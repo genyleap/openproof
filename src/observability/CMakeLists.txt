@@ -1,0 +1,9 @@
+openproof_add_module(openproof_observability
+    MODULES
+        observability.cppm
+        log.cppm
+    SOURCES
+        log.cpp
+    LINK_PUBLIC
+        openproof_foundation
+)

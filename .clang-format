@@ -1,0 +1,62 @@
+# Formatting contract for OpenProof Protocol.
+# Mirrors the code shape used by the ai-for-modern-cpp engineering contract:
+# function definitions open on their own line, control flow keeps the brace on
+# the same line, and every control-flow body is braced (SYN-015).
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: Latest
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+AccessModifierOffset: -4
+IndentAccessModifiers: false
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  BeforeLambdaBody: false
+  BeforeWhile: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+AlwaysBreakTemplateDeclarations: Yes
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 4
+PackConstructorInitializers: Never
+
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+
+FixNamespaceComments: false
+CompactNamespaces: false
+NamespaceIndentation: None
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+QualifierAlignment: Left
+
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+SeparateDefinitionBlocks: Always
+
+SpaceAfterTemplateKeyword: false
+SpacesBeforeTrailingComments: 1

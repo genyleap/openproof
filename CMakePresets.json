@@ -1,0 +1,89 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "gcc",
+      "hidden": true,
+      "inherits": "base",
+      "description": "GCC 16+ is required: the project uses C++26 contracts through standard syntax.",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/gcc.cmake"
+    },
+    {
+      "name": "gcc-debug",
+      "displayName": "GCC 16 Debug (contracts: enforce)",
+      "description": "Default development build. Contract violations terminate the process.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OPENPROOF_CONTRACT_SEMANTIC": "enforce",
+        "OPENPROOF_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC 16 Release (contracts: enforce)",
+      "description": "Optimized build. Contracts stay enforced: they guard internal invariants, so a violation means state is untrustworthy.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "OPENPROOF_CONTRACT_SEMANTIC": "enforce",
+        "OPENPROOF_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "gcc-observe",
+      "displayName": "GCC 16 Debug (contracts: observe)",
+      "description": "Staged-rollout build. Violations are reported and execution continues; this weakens the fail-closed guarantee and is not for production.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OPENPROOF_CONTRACT_SEMANTIC": "observe",
+        "OPENPROOF_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "gcc-debug",
+      "displayName": "GCC 16 Debug",
+      "configurePreset": "gcc-debug"
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC 16 Release",
+      "configurePreset": "gcc-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "gcc-debug",
+      "displayName": "GCC 16 Debug",
+      "configurePreset": "gcc-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC 16 Release",
+      "configurePreset": "gcc-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

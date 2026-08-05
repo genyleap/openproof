@@ -1,0 +1,31 @@
+# Build trees
+/build/
+/build-*/
+/out/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+
+# Local agent / editor state (SEC-002: active MCP configuration stays local)
+.mcp.json
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Secrets and local configuration overrides (SEC-001)
+*.env
+.env.*
+config/local.toml
+secrets/
+*.pem
+*.key

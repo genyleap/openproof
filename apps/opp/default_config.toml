@@ -1,0 +1,24 @@
+# Default configuration baseline for the OpenProof Protocol.
+#
+# This file is embedded into the opp binary at build time with the C++26
+# #embed directive, so `opp --print-default-config` always prints exactly the
+# defaults the binary was built with. There is no second copy in documentation
+# to drift out of date.
+#
+# It contains no secrets and never will: secret-valued settings are written as
+# references, and the loader rejects inline literals.
+
+[server]
+# Loopback by default. Exposing the listener should be a deliberate act.
+bind_address = "127.0.0.1"
+port = 8443
+
+[logging]
+level = "info"
+console = true
+
+[security]
+# A secret is referenced, never written here. Supported forms:
+#   env:NAME     read the environment variable NAME
+#   file:/path   read the contents of /path
+# token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"

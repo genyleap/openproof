@@ -1,0 +1,11 @@
+openproof_add_module(openproof_policy
+    MODULES
+        policy.cppm
+        decision.cppm
+    SOURCES
+        decision.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_identity_core
+        openproof_identity_provider
+)

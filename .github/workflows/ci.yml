@@ -1,0 +1,112 @@
+name: CI
+
+# Brief §73 requires build, test and analysis after every change, not only at
+# the end of a phase. Configure, build and test are reported as three separate
+# results: a build that never ran must not be able to look like a passing test
+# run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: GCC 16 · ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # gcc-debug is the development gate. gcc-observe proves the project still
+        # builds and passes when contracts report instead of terminating, so the
+        # staged-rollout configuration cannot silently rot.
+        preset: [gcc-debug, gcc-observe]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # GCC 16 is a hard requirement: the project uses C++26 contracts through
+      # standard syntax and no other released compiler implements them.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y g++-16 gcc-16
+
+      - name: Install CMake 3.30+
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "3.31.6"
+
+      - name: Install tomlplusplus
+        run: |
+          git clone --depth 1 --branch v3.4.0 https://github.com/marzer/tomlplusplus.git /tmp/tomlplusplus
+          sudo cmake -S /tmp/tomlplusplus -B /tmp/tomlplusplus/build \
+            -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=OFF
+          sudo cmake --install /tmp/tomlplusplus/build
+
+      - name: Report toolchain
+        run: |
+          g++-16 --version
+          cmake --version
+          ninja --version
+
+      # Separate steps so the three results are separately attributable (VER-001).
+      - name: Configure
+        env:
+          OPENPROOF_GCC_ROOT: /usr
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+      # A run that discovers zero tests is a failed run, not a passing one
+      # (TST-006). CTest alone would exit 0 on an empty suite.
+      - name: Assert the suite is non-empty
+        run: |
+          count=$(ctest --preset ${{ matrix.preset }} -N | tail -1 | grep -oE '[0-9]+$')
+          echo "discovered tests: ${count}"
+          if [ "${count}" -lt 1 ]; then
+            echo "::error::Test discovery found no tests."
+            exit 1
+          fi
+
+  hygiene:
+    name: Hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The protocol is vendor-neutral (§5). A deployment-specific name in the
+      # core is a protocol defect, so it fails the build rather than review.
+      - name: No vendor-specific identifiers in the protocol core
+        run: |
+          if grep -rniE '\bgeny|\bgip\b|genyleap' src apps tests cmake CMakeLists.txt CMakePresets.json; then
+            echo "::error::Vendor-specific identifier found. OpenProof is vendor-neutral (brief §5)."
+            exit 1
+          fi
+          echo "clean"
+
+      # MOD-006/MOD-007: no project-owned headers.
+      - name: No project headers
+        run: |
+          found=$(find src apps tests -name '*.h' -o -name '*.hpp' | wc -l)
+          if [ "${found}" -ne 0 ]; then
+            find src apps tests -name '*.h' -o -name '*.hpp'
+            echo "::error::Project-owned headers are forbidden; use .cppm/.cpp."
+            exit 1
+          fi
+          echo "clean"
+
+      - name: No trailing whitespace or conflict markers
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD --

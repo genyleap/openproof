@@ -1,0 +1,17 @@
+openproof_add_module(openproof_foundation
+    MODULES
+        foundation.cppm
+        error.cppm
+        result.cppm
+        json.cppm
+        encoding.cppm
+        secret.cppm
+        id.cppm
+        time.cppm
+    SOURCES
+        error.cpp
+        json.cpp
+        encoding.cpp
+        secret.cpp
+        time.cpp
+)
