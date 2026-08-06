@@ -30,3 +30,4 @@ export module openproof.identity.core;
 export import :identity;
 export import :link;
 export import :repository;
+export import :merge;

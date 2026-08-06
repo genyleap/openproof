@@ -9,10 +9,12 @@ openproof_add_module(openproof_identity_core
         identity.cppm
         link.cppm
         repository.cppm
+        merge.cppm
     SOURCES
         identity.cpp
         link.cpp
         repository.cpp
+        merge.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_identity_provider
