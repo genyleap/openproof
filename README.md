@@ -11,13 +11,17 @@ It is vendor-neutral. Nothing in the protocol core names a particular company,
 cloud, database, blockchain, social network or identity provider — those exist
 only as providers behind extension interfaces.
 
-> ### Status: early. Phase 1 of 12.
+> ### Status: early. Phases 0–2 of 12 complete.
 >
-> The foundation, identity core, authentication SPI and authorization decision
-> model exist and are tested. **There is no network listener, no authentication
-> provider, no proof or evidence subsystem, no trust or risk engine, no gateway
-> and no database.** `opp` starts, validates configuration, emits a structured
-> startup record and exits.
+> Implemented and tested: the foundation, the identity core (canonical identity,
+> explicit linking, explicit merge, organization-scoped repositories), the
+> authentication SPI with single-use transactions, multi-tenancy (organizations,
+> memberships, role assignment), and the authorization decision model.
+>
+> **There is no network listener, no authentication provider, no proof or
+> evidence subsystem, no trust or risk engine, no gateway and no database.**
+> `opp` starts, validates configuration, emits a structured startup record and
+> exits.
 >
 > See [docs/00-AUDIT.md](docs/00-AUDIT.md) §14 for the phase plan and exactly
 > what is and is not built. Nothing here is stubbed to look finished.

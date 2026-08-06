@@ -372,9 +372,9 @@ Mapped to §72, adjusted for what already exists.
 | Phase | Contents | Status |
 |---|---|---|
 | **0** | This audit | **complete** |
-| **1** | Rename to OpenProof (C-1, C-6, C-10); resolve C-2 domain repositories; CI (C-8); `SECURITY_INVARIANTS.md` (C-4) | **next** |
-| **2** | Identity core completion: organization context, merge flow, tenant isolation | partially present |
-| **3** | Authentication: sessions, credentials, MFA, recovery; then providers (generic OIDC → WebAuthn → email/phone → Web3 → social → enterprise) | SPI + transactions present |
+| **1** | Rename to OpenProof (C-1, C-6, C-10); resolve C-2 domain repositories; CI (C-8); `SECURITY_INVARIANTS.md` (C-4) | **complete** |
+| **2** | Identity core completion: organization context, merge flow, tenant isolation | **complete** |
+| **3** | Authentication: sessions, credentials, MFA, recovery; then providers (generic OIDC → WebAuthn → email/phone → Web3 → social → enterprise) | **next** — SPI + transactions present |
 | **4** | Proof & evidence: lifecycle, provenance, freshness, revocation, provider evidence SPI, mock adapters | not started |
 | **5** | Trust & risk: dimensions, signals, Sybil-resistance abstraction, explainable decisions | not started |
 | **6** | Policy & authorization: RBAC, ABAC, assurance/trust/risk/entitlement-aware policy | decision model present |

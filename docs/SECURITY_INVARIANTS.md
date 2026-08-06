@@ -11,7 +11,7 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 171 passing tests.
+Verified against the tree at 203 passing tests.
 
 ---
 
@@ -39,6 +39,14 @@ Verified against the tree at 171 passing tests.
 | 18 | **A nonce has exactly one textual spelling** | `fromBase64Url` rejects non-canonical trailing bits | `Base64UrlRejectsNonCanonicalTrailingBits` | `InvalidArgument` |
 | 19 | **Randomness failure is never silently downgraded** | `randomBytes` returns an error; no fallback source exists | `RejectsAnImpossiblyLargeRequest` | `Internal` error; caller cannot proceed |
 | 20 | **A broken internal invariant stops the process** | C++26 contracts under the `enforce` semantic | `SecureWipeContractTest` death tests | Standard contract diagnostic, then abort |
+| 21 | **Identity merge is never implicit** | Merge state machine; `Applied` reachable only from `Verified` | `CannotApplyWithoutVerification`, `CannotMarkVerifiedWithoutRequiringVerificationFirst` | `FailedPrecondition`; source untouched |
+| 22 | **A merge never crosses tenants** | Both identities resolved through the organization-scoped repository | `CannotMergeAcrossOrganizations` | `NotFound`; neither identity changes |
+| 23 | **A merge transfers no authority** | `applyMerge` touches associations only; memberships and roles are a separate aggregate it never opens | `MovesExternalAssociationsToTheTarget` plus the absence of any membership call | Authority must be re-granted deliberately |
+| 24 | **A merged identity survives as a tombstone and cannot authenticate** | `IdentityStatus::Merged` is terminal; `permitsAuthentication` denies it | `AppliesAVerifiedMergeAndRetiresTheSource`, `CannotMergeIntoAnAlreadyMergedIdentity` | `FailedPrecondition` on any further change |
+| 25 | **An association cannot be taken by naming it** | `reassign` requires and checks the expected current owner | `ReassignRefusesWhenTheExpectedOwnerIsWrong` | `PermissionDenied`; ownership unchanged |
+| 26 | **A removed member does not regain authority** | `remove()` drops roles; granting to a removed membership is refused | `RemovalDropsRoles` | Roles cleared; `FailedPrecondition` on re-grant |
+| 27 | **A role held in one tenant does not leak into another** | Roles live on the membership, keyed by (organization, identity) | `RolesAreScopedPerOrganization` | Role simply absent in the other tenant |
+| 28 | **A suspended member holds no effective role** | `hasRole` checks membership state before the role set | `SuspensionMakesRolesInertWithoutDiscardingThem` | `hasRole` returns false while retaining the grant |
 
 ---
 
@@ -75,7 +83,6 @@ the brief but has no subsystem to attach to yet.
 | Evidence is untrusted until verified; inference is never presented as fact | §61 | 4 |
 | Risk evaluation failure cannot silently become authorization success | §59 | 5 |
 | A trust decision is explainable, not an opaque number | §16, §62 | 5 |
-| Identity merge never escalates privilege and never crosses tenants | §52 | 2 |
 | Deployment operators own their data; the protocol phones no one home | §4, §63 | 8 |
 
 ---
