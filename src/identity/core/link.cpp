@@ -286,6 +286,34 @@ InMemoryExternalIdentityDirectory::detach(const ExternalIdentityRef& external,
     return foundation::ok();
 }
 
+foundation::Status
+InMemoryExternalIdentityDirectory::reassign(const ExternalIdentityRef& external,
+                                            const IdentityId& expectedCurrentOwner,
+                                            const IdentityId& newOwner)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+
+    const auto position = m_owners.find(external);
+    if (position == m_owners.end()) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That connected account was not found.");
+    }
+    if (position->second != expectedCurrentOwner) {
+        return foundation::fail(
+            foundation::ErrorCode::PermissionDenied,
+            "The request was denied.",
+            "Refused to reassign an external identity owned by a different canonical "
+            "identity. Naming an association is not evidence of controlling it.");
+    }
+
+    // A single in-place write, under the same lock that guards ownership. The
+    // association is never briefly unowned, which a detach-then-attach pair
+    // could not guarantee.
+    position->second = newOwner;
+    contract_assert(m_owners.at(external) == newOwner);
+    return foundation::ok();
+}
+
 foundation::Result<std::vector<ExternalIdentityRef>>
 InMemoryExternalIdentityDirectory::externalIdentitiesOf(const IdentityId& owner) const
 {

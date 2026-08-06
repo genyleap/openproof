@@ -225,6 +225,10 @@ public:
 
     [[nodiscard]] foundation::Status detach(const ExternalIdentityRef& external, const IdentityId& expectedOwner) override;
 
+    [[nodiscard]] foundation::Status reassign(const ExternalIdentityRef& external,
+                                              const IdentityId& expectedCurrentOwner,
+                                              const IdentityId& newOwner) override;
+
     [[nodiscard]] foundation::Result<std::vector<ExternalIdentityRef>>
     externalIdentitiesOf(const IdentityId& owner) const override;
 
