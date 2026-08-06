@@ -133,11 +133,12 @@ src/
   security/            openproof.security           CSPRNG, SHA-256, constant-time compare
   observability/       openproof.observability      structured JSON logging
   config/              openproof.config             typed configuration, secret references
-  identity/core/       openproof.identity.core      Identity, linking, repositories
+  identity/core/       openproof.identity.core      Identity, linking, merge, repositories
   identity/provider/   openproof.identity.provider  authentication SPI, transactions, assurance
   policy/              openproof.policy             authorization decision model
+  organization/        openproof.organization       tenants, memberships, role assignment
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 171 tests
+tests/                 203 tests
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties
@@ -148,7 +149,7 @@ docs/
 
 ## Security invariants
 
-Twenty invariants are recorded in
+Twenty-eight invariants are recorded in
 [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md), each naming what must
 be true, the mechanism that enforces it, the test that proves it, and what
 happens on failure. Invariants that are true but not yet *mechanically* enforced
