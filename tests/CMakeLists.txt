@@ -35,6 +35,7 @@ target_link_libraries(openproof_tests
         openproof_identity_provider
         openproof_identity_core
         openproof_policy
+        openproof_organization
         GTest::gtest
         GTest::gtest_main
         openproof_test_compile_options
