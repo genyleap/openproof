@@ -180,6 +180,26 @@ public:
      */
     [[nodiscard]] virtual foundation::Status detach(const ExternalIdentityRef& external, const IdentityId& expectedOwner) = 0;
 
+    /**
+     * @brief Moves an association from one canonical identity to another.
+     *
+     * Exists for identity merge, which must move associations without
+     * destroying and recreating them: a detach-then-attach pair leaves a window
+     * in which the association belongs to nobody, and loses the fact that it was
+     * moved rather than re-proven.
+     *
+     * @p expectedCurrentOwner is mandatory and checked. Without it this would be
+     * a primitive for taking over any association by naming it, which is exactly
+     * the account-takeover path the linking state machine exists to close.
+     *
+     * @return ErrorCode::NotFound when the association is absent;
+     *         ErrorCode::PermissionDenied when @p expectedCurrentOwner does not
+     *         currently own it.
+     */
+    [[nodiscard]] virtual foundation::Status reassign(const ExternalIdentityRef& external,
+                                                      const IdentityId& expectedCurrentOwner,
+                                                      const IdentityId& newOwner) = 0;
+
     /** @brief Returns every external identity owned by @p owner, in stable order. */
     [[nodiscard]] virtual foundation::Result<std::vector<ExternalIdentityRef>>
     externalIdentitiesOf(const IdentityId& owner) const = 0;
