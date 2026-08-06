@@ -91,6 +91,20 @@ target_link_options(openproof_compile_options INTERFACE
     -fcontracts
 )
 
+# Whether a violated contract stops the process under the configured semantic.
+# Tests that assert termination must not run under `observe`, where the contract
+# reports and execution continues by design. Deriving this from the semantic
+# keeps the two from drifting apart.
+if(OPENPROOF_CONTRACT_SEMANTIC MATCHES "^(enforce|quick_enforce)$")
+    set(OPENPROOF_CONTRACTS_TERMINATE 1)
+else()
+    set(OPENPROOF_CONTRACTS_TERMINATE 0)
+endif()
+
+target_compile_definitions(openproof_compile_options INTERFACE
+    OPENPROOF_CONTRACTS_TERMINATE=${OPENPROOF_CONTRACTS_TERMINATE}
+)
+
 # C++26 reflection (P2996, GCC PR120775) is NOT enabled, and the reason is a
 # compiler defect rather than a preference.
 #

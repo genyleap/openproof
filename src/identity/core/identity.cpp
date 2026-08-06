@@ -36,6 +36,8 @@ std::string_view identityStatusName(IdentityStatus status) noexcept
         return "deactivated";
     case IdentityStatus::Deleted:
         return "deleted";
+    case IdentityStatus::Merged:
+        return "merged";
     }
     return "deactivated";
 }
@@ -52,6 +54,10 @@ bool permitsAuthentication(IdentityStatus status) noexcept
     case IdentityStatus::Locked:
     case IdentityStatus::Deactivated:
     case IdentityStatus::Deleted:
+    // A merged identity must never authenticate. Its credentials and
+    // associations now belong to the successor, and letting the absorbed key
+    // still log in would reopen the account the merge was meant to close.
+    case IdentityStatus::Merged:
         return false;
     }
     return false;

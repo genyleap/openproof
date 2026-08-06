@@ -18,7 +18,6 @@ graph TD
     opp["apps/opp<br/>composition root"]
 
     idp["openproof.identity.provider<br/>authentication SPI"]
-    storage["openproof.storage<br/>persistence SPI"]
     config["openproof.config<br/>typed configuration"]
     security["openproof.security<br/>crypto boundary"]
     obs["openproof.observability<br/>structured logging"]
@@ -30,7 +29,6 @@ graph TD
     opp --> fnd
 
     idp --> fnd
-    storage --> fnd
     config --> obs
     config --> fnd
     security --> fnd
@@ -48,7 +46,6 @@ every other layer may assume.
 | `openproof.security` | `:random` `:hash` | CSPRNG, SHA-256, constant-time comparison |
 | `openproof.observability` | `:log` | Structured JSON logging with correlation identifiers |
 | `openproof.config` | — | Typed configuration, environment overrides, secret references |
-| `openproof.storage` | `:repository` | Persistence contract plus an in-memory adapter |
 | `openproof.identity.provider` | `:assurance` `:outcome` `:authenticator` `:registry` | The authentication provider SPI |
 
 21 module interface units (`.cppm`), 14 implementation units (`.cpp`).

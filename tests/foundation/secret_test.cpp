@@ -126,6 +126,11 @@ TEST(SecureWipeTest, ToleratesEmptyRequests)
     EXPECT_EQ(buffer.front(), 9U);
 }
 
+// These assert termination, which is a property of the `enforce` semantic. Under
+// `observe` a violation is reported and execution continues by design, so the
+// same assertions would be wrong rather than merely inapplicable.
+#if OPENPROOF_CONTRACTS_TERMINATE
+
 // A null pointer with a non-zero length means a caller believes it is erasing a
 // credential that is not there. Returning quietly would leave that belief
 // intact, so the contract stops the process instead.
@@ -147,6 +152,19 @@ TEST(SecureWipeContractTest, ViolationDiagnosticIdentifiesThePredicate)
     EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "semantic: enforce");
     EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), R"(size == 0U \|\| data != nullptr)");
 }
+
+#else
+
+// Under `observe` the guarantee is the opposite one, and it is worth proving:
+// the violation is reported but the process survives. A build configured this
+// way must not be mistaken for one that fails closed.
+TEST(SecureWipeContractTest, ObserveSemanticReportsWithoutTerminating)
+{
+    fnd::secureWipe(nullptr, 16U);
+    SUCCEED() << "observe semantic: violation reported, execution continued";
+}
+
+#endif
 
 
 }

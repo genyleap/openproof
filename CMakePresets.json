@@ -66,6 +66,11 @@
       "name": "gcc-release",
       "displayName": "GCC 16 Release",
       "configurePreset": "gcc-release"
+    },
+    {
+      "name": "gcc-observe",
+      "displayName": "GCC 16 Debug (contracts: observe)",
+      "configurePreset": "gcc-observe"
     }
   ],
   "testPresets": [
@@ -81,6 +86,14 @@
       "name": "gcc-release",
       "displayName": "GCC 16 Release",
       "configurePreset": "gcc-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gcc-observe",
+      "displayName": "GCC 16 Debug (contracts: observe)",
+      "configurePreset": "gcc-observe",
       "output": {
         "outputOnFailure": true
       }

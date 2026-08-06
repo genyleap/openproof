@@ -26,7 +26,6 @@ apps/opp  ── composition root
      ├── openproof.identity.provider   Authentication SPI, transactions, assurance
      ├── openproof.policy              Authorization decision model
      ├── openproof.config              Typed configuration, secret references
-     ├── openproof.storage             Repository abstraction + in-memory adapter
      ├── openproof.security            CSPRNG, SHA-256, constant-time compare
      ├── openproof.observability       Structured JSON logging
      └── openproof.foundation          Errors, Result, ids, time, secrets, encodings
@@ -44,7 +43,6 @@ Cohesive layers use module partitions; independently pluggable components
 | `openproof.policy` | `:decision` |
 | `openproof.security` | `:random :hash` |
 | `openproof.observability` | `:log` |
-| `openproof.storage` | `:repository` |
 | `openproof.config` | — |
 
 ---

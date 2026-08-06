@@ -64,6 +64,17 @@ enum class IdentityStatus {
     Locked,      ///< Barred by an automated security control.
     Deactivated, ///< Retired by the subject or the organization.
     Deleted,     ///< Erased; retained only as a tombstone for audit integrity.
+
+    /**
+     * Absorbed into another identity by an explicit merge.
+     *
+     * Terminal, and deliberately distinct from @c Deleted: a deleted identity
+     * was retired, whereas a merged one still has a successor. Anything that
+     * followed the old key -- an audit record, a stale association, a support
+     * ticket -- must be able to tell those two apart, and a single "gone" state
+     * would lose that. The successor is recorded in the MergeRecord.
+     */
+    Merged,
 };
 
 /** @brief Returns the stable wire name of @p status. */
