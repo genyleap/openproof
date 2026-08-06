@@ -116,6 +116,15 @@ foundation::Status Identity::changeStatus(IdentityStatus status)
             "reattach them.");
     }
 
+    if (m_status == IdentityStatus::Merged) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "This identity cannot be modified.",
+            "A merged identity cannot change status. Its associations were transferred to a "
+            "successor, so reactivating it would produce two live identities claiming the "
+            "same external accounts.");
+    }
+
     m_status = status;
     return foundation::ok();
 }
