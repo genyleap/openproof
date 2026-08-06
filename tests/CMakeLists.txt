@@ -17,6 +17,8 @@ add_executable(openproof_tests
     identity/core_test.cpp
     policy/decision_test.cpp
     identity/transaction_test.cpp
+    identity/merge_test.cpp
+    organization/organization_test.cpp
 )
 
 target_compile_features(openproof_tests PRIVATE cxx_std_26)
