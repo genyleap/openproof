@@ -27,6 +27,16 @@ using Sha256Digest = std::array<std::byte, 32>;
 [[nodiscard]] foundation::Result<Sha256Digest> sha256(std::string_view data);
 
 /**
+ * @brief Computes HMAC-SHA-256 over @p data using secret @p key.
+ *
+ * The key remains a SecretString throughout the API, so it cannot be formatted
+ * or logged accidentally. Empty keys are rejected rather than interpreted as a
+ * valid but unkeyed construction.
+ */
+[[nodiscard]] foundation::Result<Sha256Digest>
+hmacSha256(const foundation::SecretString& key, std::string_view data);
+
+/**
  * @brief Compares two byte sequences in time independent of their contents.
  *
  * Required whenever one side is a secret: a session token, a digest, a MAC, a

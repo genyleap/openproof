@@ -87,6 +87,25 @@ AuthenticationTransaction::create(TransactionId id, ProviderId provider, Interac
                                      createdAt,              createdAt + lifetime};
 }
 
+foundation::Result<AuthenticationTransaction> AuthenticationTransaction::restore(
+    TransactionId id, ProviderId provider, InteractionModel model,
+    security::Sha256Digest nonceDigest, BindingDigest binding,
+    foundation::CorrelationId correlation, TransactionState state,
+    foundation::Instant createdAt, foundation::Instant expiresAt,
+    AttributeMap metadata)
+{
+    if (id.empty() || provider.empty() || correlation.empty() || expiresAt <= createdAt) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The persisted authentication transaction is invalid.");
+    }
+    AuthenticationTransaction restored{
+        std::move(id), std::move(provider), model, nonceDigest, binding,
+        std::move(correlation), createdAt, expiresAt};
+    restored.m_state = state;
+    restored.m_metadata = std::move(metadata);
+    return restored;
+}
+
 const TransactionId& AuthenticationTransaction::id() const noexcept
 {
     return m_id;
@@ -120,6 +139,16 @@ foundation::Instant AuthenticationTransaction::createdAt() const noexcept
 foundation::Instant AuthenticationTransaction::expiresAt() const noexcept
 {
     return m_expiresAt;
+}
+
+const security::Sha256Digest& AuthenticationTransaction::nonceDigest() const noexcept
+{
+    return m_nonceDigest;
+}
+
+const BindingDigest& AuthenticationTransaction::binding() const noexcept
+{
+    return m_binding;
 }
 
 bool AuthenticationTransaction::isExpiredAt(foundation::Instant now) const noexcept

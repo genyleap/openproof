@@ -20,6 +20,15 @@ AuthenticationContext::AuthenticationContext(
 {
 }
 
+AuthenticationContext::AuthenticationContext(
+    const session::AuthenticatedSession& authenticatedSession)
+    : m_providerId(authenticatedSession.session().provider())
+    , m_claimedAssurance(authenticatedSession.session().assurance())
+    , m_strength(authenticatedSession.session().strength())
+    , m_authenticatedAt(authenticatedSession.session().authenticatedAt())
+{
+}
+
 bool AuthenticationContext::isAuthenticated() const noexcept
 {
     return true;
@@ -67,6 +76,34 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
     const organization::MembershipRepository& memberships,
     Action action, Resource resource)
 {
+    return createResolved(authentication.identity(), AuthenticationContext{authentication},
+                          organizationId, organizations, identities, memberships,
+                          std::move(action), std::move(resource));
+}
+
+foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
+    const session::AuthenticatedSession& authenticatedSession,
+    const identity::core::OrganizationId& organizationId,
+    const organization::OrganizationRepository& organizations,
+    const identity::core::IdentityRepository& identities,
+    const organization::MembershipRepository& memberships,
+    Action action, Resource resource)
+{
+    return createResolved(authenticatedSession.session().identity(),
+                          AuthenticationContext{authenticatedSession},
+                          organizationId, organizations, identities, memberships,
+                          std::move(action), std::move(resource));
+}
+
+foundation::Result<AuthorizationRequest> AuthorizationRequest::createResolved(
+    identity::core::IdentityId authenticatedIdentity,
+    AuthenticationContext authenticationContext,
+    const identity::core::OrganizationId& organizationId,
+    const organization::OrganizationRepository& organizations,
+    const identity::core::IdentityRepository& identities,
+    const organization::MembershipRepository& memberships,
+    Action action, Resource resource)
+{
     if (action.empty() || resource.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "An authorization request must name an action and resource.");
@@ -92,7 +129,7 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
     }
 
     foundation::Result<std::optional<identity::core::Identity>> identity =
-        identities.findById(organizationId, authentication.identity());
+        identities.findById(organizationId, authenticatedIdentity);
     if (!identity.has_value()) {
         return foundation::fail(identity.error());
     }
@@ -103,7 +140,7 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
             "Authorization context creation refused: authenticated identity is absent from "
             "the requested organization.");
     }
-    if (identity->value().id() != authentication.identity()) {
+    if (identity->value().id() != authenticatedIdentity) {
         return foundation::fail(
             foundation::ErrorCode::PermissionDenied,
             std::string{foundation::defaultErrorMessage(foundation::ErrorCode::PermissionDenied)},
@@ -118,7 +155,7 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
     }
 
     foundation::Result<std::optional<organization::Membership>> membership =
-        memberships.find(organizationId, authentication.identity());
+        memberships.find(organizationId, authenticatedIdentity);
     if (!membership.has_value()) {
         return foundation::fail(membership.error());
     }
@@ -138,7 +175,7 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::create(
     }
 
     return AuthorizationRequest{identity->value().id(), organizationId,
-                                AuthenticationContext{authentication},
+                                std::move(authenticationContext),
                                 membership->value().roles(), std::move(action),
                                 std::move(resource)};
 }

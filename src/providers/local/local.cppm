@@ -1,0 +1,115 @@
+module;
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+
+export module openproof.provider.local;
+
+import openproof.credentials;
+import openproof.foundation;
+import openproof.identity.provider;
+
+export namespace openproof::provider::local {
+
+namespace idp = identity::provider;
+
+enum class LocalVerification {
+    Password,
+    PasswordAndTotp,
+};
+
+/** Credential-specific domain boundary used by the local provider. */
+class LocalAccountDirectory {
+public:
+    LocalAccountDirectory(const LocalAccountDirectory&) = delete;
+    LocalAccountDirectory& operator=(const LocalAccountDirectory&) = delete;
+    LocalAccountDirectory(LocalAccountDirectory&&) = delete;
+    LocalAccountDirectory& operator=(LocalAccountDirectory&&) = delete;
+    virtual ~LocalAccountDirectory() = default;
+
+    [[nodiscard]] virtual foundation::Status enroll(
+        idp::ExternalSubject subject, const foundation::SecretString& password,
+        std::optional<credentials::TotpSecret> totp) = 0;
+    [[nodiscard]] virtual foundation::Status changePassword(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) = 0;
+    [[nodiscard]] virtual foundation::Result<LocalVerification> verify(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password,
+        std::optional<std::string_view> totp,
+        foundation::Instant now) = 0;
+
+protected:
+    LocalAccountDirectory() = default;
+};
+
+/** Thread-safe single-process adapter. Persistent adapters must encrypt TOTP seeds. */
+class InMemoryLocalAccountDirectory final : public LocalAccountDirectory {
+public:
+    [[nodiscard]] static foundation::Result<std::unique_ptr<InMemoryLocalAccountDirectory>>
+    create(credentials::PasswordHasher passwordHasher,
+           credentials::TotpPolicy totpPolicy);
+    ~InMemoryLocalAccountDirectory() override;
+
+    [[nodiscard]] foundation::Status enroll(
+        idp::ExternalSubject subject, const foundation::SecretString& password,
+        std::optional<credentials::TotpSecret> totp) override;
+    [[nodiscard]] foundation::Status changePassword(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Result<LocalVerification> verify(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password,
+        std::optional<std::string_view> totp,
+        foundation::Instant now) override;
+
+private:
+    struct Account;
+    InMemoryLocalAccountDirectory(credentials::PasswordHasher passwordHasher,
+                                  credentials::TotpPolicy totpPolicy,
+                                  credentials::PasswordHash dummyHash);
+    credentials::PasswordHasher m_passwordHasher;
+    credentials::TotpPolicy m_totpPolicy;
+    credentials::PasswordHash m_dummyHash;
+    mutable std::mutex m_mutex;
+    std::map<idp::ExternalSubject, std::unique_ptr<Account>> m_accounts;
+};
+
+/**
+ * Concrete challenge-response provider for locally managed passwords and TOTP.
+ * It intentionally has no registration API; credential administration goes
+ * through LocalAccountDirectory and cannot be reached through authentication.
+ */
+class LocalAuthenticationProvider final : public idp::AuthenticationProvider {
+public:
+    LocalAuthenticationProvider(idp::ProviderId id,
+                                LocalAccountDirectory& accounts,
+                                const foundation::ClockSource& clock,
+                                foundation::Duration challengeLifetime);
+
+    [[nodiscard]] idp::ProviderId id() const override;
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override;
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override;
+    [[nodiscard]] foundation::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest& request) override;
+    [[nodiscard]] foundation::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse& response) override;
+
+private:
+    struct Pending final {
+        idp::ExternalSubject subject;
+        foundation::Instant expiresAt;
+    };
+    idp::ProviderId m_id;
+    LocalAccountDirectory* m_accounts;
+    const foundation::ClockSource* m_clock;
+    foundation::Duration m_challengeLifetime;
+    std::mutex m_mutex;
+    std::map<idp::ChallengeId, Pending> m_pending;
+};
+
+}

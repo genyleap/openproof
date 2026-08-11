@@ -1,0 +1,21 @@
+# Runnable local example. The master key is resolved from the environment and
+# never stored in this file. Replace the upstream and put a trusted TLS
+# terminator in front of the loopback listener for deployment.
+
+[server]
+bind_address = "127.0.0.1"
+port = 18443
+
+[logging]
+level = "info"
+console = true
+
+[security]
+token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+
+[gateway]
+enabled = true
+route_prefix = "/"
+upstream_host = "127.0.0.1"
+upstream_port = 18080
+upstream_tls = false

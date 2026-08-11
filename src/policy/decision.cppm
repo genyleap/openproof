@@ -12,6 +12,7 @@ import openproof.authentication;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.organization;
+import openproof.session;
 
 export namespace openproof::policy {
 
@@ -78,6 +79,7 @@ private:
 
     explicit AuthenticationContext(
         const authentication::VerifiedAuthentication& authentication);
+    explicit AuthenticationContext(const session::AuthenticatedSession& session);
 
     identity::provider::ProviderId m_providerId;
     identity::provider::AssuranceLevel m_claimedAssurance{identity::provider::AssuranceLevel::Ial0};
@@ -116,6 +118,15 @@ public:
            const organization::MembershipRepository& memberships,
            Action action, Resource resource);
 
+    /** Builds the same trusted context from a server-validated revocable session. */
+    [[nodiscard]] static foundation::Result<AuthorizationRequest>
+    create(const session::AuthenticatedSession& session,
+           const identity::core::OrganizationId& organization,
+           const organization::OrganizationRepository& organizations,
+           const identity::core::IdentityRepository& identities,
+           const organization::MembershipRepository& memberships,
+           Action action, Resource resource);
+
     [[nodiscard]] const identity::core::IdentityId& subject() const noexcept;
     [[nodiscard]] const Action& action() const noexcept;
     [[nodiscard]] const Resource& resource() const noexcept;
@@ -139,6 +150,15 @@ public:
     [[nodiscard]] bool hasRole(const Role& role) const;
 
 private:
+    [[nodiscard]] static foundation::Result<AuthorizationRequest>
+    createResolved(identity::core::IdentityId authenticatedIdentity,
+                   AuthenticationContext authentication,
+                   const identity::core::OrganizationId& organization,
+                   const organization::OrganizationRepository& organizations,
+                   const identity::core::IdentityRepository& identities,
+                   const organization::MembershipRepository& memberships,
+                   Action action, Resource resource);
+
     AuthorizationRequest(identity::core::IdentityId subject,
                          identity::core::OrganizationId organization,
                          AuthenticationContext authentication, std::vector<Role> roles,

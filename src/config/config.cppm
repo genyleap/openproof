@@ -143,11 +143,35 @@ public:
     SecurityConfig& operator=(SecurityConfig&&) noexcept = default;
     ~SecurityConfig() = default;
 
-    /** @brief Key used to sign platform-issued tokens. May be empty in Phase 1. */
+    /** @brief Master key used to derive platform signing and token keys. */
     [[nodiscard]] const foundation::SecretString& tokenSigningKey() const noexcept;
 
 private:
     foundation::SecretString m_tokenSigningKey;
+};
+
+/** Configuration for the runnable single-upstream reverse-gateway process. */
+class GatewayConfig final {
+public:
+    [[nodiscard]] static foundation::Result<GatewayConfig>
+    create(bool enabled, std::string routePrefix, std::string upstreamHost,
+           std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile);
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] std::string_view routePrefix() const noexcept;
+    [[nodiscard]] std::string_view upstreamHost() const noexcept;
+    [[nodiscard]] std::uint16_t upstreamPort() const noexcept;
+    [[nodiscard]] bool upstreamTls() const noexcept;
+    [[nodiscard]] std::string_view upstreamCaFile() const noexcept;
+private:
+    GatewayConfig(bool enabled, std::string routePrefix, std::string upstreamHost,
+                  std::uint16_t upstreamPort, bool upstreamTls,
+                  std::string upstreamCaFile);
+    bool m_enabled{};
+    std::string m_routePrefix;
+    std::string m_upstreamHost;
+    std::uint16_t m_upstreamPort{};
+    bool m_upstreamTls{};
+    std::string m_upstreamCaFile;
 };
 
 /**
@@ -191,13 +215,18 @@ public:
     [[nodiscard]] const ServerConfig& server() const noexcept;
     [[nodiscard]] const LoggingConfig& logging() const noexcept;
     [[nodiscard]] const SecurityConfig& security() const noexcept;
+    [[nodiscard]] const GatewayConfig& gateway() const noexcept;
+    /** Validates the additional fail-closed requirements of `opp server`. */
+    [[nodiscard]] foundation::Status validateServerDeployment() const;
 
 private:
-    PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security);
+    PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security,
+                   GatewayConfig gateway);
 
     ServerConfig m_server;
     LoggingConfig m_logging;
     SecurityConfig m_security;
+    GatewayConfig m_gateway;
 };
 
 }

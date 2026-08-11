@@ -109,6 +109,14 @@ public:
            foundation::CorrelationId correlation,
            foundation::Instant createdAt, foundation::Duration lifetime);
 
+    /** Validates and reconstructs a persisted transaction snapshot. */
+    [[nodiscard]] static foundation::Result<AuthenticationTransaction>
+    restore(TransactionId id, ProviderId provider, InteractionModel model,
+            security::Sha256Digest nonceDigest, BindingDigest binding,
+            foundation::CorrelationId correlation, TransactionState state,
+            foundation::Instant createdAt, foundation::Instant expiresAt,
+            AttributeMap metadata);
+
     [[nodiscard]] const TransactionId& id() const noexcept;
     [[nodiscard]] const ProviderId& provider() const noexcept;
     [[nodiscard]] InteractionModel interactionModel() const noexcept;
@@ -116,6 +124,8 @@ public:
     [[nodiscard]] TransactionState state() const noexcept;
     [[nodiscard]] foundation::Instant createdAt() const noexcept;
     [[nodiscard]] foundation::Instant expiresAt() const noexcept;
+    [[nodiscard]] const security::Sha256Digest& nonceDigest() const noexcept;
+    [[nodiscard]] const BindingDigest& binding() const noexcept;
 
     /** @brief Returns whether the deadline has passed at @p now. Inclusive. */
     [[nodiscard]] bool isExpiredAt(foundation::Instant now) const noexcept;

@@ -374,16 +374,16 @@ Mapped to §72, adjusted for what already exists.
 | **0** | This audit | **complete** |
 | **1** | Rename to OpenProof (C-1, C-6, C-10); resolve C-2 domain repositories; CI (C-8); `SECURITY_INVARIANTS.md` (C-4) | **complete** |
 | **2** | Identity core completion: organization context, merge flow, tenant isolation | **complete** |
-| **3** | Authentication: sessions, credentials, MFA, recovery; then providers (generic OIDC → WebAuthn → email/phone → Web3 → social → enterprise) | **in progress** — SPI, digested single-use transactions, trusted broker, independent assurance caps and sealed authorization handoff present |
+| **3** | Authentication: sessions, credentials, MFA, recovery; then providers (generic OIDC → WebAuthn → email/phone → Web3 → social → enterprise) | **partially complete** — sessions, password, TOTP, recovery and local provider complete; generic OIDC/WebAuthn and other adapters pending |
 | **4** | Proof & evidence: lifecycle, provenance, freshness, revocation, provider evidence SPI, mock adapters | not started |
 | **5** | Trust & risk: dimensions, signals, Sybil-resistance abstraction, explainable decisions | not started |
 | **6** | Policy & authorization: RBAC, ABAC, assurance/trust/risk/entitlement-aware policy | decision model present |
-| **7** | Gateway: HTTP, routing, enforcement, rate limit, LB, circuit breaker, discovery, proxy | not started |
-| **8** | Storage: PostgreSQL adapter, migrations, transactions | in-memory only |
-| **9** | Audit & observability: audit events, metrics, tracing, security event stream | logging only |
+| **7** | Gateway: HTTP, routing, enforcement, rate limit, LB, circuit breaker, discovery, proxy | **complete for HTTP/1.1 edge/core** — runnable public single-upstream mode; protected embedding API |
+| **8** | Storage: PostgreSQL adapter, migrations, transactions | **critical path complete** — pool, migrations, sessions, auth transactions and recovery codes; remaining aggregates pending |
+| **9** | Audit & observability: audit events, metrics, tracing, security event stream | **core complete** — HMAC chain, bounded Prometheus metrics, W3C trace context and security-event sink |
 | **10** | Administration: management API, `opp` CLI | not started |
 | **11** | SDK & developer experience: docs, examples | not started |
-| **12** | Hardening: threat model, sanitizers, fuzzing, load, failure injection | not started |
+| **12** | Hardening: threat model, sanitizers, fuzzing, load, failure injection | **baseline complete** — threat model, ASan/UBSan preset, randomized boundary corpus, concurrency and failure tests |
 
 Phase 1 is deliberately *not* new features. Renaming 90 files and replacing the
 storage abstraction while the tree is small is far cheaper than doing it after

@@ -11,7 +11,8 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 225 passing tests.
+Verified against the tree at 283 discovered tests, plus five PostgreSQL tests
+run against an isolated PostgreSQL 18 instance.
 
 ---
 
@@ -24,7 +25,7 @@ Verified against the tree at 225 passing tests.
 | 3 | Authorization never implies authentication | `AuthorizationDecision` has no subject or authentication field; trusted requests require broker-minted authentication | `RawProviderValuesCannotForgeAuthenticationContext` | No trusted request can be constructed from a decision or raw provider values |
 | 4 | Identity linking never occurs implicitly | Link state machine; `Linked` reachable only from `Verified` | `CannotReachLinkedWithoutVerification`, `MatchingAttributesDoNotMergeIdentities` | `FailedPrecondition`; no association recorded |
 | 5 | Provider protocol logic never enters the identity core | `ProviderId` is opaque; `InteractionModel` is protocol-neutral; no protocol names in SPI or core | Module graph + review | Not mechanically caught — see §Gaps |
-| 6 | The gateway never owns canonical identity | Dependency direction: core links no gateway | Not yet testable — no gateway exists | — |
+| 6 | The gateway never owns canonical identity | Dependency direction: gateway consumes `AuthenticatedSession`; canonical records remain behind identity repositories | gateway protected-route tests and module graph | Authentication/authorization fails closed; no identity is created at the edge |
 | 7 | Client input cannot inject an entitlement | `AuthorizationRequest` exposes no entitlement mutator; a trusted adapter type is required before entitlements can be populated | `UntrustedEntitlementsCannotBeInjected` | Entitlement is absent and grants nothing |
 | 8 | Private keys are never accepted or stored | No API accepts key material | Review | Not mechanically caught — see §Gaps |
 | 9 | Protected operations default to deny | `evaluateProtected`, four-valued `DecisionKind` | 4 tests in `decision_test.cpp` | `Indeterminate`/`NotApplicable` deny |
@@ -53,6 +54,16 @@ Verified against the tree at 225 passing tests.
 | 32 | **Client-supplied roles and authentication state cannot enter policy input** | `AuthorizationRequest` has no public constructor, aggregate overload or mutators; its factory resolves the broker identity, tenant and membership from authoritative repositories | `RefusesAMembershipBelongingToAnotherIdentity`, `RefusesAnInactiveMembership`, `RefusesAnInactiveCanonicalIdentityFromTheRepository`, `RefusesAnInactiveOrganizationFromTheRepository` plus compile-time constructibility checks | Request construction fails |
 | 33 | **Malformed security configuration never falls back to defaults** | Closed TOML schema validates section, key and exact type before extraction | `RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults`, `RejectsUnknownSectionsAndSettings` | Startup returns `InvalidArgument` |
 | 34 | **A verified external subject cannot be attached to an arbitrary canonical identity at authorization time** | The broker resolves `(provider, external subject)` only through `ExternalIdentityDirectory`, embeds that canonical key in `VerifiedAuthentication`, and policy queries repositories only under that key | `RefusesAnExternalSubjectWithoutAnExplicitIdentityLink`, `RefusesToCombineAuthenticationWithAnotherIdentity` | Authentication or request construction fails closed |
+| 35 | **A session bearer is never stored in plaintext** | 256-bit opaque token is returned once; repositories receive only HMAC-SHA256 digest | `IssuesAndAuthenticatesAnOpaqueSession` | Database disclosure does not reveal live bearer values |
+| 36 | **Session expiry and revocation are immediate** | Repository use/rotate/revoke operations atomically check state, absolute expiry and idle expiry | session service tests and `SessionUseRotationAndRevocationAreImmediate` | Generic authentication failure |
+| 37 | **Recovery codes are exactly once across nodes** | Only peppered HMAC digests persist; PostgreSQL consumes with `DELETE ... RETURNING` | `RecoveryCodeIsConsumedExactlyOnceAcrossNodes` | One winner; all replays fail uniformly |
+| 38 | **Client identity headers are never trusted** | Gateway strips every incoming `x-openproof-*` header before creating context | `ReplacesClientIdentityAndRemovesCredentialsAndHopByHopHeaders` | Forged value is absent or replaced from the trusted session |
+| 39 | **Trusted upstream context is tamper-evident and fresh** | HMAC binds request and identity fields plus issued-at; verifier uses constant-time compare and a bounded window | `DetectsTamperingAndExpiredContexts` | Authentication failure |
+| 40 | **Ambiguous HTTP framing does not cross the edge** | Duplicate security singletons, CL+TE, controls and non-origin targets are rejected; Beast parser has hard size limits | `RejectsAbsoluteFormControlCharactersAndAmbiguousFraming`, `ParserEnforcesBodyAndHeaderLimits` | HTTP 400/413/431 |
+| 41 | **Non-idempotent requests are never automatically retried** | Retry classifier admits only GET, HEAD and OPTIONS; endpoints are distinct and attempts capped at two | `RetriesOnlyIdempotentRequestsAcrossDistinctEndpoints` | Original upstream failure becomes 503 |
+| 42 | **Audit history is tamper-evident and linearly ordered** | Append, sequence allocation and previous-hash HMAC occur under one atomic repository operation | audit repository tests | Chain verification fails closed |
+| 43 | **Untrusted metric labels cannot cause unbounded memory growth** | Label syntax/size/count validation and a hard series-cardinality ceiling | metric registry and hardening tests | New series is rejected |
+| 44 | **The plaintext listener is never exposed on a network interface by the runnable process** | `validateServerDeployment` accepts only `127.0.0.1` or `::1`; deployment must terminate TLS locally | `ServerDeploymentRequiresGatewayKeyAndLoopbackListener` | Startup fails before bind |
 
 ---
 
@@ -64,8 +75,9 @@ Listed so their weakness is visible rather than implied.
   graph and review. A CI check asserting that `openproof_identity_core` links no
   provider target would make it mechanical. Worth adding when the first concrete
   provider lands in Phase 3.
-- **#6 — gateway never owns identity.** Vacuously true: there is no gateway.
-  Becomes testable in Phase 7.
+- **#6 — gateway never owns identity.** Enforced by dependency direction and the
+  fact that it consumes broker-issued `AuthenticatedSession`; a CI link-graph
+  assertion would make this structural rule mechanically visible.
 - **#8 — private keys never enter the system.** True by inspection: no API
   accepts key material. There is no type-level prohibition, so a future
   signature could violate it silently. A `PrivateKeyMaterial` type that nothing
@@ -83,8 +95,6 @@ the brief but has no subsystem to attach to yet.
 
 | Invariant | Brief | Phase |
 |---|---|---|
-| Client-supplied identity headers are never trusted | §54, §59 | 7 — gateway |
-| The trusted context passed upstream is tamper-evident | §54 | 7 |
 | Proof freshness is policy-controlled; stale evidence is never presented as current | §14, §59 | 4 |
 | Evidence is untrusted until verified; inference is never presented as fact | §61 | 4 |
 | Risk evaluation failure cannot silently become authorization success | §59 | 5 |

@@ -1,12 +1,14 @@
 module;
 
 #include <array>
+#include <climits>
 #include <cstddef>
 #include <span>
 #include <string_view>
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 module openproof.security;
 
@@ -58,6 +60,34 @@ foundation::Result<Sha256Digest> sha256(std::span<const std::byte> data)
 foundation::Result<Sha256Digest> sha256(std::string_view data)
 {
     return sha256(asBytes(data));
+}
+
+foundation::Result<Sha256Digest> hmacSha256(const foundation::SecretString& key,
+                                            std::string_view data)
+{
+    if (key.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "An HMAC key must not be empty.");
+    }
+    if (key.expose().size() > static_cast<std::size_t>(INT_MAX)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The HMAC key is too large.");
+    }
+
+    Sha256Digest digest{};
+    unsigned int digestLength = 0;
+    const auto* const input = reinterpret_cast<const unsigned char*>(data.data());
+    unsigned char* const result = HMAC(
+        EVP_sha256(), key.expose().data(), static_cast<int>(key.expose().size()),
+        data.empty() ? nullptr : input, data.size(),
+        reinterpret_cast<unsigned char*>(digest.data()), &digestLength);
+    if (result == nullptr || digestLength != digest.size()) {
+        return foundation::fail(
+            foundation::ErrorCode::Internal,
+            std::string{foundation::defaultErrorMessage(foundation::ErrorCode::Internal)},
+            "HMAC-SHA-256 computation failed in the cryptographic provider.");
+    }
+    return digest;
 }
 
 bool constantTimeEquals(std::span<const std::byte> left,

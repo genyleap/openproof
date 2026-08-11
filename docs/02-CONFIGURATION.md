@@ -68,7 +68,24 @@ Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`.
 |---|---|---|---|
 | `token_signing_key` | secret reference | unset | Secret |
 
-Optional in Phase 1; required once tokens are issued in Phase 3.
+Required by `opp server`, with a minimum resolved length of 32 bytes. The process
+derives independent session and trusted-context keys using HMAC domain labels;
+the configured master is not used directly as either operational key.
+
+### `[gateway]`
+
+| Key | Type | Default | Class |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Public |
+| `route_prefix` | origin path prefix | `/` | Public |
+| `upstream_host` | hostname or IP | unset | Private |
+| `upstream_port` | integer 1–65535 | unset | Private |
+| `upstream_tls` | boolean | `true` | Private |
+| `upstream_ca_file` | path | system trust store | Private |
+
+When enabled, host and port are mandatory. A CA file is rejected for a plaintext
+upstream. Route prefixes must be canonical segment prefixes: no query, fragment,
+control character, `//` prefix or trailing slash (except `/`).
 
 ---
 
@@ -113,18 +130,28 @@ console = true
 
 [security]
 token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+
+[gateway]
+enabled = true
+route_prefix = "/api"
+upstream_host = "api.internal.example"
+upstream_port = 443
+upstream_tls = true
 ```
 
 ```bash
 export OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
-opp --config openproof.toml
+opp server --config openproof.toml
 ```
 
 ---
 
 ## Startup behaviour and exit codes
 
-`opp` validates configuration before doing anything else and fails closed.
+`opp server` validates configuration before opening a socket and fails closed.
+The built-in listener accepts only loopback addresses because it is plaintext;
+TLS must terminate in a trusted local proxy. Outbound TLS verifies the peer,
+hostname and SNI. SIGINT and SIGTERM stop the listener cleanly.
 
 | Exit code | Meaning |
 |---|---|

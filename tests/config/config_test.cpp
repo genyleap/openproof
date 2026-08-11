@@ -69,6 +69,7 @@ TEST(ConfigTest, AppliesDefaultsWhenNothingIsConfigured)
     EXPECT_EQ(configuration->logging().level(), obs::LogLevel::Info);
     EXPECT_TRUE(configuration->logging().console());
     EXPECT_TRUE(configuration->security().tokenSigningKey().empty());
+    EXPECT_FALSE(configuration->gateway().enabled());
 }
 
 TEST(ConfigTest, ReadsTypedValuesFromToml)
@@ -82,6 +83,68 @@ TEST(ConfigTest, ReadsTypedValuesFromToml)
     EXPECT_EQ(configuration->server().port(), 9443);
     EXPECT_EQ(configuration->logging().level(), obs::LogLevel::Debug);
     EXPECT_FALSE(configuration->logging().console());
+}
+
+TEST(ConfigTest, ReadsAndValidatesGatewayUpstream)
+{
+    const cfg::MapEnvironment environment;
+    const auto configuration = cfg::PlatformConfig::loadFromToml(R"(
+[gateway]
+enabled = true
+route_prefix = "/api"
+upstream_host = "api.internal.example"
+upstream_port = 443
+upstream_tls = true
+upstream_ca_file = "/etc/openproof/ca.pem"
+)", environment);
+    ASSERT_TRUE(configuration.has_value());
+    EXPECT_TRUE(configuration->gateway().enabled());
+    EXPECT_EQ(configuration->gateway().routePrefix(), "/api");
+    EXPECT_EQ(configuration->gateway().upstreamHost(), "api.internal.example");
+    EXPECT_EQ(configuration->gateway().upstreamPort(), 443U);
+    EXPECT_TRUE(configuration->gateway().upstreamTls());
+
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[gateway]\nenabled=true\nroute_prefix=\"//evil\"\n"
+        "upstream_host=\"host\"\nupstream_port=443\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[gateway]\nenabled=true\nupstream_host=\"host/path\"\n"
+        "upstream_port=443\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[gateway]\nenabled=true\nupstream_host=\"host\"\n"
+        "upstream_port=80\nupstream_tls=false\nupstream_ca_file=\"ca.pem\"\n",
+        environment).has_value());
+}
+
+TEST(ConfigTest, ServerDeploymentRequiresGatewayKeyAndLoopbackListener)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", "0123456789abcdef0123456789abcdef");
+    const auto valid = cfg::PlatformConfig::loadFromToml(R"(
+[server]
+bind_address = "127.0.0.1"
+[security]
+token_signing_key = "env:MASTER"
+[gateway]
+enabled = true
+upstream_host = "api.internal"
+upstream_port = 443
+)", environment);
+    ASSERT_TRUE(valid.has_value());
+    EXPECT_TRUE(valid->validateServerDeployment().has_value());
+
+    const auto exposed = cfg::PlatformConfig::loadFromToml(R"(
+[server]
+bind_address = "0.0.0.0"
+[security]
+token_signing_key = "env:MASTER"
+[gateway]
+enabled = true
+upstream_host = "api.internal"
+upstream_port = 443
+)", environment);
+    ASSERT_TRUE(exposed.has_value());
+    EXPECT_FALSE(exposed->validateServerDeployment().has_value());
 }
 
 TEST(ConfigTest, ReadsFromAFile)
@@ -171,6 +234,9 @@ TEST(ConfigTest, RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults)
         "[logging]\nlevel = false\n",
         "[logging]\nconsole = \"false\"\n",
         "[security]\ntoken_signing_key = 123\n",
+        "[gateway]\nenabled = \"yes\"\n",
+        "[gateway]\nupstream_port = \"443\"\n",
+        "[gateway]\nupstream_tls = \"true\"\n",
     };
 
     for (const std::string_view document : malformedTypes) {

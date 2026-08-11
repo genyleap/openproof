@@ -71,7 +71,7 @@ constexpr std::uint16_t kDefaultPort = 8443;
 [[nodiscard]] foundation::Status validateConfigurationSchema(const toml::table& document)
 {
     for (const auto& [key, value] : document) {
-        if (!isAllowedKey(key.str(), {"server", "logging", "security"})) {
+        if (!isAllowedKey(key.str(), {"server", "logging", "security", "gateway"})) {
             return foundation::fail(
                 foundation::ErrorCode::InvalidArgument,
                 "The configuration contains an unknown section.",
@@ -105,6 +105,12 @@ constexpr std::uint16_t kDefaultPort = 8443;
         if (!keys.has_value()) {
             return foundation::fail(keys.error());
         }
+    }
+    if (const toml::table* gateway = document["gateway"].as_table(); gateway != nullptr) {
+        const foundation::Status keys = validateTableKeys(
+            *gateway, "gateway", {"enabled", "route_prefix", "upstream_host",
+                                   "upstream_port", "upstream_tls", "upstream_ca_file"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
     }
 
     const auto requireType = [&document](std::string_view section, std::string_view key,
@@ -146,6 +152,22 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (!signingKey.has_value()) {
         return foundation::fail(signingKey.error());
     }
+    for (const std::string_view key : {
+             "route_prefix", "upstream_host", "upstream_ca_file"}) {
+        const foundation::Status type = requireType(
+            "gateway", key,
+            [](const auto& node) { return node.is_string(); }, "a string");
+        if (!type.has_value()) return foundation::fail(type.error());
+    }
+    const foundation::Status gatewayEnabled = requireType(
+        "gateway", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!gatewayEnabled.has_value()) return foundation::fail(gatewayEnabled.error());
+    const foundation::Status upstreamPort = requireType(
+        "gateway", "upstream_port", [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!upstreamPort.has_value()) return foundation::fail(upstreamPort.error());
+    const foundation::Status upstreamTls = requireType(
+        "gateway", "upstream_tls", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!upstreamTls.has_value()) return foundation::fail(upstreamTls.error());
 
     return foundation::ok();
 }
@@ -344,10 +366,56 @@ const foundation::SecretString& SecurityConfig::tokenSigningKey() const noexcept
     return m_tokenSigningKey;
 }
 
-PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security)
+GatewayConfig::GatewayConfig(bool enabled, std::string routePrefix,
+                             std::string upstreamHost, std::uint16_t upstreamPort,
+                             bool upstreamTls, std::string upstreamCaFile)
+    : m_enabled(enabled), m_routePrefix(std::move(routePrefix)),
+      m_upstreamHost(std::move(upstreamHost)), m_upstreamPort(upstreamPort),
+      m_upstreamTls(upstreamTls), m_upstreamCaFile(std::move(upstreamCaFile)) {}
+
+foundation::Result<GatewayConfig> GatewayConfig::create(
+    bool enabled, std::string routePrefix, std::string upstreamHost,
+    std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile)
+{
+    const auto invalidText = [](std::string_view text) {
+        return std::ranges::any_of(text, [](char value) {
+            const auto byte = static_cast<unsigned char>(value);
+            return byte < 0x21U || byte == 0x7FU;
+        });
+    };
+    if (routePrefix.empty()) routePrefix = "/";
+    if (!routePrefix.starts_with('/') || routePrefix.starts_with("//")
+        || routePrefix.contains('?') || routePrefix.contains('#')
+        || invalidText(routePrefix) || (routePrefix.size() > 1U && routePrefix.ends_with('/'))) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The gateway route prefix is invalid.");
+    }
+    if (enabled && (upstreamHost.empty() || upstreamPort == 0U || invalidText(upstreamHost)
+                    || upstreamHost.contains('/') || upstreamHost.contains('\\'))) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The gateway upstream is invalid.");
+    }
+    if (!upstreamTls && !upstreamCaFile.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A CA file is only valid for a TLS upstream.");
+    }
+    return GatewayConfig{enabled, std::move(routePrefix), std::move(upstreamHost),
+                         upstreamPort, upstreamTls, std::move(upstreamCaFile)};
+}
+
+bool GatewayConfig::enabled() const noexcept { return m_enabled; }
+std::string_view GatewayConfig::routePrefix() const noexcept { return m_routePrefix; }
+std::string_view GatewayConfig::upstreamHost() const noexcept { return m_upstreamHost; }
+std::uint16_t GatewayConfig::upstreamPort() const noexcept { return m_upstreamPort; }
+bool GatewayConfig::upstreamTls() const noexcept { return m_upstreamTls; }
+std::string_view GatewayConfig::upstreamCaFile() const noexcept { return m_upstreamCaFile; }
+
+PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging,
+                               SecurityConfig security, GatewayConfig gateway)
     : m_server(std::move(server))
     , m_logging(logging)
     , m_security(std::move(security))
+    , m_gateway(std::move(gateway))
 {
 }
 
@@ -455,8 +523,27 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         security = SecurityConfig{std::move(resolved).value()};
     }
 
+    const bool gatewayEnabled = document["gateway"]["enabled"].value_or(false);
+    std::uint16_t upstreamPortValue = 0U;
+    if (const auto configured = document["gateway"]["upstream_port"].value<std::int64_t>();
+        configured.has_value()) {
+        if (*configured < 1 || *configured > 65535) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The gateway upstream port is invalid.");
+        }
+        upstreamPortValue = static_cast<std::uint16_t>(*configured);
+    }
+    auto gateway = GatewayConfig::create(
+        gatewayEnabled,
+        document["gateway"]["route_prefix"].value_or(std::string{"/"}),
+        document["gateway"]["upstream_host"].value_or(std::string{}),
+        upstreamPortValue,
+        document["gateway"]["upstream_tls"].value_or(true),
+        document["gateway"]["upstream_ca_file"].value_or(std::string{}));
+    if (!gateway.has_value()) return foundation::fail(gateway.error());
+
     return PlatformConfig{std::move(server).value(), LoggingConfig{level, console},
-                          std::move(security)};
+                          std::move(security), std::move(gateway).value()};
 }
 
 foundation::Result<PlatformConfig> PlatformConfig::loadFromFile(const std::filesystem::path& path,
@@ -488,6 +575,28 @@ const LoggingConfig& PlatformConfig::logging() const noexcept
 const SecurityConfig& PlatformConfig::security() const noexcept
 {
     return m_security;
+}
+
+const GatewayConfig& PlatformConfig::gateway() const noexcept { return m_gateway; }
+
+foundation::Status PlatformConfig::validateServerDeployment() const
+{
+    if (!m_gateway.enabled()) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The gateway is disabled. Set gateway.enabled=true to run the server.");
+    }
+    if (m_security.tokenSigningKey().expose().size() < 32U) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "A master signing key of at least 32 bytes is required by the server.");
+    }
+    if (m_server.bindAddress() != "127.0.0.1" && m_server.bindAddress() != "::1") {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The built-in listener is plaintext and may only bind to loopback; terminate TLS in a local trusted proxy.");
+    }
+    return foundation::ok();
 }
 
 }

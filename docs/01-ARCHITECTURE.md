@@ -1,6 +1,6 @@
 # OpenProof Protocol — Architecture
 
-Status: **Phases 1–2 implemented and verified. Phase 3 authentication orchestration in progress.**
+Status: **Authentication, gateway, critical PostgreSQL stores and observability implemented and verified.**
 
 This document describes the architecture that exists in the repository today and
 the shape the later phases are built to fit. Anything not yet implemented is
@@ -18,6 +18,11 @@ graph TD
     opp["apps/opp<br/>composition root"]
 
     auth["openproof.authentication<br/>trusted authentication broker"]
+    sess["openproof.session<br/>opaque sessions"]
+    cred["openproof.credentials<br/>password, TOTP, recovery"]
+    gw["openproof.gateway.http<br/>bounded edge and proxy"]
+    pg["openproof.storage.postgres<br/>durable atomic stores"]
+    audit["openproof.audit / telemetry"]
     idp["openproof.identity.provider<br/>authentication SPI"]
     core["openproof.identity.core<br/>canonical identity"]
     org["openproof.organization<br/>tenants and memberships"]
@@ -28,6 +33,7 @@ graph TD
     fnd["openproof.foundation<br/>errors, ids, time, secrets, encodings"]
 
     opp --> auth
+    opp --> gw
     opp --> config
     opp --> obs
     opp --> fnd
@@ -40,6 +46,10 @@ graph TD
     auth --> core
     auth --> idp
     auth --> security
+    gw --> sess
+    gw --> policy
+    pg --> sess
+    pg --> cred
     idp --> security
     idp --> fnd
     config --> obs
@@ -64,10 +74,33 @@ every other layer may assume.
 | `openproof.identity.core` | `:identity` `:link` `:repository` `:merge` | Canonical identity and explicit association lifecycle |
 | `openproof.organization` / `.membership` | organization, membership, repository | Tenant and organization-scoped role lifecycle |
 | `openproof.policy` | `:decision` | Sealed authorization request and fail-closed decision contract |
+| `openproof.session` | model, repository, service | Opaque sessions, absolute/idle expiry, rotation and revocation |
+| `openproof.credentials` | — | Pepper+scrypt passwords, RFC 6238 TOTP, recovery codes |
+| `openproof.provider.local` | — | Concrete password and password+TOTP provider |
+| `openproof.gateway` / `.http` | — | Routing, enforcement, throttling, discovery, load balancing, circuits and Beast transport |
+| `openproof.storage.postgres` | — | Bounded pool, checksummed migrations, session/transaction/recovery stores |
+| `openproof.audit` / `.telemetry` | — | HMAC audit chain, security events, bounded metrics and trace context |
 
-33 module interface units (`.cppm`), 23 implementation units (`.cpp`).
+44 module interface units (`.cppm`), 33 implementation units (`.cpp`).
 Zero `.h` / `.hpp` files. Zero uses of `import std;` (unavailable — see
 [03-CXX26.md](03-CXX26.md) §5).
+
+### Gateway request path
+
+The edge parses HTTP with explicit header/body limits and deadlines, rejects
+ambiguous framing and absolute-form targets, strips hop-by-hop and every incoming
+`x-openproof-*` header, authenticates an opaque session for protected routes,
+and fails closed on any non-Allow policy result. It rate-limits both source IP
+and authenticated identity, resolves endpoints, selects by weighted round robin,
+and retries only idempotent methods on at most two distinct endpoints.
+
+Before proxying it emits a short-lived HMAC-SHA256 context binding method,
+target, correlation id, tenant, identity, provider and assurance. Upstreams can
+verify it through `TrustedContextSigner`; changing any field or exceeding the
+freshness window fails authentication. Outbound TLS verifies trust roots,
+hostname and SNI. The runnable process restricts its plaintext incoming listener
+to loopback so transport encryption cannot be accidentally omitted on a network
+interface.
 
 ### Why partitions in some places and dotted modules in others
 
@@ -310,15 +343,15 @@ Named explicitly so that no reader infers more than exists.
 
 | Area | State |
 |---|---|
-| Identity core, explicit linking and merge, organizations and memberships | Implemented; in-memory repositories only |
-| Any concrete authentication provider (OIDC, OAuth2, WebAuthn, wallet, ENS, Farcaster) | Phase 3 — not started. The SPI exists; no provider does. |
-| Authentication broker | Implemented; sessions, credentials, MFA and recovery are not |
+| Identity core, explicit linking and merge, organizations and memberships | Implemented; PostgreSQL adapters for these aggregates remain pending |
+| Authentication providers | Local password and password+TOTP implemented; OIDC, WebAuthn, wallet, social and enterprise providers pending |
+| Authentication broker, sessions and credentials | Implemented; durable sessions/transactions/recovery codes, in-memory local credential directory |
 | Policy engine, RBAC, ABAC, trusted entitlement adapter | Decision contract present; evaluation engines not started |
-| the OpenProof gateway: HTTP server, routing, proxy, rate limiting, circuit breaker, discovery | Phase 7 — not started. **`opp` starts no network listener.** |
-| Metrics, tracing, audit events, security events | Phase 9 — `:log` only |
-| PostgreSQL adapter, migrations, cache adapter | Phase 8 — repository SPI and in-memory adapter only |
+| OpenProof gateway | HTTP/1.1 edge, routing, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
+| Metrics, tracing, audit events, security events | Core adapters implemented; production exporters and durable audit repository pending |
+| PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migration, session/transaction/recovery adapters implemented; other aggregates and cache pending |
 | `opp` administrative CLI | Not started. Not stubbed: an executable that does nothing would be a claim of progress rather than progress. |
-| Threat model, load tests, fuzzing | Phase 12 — not started |
+| Threat model, load tests, fuzzing | Baseline implemented; sustained distributed load and protocol-specific fuzz targets remain ongoing work |
 | HTTP/3 | Architected for behind a transport abstraction; **not implemented and not claimed** |
 
 ---

@@ -40,9 +40,32 @@ option(OPENPROOF_BUILD_TESTS "Build the OpenProof test suites" ON)
 # External dependencies. SEC-006 requires a concrete reason for each.
 #   OpenSSL        cryptographic primitives; the project never implements them.
 #   tomlplusplus   typed configuration parsing (brief section 42).
+#   Boost.Beast    bounded HTTP/1.1 listener and reverse-proxy transport.
 #   GTest          unit, integration and security test suites.
 find_package(OpenSSL 3.0 REQUIRED)
 find_package(tomlplusplus REQUIRED)
+find_package(Boost 1.88 REQUIRED)
+find_program(OPENPROOF_PG_CONFIG NAMES pg_config REQUIRED)
+execute_process(COMMAND "${OPENPROOF_PG_CONFIG}" --includedir
+    OUTPUT_VARIABLE OPENPROOF_LIBPQ_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${OPENPROOF_PG_CONFIG}" --libdir
+    OUTPUT_VARIABLE OPENPROOF_LIBPQ_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${OPENPROOF_PG_CONFIG}" --version
+    OUTPUT_VARIABLE OPENPROOF_LIBPQ_VERSION_TEXT OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+string(REGEX MATCH "[0-9]+(\\.[0-9]+)+" OPENPROOF_LIBPQ_VERSION
+    "${OPENPROOF_LIBPQ_VERSION_TEXT}")
+if(OPENPROOF_LIBPQ_VERSION VERSION_LESS 15)
+    message(FATAL_ERROR "OpenProof requires libpq >= 15; pg_config reported '${OPENPROOF_LIBPQ_VERSION_TEXT}'.")
+endif()
+find_library(OPENPROOF_LIBPQ_LIBRARY NAMES pq HINTS "${OPENPROOF_LIBPQ_LIBDIR}" REQUIRED)
+add_library(openproof_libpq UNKNOWN IMPORTED)
+set_target_properties(openproof_libpq PROPERTIES
+    IMPORTED_LOCATION "${OPENPROOF_LIBPQ_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${OPENPROOF_LIBPQ_INCLUDEDIR}")
+add_library(OpenProof::libpq ALIAS openproof_libpq)
 
 add_subdirectory(src)
 add_subdirectory(apps)

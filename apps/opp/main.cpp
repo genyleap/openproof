@@ -5,12 +5,12 @@
 // registry and wires the layers together. Every other unit receives what it
 // needs and never reaches for a global.
 //
-// Current development scope: the process starts, validates its configuration,
-// composes the trusted authentication boundary, emits structured startup state,
-// and exits cleanly. There is no listener yet, and none is pretended.
+// The `server` subcommand composes and runs the bounded HTTP reverse gateway.
 
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <version>
@@ -33,20 +34,26 @@
 #endif
 
 import openproof.config;
-import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
-import openproof.identity.provider;
 import openproof.observability;
+import openproof.gateway;
+import openproof.gateway.http;
+import openproof.policy;
+import openproof.security;
+import openproof.session;
 
 namespace {
 
 namespace fnd = openproof::foundation;
 namespace cfg = openproof::config;
-namespace auth = openproof::authentication;
 namespace obs = openproof::observability;
 namespace identity = openproof::identity::core;
-namespace idp = openproof::identity::provider;
+namespace gateway = openproof::gateway;
+namespace gatewayHttp = openproof::gateway::http;
+namespace policy = openproof::policy;
+namespace security = openproof::security;
+namespace session = openproof::session;
 
 // OPENPROOF_VERSION is injected by the build system, which is the only thing that
 // knows it. It is bound to a real constant here so that no other code depends
@@ -91,6 +98,8 @@ enum class ExitCode : int {
     InternalError = 70,
 };
 
+void reportStartupFailure(const fnd::Error& failure);
+
 [[nodiscard]] int toInt(ExitCode code) noexcept
 {
     return static_cast<int>(code);
@@ -116,6 +125,8 @@ public:
         return m_printDefaultConfig;
     }
 
+    [[nodiscard]] bool runServer() const noexcept { return m_runServer; }
+
     [[nodiscard]] const std::optional<std::filesystem::path>& configPath() const noexcept
     {
         return m_configPath;
@@ -125,6 +136,7 @@ private:
     bool m_showHelp{false};
     bool m_showVersion{false};
     bool m_printDefaultConfig{false};
+    bool m_runServer{false};
     std::optional<std::filesystem::path> m_configPath;
 };
 
@@ -135,7 +147,13 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
     for (std::size_t index = 0; index < arguments.size(); ++index) {
         const std::string_view argument = arguments[index];
 
-        if (argument == "--help" || argument == "-h") {
+        if (argument == "server") {
+            if (parsed.m_runServer) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'server' subcommand was specified more than once.");
+            }
+            parsed.m_runServer = true;
+        } else if (argument == "--help" || argument == "-h") {
             parsed.m_showHelp = true;
         } else if (argument == "--version" || argument == "-V") {
             parsed.m_showVersion = true;
@@ -162,7 +180,8 @@ void printUsage()
     std::println("{} {} - OpenProof Protocol server", kProgramName, kVersion);
     std::println("");
     std::println("Usage:");
-    std::println("  {} [options]", kProgramName);
+    std::println("  {} server [options]", kProgramName);
+    std::println("  {} [--help | --version | --print-default-config]", kProgramName);
     std::println("");
     std::println("Options:");
     std::println("  -c, --config <path>  Load configuration from a TOML file.");
@@ -177,6 +196,144 @@ void printUsage()
     std::println("Environment overrides:");
     std::println("  OPENPROOF_SERVER_BIND_ADDRESS, OPENPROOF_SERVER_PORT,");
     std::println("  OPENPROOF_LOGGING_LEVEL, OPENPROOF_LOGGING_CONSOLE");
+}
+
+volatile std::sig_atomic_t g_shutdownRequested = 0;
+
+extern "C" void requestShutdown(int) noexcept
+{
+    g_shutdownRequested = 1;
+}
+
+class DenyAccess final : public gateway::AccessController {
+public:
+    [[nodiscard]] policy::AuthorizationDecision authorize(
+        const session::AuthenticatedSession&, const gateway::Route&) override
+    {
+        return policy::AuthorizationDecision::deny(
+            "No protected-route policy is configured in this process.");
+    }
+};
+
+[[nodiscard]] fnd::Status addPublicRoutes(gateway::Router& router,
+                                          std::string_view prefix)
+{
+    constexpr gateway::HttpMethod methods[] = {
+        gateway::HttpMethod::Get, gateway::HttpMethod::Head,
+        gateway::HttpMethod::Post, gateway::HttpMethod::Put,
+        gateway::HttpMethod::Patch, gateway::HttpMethod::Delete,
+        gateway::HttpMethod::Options};
+    for (const gateway::HttpMethod method : methods) {
+        auto route = gateway::Route::create(
+            gateway::RouteId{std::string{"default-"} +
+                std::string{gateway::httpMethodName(method)}},
+            method, std::string{prefix}, gateway::ServiceId{"default"}, false,
+            identity::OrganizationId{}, policy::Action{}, policy::Resource{});
+        if (!route.has_value()) return fnd::fail(route.error());
+        const fnd::Status added = router.add(std::move(route).value());
+        if (!added.has_value()) return fnd::fail(added.error());
+    }
+    return fnd::ok();
+}
+
+[[nodiscard]] ExitCode runGatewayServer(const cfg::PlatformConfig& platform,
+                                        const fnd::ClockSource& clock,
+                                        const obs::Logger& logger)
+{
+    const fnd::Status deployment = platform.validateServerDeployment();
+    if (!deployment.has_value()) {
+        reportStartupFailure(deployment.error());
+        return ExitCode::ConfigurationError;
+    }
+
+    auto sessionDigest = security::hmacSha256(
+        platform.security().tokenSigningKey(), "openproof/session-key/v1");
+    auto contextDigest = security::hmacSha256(
+        platform.security().tokenSigningKey(), "openproof/trusted-context-key/v1");
+    if (!sessionDigest.has_value() || !contextDigest.has_value()) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auto sessionKey = session::SessionKey::create(
+        fnd::SecretString{fnd::toHex(sessionDigest.value())});
+    auto contextKey = gateway::TrustedContextKey::create(
+        fnd::SecretString{fnd::toHex(contextDigest.value())});
+    if (!sessionKey.has_value() || !contextKey.has_value()) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+
+    session::InMemorySessionRepository sessionRepository;
+    session::SessionService sessions{
+        sessionRepository, clock, std::move(sessionKey).value(),
+        session::SessionPolicy::create(std::chrono::hours{8},
+                                       std::chrono::minutes{30}).value()};
+    auto limiter = gateway::TokenBucketRateLimiter::create(
+        clock, 1'000.0, 100.0, 100'000U);
+    auto circuits = gateway::CircuitBreaker::create(
+        clock, 5U, std::chrono::seconds{30});
+    auto signer = gateway::TrustedContextSigner::create(
+        clock, std::move(contextKey).value(), std::chrono::seconds{30});
+    auto proxy = gatewayHttp::BeastProxyTransport::create(
+        gatewayHttp::ProxyConfig::create(
+            64U * 1024U, 64U * 1024U * 1024U,
+            std::string{platform.gateway().upstreamCaFile()}).value());
+    if (!limiter || !circuits || !signer || !proxy) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
+        return ExitCode::ConfigurationError;
+    }
+
+    gateway::Router router;
+    const fnd::Status routes = addPublicRoutes(router, platform.gateway().routePrefix());
+    gateway::StaticServiceDiscovery discovery;
+    auto endpoint = gateway::Endpoint::create(
+        gateway::EndpointId{"default-1"},
+        std::string{platform.gateway().upstreamHost()},
+        platform.gateway().upstreamPort(), platform.gateway().upstreamTls(), 1U);
+    if (!routes || !endpoint || !discovery.set(
+            gateway::ServiceId{"default"},
+            std::vector<gateway::Endpoint>{std::move(endpoint).value()})) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
+        return ExitCode::ConfigurationError;
+    }
+    gateway::WeightedRoundRobin loadBalancer;
+    DenyAccess access;
+    gateway::Gateway gatewayCore{
+        router, sessions, access, limiter.value(), discovery, loadBalancer,
+        circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+
+    const unsigned int detected = std::thread::hardware_concurrency();
+    const std::size_t workers = std::clamp<std::size_t>(
+        detected == 0U ? 2U : static_cast<std::size_t>(detected), 2U, 32U);
+    auto serverConfig = gatewayHttp::ServerConfig::create(
+        std::string{platform.server().bindAddress()}, platform.server().port(),
+        64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
+        std::chrono::seconds{15}, 4'096U, workers);
+    if (!serverConfig) {
+        reportStartupFailure(serverConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    gatewayHttp::BeastHttpServer server{gatewayCore, std::move(serverConfig).value()};
+    const fnd::Status started = server.start();
+    if (!started) {
+        reportStartupFailure(started.error());
+        return ExitCode::InternalError;
+    }
+    const std::vector<obs::LogField> listenerFields{
+        obs::LogField::integer("bound_port", static_cast<std::int64_t>(server.boundPort())),
+        obs::LogField::text("upstream_host", std::string{platform.gateway().upstreamHost()}),
+        obs::LogField::boolean("upstream_tls", platform.gateway().upstreamTls())};
+    logger.info("openproof gateway listener started", listenerFields);
+
+    g_shutdownRequested = 0;
+    std::signal(SIGINT, requestShutdown);
+    std::signal(SIGTERM, requestShutdown);
+    while (g_shutdownRequested == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    server.stop();
+    logger.info("openproof gateway listener stopped");
+    return ExitCode::Success;
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
@@ -260,6 +417,10 @@ void reportStartupFailure(const fnd::Error& failure)
             return ExitCode::Success;
         }
     }
+    if (!commandLine->runServer()) {
+        printUsage();
+        return ExitCode::UsageError;
+    }
 
     const cfg::SystemEnvironment environment;
     fnd::Result<cfg::PlatformConfig> configuration =
@@ -277,25 +438,11 @@ void reportStartupFailure(const fnd::Error& failure)
     const auto clock = std::make_shared<const fnd::SystemClockSource>();
     const obs::Logger logger{makeSink(platform.logging()), clock, platform.logging().level()};
 
-    // The provider registry starts empty by design. The SPI and trusted broker
-    // exist, but no concrete provider exists yet, and none is fabricated.
-    idp::ProviderRegistry providers;
-    idp::InMemoryAuthenticationTransactionStore authenticationTransactions;
-    identity::InMemoryExternalIdentityDirectory externalIdentities;
-    auth::ProviderTrustPolicy providerTrust;
-    const auth::AuthenticationService authentication{
-        providers, authenticationTransactions, externalIdentities, *clock,
-        std::move(providerTrust),
-        std::chrono::minutes{5}};
-    static_cast<void>(authentication);
-
     std::vector<obs::LogField> startupFields{
         obs::LogField::text("version", std::string{kVersion}),
         obs::LogField::text("bind_address", std::string{platform.server().bindAddress()}),
         obs::LogField::integer("port", static_cast<std::int64_t>(platform.server().port())),
         obs::LogField::text("log_level", std::string{obs::logLevelName(platform.logging().level())}),
-        obs::LogField::integer("registered_providers",
-                               static_cast<std::int64_t>(providers.size())),
         obs::LogField::boolean("token_signing_key_configured",
                                !platform.security().tokenSigningKey().empty()),
         // Contracts are always compiled in; the operator still needs to know
@@ -309,12 +456,7 @@ void reportStartupFailure(const fnd::Error& failure)
 
     logger.info("openproof server starting", startupFields);
 
-    // Note what is deliberately absent, so a reader of the logs is never left to
-    // infer that a listener failed to start.
-    logger.info("development scope: authentication broker composed; no network listener is started");
-
-    logger.info("openproof server stopped");
-    return ExitCode::Success;
+    return runGatewayServer(platform, *clock, logger);
 }
 
 }

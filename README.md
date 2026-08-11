@@ -11,20 +11,20 @@ It is vendor-neutral. Nothing in the protocol core names a particular company,
 cloud, database, blockchain, social network or identity provider — those exist
 only as providers behind extension interfaces.
 
-> ### Status: early. Phases 0–2 complete; authentication orchestration from Phase 3 is in progress.
+> ### Status: authentication and gateway milestone implemented and verified.
 >
 > Implemented and tested: the foundation, the identity core (canonical identity,
 > explicit linking, explicit merge, organization-scoped repositories), the
-> authentication SPI with single-use transactions, multi-tenancy (organizations,
-> memberships, role assignment), a trusted authentication broker with independent
-> provider assurance caps, sealed authorization contexts, and the authorization
-> decision model. Configuration is schema-checked and rejects unknown or mistyped
-> security settings.
+> authentication SPI and local password+TOTP provider, opaque server-side sessions,
+> recovery codes, multi-tenancy, trusted authentication/authorization handoff,
+> bounded HTTP reverse proxy, signed upstream identity context, rate limiting,
+> discovery, weighted load balancing, circuit breaking, PostgreSQL migrations and
+> durable single-use stores, audit chaining, metrics and tracing.
 >
-> **There is no network listener, no authentication provider, no proof or
-> evidence subsystem, no trust or risk engine, no gateway and no database.**
-> `opp` starts, validates configuration, emits a structured startup record and
-> exits.
+> Proof/evidence, trust/risk, generic OIDC/WebAuthn and the administrative API are
+> still future phases. `opp server` is deliberately a public-route, single-upstream
+> deployment mode; protected-route composition remains an embedding API until the
+> administrative/policy bootstrap exists.
 >
 > See [docs/00-AUDIT.md](docs/00-AUDIT.md) §14 for the phase plan and exactly
 > what is and is not built. Nothing here is stubbed to look finished.
@@ -67,6 +67,8 @@ logs. The protocol does not require its maintainers to hold anyone's data.
 | OpenSSL | ≥ 3.0 | 3.6.3 |
 | tomlplusplus | 3.x | 3.4.0 |
 | GoogleTest | 1.x | 1.17.0 (built from source) |
+| Boost | ≥ 1.88 | 1.90.0 |
+| PostgreSQL client | ≥ 15 | 18.4 |
 
 GCC 16 is required, not preferred: OpenProof uses C++26 contracts (P2900)
 through standard syntax, and no other released compiler implements them. Clang
@@ -75,7 +77,7 @@ feature matrix, including two GCC defects worked around, is in
 [docs/03-CXX26.md](docs/03-CXX26.md).
 
 ```bash
-brew install gcc cmake ninja openssl@3 tomlplusplus
+brew install gcc cmake ninja openssl@3 tomlplusplus boost postgresql@18
 ```
 
 ## Build
@@ -93,7 +95,8 @@ ctest --preset gcc-debug
 ```
 
 Presets: `gcc-debug`, `gcc-release`, and `gcc-observe` (contracts report instead
-of terminating — for staged rollout, not production).
+of terminating — for staged rollout, not production), plus `gcc-asan` for
+AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### CLion
 
@@ -121,6 +124,15 @@ field at `g++-16` is detected at configure time with the correct driver named.
 ./cmake-build-gcc-debug/apps/opp/opp --print-default-config
 ```
 
+```bash
+OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)" \
+  ./cmake-build-gcc-debug/apps/opp/opp server --config openproof.toml
+```
+
+The built-in incoming listener is intentionally plaintext and refuses any
+non-loopback bind. Terminate TLS in a trusted local reverse proxy/sidecar. TLS to
+the upstream is verified by default, including SNI and hostname verification.
+
 Configuration reference: [docs/02-CONFIGURATION.md](docs/02-CONFIGURATION.md).
 
 ---
@@ -143,21 +155,29 @@ src/
   identity/core/       openproof.identity.core      Identity, linking, merge, repositories
   identity/provider/   openproof.identity.provider  authentication SPI, transactions, assurance
   authentication/      openproof.authentication     trusted orchestration, provider trust caps
+  session/             openproof.session            opaque sessions, rotation and revocation
+  credentials/         openproof.credentials        scrypt passwords, TOTP and recovery codes
+  providers/local/     openproof.provider.local      password and password+TOTP provider
+  gateway/             openproof.gateway[.http]      routing, enforcement and reverse proxy
+  storage/postgres/    openproof.storage.postgres    pool, migration and durable atomic stores
+  audit/               openproof.audit               HMAC-chained audit/security events
+  telemetry/           openproof.telemetry           bounded metrics and W3C trace context
   policy/              openproof.policy             authorization decision model
   organization/        openproof.organization       tenants, memberships, role assignment
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 225 tests
+tests/                 283 discovered tests
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties
   02-CONFIGURATION.md      configuration reference
   03-CXX26.md              measured C++26 feature baseline
   SECURITY_INVARIANTS.md   invariants with enforcement, proof and failure mode
+  THREAT_MODEL.md          assets, trust boundaries, threats and residual risks
 ```
 
 ## Security invariants
 
-Thirty-four invariants are recorded in
+Forty-four invariants are recorded in
 [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md), each naming what must
 be true, the mechanism that enforces it, the test that proves it, and what
 happens on failure. Invariants that are true but not yet *mechanically* enforced

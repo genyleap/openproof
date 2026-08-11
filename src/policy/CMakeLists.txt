@@ -10,4 +10,5 @@ openproof_add_module(openproof_policy
         openproof_identity_core
         openproof_identity_provider
         openproof_organization
+        openproof_session
 )

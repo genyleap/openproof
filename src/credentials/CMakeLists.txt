@@ -1,0 +1,12 @@
+openproof_add_module(openproof_credentials
+    MODULES
+        credentials.cppm
+    SOURCES
+        credentials.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_identity_core
+    LINK_PRIVATE
+        OpenSSL::Crypto
+)

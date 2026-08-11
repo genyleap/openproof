@@ -13,6 +13,9 @@ include_guard(GLOBAL)
 add_library(openproof_compile_options INTERFACE)
 add_library(openproof::compile_options ALIAS openproof_compile_options)
 
+option(OPENPROOF_ENABLE_SANITIZERS
+    "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(openproof_compile_options INTERFACE
         -Wall
@@ -44,6 +47,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_definitions(openproof_compile_options INTERFACE
         $<$<NOT:$<CONFIG:Debug>>:_FORTIFY_SOURCE=2>
     )
+endif()
+
+if(OPENPROOF_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "OPENPROOF_ENABLE_SANITIZERS is verified only with the required GNU toolchain.")
+    endif()
+    target_compile_options(openproof_compile_options INTERFACE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer)
+    target_link_options(openproof_compile_options INTERFACE
+        -fsanitize=address,undefined)
 endif()
 
 # C++26 contracts (P2900).

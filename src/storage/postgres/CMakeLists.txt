@@ -1,0 +1,15 @@
+openproof_add_module(openproof_storage_postgres
+    MODULES
+        postgres.cppm
+    SOURCES
+        postgres.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_identity_core
+        openproof_identity_provider
+        openproof_session
+        openproof_credentials
+    LINK_PRIVATE
+        OpenProof::libpq
+)

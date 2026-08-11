@@ -54,6 +54,15 @@
         "OPENPROOF_CONTRACT_SEMANTIC": "observe",
         "OPENPROOF_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "gcc-asan",
+      "displayName": "GCC 16 Debug (ASan + UBSan)",
+      "description": "Hardening build with address and undefined-behavior sanitizers.",
+      "inherits": "gcc-debug",
+      "cacheVariables": {
+        "OPENPROOF_ENABLE_SANITIZERS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -71,6 +80,11 @@
       "name": "gcc-observe",
       "displayName": "GCC 16 Debug (contracts: observe)",
       "configurePreset": "gcc-observe"
+    },
+    {
+      "name": "gcc-asan",
+      "displayName": "GCC 16 Debug (ASan + UBSan)",
+      "configurePreset": "gcc-asan"
     }
   ],
   "testPresets": [
@@ -94,6 +108,14 @@
       "name": "gcc-observe",
       "displayName": "GCC 16 Debug (contracts: observe)",
       "configurePreset": "gcc-observe",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gcc-asan",
+      "displayName": "GCC 16 Debug (ASan + UBSan)",
+      "configurePreset": "gcc-asan",
       "output": {
         "outputOnFailure": true
       }

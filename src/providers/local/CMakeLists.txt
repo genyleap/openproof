@@ -1,0 +1,11 @@
+openproof_add_module(openproof_provider_local
+    MODULES
+        local.cppm
+    SOURCES
+        local.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_credentials
+        openproof_identity_provider
+)

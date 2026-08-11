@@ -74,6 +74,25 @@ TEST(HashTest, Sha256MatchesKnownVectors)
               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
 
+TEST(HashTest, HmacSha256MatchesKnownVector)
+{
+    const fnd::SecretString key{"key"};
+    const auto digest = sec::hmacSha256(key, "The quick brown fox jumps over the lazy dog");
+
+    ASSERT_TRUE(digest.has_value());
+    EXPECT_EQ(fnd::toHex(*digest),
+              "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+}
+
+TEST(HashTest, HmacSha256RejectsAnEmptyKey)
+{
+    const fnd::SecretString key;
+    const auto digest = sec::hmacSha256(key, "data");
+
+    ASSERT_FALSE(digest.has_value());
+    EXPECT_EQ(digest.error().code(), fnd::ErrorCode::InvalidArgument);
+}
+
 TEST(HashTest, Sha256IsDeterministicAndSizeCorrect)
 {
     const auto first = sec::sha256(std::string_view{"openproof protocol"});
