@@ -215,8 +215,11 @@ foundation::Result<HttpRequest> HttpRequest::create(
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                     "The HTTP request contains an ambiguous header.");
         }
-        if (normalized.contains(name)) normalized[name].append(",").append(value);
-        else normalized.emplace(std::move(name), std::move(value));
+        if (normalized.contains(name)) {
+            normalized[name].append(name == "cookie" ? "; " : ",").append(value);
+        } else {
+            normalized.emplace(std::move(name), std::move(value));
+        }
     }
     if (normalized.contains("content-length") && normalized.contains("transfer-encoding")) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -281,6 +284,86 @@ void HttpResponse::eraseHeader(std::string_view name)
     std::erase_if(m_repeatedHeaders, [&normalized](const auto& header) {
         return header.first == normalized;
     });
+}
+
+foundation::Result<std::optional<foundation::SecretString>>
+takeSessionCredential(HttpRequest& request)
+{
+    std::optional<std::string> bearer;
+    if (const auto authorization = request.header("authorization"); authorization.has_value()) {
+        constexpr std::string_view prefix{"Bearer "};
+        if (!authorization->starts_with(prefix) || authorization->size() <= prefix.size()
+            || authorization->substr(prefix.size()).contains(' ')
+            || authorization->substr(prefix.size()).contains('\t')) {
+            request.eraseHeader("authorization");
+            return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
+                                    "Authentication is required.");
+        }
+        bearer = std::string{authorization->substr(prefix.size())};
+        request.eraseHeader("authorization");
+    }
+
+    std::optional<std::string> cookieToken;
+    if (const auto cookie = request.header("cookie"); cookie.has_value()) {
+        std::vector<std::string> retained;
+        std::size_t begin = 0U;
+        while (begin <= cookie->size()) {
+            const std::size_t end = cookie->find(';', begin);
+            std::string_view item = cookie->substr(
+                begin, end == std::string_view::npos ? cookie->size() - begin : end - begin);
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) {
+                item.remove_prefix(1U);
+            }
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) {
+                item.remove_suffix(1U);
+            }
+            const std::size_t equals = item.find('=');
+            if (equals != std::string_view::npos
+                && item.substr(0U, equals) == "openproof_session") {
+                const std::string_view value = item.substr(equals + 1U);
+                const bool valid = !value.empty() && value.size() <= 128U
+                    && std::ranges::all_of(value, [](char symbol) {
+                           return (symbol >= 'A' && symbol <= 'Z')
+                               || (symbol >= 'a' && symbol <= 'z')
+                               || (symbol >= '0' && symbol <= '9')
+                               || symbol == '-' || symbol == '_';
+                       });
+                if (!valid || cookieToken.has_value()) {
+                    request.eraseHeader("cookie");
+                    return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
+                                            "Authentication is required.");
+                }
+                cookieToken = std::string{value};
+            } else if (!item.empty()) {
+                retained.emplace_back(item);
+            }
+            if (end == std::string_view::npos) break;
+            begin = end + 1U;
+        }
+        if (retained.empty()) {
+            request.eraseHeader("cookie");
+        } else {
+            std::string rebuilt;
+            for (const auto& item : retained) {
+                if (!rebuilt.empty()) rebuilt.append("; ");
+                rebuilt.append(item);
+            }
+            request.setHeader("cookie", std::move(rebuilt));
+        }
+    }
+    if (bearer.has_value() && cookieToken.has_value()) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
+                                "Authentication is required.");
+    }
+    if (bearer.has_value()) {
+        return std::optional<foundation::SecretString>{
+            foundation::SecretString{std::move(bearer).value()}};
+    }
+    if (cookieToken.has_value()) {
+        return std::optional<foundation::SecretString>{
+            foundation::SecretString{std::move(cookieToken).value()}};
+    }
+    return std::optional<foundation::SecretString>{};
 }
 
 Route::Route(RouteId id, HttpMethod method, std::string pathPrefix,
@@ -694,17 +777,14 @@ HttpResponse Gateway::handle(HttpRequest request)
     stripHopByHop(request);
 
     if (route->isProtected()) {
-        const auto authorization = request.header("authorization");
-        constexpr std::string_view prefix{"Bearer "};
-        if (!authorization.has_value() || !authorization->starts_with(prefix)
-            || authorization->size() <= prefix.size()
-            || authorization->substr(prefix.size()).contains(' ')) {
+        auto credential = takeSessionCredential(request);
+        if (!credential.has_value() || !credential->has_value()) {
             return errorResponse(
-                foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+                credential.has_value()
+                    ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
+                    : credential.error(), request);
         }
-        foundation::SecretString bearer{std::string{authorization->substr(prefix.size())}};
-        request.eraseHeader("authorization");
-        auto authenticated = m_sessions->authenticate(bearer);
+        auto authenticated = m_sessions->authenticate(credential->value());
         if (!authenticated.has_value()) {
             return errorResponse(authenticated.error(), request);
         }

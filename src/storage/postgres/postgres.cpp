@@ -731,4 +731,662 @@ foundation::Result<std::size_t> PostgresRecoveryCodeRepository::remaining(
     return parseInteger<std::size_t>(field(result.get(), 0, 0));
 }
 
+namespace {
+
+[[nodiscard]] foundation::Result<identity::core::Identity>
+identityFromRow(PGresult* result, int row)
+{
+    auto kind = parseInteger<unsigned int>(field(result, row, 1));
+    auto status = parseInteger<unsigned int>(field(result, row, 2));
+    auto created = parseInteger<std::int64_t>(field(result, row, 3));
+    if (!kind || !status || !created || kind.value() > 3U || status.value() > 5U) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "PostgreSQL returned invalid identity data.");
+    }
+    auto value = identity::core::Identity::create(
+        identity::core::IdentityId{field(result, row, 0)},
+        static_cast<identity::core::SubjectKind>(kind.value()),
+        foundation::Instant{foundation::Duration{created.value()}});
+    if (!value) return foundation::fail(value.error());
+    if (status.value() != static_cast<unsigned int>(identity::core::IdentityStatus::Active)) {
+        auto changed = value->changeStatus(
+            static_cast<identity::core::IdentityStatus>(status.value()));
+        if (!changed) return foundation::fail(changed.error());
+    }
+    return value;
+}
+
+[[nodiscard]] foundation::Result<organization::Organization>
+organizationFromRow(PGresult* result, int row)
+{
+    auto state = parseInteger<unsigned int>(field(result, row, 2));
+    auto created = parseInteger<std::int64_t>(field(result, row, 3));
+    if (!state || !created || state.value() > 2U) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "PostgreSQL returned invalid organization data.");
+    }
+    auto value = organization::Organization::create(
+        organization::OrganizationId{field(result, row, 0)}, field(result, row, 1),
+        foundation::Instant{foundation::Duration{created.value()}});
+    if (!value) return foundation::fail(value.error());
+    if (state.value() != static_cast<unsigned int>(organization::OrganizationStatus::Active)) {
+        auto changed = value->changeStatus(
+            static_cast<organization::OrganizationStatus>(state.value()));
+        if (!changed) return foundation::fail(changed.error());
+    }
+    return value;
+}
+
+[[nodiscard]] foundation::Result<organization::Membership>
+membershipFromRow(PGconn* connection, PGresult* result, int row)
+{
+    auto state = parseInteger<unsigned int>(field(result, row, 2));
+    auto invited = parseInteger<std::int64_t>(field(result, row, 3));
+    if (!state || !invited || state.value() > 3U) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "PostgreSQL returned invalid membership data.");
+    }
+    organization::OrganizationId organizationId{field(result, row, 0)};
+    organization::IdentityId identityId{field(result, row, 1)};
+    auto value = organization::Membership::invite(
+        organizationId, identityId,
+        foundation::Instant{foundation::Duration{invited.value()}});
+    if (!value) return foundation::fail(value.error());
+    ResultPointer roles = execParams(connection,
+        "SELECT role FROM openproof.membership_roles "
+        "WHERE organization_id=$1 AND identity_id=$2 ORDER BY role",
+        {std::string{organizationId.value()}, std::string{identityId.value()}});
+    if (!tuplesOk(roles.get())) {
+        return foundation::fail(databaseError(roles.get(), "read membership roles"));
+    }
+    if (state.value() == static_cast<unsigned int>(organization::MembershipState::Removed)
+        && PQntuples(roles.get()) != 0) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "A removed PostgreSQL membership retained roles.");
+    }
+    for (int role = 0; role < PQntuples(roles.get()); ++role) {
+        auto granted = value->grantRole(organization::Role{field(roles.get(), role, 0)});
+        if (!granted) return foundation::fail(granted.error());
+    }
+    if (state.value() >= static_cast<unsigned int>(organization::MembershipState::Active)) {
+        auto accepted = value->accept();
+        if (!accepted) return foundation::fail(accepted.error());
+    }
+    if (state.value() == static_cast<unsigned int>(organization::MembershipState::Suspended)) {
+        auto suspended = value->suspend();
+        if (!suspended) return foundation::fail(suspended.error());
+    } else if (state.value() == static_cast<unsigned int>(organization::MembershipState::Removed)) {
+        auto removed = value->remove();
+        if (!removed) return foundation::fail(removed.error());
+    }
+    return value;
+}
+
+}
+
+PostgresIdentityRepository::PostgresIdentityRepository(ConnectionPool& pool) : m_pool(&pool) {}
+
+foundation::Status PostgresIdentityRepository::add(
+    const identity::core::OrganizationId& organization, identity::core::Identity value)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+        "VALUES($1,$2,$3,$4,$5)",
+        {std::string{value.id().value()}, std::string{organization.value()},
+         std::to_string(static_cast<unsigned int>(value.kind())),
+         std::to_string(static_cast<unsigned int>(value.status())), instant(value.createdAt())});
+    return commandOk(result.get()) ? foundation::ok()
+                                   : foundation::fail(databaseError(result.get(), "insert identity"));
+}
+
+foundation::Result<std::optional<identity::core::Identity>>
+PostgresIdentityRepository::findById(const identity::core::OrganizationId& organization,
+                                     const identity::core::IdentityId& id) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id,kind,status,created_at_ms FROM openproof.identities "
+        "WHERE organization_id=$1 AND id=$2",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find identity"));
+    if (PQntuples(result.get()) == 0) return std::optional<identity::core::Identity>{};
+    auto value = identityFromRow(result.get(), 0);
+    if (!value) return foundation::fail(value.error());
+    return std::optional<identity::core::Identity>{std::move(value).value()};
+}
+
+foundation::Status PostgresIdentityRepository::changeStatus(
+    const identity::core::OrganizationId& organization,
+    const identity::core::IdentityId& id, identity::core::IdentityStatus status)
+{
+    auto current = findById(organization, id);
+    if (!current) return foundation::fail(current.error());
+    if (!current->has_value()) return foundation::fail(foundation::ErrorCode::NotFound);
+    const auto previous = current->value().status();
+    auto transition = current->value().changeStatus(status);
+    if (!transition) return foundation::fail(transition.error());
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.identities SET status=$3 WHERE organization_id=$1 AND id=$2 "
+        "AND status=$4 RETURNING id",
+        {std::string{organization.value()}, std::string{id.value()},
+         std::to_string(static_cast<unsigned int>(status)),
+         std::to_string(static_cast<unsigned int>(previous))});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "change identity status"));
+    return PQntuples(result.get()) == 1 ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::Conflict,
+                           "The identity changed concurrently.");
+}
+
+foundation::Result<std::vector<identity::core::IdentityId>>
+PostgresIdentityRepository::idsOfKind(
+    const identity::core::OrganizationId& organization,
+    identity::core::SubjectKind kind) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id FROM openproof.identities WHERE organization_id=$1 AND kind=$2 ORDER BY id",
+        {std::string{organization.value()}, std::to_string(static_cast<unsigned int>(kind))});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list identities"));
+    std::vector<identity::core::IdentityId> output;
+    for (int row = 0; row < PQntuples(result.get()); ++row) output.emplace_back(field(result.get(), row, 0));
+    return output;
+}
+
+foundation::Result<std::size_t> PostgresIdentityRepository::countIn(
+    const identity::core::OrganizationId& organization) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT count(*) FROM openproof.identities WHERE organization_id=$1",
+        {std::string{organization.value()}});
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+        return foundation::fail(databaseError(result.get(), "count identities"));
+    }
+    return parseInteger<std::size_t>(field(result.get(), 0, 0));
+}
+
+PostgresExternalIdentityDirectory::PostgresExternalIdentityDirectory(ConnectionPool& pool)
+    : m_pool(&pool) {}
+
+foundation::Status PostgresExternalIdentityDirectory::attach(
+    const identity::core::IdentityLink& link)
+{
+    if (link.state() != identity::core::LinkState::Linked) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "This account link is not complete.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+        "VALUES($1,$2,$3,$4) ON CONFLICT(provider,external_subject) DO UPDATE SET "
+        "identity_id=EXCLUDED.identity_id WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id",
+        {std::string{link.external().providerId().value()},
+         std::string{link.external().subject().value()}, std::string{link.owner().value()},
+         instant(link.requestedAt())});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "attach external identity"));
+    return std::string_view{PQcmdTuples(result.get())} == "1" ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::Conflict,
+                           "That account is already connected to a different identity.");
+}
+
+foundation::Result<std::optional<identity::core::IdentityId>>
+PostgresExternalIdentityDirectory::ownerOf(
+    const identity::core::ExternalIdentityRef& external) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2",
+        {std::string{external.providerId().value()}, std::string{external.subject().value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find external identity"));
+    if (PQntuples(result.get()) == 0) return std::optional<identity::core::IdentityId>{};
+    return std::optional<identity::core::IdentityId>{identity::core::IdentityId{field(result.get(), 0, 0)}};
+}
+
+foundation::Status PostgresExternalIdentityDirectory::detach(
+    const identity::core::ExternalIdentityRef& external,
+    const identity::core::IdentityId& expectedOwner)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "DELETE FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2 "
+        "AND identity_id=$3 RETURNING identity_id",
+        {std::string{external.providerId().value()}, std::string{external.subject().value()},
+         std::string{expectedOwner.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "detach external identity"));
+    if (PQntuples(result.get()) == 1) return foundation::ok();
+    auto owner = ownerOf(external);
+    if (!owner) return foundation::fail(owner.error());
+    return owner->has_value()
+        ? foundation::fail(foundation::ErrorCode::PermissionDenied)
+        : foundation::fail(foundation::ErrorCode::NotFound);
+}
+
+foundation::Status PostgresExternalIdentityDirectory::reassign(
+    const identity::core::ExternalIdentityRef& external,
+    const identity::core::IdentityId& expectedCurrentOwner,
+    const identity::core::IdentityId& newOwner)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.external_identities SET identity_id=$4 WHERE provider=$1 "
+        "AND external_subject=$2 AND identity_id=$3 RETURNING identity_id",
+        {std::string{external.providerId().value()}, std::string{external.subject().value()},
+         std::string{expectedCurrentOwner.value()}, std::string{newOwner.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "reassign external identity"));
+    if (PQntuples(result.get()) == 1) return foundation::ok();
+    auto owner = ownerOf(external);
+    if (!owner) return foundation::fail(owner.error());
+    return owner->has_value()
+        ? foundation::fail(foundation::ErrorCode::PermissionDenied)
+        : foundation::fail(foundation::ErrorCode::NotFound);
+}
+
+foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
+PostgresExternalIdentityDirectory::externalIdentitiesOf(
+    const identity::core::IdentityId& owner) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT provider,external_subject FROM openproof.external_identities "
+        "WHERE identity_id=$1 ORDER BY provider,external_subject", {std::string{owner.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list external identities"));
+    std::vector<identity::core::ExternalIdentityRef> output;
+    for (int row = 0; row < PQntuples(result.get()); ++row) {
+        output.emplace_back(identity::provider::ProviderId{field(result.get(), row, 0)},
+                            identity::provider::ExternalSubject{field(result.get(), row, 1)});
+    }
+    return output;
+}
+
+std::size_t PostgresExternalIdentityDirectory::size() const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return 0U;
+    ResultPointer result = exec(lease->get(), "SELECT count(*) FROM openproof.external_identities");
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) return 0U;
+    auto count = parseInteger<std::size_t>(field(result.get(), 0, 0));
+    return count ? count.value() : 0U;
+}
+
+PostgresOrganizationRepository::PostgresOrganizationRepository(ConnectionPool& pool)
+    : m_pool(&pool) {}
+
+foundation::Status PostgresOrganizationRepository::add(organization::Organization value)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.organizations(id,name,state,created_at_ms) VALUES($1,$2,$3,$4)",
+        {std::string{value.id().value()}, std::string{value.displayName()},
+         std::to_string(static_cast<unsigned int>(value.status())), instant(value.createdAt())});
+    return commandOk(result.get()) ? foundation::ok()
+        : foundation::fail(databaseError(result.get(), "insert organization"));
+}
+
+foundation::Result<std::optional<organization::Organization>>
+PostgresOrganizationRepository::findById(const organization::OrganizationId& id) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id,name,state,created_at_ms FROM openproof.organizations WHERE id=$1",
+        {std::string{id.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find organization"));
+    if (PQntuples(result.get()) == 0) return std::optional<organization::Organization>{};
+    auto value = organizationFromRow(result.get(), 0);
+    if (!value) return foundation::fail(value.error());
+    return std::optional<organization::Organization>{std::move(value).value()};
+}
+
+foundation::Status PostgresOrganizationRepository::changeStatus(
+    const organization::OrganizationId& id, organization::OrganizationStatus status)
+{
+    auto current = findById(id);
+    if (!current) return foundation::fail(current.error());
+    if (!current->has_value()) return foundation::fail(foundation::ErrorCode::NotFound);
+    const auto previous = current->value().status();
+    auto transition = current->value().changeStatus(status);
+    if (!transition) return foundation::fail(transition.error());
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.organizations SET state=$2 WHERE id=$1 AND state=$3 RETURNING id",
+        {std::string{id.value()}, std::to_string(static_cast<unsigned int>(status)),
+         std::to_string(static_cast<unsigned int>(previous))});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "change organization state"));
+    return PQntuples(result.get()) == 1 ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::Conflict,
+                           "The organization changed concurrently.");
+}
+
+foundation::Result<std::size_t> PostgresOrganizationRepository::count() const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = exec(lease->get(), "SELECT count(*) FROM openproof.organizations");
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+        return foundation::fail(databaseError(result.get(), "count organizations"));
+    }
+    return parseInteger<std::size_t>(field(result.get(), 0, 0));
+}
+
+PostgresMembershipRepository::PostgresMembershipRepository(ConnectionPool& pool)
+    : m_pool(&pool) {}
+
+foundation::Status PostgresMembershipRepository::add(organization::Membership value)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    ResultPointer result = execParams(connection,
+        "INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+        "VALUES($1,$2,$3,$4)",
+        {std::string{value.organization().value()}, std::string{value.identity().value()},
+         std::to_string(static_cast<unsigned int>(value.state())), instant(value.invitedAt())});
+    if (!commandOk(result.get())) { rollback(connection); return foundation::fail(databaseError(result.get(), "insert membership")); }
+    for (const auto& role : value.roles()) {
+        ResultPointer inserted = execParams(connection,
+            "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {std::string{value.organization().value()}, std::string{value.identity().value()},
+             std::string{role.value()}});
+        if (!commandOk(inserted.get())) { rollback(connection); return foundation::fail(databaseError(inserted.get(), "insert membership role")); }
+    }
+    return commit(connection);
+}
+
+foundation::Result<std::optional<organization::Membership>>
+PostgresMembershipRepository::find(const organization::OrganizationId& organizationId,
+                                   const organization::IdentityId& identityId) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT organization_id,identity_id,state,invited_at_ms FROM openproof.memberships "
+        "WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{organizationId.value()}, std::string{identityId.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find membership"));
+    if (PQntuples(result.get()) == 0) return std::optional<organization::Membership>{};
+    auto value = membershipFromRow(lease->get(), result.get(), 0);
+    if (!value) return foundation::fail(value.error());
+    return std::optional<organization::Membership>{std::move(value).value()};
+}
+
+foundation::Status PostgresMembershipRepository::save(const organization::Membership& value)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    ResultPointer updated = execParams(connection,
+        "UPDATE openproof.memberships SET state=$3 WHERE organization_id=$1 AND identity_id=$2 RETURNING identity_id",
+        {std::string{value.organization().value()}, std::string{value.identity().value()},
+         std::to_string(static_cast<unsigned int>(value.state()))});
+    if (!tuplesOk(updated.get())) { rollback(connection); return foundation::fail(databaseError(updated.get(), "save membership")); }
+    if (PQntuples(updated.get()) != 1) { rollback(connection); return foundation::fail(foundation::ErrorCode::NotFound); }
+    ResultPointer removed = execParams(connection,
+        "DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{value.organization().value()}, std::string{value.identity().value()}});
+    if (!commandOk(removed.get())) { rollback(connection); return foundation::fail(databaseError(removed.get(), "replace membership roles")); }
+    for (const auto& role : value.roles()) {
+        ResultPointer inserted = execParams(connection,
+            "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {std::string{value.organization().value()}, std::string{value.identity().value()}, std::string{role.value()}});
+        if (!commandOk(inserted.get())) { rollback(connection); return foundation::fail(databaseError(inserted.get(), "save membership role")); }
+    }
+    return commit(connection);
+}
+
+foundation::Result<std::vector<organization::IdentityId>>
+PostgresMembershipRepository::membersOf(const organization::OrganizationId& organizationId) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id FROM openproof.memberships WHERE organization_id=$1 ORDER BY identity_id",
+        {std::string{organizationId.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list members"));
+    std::vector<organization::IdentityId> output;
+    for (int row = 0; row < PQntuples(result.get()); ++row) output.emplace_back(field(result.get(), row, 0));
+    return output;
+}
+
+foundation::Result<std::vector<organization::OrganizationId>>
+PostgresMembershipRepository::organizationsOf(const organization::IdentityId& identityId) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT organization_id FROM openproof.memberships WHERE identity_id=$1 ORDER BY organization_id",
+        {std::string{identityId.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list identity organizations"));
+    std::vector<organization::OrganizationId> output;
+    for (int row = 0; row < PQntuples(result.get()); ++row) output.emplace_back(field(result.get(), row, 0));
+    return output;
+}
+
+foundation::Result<std::size_t> PostgresMembershipRepository::countIn(
+    const organization::OrganizationId& organizationId) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT count(*) FROM openproof.memberships WHERE organization_id=$1",
+        {std::string{organizationId.value()}});
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+        return foundation::fail(databaseError(result.get(), "count memberships"));
+    }
+    return parseInteger<std::size_t>(field(result.get(), 0, 0));
+}
+
+PostgresLocalAccountDirectory::PostgresLocalAccountDirectory(
+    ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+    credentials::TotpPolicy totpPolicy, security::AeadKey totpKey,
+    unsigned int keyVersion, identity::provider::ProviderId providerId,
+    credentials::PasswordHash dummyHash)
+    : m_pool(&pool), m_passwordHasher(std::move(passwordHasher)),
+      m_totpPolicy(totpPolicy), m_totpKey(std::move(totpKey)),
+      m_keyVersion(keyVersion), m_provider(std::move(providerId)),
+      m_dummyHash(std::move(dummyHash))
+{
+}
+
+PostgresLocalAccountDirectory::~PostgresLocalAccountDirectory() = default;
+
+foundation::Result<std::unique_ptr<PostgresLocalAccountDirectory>>
+PostgresLocalAccountDirectory::create(
+    ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+    credentials::TotpPolicy totpPolicy, security::AeadKey totpKey,
+    unsigned int keyVersion, identity::provider::ProviderId providerId)
+{
+    if (keyVersion == 0U || providerId.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The persistent local-account configuration is invalid.");
+    }
+    auto dummyHash = passwordHasher.hash(foundation::SecretString{
+        "openproof-dummy-password-never-valid"});
+    if (!dummyHash) return foundation::fail(dummyHash.error());
+    return std::unique_ptr<PostgresLocalAccountDirectory>{
+        new PostgresLocalAccountDirectory{
+            pool, std::move(passwordHasher), totpPolicy, std::move(totpKey),
+            keyVersion, std::move(providerId), std::move(dummyHash).value()}};
+}
+
+foundation::Status PostgresLocalAccountDirectory::enroll(
+    identity::provider::ExternalSubject subject,
+    const foundation::SecretString& password,
+    std::optional<credentials::TotpSecret> totp)
+{
+    if (subject.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A local account subject must not be empty.");
+    }
+    auto passwordHash = m_passwordHasher.hash(password);
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    ResultPointer owner = execParams(connection,
+        "SELECT e.identity_id FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(owner.get())) return foundation::fail(databaseError(owner.get(), "resolve local account"));
+    if (PQntuples(owner.get()) != 1) {
+        return foundation::fail(authenticationFailure(
+            "Local enrollment requires a pre-existing explicit identity link."));
+    }
+    const std::string identityId = field(owner.get(), 0, 0);
+    std::optional<std::vector<std::byte>> sealed;
+    if (totp.has_value()) {
+        auto encrypted = security::sealAes256Gcm(
+            m_totpKey, totp->bytes(), "openproof/totp/v1:" + identityId);
+        if (!encrypted) return foundation::fail(encrypted.error());
+        sealed = std::move(encrypted).value();
+    }
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    ResultPointer insertedPassword = execParams(connection,
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,$2,(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+        {identityId, std::string{passwordHash->encoded()}});
+    if (!commandOk(insertedPassword.get())) {
+        rollback(connection);
+        return foundation::fail(databaseError(insertedPassword.get(), "enroll local password"));
+    }
+    if (sealed.has_value()) {
+        ResultPointer insertedTotp = execParams(connection,
+            "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES($1,decode($2,'hex'),$3,NULL,(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+            {identityId, foundation::toHex(sealed.value()), std::to_string(m_keyVersion)});
+        if (!commandOk(insertedTotp.get())) {
+            rollback(connection);
+            return foundation::fail(databaseError(insertedTotp.get(), "enroll local TOTP"));
+        }
+    }
+    return commit(connection);
+}
+
+foundation::Status PostgresLocalAccountDirectory::changePassword(
+    const identity::provider::ExternalSubject& subject,
+    const foundation::SecretString& password)
+{
+    auto passwordHash = m_passwordHasher.hash(password);
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.password_credentials p SET password_hash=$3,"
+        "changed_at_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint "
+        "FROM openproof.external_identities e WHERE e.provider=$1 AND e.external_subject=$2 "
+        "AND e.identity_id=p.identity_id RETURNING p.identity_id",
+        {std::string{m_provider.value()}, std::string{subject.value()},
+         std::string{passwordHash->encoded()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "change local password"));
+    return PQntuples(result.get()) == 1 ? foundation::ok()
+        : foundation::fail(authenticationFailure("Local account is unknown."));
+}
+
+foundation::Result<provider::local::LocalVerification>
+PostgresLocalAccountDirectory::verify(
+    const identity::provider::ExternalSubject& subject,
+    const foundation::SecretString& password,
+    std::optional<std::string_view> presentedTotp, foundation::Instant now)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT e.identity_id,p.password_hash,encode(t.encrypted_seed,'hex'),"
+        "t.key_version,t.last_accepted_step FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "LEFT JOIN openproof.totp_credentials t ON t.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "verify local account"));
+    if (PQntuples(result.get()) != 1) {
+        auto dummy = m_passwordHasher.verify(password, m_dummyHash);
+        if (!dummy) return foundation::fail(dummy.error());
+        return foundation::fail(authenticationFailure("Local account is unknown or inactive."));
+    }
+    const std::string identityId = field(result.get(), 0, 0);
+    const std::string encodedHash = field(result.get(), 0, 1);
+    auto parsedHash = credentials::PasswordHash::parse(encodedHash);
+    if (!parsedHash) return foundation::fail(parsedHash.error());
+    auto passwordMatches = m_passwordHasher.verify(password, parsedHash.value());
+    if (!passwordMatches) return foundation::fail(passwordMatches.error());
+    if (!passwordMatches.value()) {
+        return foundation::fail(authenticationFailure("Local credential verification failed."));
+    }
+    const bool hasTotp = PQgetisnull(result.get(), 0, 2) == 0;
+    if (!hasTotp) {
+        ResultPointer current = execParams(lease->get(),
+            "SELECT 1 FROM openproof.password_credentials p "
+            "JOIN openproof.identities i ON i.id=p.identity_id AND i.status=0 "
+            "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+            "WHERE p.identity_id=$1 AND p.password_hash=$2 AND e.provider=$3 AND e.external_subject=$4",
+            {identityId, encodedHash, std::string{m_provider.value()}, std::string{subject.value()}});
+        if (!tuplesOk(current.get())) return foundation::fail(databaseError(current.get(), "confirm local credential"));
+        return PQntuples(current.get()) == 1
+            ? foundation::Result<provider::local::LocalVerification>{provider::local::LocalVerification::Password}
+            : foundation::Result<provider::local::LocalVerification>{foundation::fail(
+                authenticationFailure("Local credential changed during verification."))};
+    }
+    if (!presentedTotp.has_value()) {
+        return foundation::fail(authenticationFailure("A second factor is required."));
+    }
+    auto version = parseInteger<unsigned int>(field(result.get(), 0, 3));
+    if (!version || version.value() != m_keyVersion) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "The TOTP credential key version is unavailable.");
+    }
+    const std::string encryptedHex = field(result.get(), 0, 2);
+    auto encrypted = foundation::fromHex(encryptedHex);
+    if (!encrypted) return foundation::fail(encrypted.error());
+    auto plaintext = security::openAes256Gcm(
+        m_totpKey, encrypted.value(), "openproof/totp/v1:" + identityId);
+    if (!plaintext) return foundation::fail(plaintext.error());
+    auto secret = credentials::TotpSecret::create(std::move(plaintext).value());
+    if (!secret) return foundation::fail(secret.error());
+    std::optional<std::uint64_t> lastAccepted;
+    if (PQgetisnull(result.get(), 0, 4) == 0) {
+        auto parsed = parseInteger<std::uint64_t>(field(result.get(), 0, 4));
+        if (!parsed) return foundation::fail(parsed.error());
+        lastAccepted = parsed.value();
+    }
+    auto accepted = credentials::verifyTotp(
+        secret.value(), m_totpPolicy, presentedTotp.value(), now, lastAccepted);
+    if (!accepted) return foundation::fail(accepted.error());
+    ResultPointer consumed = execParams(lease->get(),
+        "UPDATE openproof.totp_credentials t SET last_accepted_step=$5 WHERE t.identity_id=$1 "
+        "AND t.key_version=$6 AND t.encrypted_seed=decode($7,'hex') "
+        "AND (t.last_accepted_step IS NULL OR t.last_accepted_step<$5::bigint) "
+        "AND EXISTS(SELECT 1 FROM openproof.password_credentials p "
+        "JOIN openproof.identities i ON i.id=p.identity_id AND i.status=0 "
+        "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+        "WHERE p.identity_id=$1 AND p.password_hash=$2 AND e.provider=$3 AND e.external_subject=$4) "
+        "RETURNING t.identity_id",
+        {identityId, encodedHash, std::string{m_provider.value()}, std::string{subject.value()},
+         std::to_string(accepted.value()), std::to_string(m_keyVersion), encryptedHex});
+    if (!tuplesOk(consumed.get())) return foundation::fail(databaseError(consumed.get(), "consume TOTP step"));
+    return PQntuples(consumed.get()) == 1
+        ? foundation::Result<provider::local::LocalVerification>{provider::local::LocalVerification::PasswordAndTotp}
+        : foundation::Result<provider::local::LocalVerification>{foundation::fail(
+            authenticationFailure("Local credential changed or TOTP was replayed."))};
+}
+
 }

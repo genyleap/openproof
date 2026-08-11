@@ -21,10 +21,12 @@ only as providers behind extension interfaces.
 > discovery, weighted load balancing, circuit breaking, PostgreSQL migrations and
 > durable single-use stores, audit chaining, metrics and tracing.
 >
-> Proof/evidence, trust/risk, generic OIDC/WebAuthn and the administrative API are
-> still future phases. `opp server` is deliberately a public-route, single-upstream
-> deployment mode; protected-route composition remains an embedding API until the
-> administrative/policy bootstrap exists.
+> `opp server` now has an opt-in operational authentication mode: HTTP login/MFA,
+> session rotation/revocation, recovery-code issuance, PostgreSQL-backed identities,
+> memberships, local password/TOTP credentials and protected-route enforcement.
+> Credential enrollment and tenant/policy administration deliberately remain an
+> operator/admin boundary; there is no public sign-up endpoint. Proof/evidence,
+> trust/risk, generic OIDC/WebAuthn and the administrative API are future phases.
 >
 > See [docs/00-AUDIT.md](docs/00-AUDIT.md) §14 for the phase plan and exactly
 > what is and is not built. Nothing here is stubbed to look finished.
@@ -129,6 +131,12 @@ OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)" \
   ./cmake-build-gcc-debug/apps/opp/opp server --config openproof.toml
 ```
 
+For the persistent protected gateway, provision an active organization and an
+explicitly linked local account, then use
+[`examples/openproof.auth-gateway.toml`](examples/openproof.auth-gateway.toml).
+The process applies checksummed migrations at startup. Authentication endpoints
+are documented in [docs/02-CONFIGURATION.md](docs/02-CONFIGURATION.md).
+
 The built-in incoming listener is intentionally plaintext and refuses any
 non-loopback bind. Terminate TLS in a trusted local reverse proxy/sidecar. TLS to
 the upstream is verified by default, including SNI and hostname verification.
@@ -149,12 +157,12 @@ cmake/
   toolchains/gcc.cmake            GCC discovery without machine-specific paths
 src/
   foundation/          openproof.foundation         errors, Result, ids, time, secrets, encodings
-  security/            openproof.security           CSPRNG, SHA-256, constant-time compare
+  security/            openproof.security           CSPRNG, SHA-256, constant-time compare, AEAD
   observability/       openproof.observability      structured JSON logging
   config/              openproof.config             typed configuration, secret references
   identity/core/       openproof.identity.core      Identity, linking, merge, repositories
   identity/provider/   openproof.identity.provider  authentication SPI, transactions, assurance
-  authentication/      openproof.authentication     trusted orchestration, provider trust caps
+  authentication/      openproof.authentication     broker plus bounded HTTP auth plane
   session/             openproof.session            opaque sessions, rotation and revocation
   credentials/         openproof.credentials        scrypt passwords, TOTP and recovery codes
   providers/local/     openproof.provider.local      password and password+TOTP provider
@@ -165,7 +173,7 @@ src/
   policy/              openproof.policy             authorization decision model
   organization/        openproof.organization       tenants, memberships, role assignment
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 283 discovered tests
+tests/                 291 discovered tests
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties
@@ -177,7 +185,7 @@ docs/
 
 ## Security invariants
 
-Forty-four invariants are recorded in
+Forty-nine invariants are recorded in
 [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md), each naming what must
 be true, the mechanism that enforces it, the test that proves it, and what
 happens on failure. Invariants that are true but not yet *mechanically* enforced

@@ -46,7 +46,7 @@ private:
 
 class BeastHttpServer final {
 public:
-    BeastHttpServer(Gateway& gateway, ServerConfig config);
+    BeastHttpServer(HttpHandler& handler, ServerConfig config);
     BeastHttpServer(const BeastHttpServer&) = delete;
     BeastHttpServer& operator=(const BeastHttpServer&) = delete;
     BeastHttpServer(BeastHttpServer&&) = delete;

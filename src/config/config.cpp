@@ -71,7 +71,8 @@ constexpr std::uint16_t kDefaultPort = 8443;
 [[nodiscard]] foundation::Status validateConfigurationSchema(const toml::table& document)
 {
     for (const auto& [key, value] : document) {
-        if (!isAllowedKey(key.str(), {"server", "logging", "security", "gateway"})) {
+        if (!isAllowedKey(key.str(), {"server", "logging", "security", "gateway",
+                                      "database", "auth"})) {
             return foundation::fail(
                 foundation::ErrorCode::InvalidArgument,
                 "The configuration contains an unknown section.",
@@ -110,6 +111,17 @@ constexpr std::uint16_t kDefaultPort = 8443;
         const foundation::Status keys = validateTableKeys(
             *gateway, "gateway", {"enabled", "route_prefix", "upstream_host",
                                    "upstream_port", "upstream_tls", "upstream_ca_file"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
+    }
+    if (const toml::table* database = document["database"].as_table(); database != nullptr) {
+        const foundation::Status keys = validateTableKeys(
+            *database, "database", {"connection_string", "pool_size", "migration_directory"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
+    }
+    if (const toml::table* auth = document["auth"].as_table(); auth != nullptr) {
+        const foundation::Status keys = validateTableKeys(
+            *auth, "auth", {"enabled", "provider_id", "organization_id",
+                             "protected_route_prefix"});
         if (!keys.has_value()) return foundation::fail(keys.error());
     }
 
@@ -168,6 +180,22 @@ constexpr std::uint16_t kDefaultPort = 8443;
     const foundation::Status upstreamTls = requireType(
         "gateway", "upstream_tls", [](const auto& node) { return node.is_boolean(); }, "a boolean");
     if (!upstreamTls.has_value()) return foundation::fail(upstreamTls.error());
+    for (const std::string_view key : {"connection_string", "migration_directory"}) {
+        const foundation::Status type = requireType(
+            "database", key, [](const auto& node) { return node.is_string(); }, "a string");
+        if (!type.has_value()) return foundation::fail(type.error());
+    }
+    const foundation::Status poolSize = requireType(
+        "database", "pool_size", [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!poolSize.has_value()) return foundation::fail(poolSize.error());
+    const foundation::Status authEnabled = requireType(
+        "auth", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!authEnabled.has_value()) return foundation::fail(authEnabled.error());
+    for (const std::string_view key : {"provider_id", "organization_id", "protected_route_prefix"}) {
+        const foundation::Status type = requireType(
+            "auth", key, [](const auto& node) { return node.is_string(); }, "a string");
+        if (!type.has_value()) return foundation::fail(type.error());
+    }
 
     return foundation::ok();
 }
@@ -410,12 +438,64 @@ std::uint16_t GatewayConfig::upstreamPort() const noexcept { return m_upstreamPo
 bool GatewayConfig::upstreamTls() const noexcept { return m_upstreamTls; }
 std::string_view GatewayConfig::upstreamCaFile() const noexcept { return m_upstreamCaFile; }
 
+DatabaseConfig::DatabaseConfig() = default;
+DatabaseConfig::DatabaseConfig(foundation::SecretString connectionString,
+                               std::size_t poolSize,
+                               std::filesystem::path migrationDirectory)
+    : m_connectionString(std::move(connectionString)), m_poolSize(poolSize),
+      m_migrationDirectory(std::move(migrationDirectory)) {}
+bool DatabaseConfig::enabled() const noexcept { return !m_connectionString.empty(); }
+const foundation::SecretString& DatabaseConfig::connectionString() const noexcept
+{ return m_connectionString; }
+std::size_t DatabaseConfig::poolSize() const noexcept { return m_poolSize; }
+const std::filesystem::path& DatabaseConfig::migrationDirectory() const noexcept
+{ return m_migrationDirectory; }
+
+AuthConfig::AuthConfig(bool enabled, std::string providerId,
+                       std::string organizationId, std::string protectedRoutePrefix)
+    : m_enabled(enabled), m_providerId(std::move(providerId)),
+      m_organizationId(std::move(organizationId)),
+      m_protectedRoutePrefix(std::move(protectedRoutePrefix)) {}
+
+foundation::Result<AuthConfig> AuthConfig::create(
+    bool enabled, std::string providerId, std::string organizationId,
+    std::string protectedRoutePrefix)
+{
+    const auto invalid = [](std::string_view text) {
+        return std::ranges::any_of(text, [](char value) {
+            const auto byte = static_cast<unsigned char>(value);
+            return byte < 0x21U || byte == 0x7FU;
+        });
+    };
+    if (providerId.empty()) providerId = "local";
+    if (protectedRoutePrefix.empty()) protectedRoutePrefix = "/";
+    if ((enabled && organizationId.empty()) || invalid(providerId)
+        || invalid(organizationId) || !protectedRoutePrefix.starts_with('/')
+        || protectedRoutePrefix.starts_with("//") || protectedRoutePrefix.contains('?')
+        || protectedRoutePrefix.contains('#') || invalid(protectedRoutePrefix)
+        || (protectedRoutePrefix.size() > 1U && protectedRoutePrefix.ends_with('/'))
+        || protectedRoutePrefix == "/auth") {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The authentication configuration is invalid.");
+    }
+    return AuthConfig{enabled, std::move(providerId), std::move(organizationId),
+                      std::move(protectedRoutePrefix)};
+}
+bool AuthConfig::enabled() const noexcept { return m_enabled; }
+std::string_view AuthConfig::providerId() const noexcept { return m_providerId; }
+std::string_view AuthConfig::organizationId() const noexcept { return m_organizationId; }
+std::string_view AuthConfig::protectedRoutePrefix() const noexcept
+{ return m_protectedRoutePrefix; }
+
 PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging,
-                               SecurityConfig security, GatewayConfig gateway)
+                               SecurityConfig security, GatewayConfig gateway,
+                               DatabaseConfig database, AuthConfig auth)
     : m_server(std::move(server))
     , m_logging(logging)
     , m_security(std::move(security))
     , m_gateway(std::move(gateway))
+    , m_database(std::move(database))
+    , m_auth(std::move(auth))
 {
 }
 
@@ -542,8 +622,39 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         document["gateway"]["upstream_ca_file"].value_or(std::string{}));
     if (!gateway.has_value()) return foundation::fail(gateway.error());
 
+    foundation::SecretString databaseConnection;
+    if (const auto reference = document["database"]["connection_string"].value<std::string>();
+        reference.has_value()) {
+        auto resolved = resolveSecretReference(*reference, environment);
+        if (!resolved) return foundation::fail(resolved.error());
+        databaseConnection = std::move(resolved).value();
+    } else if (const auto direct = environment.get("OPENPROOF_DATABASE_URL");
+               direct.has_value()) {
+        databaseConnection = foundation::SecretString{*direct};
+    }
+    std::size_t databasePoolSize = 8U;
+    if (const auto configured = document["database"]["pool_size"].value<std::int64_t>();
+        configured.has_value()) {
+        if (*configured < 1 || *configured > 256) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The database pool size is invalid.");
+        }
+        databasePoolSize = static_cast<std::size_t>(*configured);
+    }
+    DatabaseConfig database{
+        std::move(databaseConnection), databasePoolSize,
+        std::filesystem::path{document["database"]["migration_directory"].value_or(
+            std::string{"migrations"})}};
+    auto auth = AuthConfig::create(
+        document["auth"]["enabled"].value_or(false),
+        document["auth"]["provider_id"].value_or(std::string{"local"}),
+        document["auth"]["organization_id"].value_or(std::string{}),
+        document["auth"]["protected_route_prefix"].value_or(std::string{"/"}));
+    if (!auth) return foundation::fail(auth.error());
+
     return PlatformConfig{std::move(server).value(), LoggingConfig{level, console},
-                          std::move(security), std::move(gateway).value()};
+                          std::move(security), std::move(gateway).value(),
+                          std::move(database), std::move(auth).value()};
 }
 
 foundation::Result<PlatformConfig> PlatformConfig::loadFromFile(const std::filesystem::path& path,
@@ -578,6 +689,8 @@ const SecurityConfig& PlatformConfig::security() const noexcept
 }
 
 const GatewayConfig& PlatformConfig::gateway() const noexcept { return m_gateway; }
+const DatabaseConfig& PlatformConfig::database() const noexcept { return m_database; }
+const AuthConfig& PlatformConfig::auth() const noexcept { return m_auth; }
 
 foundation::Status PlatformConfig::validateServerDeployment() const
 {
@@ -595,6 +708,11 @@ foundation::Status PlatformConfig::validateServerDeployment() const
         return foundation::fail(
             foundation::ErrorCode::FailedPrecondition,
             "The built-in listener is plaintext and may only bind to loopback; terminate TLS in a local trusted proxy.");
+    }
+    if (m_auth.enabled() && !m_database.enabled()) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "Authentication requires a PostgreSQL connection.");
     }
     return foundation::ok();
 }

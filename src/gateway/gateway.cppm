@@ -79,6 +79,21 @@ private:
     std::string m_body;
 };
 
+/** Transport-neutral HTTP application consumed by the bounded listener. */
+class HttpHandler {
+public:
+    HttpHandler(const HttpHandler&) = delete;
+    HttpHandler& operator=(const HttpHandler&) = delete;
+    virtual ~HttpHandler() = default;
+    [[nodiscard]] virtual HttpResponse handle(HttpRequest request) = 0;
+protected:
+    HttpHandler() = default;
+};
+
+/** Extracts and removes one unambiguous bearer or platform session cookie. */
+[[nodiscard]] foundation::Result<std::optional<foundation::SecretString>>
+takeSessionCredential(HttpRequest& request);
+
 struct RouteIdTag {};
 using RouteId = foundation::StrongId<RouteIdTag>;
 struct ServiceIdTag {};
@@ -320,7 +335,7 @@ private:
     foundation::Duration m_maximumAge{};
 };
 
-class Gateway final {
+class Gateway final : public HttpHandler {
 public:
     Gateway(const Router& router, session::SessionService& sessions,
             AccessController& access, TokenBucketRateLimiter& rateLimiter,
@@ -329,7 +344,7 @@ public:
             TrustedContextSigner& contextSigner,
             foundation::Duration upstreamTimeout);
 
-    [[nodiscard]] HttpResponse handle(HttpRequest request);
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
 
 private:
     [[nodiscard]] HttpResponse errorResponse(const foundation::Error& error,

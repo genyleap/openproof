@@ -99,6 +99,7 @@ public:
         providerHeader = request.header("x-openproof-provider");
         authorizationHeader = request.header("authorization");
         connectionHeader = request.header("connection");
+        cookieHeader = request.header("cookie");
         return gw::HttpResponse{200, gw::Headers{{"connection", "close"}}, "ok"};
     }
     std::vector<gw::EndpointId> endpoints;
@@ -106,6 +107,7 @@ public:
     std::optional<std::string> providerHeader;
     std::optional<std::string> authorizationHeader;
     std::optional<std::string> connectionHeader;
+    std::optional<std::string> cookieHeader;
 };
 
 class FailingProxy final : public gw::ProxyTransport {
@@ -279,6 +281,29 @@ TEST(GatewayTest, ProtectedRouteRequiresBearerAndFailsClosedOnDeniedAccess)
     const auto response = gateway.handle(request());
     EXPECT_EQ(response.status(), 401);
     EXPECT_TRUE(proxy.endpoints.empty());
+}
+
+TEST(GatewayTest, SessionCookieIsAcceptedStrippedAndCannotConflictWithBearer)
+{
+    GatewayFixture fixture;
+    gw::Router router;
+    EXPECT_TRUE(router.add(route(true)));
+    RecordingProxy proxy;
+    gw::Gateway gateway{router, fixture.sessions, fixture.access, fixture.limiter,
+                        fixture.discovery, fixture.balancer, fixture.circuits, proxy,
+                        fixture.signer, std::chrono::seconds{2}};
+    auto grant = fixture.sessions.issue(verifiedAuthentication()).value();
+    const std::string token = grant.token().expose();
+    auto accepted = gateway.handle(request({
+        {"Cookie", "theme=dark; openproof_session=" + token}}));
+    EXPECT_EQ(accepted.status(), 200);
+    ASSERT_TRUE(proxy.cookieHeader);
+    EXPECT_EQ(proxy.cookieHeader.value(), "theme=dark");
+
+    auto ambiguous = gateway.handle(request({
+        {"Authorization", "Bearer " + token},
+        {"Cookie", "openproof_session=" + token}}));
+    EXPECT_EQ(ambiguous.status(), 401);
 }
 
 TEST(GatewayTest, RetriesOnlyIdempotentRequestsAcrossDistinctEndpoints)

@@ -8,6 +8,7 @@
 // The `server` subcommand composes and runs the bounded HTTP reverse gateway.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <chrono>
 #include <csignal>
@@ -34,26 +35,38 @@
 #endif
 
 import openproof.config;
+import openproof.authentication;
+import openproof.authentication.http;
+import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.provider;
 import openproof.observability;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.policy;
+import openproof.provider.local;
 import openproof.security;
 import openproof.session;
+import openproof.storage.postgres;
 
 namespace {
 
 namespace fnd = openproof::foundation;
 namespace cfg = openproof::config;
+namespace auth = openproof::authentication;
+namespace authHttp = openproof::authentication::http;
+namespace credentials = openproof::credentials;
 namespace obs = openproof::observability;
 namespace identity = openproof::identity::core;
 namespace gateway = openproof::gateway;
 namespace gatewayHttp = openproof::gateway::http;
 namespace policy = openproof::policy;
+namespace local = openproof::provider::local;
 namespace security = openproof::security;
 namespace session = openproof::session;
+namespace postgres = openproof::storage::postgres;
+namespace idp = openproof::identity::provider;
 
 // OPENPROOF_VERSION is injected by the build system, which is the only thing that
 // knows it. It is bound to a real constant here so that no other code depends
@@ -195,7 +208,8 @@ void printUsage()
     std::println("");
     std::println("Environment overrides:");
     std::println("  OPENPROOF_SERVER_BIND_ADDRESS, OPENPROOF_SERVER_PORT,");
-    std::println("  OPENPROOF_LOGGING_LEVEL, OPENPROOF_LOGGING_CONSOLE");
+    std::println("  OPENPROOF_LOGGING_LEVEL, OPENPROOF_LOGGING_CONSOLE,");
+    std::println("  OPENPROOF_DATABASE_URL");
 }
 
 volatile std::sig_atomic_t g_shutdownRequested = 0;
@@ -215,8 +229,19 @@ public:
     }
 };
 
-[[nodiscard]] fnd::Status addPublicRoutes(gateway::Router& router,
-                                          std::string_view prefix)
+class ActiveMemberPolicy final : public policy::PolicyEngine {
+public:
+    [[nodiscard]] policy::AuthorizationDecision evaluate(
+        const policy::AuthorizationRequest&) override
+    {
+        return policy::AuthorizationDecision::allow(
+            "The active organization member may reach the configured upstream.");
+    }
+};
+
+[[nodiscard]] fnd::Status addRoutes(gateway::Router& router,
+                                    std::string_view prefix, bool protectedRoute,
+                                    identity::OrganizationId organization)
 {
     constexpr gateway::HttpMethod methods[] = {
         gateway::HttpMethod::Get, gateway::HttpMethod::Head,
@@ -227,13 +252,68 @@ public:
         auto route = gateway::Route::create(
             gateway::RouteId{std::string{"default-"} +
                 std::string{gateway::httpMethodName(method)}},
-            method, std::string{prefix}, gateway::ServiceId{"default"}, false,
-            identity::OrganizationId{}, policy::Action{}, policy::Resource{});
+            method, std::string{prefix}, gateway::ServiceId{"default"}, protectedRoute,
+            organization,
+            protectedRoute ? policy::Action{std::string{"proxy."}
+                + std::string{gateway::httpMethodName(method)}} : policy::Action{},
+            protectedRoute ? policy::Resource{std::string{"upstream:"}
+                + std::string{prefix}} : policy::Resource{});
         if (!route.has_value()) return fnd::fail(route.error());
         const fnd::Status added = router.add(std::move(route).value());
         if (!added.has_value()) return fnd::fail(added.error());
     }
     return fnd::ok();
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> deriveSecret(
+    const fnd::SecretString& master, std::string_view label)
+{
+    auto digest = security::hmacSha256(master, label);
+    if (!digest) return fnd::fail(digest.error());
+    std::string raw;
+    raw.reserve(digest->size());
+    for (std::byte value : digest.value()) {
+        raw.push_back(static_cast<char>(std::to_integer<unsigned char>(value)));
+    }
+    return fnd::SecretString{std::move(raw)};
+}
+
+[[nodiscard]] ExitCode runListener(const cfg::PlatformConfig& platform,
+                                   gateway::HttpHandler& handler,
+                                   const obs::Logger& logger)
+{
+    const unsigned int detected = std::thread::hardware_concurrency();
+    const std::size_t workers = std::clamp<std::size_t>(
+        detected == 0U ? 2U : static_cast<std::size_t>(detected), 2U, 32U);
+    auto serverConfig = gatewayHttp::ServerConfig::create(
+        std::string{platform.server().bindAddress()}, platform.server().port(),
+        64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
+        std::chrono::seconds{15}, 4'096U, workers);
+    if (!serverConfig) {
+        reportStartupFailure(serverConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    gatewayHttp::BeastHttpServer server{handler, std::move(serverConfig).value()};
+    const fnd::Status started = server.start();
+    if (!started) {
+        reportStartupFailure(started.error());
+        return ExitCode::InternalError;
+    }
+    const std::vector<obs::LogField> listenerFields{
+        obs::LogField::integer("bound_port", static_cast<std::int64_t>(server.boundPort())),
+        obs::LogField::text("upstream_host", std::string{platform.gateway().upstreamHost()}),
+        obs::LogField::boolean("upstream_tls", platform.gateway().upstreamTls()),
+        obs::LogField::boolean("authentication_enabled", platform.auth().enabled())};
+    logger.info("openproof gateway listener started", listenerFields);
+    g_shutdownRequested = 0;
+    std::signal(SIGINT, requestShutdown);
+    std::signal(SIGTERM, requestShutdown);
+    while (g_shutdownRequested == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    server.stop();
+    logger.info("openproof gateway listener stopped");
+    return ExitCode::Success;
 }
 
 [[nodiscard]] ExitCode runGatewayServer(const cfg::PlatformConfig& platform,
@@ -246,28 +326,23 @@ public:
         return ExitCode::ConfigurationError;
     }
 
-    auto sessionDigest = security::hmacSha256(
+    auto sessionSecret = deriveSecret(
         platform.security().tokenSigningKey(), "openproof/session-key/v1");
-    auto contextDigest = security::hmacSha256(
+    auto contextSecret = deriveSecret(
         platform.security().tokenSigningKey(), "openproof/trusted-context-key/v1");
-    if (!sessionDigest.has_value() || !contextDigest.has_value()) {
+    if (!sessionSecret || !contextSecret) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
     auto sessionKey = session::SessionKey::create(
-        fnd::SecretString{fnd::toHex(sessionDigest.value())});
+        std::move(sessionSecret).value());
     auto contextKey = gateway::TrustedContextKey::create(
-        fnd::SecretString{fnd::toHex(contextDigest.value())});
+        std::move(contextSecret).value());
     if (!sessionKey.has_value() || !contextKey.has_value()) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
 
-    session::InMemorySessionRepository sessionRepository;
-    session::SessionService sessions{
-        sessionRepository, clock, std::move(sessionKey).value(),
-        session::SessionPolicy::create(std::chrono::hours{8},
-                                       std::chrono::minutes{30}).value()};
     auto limiter = gateway::TokenBucketRateLimiter::create(
         clock, 1'000.0, 100.0, 100'000U);
     auto circuits = gateway::CircuitBreaker::create(
@@ -284,7 +359,14 @@ public:
     }
 
     gateway::Router router;
-    const fnd::Status routes = addPublicRoutes(router, platform.gateway().routePrefix());
+    const bool authenticationEnabled = platform.auth().enabled();
+    const std::string_view routePrefix = authenticationEnabled
+        ? platform.auth().protectedRoutePrefix() : platform.gateway().routePrefix();
+    const fnd::Status routes = addRoutes(
+        router, routePrefix, authenticationEnabled,
+        authenticationEnabled
+            ? identity::OrganizationId{std::string{platform.auth().organizationId()}}
+            : identity::OrganizationId{});
     gateway::StaticServiceDiscovery discovery;
     auto endpoint = gateway::Endpoint::create(
         gateway::EndpointId{"default-1"},
@@ -297,43 +379,115 @@ public:
         return ExitCode::ConfigurationError;
     }
     gateway::WeightedRoundRobin loadBalancer;
-    DenyAccess access;
+    const auto sessionPolicy = session::SessionPolicy::create(
+        std::chrono::hours{8}, std::chrono::minutes{30}).value();
+
+    if (!authenticationEnabled) {
+        session::InMemorySessionRepository sessionRepository;
+        session::SessionService sessions{
+            sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
+        DenyAccess access;
+        gateway::Gateway gatewayCore{
+            router, sessions, access, limiter.value(), discovery, loadBalancer,
+            circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+        return runListener(platform, gatewayCore, logger);
+    }
+
+    auto poolConfig = postgres::PoolConfig::create(
+        platform.database().connectionString().clone(), platform.database().poolSize(),
+        std::chrono::seconds{5});
+    if (!poolConfig) {
+        reportStartupFailure(poolConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+    if (!pool) {
+        reportStartupFailure(pool.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::Migrator migrator{*pool.value()};
+    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
+
+    postgres::PostgresIdentityRepository identities{*pool.value()};
+    postgres::PostgresExternalIdentityDirectory externalIdentities{*pool.value()};
+    postgres::PostgresOrganizationRepository organizations{*pool.value()};
+    postgres::PostgresMembershipRepository memberships{*pool.value()};
+    postgres::PostgresSessionRepository sessionRepository{*pool.value()};
+    postgres::PostgresAuthenticationTransactionStore transactions{*pool.value()};
+    postgres::PostgresRecoveryCodeRepository recoveryRepository{*pool.value()};
+
+    auto configuredOrganization = organizations.findById(
+        identity::OrganizationId{std::string{platform.auth().organizationId()}});
+    if (!configuredOrganization) {
+        reportStartupFailure(configuredOrganization.error());
+        return ExitCode::ConfigurationError;
+    }
+    if (!configuredOrganization->has_value()
+        || !configuredOrganization->value().isUsable()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "The configured authentication organization is absent or inactive."});
+        return ExitCode::ConfigurationError;
+    }
+
+    auto passwordSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/password-pepper/v1");
+    auto totpSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/totp-encryption-key/v1");
+    auto recoverySecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/recovery-code-pepper/v1");
+    if (!passwordSecret || !totpSecret || !recoverySecret) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auto passwordHasher = credentials::PasswordHasher::create(
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+    auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
+    if (!passwordHasher || !totpKey) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    const idp::ProviderId providerId{std::string{platform.auth().providerId()}};
+    auto accounts = postgres::PostgresLocalAccountDirectory::create(
+        *pool.value(), std::move(passwordHasher).value(),
+        credentials::TotpPolicy::recommended(), std::move(totpKey).value(), 1U,
+        providerId);
+    auto recoveryCodes = credentials::RecoveryCodeService::create(
+        recoveryRepository, std::move(recoverySecret).value());
+    if (!accounts || !recoveryCodes) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+
+    idp::ProviderRegistry providers;
+    auto provider = std::make_unique<local::LocalAuthenticationProvider>(
+        providerId, *accounts.value(), clock, std::chrono::minutes{5});
+    const fnd::Status registered = providers.registerProvider(std::move(provider));
+    auth::ProviderTrustPolicy trust;
+    const fnd::Status trusted = trust.trust(providerId, idp::AssuranceLevel::Ial2);
+    if (!registered || !trusted) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auth::AuthenticationService authentication{
+        providers, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    session::SessionService sessions{
+        sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
+    ActiveMemberPolicy memberPolicy;
+    gateway::PolicyAccessController access{
+        &memberPolicy, organizations, identities, memberships};
     gateway::Gateway gatewayCore{
         router, sessions, access, limiter.value(), discovery, loadBalancer,
         circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
-
-    const unsigned int detected = std::thread::hardware_concurrency();
-    const std::size_t workers = std::clamp<std::size_t>(
-        detected == 0U ? 2U : static_cast<std::size_t>(detected), 2U, 32U);
-    auto serverConfig = gatewayHttp::ServerConfig::create(
-        std::string{platform.server().bindAddress()}, platform.server().port(),
-        64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
-        std::chrono::seconds{15}, 4'096U, workers);
-    if (!serverConfig) {
-        reportStartupFailure(serverConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    gatewayHttp::BeastHttpServer server{gatewayCore, std::move(serverConfig).value()};
-    const fnd::Status started = server.start();
-    if (!started) {
-        reportStartupFailure(started.error());
-        return ExitCode::InternalError;
-    }
-    const std::vector<obs::LogField> listenerFields{
-        obs::LogField::integer("bound_port", static_cast<std::int64_t>(server.boundPort())),
-        obs::LogField::text("upstream_host", std::string{platform.gateway().upstreamHost()}),
-        obs::LogField::boolean("upstream_tls", platform.gateway().upstreamTls())};
-    logger.info("openproof gateway listener started", listenerFields);
-
-    g_shutdownRequested = 0;
-    std::signal(SIGINT, requestShutdown);
-    std::signal(SIGTERM, requestShutdown);
-    while (g_shutdownRequested == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    }
-    server.stop();
-    logger.info("openproof gateway listener stopped");
-    return ExitCode::Success;
+    authHttp::AuthenticationHttpApi authApi{
+        authentication, sessions, recoveryCodes.value(), limiter.value(),
+        providerId, gatewayCore};
+    return runListener(platform, authApi, logger);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */

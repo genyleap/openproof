@@ -147,6 +147,58 @@ upstream_port = 443
     EXPECT_FALSE(exposed->validateServerDeployment().has_value());
 }
 
+TEST(ConfigTest, AuthDeploymentRequiresDatabaseAndResolvesItsSecretReference)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", std::string(32U, 'm'));
+    environment.set("DATABASE", "host=/tmp dbname=openproof");
+    auto configured = cfg::PlatformConfig::loadFromToml(R"(
+[server]
+bind_address = "127.0.0.1"
+port = 8443
+[security]
+token_signing_key = "env:MASTER"
+[gateway]
+enabled = true
+upstream_host = "127.0.0.1"
+upstream_port = 8080
+upstream_tls = false
+[database]
+connection_string = "env:DATABASE"
+pool_size = 12
+migration_directory = "migrations"
+[auth]
+enabled = true
+provider_id = "local"
+organization_id = "org"
+protected_route_prefix = "/api"
+)", environment);
+    ASSERT_TRUE(configured);
+    EXPECT_TRUE(configured->database().enabled());
+    EXPECT_EQ(configured->database().poolSize(), 12U);
+    EXPECT_TRUE(configured->auth().enabled());
+    EXPECT_EQ(configured->auth().organizationId(), "org");
+    EXPECT_TRUE(configured->validateServerDeployment());
+
+    auto missingDatabase = cfg::PlatformConfig::loadFromToml(R"(
+[server]
+bind_address = "127.0.0.1"
+port = 8443
+[security]
+token_signing_key = "env:MASTER"
+[gateway]
+enabled = true
+upstream_host = "127.0.0.1"
+upstream_port = 8080
+upstream_tls = false
+[auth]
+enabled = true
+organization_id = "org"
+)", environment);
+    ASSERT_TRUE(missingDatabase);
+    EXPECT_FALSE(missingDatabase->validateServerDeployment());
+}
+
 TEST(ConfigTest, ReadsFromAFile)
 {
     const TemporaryFile file{"openproof_config_test.toml", kSampleToml};

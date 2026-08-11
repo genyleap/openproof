@@ -21,6 +21,7 @@ add_executable(openproof_tests
     policy/decision_test.cpp
     identity/transaction_test.cpp
     authentication/service_test.cpp
+    authentication/http_test.cpp
     session/session_test.cpp
     credentials/credentials_test.cpp
     providers/local_test.cpp
@@ -54,6 +55,7 @@ target_link_libraries(openproof_tests
         openproof_config
         openproof_identity_provider
         openproof_authentication
+        openproof_authentication_http
         openproof_session
         openproof_credentials
         openproof_provider_local

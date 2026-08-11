@@ -10,6 +10,8 @@ openproof_add_module(openproof_storage_postgres
         openproof_identity_provider
         openproof_session
         openproof_credentials
+        openproof_provider_local
+        openproof_organization
     LINK_PRIVATE
         OpenProof::libpq
 )

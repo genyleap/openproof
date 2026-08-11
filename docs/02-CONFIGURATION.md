@@ -87,6 +87,49 @@ When enabled, host and port are mandatory. A CA file is rejected for a plaintext
 upstream. Route prefixes must be canonical segment prefixes: no query, fragment,
 control character, `//` prefix or trailing slash (except `/`).
 
+### `[database]`
+
+| Key | Type | Default | Environment override | Class |
+|---|---|---|---|---|
+| `connection_string` | secret reference | unset | `OPENPROOF_DATABASE_URL` | Secret |
+| `pool_size` | integer 1–256 | `8` | — | Private |
+| `migration_directory` | path | `migrations` | — | Private |
+
+`OPENPROOF_DATABASE_URL` is accepted directly because process environments are
+already secret-bearing deployment channels; the TOML value must still use an
+`env:` or `file:` reference. Enabling authentication requires a database. The
+process opens a bounded pool and applies every checksummed migration before it
+opens the listener.
+
+### `[auth]`
+
+| Key | Type | Default | Class |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Public |
+| `provider_id` | non-empty string | `local` | Private |
+| `organization_id` | non-empty string when enabled | unset | Private |
+| `protected_route_prefix` | canonical origin path prefix | `/` | Public |
+
+When enabled, the configured organization must already exist and be active.
+Every matching gateway route requires a valid session and an active membership
+in that organization. The auth plane owns `/auth` and `/auth/*`; it does not
+expose registration, password enrollment, TOTP enrollment, membership changes,
+or policy administration.
+
+| Method and path | Purpose | Authentication |
+|---|---|---|
+| `POST /auth/login` | Begin a single-use, client-bound local login | none |
+| `POST /auth/mfa/verify` | Verify password and optional TOTP, then issue a session | pre-auth cookies |
+| `POST /auth/session/rotate` | Atomically replace the current session | session cookie or Bearer |
+| `POST /auth/logout` | Revoke the current session | session cookie or Bearer |
+| `POST /auth/logout-all` | Revoke every session for the identity | session cookie or Bearer |
+| `POST /auth/recovery-codes` | Replace and return ten one-time codes | IAL2 session |
+
+Requests use strict JSON with a 16 KiB limit and reject unknown fields. Cookies
+are `Secure`, `HttpOnly`, and `SameSite=Strict`; auth responses are `no-store`.
+Supplying both a Bearer and session cookie is rejected as ambiguous. A front
+proxy must preserve `Set-Cookie` and the client address used for rate limiting.
+
 ---
 
 ## Secret references
@@ -137,10 +180,22 @@ route_prefix = "/api"
 upstream_host = "api.internal.example"
 upstream_port = 443
 upstream_tls = true
+
+[database]
+connection_string = "env:OPENPROOF_DATABASE_URL"
+pool_size = 8
+migration_directory = "migrations"
+
+[auth]
+enabled = true
+provider_id = "local"
+organization_id = "tenant-id"
+protected_route_prefix = "/api"
 ```
 
 ```bash
 export OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
+export OPENPROOF_DATABASE_URL="postgresql://openproof@127.0.0.1/openproof"
 opp server --config openproof.toml
 ```
 

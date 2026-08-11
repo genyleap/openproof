@@ -32,7 +32,8 @@ an authorization decision.
 | Credential stuffing and account enumeration | Pepper+scrypt, dummy verification for unknown local accounts, normalized failures, IP+identity token buckets | Distributed low-rate attacks require external aggregation and alerting |
 | Session database theft | 256-bit opaque bearers; only keyed digests persist; absolute+idle expiry; rotation/revocation | A stolen live bearer at the client remains usable until expiry/revocation |
 | Authentication replay/substitution | Hashed single-use nonce, binding digest, challenge id, inclusive deadline, atomic PostgreSQL consume | Correct binding material must come from the TLS-facing adapter |
-| TOTP/recovery replay | Last accepted TOTP step; atomic recovery `DELETE ... RETURNING` | TOTP is not phishing-resistant; prefer WebAuthn when implemented |
+| TOTP/recovery replay | Encrypted TOTP seed with atomic last-step update; atomic recovery `DELETE ... RETURNING` | TOTP is not phishing-resistant; prefer WebAuthn when implemented |
+| Browser credential confusion/CSRF | Bearer and session cookie are mutually exclusive; `Secure`, `HttpOnly`, `SameSite=Strict`; pre-auth cookies are path-scoped, client-bound and short-lived | SameSite is defense in depth; the TLS terminator must preserve host/origin controls |
 | Header spoofing | Strip all `x-openproof-*`; rebuild from trusted session; HMAC/freshness on upstream context | Upstream must verify the signature and protect the shared key |
 | Request smuggling / parser abuse | Origin-form only; duplicate singleton and CL+TE rejection; Beast header/body limits; deadlines; connection ceiling | HTTP/2/3 termination behaviour belongs to the front proxy and must be tested there |
 | SSRF through routing | Upstream host/port are closed-schema operator configuration, never request input | Configuration compromise can still redirect traffic |
@@ -48,15 +49,16 @@ an authorization decision.
 
 - The built-in incoming listener is HTTP/1.1 plaintext and `opp server` refuses
   non-loopback binds. TLS is terminated by a trusted local proxy/sidecar.
-- The runnable mode currently exposes public routes to one configured upstream.
-  Protected-route construction is available as a library API, but production
-  administration/policy bootstrap is not yet exposed by this binary.
+- The runnable mode supports either public or protected routes to one configured
+  upstream. Protected mode requires PostgreSQL, an active pre-provisioned
+  organization and active membership. Administration and credential enrollment
+  are intentionally not public HTTP endpoints.
 - Generic OIDC and WebAuthn providers are not implemented. The concrete local
   provider supports password and password+TOTP only.
-- PostgreSQL currently provides durable session, authentication-transaction and
-  recovery-code repositories. Identity/organization and encrypted TOTP-seed
-  adapters remain future work; the schema is present but schema alone is not a
-  durability claim.
+- PostgreSQL provides durable sessions, authentication transactions, recovery
+  codes, identities, external links, organizations, memberships, password
+  verifiers and AES-256-GCM-encrypted TOTP seeds. Audit persistence and fleet-wide
+  rate limiting remain deployment work.
 
 ## Verification gates
 

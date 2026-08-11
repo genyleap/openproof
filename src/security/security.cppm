@@ -16,3 +16,4 @@ export module openproof.security;
 
 export import :random;
 export import :hash;
+export import :aead;

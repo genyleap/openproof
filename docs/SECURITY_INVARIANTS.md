@@ -11,7 +11,7 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 283 discovered tests, plus five PostgreSQL tests
+Verified against the tree at 291 discovered tests, plus seven PostgreSQL tests
 run against an isolated PostgreSQL 18 instance.
 
 ---
@@ -64,6 +64,11 @@ run against an isolated PostgreSQL 18 instance.
 | 42 | **Audit history is tamper-evident and linearly ordered** | Append, sequence allocation and previous-hash HMAC occur under one atomic repository operation | audit repository tests | Chain verification fails closed |
 | 43 | **Untrusted metric labels cannot cause unbounded memory growth** | Label syntax/size/count validation and a hard series-cardinality ceiling | metric registry and hardening tests | New series is rejected |
 | 44 | **The plaintext listener is never exposed on a network interface by the runnable process** | `validateServerDeployment` accepts only `127.0.0.1` or `::1`; deployment must terminate TLS locally | `ServerDeploymentRequiresGatewayKeyAndLoopbackListener` | Startup fails before bind |
+| 45 | **A browser session credential has one unambiguous source and never reaches an upstream** | Credential extraction accepts exactly one Bearer or `openproof_session` cookie, removes it, and rejects conflicts or duplicates | `SessionCookieIsAcceptedStrippedAndCannotConflictWithBearer`, `LogoutRejectsAmbiguousCredentials` | Generic authentication failure; no proxy call |
+| 46 | **A pre-authentication exchange is short-lived, client-bound and single-use** | Separate `Secure`/`HttpOnly`/`SameSite=Strict` continuation and binding cookies feed the broker's atomic transaction consume | `LoginMfaRecoveryRotationAndLogoutAreEndToEnd`, `WrongPasswordBurnsExchangeAndClearsPreauthCookies` | Failure burns the exchange and clears both cookies |
+| 47 | **A persisted TOTP seed is confidential and a time step succeeds at most once** | AES-256-GCM with identity-bound AAD protects the seed; a conditional PostgreSQL update advances the last accepted step | `PersistentLocalTotpIsEncryptedAndConsumedOnce`, `RoundTripsWithAssociatedDataAndRejectsTampering` | Tampering fails decryption; concurrent replay has one winner |
+| 48 | **The public auth plane is bounded and does not reveal account/check existence** | 16 KiB strict JSON boundary, closed fields, normalized auth errors, dummy password verification and dual IP/subject throttles | auth HTTP tests and local-provider unknown-account tests | Generic 4xx/429 with no operator detail |
+| 49 | **Protected runnable routes authorize from durable canonical state** | Startup requires PostgreSQL and an active configured organization; policy rebuilds tenant, identity and membership from repositories | `AuthDeploymentRequiresDatabaseAndResolvesItsSecretReference`, PostgreSQL aggregate round-trip and gateway protected-route tests | Startup or request fails closed |
 
 ---
 

@@ -16,6 +16,8 @@ import openproof.foundation;
 import openproof.credentials;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.organization;
+import openproof.provider.local;
 import openproof.security;
 import openproof.session;
 import openproof.storage.postgres;
@@ -27,6 +29,8 @@ namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
 namespace idp = openproof::identity::provider;
 namespace pg = openproof::storage::postgres;
+namespace org = openproof::organization;
+namespace local = openproof::provider::local;
 namespace sec = openproof::security;
 namespace sess = openproof::session;
 
@@ -210,6 +214,94 @@ TEST_F(PostgresIntegrationTest, RecoveryCodeIsConsumedExactlyOnceAcrossNodes)
     second.join();
     EXPECT_EQ(winners.load(), 1U);
     EXPECT_EQ(firstRepository.remaining(core::IdentityId{"identity-1"}).value(), 3U);
+}
+
+TEST_F(PostgresIntegrationTest, IdentityOrganizationMembershipAndExternalLinksRoundTrip)
+{
+    pg::PostgresOrganizationRepository organizations{*pool};
+    pg::PostgresIdentityRepository identities{*pool};
+    pg::PostgresMembershipRepository memberships{*pool};
+    pg::PostgresExternalIdentityDirectory external{*pool};
+
+    auto organization = organizations.findById(core::OrganizationId{"org"});
+    ASSERT_TRUE(organization);
+    ASSERT_TRUE(organization->has_value());
+    EXPECT_TRUE(organization->value().isUsable());
+    auto identity = identities.findById(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
+    ASSERT_TRUE(identity);
+    ASSERT_TRUE(identity->has_value());
+    EXPECT_TRUE(identity->value().canAuthenticate());
+
+    auto membership = org::Membership::invite(
+        org::OrganizationId{"org"}, org::IdentityId{"identity-1"}, kNow).value();
+    ASSERT_TRUE(membership.grantRole(org::Role{"member"}));
+    ASSERT_TRUE(membership.accept());
+    ASSERT_TRUE(memberships.add(membership));
+    auto persisted = memberships.find(
+        org::OrganizationId{"org"}, org::IdentityId{"identity-1"});
+    ASSERT_TRUE(persisted);
+    ASSERT_TRUE(persisted->has_value());
+    EXPECT_TRUE(persisted->value().hasRole(org::Role{"member"}));
+
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-1"},
+        core::ExternalIdentityRef{idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"alice"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(external.attach(link));
+    auto owner = external.ownerOf(link.external());
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), core::IdentityId{"identity-1"});
+}
+
+TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)
+{
+    pg::PostgresExternalIdentityDirectory external{*pool};
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-1"},
+        core::ExternalIdentityRef{idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"alice"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(external.attach(link));
+
+    auto passwordPolicy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
+    auto passwordHasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
+    auto encryptionKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto directory = pg::PostgresLocalAccountDirectory::create(
+        *pool, std::move(passwordHasher), cred::TotpPolicy::recommended(),
+        std::move(encryptionKey), 1U, idp::ProviderId{"local"});
+    ASSERT_TRUE(directory);
+    auto secret = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    const std::string code = cred::totpAt(
+        secret, cred::TotpPolicy::recommended(), kNow).value();
+    ASSERT_TRUE(directory.value()->enroll(
+        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
+        std::optional<cred::TotpSecret>{std::move(secret)}));
+
+    std::atomic<unsigned int> winners{0U};
+    auto verify = [&] {
+        auto result = directory.value()->verify(
+            idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
+            code, kNow);
+        if (result.has_value()) winners.fetch_add(1U);
+    };
+    std::thread first{verify};
+    std::thread second{verify};
+    first.join();
+    second.join();
+    EXPECT_EQ(winners.load(), 1U);
 }
 
 }

@@ -32,6 +32,11 @@ target_link_libraries(opp
         openproof_identity_provider
         openproof_identity_core
         openproof_authentication
+        openproof_authentication_http
+        openproof_credentials
+        openproof_provider_local
+        openproof_storage_postgres
+        openproof_organization
         openproof_session
         openproof_gateway
         openproof_gateway_http

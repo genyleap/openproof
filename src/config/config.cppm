@@ -1,5 +1,6 @@
 module;
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -174,6 +175,43 @@ private:
     std::string m_upstreamCaFile;
 };
 
+class DatabaseConfig final {
+public:
+    DatabaseConfig();
+    DatabaseConfig(foundation::SecretString connectionString,
+                   std::size_t poolSize, std::filesystem::path migrationDirectory);
+    DatabaseConfig(const DatabaseConfig&) = delete;
+    DatabaseConfig& operator=(const DatabaseConfig&) = delete;
+    DatabaseConfig(DatabaseConfig&&) noexcept = default;
+    DatabaseConfig& operator=(DatabaseConfig&&) noexcept = default;
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] const foundation::SecretString& connectionString() const noexcept;
+    [[nodiscard]] std::size_t poolSize() const noexcept;
+    [[nodiscard]] const std::filesystem::path& migrationDirectory() const noexcept;
+private:
+    foundation::SecretString m_connectionString;
+    std::size_t m_poolSize{8U};
+    std::filesystem::path m_migrationDirectory{"migrations"};
+};
+
+class AuthConfig final {
+public:
+    [[nodiscard]] static foundation::Result<AuthConfig>
+    create(bool enabled, std::string providerId, std::string organizationId,
+           std::string protectedRoutePrefix);
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] std::string_view providerId() const noexcept;
+    [[nodiscard]] std::string_view organizationId() const noexcept;
+    [[nodiscard]] std::string_view protectedRoutePrefix() const noexcept;
+private:
+    AuthConfig(bool enabled, std::string providerId, std::string organizationId,
+               std::string protectedRoutePrefix);
+    bool m_enabled{};
+    std::string m_providerId;
+    std::string m_organizationId;
+    std::string m_protectedRoutePrefix;
+};
+
 /**
  * @brief The complete, validated platform configuration.
  *
@@ -216,17 +254,21 @@ public:
     [[nodiscard]] const LoggingConfig& logging() const noexcept;
     [[nodiscard]] const SecurityConfig& security() const noexcept;
     [[nodiscard]] const GatewayConfig& gateway() const noexcept;
+    [[nodiscard]] const DatabaseConfig& database() const noexcept;
+    [[nodiscard]] const AuthConfig& auth() const noexcept;
     /** Validates the additional fail-closed requirements of `opp server`. */
     [[nodiscard]] foundation::Status validateServerDeployment() const;
 
 private:
     PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security,
-                   GatewayConfig gateway);
+                   GatewayConfig gateway, DatabaseConfig database, AuthConfig auth);
 
     ServerConfig m_server;
     LoggingConfig m_logging;
     SecurityConfig m_security;
     GatewayConfig m_gateway;
+    DatabaseConfig m_database;
+    AuthConfig m_auth;
 };
 
 }

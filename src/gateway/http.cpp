@@ -156,8 +156,8 @@ std::size_t ServerConfig::workerThreads() const noexcept { return m_workerThread
 
 class BeastHttpServer::Implementation final {
 public:
-    Implementation(Gateway& gateway, ServerConfig config)
-        : m_gateway(&gateway), m_config(std::move(config)), m_acceptor(m_context)
+    Implementation(HttpHandler& handler, ServerConfig config)
+        : m_handler(&handler), m_config(std::move(config)), m_acceptor(m_context)
     {
     }
 
@@ -222,7 +222,7 @@ public:
                                     incoming.version()));
                 return;
             }
-            HttpResponse response = m_owner->m_gateway->handle(std::move(request).value());
+            HttpResponse response = m_owner->m_handler->handle(std::move(request).value());
             write(wireResponse(std::move(response), incoming.version(),
                                incoming.method() == beastHttp::verb::head));
         }
@@ -323,7 +323,7 @@ private:
         });
     }
 
-    Gateway* m_gateway;
+    HttpHandler* m_handler;
     ServerConfig m_config;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_started{false};
@@ -334,8 +334,8 @@ private:
     std::vector<std::jthread> m_workers;
 };
 
-BeastHttpServer::BeastHttpServer(Gateway& gateway, ServerConfig config)
-    : m_implementation(std::make_unique<Implementation>(gateway, std::move(config)))
+BeastHttpServer::BeastHttpServer(HttpHandler& handler, ServerConfig config)
+    : m_implementation(std::make_unique<Implementation>(handler, std::move(config)))
 {
 }
 BeastHttpServer::~BeastHttpServer() { stop(); }

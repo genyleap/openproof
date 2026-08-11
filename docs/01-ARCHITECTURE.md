@@ -343,13 +343,13 @@ Named explicitly so that no reader infers more than exists.
 
 | Area | State |
 |---|---|
-| Identity core, explicit linking and merge, organizations and memberships | Implemented; PostgreSQL adapters for these aggregates remain pending |
+| Identity core, explicit linking and merge, organizations and memberships | Implemented with PostgreSQL identity, external-link, organization and membership adapters |
 | Authentication providers | Local password and password+TOTP implemented; OIDC, WebAuthn, wallet, social and enterprise providers pending |
-| Authentication broker, sessions and credentials | Implemented; durable sessions/transactions/recovery codes, in-memory local credential directory |
+| Authentication broker, sessions and credentials | Implemented; operational HTTP auth plane and durable sessions, transactions, recovery codes, password verifiers and encrypted TOTP seeds |
 | Policy engine, RBAC, ABAC, trusted entitlement adapter | Decision contract present; evaluation engines not started |
-| OpenProof gateway | HTTP/1.1 edge, routing, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
+| OpenProof gateway | HTTP/1.1 edge, protected-route composition, cookie/Bearer sessions, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
 | Metrics, tracing, audit events, security events | Core adapters implemented; production exporters and durable audit repository pending |
-| PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migration, session/transaction/recovery adapters implemented; other aggregates and cache pending |
+| PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migrations and critical authentication/identity/organization adapters implemented; cache and remaining domains pending |
 | `opp` administrative CLI | Not started. Not stubbed: an executable that does nothing would be a claim of progress rather than progress. |
 | Threat model, load tests, fuzzing | Baseline implemented; sustained distributed load and protocol-specific fuzz targets remain ongoing work |
 | HTTP/3 | Architected for behind a transport abstraction; **not implemented and not claimed** |

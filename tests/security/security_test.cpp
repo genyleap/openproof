@@ -153,4 +153,20 @@ TEST(ConstantTimeEqualsTest, ComparesDigests)
     EXPECT_FALSE(sec::constantTimeEquals(expected.value(), wrong.value()));
 }
 
+TEST(AeadTest, RoundTripsWithAssociatedDataAndRejectsTampering)
+{
+    auto key = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"});
+    ASSERT_TRUE(key.has_value());
+    auto envelope = sec::sealAes256Gcm(
+        key.value(), fnd::SecretString{"credential-secret"}, "identity-1");
+    ASSERT_TRUE(envelope.has_value());
+    auto opened = sec::openAes256Gcm(key.value(), envelope.value(), "identity-1");
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(opened->expose(), "credential-secret");
+    EXPECT_FALSE(sec::openAes256Gcm(key.value(), envelope.value(), "identity-2"));
+    envelope->back() ^= std::byte{0x01};
+    EXPECT_FALSE(sec::openAes256Gcm(key.value(), envelope.value(), "identity-1"));
+}
+
 }

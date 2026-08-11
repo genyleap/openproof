@@ -31,3 +31,15 @@ route_prefix = "/"
 # upstream_port = 443
 upstream_tls = true
 # upstream_ca_file = "/etc/openproof/internal-ca.pem"
+
+[database]
+# Required when auth.enabled=true. This must remain a secret reference.
+# connection_string = "env:OPENPROOF_DATABASE_URL"
+pool_size = 8
+migration_directory = "migrations"
+
+[auth]
+enabled = false
+provider_id = "local"
+# organization_id = "tenant-id"
+protected_route_prefix = "/"

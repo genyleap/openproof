@@ -7,9 +7,11 @@ openproof_add_module(openproof_security
         security.cppm
         random.cppm
         hash.cppm
+        aead.cppm
     SOURCES
         random.cpp
         hash.cpp
+        aead.cpp
     LINK_PUBLIC
         openproof_foundation
     LINK_PRIVATE
