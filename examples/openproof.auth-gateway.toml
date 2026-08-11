@@ -26,3 +26,10 @@ enabled = true
 provider_id = "local"
 organization_id = "org"
 protected_route_prefix = "/"
+
+[[auth.route_policies]]
+path_prefix = "/"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial2"

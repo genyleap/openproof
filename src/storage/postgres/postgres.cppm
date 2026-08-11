@@ -15,6 +15,7 @@ import openproof.credentials;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.organization;
+import openproof.policy;
 import openproof.provider.local;
 import openproof.security;
 import openproof.session;
@@ -63,6 +64,7 @@ private:
     friend class PostgresMembershipRepository;
     friend class PostgresLocalAccountDirectory;
     friend class PostgresAdministrationRepository;
+    friend class PostgresAuthorizationDecisionSink;
     class Implementation;
     explicit ConnectionPool(std::unique_ptr<Implementation> implementation);
     std::unique_ptr<Implementation> m_implementation;
@@ -294,6 +296,27 @@ private:
     unsigned int m_keyVersion{};
     identity::provider::ProviderId m_provider;
     audit::AuditKey m_auditKey;
+};
+
+/** Persists every rejected protected-route decision in the audit chain/outbox. */
+class PostgresAuthorizationDecisionSink final
+    : public policy::AuthorizationDecisionSink {
+public:
+    PostgresAuthorizationDecisionSink(
+        ConnectionPool& pool, audit::AuditKey auditKey,
+        const foundation::ClockSource& clock);
+
+    [[nodiscard]] foundation::Status record(
+        const session::AuthenticatedSession& authenticatedSession,
+        const identity::core::OrganizationId& organization,
+        const policy::Action& action, const policy::Resource& resource,
+        const policy::AuthorizationDecision& decision,
+        const foundation::CorrelationId& correlation) override;
+
+private:
+    ConnectionPool* m_pool;
+    audit::AuditKey m_auditKey;
+    const foundation::ClockSource* m_clock;
 };
 
 }

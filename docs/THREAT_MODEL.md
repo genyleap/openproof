@@ -38,11 +38,11 @@ an authorization decision.
 | Request smuggling / parser abuse | Origin-form only; duplicate singleton and CL+TE rejection; Beast header/body limits; deadlines; connection ceiling | HTTP/2/3 termination behaviour belongs to the front proxy and must be tested there |
 | SSRF through routing | Upstream host/port are closed-schema operator configuration, never request input | Configuration compromise can still redirect traffic |
 | Upstream MITM | TLS peer, hostname and SNI verification; optional private CA | Plain upstream mode should be limited to an equally trusted local channel |
-| Authorization bypass | Sealed policy input; tenant-scoped repositories; every non-Allow fails closed | Policy correctness and administrative change control remain deployment duties |
+| Authorization bypass | Closed explicit method/path policies; immutable exact-match RBAC and minimum IAL; sealed policy input rebuilt from tenant-scoped PostgreSQL repositories; every non-Allow fails closed | Policy selection and administrative change review remain deployment duties; ABAC/trust/risk evaluation is not yet implemented |
 | Cross-tenant access | Organization required by repository operations and membership ownership checks | Database superusers can bypass application isolation; separate DB roles are recommended |
 | Database race/replay | Atomic conditional UPDATE/DELETE with RETURNING; transactional migrations and replacement | HA failover semantics depend on PostgreSQL deployment consistency |
 | Log/metric injection and secret leakage | Secret types are non-formatable; JSON escaping; label validation/cardinality cap | Operator-added sinks must preserve the same contracts |
-| Audit tampering | HMAC-linked sequence chain; bootstrap record and security outbox commit with authoritative state | General event persistence/export and off-host checkpoints remain deployment work |
+| Audit tampering | HMAC-linked sequence chain; bootstrap, member-lifecycle and rejected-authorization records commit with their security outbox events | General event persistence/export and off-host checkpoints remain deployment work |
 | Bootstrap privilege creation | Offline-only command, environment-only password, generated TOTP, fixed owner role, serializable transaction, global advisory lock, refusal after first tenant | Operator shell and master-key access are fully trusted during the initial ceremony |
 | Administrative privilege escalation | IAL2 session at HTTP boundary; active owner role re-read in the same serialized PostgreSQL transaction as every mutation; no roles trusted from the session; final active owner cannot lose authority; target sessions are revoked | An authorized owner may deliberately grant another owner role; administrative account protection and change review remain operator duties |
 | Administrative credential disclosure | Initial and reset password/TOTP values are CSPRNG-generated server-side, excluded from audit/outbox, returned once only after commit with `no-store`; reset deletes recovery codes and revokes sessions | The TLS terminator, administrator client and recipient transfer channel can still expose the one-time response |
@@ -59,13 +59,16 @@ an authorization decision.
   suspension/reinstatement/removal and credential reset exist only behind an
   IAL2 session plus a transactional authoritative owner check; they are not
   public or self-service endpoints.
+- Protected gateway access has no implicit active-member allow. Every reachable
+  method/path pair must have an operator-configured role and assurance rule;
+  rules are immutable until a validated process restart.
 - Generic OIDC and WebAuthn providers are not implemented. The concrete local
   provider supports password and password+TOTP only.
 - PostgreSQL provides durable sessions, authentication transactions, recovery
   codes, identities, external links, organizations, memberships, password
   verifiers and AES-256-GCM-encrypted TOTP seeds. Bootstrap and administrative
-  member-lifecycle audit persistence is transactional; general audit persistence
-  and fleet-wide rate limiting remain deployment work.
+  member-lifecycle and rejected-authorization audit persistence is transactional;
+  general audit persistence and fleet-wide rate limiting remain deployment work.
 
 ## Verification gates
 

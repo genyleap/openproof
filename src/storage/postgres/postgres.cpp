@@ -269,9 +269,9 @@ struct LockedMember final {
         "administration", std::move(action), "success", std::move(fields));
 }
 
-[[nodiscard]] foundation::Status appendAdministrationRecords(
+[[nodiscard]] foundation::Status appendAuditRecord(
     PGconn* connection, const audit::AuditEvent& event,
-    const audit::AuditKey& key, std::string_view securityType)
+    const audit::AuditKey& key)
 {
     ResultPointer auditLock = exec(
         connection, "SELECT pg_advisory_xact_lock(7299730475761673314)");
@@ -326,22 +326,39 @@ struct LockedMember final {
         "WHERE sequence=$1",
         {std::to_string(sequence.value()), foundation::toHex(recordHash.value())},
         "seal administration audit event");
-    if (!sealed) return sealed;
+    return sealed;
+}
 
+[[nodiscard]] foundation::Status appendSecurityRecord(
+    PGconn* connection, const audit::AuditEvent& event,
+    std::string_view securityType, std::string_view actorIdentity,
+    std::string_view severity)
+{
     foundation::JsonObjectWriter payload;
     payload.add("event_id", event.id().value())
         .add("type", securityType)
         .add("organization_id", event.organization()->value())
         .add("identity_id", event.identity()->value())
-        .add("actor_identity_id", event.fields().at("actor_identity_id"))
-        .add("severity", "critical");
+        .add("actor_identity_id", actorIdentity)
+        .add("severity", severity);
     return runCommand(
         connection,
         "INSERT INTO openproof.security_event_outbox"
         "(event_id,occurred_at_ms,payload) VALUES($1,$2,$3::jsonb)",
         {std::string{event.id().value()}, instant(event.occurredAt()),
          payload.build()},
-        "append administration security event");
+        "append security event");
+}
+
+[[nodiscard]] foundation::Status appendAdministrationRecords(
+    PGconn* connection, const audit::AuditEvent& event,
+    const audit::AuditKey& key, std::string_view securityType)
+{
+    auto recorded = appendAuditRecord(connection, event, key);
+    if (!recorded) return recorded;
+    return appendSecurityRecord(
+        connection, event, securityType,
+        event.fields().at("actor_identity_id"), "critical");
 }
 
 constexpr std::string_view kSessionColumns =
@@ -2300,6 +2317,60 @@ foundation::Status PostgresAdministrationRepository::resetCredentials(
         "administration.local-member.credentials-reset");
     if (!status) return failTransaction(status.error());
     return commit(connection);
+}
+
+PostgresAuthorizationDecisionSink::PostgresAuthorizationDecisionSink(
+    ConnectionPool& pool, audit::AuditKey auditKey,
+    const foundation::ClockSource& clock)
+    : m_pool(&pool), m_auditKey(std::move(auditKey)), m_clock(&clock)
+{
+}
+
+foundation::Status PostgresAuthorizationDecisionSink::record(
+    const session::AuthenticatedSession& authenticatedSession,
+    const identity::core::OrganizationId& organization,
+    const policy::Action& action, const policy::Resource& resource,
+    const policy::AuthorizationDecision& decision,
+    const foundation::CorrelationId& correlation)
+{
+    auto randomId = security::randomTokenBase64Url(24U);
+    if (!randomId) return foundation::fail(randomId.error());
+    const foundation::Instant now = m_clock->now();
+    auto event = audit::AuditEvent::create(
+        audit::AuditEventId{"authorization-" + randomId.value()}, now,
+        correlation,
+        std::optional<identity::core::OrganizationId>{organization},
+        std::optional<identity::core::IdentityId>{
+            authenticatedSession.session().identity()},
+        "authorization", "protected-route.evaluate",
+        std::string{policy::decisionKindName(decision.kind())},
+        audit::AuditFields{
+            {"action", std::string{action.value()}},
+            {"assurance", std::string{identity::provider::assuranceLevelName(
+                              authenticatedSession.session().assurance())}},
+            {"provider", std::string{
+                             authenticatedSession.session().provider().value()}},
+            {"reason", std::string{decision.reason()}},
+            {"resource", std::string{resource.value()}}});
+    if (!event) return foundation::fail(event.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    const auto failTransaction = [&](const foundation::Error& error) {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    auto recorded = appendAuditRecord(connection, event.value(), m_auditKey);
+    if (!recorded) return failTransaction(recorded.error());
+    recorded = appendSecurityRecord(
+        connection, event.value(), "authorization.protected-route.denied",
+        authenticatedSession.session().identity().value(), "warning");
+    if (!recorded) return failTransaction(recorded.error());
+    auto committed = commit(connection);
+    return committed ? committed : failTransaction(committed.error());
 }
 
 }

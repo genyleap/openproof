@@ -295,26 +295,16 @@ extern "C" void requestShutdown(int) noexcept
 class DenyAccess final : public gateway::AccessController {
 public:
     [[nodiscard]] policy::AuthorizationDecision authorize(
-        const session::AuthenticatedSession&, const gateway::Route&) override
+        const session::AuthenticatedSession&, const gateway::Route&,
+        const fnd::CorrelationId&) override
     {
         return policy::AuthorizationDecision::deny(
             "No protected-route policy is configured in this process.");
     }
 };
 
-class ActiveMemberPolicy final : public policy::PolicyEngine {
-public:
-    [[nodiscard]] policy::AuthorizationDecision evaluate(
-        const policy::AuthorizationRequest&) override
-    {
-        return policy::AuthorizationDecision::allow(
-            "The active organization member may reach the configured upstream.");
-    }
-};
-
-[[nodiscard]] fnd::Status addRoutes(gateway::Router& router,
-                                    std::string_view prefix, bool protectedRoute,
-                                    identity::OrganizationId organization)
+[[nodiscard]] fnd::Status addPublicRoutes(
+    gateway::Router& router, std::string_view prefix)
 {
     constexpr gateway::HttpMethod methods[] = {
         gateway::HttpMethod::Get, gateway::HttpMethod::Head,
@@ -325,17 +315,68 @@ public:
         auto route = gateway::Route::create(
             gateway::RouteId{std::string{"default-"} +
                 std::string{gateway::httpMethodName(method)}},
-            method, std::string{prefix}, gateway::ServiceId{"default"}, protectedRoute,
-            organization,
-            protectedRoute ? policy::Action{std::string{"proxy."}
-                + std::string{gateway::httpMethodName(method)}} : policy::Action{},
-            protectedRoute ? policy::Resource{std::string{"upstream:"}
-                + std::string{prefix}} : policy::Resource{});
+            method, std::string{prefix}, gateway::ServiceId{"default"}, false,
+            identity::OrganizationId{}, policy::Action{}, policy::Resource{});
         if (!route.has_value()) return fnd::fail(route.error());
         const fnd::Status added = router.add(std::move(route).value());
         if (!added.has_value()) return fnd::fail(added.error());
     }
     return fnd::ok();
+}
+
+[[nodiscard]] fnd::Result<idp::AssuranceLevel>
+configuredAssurance(std::string_view value)
+{
+    if (value == "ial1") return idp::AssuranceLevel::Ial1;
+    if (value == "ial2") return idp::AssuranceLevel::Ial2;
+    if (value == "ial3") return idp::AssuranceLevel::Ial3;
+    if (value == "ial4") return idp::AssuranceLevel::Ial4;
+    return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                     "The route assurance policy is invalid.");
+}
+
+[[nodiscard]] fnd::Result<std::vector<policy::RolePolicyRule>>
+addProtectedRoutes(gateway::Router& router,
+                   const std::vector<cfg::RoutePolicyConfig>& configured,
+                   const identity::OrganizationId& organization)
+{
+    std::vector<policy::RolePolicyRule> rules;
+    std::size_t routeIndex = 0U;
+    for (const cfg::RoutePolicyConfig& routePolicy : configured) {
+        auto assurance = configuredAssurance(routePolicy.minimumAssurance());
+        if (!assurance) return fnd::fail(assurance.error());
+        std::vector<policy::Role> requiredRoles;
+        requiredRoles.reserve(routePolicy.requiredRoles().size());
+        for (const std::string& role : routePolicy.requiredRoles()) {
+            requiredRoles.emplace_back(role);
+        }
+        for (const std::string& methodName : routePolicy.methods()) {
+            auto method = gateway::parseHttpMethod(methodName);
+            if (!method) return fnd::fail(method.error());
+            const std::string actionName = "proxy."
+                + std::string{gateway::httpMethodName(method.value())}
+                + ":" + std::string{routePolicy.pathPrefix()};
+            const std::string resourceName =
+                "upstream:" + std::string{routePolicy.pathPrefix()};
+            auto route = gateway::Route::create(
+                gateway::RouteId{"policy-" + std::to_string(routeIndex++)},
+                method.value(), std::string{routePolicy.pathPrefix()},
+                gateway::ServiceId{"default"}, true, organization,
+                policy::Action{actionName}, policy::Resource{resourceName});
+            auto rule = policy::RolePolicyRule::create(
+                policy::Action{actionName}, policy::Resource{resourceName},
+                requiredRoles,
+                routePolicy.roleMatch() == "all"
+                    ? policy::RoleMatchMode::All : policy::RoleMatchMode::Any,
+                assurance.value());
+            if (!route) return fnd::fail(route.error());
+            if (!rule) return fnd::fail(rule.error());
+            auto added = router.add(std::move(route).value());
+            if (!added) return fnd::fail(added.error());
+            rules.push_back(std::move(rule).value());
+        }
+    }
+    return rules;
 }
 
 [[nodiscard]] fnd::Result<fnd::SecretString> deriveSecret(
@@ -526,13 +567,20 @@ public:
 
     gateway::Router router;
     const bool authenticationEnabled = platform.auth().enabled();
-    const std::string_view routePrefix = authenticationEnabled
-        ? platform.auth().protectedRoutePrefix() : platform.gateway().routePrefix();
-    const fnd::Status routes = addRoutes(
-        router, routePrefix, authenticationEnabled,
-        authenticationEnabled
-            ? identity::OrganizationId{std::string{platform.auth().organizationId()}}
-            : identity::OrganizationId{});
+    fnd::Status routes = fnd::ok();
+    std::vector<policy::RolePolicyRule> authorizationRules;
+    if (authenticationEnabled) {
+        auto configuredRoutes = addProtectedRoutes(
+            router, platform.auth().routePolicies(),
+            identity::OrganizationId{std::string{platform.auth().organizationId()}});
+        if (!configuredRoutes) {
+            reportStartupFailure(configuredRoutes.error());
+            return ExitCode::ConfigurationError;
+        }
+        authorizationRules = std::move(configuredRoutes).value();
+    } else {
+        routes = addPublicRoutes(router, platform.gateway().routePrefix());
+    }
     gateway::StaticServiceDiscovery discovery;
     auto endpoint = gateway::Endpoint::create(
         gateway::EndpointId{"default-1"},
@@ -615,13 +663,15 @@ public:
     auto administrationPasswordHasher = credentials::PasswordHasher::create(
         passwordSecret->clone(), credentials::PasswordPolicy::recommended());
     auto administrationTotpKey = security::AeadKey::create(totpSecret->clone());
-    auto administrationAuditKey = audit::AuditKey::create(
+    auto administrationAuditKey = audit::AuditKey::create(auditSecret->clone());
+    auto authorizationAuditKey = audit::AuditKey::create(
         std::move(auditSecret).value());
     auto passwordHasher = credentials::PasswordHasher::create(
         std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
     if (!passwordHasher || !totpKey || !administrationPasswordHasher
-        || !administrationTotpKey || !administrationAuditKey) {
+        || !administrationTotpKey || !administrationAuditKey
+        || !authorizationAuditKey) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -656,9 +706,17 @@ public:
         std::chrono::minutes{5}};
     session::SessionService sessions{
         sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
-    ActiveMemberPolicy memberPolicy;
+    auto memberPolicy = policy::RolePolicyEngine::create(
+        std::move(authorizationRules));
+    if (!memberPolicy) {
+        reportStartupFailure(memberPolicy.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::PostgresAuthorizationDecisionSink authorizationAudit{
+        *pool.value(), std::move(authorizationAuditKey).value(), clock};
     gateway::PolicyAccessController access{
-        &memberPolicy, organizations, identities, memberships};
+        memberPolicy->get(), organizations, identities, memberships,
+        &authorizationAudit};
     gateway::Gateway gatewayCore{
         router, sessions, access, limiter.value(), discovery, loadBalancer,
         circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};

@@ -1,6 +1,7 @@
 module;
 
 #include <algorithm>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -286,6 +287,120 @@ bool AuthorizationDecision::isPermitted() const noexcept
     // Written as an allow-list of exactly one value. A deny-list spelling would
     // silently permit any decision kind added later.
     return m_kind == DecisionKind::Allow;
+}
+
+std::string_view roleMatchModeName(RoleMatchMode mode) noexcept
+{
+    switch (mode) {
+    case RoleMatchMode::Any: return "any";
+    case RoleMatchMode::All: return "all";
+    }
+    return "all";
+}
+
+RolePolicyRule::RolePolicyRule(
+    Action actionValue, Resource resourceValue,
+    std::vector<Role> requiredRolesValue, RoleMatchMode roleMatchValue,
+    identity::provider::AssuranceLevel minimumAssuranceValue)
+    : m_action(std::move(actionValue)), m_resource(std::move(resourceValue)),
+      m_requiredRoles(std::move(requiredRolesValue)),
+      m_roleMatch(roleMatchValue), m_minimumAssurance(minimumAssuranceValue)
+{
+}
+
+foundation::Result<RolePolicyRule> RolePolicyRule::create(
+    Action action, Resource resource, std::vector<Role> requiredRoles,
+    RoleMatchMode roleMatch,
+    identity::provider::AssuranceLevel minimumAssurance)
+{
+    const bool recognizedMode = roleMatch == RoleMatchMode::Any
+        || roleMatch == RoleMatchMode::All;
+    const bool recognizedAssurance =
+        minimumAssurance >= identity::provider::AssuranceLevel::Ial1
+        && minimumAssurance <= identity::provider::AssuranceLevel::Ial4;
+    if (action.empty() || resource.empty() || requiredRoles.empty()
+        || requiredRoles.size() > 16U || !recognizedMode
+        || !recognizedAssurance
+        || std::ranges::any_of(requiredRoles, [](const Role& role) {
+               return role.empty() || role.value().size() > 200U
+                   || std::ranges::any_of(role.value(), [](char symbol) {
+                          const auto byte = static_cast<unsigned char>(symbol);
+                          return byte < 0x21U || byte == 0x7FU;
+                      });
+           })) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The route authorization rule is invalid.");
+    }
+    std::ranges::sort(requiredRoles);
+    if (std::ranges::adjacent_find(requiredRoles) != requiredRoles.end()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Required route roles must be unique.");
+    }
+    return RolePolicyRule{std::move(action), std::move(resource),
+                          std::move(requiredRoles), roleMatch,
+                          minimumAssurance};
+}
+
+const Action& RolePolicyRule::action() const noexcept { return m_action; }
+const Resource& RolePolicyRule::resource() const noexcept { return m_resource; }
+const std::vector<Role>& RolePolicyRule::requiredRoles() const noexcept
+{ return m_requiredRoles; }
+RoleMatchMode RolePolicyRule::roleMatch() const noexcept { return m_roleMatch; }
+identity::provider::AssuranceLevel
+RolePolicyRule::minimumAssurance() const noexcept { return m_minimumAssurance; }
+
+RolePolicyEngine::RolePolicyEngine(std::vector<RolePolicyRule> rules)
+    : m_rules(std::move(rules))
+{
+}
+
+foundation::Result<std::unique_ptr<RolePolicyEngine>>
+RolePolicyEngine::create(std::vector<RolePolicyRule> rules)
+{
+    if (rules.empty() || rules.size() > 256U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "At least one bounded route policy is required.");
+    }
+    std::ranges::sort(rules, {}, [](const RolePolicyRule& rule) {
+        return std::pair{rule.action(), rule.resource()};
+    });
+    if (std::ranges::adjacent_find(
+            rules, {}, [](const RolePolicyRule& rule) {
+                return std::pair{rule.action(), rule.resource()};
+            }) != rules.end()) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "A route policy is duplicated.");
+    }
+    return std::unique_ptr<RolePolicyEngine>{
+        new RolePolicyEngine{std::move(rules)}};
+}
+
+AuthorizationDecision RolePolicyEngine::evaluate(
+    const AuthorizationRequest& request)
+{
+    const auto rule = std::ranges::find_if(m_rules, [&](const RolePolicyRule& item) {
+        return item.action() == request.action()
+            && item.resource() == request.resource();
+    });
+    if (rule == m_rules.end()) {
+        return AuthorizationDecision::notApplicable(
+            "No exact route authorization rule matched.");
+    }
+    if (!identity::provider::meetsAssurance(
+            request.authentication().claimedAssurance(),
+            rule->minimumAssurance())) {
+        return AuthorizationDecision::deny(
+            "The authenticated session does not meet the route assurance requirement.");
+    }
+    const auto holds = [&](const Role& role) { return request.hasRole(role); };
+    const bool permitted = rule->roleMatch() == RoleMatchMode::All
+        ? std::ranges::all_of(rule->requiredRoles(), holds)
+        : std::ranges::any_of(rule->requiredRoles(), holds);
+    return permitted
+        ? AuthorizationDecision::allow(
+              "The trusted membership satisfies the route role policy.")
+        : AuthorizationDecision::deny(
+              "The trusted membership does not satisfy the route role policy.");
 }
 
 AuthorizationDecision evaluateProtected(PolicyEngine* engine,

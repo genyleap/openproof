@@ -219,6 +219,76 @@ TEST(AuthorizationDecisionTest, CarriesAReason)
     EXPECT_FALSE(pol::decisionKindName(decision.kind()).empty());
 }
 
+TEST(RolePolicyRuleTest, CanonicalizesAndRejectsDuplicateRequiredRoles)
+{
+    auto rule = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"viewer"}, pol::Role{"owner"}},
+        pol::RoleMatchMode::Any, idp::AssuranceLevel::Ial2);
+    ASSERT_TRUE(rule);
+    EXPECT_EQ(rule->requiredRoles(),
+              (std::vector<pol::Role>{pol::Role{"owner"}, pol::Role{"viewer"}}));
+    EXPECT_FALSE(pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"owner"}, pol::Role{"owner"}},
+        pol::RoleMatchMode::Any, idp::AssuranceLevel::Ial2));
+}
+
+TEST(RolePolicyEngineTest, RequiresAnExactRuleAndTheConfiguredAssurance)
+{
+    auto rule = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"owner"}}, pol::RoleMatchMode::All,
+        idp::AssuranceLevel::Ial4).value();
+    auto engine = pol::RolePolicyEngine::create({std::move(rule)});
+    ASSERT_TRUE(engine);
+    EXPECT_TRUE((*engine)->evaluate(baseRequest()).isPermitted());
+
+    auto unmatched = pol::RolePolicyRule::create(
+        pol::Action{"another.action"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"owner"}}, pol::RoleMatchMode::All,
+        idp::AssuranceLevel::Ial1).value();
+    auto unmatchedEngine = pol::RolePolicyEngine::create({std::move(unmatched)});
+    ASSERT_TRUE(unmatchedEngine);
+    EXPECT_EQ((*unmatchedEngine)->evaluate(baseRequest()).kind(),
+              pol::DecisionKind::NotApplicable);
+}
+
+TEST(RolePolicyEngineTest, EnforcesAnyAndAllRoleSemantics)
+{
+    auto anyRule = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"missing"}, pol::Role{"owner"}},
+        pol::RoleMatchMode::Any, idp::AssuranceLevel::Ial1).value();
+    auto anyEngine = pol::RolePolicyEngine::create({std::move(anyRule)});
+    ASSERT_TRUE(anyEngine);
+    EXPECT_TRUE((*anyEngine)->evaluate(baseRequest()).isPermitted());
+
+    auto allRule = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"missing"}, pol::Role{"owner"}},
+        pol::RoleMatchMode::All, idp::AssuranceLevel::Ial1).value();
+    auto allEngine = pol::RolePolicyEngine::create({std::move(allRule)});
+    ASSERT_TRUE(allEngine);
+    EXPECT_EQ((*allEngine)->evaluate(baseRequest()).kind(),
+              pol::DecisionKind::Deny);
+}
+
+TEST(RolePolicyEngineTest, RejectsDuplicateAndEmptyRuleSets)
+{
+    EXPECT_FALSE(pol::RolePolicyEngine::create({}));
+    auto first = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"owner"}}, pol::RoleMatchMode::All,
+        idp::AssuranceLevel::Ial1).value();
+    auto second = pol::RolePolicyRule::create(
+        pol::Action{"agent.execute"}, pol::Resource{"billing:invoice/42"},
+        {pol::Role{"viewer"}}, pol::RoleMatchMode::Any,
+        idp::AssuranceLevel::Ial2).value();
+    EXPECT_FALSE(pol::RolePolicyEngine::create(
+        {std::move(first), std::move(second)}));
+}
+
 // --- Fail-closed ------------------------------------------------------------
 
 TEST(EvaluateProtectedTest, PermitsOnlyAnExplicitAllow)

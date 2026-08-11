@@ -108,13 +108,46 @@ opens the listener.
 | `enabled` | boolean | `false` | Public |
 | `provider_id` | non-empty string | `local` | Private |
 | `organization_id` | non-empty string when enabled | unset | Private |
-| `protected_route_prefix` | canonical origin path prefix | `/` | Public |
+| `protected_route_prefix` | canonical boundary containing every policy path | `/` | Public |
+| `route_policies` | array of closed route-policy tables | required when enabled | Private |
 
 When enabled, the configured organization must already exist and be active.
-Every matching gateway route requires a valid session and an active membership
-in that organization. The auth plane owns `/auth` and `/auth/*`. There is no
+Only method/path pairs declared by `route_policies` exist in the protected
+router; an undeclared pair returns `404` and cannot fall through to a broader
+allow. Every declared route requires a valid session, active identity,
+organization and membership. The auth plane owns `/auth` and `/auth/*`, while
+the administration plane owns `/admin` and `/admin/*`; policies cannot claim
+either namespace. There is no
 public registration or self-service password/TOTP enrollment endpoint. Member
 administration is owner-only; policy administration is not implemented.
+
+Each `[[auth.route_policies]]` table accepts exactly these fields:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `path_prefix` | yes | Canonical path prefix inside `protected_route_prefix` |
+| `methods` | yes | Non-empty unique subset of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` |
+| `required_roles` | yes | One to 16 unique organization roles |
+| `role_match` | no | `any` (default) or `all` |
+| `minimum_assurance` | no | `ial1` (default), `ial2`, `ial3`, or `ial4` |
+
+```toml
+[[auth.route_policies]]
+path_prefix = "/api/reports"
+methods = ["GET", "POST"]
+required_roles = ["report-reader", "report-admin"]
+role_match = "any"
+minimum_assurance = "ial2"
+```
+
+Policies are immutable for the process lifetime and validated before the
+listener opens. Empty/duplicate rules, duplicate method/path pairs, unknown
+fields, unsupported methods, invalid roles and policies outside the configured
+boundary fail startup. Role and assurance evaluation uses only the trusted
+authorization request rebuilt from PostgreSQL. Missing/invalid authentication
+returns `401`; an authenticated subject failing membership, role or assurance
+checks returns `403`. Every rejected authenticated decision is atomically added
+to the HMAC audit chain and security-event outbox.
 
 | Method and path | Purpose | Authentication |
 |---|---|---|
@@ -286,6 +319,13 @@ enabled = true
 provider_id = "local"
 organization_id = "tenant-id"
 protected_route_prefix = "/api"
+
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial2"
 ```
 
 ```bash

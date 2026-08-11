@@ -644,24 +644,48 @@ PolicyAccessController::PolicyAccessController(
     policy::PolicyEngine* policies,
     const organization::OrganizationRepository& organizations,
     const identity::core::IdentityRepository& identities,
-    const organization::MembershipRepository& memberships)
+    const organization::MembershipRepository& memberships,
+    policy::AuthorizationDecisionSink* decisionSink)
     : m_policies(policies), m_organizations(&organizations), m_identities(&identities),
-      m_memberships(&memberships)
+      m_memberships(&memberships), m_decisionSink(decisionSink)
 {
 }
 
 policy::AuthorizationDecision PolicyAccessController::authorize(
-    const session::AuthenticatedSession& authenticatedSession, const Route& route)
+    const session::AuthenticatedSession& authenticatedSession, const Route& route,
+    const foundation::CorrelationId& correlation)
 {
     auto request = policy::AuthorizationRequest::create(
         authenticatedSession, route.organization(), *m_organizations,
         *m_identities, *m_memberships, route.action(), route.resource());
     if (!request.has_value()) {
-        return policy::AuthorizationDecision::indeterminate(
+        policy::AuthorizationDecision decision =
+            policy::AuthorizationDecision::indeterminate(
             std::string{"Trusted authorization context failed: "}
             + std::string{request.error().internalDetail()});
+        if (m_decisionSink != nullptr) {
+            const auto recorded = m_decisionSink->record(
+                authenticatedSession, route.organization(), route.action(),
+                route.resource(), decision, correlation);
+            if (!recorded) {
+                return policy::AuthorizationDecision::indeterminate(
+                    "Authorization failed and its security audit could not be persisted.");
+            }
+        }
+        return decision;
     }
-    return policy::evaluateProtected(m_policies, request.value());
+    policy::AuthorizationDecision decision =
+        policy::evaluateProtected(m_policies, request.value());
+    if (!decision.isPermitted() && m_decisionSink != nullptr) {
+        const auto recorded = m_decisionSink->record(
+            authenticatedSession, route.organization(), route.action(),
+            route.resource(), decision, correlation);
+        if (!recorded) {
+            return policy::AuthorizationDecision::indeterminate(
+                "Authorization was denied and its security audit could not be persisted.");
+        }
+    }
+    return decision;
 }
 
 TrustedContextKey::TrustedContextKey(foundation::SecretString key)
@@ -793,7 +817,8 @@ HttpResponse Gateway::handle(HttpRequest request)
             return errorResponse(foundation::Error{foundation::ErrorCode::RateLimited}, request);
         }
         const policy::AuthorizationDecision decision =
-            m_access->authorize(authenticated.value(), route.value());
+            m_access->authorize(authenticated.value(), route.value(),
+                                request.correlation());
         if (!decision.isPermitted()) {
             return errorResponse(foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
         }

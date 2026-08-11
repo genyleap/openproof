@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -13,6 +14,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.organization;
 import openproof.policy;
 import openproof.security;
 import openproof.session;
@@ -25,10 +27,13 @@ namespace fnd = openproof::foundation;
 namespace gw = openproof::gateway;
 namespace idp = openproof::identity::provider;
 namespace pol = openproof::policy;
+namespace org = openproof::organization;
 namespace sec = openproof::security;
 namespace sess = openproof::session;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
+constexpr std::string_view kSessionKey =
+    "0123456789abcdef0123456789abcdef";
 
 class TestProvider final : public idp::AuthenticationProvider {
 public:
@@ -84,8 +89,29 @@ public:
 class AllowAccess final : public gw::AccessController {
 public:
     [[nodiscard]] pol::AuthorizationDecision authorize(
-        const sess::AuthenticatedSession&, const gw::Route&) override
+        const sess::AuthenticatedSession&, const gw::Route&,
+        const fnd::CorrelationId&) override
     { return pol::AuthorizationDecision::allow("test permit"); }
+};
+
+class RecordingDecisionSink final : public pol::AuthorizationDecisionSink {
+public:
+    [[nodiscard]] fnd::Status record(
+        const sess::AuthenticatedSession& authenticated,
+        const core::OrganizationId&, const pol::Action&, const pol::Resource&,
+        const pol::AuthorizationDecision& decision,
+        const fnd::CorrelationId& correlation) override
+    {
+        ++calls;
+        identity = std::string{authenticated.session().identity().value()};
+        kind = decision.kind();
+        requestId = std::string{correlation.value()};
+        return fnd::ok();
+    }
+    std::size_t calls{};
+    std::string identity;
+    pol::DecisionKind kind{pol::DecisionKind::Allow};
+    std::string requestId;
 };
 
 class RecordingProxy final : public gw::ProxyTransport {
@@ -154,7 +180,7 @@ struct GatewayFixture {
               std::chrono::seconds{30}).value()),
           sessions(sessionRepository, clock,
               sess::SessionKey::create(fnd::SecretString{
-                  "0123456789abcdef0123456789abcdef"}).value(),
+                  std::string{kSessionKey}}).value(),
               sess::SessionPolicy::create(std::chrono::hours{8},
                                           std::chrono::minutes{30}).value()),
           limiter(gw::TokenBucketRateLimiter::create(clock, 100.0, 100.0, 1000U).value()),
@@ -163,6 +189,27 @@ struct GatewayFixture {
         EXPECT_TRUE(discovery.set(gw::ServiceId{"service"},
             {gw::Endpoint::create(gw::EndpointId{"one"}, "127.0.0.1", 9001U, false, 1U).value(),
              gw::Endpoint::create(gw::EndpointId{"two"}, "127.0.0.1", 9002U, false, 1U).value()}));
+    }
+
+    [[nodiscard]] sess::AuthenticatedSession authenticated(
+        idp::AssuranceLevel assurance = idp::AssuranceLevel::Ial2)
+    {
+        const std::string assuranceName{idp::assuranceLevelName(assurance)};
+        const std::string token = "gateway-policy-token-" + assuranceName;
+        const auto digest = sec::hmacSha256(
+            fnd::SecretString{std::string{kSessionKey}}, token).value();
+        EXPECT_TRUE(sessionRepository.add(sess::Session::create(
+            sess::SessionId{"gateway-policy-session-" + assuranceName},
+            core::IdentityId{"identity-1"}, idp::ProviderId{"test"}, assurance,
+            idp::AuthenticationStrength{
+                assurance == idp::AssuranceLevel::Ial1
+                    ? idp::AuthenticationFactor::Knowledge
+                    : idp::AuthenticationFactor::Knowledge
+                        | idp::AuthenticationFactor::Possession,
+                false},
+            kNow, sess::TokenDigest{digest}, kNow, std::chrono::hours{8},
+            std::chrono::minutes{30}).value()));
+        return sessions.authenticate(fnd::SecretString{token}).value();
     }
     fnd::ManualClockSource clock;
     gw::TrustedContextSigner signer;
@@ -174,6 +221,58 @@ struct GatewayFixture {
     gw::WeightedRoundRobin balancer;
     gw::CircuitBreaker circuits;
 };
+
+TEST(PolicyAccessControllerTest, UsesDurableRolesAssuranceAndAuditsDenials)
+{
+    GatewayFixture fixture;
+    org::InMemoryOrganizationRepository organizations;
+    core::InMemoryIdentityRepository identities;
+    org::InMemoryMembershipRepository memberships;
+    ASSERT_TRUE(organizations.add(org::Organization::create(
+        core::OrganizationId{"org"}, "Organization", kNow).value()));
+    ASSERT_TRUE(identities.add(
+        core::OrganizationId{"org"},
+        core::Identity::create(core::IdentityId{"identity-1"},
+                               core::SubjectKind::Human, kNow).value()));
+    auto membership = org::Membership::invite(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"}, kNow).value();
+    ASSERT_TRUE(membership.grantRole(org::Role{"reader"}));
+    ASSERT_TRUE(membership.accept());
+    ASSERT_TRUE(memberships.add(membership));
+
+    auto rule = pol::RolePolicyRule::create(
+        pol::Action{"read"}, pol::Resource{"thing"}, {pol::Role{"reader"}},
+        pol::RoleMatchMode::All, idp::AssuranceLevel::Ial2).value();
+    auto engine = pol::RolePolicyEngine::create({std::move(rule)}).value();
+    RecordingDecisionSink auditSink;
+    gw::PolicyAccessController access{
+        engine.get(), organizations, identities, memberships, &auditSink};
+    const sess::AuthenticatedSession ial2 = fixture.authenticated();
+    EXPECT_TRUE(access.authorize(
+        ial2, route(true), fnd::CorrelationId{"allowed"})
+                    .isPermitted());
+    EXPECT_EQ(auditSink.calls, 0U);
+
+    ASSERT_TRUE(membership.revokeRole(org::Role{"reader"}));
+    ASSERT_TRUE(membership.grantRole(org::Role{"viewer"}));
+    ASSERT_TRUE(memberships.save(membership));
+    const auto roleDenied = access.authorize(
+        ial2, route(true), fnd::CorrelationId{"role-denied"});
+    EXPECT_EQ(roleDenied.kind(), pol::DecisionKind::Deny);
+    EXPECT_EQ(auditSink.calls, 1U);
+    EXPECT_EQ(auditSink.identity, "identity-1");
+    EXPECT_EQ(auditSink.kind, pol::DecisionKind::Deny);
+    EXPECT_EQ(auditSink.requestId, "role-denied");
+
+    ASSERT_TRUE(membership.grantRole(org::Role{"reader"}));
+    ASSERT_TRUE(memberships.save(membership));
+    const auto assuranceDenied = access.authorize(
+        fixture.authenticated(idp::AssuranceLevel::Ial1), route(true),
+        fnd::CorrelationId{"assurance-denied"});
+    EXPECT_EQ(assuranceDenied.kind(), pol::DecisionKind::Deny);
+    EXPECT_EQ(auditSink.calls, 2U);
+    EXPECT_EQ(auditSink.requestId, "assurance-denied");
+}
 
 TEST(HttpRequestTest, RejectsAbsoluteFormControlCharactersAndAmbiguousFraming)
 {

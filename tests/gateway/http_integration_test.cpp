@@ -33,7 +33,8 @@ constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
 class AllowAccess final : public gw::AccessController {
 public:
     [[nodiscard]] pol::AuthorizationDecision authorize(
-        const sess::AuthenticatedSession&, const gw::Route&) override
+        const sess::AuthenticatedSession&, const gw::Route&,
+        const fnd::CorrelationId&) override
     { return pol::AuthorizationDecision::allow("test permit"); }
 };
 

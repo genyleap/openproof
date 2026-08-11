@@ -15,6 +15,7 @@ module;
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 // The TOML parser is configured to report failures as values rather than
 // exceptions, and this is load-bearing rather than stylistic.
@@ -121,8 +122,51 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (const toml::table* auth = document["auth"].as_table(); auth != nullptr) {
         const foundation::Status keys = validateTableKeys(
             *auth, "auth", {"enabled", "provider_id", "organization_id",
-                             "protected_route_prefix"});
+                             "protected_route_prefix", "route_policies"});
         if (!keys.has_value()) return foundation::fail(keys.error());
+        if (const toml::node* policies = auth->get("route_policies");
+            policies != nullptr) {
+            const toml::array* array = policies->as_array();
+            if (array == nullptr || array->empty() || array->size() > 256U) {
+                return foundation::fail(
+                    foundation::ErrorCode::InvalidArgument,
+                    "The route policy configuration is invalid.");
+            }
+            for (const toml::node& node : *array) {
+                const toml::table* policy = node.as_table();
+                if (policy == nullptr) {
+                    return foundation::fail(
+                        foundation::ErrorCode::InvalidArgument,
+                        "Each route policy must be a TOML table.");
+                }
+                const foundation::Status policyKeys = validateTableKeys(
+                    *policy, "auth.route_policies",
+                    {"path_prefix", "methods", "required_roles", "role_match",
+                     "minimum_assurance"});
+                if (!policyKeys) return foundation::fail(policyKeys.error());
+                const auto requiredString = [&](std::string_view key) {
+                    const toml::node* value = policy->get(key);
+                    return value != nullptr && value->is_string();
+                };
+                const auto requiredArray = [&](std::string_view key) {
+                    const toml::node* value = policy->get(key);
+                    return value != nullptr && value->is_array();
+                };
+                const auto optionalString = [&](std::string_view key) {
+                    const toml::node* value = policy->get(key);
+                    return value == nullptr || value->is_string();
+                };
+                if (!requiredString("path_prefix")
+                    || !requiredArray("methods")
+                    || !requiredArray("required_roles")
+                    || !optionalString("role_match")
+                    || !optionalString("minimum_assurance")) {
+                    return foundation::fail(
+                        foundation::ErrorCode::InvalidArgument,
+                        "A route policy setting has the wrong type.");
+                }
+            }
+        }
     }
 
     const auto requireType = [&document](std::string_view section, std::string_view key,
@@ -196,8 +240,34 @@ constexpr std::uint16_t kDefaultPort = 8443;
             "auth", key, [](const auto& node) { return node.is_string(); }, "a string");
         if (!type.has_value()) return foundation::fail(type.error());
     }
+    const foundation::Status routePolicies = requireType(
+        "auth", "route_policies", [](const auto& node) { return node.is_array(); },
+        "an array of tables");
+    if (!routePolicies.has_value()) return foundation::fail(routePolicies.error());
 
     return foundation::ok();
+}
+
+[[nodiscard]] foundation::Result<std::vector<std::string>> stringArray(
+    const toml::table& table, std::string_view key)
+{
+    const toml::array* values = table[key].as_array();
+    if (values == nullptr) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A route policy array is missing or invalid.");
+    }
+    std::vector<std::string> output;
+    output.reserve(values->size());
+    for (const toml::node& node : *values) {
+        const auto value = node.value<std::string>();
+        if (!value.has_value()) {
+            return foundation::fail(
+                foundation::ErrorCode::InvalidArgument,
+                "Every route policy array item must be a string.");
+        }
+        output.push_back(*value);
+    }
+    return output;
 }
 
 [[nodiscard]] foundation::Result<std::string> readFileContents(const std::filesystem::path& path)
@@ -451,15 +521,86 @@ std::size_t DatabaseConfig::poolSize() const noexcept { return m_poolSize; }
 const std::filesystem::path& DatabaseConfig::migrationDirectory() const noexcept
 { return m_migrationDirectory; }
 
+RoutePolicyConfig::RoutePolicyConfig(
+    std::string pathPrefix, std::vector<std::string> methods,
+    std::vector<std::string> requiredRoles, std::string roleMatch,
+    std::string minimumAssurance)
+    : m_pathPrefix(std::move(pathPrefix)), m_methods(std::move(methods)),
+      m_requiredRoles(std::move(requiredRoles)), m_roleMatch(std::move(roleMatch)),
+      m_minimumAssurance(std::move(minimumAssurance))
+{
+}
+
+foundation::Result<RoutePolicyConfig> RoutePolicyConfig::create(
+    std::string pathPrefix, std::vector<std::string> methods,
+    std::vector<std::string> requiredRoles, std::string roleMatch,
+    std::string minimumAssurance)
+{
+    const auto invalidText = [](std::string_view text, std::size_t maximum) {
+        return text.empty() || text.size() > maximum
+            || std::ranges::any_of(text, [](char value) {
+                   const auto byte = static_cast<unsigned char>(value);
+                   return byte < 0x21U || byte == 0x7FU;
+               });
+    };
+    constexpr std::string_view allowedMethods[] = {
+        "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"};
+    if (pathPrefix.empty() || !pathPrefix.starts_with('/')
+        || pathPrefix.starts_with("//") || pathPrefix.contains('?')
+        || pathPrefix.contains('#') || invalidText(pathPrefix, 2048U)
+        || (pathPrefix.size() > 1U && pathPrefix.ends_with('/'))
+        || pathPrefix == "/auth" || pathPrefix.starts_with("/auth/")
+        || pathPrefix == "/admin" || pathPrefix.starts_with("/admin/")
+        || methods.empty() || methods.size() > std::size(allowedMethods)
+        || requiredRoles.empty() || requiredRoles.size() > 16U
+        || (roleMatch != "any" && roleMatch != "all")
+        || (minimumAssurance != "ial1" && minimumAssurance != "ial2"
+            && minimumAssurance != "ial3" && minimumAssurance != "ial4")
+        || std::ranges::any_of(methods, [&](const std::string& method) {
+               return std::ranges::find(allowedMethods, method)
+                   == std::ranges::end(allowedMethods);
+           })
+        || std::ranges::any_of(requiredRoles, [&](const std::string& role) {
+               return invalidText(role, 200U);
+           })) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The route policy configuration is invalid.");
+    }
+    std::ranges::sort(methods);
+    std::ranges::sort(requiredRoles);
+    if (std::ranges::adjacent_find(methods) != methods.end()
+        || std::ranges::adjacent_find(requiredRoles) != requiredRoles.end()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Route policy methods and roles must be unique.");
+    }
+    return RoutePolicyConfig{std::move(pathPrefix), std::move(methods),
+                             std::move(requiredRoles), std::move(roleMatch),
+                             std::move(minimumAssurance)};
+}
+
+std::string_view RoutePolicyConfig::pathPrefix() const noexcept
+{ return m_pathPrefix; }
+const std::vector<std::string>& RoutePolicyConfig::methods() const noexcept
+{ return m_methods; }
+const std::vector<std::string>& RoutePolicyConfig::requiredRoles() const noexcept
+{ return m_requiredRoles; }
+std::string_view RoutePolicyConfig::roleMatch() const noexcept
+{ return m_roleMatch; }
+std::string_view RoutePolicyConfig::minimumAssurance() const noexcept
+{ return m_minimumAssurance; }
+
 AuthConfig::AuthConfig(bool enabled, std::string providerId,
-                       std::string organizationId, std::string protectedRoutePrefix)
+                       std::string organizationId, std::string protectedRoutePrefix,
+                       std::vector<RoutePolicyConfig> routePolicies)
     : m_enabled(enabled), m_providerId(std::move(providerId)),
       m_organizationId(std::move(organizationId)),
-      m_protectedRoutePrefix(std::move(protectedRoutePrefix)) {}
+      m_protectedRoutePrefix(std::move(protectedRoutePrefix)),
+      m_routePolicies(std::move(routePolicies)) {}
 
 foundation::Result<AuthConfig> AuthConfig::create(
     bool enabled, std::string providerId, std::string organizationId,
-    std::string protectedRoutePrefix)
+    std::string protectedRoutePrefix,
+    std::vector<RoutePolicyConfig> routePolicies)
 {
     const auto invalid = [](std::string_view text) {
         return std::ranges::any_of(text, [](char value) {
@@ -469,23 +610,46 @@ foundation::Result<AuthConfig> AuthConfig::create(
     };
     if (providerId.empty()) providerId = "local";
     if (protectedRoutePrefix.empty()) protectedRoutePrefix = "/";
-    if ((enabled && organizationId.empty()) || invalid(providerId)
+    if ((enabled && (organizationId.empty() || routePolicies.empty()))
+        || (!enabled && !routePolicies.empty()) || invalid(providerId)
         || invalid(organizationId) || !protectedRoutePrefix.starts_with('/')
         || protectedRoutePrefix.starts_with("//") || protectedRoutePrefix.contains('?')
         || protectedRoutePrefix.contains('#') || invalid(protectedRoutePrefix)
         || (protectedRoutePrefix.size() > 1U && protectedRoutePrefix.ends_with('/'))
-        || protectedRoutePrefix == "/auth") {
+        || protectedRoutePrefix == "/auth"
+        || std::ranges::any_of(routePolicies, [&](const RoutePolicyConfig& policy) {
+               return protectedRoutePrefix != "/"
+                   && policy.pathPrefix() != protectedRoutePrefix
+                   && !policy.pathPrefix().starts_with(protectedRoutePrefix + "/");
+           })) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The authentication configuration is invalid.");
     }
+    std::vector<std::string> routeKeys;
+    for (const RoutePolicyConfig& policy : routePolicies) {
+        for (const std::string& method : policy.methods()) {
+            routeKeys.emplace_back(method + " " + std::string{policy.pathPrefix()});
+        }
+    }
+    std::ranges::sort(routeKeys);
+    if (routeKeys.size() > 256U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "At most 256 protected method routes are allowed.");
+    }
+    if (std::ranges::adjacent_find(routeKeys) != routeKeys.end()) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "A protected route policy is duplicated.");
+    }
     return AuthConfig{enabled, std::move(providerId), std::move(organizationId),
-                      std::move(protectedRoutePrefix)};
+                      std::move(protectedRoutePrefix), std::move(routePolicies)};
 }
 bool AuthConfig::enabled() const noexcept { return m_enabled; }
 std::string_view AuthConfig::providerId() const noexcept { return m_providerId; }
 std::string_view AuthConfig::organizationId() const noexcept { return m_organizationId; }
 std::string_view AuthConfig::protectedRoutePrefix() const noexcept
 { return m_protectedRoutePrefix; }
+const std::vector<RoutePolicyConfig>& AuthConfig::routePolicies() const noexcept
+{ return m_routePolicies; }
 
 PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging,
                                SecurityConfig security, GatewayConfig gateway,
@@ -645,11 +809,39 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         std::move(databaseConnection), databasePoolSize,
         std::filesystem::path{document["database"]["migration_directory"].value_or(
             std::string{"migrations"})}};
+    std::vector<RoutePolicyConfig> routePolicies;
+    if (const toml::array* configuredPolicies =
+            document["auth"]["route_policies"].as_array();
+        configuredPolicies != nullptr) {
+        routePolicies.reserve(configuredPolicies->size());
+        for (const toml::node& node : *configuredPolicies) {
+            const toml::table* configured = node.as_table();
+            if (configured == nullptr) {
+                return foundation::fail(
+                    foundation::ErrorCode::InvalidArgument,
+                    "Each route policy must be a TOML table.");
+            }
+            auto methods = stringArray(*configured, "methods");
+            auto roles = stringArray(*configured, "required_roles");
+            if (!methods || !roles) {
+                return foundation::fail(methods ? roles.error() : methods.error());
+            }
+            auto policy = RoutePolicyConfig::create(
+                (*configured)["path_prefix"].value_or(std::string{}),
+                std::move(methods).value(), std::move(roles).value(),
+                (*configured)["role_match"].value_or(std::string{"any"}),
+                (*configured)["minimum_assurance"].value_or(
+                    std::string{"ial1"}));
+            if (!policy) return foundation::fail(policy.error());
+            routePolicies.push_back(std::move(policy).value());
+        }
+    }
     auto auth = AuthConfig::create(
         document["auth"]["enabled"].value_or(false),
         document["auth"]["provider_id"].value_or(std::string{"local"}),
         document["auth"]["organization_id"].value_or(std::string{}),
-        document["auth"]["protected_route_prefix"].value_or(std::string{"/"}));
+        document["auth"]["protected_route_prefix"].value_or(std::string{"/"}),
+        std::move(routePolicies));
     if (!auth) return foundation::fail(auth.error());
 
     return PlatformConfig{std::move(server).value(), LoggingConfig{level, console},

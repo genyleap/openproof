@@ -23,7 +23,8 @@ only as providers behind extension interfaces.
 >
 > `opp server` now has an opt-in operational authentication mode: HTTP login/MFA,
 > session rotation/revocation, recovery-code issuance, PostgreSQL-backed identities,
-> memberships, local password/TOTP credentials and protected-route enforcement.
+> memberships, local password/TOTP credentials and fail-closed protected-route
+> RBAC/assurance enforcement.
 > The first tenant owner is provisioned through the one-time offline
 > `bootstrap-admin` ceremony. An authenticated IAL2 owner can then create local
 > members, replace their complete role set, suspend/reinstate/remove memberships,
@@ -169,6 +170,13 @@ the exact request and response. The remaining local-member operations are
 `reinstate`, `remove`, and `credentials/reset`. Every mutation re-authorizes the
 active owner in PostgreSQL and revokes the target member's existing sessions.
 
+Protected upstream routes are declared explicitly with method, path prefix,
+required roles (`any`/`all`) and minimum IAL. The gateway rebuilds organization,
+identity, membership and roles from PostgreSQL for every request; client headers
+and session claims cannot inject authority. Missing policies deny by construction,
+and rejected authenticated decisions are committed to the HMAC audit chain and
+security outbox.
+
 The built-in incoming listener is intentionally plaintext and refuses any
 non-loopback bind. Terminate TLS in a trusted local reverse proxy/sidecar. TLS to
 the upstream is verified by default, including SNI and hostname verification.
@@ -206,7 +214,7 @@ src/
   organization/        openproof.organization       tenants, memberships, role assignment
   administration/      openproof.administration     bootstrap and owner-authorized member lifecycle
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 310 discovered tests
+tests/                 317 discovered tests
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties

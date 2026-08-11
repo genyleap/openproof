@@ -43,3 +43,6 @@ enabled = false
 provider_id = "local"
 # organization_id = "tenant-id"
 protected_route_prefix = "/"
+# Enabling auth also requires at least one explicit [[auth.route_policies]]
+# table. Each table declares path_prefix, methods, required_roles, role_match
+# ("any" or "all"), and minimum_assurance ("ial1" through "ial4").

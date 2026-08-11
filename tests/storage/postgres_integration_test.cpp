@@ -19,6 +19,7 @@ import openproof.credentials;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.organization;
+import openproof.policy;
 import openproof.provider.local;
 import openproof.security;
 import openproof.session;
@@ -33,6 +34,7 @@ namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
 namespace idp = openproof::identity::provider;
 namespace pg = openproof::storage::postgres;
+namespace pol = openproof::policy;
 namespace org = openproof::organization;
 namespace local = openproof::provider::local;
 namespace sec = openproof::security;
@@ -264,6 +266,55 @@ TEST_F(PostgresIntegrationTest, IdentityOrganizationMembershipAndExternalLinksRo
     ASSERT_TRUE(owner);
     ASSERT_TRUE(owner->has_value());
     EXPECT_EQ(owner->value(), core::IdentityId{"identity-1"});
+}
+
+TEST_F(PostgresIntegrationTest, RejectedAuthorizationIsChainedAndPublished)
+{
+    fnd::ManualClockSource clock{kNow};
+    const fnd::SecretString sessionSecret{
+        "0123456789abcdef0123456789abcdef"};
+    auto digest = sec::hmacSha256(sessionSecret, "denied-token").value();
+    sess::InMemorySessionRepository sessionRepository;
+    ASSERT_TRUE(sessionRepository.add(sess::Session::create(
+        sess::SessionId{"denied-session"}, core::IdentityId{"identity-1"},
+        idp::ProviderId{"local"}, idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{
+            idp::AuthenticationFactor::Knowledge
+                | idp::AuthenticationFactor::Possession,
+            false},
+        kNow, sess::TokenDigest{digest}, kNow, std::chrono::hours{1},
+        std::chrono::minutes{10}).value()));
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(sessionSecret.clone()).value(),
+        sess::SessionPolicy::create(std::chrono::hours{1},
+                                    std::chrono::minutes{10}).value()};
+    auto authenticated = sessions.authenticate(
+        fnd::SecretString{"denied-token"});
+    ASSERT_TRUE(authenticated);
+
+    pg::PostgresAuthorizationDecisionSink sink{
+        *pool,
+        audit::AuditKey::create(fnd::SecretString{
+            "abcdef0123456789abcdef0123456789"}).value(),
+        clock};
+    ASSERT_TRUE(sink.record(
+        authenticated.value(), core::OrganizationId{"org"},
+        pol::Action{"proxy.GET:/api"}, pol::Resource{"upstream:/api"},
+        pol::AuthorizationDecision::deny("required role is absent"),
+        fnd::CorrelationId{"authorization-request"}));
+
+    std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.audit_events WHERE "
+        "category='authorization' AND action='protected-route.evaluate' "
+        "AND outcome='deny' AND encode(event_hash,'hex')<>repeat('0',64)),"
+        "(SELECT count(*) FROM openproof.security_event_outbox WHERE "
+        "payload->>'type'='authorization.protected-route.denied')")};
+    ASSERT_NE(evidence.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(evidence.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 0), "1");
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 1), "1");
 }
 
 TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)

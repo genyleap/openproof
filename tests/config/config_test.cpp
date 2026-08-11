@@ -6,6 +6,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 import openproof.config;
 import openproof.foundation;
@@ -172,12 +173,23 @@ enabled = true
 provider_id = "local"
 organization_id = "org"
 protected_route_prefix = "/api"
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET", "POST"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial2"
 )", environment);
     ASSERT_TRUE(configured);
     EXPECT_TRUE(configured->database().enabled());
     EXPECT_EQ(configured->database().poolSize(), 12U);
     EXPECT_TRUE(configured->auth().enabled());
     EXPECT_EQ(configured->auth().organizationId(), "org");
+    ASSERT_EQ(configured->auth().routePolicies().size(), 1U);
+    EXPECT_EQ(configured->auth().routePolicies().front().methods(),
+              (std::vector<std::string>{"GET", "POST"}));
+    EXPECT_EQ(configured->auth().routePolicies().front().minimumAssurance(),
+              "ial2");
     EXPECT_TRUE(configured->validateServerDeployment());
 
     auto missingDatabase = cfg::PlatformConfig::loadFromToml(R"(
@@ -194,9 +206,94 @@ upstream_tls = false
 [auth]
 enabled = true
 organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/"
+methods = ["GET"]
+required_roles = ["member"]
 )", environment);
     ASSERT_TRUE(missingDatabase);
     EXPECT_FALSE(missingDatabase->validateServerDeployment());
+}
+
+TEST(ConfigTest, ProtectedAuthenticationRequiresExplicitClosedRoutePolicies)
+{
+    const cfg::MapEnvironment environment;
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+protected_route_prefix = "/api"
+[[auth.route_policies]]
+path_prefix = "/outside"
+methods = ["GET"]
+required_roles = ["member"]
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/"
+methods = ["TRACE"]
+required_roles = ["member"]
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/"
+methods = ["GET"]
+required_roles = []
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/auth/login"
+methods = ["POST"]
+required_roles = ["member"]
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET"]
+required_roles = ["member"]
+unexpected_allow = true
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET"]
+required_roles = ["member"]
+role_match = true
+minimum_assurance = 2
+)", environment));
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[auth]
+enabled = true
+organization_id = "org"
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET"]
+required_roles = ["member"]
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET"]
+required_roles = ["owner"]
+)", environment));
 }
 
 TEST(ConfigTest, ReadsFromAFile)

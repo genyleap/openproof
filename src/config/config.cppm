@@ -8,6 +8,7 @@ module;
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 export module openproof.config;
 
@@ -194,22 +195,49 @@ private:
     std::filesystem::path m_migrationDirectory{"migrations"};
 };
 
+/** One explicit protected-route RBAC and assurance policy. */
+class RoutePolicyConfig final {
+public:
+    [[nodiscard]] static foundation::Result<RoutePolicyConfig>
+    create(std::string pathPrefix, std::vector<std::string> methods,
+           std::vector<std::string> requiredRoles, std::string roleMatch,
+           std::string minimumAssurance);
+    [[nodiscard]] std::string_view pathPrefix() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& methods() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& requiredRoles() const noexcept;
+    [[nodiscard]] std::string_view roleMatch() const noexcept;
+    [[nodiscard]] std::string_view minimumAssurance() const noexcept;
+private:
+    RoutePolicyConfig(std::string pathPrefix, std::vector<std::string> methods,
+                      std::vector<std::string> requiredRoles,
+                      std::string roleMatch, std::string minimumAssurance);
+    std::string m_pathPrefix;
+    std::vector<std::string> m_methods;
+    std::vector<std::string> m_requiredRoles;
+    std::string m_roleMatch;
+    std::string m_minimumAssurance;
+};
+
 class AuthConfig final {
 public:
     [[nodiscard]] static foundation::Result<AuthConfig>
     create(bool enabled, std::string providerId, std::string organizationId,
-           std::string protectedRoutePrefix);
+           std::string protectedRoutePrefix,
+           std::vector<RoutePolicyConfig> routePolicies);
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] std::string_view providerId() const noexcept;
     [[nodiscard]] std::string_view organizationId() const noexcept;
     [[nodiscard]] std::string_view protectedRoutePrefix() const noexcept;
+    [[nodiscard]] const std::vector<RoutePolicyConfig>& routePolicies() const noexcept;
 private:
     AuthConfig(bool enabled, std::string providerId, std::string organizationId,
-               std::string protectedRoutePrefix);
+               std::string protectedRoutePrefix,
+               std::vector<RoutePolicyConfig> routePolicies);
     bool m_enabled{};
     std::string m_providerId;
     std::string m_organizationId;
     std::string m_protectedRoutePrefix;
+    std::vector<RoutePolicyConfig> m_routePolicies;
 };
 
 /**

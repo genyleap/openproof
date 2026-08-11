@@ -1,6 +1,7 @@
 module;
 
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -269,6 +270,73 @@ public:
 
 protected:
     PolicyEngine() = default;
+};
+
+/** How the required role set of one route is interpreted. */
+enum class RoleMatchMode {
+    Any,
+    All,
+};
+
+[[nodiscard]] std::string_view roleMatchModeName(RoleMatchMode mode) noexcept;
+
+/**
+ * Immutable authorization rule bound to one exact trusted action/resource pair.
+ * Rules are constructed only from validated operator configuration.
+ */
+class RolePolicyRule final {
+public:
+    [[nodiscard]] static foundation::Result<RolePolicyRule>
+    create(Action action, Resource resource, std::vector<Role> requiredRoles,
+           RoleMatchMode roleMatch,
+           identity::provider::AssuranceLevel minimumAssurance);
+
+    [[nodiscard]] const Action& action() const noexcept;
+    [[nodiscard]] const Resource& resource() const noexcept;
+    [[nodiscard]] const std::vector<Role>& requiredRoles() const noexcept;
+    [[nodiscard]] RoleMatchMode roleMatch() const noexcept;
+    [[nodiscard]] identity::provider::AssuranceLevel minimumAssurance() const noexcept;
+
+private:
+    RolePolicyRule(Action action, Resource resource,
+                   std::vector<Role> requiredRoles, RoleMatchMode roleMatch,
+                   identity::provider::AssuranceLevel minimumAssurance);
+    Action m_action;
+    Resource m_resource;
+    std::vector<Role> m_requiredRoles;
+    RoleMatchMode m_roleMatch{RoleMatchMode::Any};
+    identity::provider::AssuranceLevel m_minimumAssurance{
+        identity::provider::AssuranceLevel::Ial1};
+};
+
+/** Exact-match, fail-closed RBAC and assurance policy engine. */
+class RolePolicyEngine final : public PolicyEngine {
+public:
+    [[nodiscard]] static foundation::Result<std::unique_ptr<RolePolicyEngine>>
+    create(std::vector<RolePolicyRule> rules);
+
+    [[nodiscard]] AuthorizationDecision
+    evaluate(const AuthorizationRequest& request) override;
+
+private:
+    explicit RolePolicyEngine(std::vector<RolePolicyRule> rules);
+    std::vector<RolePolicyRule> m_rules;
+};
+
+/** Durable observer for authorization decisions that must be security-audited. */
+class AuthorizationDecisionSink {
+public:
+    AuthorizationDecisionSink(const AuthorizationDecisionSink&) = delete;
+    AuthorizationDecisionSink& operator=(const AuthorizationDecisionSink&) = delete;
+    virtual ~AuthorizationDecisionSink() = default;
+    [[nodiscard]] virtual foundation::Status record(
+        const session::AuthenticatedSession& authenticatedSession,
+        const identity::core::OrganizationId& organization,
+        const Action& action, const Resource& resource,
+        const AuthorizationDecision& decision,
+        const foundation::CorrelationId& correlation) = 0;
+protected:
+    AuthorizationDecisionSink() = default;
 };
 
 /**

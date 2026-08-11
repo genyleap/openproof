@@ -272,7 +272,8 @@ public:
     virtual ~AccessController() = default;
     [[nodiscard]] virtual policy::AuthorizationDecision authorize(
         const session::AuthenticatedSession& authenticatedSession,
-        const Route& route) = 0;
+        const Route& route,
+        const foundation::CorrelationId& correlation) = 0;
 protected:
     AccessController() = default;
 };
@@ -282,15 +283,18 @@ public:
     PolicyAccessController(policy::PolicyEngine* policies,
                            const organization::OrganizationRepository& organizations,
                            const identity::core::IdentityRepository& identities,
-                           const organization::MembershipRepository& memberships);
+                           const organization::MembershipRepository& memberships,
+                           policy::AuthorizationDecisionSink* decisionSink = nullptr);
     [[nodiscard]] policy::AuthorizationDecision authorize(
         const session::AuthenticatedSession& authenticatedSession,
-        const Route& route) override;
+        const Route& route,
+        const foundation::CorrelationId& correlation) override;
 private:
     policy::PolicyEngine* m_policies;
     const organization::OrganizationRepository* m_organizations;
     const identity::core::IdentityRepository* m_identities;
     const organization::MembershipRepository* m_memberships;
+    policy::AuthorizationDecisionSink* m_decisionSink;
 };
 
 /** Key used to authenticate the identity context emitted by the gateway. */

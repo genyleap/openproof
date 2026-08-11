@@ -78,7 +78,7 @@ every other layer may assume.
 | `openproof.authentication` | `:service` | Trusted orchestration, single-use enforcement and assurance adjudication |
 | `openproof.identity.core` | `:identity` `:link` `:repository` `:merge` | Canonical identity and explicit association lifecycle |
 | `openproof.organization` / `.membership` | organization, membership, repository | Tenant and organization-scoped role lifecycle |
-| `openproof.policy` | `:decision` | Sealed authorization request and fail-closed decision contract |
+| `openproof.policy` | `:decision` | Sealed authorization request plus immutable exact-route RBAC/assurance engine |
 | `openproof.session` | model, repository, service | Opaque sessions, absolute/idle expiry, rotation and revocation |
 | `openproof.credentials` | — | Pepper+scrypt passwords, RFC 6238 TOTP, recovery codes |
 | `openproof.administration` / `.http` | — | Validated bootstrap, enrollment, role, membership-state and credential-rotation commands plus IAL2 administrative HTTP boundary |
@@ -352,9 +352,9 @@ Named explicitly so that no reader infers more than exists.
 | Identity core, explicit linking and merge, organizations and memberships | Implemented with PostgreSQL identity, external-link, organization and membership adapters |
 | Authentication providers | Local password and password+TOTP implemented; OIDC, WebAuthn, wallet, social and enterprise providers pending |
 | Authentication broker, sessions and credentials | Implemented; operational HTTP auth plane and durable sessions, transactions, recovery codes, password verifiers and encrypted TOTP seeds |
-| Policy engine, RBAC, ABAC, trusted entitlement adapter | Decision contract present; evaluation engines not started |
-| OpenProof gateway | HTTP/1.1 edge, protected-route composition, cookie/Bearer sessions, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
-| Metrics, tracing, audit events, security events | Core adapters implemented; production exporters and durable audit repository pending |
+| Policy engine, RBAC, ABAC, trusted entitlement adapter | Exact method/path RBAC (`any`/`all`) and minimum-assurance evaluation implemented; ABAC, trust/risk and entitlement adapters pending |
+| OpenProof gateway | HTTP/1.1 edge, explicit fail-closed route policies, cookie/Bearer sessions, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
+| Metrics, tracing, audit events, security events | Core adapters plus durable chained administrative and rejected-authorization events implemented; production exporters and general-purpose durable audit repository pending |
 | PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migrations and critical authentication/identity/organization adapters implemented; cache and remaining domains pending |
 | Administration | One-time offline `bootstrap-admin` plus IAL2 owner-only local-member creation, role replacement, suspension/reinstatement/removal and credential reset implemented; tenant/policy lifecycle remains pending |
 | Threat model, load tests, fuzzing | Baseline implemented; sustained distributed load and protocol-specific fuzz targets remain ongoing work |
