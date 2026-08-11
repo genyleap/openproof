@@ -8,6 +8,8 @@ module;
 
 export module openproof.storage.postgres;
 
+import openproof.administration;
+import openproof.audit;
 import openproof.foundation;
 import openproof.credentials;
 import openproof.identity.core;
@@ -60,6 +62,7 @@ private:
     friend class PostgresOrganizationRepository;
     friend class PostgresMembershipRepository;
     friend class PostgresLocalAccountDirectory;
+    friend class PostgresAdministrationRepository;
     class Implementation;
     explicit ConnectionPool(std::unique_ptr<Implementation> implementation);
     std::unique_ptr<Implementation> m_implementation;
@@ -248,6 +251,40 @@ private:
     unsigned int m_keyVersion{};
     identity::provider::ProviderId m_provider;
     credentials::PasswordHash m_dummyHash;
+};
+
+/**
+ * PostgreSQL implementation of the one-time initial-owner ceremony.
+ * All aggregates, credentials and audit/outbox records commit together.
+ */
+class PostgresAdministrationRepository final
+    : public administration::BootstrapRepository,
+      public administration::LocalMemberProvisioner {
+public:
+    [[nodiscard]] static foundation::Result<std::unique_ptr<PostgresAdministrationRepository>>
+    create(ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+           security::AeadKey totpKey, unsigned int keyVersion,
+           identity::provider::ProviderId provider, audit::AuditKey auditKey);
+    ~PostgresAdministrationRepository() override;
+
+    [[nodiscard]] foundation::Status initialize(
+        const administration::InitialAdministrator& administrator) override;
+    [[nodiscard]] foundation::Status provision(
+        const identity::core::IdentityId& actor,
+        const administration::LocalMemberEnrollment& enrollment) override;
+
+private:
+    PostgresAdministrationRepository(
+        ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+        security::AeadKey totpKey, unsigned int keyVersion,
+        identity::provider::ProviderId provider, audit::AuditKey auditKey);
+
+    ConnectionPool* m_pool;
+    credentials::PasswordHasher m_passwordHasher;
+    security::AeadKey m_totpKey;
+    unsigned int m_keyVersion{};
+    identity::provider::ProviderId m_provider;
+    audit::AuditKey m_auditKey;
 };
 
 }

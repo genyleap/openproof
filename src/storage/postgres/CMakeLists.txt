@@ -5,6 +5,8 @@ openproof_add_module(openproof_storage_postgres
         postgres.cpp
     LINK_PUBLIC
         openproof_foundation
+        openproof_administration
+        openproof_audit
         openproof_security
         openproof_identity_core
         openproof_identity_provider

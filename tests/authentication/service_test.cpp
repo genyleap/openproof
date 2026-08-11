@@ -83,6 +83,10 @@ public:
         if (proof == response.parameters().end() || proof->second.expose() != "valid") {
             return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
+        if (advancingClock != nullptr) {
+            advancingClock->advance(std::chrono::milliseconds{1});
+            verifiedAt = advancingClock->now();
+        }
 
         return idp::AuthenticationOutcome::create(
             idp::ProviderId{outcomeProvider.empty() ? m_id : outcomeProvider},
@@ -101,6 +105,7 @@ public:
     bool failComplete{false};
     bool throwOnBegin{false};
     bool throwOnComplete{false};
+    fnd::ManualClockSource* advancingClock{nullptr};
     int beginCalls{0};
     int completeCalls{0};
 
@@ -389,6 +394,43 @@ TEST(AuthenticationServiceTest, RefusesVerificationTimeOutsideTheTransactionWind
                                             started->continuationToken(), binding, response);
 
     ASSERT_FALSE(completed.has_value());
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
+TEST(AuthenticationServiceTest, AllowsProviderToFinishAfterCompletionBegins)
+{
+    Fixture fixture;
+    fixture.implementation->advancingClock = &fixture.clock;
+    auto service = fixture.service();
+    const idp::BindingDigest binding = bindingOf("agent");
+    auto started = service.begin(fixture.request(), binding,
+                                 fnd::CorrelationId{"corr-1"});
+    ASSERT_TRUE(started);
+
+    const auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+    EXPECT_EQ(completed->outcome().verifiedAt(),
+              kNow + std::chrono::milliseconds{1});
+}
+
+TEST(AuthenticationServiceTest, StillRefusesAProviderTimestampAfterCompletion)
+{
+    Fixture fixture;
+    fixture.implementation->verifiedAt = kNow + std::chrono::minutes{1};
+    auto service = fixture.service();
+    const idp::BindingDigest binding = bindingOf("agent");
+    auto started = service.begin(fixture.request(), binding,
+                                 fnd::CorrelationId{"corr-1"});
+    ASSERT_TRUE(started);
+
+    const auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_FALSE(completed);
     EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 

@@ -55,14 +55,6 @@ void appendPart(std::string& output, std::string_view value)
     return output;
 }
 
-[[nodiscard]] foundation::Result<security::Sha256Digest>
-recordHash(const AuditEvent& event, std::uint64_t sequence,
-           const std::optional<security::Sha256Digest>& previous,
-           const AuditKey& key)
-{
-    return security::hmacSha256(key.secret(), canonical(event, sequence, previous));
-}
-
 [[nodiscard]] foundation::Status validateFields(const AuditFields& fields)
 {
     if (fields.size() > 64U) {
@@ -144,6 +136,15 @@ const AuditEvent& AuditRecord::event() const noexcept { return m_event; }
 const std::optional<security::Sha256Digest>& AuditRecord::previousHash() const noexcept { return m_previousHash; }
 const security::Sha256Digest& AuditRecord::hash() const noexcept { return m_hash; }
 
+foundation::Result<security::Sha256Digest> computeAuditRecordHash(
+    const AuditEvent& event, std::uint64_t sequence,
+    const std::optional<security::Sha256Digest>& previousHash,
+    const AuditKey& key)
+{
+    return security::hmacSha256(
+        key.secret(), canonical(event, sequence, previousHash));
+}
+
 foundation::Result<AuditRecord> InMemoryAuditRepository::append(
     AuditEvent event, const AuditKey& key)
 {
@@ -156,7 +157,7 @@ foundation::Result<AuditRecord> InMemoryAuditRepository::append(
     const std::uint64_t sequence = static_cast<std::uint64_t>(m_records.size()) + 1U;
     const std::optional<security::Sha256Digest> previous = m_records.empty()
         ? std::nullopt : std::optional<security::Sha256Digest>{m_records.back().hash()};
-    auto hash = recordHash(event, sequence, previous, key);
+    auto hash = computeAuditRecordHash(event, sequence, previous, key);
     if (!hash.has_value()) return foundation::fail(hash.error());
     m_records.emplace_back(sequence, std::move(event), previous, hash.value());
     return m_records.back();
@@ -177,7 +178,8 @@ foundation::Status InMemoryAuditRepository::verify(const AuditKey& key) const
             return foundation::fail(foundation::ErrorCode::FailedPrecondition,
                                     "The audit chain is not intact.");
         }
-        auto expected = recordHash(record.event(), record.sequence(), previous, key);
+        auto expected = computeAuditRecordHash(
+            record.event(), record.sequence(), previous, key);
         if (!expected.has_value()) return foundation::fail(expected.error());
         if (!security::constantTimeEquals(expected.value(), record.hash())) {
             return foundation::fail(foundation::ErrorCode::FailedPrecondition,

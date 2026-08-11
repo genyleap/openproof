@@ -27,6 +27,8 @@ set_source_files_properties(main.cpp PROPERTIES
 target_link_libraries(opp
     PRIVATE
         openproof_foundation
+        openproof_administration
+        openproof_audit
         openproof_config
         openproof_observability
         openproof_identity_provider

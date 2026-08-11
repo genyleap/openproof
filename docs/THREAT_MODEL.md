@@ -42,7 +42,10 @@ an authorization decision.
 | Cross-tenant access | Organization required by repository operations and membership ownership checks | Database superusers can bypass application isolation; separate DB roles are recommended |
 | Database race/replay | Atomic conditional UPDATE/DELETE with RETURNING; transactional migrations and replacement | HA failover semantics depend on PostgreSQL deployment consistency |
 | Log/metric injection and secret leakage | Secret types are non-formatable; JSON escaping; label validation/cardinality cap | Operator-added sinks must preserve the same contracts |
-| Audit tampering | HMAC-linked sequence chain and verification | In-memory adapter is not durable; production needs append-only PostgreSQL/object retention and off-host checkpoints |
+| Audit tampering | HMAC-linked sequence chain; bootstrap record and security outbox commit with authoritative state | General event persistence/export and off-host checkpoints remain deployment work |
+| Bootstrap privilege creation | Offline-only command, environment-only password, generated TOTP, fixed owner role, serializable transaction, global advisory lock, refusal after first tenant | Operator shell and master-key access are fully trusted during the initial ceremony |
+| Administrative privilege escalation | IAL2 session at HTTP boundary; active owner role re-read and locked in the same serializable PostgreSQL transaction as member creation; no roles trusted from the session | An authorized owner may deliberately grant another owner role; administrative account protection and change review remain operator duties |
+| Administrative credential disclosure | Password and TOTP are CSPRNG-generated server-side, excluded from audit/outbox, returned once only after commit with `no-store` | The TLS terminator, administrator client and recipient transfer channel can still expose the one-time response |
 | Denial of service | Size/time/connection limits, scrypt resource ceilings, rate limits, circuit breaker | Per-process limiter state is not globally coordinated; front proxy should enforce fleet-wide limits |
 
 ## Deliberate constraints
@@ -51,14 +54,17 @@ an authorization decision.
   non-loopback binds. TLS is terminated by a trusted local proxy/sidecar.
 - The runnable mode supports either public or protected routes to one configured
   upstream. Protected mode requires PostgreSQL, an active pre-provisioned
-  organization and active membership. Administration and credential enrollment
-  are intentionally not public HTTP endpoints.
+  organization and active membership. The first owner is enrolled by the
+  one-time offline bootstrap command. Local-member credential enrollment exists
+  only behind an IAL2 session plus a transactional authoritative owner check;
+  it is not a public registration endpoint.
 - Generic OIDC and WebAuthn providers are not implemented. The concrete local
   provider supports password and password+TOTP only.
 - PostgreSQL provides durable sessions, authentication transactions, recovery
   codes, identities, external links, organizations, memberships, password
-  verifiers and AES-256-GCM-encrypted TOTP seeds. Audit persistence and fleet-wide
-  rate limiting remain deployment work.
+  verifiers and AES-256-GCM-encrypted TOTP seeds. Bootstrap and administrative
+  member-creation audit persistence is transactional; general audit persistence
+  and fleet-wide rate limiting remain deployment work.
 
 ## Verification gates
 

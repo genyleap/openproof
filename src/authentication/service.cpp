@@ -294,6 +294,11 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     if (!outcome.has_value()) {
         return foundation::fail(outcome.error());
     }
+    // The provider may legitimately read the same real clock after the broker
+    // consumed the transaction. Using the pre-call timestamp as an upper bound
+    // makes every millisecond crossed inside provider verification look like a
+    // future assertion. Bound against a fresh post-verification reading.
+    const foundation::Instant completionFinishedAt = m_clock.now();
     if (outcome->provider() != transaction->provider()) {
         return foundation::fail(authenticationFailure(
             "Provider returned an outcome under a different provider identifier."));
@@ -317,7 +322,8 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
         }
     }
 
-    if (outcome->verifiedAt() < transaction->createdAt() || outcome->verifiedAt() > now) {
+    if (outcome->verifiedAt() < transaction->createdAt()
+        || outcome->verifiedAt() > completionFinishedAt) {
         return foundation::fail(authenticationFailure(
             "Provider returned a verification timestamp outside the transaction window."));
     }

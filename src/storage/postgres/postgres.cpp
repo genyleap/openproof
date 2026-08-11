@@ -22,6 +22,8 @@ module;
 
 module openproof.storage.postgres;
 
+import openproof.administration;
+import openproof.audit;
 import openproof.identity.core;
 import openproof.security;
 
@@ -1387,6 +1389,441 @@ PostgresLocalAccountDirectory::verify(
         ? foundation::Result<provider::local::LocalVerification>{provider::local::LocalVerification::PasswordAndTotp}
         : foundation::Result<provider::local::LocalVerification>{foundation::fail(
             authenticationFailure("Local credential changed or TOTP was replayed."))};
+}
+
+PostgresAdministrationRepository::PostgresAdministrationRepository(
+    ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+    security::AeadKey totpKey, unsigned int keyVersion,
+    identity::provider::ProviderId providerId, audit::AuditKey auditKey)
+    : m_pool(&pool), m_passwordHasher(std::move(passwordHasher)),
+      m_totpKey(std::move(totpKey)), m_keyVersion(keyVersion),
+      m_provider(std::move(providerId)), m_auditKey(std::move(auditKey))
+{
+}
+
+PostgresAdministrationRepository::~PostgresAdministrationRepository() = default;
+
+foundation::Result<std::unique_ptr<PostgresAdministrationRepository>>
+PostgresAdministrationRepository::create(
+    ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
+    security::AeadKey totpKey, unsigned int keyVersion,
+    identity::provider::ProviderId providerId, audit::AuditKey auditKey)
+{
+    if (keyVersion == 0U || providerId.empty()) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The PostgreSQL bootstrap configuration is invalid.");
+    }
+    return std::unique_ptr<PostgresAdministrationRepository>{
+        new PostgresAdministrationRepository{
+            pool, std::move(passwordHasher), std::move(totpKey), keyVersion,
+            std::move(providerId), std::move(auditKey)}};
+}
+
+foundation::Status PostgresAdministrationRepository::initialize(
+    const administration::InitialAdministrator& administrator)
+{
+    const auto& tenant = administrator.organization();
+    const auto& identityValue = administrator.identity();
+    const auto& link = administrator.link();
+    const auto& membership = administrator.membership();
+    if (!tenant.isUsable() || !identityValue.canAuthenticate()
+        || identityValue.kind() != identity::core::SubjectKind::Human
+        || link.state() != identity::core::LinkState::Linked
+        || link.external().providerId() != m_provider
+        || link.owner() != identityValue.id()
+        || membership.organization() != tenant.id()
+        || membership.identity() != identityValue.id()
+        || membership.state() != organization::MembershipState::Active
+        || !membership.hasRole(organization::Role{"owner"})) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The initial-administrator ceremony is incomplete.");
+    }
+
+    auto passwordHash = m_passwordHasher.hash(administrator.password());
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto encryptedTotp = security::sealAes256Gcm(
+        m_totpKey, administrator.totp().bytes(),
+        "openproof/totp/v1:" + std::string{identityValue.id().value()});
+    if (!encryptedTotp) return foundation::fail(encryptedTotp.error());
+    auto randomId = security::randomTokenBase64Url(24U);
+    if (!randomId) return foundation::fail(randomId.error());
+    const std::string eventId = "bootstrap-" + randomId.value();
+    auto auditEvent = audit::AuditEvent::create(
+        audit::AuditEventId{eventId}, identityValue.createdAt(),
+        foundation::CorrelationId{eventId},
+        std::optional<identity::core::OrganizationId>{tenant.id()},
+        std::optional<identity::core::IdentityId>{identityValue.id()},
+        "administration", "bootstrap.initial-owner", "success",
+        audit::AuditFields{{"provider", std::string{m_provider.value()}},
+                           {"role", "owner"}});
+    if (!auditEvent) return foundation::fail(auditEvent.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+
+    auto run = [&](std::string_view sql, const std::vector<std::string>& parameters,
+                   std::string_view operation) -> foundation::Status {
+        ResultPointer result = execParams(connection, sql, parameters);
+        return commandOk(result.get()) ? foundation::ok()
+            : foundation::fail(databaseError(result.get(), operation));
+    };
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+
+    ResultPointer isolated = exec(connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return failTransaction(databaseError(isolated.get(), "set bootstrap isolation"));
+    }
+    ResultPointer locked = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673313)");
+    if (!tuplesOk(locked.get())) {
+        return failTransaction(databaseError(locked.get(), "lock bootstrap ceremony"));
+    }
+    ResultPointer count = exec(connection, "SELECT count(*) FROM openproof.organizations");
+    if (!tuplesOk(count.get()) || PQntuples(count.get()) != 1) {
+        return failTransaction(databaseError(count.get(), "check bootstrap state"));
+    }
+    auto organizationCount = parseInteger<std::size_t>(field(count.get(), 0, 0));
+    if (!organizationCount) return failTransaction(organizationCount.error());
+    if (organizationCount.value() != 0U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::AlreadyExists,
+            "The deployment has already been initialized."});
+    }
+
+    foundation::Status status = run(
+        "INSERT INTO openproof.organizations(id,name,state,created_at_ms) "
+        "VALUES($1,$2,$3,$4)",
+        {std::string{tenant.id().value()}, std::string{tenant.displayName()},
+         std::to_string(static_cast<unsigned int>(tenant.status())),
+         instant(tenant.createdAt())}, "bootstrap organization");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+        "VALUES($1,$2,$3,$4,$5)",
+        {std::string{identityValue.id().value()}, std::string{tenant.id().value()},
+         std::to_string(static_cast<unsigned int>(identityValue.kind())),
+         std::to_string(static_cast<unsigned int>(identityValue.status())),
+         instant(identityValue.createdAt())}, "bootstrap identity");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.external_identities"
+        "(provider,external_subject,identity_id,linked_at_ms) VALUES($1,$2,$3,$4)",
+        {std::string{link.external().providerId().value()},
+         std::string{link.external().subject().value()},
+         std::string{identityValue.id().value()}, instant(link.requestedAt())},
+        "bootstrap external identity");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.memberships"
+        "(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,$3,$4)",
+        {std::string{tenant.id().value()}, std::string{identityValue.id().value()},
+         std::to_string(static_cast<unsigned int>(membership.state())),
+         instant(membership.invitedAt())}, "bootstrap membership");
+    if (!status) return failTransaction(status.error());
+    for (const organization::Role& role : membership.roles()) {
+        status = run(
+            "INSERT INTO openproof.membership_roles"
+            "(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {std::string{tenant.id().value()},
+             std::string{identityValue.id().value()}, std::string{role.value()}},
+            "bootstrap membership role");
+        if (!status) return failTransaction(status.error());
+    }
+    status = run(
+        "INSERT INTO openproof.password_credentials"
+        "(identity_id,password_hash,changed_at_ms) VALUES($1,$2,$3)",
+        {std::string{identityValue.id().value()},
+         std::string{passwordHash->encoded()}, instant(identityValue.createdAt())},
+        "bootstrap password");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.totp_credentials"
+        "(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+        "VALUES($1,decode($2,'hex'),$3,NULL,$4)",
+        {std::string{identityValue.id().value()},
+         foundation::toHex(encryptedTotp.value()), std::to_string(m_keyVersion),
+         instant(identityValue.createdAt())}, "bootstrap TOTP");
+    if (!status) return failTransaction(status.error());
+
+    ResultPointer auditLock = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673314)");
+    if (!tuplesOk(auditLock.get())) {
+        return failTransaction(databaseError(auditLock.get(), "lock audit chain"));
+    }
+    ResultPointer previousResult = exec(
+        connection,
+        "SELECT encode(event_hash,'hex') FROM openproof.audit_events "
+        "ORDER BY sequence DESC LIMIT 1");
+    if (!tuplesOk(previousResult.get())) {
+        return failTransaction(databaseError(previousResult.get(), "read audit chain head"));
+    }
+    std::optional<security::Sha256Digest> previousHash;
+    std::string previousHex;
+    if (PQntuples(previousResult.get()) == 1) {
+        auto parsed = parseDigest(field(previousResult.get(), 0, 0));
+        if (!parsed) return failTransaction(parsed.error());
+        previousHash = parsed.value();
+        previousHex = foundation::toHex(parsed.value());
+    }
+    foundation::JsonObjectWriter detail;
+    for (const auto& [name, value] : auditEvent->fields()) detail.add(name, value);
+    ResultPointer insertedAudit = execParams(
+        connection,
+        "INSERT INTO openproof.audit_events"
+        "(event_id,occurred_at_ms,correlation_id,organization_id,identity_id,"
+        "category,action,outcome,detail,previous_hash,event_hash) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,"
+        "CASE WHEN $10='' THEN NULL ELSE decode($10,'hex') END,decode($11,'hex')) "
+        "RETURNING sequence",
+        {eventId, instant(auditEvent->occurredAt()),
+         std::string{auditEvent->correlation().value()},
+         std::string{tenant.id().value()}, std::string{identityValue.id().value()},
+         std::string{auditEvent->category()}, std::string{auditEvent->action()},
+         std::string{auditEvent->outcome()}, detail.build(), previousHex,
+         std::string(64U, '0')});
+    if (!tuplesOk(insertedAudit.get()) || PQntuples(insertedAudit.get()) != 1) {
+        return failTransaction(databaseError(insertedAudit.get(), "append bootstrap audit event"));
+    }
+    auto sequence = parseInteger<std::uint64_t>(field(insertedAudit.get(), 0, 0));
+    if (!sequence) return failTransaction(sequence.error());
+    auto recordHash = audit::computeAuditRecordHash(
+        auditEvent.value(), sequence.value(), previousHash, m_auditKey);
+    if (!recordHash) return failTransaction(recordHash.error());
+    status = run(
+        "UPDATE openproof.audit_events SET event_hash=decode($2,'hex') "
+        "WHERE sequence=$1",
+        {std::to_string(sequence.value()), foundation::toHex(recordHash.value())},
+        "seal bootstrap audit event");
+    if (!status) return failTransaction(status.error());
+
+    foundation::JsonObjectWriter payload;
+    payload.add("event_id", eventId)
+        .add("type", "bootstrap.initial-owner")
+        .add("organization_id", tenant.id().value())
+        .add("identity_id", identityValue.id().value())
+        .add("severity", "critical");
+    status = run(
+        "INSERT INTO openproof.security_event_outbox"
+        "(event_id,occurred_at_ms,payload) VALUES($1,$2,$3::jsonb)",
+        {eventId, instant(identityValue.createdAt()), payload.build()},
+        "append bootstrap security event");
+    if (!status) return failTransaction(status.error());
+
+    return commit(connection);
+}
+
+foundation::Status PostgresAdministrationRepository::provision(
+    const identity::core::IdentityId& actor,
+    const administration::LocalMemberEnrollment& enrollment)
+{
+    const auto& identityValue = enrollment.identity();
+    const auto& link = enrollment.link();
+    const auto& membership = enrollment.membership();
+    if (actor.empty() || !identityValue.canAuthenticate()
+        || identityValue.kind() != identity::core::SubjectKind::Human
+        || link.state() != identity::core::LinkState::Linked
+        || link.external().providerId() != m_provider
+        || link.owner() != identityValue.id()
+        || membership.organization() != enrollment.organizationId()
+        || membership.identity() != identityValue.id()
+        || membership.state() != organization::MembershipState::Active) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The local-member enrollment ceremony is incomplete.");
+    }
+
+    auto passwordHash = m_passwordHasher.hash(enrollment.generatedPassword());
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto encryptedTotp = security::sealAes256Gcm(
+        m_totpKey, enrollment.generatedTotp().bytes(),
+        "openproof/totp/v1:" + std::string{identityValue.id().value()});
+    if (!encryptedTotp) return foundation::fail(encryptedTotp.error());
+    auto randomId = security::randomTokenBase64Url(24U);
+    if (!randomId) return foundation::fail(randomId.error());
+    const std::string eventId = "admin-member-" + randomId.value();
+    std::string roleList;
+    for (const organization::Role& role : membership.roles()) {
+        if (!roleList.empty()) roleList.push_back(',');
+        roleList.append(role.value());
+    }
+    auto auditEvent = audit::AuditEvent::create(
+        audit::AuditEventId{eventId}, identityValue.createdAt(),
+        foundation::CorrelationId{eventId},
+        std::optional<identity::core::OrganizationId>{enrollment.organizationId()},
+        std::optional<identity::core::IdentityId>{identityValue.id()},
+        "administration", "local-member.create", "success",
+        audit::AuditFields{{"actor_identity_id", std::string{actor.value()}},
+                           {"provider", std::string{m_provider.value()}},
+                           {"roles", roleList}});
+    if (!auditEvent) return foundation::fail(auditEvent.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    auto run = [&](std::string_view sql, const std::vector<std::string>& parameters,
+                   std::string_view operation) -> foundation::Status {
+        ResultPointer result = execParams(connection, sql, parameters);
+        return commandOk(result.get()) ? foundation::ok()
+            : foundation::fail(databaseError(result.get(), operation));
+    };
+
+    ResultPointer isolated = exec(connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return failTransaction(databaseError(isolated.get(), "set administration isolation"));
+    }
+    ResultPointer locked = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673315)");
+    if (!tuplesOk(locked.get())) {
+        return failTransaction(databaseError(locked.get(), "lock administration mutation"));
+    }
+    ResultPointer authorized = execParams(
+        connection,
+        "SELECT 1 FROM openproof.organizations o "
+        "JOIN openproof.identities i ON i.organization_id=o.id AND i.id=$2 "
+        "JOIN openproof.memberships m ON m.organization_id=o.id AND m.identity_id=i.id "
+        "JOIN openproof.membership_roles r ON r.organization_id=m.organization_id "
+        "AND r.identity_id=m.identity_id AND r.role='owner' "
+        "WHERE o.id=$1 AND o.state=0 AND i.status=0 AND m.state=1 "
+        "FOR UPDATE OF o,i,m",
+        {std::string{enrollment.organizationId().value()}, std::string{actor.value()}});
+    if (!tuplesOk(authorized.get())) {
+        return failTransaction(databaseError(authorized.get(), "authorize member provisioning"));
+    }
+    if (PQntuples(authorized.get()) != 1) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::PermissionDenied,
+            "The operation is not permitted."});
+    }
+
+    foundation::Status status = run(
+        "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+        "VALUES($1,$2,$3,$4,$5)",
+        {std::string{identityValue.id().value()},
+         std::string{enrollment.organizationId().value()},
+         std::to_string(static_cast<unsigned int>(identityValue.kind())),
+         std::to_string(static_cast<unsigned int>(identityValue.status())),
+         instant(identityValue.createdAt())}, "create managed identity");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.external_identities"
+        "(provider,external_subject,identity_id,linked_at_ms) VALUES($1,$2,$3,$4)",
+        {std::string{link.external().providerId().value()},
+         std::string{link.external().subject().value()},
+         std::string{identityValue.id().value()}, instant(link.requestedAt())},
+        "create managed external identity");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.memberships"
+        "(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,$3,$4)",
+        {std::string{enrollment.organizationId().value()},
+         std::string{identityValue.id().value()},
+         std::to_string(static_cast<unsigned int>(membership.state())),
+         instant(membership.invitedAt())}, "create managed membership");
+    if (!status) return failTransaction(status.error());
+    for (const organization::Role& role : membership.roles()) {
+        status = run(
+            "INSERT INTO openproof.membership_roles"
+            "(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {std::string{enrollment.organizationId().value()},
+             std::string{identityValue.id().value()}, std::string{role.value()}},
+            "create managed membership role");
+        if (!status) return failTransaction(status.error());
+    }
+    status = run(
+        "INSERT INTO openproof.password_credentials"
+        "(identity_id,password_hash,changed_at_ms) VALUES($1,$2,$3)",
+        {std::string{identityValue.id().value()},
+         std::string{passwordHash->encoded()}, instant(identityValue.createdAt())},
+        "create managed password");
+    if (!status) return failTransaction(status.error());
+    status = run(
+        "INSERT INTO openproof.totp_credentials"
+        "(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+        "VALUES($1,decode($2,'hex'),$3,NULL,$4)",
+        {std::string{identityValue.id().value()},
+         foundation::toHex(encryptedTotp.value()), std::to_string(m_keyVersion),
+         instant(identityValue.createdAt())}, "create managed TOTP");
+    if (!status) return failTransaction(status.error());
+
+    ResultPointer auditLock = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673314)");
+    if (!tuplesOk(auditLock.get())) {
+        return failTransaction(databaseError(auditLock.get(), "lock audit chain"));
+    }
+    ResultPointer previousResult = exec(
+        connection,
+        "SELECT encode(event_hash,'hex') FROM openproof.audit_events "
+        "ORDER BY sequence DESC LIMIT 1");
+    if (!tuplesOk(previousResult.get())) {
+        return failTransaction(databaseError(previousResult.get(), "read audit chain head"));
+    }
+    std::optional<security::Sha256Digest> previousHash;
+    std::string previousHex;
+    if (PQntuples(previousResult.get()) == 1) {
+        auto parsed = parseDigest(field(previousResult.get(), 0, 0));
+        if (!parsed) return failTransaction(parsed.error());
+        previousHash = parsed.value();
+        previousHex = foundation::toHex(parsed.value());
+    }
+    foundation::JsonObjectWriter detail;
+    for (const auto& [name, value] : auditEvent->fields()) detail.add(name, value);
+    ResultPointer insertedAudit = execParams(
+        connection,
+        "INSERT INTO openproof.audit_events"
+        "(event_id,occurred_at_ms,correlation_id,organization_id,identity_id,"
+        "category,action,outcome,detail,previous_hash,event_hash) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,"
+        "CASE WHEN $10='' THEN NULL ELSE decode($10,'hex') END,decode($11,'hex')) "
+        "RETURNING sequence",
+        {eventId, instant(auditEvent->occurredAt()),
+         std::string{auditEvent->correlation().value()},
+         std::string{enrollment.organizationId().value()},
+         std::string{identityValue.id().value()},
+         std::string{auditEvent->category()}, std::string{auditEvent->action()},
+         std::string{auditEvent->outcome()}, detail.build(), previousHex,
+         std::string(64U, '0')});
+    if (!tuplesOk(insertedAudit.get()) || PQntuples(insertedAudit.get()) != 1) {
+        return failTransaction(databaseError(insertedAudit.get(), "append member audit event"));
+    }
+    auto sequence = parseInteger<std::uint64_t>(field(insertedAudit.get(), 0, 0));
+    if (!sequence) return failTransaction(sequence.error());
+    auto recordHash = audit::computeAuditRecordHash(
+        auditEvent.value(), sequence.value(), previousHash, m_auditKey);
+    if (!recordHash) return failTransaction(recordHash.error());
+    status = run(
+        "UPDATE openproof.audit_events SET event_hash=decode($2,'hex') WHERE sequence=$1",
+        {std::to_string(sequence.value()), foundation::toHex(recordHash.value())},
+        "seal member audit event");
+    if (!status) return failTransaction(status.error());
+
+    foundation::JsonObjectWriter payload;
+    payload.add("event_id", eventId)
+        .add("type", "administration.local-member.created")
+        .add("organization_id", enrollment.organizationId().value())
+        .add("actor_identity_id", actor.value())
+        .add("identity_id", identityValue.id().value())
+        .add("severity", "critical");
+    status = run(
+        "INSERT INTO openproof.security_event_outbox"
+        "(event_id,occurred_at_ms,payload) VALUES($1,$2,$3::jsonb)",
+        {eventId, instant(identityValue.createdAt()), payload.build()},
+        "append member security event");
+    if (!status) return failTransaction(status.error());
+    return commit(connection);
 }
 
 }

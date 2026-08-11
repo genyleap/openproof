@@ -34,6 +34,9 @@
 #define OPENPROOF_HAS_TEXT_ENCODING 0
 #endif
 
+import openproof.administration;
+import openproof.administration.http;
+import openproof.audit;
 import openproof.config;
 import openproof.authentication;
 import openproof.authentication.http;
@@ -53,6 +56,9 @@ import openproof.storage.postgres;
 namespace {
 
 namespace fnd = openproof::foundation;
+namespace administration = openproof::administration;
+namespace adminHttp = openproof::administration::http;
+namespace audit = openproof::audit;
 namespace cfg = openproof::config;
 namespace auth = openproof::authentication;
 namespace authHttp = openproof::authentication::http;
@@ -139,6 +145,14 @@ public:
     }
 
     [[nodiscard]] bool runServer() const noexcept { return m_runServer; }
+    [[nodiscard]] bool bootstrapAdmin() const noexcept { return m_bootstrapAdmin; }
+
+    [[nodiscard]] const std::string& organizationName() const noexcept
+    { return *m_organizationName; }
+    [[nodiscard]] const std::string& identityId() const noexcept
+    { return *m_identityId; }
+    [[nodiscard]] const std::string& externalSubject() const noexcept
+    { return *m_externalSubject; }
 
     [[nodiscard]] const std::optional<std::filesystem::path>& configPath() const noexcept
     {
@@ -150,7 +164,11 @@ private:
     bool m_showVersion{false};
     bool m_printDefaultConfig{false};
     bool m_runServer{false};
+    bool m_bootstrapAdmin{false};
     std::optional<std::filesystem::path> m_configPath;
+    std::optional<std::string> m_organizationName;
+    std::optional<std::string> m_identityId;
+    std::optional<std::string> m_externalSubject;
 };
 
 fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> arguments)
@@ -166,6 +184,12 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "The 'server' subcommand was specified more than once.");
             }
             parsed.m_runServer = true;
+        } else if (argument == "bootstrap-admin") {
+            if (parsed.m_bootstrapAdmin) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'bootstrap-admin' subcommand was specified more than once.");
+            }
+            parsed.m_bootstrapAdmin = true;
         } else if (argument == "--help" || argument == "-h") {
             parsed.m_showHelp = true;
         } else if (argument == "--version" || argument == "-V") {
@@ -178,11 +202,53 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "Option '--config' requires a file path.");
             }
             ++index;
+            if (parsed.m_configPath.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--config' was specified more than once.");
+            }
             parsed.m_configPath = std::filesystem::path{arguments[index]};
+        } else if (argument == "--organization-name") {
+            if ((index + 1U) >= arguments.size() || parsed.m_organizationName.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--organization-name' requires one unique value.");
+            }
+            parsed.m_organizationName = std::string{arguments[++index]};
+        } else if (argument == "--identity-id") {
+            if ((index + 1U) >= arguments.size() || parsed.m_identityId.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--identity-id' requires one unique value.");
+            }
+            parsed.m_identityId = std::string{arguments[++index]};
+        } else if (argument == "--subject") {
+            if ((index + 1U) >= arguments.size() || parsed.m_externalSubject.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--subject' requires one unique value.");
+            }
+            parsed.m_externalSubject = std::string{arguments[++index]};
         } else {
             return fnd::fail(fnd::ErrorCode::InvalidArgument,
                              std::string{"Unrecognized option: "} + std::string{argument});
         }
+    }
+
+    if (parsed.m_showHelp) return parsed;
+    if (parsed.m_runServer && parsed.m_bootstrapAdmin) {
+        return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                         "Only one subcommand may be selected.");
+    }
+    const bool hasBootstrapOption = parsed.m_organizationName.has_value()
+        || parsed.m_identityId.has_value() || parsed.m_externalSubject.has_value();
+    if (parsed.m_bootstrapAdmin
+        && (!parsed.m_configPath.has_value() || !parsed.m_organizationName.has_value()
+            || !parsed.m_identityId.has_value()
+            || !parsed.m_externalSubject.has_value())) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "bootstrap-admin requires --config, --organization-name, --identity-id and --subject.");
+    }
+    if (!parsed.m_bootstrapAdmin && hasBootstrapOption) {
+        return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                         "Bootstrap options require the bootstrap-admin subcommand.");
     }
 
     return parsed;
@@ -194,6 +260,9 @@ void printUsage()
     std::println("");
     std::println("Usage:");
     std::println("  {} server [options]", kProgramName);
+    std::println("  {} bootstrap-admin --config <path> --organization-name <name>",
+                 kProgramName);
+    std::println("      --identity-id <id> --subject <local-subject>");
     std::println("  {} [--help | --version | --print-default-config]", kProgramName);
     std::println("");
     std::println("Options:");
@@ -205,11 +274,15 @@ void printUsage()
     std::println("                       this binary and exit.");
     std::println("  -h, --help           Show this message and exit.");
     std::println("  -V, --version        Show the version and exit.");
+    std::println("  --organization-name  Display name of the initial tenant.");
+    std::println("  --identity-id        Canonical id for the initial owner.");
+    std::println("  --subject            Local login subject; never reused as identity id.");
     std::println("");
     std::println("Environment overrides:");
     std::println("  OPENPROOF_SERVER_BIND_ADDRESS, OPENPROOF_SERVER_PORT,");
     std::println("  OPENPROOF_LOGGING_LEVEL, OPENPROOF_LOGGING_CONSOLE,");
     std::println("  OPENPROOF_DATABASE_URL");
+    std::println("  OPENPROOF_BOOTSTRAP_PASSWORD (bootstrap-admin only; minimum 16 bytes)");
 }
 
 volatile std::sig_atomic_t g_shutdownRequested = 0;
@@ -276,6 +349,99 @@ public:
         raw.push_back(static_cast<char>(std::to_integer<unsigned char>(value)));
     }
     return fnd::SecretString{std::move(raw)};
+}
+
+[[nodiscard]] ExitCode runBootstrapAdmin(
+    const cfg::PlatformConfig& platform, const cfg::Environment& environment,
+    const CommandLine& commandLine, const fnd::ClockSource& clock)
+{
+    if (!platform.auth().enabled() || !platform.database().enabled()
+        || platform.security().tokenSigningKey().expose().size() < 32U) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "bootstrap-admin requires enabled auth, PostgreSQL and a master key of at least 32 bytes."});
+        return ExitCode::ConfigurationError;
+    }
+    const auto password = environment.get("OPENPROOF_BOOTSTRAP_PASSWORD");
+    if (!password.has_value()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "OPENPROOF_BOOTSTRAP_PASSWORD is required by bootstrap-admin."});
+        return ExitCode::ConfigurationError;
+    }
+
+    auto poolConfig = postgres::PoolConfig::create(
+        platform.database().connectionString().clone(), platform.database().poolSize(),
+        std::chrono::seconds{5});
+    if (!poolConfig) {
+        reportStartupFailure(poolConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+    if (!pool) {
+        reportStartupFailure(pool.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::Migrator migrator{*pool.value()};
+    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
+
+    auto passwordSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/password-pepper/v1");
+    auto totpSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/totp-encryption-key/v1");
+    auto auditSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/audit-chain-key/v1");
+    if (!passwordSecret || !totpSecret || !auditSecret) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auto passwordHasher = credentials::PasswordHasher::create(
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+    auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
+    auto auditKey = audit::AuditKey::create(std::move(auditSecret).value());
+    auto generatedTotp = credentials::TotpSecret::generate();
+    if (!passwordHasher || !totpKey || !auditKey || !generatedTotp) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+
+    auto administrator = administration::InitialAdministrator::create(
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        commandLine.organizationName(),
+        identity::IdentityId{commandLine.identityId()},
+        idp::ProviderId{std::string{platform.auth().providerId()}},
+        idp::ExternalSubject{commandLine.externalSubject()},
+        fnd::SecretString{*password}, std::move(generatedTotp).value(), clock.now());
+    if (!administrator) {
+        reportStartupFailure(administrator.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto repository = postgres::PostgresAdministrationRepository::create(
+        *pool.value(), std::move(passwordHasher).value(),
+        std::move(totpKey).value(), 1U,
+        idp::ProviderId{std::string{platform.auth().providerId()}},
+        std::move(auditKey).value());
+    if (!repository) {
+        reportStartupFailure(repository.error());
+        return ExitCode::InternalError;
+    }
+    const fnd::Status initialized = repository.value()->initialize(administrator.value());
+    if (!initialized) {
+        reportStartupFailure(initialized.error());
+        return initialized.error().code() == fnd::ErrorCode::AlreadyExists
+            ? ExitCode::UsageError : ExitCode::InternalError;
+    }
+
+    const fnd::SecretString enrollment = administrator->totp().enrollmentBase32();
+    std::println("Initial administrator created for organization '{}'.",
+                 platform.auth().organizationId());
+    std::println("TOTP secret (Base32; shown once): {}", enrollment.expose());
+    std::println("Store this secret in the owner's authenticator before starting the server.");
+    return ExitCode::Success;
 }
 
 [[nodiscard]] ExitCode runListener(const cfg::PlatformConfig& platform,
@@ -440,14 +606,22 @@ public:
         platform.security().tokenSigningKey(), "openproof/totp-encryption-key/v1");
     auto recoverySecret = deriveSecret(
         platform.security().tokenSigningKey(), "openproof/recovery-code-pepper/v1");
-    if (!passwordSecret || !totpSecret || !recoverySecret) {
+    auto auditSecret = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/audit-chain-key/v1");
+    if (!passwordSecret || !totpSecret || !recoverySecret || !auditSecret) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
+    auto administrationPasswordHasher = credentials::PasswordHasher::create(
+        passwordSecret->clone(), credentials::PasswordPolicy::recommended());
+    auto administrationTotpKey = security::AeadKey::create(totpSecret->clone());
+    auto administrationAuditKey = audit::AuditKey::create(
+        std::move(auditSecret).value());
     auto passwordHasher = credentials::PasswordHasher::create(
         std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
-    if (!passwordHasher || !totpKey) {
+    if (!passwordHasher || !totpKey || !administrationPasswordHasher
+        || !administrationTotpKey || !administrationAuditKey) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -458,7 +632,11 @@ public:
         providerId);
     auto recoveryCodes = credentials::RecoveryCodeService::create(
         recoveryRepository, std::move(recoverySecret).value());
-    if (!accounts || !recoveryCodes) {
+    auto administrationRepository = postgres::PostgresAdministrationRepository::create(
+        *pool.value(), std::move(administrationPasswordHasher).value(),
+        std::move(administrationTotpKey).value(), 1U, providerId,
+        std::move(administrationAuditKey).value());
+    if (!accounts || !recoveryCodes || !administrationRepository) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -484,9 +662,13 @@ public:
     gateway::Gateway gatewayCore{
         router, sessions, access, limiter.value(), discovery, loadBalancer,
         circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+    adminHttp::AdministrationHttpApi administrationApi{
+        sessions, *administrationRepository.value(), limiter.value(),
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        providerId, clock, gatewayCore};
     authHttp::AuthenticationHttpApi authApi{
         authentication, sessions, recoveryCodes.value(), limiter.value(),
-        providerId, gatewayCore};
+        providerId, administrationApi};
     return runListener(platform, authApi, logger);
 }
 
@@ -571,7 +753,7 @@ void reportStartupFailure(const fnd::Error& failure)
             return ExitCode::Success;
         }
     }
-    if (!commandLine->runServer()) {
+    if (!commandLine->runServer() && !commandLine->bootstrapAdmin()) {
         printUsage();
         return ExitCode::UsageError;
     }
@@ -591,6 +773,10 @@ void reportStartupFailure(const fnd::Error& failure)
 
     const auto clock = std::make_shared<const fnd::SystemClockSource>();
     const obs::Logger logger{makeSink(platform.logging()), clock, platform.logging().level()};
+
+    if (commandLine->bootstrapAdmin()) {
+        return runBootstrapAdmin(platform, environment, commandLine.value(), *clock);
+    }
 
     std::vector<obs::LogField> startupFields{
         obs::LogField::text("version", std::string{kVersion}),

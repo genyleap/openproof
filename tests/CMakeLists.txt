@@ -22,6 +22,8 @@ add_executable(openproof_tests
     identity/transaction_test.cpp
     authentication/service_test.cpp
     authentication/http_test.cpp
+    administration/administration_test.cpp
+    administration/http_test.cpp
     session/session_test.cpp
     credentials/credentials_test.cpp
     providers/local_test.cpp
@@ -48,6 +50,7 @@ set_target_properties(openproof_tests PROPERTIES
 target_link_libraries(openproof_tests
     PRIVATE
         openproof_foundation
+        openproof_administration
         openproof_security
         openproof_observability
         openproof_audit

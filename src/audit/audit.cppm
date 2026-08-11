@@ -88,6 +88,13 @@ private:
     security::Sha256Digest m_hash{};
 };
 
+/** Computes the canonical HMAC for a repository-assigned audit position. */
+[[nodiscard]] foundation::Result<security::Sha256Digest>
+computeAuditRecordHash(
+    const AuditEvent& event, std::uint64_t sequence,
+    const std::optional<security::Sha256Digest>& previousHash,
+    const AuditKey& key);
+
 class AuditRepository {
 public:
     AuditRepository(const AuditRepository&) = delete;

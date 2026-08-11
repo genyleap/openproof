@@ -13,6 +13,8 @@
 #include <libpq-fe.h>
 
 import openproof.foundation;
+import openproof.administration;
+import openproof.audit;
 import openproof.credentials;
 import openproof.identity.core;
 import openproof.identity.provider;
@@ -25,6 +27,8 @@ import openproof.storage.postgres;
 namespace {
 
 namespace core = openproof::identity::core;
+namespace admin = openproof::administration;
+namespace audit = openproof::audit;
 namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
 namespace idp = openproof::identity::provider;
@@ -302,6 +306,186 @@ TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)
     first.join();
     second.join();
     EXPECT_EQ(winners.load(), 1U);
+}
+
+TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndOneTime)
+{
+    execute("TRUNCATE openproof.audit_events, openproof.security_event_outbox, "
+            "openproof.organizations CASCADE");
+    auto command = admin::InitialAdministrator::create(
+        core::OrganizationId{"bootstrap-org"}, "Bootstrap Organization",
+        core::IdentityId{"bootstrap-identity"}, idp::ProviderId{"local"},
+        idp::ExternalSubject{"owner@example.test"},
+        fnd::SecretString{"correct-bootstrap-password"},
+        cred::TotpSecret::create(
+            fnd::SecretString{"12345678901234567890"}).value(), kNow);
+    ASSERT_TRUE(command);
+
+    auto policy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
+    auto hasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, policy).value();
+    auto encryptionKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto auditKey = audit::AuditKey::create(
+        fnd::SecretString{"abcdef0123456789abcdef0123456789"}).value();
+    auto bootstrap = pg::PostgresAdministrationRepository::create(
+        *pool, std::move(hasher), std::move(encryptionKey), 1U,
+        idp::ProviderId{"local"}, std::move(auditKey));
+    ASSERT_TRUE(bootstrap);
+    ASSERT_TRUE(bootstrap.value()->initialize(command.value()));
+
+    auto repeated = bootstrap.value()->initialize(command.value());
+    ASSERT_FALSE(repeated);
+    EXPECT_EQ(repeated.error().code(), fnd::ErrorCode::AlreadyExists);
+
+    pg::PostgresOrganizationRepository organizations{*pool};
+    pg::PostgresIdentityRepository identities{*pool};
+    pg::PostgresMembershipRepository memberships{*pool};
+    pg::PostgresExternalIdentityDirectory external{*pool};
+    auto tenant = organizations.findById(core::OrganizationId{"bootstrap-org"});
+    auto identity = identities.findById(
+        core::OrganizationId{"bootstrap-org"},
+        core::IdentityId{"bootstrap-identity"});
+    auto membership = memberships.find(
+        core::OrganizationId{"bootstrap-org"},
+        core::IdentityId{"bootstrap-identity"});
+    auto owner = external.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"local"}, idp::ExternalSubject{"owner@example.test"}});
+    ASSERT_TRUE(tenant && tenant->has_value());
+    ASSERT_TRUE(identity && identity->has_value());
+    ASSERT_TRUE(membership && membership->has_value());
+    ASSERT_TRUE(owner && owner->has_value());
+    EXPECT_TRUE(membership->value().hasRole(org::Role{"owner"}));
+    EXPECT_EQ(owner->value(), core::IdentityId{"bootstrap-identity"});
+
+    std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.audit_events WHERE "
+        "action='bootstrap.initial-owner' AND encode(event_hash,'hex')<>repeat('0',64)),"
+        "(SELECT count(*) FROM openproof.security_event_outbox),"
+        "(SELECT encrypted_seed=convert_to('12345678901234567890','UTF8') "
+        "FROM openproof.totp_credentials WHERE identity_id='bootstrap-identity')")};
+    ASSERT_NE(evidence.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(evidence.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(evidence.get()), 1);
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 0), "1");
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 1), "1");
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 2), "f");
+
+    auto verifierHasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, policy).value();
+    auto verifierKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto accounts = pg::PostgresLocalAccountDirectory::create(
+        *pool, std::move(verifierHasher), cred::TotpPolicy::recommended(),
+        std::move(verifierKey), 1U, idp::ProviderId{"local"});
+    ASSERT_TRUE(accounts);
+    const std::string code = cred::totpAt(
+        command->totp(), cred::TotpPolicy::recommended(), kNow).value();
+    auto verified = accounts.value()->verify(
+        idp::ExternalSubject{"owner@example.test"},
+        fnd::SecretString{"correct-bootstrap-password"}, code, kNow);
+    ASSERT_TRUE(verified) << verified.error().internalDetail();
+    EXPECT_EQ(verified.value(), local::LocalVerification::PasswordAndTotp);
+}
+
+TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembers)
+{
+    execute("TRUNCATE openproof.audit_events, openproof.security_event_outbox");
+    execute("INSERT INTO openproof.memberships"
+            "(organization_id,identity_id,state,invited_at_ms) "
+            "VALUES('org','identity-1',1,1770000000000)");
+    execute("INSERT INTO openproof.membership_roles"
+            "(organization_id,identity_id,role) "
+            "VALUES('org','identity-1','owner')");
+
+    auto policy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
+    auto hasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, policy).value();
+    auto encryptionKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto auditKey = audit::AuditKey::create(
+        fnd::SecretString{"abcdef0123456789abcdef0123456789"}).value();
+    auto administration = pg::PostgresAdministrationRepository::create(
+        *pool, std::move(hasher), std::move(encryptionKey), 1U,
+        idp::ProviderId{"local"}, std::move(auditKey));
+    ASSERT_TRUE(administration);
+
+    const fnd::SecretString password{"generated-member-password-123456"};
+    auto memberTotp = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    auto enrollment = admin::LocalMemberEnrollment::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        idp::ProviderId{"local"}, idp::ExternalSubject{"bob@example.test"},
+        std::vector<org::Role>{org::Role{"viewer"}, org::Role{"member"}},
+        password.clone(), std::move(memberTotp), kNow);
+    ASSERT_TRUE(enrollment);
+    ASSERT_TRUE(administration.value()->provision(
+        core::IdentityId{"identity-1"}, enrollment.value()));
+
+    pg::PostgresIdentityRepository identities{*pool};
+    pg::PostgresMembershipRepository memberships{*pool};
+    pg::PostgresExternalIdentityDirectory external{*pool};
+    auto identity = identities.findById(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
+    auto membership = memberships.find(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
+    auto owner = external.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"local"}, idp::ExternalSubject{"bob@example.test"}});
+    ASSERT_TRUE(identity && identity->has_value());
+    ASSERT_TRUE(membership && membership->has_value());
+    ASSERT_TRUE(owner && owner->has_value());
+    EXPECT_EQ(owner->value(), core::IdentityId{"identity-2"});
+    EXPECT_TRUE(membership->value().hasRole(org::Role{"member"}));
+    EXPECT_TRUE(membership->value().hasRole(org::Role{"viewer"}));
+    EXPECT_FALSE(membership->value().hasRole(org::Role{"owner"}));
+
+    auto verifierHasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, policy).value();
+    auto verifierKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto accounts = pg::PostgresLocalAccountDirectory::create(
+        *pool, std::move(verifierHasher), cred::TotpPolicy::recommended(),
+        std::move(verifierKey), 1U, idp::ProviderId{"local"});
+    ASSERT_TRUE(accounts);
+    auto verifierTotp = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    const std::string code = cred::totpAt(
+        verifierTotp, cred::TotpPolicy::recommended(), kNow).value();
+    ASSERT_TRUE(accounts.value()->verify(
+        idp::ExternalSubject{"bob@example.test"}, password, code, kNow));
+
+    auto refused = admin::LocalMemberEnrollment::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-3"},
+        idp::ProviderId{"local"}, idp::ExternalSubject{"mallory@example.test"},
+        std::vector<org::Role>{org::Role{"member"}},
+        fnd::SecretString{"another-generated-password-12345"},
+        cred::TotpSecret::create(
+            fnd::SecretString{"abcdefghijabcdefghij"}).value(), kNow);
+    ASSERT_TRUE(refused);
+    const auto denied = administration.value()->provision(
+        core::IdentityId{"identity-2"}, refused.value());
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(), fnd::ErrorCode::PermissionDenied);
+    auto absent = identities.findById(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-3"});
+    ASSERT_TRUE(absent);
+    EXPECT_FALSE(absent->has_value());
+
+    std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.audit_events WHERE "
+        "action='local-member.create' AND encode(event_hash,'hex')<>repeat('0',64)),"
+        "(SELECT count(*) FROM openproof.security_event_outbox),"
+        "(SELECT count(*) FROM openproof.identities WHERE id='identity-3')")};
+    ASSERT_NE(evidence.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(evidence.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(evidence.get()), 1);
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 0), "1");
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 1), "1");
+    EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 2), "0");
 }
 
 }

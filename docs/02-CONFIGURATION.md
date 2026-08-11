@@ -112,9 +112,9 @@ opens the listener.
 
 When enabled, the configured organization must already exist and be active.
 Every matching gateway route requires a valid session and an active membership
-in that organization. The auth plane owns `/auth` and `/auth/*`; it does not
-expose registration, password enrollment, TOTP enrollment, membership changes,
-or policy administration.
+in that organization. The auth plane owns `/auth` and `/auth/*`. There is no
+public registration, password/TOTP enrollment, membership-change or policy
+administration endpoint.
 
 | Method and path | Purpose | Authentication |
 |---|---|---|
@@ -129,6 +129,78 @@ Requests use strict JSON with a 16 KiB limit and reject unknown fields. Cookies
 are `Secure`, `HttpOnly`, and `SameSite=Strict`; auth responses are `no-store`.
 Supplying both a Bearer and session cookie is rejected as ambiguous. A front
 proxy must preserve `Set-Cookie` and the client address used for rate limiting.
+
+## Owner administration API
+
+The administration plane reserves `/admin` and `/admin/*`. Its first supported
+operation creates a local member in the configured organization:
+
+| Method and path | Purpose | Authentication |
+|---|---|---|
+| `POST /admin/local-members` | Atomically create a local identity, link, active membership, roles, password and TOTP | Active IAL2 session whose identity has the active `owner` role |
+
+The owner check is performed from authoritative PostgreSQL state inside the
+same serializable transaction as the mutation. The HTTP layer deliberately does
+not trust a role carried in the session. Requests are strict JSON, limited to
+16 KiB, and accept exactly these fields:
+
+```json
+{
+  "identity_id": "member-42",
+  "subject": "member@example.test",
+  "roles": ["member"]
+}
+```
+
+`identity_id` is the canonical internal identifier and must differ from the
+provider `subject`. Roles must be a non-empty set of at most 16 unique values.
+The client cannot choose either credential. After a successful atomic commit,
+the server returns `201 Created`:
+
+```json
+{
+  "identity_id": "member-42",
+  "initial_password": "generated-base64url-secret",
+  "totp_secret_base32": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+}
+```
+
+The 256-bit password and 160-bit TOTP seed are generated with the platform
+CSPRNG, returned only in this response, and never written to audit or outbox
+payloads. The response is `no-store`; the administrator must transfer the
+credentials over the trusted TLS-protected channel and the recipient should
+enroll the TOTP immediately. Any validation, authorization, uniqueness,
+credential, audit or outbox failure rolls back the entire operation. A denied
+or failed response contains no generated secret.
+
+## Initial owner bootstrap
+
+`bootstrap-admin` is the only supported way to initialize a fresh deployment.
+It is an offline operator ceremony, not an HTTP registration endpoint:
+
+```bash
+export OPENPROOF_BOOTSTRAP_PASSWORD="use-a-long-unique-password"
+
+opp bootstrap-admin \
+  --config examples/openproof.auth-gateway.toml \
+  --organization-name "Example Organization" \
+  --identity-id "initial-owner" \
+  --subject "owner@example.test"
+```
+
+The organization id and local provider id come from `[auth]`. The canonical
+identity id must differ from the external login subject. Passwords must contain
+16–1024 bytes and are accepted only through `OPENPROOF_BOOTSTRAP_PASSWORD`; no
+secret-valued command-line option exists.
+
+The command applies migrations, generates a 160-bit TOTP seed, and atomically
+creates the organization, human identity, explicitly verified provider link,
+active `owner` membership, scrypt password verifier, AES-256-GCM-encrypted TOTP
+credential, HMAC-chained audit record and security-event outbox entry. A
+serializable transaction plus a deployment-wide advisory lock rejects every
+attempt after the first organization exists. The Base32 seed is printed only
+after commit and only once; capture it securely, enroll it, then unset the
+password environment variable.
 
 ---
 
@@ -207,6 +279,10 @@ opp server --config openproof.toml
 The built-in listener accepts only loopback addresses because it is plaintext;
 TLS must terminate in a trusted local proxy. Outbound TLS verifies the peer,
 hostname and SNI. SIGINT and SIGTERM stop the listener cleanly.
+
+`opp bootstrap-admin` does not open a listener. It requires `[auth].enabled`, a
+database, a master key, a configuration file and all non-secret bootstrap
+arguments. Repeating it returns exit code `2` without printing a new TOTP seed.
 
 | Exit code | Meaning |
 |---|---|
