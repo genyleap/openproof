@@ -43,7 +43,7 @@ public:
     }
 };
 
-class RecordingProvisioner final : public admin::LocalMemberProvisioner {
+class RecordingProvisioner final : public admin::LocalMemberAdministrator {
 public:
     [[nodiscard]] fnd::Status provision(
         const core::IdentityId& actor,
@@ -65,8 +65,59 @@ public:
         return fnd::ok();
     }
 
+    [[nodiscard]] fnd::Status replaceRoles(
+        const core::IdentityId& actor,
+        const admin::MemberRoleReplacement& replacement) override
+    {
+        called = true;
+        operation = "roles";
+        actorId = std::string{actor.value()};
+        identityId = std::string{replacement.identityId().value()};
+        roles.clear();
+        for (const org::Role& role : replacement.roles()) {
+            roles.emplace_back(role.value());
+        }
+        return result();
+    }
+
+    [[nodiscard]] fnd::Status changeLifecycle(
+        const core::IdentityId& actor,
+        const admin::MemberLifecycleChange& change) override
+    {
+        called = true;
+        operation = std::string{admin::memberLifecycleActionName(change.action())};
+        actorId = std::string{actor.value()};
+        identityId = std::string{change.identityId().value()};
+        return result();
+    }
+
+    [[nodiscard]] fnd::Status resetCredentials(
+        const core::IdentityId& actor,
+        const admin::LocalCredentialReset& reset) override
+    {
+        called = true;
+        operation = "reset";
+        actorId = std::string{actor.value()};
+        identityId = std::string{reset.identityId().value()};
+        password = std::string{reset.generatedPassword().expose()};
+        totpBase32 = std::string{
+            reset.generatedTotp().enrollmentBase32().expose()};
+        return result();
+    }
+
+private:
+    [[nodiscard]] fnd::Status result() const
+    {
+        return failure.has_value()
+            ? fnd::Status{fnd::fail(*failure, "administration refused")}
+            : fnd::ok();
+    }
+
+public:
+
     bool called{false};
     std::optional<fnd::ErrorCode> failure;
+    std::string operation;
     std::string actorId;
     std::string identityId;
     std::string password;
@@ -75,7 +126,8 @@ public:
 };
 
 [[nodiscard]] gw::HttpRequest request(
-    std::string path, std::string body = {}, std::string token = {})
+    std::string path, std::string body = {}, std::string token = {},
+    gw::HttpMethod method = gw::HttpMethod::Post)
 {
     std::vector<std::pair<std::string, std::string>> headers;
     if (!body.empty()) headers.emplace_back("content-type", "application/json");
@@ -83,7 +135,7 @@ public:
         headers.emplace_back("authorization", "Bearer " + std::move(token));
     }
     return gw::HttpRequest::create(
-        gw::HttpMethod::Post, std::move(path), std::move(headers),
+        method, std::move(path), std::move(headers),
         std::move(body), "127.0.0.1", fnd::CorrelationId{"request"}).value();
 }
 
@@ -201,6 +253,64 @@ TEST(AdministrationHttpApiTest, RejectsUnknownFieldsAndReservesAdminNamespace)
                   "/admin/unknown", {}, "owner-token")).status(),
               404);
     EXPECT_EQ(fixture.api.handle(request("/outside")).status(), 418);
+}
+
+TEST(AdministrationHttpApiTest, ReplacesRolesThroughTheExplicitPutRoute)
+{
+    Fixture fixture;
+    fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    const auto response = fixture.api.handle(request(
+        "/admin/local-members/roles",
+        R"({"identity_id":"identity-2","roles":["viewer","member"]})",
+        "owner-token", gw::HttpMethod::Put));
+
+    EXPECT_EQ(response.status(), 204) << response.body();
+    EXPECT_EQ(fixture.provisioner.operation, "roles");
+    EXPECT_EQ(fixture.provisioner.identityId, "identity-2");
+    EXPECT_EQ(fixture.provisioner.roles,
+              (std::vector<std::string>{"member", "viewer"}));
+}
+
+TEST(AdministrationHttpApiTest, DispatchesEachExplicitLifecycleTransition)
+{
+    Fixture fixture;
+    fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    for (const auto& [path, operation] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"/admin/local-members/suspend", "suspend"},
+             {"/admin/local-members/reinstate", "reinstate"},
+             {"/admin/local-members/remove", "remove"}}) {
+        const auto response = fixture.api.handle(request(
+            path, R"({"identity_id":"identity-2"})", "owner-token"));
+        EXPECT_EQ(response.status(), 204) << response.body();
+        EXPECT_EQ(fixture.provisioner.operation, operation);
+    }
+}
+
+TEST(AdministrationHttpApiTest, CredentialResetReturnsSecretsOnlyAfterSuccess)
+{
+    Fixture fixture;
+    fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    const auto response = fixture.api.handle(request(
+        "/admin/local-members/credentials/reset",
+        R"({"identity_id":"identity-2"})", "owner-token"));
+    ASSERT_EQ(response.status(), 200) << response.body();
+    EXPECT_EQ(fixture.provisioner.operation, "reset");
+    const json::object body = json::parse(response.body()).as_object();
+    EXPECT_EQ(std::string{body.at("initial_password").as_string()},
+              fixture.provisioner.password);
+    EXPECT_EQ(std::string{body.at("totp_secret_base32").as_string()},
+              fixture.provisioner.totpBase32);
+
+    Fixture denied;
+    denied.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    denied.provisioner.failure = fnd::ErrorCode::FailedPrecondition;
+    const auto refused = denied.api.handle(request(
+        "/admin/local-members/credentials/reset",
+        R"({"identity_id":"identity-2"})", "owner-token"));
+    EXPECT_EQ(refused.status(), 412);
+    EXPECT_EQ(refused.body().find("initial_password"), std::string::npos);
+    EXPECT_EQ(refused.body().find("totp_secret"), std::string::npos);
 }
 
 }

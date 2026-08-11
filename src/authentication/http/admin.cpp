@@ -36,6 +36,16 @@ constexpr std::size_t kMaximumAdminBody = 16U * 1024U;
     return output;
 }
 
+[[nodiscard]] gateway::HttpResponse emptyResponse(int status)
+{
+    gateway::HttpResponse output{status, {}, {}};
+    output.setHeader("cache-control", "no-store");
+    output.setHeader("pragma", "no-cache");
+    output.setHeader("x-content-type-options", "nosniff");
+    output.setHeader("referrer-policy", "no-referrer");
+    return output;
+}
+
 [[nodiscard]] foundation::Result<json::object>
 parseObject(const gateway::HttpRequest& request)
 {
@@ -115,7 +125,7 @@ requiredRoles(const json::object& object)
 }
 
 AdministrationHttpApi::AdministrationHttpApi(
-    session::SessionService& sessions, LocalMemberProvisioner& members,
+    session::SessionService& sessions, LocalMemberAdministrator& members,
     gateway::TokenBucketRateLimiter& rateLimiter,
     identity::core::OrganizationId organization,
     idp::ProviderId provider, const foundation::ClockSource& clock,
@@ -153,8 +163,19 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
             "admin-ip:" + std::string{request.remoteAddress()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
-    if (request.method() != gateway::HttpMethod::Post
-        || request.path() != "/admin/local-members") {
+    const bool create = request.method() == gateway::HttpMethod::Post
+        && request.path() == "/admin/local-members";
+    const bool roles = request.method() == gateway::HttpMethod::Put
+        && request.path() == "/admin/local-members/roles";
+    const bool suspend = request.method() == gateway::HttpMethod::Post
+        && request.path() == "/admin/local-members/suspend";
+    const bool reinstate = request.method() == gateway::HttpMethod::Post
+        && request.path() == "/admin/local-members/reinstate";
+    const bool remove = request.method() == gateway::HttpMethod::Post
+        && request.path() == "/admin/local-members/remove";
+    const bool reset = request.method() == gateway::HttpMethod::Post
+        && request.path() == "/admin/local-members/credentials/reset";
+    if (!create && !roles && !suspend && !reinstate && !remove && !reset) {
         return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
     }
     auto credential = gateway::takeSessionCredential(request);
@@ -175,7 +196,21 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
     if (!m_rateLimiter->allow("admin-identity:" + std::string{actor.value()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
-    return createLocalMember(std::move(request), actor);
+    if (create) return createLocalMember(std::move(request), actor);
+    if (roles) return replaceRoles(std::move(request), actor);
+    if (suspend) {
+        return changeLifecycle(std::move(request), actor,
+                               MemberLifecycleAction::Suspend);
+    }
+    if (reinstate) {
+        return changeLifecycle(std::move(request), actor,
+                               MemberLifecycleAction::Reinstate);
+    }
+    if (remove) {
+        return changeLifecycle(std::move(request), actor,
+                               MemberLifecycleAction::Remove);
+    }
+    return resetCredentials(std::move(request), actor);
 }
 
 gateway::HttpResponse AdministrationHttpApi::createLocalMember(
@@ -216,6 +251,84 @@ gateway::HttpResponse AdministrationHttpApi::createLocalMember(
     payload["initial_password"] = enrollment->generatedPassword().expose();
     payload["totp_secret_base32"] = base32.expose();
     return jsonResponse(201, std::move(payload));
+}
+
+gateway::HttpResponse AdministrationHttpApi::replaceRoles(
+    gateway::HttpRequest request, const identity::core::IdentityId& actor)
+{
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"identity_id", "roles"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto identityId = requiredString(body.value(), "identity_id", 200U);
+    auto roles = requiredRoles(body.value());
+    if (!identityId || !roles) {
+        return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    auto replacement = MemberRoleReplacement::create(
+        m_organization,
+        identity::core::IdentityId{std::move(identityId).value()},
+        std::move(roles).value(), m_clock->now());
+    if (!replacement) return error(replacement.error(), request);
+    const foundation::Status replaced =
+        m_members->replaceRoles(actor, replacement.value());
+    return replaced ? emptyResponse(204) : error(replaced.error(), request);
+}
+
+gateway::HttpResponse AdministrationHttpApi::changeLifecycle(
+    gateway::HttpRequest request, const identity::core::IdentityId& actor,
+    MemberLifecycleAction action)
+{
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"identity_id"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto identityId = requiredString(body.value(), "identity_id", 200U);
+    if (!identityId) return error(identityId.error(), request);
+    auto change = MemberLifecycleChange::create(
+        m_organization,
+        identity::core::IdentityId{std::move(identityId).value()},
+        action, m_clock->now());
+    if (!change) return error(change.error(), request);
+    const foundation::Status changed =
+        m_members->changeLifecycle(actor, change.value());
+    return changed ? emptyResponse(204) : error(changed.error(), request);
+}
+
+gateway::HttpResponse AdministrationHttpApi::resetCredentials(
+    gateway::HttpRequest request, const identity::core::IdentityId& actor)
+{
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"identity_id"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto identityId = requiredString(body.value(), "identity_id", 200U);
+    if (!identityId) return error(identityId.error(), request);
+    auto password = security::randomTokenBase64Url(32U);
+    auto totp = credentials::TotpSecret::generate();
+    if (!password || !totp) {
+        return error(foundation::Error{foundation::ErrorCode::Internal}, request);
+    }
+    auto reset = LocalCredentialReset::create(
+        m_organization,
+        identity::core::IdentityId{std::move(identityId).value()},
+        foundation::SecretString{std::move(password).value()},
+        std::move(totp).value(), m_clock->now());
+    if (!reset) return error(reset.error(), request);
+    const foundation::Status resetStatus =
+        m_members->resetCredentials(actor, reset.value());
+    if (!resetStatus) return error(resetStatus.error(), request);
+
+    const foundation::SecretString base32 =
+        reset->generatedTotp().enrollmentBase32();
+    json::object payload;
+    payload["identity_id"] = reset->identityId().value();
+    payload["initial_password"] = reset->generatedPassword().expose();
+    payload["totp_secret_base32"] = base32.expose();
+    return jsonResponse(200, std::move(payload));
 }
 
 }

@@ -11,7 +11,7 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 304 discovered tests, with all nine PostgreSQL tests also
+Verified against the tree at 310 discovered tests, with all nine PostgreSQL tests also
 run against an isolated PostgreSQL 18 instance.
 
 ---
@@ -72,6 +72,7 @@ run against an isolated PostgreSQL 18 instance.
 | 50 | **Initial owner authority is created once, atomically and outside the public edge** | `bootstrap-admin` has no HTTP route or secret CLI flag; a serializable PostgreSQL transaction and deployment advisory lock create every aggregate, encrypted credential, audit record and outbox event, and require zero existing organizations | `InitialAdministratorTest.*`, `InitialAdministratorBootstrapIsAtomicAuditedAndOneTime`, executable bootstrap-to-protected-route smoke test | Entire transaction rolls back; repeat returns `AlreadyExists` without revealing a TOTP seed |
 | 51 | **Provider verification time is bounded by actual completion, not by a stale pre-call clock reading** | Broker consumes expiry at call start and takes a fresh upper-bound timestamp immediately after provider completion | `AllowsProviderToFinishAfterCompletionBegins`, `StillRefusesAProviderTimestampAfterCompletion` | Real providers may cross clock ticks; genuinely future timestamps still fail authentication |
 | 52 | **Local-member authority and credentials are created only by an active IAL2 owner and never partially** | HTTP requires IAL2; PostgreSQL re-authorizes the actor's active `owner` role and locks authoritative tenant/identity/membership rows inside the same serializable transaction that creates the identity, explicit link, membership/roles, server-generated password, encrypted TOTP, chained audit record and outbox event; secrets are returned only after commit | `LocalMemberEnrollmentTest.*`, `AdministrationHttpApiTest.*`, `OwnerProvisioningIsAtomicAuditedAndDeniedToMembers`, executable owner-to-new-member login smoke test | Non-owner/invalid/conflicting requests roll back completely and receive no generated secret |
+| 53 | **Administrative member changes cannot orphan the tenant or leave stale authority live** | PostgreSQL serializes all owner mutations, re-authorizes the actor, prevents the final active owner from losing `owner`/being suspended/being removed, and atomically revokes target sessions; removal clears roles, while credential reset rotates password/TOTP replay state and deletes recovery codes | `MemberRoleReplacementTest.*`, `MemberLifecycleChangeTest.*`, `LocalCredentialResetTest.*`, `AdministrationHttpApiTest.*`, `OwnerProvisioningIsAtomicAuditedAndDeniedToMembers`, executable full-lifecycle smoke test | The complete transaction, audit record and outbox event roll back; old sessions or credentials are invalid after a successful commit |
 
 ---
 

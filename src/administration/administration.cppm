@@ -127,13 +127,107 @@ private:
 };
 
 /** Atomic, owner-authorized persistence boundary for local member creation. */
-class LocalMemberProvisioner {
+enum class MemberLifecycleAction {
+    Suspend,
+    Reinstate,
+    Remove,
+};
+
+[[nodiscard]] std::string_view
+memberLifecycleActionName(MemberLifecycleAction action) noexcept;
+
+/** Validated replacement for the complete role set of one local member. */
+class MemberRoleReplacement final {
 public:
-    LocalMemberProvisioner(const LocalMemberProvisioner&) = delete;
-    LocalMemberProvisioner& operator=(const LocalMemberProvisioner&) = delete;
-    LocalMemberProvisioner(LocalMemberProvisioner&&) = delete;
-    LocalMemberProvisioner& operator=(LocalMemberProvisioner&&) = delete;
-    virtual ~LocalMemberProvisioner() = default;
+    [[nodiscard]] static foundation::Result<MemberRoleReplacement> create(
+        identity::core::OrganizationId organizationId,
+        identity::core::IdentityId identityId,
+        std::vector<organization::Role> roles,
+        foundation::Instant now);
+
+    [[nodiscard]] const identity::core::OrganizationId& organizationId() const noexcept;
+    [[nodiscard]] const identity::core::IdentityId& identityId() const noexcept;
+    [[nodiscard]] const std::vector<organization::Role>& roles() const noexcept;
+    [[nodiscard]] foundation::Instant occurredAt() const noexcept;
+
+private:
+    MemberRoleReplacement(identity::core::OrganizationId organizationId,
+                          identity::core::IdentityId identityId,
+                          std::vector<organization::Role> roles,
+                          foundation::Instant now);
+    identity::core::OrganizationId m_organizationId;
+    identity::core::IdentityId m_identityId;
+    std::vector<organization::Role> m_roles;
+    foundation::Instant m_occurredAt{};
+};
+
+/** Validated request for one explicit membership state transition. */
+class MemberLifecycleChange final {
+public:
+    [[nodiscard]] static foundation::Result<MemberLifecycleChange> create(
+        identity::core::OrganizationId organizationId,
+        identity::core::IdentityId identityId,
+        MemberLifecycleAction action,
+        foundation::Instant now);
+
+    [[nodiscard]] const identity::core::OrganizationId& organizationId() const noexcept;
+    [[nodiscard]] const identity::core::IdentityId& identityId() const noexcept;
+    [[nodiscard]] MemberLifecycleAction action() const noexcept;
+    [[nodiscard]] foundation::Instant occurredAt() const noexcept;
+
+private:
+    MemberLifecycleChange(identity::core::OrganizationId organizationId,
+                          identity::core::IdentityId identityId,
+                          MemberLifecycleAction action,
+                          foundation::Instant now);
+    identity::core::OrganizationId m_organizationId;
+    identity::core::IdentityId m_identityId;
+    MemberLifecycleAction m_action{MemberLifecycleAction::Suspend};
+    foundation::Instant m_occurredAt{};
+};
+
+/** Server-generated replacement password and TOTP for one active member. */
+class LocalCredentialReset final {
+public:
+    [[nodiscard]] static foundation::Result<LocalCredentialReset> create(
+        identity::core::OrganizationId organizationId,
+        identity::core::IdentityId identityId,
+        foundation::SecretString generatedPassword,
+        credentials::TotpSecret generatedTotp,
+        foundation::Instant now);
+
+    LocalCredentialReset(const LocalCredentialReset&) = delete;
+    LocalCredentialReset& operator=(const LocalCredentialReset&) = delete;
+    LocalCredentialReset(LocalCredentialReset&&) noexcept = default;
+    LocalCredentialReset& operator=(LocalCredentialReset&&) noexcept = default;
+
+    [[nodiscard]] const identity::core::OrganizationId& organizationId() const noexcept;
+    [[nodiscard]] const identity::core::IdentityId& identityId() const noexcept;
+    [[nodiscard]] const foundation::SecretString& generatedPassword() const noexcept;
+    [[nodiscard]] const credentials::TotpSecret& generatedTotp() const noexcept;
+    [[nodiscard]] foundation::Instant occurredAt() const noexcept;
+
+private:
+    LocalCredentialReset(identity::core::OrganizationId organizationId,
+                         identity::core::IdentityId identityId,
+                         foundation::SecretString generatedPassword,
+                         credentials::TotpSecret generatedTotp,
+                         foundation::Instant now);
+    identity::core::OrganizationId m_organizationId;
+    identity::core::IdentityId m_identityId;
+    foundation::SecretString m_generatedPassword;
+    credentials::TotpSecret m_generatedTotp;
+    foundation::Instant m_occurredAt{};
+};
+
+/** Atomic, owner-authorized persistence boundary for local-member lifecycle. */
+class LocalMemberAdministrator {
+public:
+    LocalMemberAdministrator(const LocalMemberAdministrator&) = delete;
+    LocalMemberAdministrator& operator=(const LocalMemberAdministrator&) = delete;
+    LocalMemberAdministrator(LocalMemberAdministrator&&) = delete;
+    LocalMemberAdministrator& operator=(LocalMemberAdministrator&&) = delete;
+    virtual ~LocalMemberAdministrator() = default;
 
     /**
      * Persists @p enrollment only when @p actor is an active owner of its
@@ -142,9 +236,18 @@ public:
     [[nodiscard]] virtual foundation::Status provision(
         const identity::core::IdentityId& actor,
         const LocalMemberEnrollment& enrollment) = 0;
+    [[nodiscard]] virtual foundation::Status replaceRoles(
+        const identity::core::IdentityId& actor,
+        const MemberRoleReplacement& replacement) = 0;
+    [[nodiscard]] virtual foundation::Status changeLifecycle(
+        const identity::core::IdentityId& actor,
+        const MemberLifecycleChange& change) = 0;
+    [[nodiscard]] virtual foundation::Status resetCredentials(
+        const identity::core::IdentityId& actor,
+        const LocalCredentialReset& reset) = 0;
 
 protected:
-    LocalMemberProvisioner() = default;
+    LocalMemberAdministrator() = default;
 };
 
 }

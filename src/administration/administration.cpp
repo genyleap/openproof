@@ -195,4 +195,137 @@ LocalMemberEnrollment::generatedPassword() const noexcept
 const credentials::TotpSecret&
 LocalMemberEnrollment::generatedTotp() const noexcept { return m_generatedTotp; }
 
+std::string_view memberLifecycleActionName(MemberLifecycleAction action) noexcept
+{
+    switch (action) {
+    case MemberLifecycleAction::Suspend: return "suspend";
+    case MemberLifecycleAction::Reinstate: return "reinstate";
+    case MemberLifecycleAction::Remove: return "remove";
+    }
+    return "remove";
+}
+
+MemberRoleReplacement::MemberRoleReplacement(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    std::vector<organization::Role> roles,
+    foundation::Instant now)
+    : m_organizationId(std::move(organizationId)),
+      m_identityId(std::move(identityId)), m_roles(std::move(roles)),
+      m_occurredAt(now)
+{
+}
+
+foundation::Result<MemberRoleReplacement> MemberRoleReplacement::create(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    std::vector<organization::Role> roles,
+    foundation::Instant now)
+{
+    if (!validText(organizationId.value(), 200U)
+        || !validText(identityId.value(), 200U) || roles.empty()
+        || roles.size() > 16U
+        || std::ranges::any_of(roles, [](const organization::Role& role) {
+               return !validText(role.value(), 200U);
+           })) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The role replacement request is invalid.");
+    }
+    std::ranges::sort(roles);
+    if (std::ranges::adjacent_find(roles) != roles.end()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Replacement roles must be unique.");
+    }
+    return MemberRoleReplacement{std::move(organizationId), std::move(identityId),
+                                 std::move(roles), now};
+}
+
+const identity::core::OrganizationId&
+MemberRoleReplacement::organizationId() const noexcept { return m_organizationId; }
+const identity::core::IdentityId&
+MemberRoleReplacement::identityId() const noexcept { return m_identityId; }
+const std::vector<organization::Role>&
+MemberRoleReplacement::roles() const noexcept { return m_roles; }
+foundation::Instant MemberRoleReplacement::occurredAt() const noexcept
+{ return m_occurredAt; }
+
+MemberLifecycleChange::MemberLifecycleChange(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    MemberLifecycleAction action,
+    foundation::Instant now)
+    : m_organizationId(std::move(organizationId)),
+      m_identityId(std::move(identityId)), m_action(action), m_occurredAt(now)
+{
+}
+
+foundation::Result<MemberLifecycleChange> MemberLifecycleChange::create(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    MemberLifecycleAction action,
+    foundation::Instant now)
+{
+    const bool recognized = action == MemberLifecycleAction::Suspend
+        || action == MemberLifecycleAction::Reinstate
+        || action == MemberLifecycleAction::Remove;
+    if (!validText(organizationId.value(), 200U)
+        || !validText(identityId.value(), 200U) || !recognized) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The membership lifecycle request is invalid.");
+    }
+    return MemberLifecycleChange{std::move(organizationId), std::move(identityId),
+                                 action, now};
+}
+
+const identity::core::OrganizationId&
+MemberLifecycleChange::organizationId() const noexcept { return m_organizationId; }
+const identity::core::IdentityId&
+MemberLifecycleChange::identityId() const noexcept { return m_identityId; }
+MemberLifecycleAction MemberLifecycleChange::action() const noexcept { return m_action; }
+foundation::Instant MemberLifecycleChange::occurredAt() const noexcept
+{ return m_occurredAt; }
+
+LocalCredentialReset::LocalCredentialReset(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    foundation::SecretString generatedPassword,
+    credentials::TotpSecret generatedTotp,
+    foundation::Instant now)
+    : m_organizationId(std::move(organizationId)),
+      m_identityId(std::move(identityId)),
+      m_generatedPassword(std::move(generatedPassword)),
+      m_generatedTotp(std::move(generatedTotp)), m_occurredAt(now)
+{
+}
+
+foundation::Result<LocalCredentialReset> LocalCredentialReset::create(
+    identity::core::OrganizationId organizationId,
+    identity::core::IdentityId identityId,
+    foundation::SecretString generatedPassword,
+    credentials::TotpSecret generatedTotp,
+    foundation::Instant now)
+{
+    if (!validText(organizationId.value(), 200U)
+        || !validText(identityId.value(), 200U)
+        || generatedPassword.expose().size() < 32U
+        || generatedPassword.expose().size() > 1024U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The credential reset request is invalid.");
+    }
+    return LocalCredentialReset{
+        std::move(organizationId), std::move(identityId),
+        std::move(generatedPassword), std::move(generatedTotp), now};
+}
+
+const identity::core::OrganizationId&
+LocalCredentialReset::organizationId() const noexcept { return m_organizationId; }
+const identity::core::IdentityId&
+LocalCredentialReset::identityId() const noexcept { return m_identityId; }
+const foundation::SecretString&
+LocalCredentialReset::generatedPassword() const noexcept { return m_generatedPassword; }
+const credentials::TotpSecret&
+LocalCredentialReset::generatedTotp() const noexcept { return m_generatedTotp; }
+foundation::Instant LocalCredentialReset::occurredAt() const noexcept
+{ return m_occurredAt; }
+
 }

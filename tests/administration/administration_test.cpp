@@ -105,4 +105,49 @@ TEST(LocalMemberEnrollmentTest, RejectsDuplicateRolesAndCanonicalSubjectReuse)
         fnd::SecretString{std::string(43U, 'p')}, totp(), kNow));
 }
 
+TEST(MemberRoleReplacementTest, CanonicalizesAndValidatesTheCompleteRoleSet)
+{
+    auto replacement = admin::MemberRoleReplacement::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        std::vector<org::Role>{org::Role{"viewer"}, org::Role{"member"}}, kNow);
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(replacement->roles().size(), 2U);
+    EXPECT_EQ(replacement->roles()[0], org::Role{"member"});
+    EXPECT_EQ(replacement->roles()[1], org::Role{"viewer"});
+    EXPECT_FALSE(admin::MemberRoleReplacement::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        std::vector<org::Role>{org::Role{"member"}, org::Role{"member"}}, kNow));
+    EXPECT_FALSE(admin::MemberRoleReplacement::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"}, {}, kNow));
+}
+
+TEST(MemberLifecycleChangeTest, AcceptsOnlyKnownExplicitTransitions)
+{
+    for (const auto action : {admin::MemberLifecycleAction::Suspend,
+                              admin::MemberLifecycleAction::Reinstate,
+                              admin::MemberLifecycleAction::Remove}) {
+        auto change = admin::MemberLifecycleChange::create(
+            core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+            action, kNow);
+        ASSERT_TRUE(change);
+        EXPECT_FALSE(admin::memberLifecycleActionName(action).empty());
+    }
+    EXPECT_FALSE(admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        static_cast<admin::MemberLifecycleAction>(99), kNow));
+}
+
+TEST(LocalCredentialResetTest, IsMoveOnlyAndRejectsWeakGeneratedMaterial)
+{
+    auto reset = admin::LocalCredentialReset::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        fnd::SecretString{std::string(43U, 'p')}, totp(), kNow);
+    ASSERT_TRUE(reset);
+    EXPECT_EQ(reset->identityId(), core::IdentityId{"identity-2"});
+    EXPECT_FALSE(admin::LocalCredentialReset::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        fnd::SecretString{"weak"}, totp(), kNow));
+    static_assert(!std::is_copy_constructible_v<admin::LocalCredentialReset>);
+}
+
 }

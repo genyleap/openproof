@@ -91,10 +91,13 @@ protected:
     std::unique_ptr<PGconn, ConnectionDeleter> direct;
 };
 
-[[nodiscard]] sess::Session sessionValue(std::string_view token)
+[[nodiscard]] sess::Session sessionValue(
+    std::string_view token, std::string_view sessionId = "session-1",
+    std::string_view identityId = "identity-1")
 {
     return sess::Session::create(
-        sess::SessionId{"session-1"}, core::IdentityId{"identity-1"},
+        sess::SessionId{std::string{sessionId}},
+        core::IdentityId{std::string{identityId}},
         idp::ProviderId{"provider"}, idp::AssuranceLevel::Ial2,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge
                                         | idp::AuthenticationFactor::Possession,
@@ -399,6 +402,9 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
     execute("INSERT INTO openproof.membership_roles"
             "(organization_id,identity_id,role) "
             "VALUES('org','identity-1','owner')");
+    execute("INSERT INTO openproof.external_identities"
+            "(provider,external_subject,identity_id,linked_at_ms) "
+            "VALUES('local','owner@example.test','identity-1',1770000000000)");
 
     auto policy = cred::PasswordPolicy::create(
         1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
@@ -486,6 +492,132 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
     EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 0), "1");
     EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 1), "1");
     EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 2), "0");
+
+    auto finalOwnerRoles = admin::MemberRoleReplacement::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
+        std::vector<org::Role>{org::Role{"member"}},
+        kNow + std::chrono::minutes{1}).value();
+    auto refusedLastOwner = administration.value()->replaceRoles(
+        core::IdentityId{"identity-1"}, finalOwnerRoles);
+    ASSERT_FALSE(refusedLastOwner);
+    EXPECT_EQ(refusedLastOwner.error().code(), fnd::ErrorCode::FailedPrecondition);
+    auto suspendFinalOwner = admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
+        admin::MemberLifecycleAction::Suspend,
+        kNow + std::chrono::minutes{1}).value();
+    auto refusedSuspension = administration.value()->changeLifecycle(
+        core::IdentityId{"identity-1"}, suspendFinalOwner);
+    ASSERT_FALSE(refusedSuspension);
+    EXPECT_EQ(refusedSuspension.error().code(), fnd::ErrorCode::FailedPrecondition);
+
+    pg::PostgresSessionRepository sessions{*pool};
+    ASSERT_TRUE(sessions.add(sessionValue(
+        "member-role-token", "member-role-session", "identity-2")));
+    auto promote = admin::MemberRoleReplacement::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        std::vector<org::Role>{org::Role{"member"}, org::Role{"owner"}},
+        kNow + std::chrono::minutes{2}).value();
+    ASSERT_TRUE(administration.value()->replaceRoles(
+        core::IdentityId{"identity-1"}, promote));
+    EXPECT_FALSE(sessions.use(
+        sess::TokenDigest{sec::sha256("member-role-token").value()},
+        kNow + std::chrono::minutes{2}));
+    auto promotedMembership = memberships.find(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
+    ASSERT_TRUE(promotedMembership && promotedMembership->has_value());
+    EXPECT_TRUE(promotedMembership->value().hasRole(org::Role{"owner"}));
+
+    ASSERT_TRUE(sessions.add(sessionValue(
+        "owner-lifecycle-token", "owner-lifecycle-session", "identity-1")));
+    auto suspendOwner = admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
+        admin::MemberLifecycleAction::Suspend,
+        kNow + std::chrono::minutes{3}).value();
+    ASSERT_TRUE(administration.value()->changeLifecycle(
+        core::IdentityId{"identity-2"}, suspendOwner));
+    EXPECT_FALSE(sessions.use(
+        sess::TokenDigest{sec::sha256("owner-lifecycle-token").value()},
+        kNow + std::chrono::minutes{3}));
+    auto suspended = memberships.find(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
+    ASSERT_TRUE(suspended && suspended->has_value());
+    EXPECT_EQ(suspended->value().state(), org::MembershipState::Suspended);
+    EXPECT_FALSE(suspended->value().hasRole(org::Role{"owner"}));
+
+    auto reinstateOwner = admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
+        admin::MemberLifecycleAction::Reinstate,
+        kNow + std::chrono::minutes{4}).value();
+    ASSERT_TRUE(administration.value()->changeLifecycle(
+        core::IdentityId{"identity-2"}, reinstateOwner));
+    auto reinstated = memberships.find(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
+    ASSERT_TRUE(reinstated && reinstated->has_value());
+    EXPECT_TRUE(reinstated->value().hasRole(org::Role{"owner"}));
+
+    ASSERT_TRUE(sessions.add(sessionValue(
+        "member-reset-token", "member-reset-session", "identity-2")));
+    execute("INSERT INTO openproof.recovery_codes"
+            "(identity_id,code_digest,issued_at_ms) "
+            "VALUES('identity-2',decode(repeat('ab',32),'hex'),1770000000000)");
+    const fnd::SecretString resetPassword{"reset-generated-password-12345678"};
+    auto reset = admin::LocalCredentialReset::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        resetPassword.clone(),
+        cred::TotpSecret::create(
+            fnd::SecretString{"abcdefghijabcdefghij"}).value(),
+        kNow + std::chrono::minutes{5}).value();
+    ASSERT_TRUE(administration.value()->resetCredentials(
+        core::IdentityId{"identity-1"}, reset));
+    EXPECT_FALSE(sessions.use(
+        sess::TokenDigest{sec::sha256("member-reset-token").value()},
+        kNow + std::chrono::minutes{5}));
+    auto resetTotp = cred::TotpSecret::create(
+        fnd::SecretString{"abcdefghijabcdefghij"}).value();
+    const std::string resetCode = cred::totpAt(
+        resetTotp, cred::TotpPolicy::recommended(),
+        kNow + std::chrono::minutes{5}).value();
+    EXPECT_FALSE(accounts.value()->verify(
+        idp::ExternalSubject{"bob@example.test"}, password, resetCode,
+        kNow + std::chrono::minutes{5}));
+    ASSERT_TRUE(accounts.value()->verify(
+        idp::ExternalSubject{"bob@example.test"}, resetPassword, resetCode,
+        kNow + std::chrono::minutes{5}));
+
+    auto removeMember = admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
+        admin::MemberLifecycleAction::Remove,
+        kNow + std::chrono::minutes{6}).value();
+    ASSERT_TRUE(administration.value()->changeLifecycle(
+        core::IdentityId{"identity-1"}, removeMember));
+    auto removedMembership = memberships.find(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
+    ASSERT_TRUE(removedMembership && removedMembership->has_value());
+    EXPECT_EQ(removedMembership->value().state(), org::MembershipState::Removed);
+    EXPECT_TRUE(removedMembership->value().roles().empty());
+
+    auto removeFinalOwner = admin::MemberLifecycleChange::create(
+        core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
+        admin::MemberLifecycleAction::Remove,
+        kNow + std::chrono::minutes{7}).value();
+    auto finalRemoval = administration.value()->changeLifecycle(
+        core::IdentityId{"identity-1"}, removeFinalOwner);
+    ASSERT_FALSE(finalRemoval);
+    EXPECT_EQ(finalRemoval.error().code(), fnd::ErrorCode::FailedPrecondition);
+
+    std::unique_ptr<PGresult, ResultDeleter> lifecycleEvidence{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.audit_events),"
+        "(SELECT count(*) FROM openproof.security_event_outbox),"
+        "(SELECT count(*) FROM openproof.recovery_codes WHERE identity_id='identity-2'),"
+        "(SELECT count(*) FROM openproof.sessions WHERE identity_id IN "
+        "('identity-1','identity-2') AND state=0)")};
+    ASSERT_NE(lifecycleEvidence.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(lifecycleEvidence.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 0), "6");
+    EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 1), "6");
+    EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 2), "0");
+    EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 3), "0");
 }
 
 }

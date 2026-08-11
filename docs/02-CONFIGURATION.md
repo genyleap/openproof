@@ -113,8 +113,8 @@ opens the listener.
 When enabled, the configured organization must already exist and be active.
 Every matching gateway route requires a valid session and an active membership
 in that organization. The auth plane owns `/auth` and `/auth/*`. There is no
-public registration, password/TOTP enrollment, membership-change or policy
-administration endpoint.
+public registration or self-service password/TOTP enrollment endpoint. Member
+administration is owner-only; policy administration is not implemented.
 
 | Method and path | Purpose | Authentication |
 |---|---|---|
@@ -132,12 +132,17 @@ proxy must preserve `Set-Cookie` and the client address used for rate limiting.
 
 ## Owner administration API
 
-The administration plane reserves `/admin` and `/admin/*`. Its first supported
-operation creates a local member in the configured organization:
+The administration plane reserves `/admin` and `/admin/*`. It manages local
+members in the configured organization:
 
 | Method and path | Purpose | Authentication |
 |---|---|---|
 | `POST /admin/local-members` | Atomically create a local identity, link, active membership, roles, password and TOTP | Active IAL2 session whose identity has the active `owner` role |
+| `PUT /admin/local-members/roles` | Replace the member's complete role set | Active IAL2 owner |
+| `POST /admin/local-members/suspend` | Suspend an active membership | Active IAL2 owner |
+| `POST /admin/local-members/reinstate` | Reinstate a suspended membership | Active IAL2 owner |
+| `POST /admin/local-members/remove` | Permanently remove a membership and its roles | Active IAL2 owner |
+| `POST /admin/local-members/credentials/reset` | Rotate the local password and TOTP seed and delete recovery codes | Active IAL2 owner |
 
 The owner check is performed from authoritative PostgreSQL state inside the
 same serializable transaction as the mutation. The HTTP layer deliberately does
@@ -172,6 +177,24 @@ credentials over the trusted TLS-protected channel and the recipient should
 enroll the TOTP immediately. Any validation, authorization, uniqueness,
 credential, audit or outbox failure rolls back the entire operation. A denied
 or failed response contains no generated secret.
+
+Role replacement accepts exactly `identity_id` and a non-empty unique `roles`
+array. Lifecycle and credential-reset requests accept exactly `identity_id`.
+Role and lifecycle mutations return `204 No Content`; credential reset returns
+`200 OK` with the same one-time `initial_password` and `totp_secret_base32`
+fields used during creation. Reset is allowed only for an active membership.
+
+Every administrative mutation is serialized and committed atomically with its
+HMAC-chained audit record and outbox event. The actor is re-authorized from
+authoritative PostgreSQL state inside that transaction, and all active sessions
+of the target member are revoked before commit. Removing a membership is
+terminal and clears its roles; suspension retains roles but makes them
+ineffective. The final active owner cannot lose the `owner` role, be suspended,
+or be removed. Credential reset replaces the password and encrypted TOTP seed,
+resets TOTP replay state, deletes every recovery code, and returns new secrets
+only after commit. A removed member's canonical identity and local credential
+record remain as durable identity-layer data, but no longer authorize access to
+the organization.
 
 ## Initial owner bootstrap
 

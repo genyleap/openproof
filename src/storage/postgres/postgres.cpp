@@ -132,6 +132,218 @@ void rollback(PGconn* connection) noexcept
                                    : foundation::fail(databaseError(result.get(), "COMMIT"));
 }
 
+[[nodiscard]] foundation::Status runCommand(
+    PGconn* connection, std::string_view sql,
+    const std::vector<std::string>& parameters,
+    std::string_view operation)
+{
+    ResultPointer result = execParams(connection, sql, parameters);
+    return commandOk(result.get()) ? foundation::ok()
+        : foundation::fail(databaseError(result.get(), operation));
+}
+
+[[nodiscard]] foundation::Status prepareAdministrationTransaction(
+    PGconn* connection)
+{
+    ResultPointer isolated = exec(
+        connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return foundation::fail(
+            databaseError(isolated.get(), "set administration isolation"));
+    }
+    ResultPointer locked = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673315)");
+    return tuplesOk(locked.get()) ? foundation::ok()
+        : foundation::fail(
+            databaseError(locked.get(), "lock administration mutation"));
+}
+
+[[nodiscard]] foundation::Status authorizeActiveOwner(
+    PGconn* connection, const identity::core::OrganizationId& organizationId,
+    const identity::core::IdentityId& actor)
+{
+    ResultPointer authorized = execParams(
+        connection,
+        "SELECT 1 FROM openproof.organizations o "
+        "JOIN openproof.identities i ON i.organization_id=o.id AND i.id=$2 "
+        "JOIN openproof.memberships m ON m.organization_id=o.id AND m.identity_id=i.id "
+        "JOIN openproof.membership_roles r ON r.organization_id=m.organization_id "
+        "AND r.identity_id=m.identity_id AND r.role='owner' "
+        "WHERE o.id=$1 AND o.state=0 AND i.status=0 AND m.state=1 "
+        "FOR UPDATE OF o,i,m",
+        {std::string{organizationId.value()}, std::string{actor.value()}});
+    if (!tuplesOk(authorized.get())) {
+        return foundation::fail(
+            databaseError(authorized.get(), "authorize administration"));
+    }
+    return PQntuples(authorized.get()) == 1 ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::PermissionDenied,
+                           "The operation is not permitted.");
+}
+
+struct LockedMember final {
+    organization::MembershipState state{organization::MembershipState::Removed};
+    bool owner{false};
+};
+
+[[nodiscard]] foundation::Result<LockedMember> lockLocalMember(
+    PGconn* connection, const identity::core::OrganizationId& organizationId,
+    const identity::core::IdentityId& identityId,
+    const identity::provider::ProviderId& provider)
+{
+    ResultPointer target = execParams(
+        connection,
+        "SELECT m.state,EXISTS(SELECT 1 FROM openproof.membership_roles r "
+        "WHERE r.organization_id=m.organization_id AND r.identity_id=m.identity_id "
+        "AND r.role='owner') FROM openproof.organizations o "
+        "JOIN openproof.identities i ON i.organization_id=o.id AND i.id=$2 "
+        "JOIN openproof.memberships m ON m.organization_id=o.id AND m.identity_id=i.id "
+        "WHERE o.id=$1 AND o.state=0 AND i.status=0 "
+        "AND EXISTS(SELECT 1 FROM openproof.external_identities e "
+        "WHERE e.identity_id=i.id AND e.provider=$3) FOR UPDATE OF o,i,m",
+        {std::string{organizationId.value()}, std::string{identityId.value()},
+         std::string{provider.value()}});
+    if (!tuplesOk(target.get())) {
+        return foundation::fail(
+            databaseError(target.get(), "lock managed local member"));
+    }
+    if (PQntuples(target.get()) != 1) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That local member was not found.");
+    }
+    auto state = parseInteger<unsigned int>(field(target.get(), 0, 0));
+    if (!state || state.value() > 3U) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "PostgreSQL returned invalid membership state.");
+    }
+    return LockedMember{
+        static_cast<organization::MembershipState>(state.value()),
+        field(target.get(), 0, 1) == "t"};
+}
+
+[[nodiscard]] foundation::Result<std::size_t> activeOwnerCount(
+    PGconn* connection, const identity::core::OrganizationId& organizationId)
+{
+    ResultPointer result = execParams(
+        connection,
+        "SELECT count(*) FROM openproof.memberships m "
+        "JOIN openproof.identities i ON i.id=m.identity_id "
+        "JOIN openproof.membership_roles r ON r.organization_id=m.organization_id "
+        "AND r.identity_id=m.identity_id AND r.role='owner' "
+        "WHERE m.organization_id=$1 AND m.state=1 AND i.status=0",
+        {std::string{organizationId.value()}});
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+        return foundation::fail(
+            databaseError(result.get(), "count active owners"));
+    }
+    return parseInteger<std::size_t>(field(result.get(), 0, 0));
+}
+
+[[nodiscard]] foundation::Status revokeMemberSessions(
+    PGconn* connection, const identity::core::IdentityId& identityId,
+    foundation::Instant now)
+{
+    return runCommand(
+        connection,
+        "UPDATE openproof.sessions SET state=1,revoked_at_ms=$2 "
+        "WHERE identity_id=$1 AND state=0",
+        {std::string{identityId.value()}, instant(now)},
+        "revoke managed member sessions");
+}
+
+[[nodiscard]] foundation::Result<audit::AuditEvent> administrationEvent(
+    std::string action,
+    const identity::core::OrganizationId& organizationId,
+    const identity::core::IdentityId& target,
+    const identity::core::IdentityId& actor,
+    foundation::Instant now, audit::AuditFields fields = {})
+{
+    auto randomId = security::randomTokenBase64Url(24U);
+    if (!randomId) return foundation::fail(randomId.error());
+    const std::string eventId = "admin-" + randomId.value();
+    fields.emplace("actor_identity_id", std::string{actor.value()});
+    return audit::AuditEvent::create(
+        audit::AuditEventId{eventId}, now, foundation::CorrelationId{eventId},
+        std::optional<identity::core::OrganizationId>{organizationId},
+        std::optional<identity::core::IdentityId>{target},
+        "administration", std::move(action), "success", std::move(fields));
+}
+
+[[nodiscard]] foundation::Status appendAdministrationRecords(
+    PGconn* connection, const audit::AuditEvent& event,
+    const audit::AuditKey& key, std::string_view securityType)
+{
+    ResultPointer auditLock = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673314)");
+    if (!tuplesOk(auditLock.get())) {
+        return foundation::fail(
+            databaseError(auditLock.get(), "lock audit chain"));
+    }
+    ResultPointer previousResult = exec(
+        connection,
+        "SELECT encode(event_hash,'hex') FROM openproof.audit_events "
+        "ORDER BY sequence DESC LIMIT 1");
+    if (!tuplesOk(previousResult.get())) {
+        return foundation::fail(
+            databaseError(previousResult.get(), "read audit chain head"));
+    }
+    std::optional<security::Sha256Digest> previousHash;
+    std::string previousHex;
+    if (PQntuples(previousResult.get()) == 1) {
+        auto parsed = parseDigest(field(previousResult.get(), 0, 0));
+        if (!parsed) return foundation::fail(parsed.error());
+        previousHash = parsed.value();
+        previousHex = foundation::toHex(parsed.value());
+    }
+    foundation::JsonObjectWriter detail;
+    for (const auto& [name, value] : event.fields()) detail.add(name, value);
+    ResultPointer insertedAudit = execParams(
+        connection,
+        "INSERT INTO openproof.audit_events"
+        "(event_id,occurred_at_ms,correlation_id,organization_id,identity_id,"
+        "category,action,outcome,detail,previous_hash,event_hash) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,"
+        "CASE WHEN $10='' THEN NULL ELSE decode($10,'hex') END,decode($11,'hex')) "
+        "RETURNING sequence",
+        {std::string{event.id().value()}, instant(event.occurredAt()),
+         std::string{event.correlation().value()},
+         std::string{event.organization()->value()},
+         std::string{event.identity()->value()}, std::string{event.category()},
+         std::string{event.action()}, std::string{event.outcome()}, detail.build(),
+         previousHex, std::string(64U, '0')});
+    if (!tuplesOk(insertedAudit.get()) || PQntuples(insertedAudit.get()) != 1) {
+        return foundation::fail(
+            databaseError(insertedAudit.get(), "append administration audit event"));
+    }
+    auto sequence = parseInteger<std::uint64_t>(field(insertedAudit.get(), 0, 0));
+    if (!sequence) return foundation::fail(sequence.error());
+    auto recordHash = audit::computeAuditRecordHash(
+        event, sequence.value(), previousHash, key);
+    if (!recordHash) return foundation::fail(recordHash.error());
+    auto sealed = runCommand(
+        connection,
+        "UPDATE openproof.audit_events SET event_hash=decode($2,'hex') "
+        "WHERE sequence=$1",
+        {std::to_string(sequence.value()), foundation::toHex(recordHash.value())},
+        "seal administration audit event");
+    if (!sealed) return sealed;
+
+    foundation::JsonObjectWriter payload;
+    payload.add("event_id", event.id().value())
+        .add("type", securityType)
+        .add("organization_id", event.organization()->value())
+        .add("identity_id", event.identity()->value())
+        .add("actor_identity_id", event.fields().at("actor_identity_id"))
+        .add("severity", "critical");
+    return runCommand(
+        connection,
+        "INSERT INTO openproof.security_event_outbox"
+        "(event_id,occurred_at_ms,payload) VALUES($1,$2,$3::jsonb)",
+        {std::string{event.id().value()}, instant(event.occurredAt()),
+         payload.build()},
+        "append administration security event");
+}
+
 constexpr std::string_view kSessionColumns =
     "id, identity_id, provider, assurance, factors, phishing_resistant, state, "
     "encode(token_digest, 'hex'), authenticated_at_ms, issued_at_ms, "
@@ -1822,6 +2034,270 @@ foundation::Status PostgresAdministrationRepository::provision(
         "(event_id,occurred_at_ms,payload) VALUES($1,$2,$3::jsonb)",
         {eventId, instant(identityValue.createdAt()), payload.build()},
         "append member security event");
+    if (!status) return failTransaction(status.error());
+    return commit(connection);
+}
+
+foundation::Status PostgresAdministrationRepository::replaceRoles(
+    const identity::core::IdentityId& actor,
+    const administration::MemberRoleReplacement& replacement)
+{
+    if (actor.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The administrative actor is invalid.");
+    }
+    std::string roleList;
+    bool replacementHasOwner = false;
+    for (const organization::Role& role : replacement.roles()) {
+        if (!roleList.empty()) roleList.push_back(',');
+        roleList.append(role.value());
+        replacementHasOwner = replacementHasOwner || role.value() == "owner";
+    }
+    auto event = administrationEvent(
+        "local-member.roles.replace", replacement.organizationId(),
+        replacement.identityId(), actor, replacement.occurredAt(),
+        audit::AuditFields{{"roles", roleList}});
+    if (!event) return foundation::fail(event.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    auto prepared = prepareAdministrationTransaction(connection);
+    if (!prepared) return failTransaction(prepared.error());
+    auto authorized = authorizeActiveOwner(
+        connection, replacement.organizationId(), actor);
+    if (!authorized) return failTransaction(authorized.error());
+    auto member = lockLocalMember(
+        connection, replacement.organizationId(), replacement.identityId(), m_provider);
+    if (!member) return failTransaction(member.error());
+    if (member->state == organization::MembershipState::Removed) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "A removed membership cannot receive roles."});
+    }
+    if (member->state == organization::MembershipState::Active
+        && member->owner && !replacementHasOwner) {
+        auto owners = activeOwnerCount(connection, replacement.organizationId());
+        if (!owners) return failTransaction(owners.error());
+        if (owners.value() <= 1U) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "The final active owner cannot lose the owner role."});
+        }
+    }
+    auto status = runCommand(
+        connection,
+        "DELETE FROM openproof.membership_roles "
+        "WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{replacement.organizationId().value()},
+         std::string{replacement.identityId().value()}},
+        "replace managed member roles");
+    if (!status) return failTransaction(status.error());
+    for (const organization::Role& role : replacement.roles()) {
+        status = runCommand(
+            connection,
+            "INSERT INTO openproof.membership_roles"
+            "(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {std::string{replacement.organizationId().value()},
+             std::string{replacement.identityId().value()},
+             std::string{role.value()}},
+            "insert replacement member role");
+        if (!status) return failTransaction(status.error());
+    }
+    status = revokeMemberSessions(
+        connection, replacement.identityId(), replacement.occurredAt());
+    if (!status) return failTransaction(status.error());
+    status = appendAdministrationRecords(
+        connection, event.value(), m_auditKey,
+        "administration.local-member.roles-replaced");
+    if (!status) return failTransaction(status.error());
+    return commit(connection);
+}
+
+foundation::Status PostgresAdministrationRepository::changeLifecycle(
+    const identity::core::IdentityId& actor,
+    const administration::MemberLifecycleChange& change)
+{
+    if (actor.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The administrative actor is invalid.");
+    }
+    const std::string actionName{
+        administration::memberLifecycleActionName(change.action())};
+    auto event = administrationEvent(
+        "local-member." + actionName, change.organizationId(),
+        change.identityId(), actor, change.occurredAt());
+    if (!event) return foundation::fail(event.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    auto prepared = prepareAdministrationTransaction(connection);
+    if (!prepared) return failTransaction(prepared.error());
+    auto authorized = authorizeActiveOwner(connection, change.organizationId(), actor);
+    if (!authorized) return failTransaction(authorized.error());
+    auto member = lockLocalMember(
+        connection, change.organizationId(), change.identityId(), m_provider);
+    if (!member) return failTransaction(member.error());
+
+    organization::MembershipState next{};
+    switch (change.action()) {
+    case administration::MemberLifecycleAction::Suspend:
+        if (member->state != organization::MembershipState::Active) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "Only an active membership can be suspended."});
+        }
+        next = organization::MembershipState::Suspended;
+        break;
+    case administration::MemberLifecycleAction::Reinstate:
+        if (member->state != organization::MembershipState::Suspended) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "Only a suspended membership can be reinstated."});
+        }
+        next = organization::MembershipState::Active;
+        break;
+    case administration::MemberLifecycleAction::Remove:
+        if (member->state == organization::MembershipState::Removed) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "This membership has already been removed."});
+        }
+        next = organization::MembershipState::Removed;
+        break;
+    }
+    if (member->state == organization::MembershipState::Active && member->owner
+        && change.action() != administration::MemberLifecycleAction::Reinstate) {
+        auto owners = activeOwnerCount(connection, change.organizationId());
+        if (!owners) return failTransaction(owners.error());
+        if (owners.value() <= 1U) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "The final active owner cannot be suspended or removed."});
+        }
+    }
+    auto status = runCommand(
+        connection,
+        "UPDATE openproof.memberships SET state=$3 "
+        "WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{change.organizationId().value()},
+         std::string{change.identityId().value()},
+         std::to_string(static_cast<unsigned int>(next))},
+        "change managed member lifecycle");
+    if (!status) return failTransaction(status.error());
+    if (next == organization::MembershipState::Removed) {
+        status = runCommand(
+            connection,
+            "DELETE FROM openproof.membership_roles "
+            "WHERE organization_id=$1 AND identity_id=$2",
+            {std::string{change.organizationId().value()},
+             std::string{change.identityId().value()}},
+            "drop removed member roles");
+        if (!status) return failTransaction(status.error());
+    }
+    status = revokeMemberSessions(
+        connection, change.identityId(), change.occurredAt());
+    if (!status) return failTransaction(status.error());
+    status = appendAdministrationRecords(
+        connection, event.value(), m_auditKey,
+        "administration.local-member." + actionName);
+    if (!status) return failTransaction(status.error());
+    return commit(connection);
+}
+
+foundation::Status PostgresAdministrationRepository::resetCredentials(
+    const identity::core::IdentityId& actor,
+    const administration::LocalCredentialReset& reset)
+{
+    if (actor.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The administrative actor is invalid.");
+    }
+    auto passwordHash = m_passwordHasher.hash(reset.generatedPassword());
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto encryptedTotp = security::sealAes256Gcm(
+        m_totpKey, reset.generatedTotp().bytes(),
+        "openproof/totp/v1:" + std::string{reset.identityId().value()});
+    if (!encryptedTotp) return foundation::fail(encryptedTotp.error());
+    auto event = administrationEvent(
+        "local-member.credentials.reset", reset.organizationId(),
+        reset.identityId(), actor, reset.occurredAt(),
+        audit::AuditFields{{"provider", std::string{m_provider.value()}}});
+    if (!event) return foundation::fail(event.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    auto prepared = prepareAdministrationTransaction(connection);
+    if (!prepared) return failTransaction(prepared.error());
+    auto authorized = authorizeActiveOwner(connection, reset.organizationId(), actor);
+    if (!authorized) return failTransaction(authorized.error());
+    auto member = lockLocalMember(
+        connection, reset.organizationId(), reset.identityId(), m_provider);
+    if (!member) return failTransaction(member.error());
+    if (member->state != organization::MembershipState::Active) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "Credentials can be reset only for an active member."});
+    }
+
+    ResultPointer password = execParams(
+        connection,
+        "UPDATE openproof.password_credentials "
+        "SET password_hash=$2,changed_at_ms=$3 WHERE identity_id=$1 RETURNING identity_id",
+        {std::string{reset.identityId().value()},
+         std::string{passwordHash->encoded()}, instant(reset.occurredAt())});
+    if (!tuplesOk(password.get())) {
+        return failTransaction(
+            databaseError(password.get(), "reset managed member password"));
+    }
+    ResultPointer totp = execParams(
+        connection,
+        "UPDATE openproof.totp_credentials SET encrypted_seed=decode($2,'hex'),"
+        "key_version=$3,last_accepted_step=NULL,enrolled_at_ms=$4 "
+        "WHERE identity_id=$1 RETURNING identity_id",
+        {std::string{reset.identityId().value()},
+         foundation::toHex(encryptedTotp.value()), std::to_string(m_keyVersion),
+         instant(reset.occurredAt())});
+    if (!tuplesOk(totp.get())) {
+        return failTransaction(
+            databaseError(totp.get(), "reset managed member TOTP"));
+    }
+    if (PQntuples(password.get()) != 1 || PQntuples(totp.get()) != 1) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "The local member does not have a complete credential set."});
+    }
+    auto status = runCommand(
+        connection, "DELETE FROM openproof.recovery_codes WHERE identity_id=$1",
+        {std::string{reset.identityId().value()}},
+        "invalidate managed member recovery codes");
+    if (!status) return failTransaction(status.error());
+    status = revokeMemberSessions(
+        connection, reset.identityId(), reset.occurredAt());
+    if (!status) return failTransaction(status.error());
+    status = appendAdministrationRecords(
+        connection, event.value(), m_auditKey,
+        "administration.local-member.credentials-reset");
     if (!status) return failTransaction(status.error());
     return commit(connection);
 }

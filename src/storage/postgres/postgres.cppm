@@ -259,7 +259,7 @@ private:
  */
 class PostgresAdministrationRepository final
     : public administration::BootstrapRepository,
-      public administration::LocalMemberProvisioner {
+      public administration::LocalMemberAdministrator {
 public:
     [[nodiscard]] static foundation::Result<std::unique_ptr<PostgresAdministrationRepository>>
     create(ConnectionPool& pool, credentials::PasswordHasher passwordHasher,
@@ -272,6 +272,15 @@ public:
     [[nodiscard]] foundation::Status provision(
         const identity::core::IdentityId& actor,
         const administration::LocalMemberEnrollment& enrollment) override;
+    [[nodiscard]] foundation::Status replaceRoles(
+        const identity::core::IdentityId& actor,
+        const administration::MemberRoleReplacement& replacement) override;
+    [[nodiscard]] foundation::Status changeLifecycle(
+        const identity::core::IdentityId& actor,
+        const administration::MemberLifecycleChange& change) override;
+    [[nodiscard]] foundation::Status resetCredentials(
+        const identity::core::IdentityId& actor,
+        const administration::LocalCredentialReset& reset) override;
 
 private:
     PostgresAdministrationRepository(

@@ -18,7 +18,7 @@ graph TD
     opp["apps/opp<br/>composition root"]
 
     auth["openproof.authentication<br/>trusted authentication broker"]
-    admin["openproof.administration<br/>bootstrap + owner enrollment"]
+    admin["openproof.administration<br/>bootstrap + member lifecycle"]
     sess["openproof.session<br/>opaque sessions"]
     cred["openproof.credentials<br/>password, TOTP, recovery"]
     gw["openproof.gateway.http<br/>bounded edge and proxy"]
@@ -81,7 +81,7 @@ every other layer may assume.
 | `openproof.policy` | `:decision` | Sealed authorization request and fail-closed decision contract |
 | `openproof.session` | model, repository, service | Opaque sessions, absolute/idle expiry, rotation and revocation |
 | `openproof.credentials` | — | Pepper+scrypt passwords, RFC 6238 TOTP, recovery codes |
-| `openproof.administration` / `.http` | — | Validated, secret-bearing bootstrap/member commands plus IAL2 administrative HTTP boundary |
+| `openproof.administration` / `.http` | — | Validated bootstrap, enrollment, role, membership-state and credential-rotation commands plus IAL2 administrative HTTP boundary |
 | `openproof.provider.local` | — | Concrete password and password+TOTP provider |
 | `openproof.gateway` / `.http` | — | Routing, enforcement, throttling, discovery, load balancing, circuits and Beast transport |
 | `openproof.storage.postgres` | — | Bounded pool, migrations, durable auth/identity stores and atomic owner-authorized administration adapter |
@@ -356,7 +356,7 @@ Named explicitly so that no reader infers more than exists.
 | OpenProof gateway | HTTP/1.1 edge, protected-route composition, cookie/Bearer sessions, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
 | Metrics, tracing, audit events, security events | Core adapters implemented; production exporters and durable audit repository pending |
 | PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migrations and critical authentication/identity/organization adapters implemented; cache and remaining domains pending |
-| Administration | One-time offline `bootstrap-admin` and IAL2 owner-only local-member creation API implemented; suspension/removal, role mutation, credential reset and tenant/policy lifecycle remain pending |
+| Administration | One-time offline `bootstrap-admin` plus IAL2 owner-only local-member creation, role replacement, suspension/reinstatement/removal and credential reset implemented; tenant/policy lifecycle remains pending |
 | Threat model, load tests, fuzzing | Baseline implemented; sustained distributed load and protocol-specific fuzz targets remain ongoing work |
 | HTTP/3 | Architected for behind a transport abstraction; **not implemented and not claimed** |
 

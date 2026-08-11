@@ -18,7 +18,7 @@ class AdministrationHttpApi final : public gateway::HttpHandler {
 public:
     AdministrationHttpApi(
         session::SessionService& sessions,
-        LocalMemberProvisioner& members,
+        LocalMemberAdministrator& members,
         gateway::TokenBucketRateLimiter& rateLimiter,
         identity::core::OrganizationId organization,
         identity::provider::ProviderId provider,
@@ -31,12 +31,19 @@ private:
     [[nodiscard]] gateway::HttpResponse createLocalMember(
         gateway::HttpRequest request,
         const identity::core::IdentityId& actor);
+    [[nodiscard]] gateway::HttpResponse replaceRoles(
+        gateway::HttpRequest request, const identity::core::IdentityId& actor);
+    [[nodiscard]] gateway::HttpResponse changeLifecycle(
+        gateway::HttpRequest request, const identity::core::IdentityId& actor,
+        MemberLifecycleAction action);
+    [[nodiscard]] gateway::HttpResponse resetCredentials(
+        gateway::HttpRequest request, const identity::core::IdentityId& actor);
     [[nodiscard]] gateway::HttpResponse error(
         const foundation::Error& failure,
         const gateway::HttpRequest& request) const;
 
     session::SessionService* m_sessions;
-    LocalMemberProvisioner* m_members;
+    LocalMemberAdministrator* m_members;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     identity::core::OrganizationId m_organization;
     identity::provider::ProviderId m_provider;

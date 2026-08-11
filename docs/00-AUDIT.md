@@ -381,7 +381,7 @@ Mapped to §72, adjusted for what already exists.
 | **7** | Gateway: HTTP, routing, enforcement, rate limit, LB, circuit breaker, discovery, proxy | **complete for HTTP/1.1 edge/core** — runnable public or authenticated protected single-upstream mode |
 | **8** | Storage: PostgreSQL adapter, migrations, transactions | **authentication path complete** — pool, migrations, identities, links, organizations, memberships, local credentials, sessions, auth transactions and recovery codes |
 | **9** | Audit & observability: audit events, metrics, tracing, security event stream | **core complete** — HMAC chain, bounded Prometheus metrics, W3C trace context and security-event sink |
-| **10** | Administration: management API, `opp` CLI | **bootstrap and minimum member enrollment complete** — atomic offline first-owner ceremony plus IAL2 owner-only local-member creation; suspension/removal, role mutation, reset and tenant/policy lifecycle pending |
+| **10** | Administration: management API, `opp` CLI | **bootstrap and local-member lifecycle complete** — atomic offline first-owner ceremony plus IAL2 owner-only creation, role replacement, suspension/reinstatement/removal and credential reset; tenant/policy lifecycle pending |
 | **11** | SDK & developer experience: docs, examples | not started |
 | **12** | Hardening: threat model, sanitizers, fuzzing, load, failure injection | **baseline complete** — threat model, ASan/UBSan preset, randomized boundary corpus, concurrency and failure tests |
 
