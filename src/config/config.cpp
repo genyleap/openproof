@@ -1,11 +1,13 @@
 module;
 
 #include <charconv>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <ios>
 #include <iterator>
 #include <optional>
@@ -43,6 +45,110 @@ constexpr std::string_view kFilePrefix = "file:";
 
 constexpr std::string_view kDefaultBindAddress = "127.0.0.1";
 constexpr std::uint16_t kDefaultPort = 8443;
+
+[[nodiscard]] bool isAllowedKey(
+    std::string_view key, std::initializer_list<std::string_view> allowed) noexcept
+{
+    return std::ranges::find(allowed, key) != allowed.end();
+}
+
+[[nodiscard]] foundation::Status validateTableKeys(
+    const toml::table& table, std::string_view tableName,
+    std::initializer_list<std::string_view> allowed)
+{
+    for (const auto& [key, value] : table) {
+        static_cast<void>(value);
+        if (!isAllowedKey(key.str(), allowed)) {
+            return foundation::fail(
+                foundation::ErrorCode::InvalidArgument,
+                "The configuration contains an unknown setting.",
+                std::format("Unknown configuration key '{}.{}'.", tableName, key.str()));
+        }
+    }
+    return foundation::ok();
+}
+
+[[nodiscard]] foundation::Status validateConfigurationSchema(const toml::table& document)
+{
+    for (const auto& [key, value] : document) {
+        if (!isAllowedKey(key.str(), {"server", "logging", "security"})) {
+            return foundation::fail(
+                foundation::ErrorCode::InvalidArgument,
+                "The configuration contains an unknown section.",
+                std::format("Unknown top-level configuration key '{}'.", key.str()));
+        }
+        if (!value.is_table()) {
+            return foundation::fail(
+                foundation::ErrorCode::InvalidArgument,
+                "A configuration section has the wrong type.",
+                std::format("Configuration section '{}' must be a TOML table.", key.str()));
+        }
+    }
+
+    if (const toml::table* server = document["server"].as_table(); server != nullptr) {
+        const foundation::Status keys =
+            validateTableKeys(*server, "server", {"bind_address", "port"});
+        if (!keys.has_value()) {
+            return foundation::fail(keys.error());
+        }
+    }
+    if (const toml::table* logging = document["logging"].as_table(); logging != nullptr) {
+        const foundation::Status keys =
+            validateTableKeys(*logging, "logging", {"level", "console"});
+        if (!keys.has_value()) {
+            return foundation::fail(keys.error());
+        }
+    }
+    if (const toml::table* security = document["security"].as_table(); security != nullptr) {
+        const foundation::Status keys =
+            validateTableKeys(*security, "security", {"token_signing_key"});
+        if (!keys.has_value()) {
+            return foundation::fail(keys.error());
+        }
+    }
+
+    const auto requireType = [&document](std::string_view section, std::string_view key,
+                                         auto predicate, std::string_view expected)
+        -> foundation::Status {
+        const toml::node_view<const toml::node> node = document[section][key];
+        if (node && !predicate(node)) {
+            return foundation::fail(
+                foundation::ErrorCode::InvalidArgument,
+                "A configuration setting has the wrong type.",
+                std::format("Configuration key '{}.{}' must be {}.", section, key, expected));
+        }
+        return foundation::ok();
+    };
+
+    const foundation::Status bindAddress = requireType(
+        "server", "bind_address", [](const auto& node) { return node.is_string(); }, "a string");
+    if (!bindAddress.has_value()) {
+        return foundation::fail(bindAddress.error());
+    }
+    const foundation::Status port = requireType(
+        "server", "port", [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!port.has_value()) {
+        return foundation::fail(port.error());
+    }
+    const foundation::Status level = requireType(
+        "logging", "level", [](const auto& node) { return node.is_string(); }, "a string");
+    if (!level.has_value()) {
+        return foundation::fail(level.error());
+    }
+    const foundation::Status console = requireType(
+        "logging", "console", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!console.has_value()) {
+        return foundation::fail(console.error());
+    }
+    const foundation::Status signingKey = requireType(
+        "security", "token_signing_key", [](const auto& node) { return node.is_string(); },
+        "a secret-reference string");
+    if (!signingKey.has_value()) {
+        return foundation::fail(signingKey.error());
+    }
+
+    return foundation::ok();
+}
 
 [[nodiscard]] foundation::Result<std::string> readFileContents(const std::filesystem::path& path)
 {
@@ -260,6 +366,11 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     }
 
     const toml::table& document = parsedDocument.table();
+
+    const foundation::Status schema = validateConfigurationSchema(document);
+    if (!schema.has_value()) {
+        return foundation::fail(schema.error());
+    }
 
     std::string bindAddress{
         document["server"]["bind_address"].value_or(std::string{kDefaultBindAddress})};

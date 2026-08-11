@@ -161,6 +161,50 @@ TEST(ConfigTest, RejectsANonNumericPort)
     EXPECT_EQ(configuration.error().code(), fnd::ErrorCode::InvalidArgument);
 }
 
+TEST(ConfigTest, RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults)
+{
+    const cfg::MapEnvironment environment;
+
+    constexpr std::string_view malformedTypes[] = {
+        "[server]\nbind_address = 127\n",
+        "[server]\nport = \"8443\"\n",
+        "[logging]\nlevel = false\n",
+        "[logging]\nconsole = \"false\"\n",
+        "[security]\ntoken_signing_key = 123\n",
+    };
+
+    for (const std::string_view document : malformedTypes) {
+        const auto configuration = cfg::PlatformConfig::loadFromToml(document, environment);
+        ASSERT_FALSE(configuration.has_value()) << document;
+        EXPECT_EQ(configuration.error().code(), fnd::ErrorCode::InvalidArgument) << document;
+    }
+}
+
+TEST(ConfigTest, RejectsUnknownSectionsAndSettings)
+{
+    const cfg::MapEnvironment environment;
+
+    const auto unknownSection =
+        cfg::PlatformConfig::loadFromToml("[securty]\nenabled = true\n", environment);
+    ASSERT_FALSE(unknownSection.has_value());
+    EXPECT_EQ(unknownSection.error().code(), fnd::ErrorCode::InvalidArgument);
+
+    const auto unknownSetting =
+        cfg::PlatformConfig::loadFromToml("[server]\nprt = 8443\n", environment);
+    ASSERT_FALSE(unknownSetting.has_value());
+    EXPECT_EQ(unknownSetting.error().code(), fnd::ErrorCode::InvalidArgument);
+}
+
+TEST(ConfigTest, RejectsASectionThatIsNotATable)
+{
+    const cfg::MapEnvironment environment;
+
+    const auto configuration = cfg::PlatformConfig::loadFromToml("server = true\n", environment);
+
+    ASSERT_FALSE(configuration.has_value());
+    EXPECT_EQ(configuration.error().code(), fnd::ErrorCode::InvalidArgument);
+}
+
 TEST(ConfigTest, RejectsAnUnknownLogLevel)
 {
     const cfg::MapEnvironment environment;

@@ -80,12 +80,8 @@ public:
     // C++26 delete-with-reason: the diagnostic explains the rule instead of
     // just reporting that the function is deleted, so the fix is obvious at the
     // point of misuse.
-    Secret(const Secret&) =
-        delete("a secret must not be duplicated implicitly; call clone() when duplication "
-               "is genuinely intended");
-    Secret& operator=(const Secret&) =
-        delete("a secret must not be duplicated implicitly; call clone() when duplication "
-               "is genuinely intended");
+    Secret(const Secret&) = delete("a secret must not be duplicated implicitly; call clone() when duplication is genuinely intended");
+    Secret& operator=(const Secret&) = delete("a secret must not be duplicated implicitly; call clone() when duplication is genuinely intended");
 
     Secret(Secret&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
         : m_value(std::move(other.m_value))

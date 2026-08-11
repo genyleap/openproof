@@ -66,9 +66,9 @@ enum class TransactionState {
  *
  *  - **Replay.** A completed transaction is terminal. Presenting it again fails
  *    because the state has already left @c Pending.
- *  - **Nonce reuse or substitution.** The presented nonce is compared with the
- *    issued one in constant time; a mismatch fails the transaction outright
- *    rather than merely being ignored.
+     *  - **Nonce reuse or substitution.** Only a digest of the issued nonce is
+     *    retained. The presented nonce is digested and compared in constant time;
+     *    a mismatch fails the transaction outright rather than being ignored.
  *  - **Expired acceptance.** Expiry is evaluated against an injected clock at
  *    the moment of consumption, not at issue time.
  *  - **Cross-session substitution.** The transaction is bound to the agent that
@@ -104,8 +104,9 @@ public:
      *         make every comparison below trivially satisfiable.
      */
     [[nodiscard]] static foundation::Result<AuthenticationTransaction>
-    create(TransactionId id, ProviderId provider, InteractionModel model, std::string nonce,
-           BindingDigest binding, foundation::CorrelationId correlation,
+    create(TransactionId id, ProviderId provider, InteractionModel model,
+           foundation::SecretString nonce, BindingDigest binding,
+           foundation::CorrelationId correlation,
            foundation::Instant createdAt, foundation::Duration lifetime);
 
     [[nodiscard]] const TransactionId& id() const noexcept;
@@ -143,7 +144,7 @@ public:
      *         binding does not match. The two are distinguished for operators in
      *         the internal detail, never in the client-facing message.
      */
-    [[nodiscard]] foundation::Status consume(std::string_view presentedNonce,
+    [[nodiscard]] foundation::Status consume(const foundation::SecretString& presentedNonce,
                                              const BindingDigest& presentedBinding,
                                              foundation::Instant now);
 
@@ -155,14 +156,14 @@ public:
 
 private:
     AuthenticationTransaction(TransactionId id, ProviderId provider, InteractionModel model,
-                              std::string nonce, BindingDigest binding,
+                              security::Sha256Digest nonceDigest, BindingDigest binding,
                               foundation::CorrelationId correlation,
                               foundation::Instant createdAt, foundation::Instant expiresAt);
 
     TransactionId m_id;
     ProviderId m_provider;
     InteractionModel m_interactionModel{InteractionModel::ChallengeResponse};
-    std::string m_nonce;
+    security::Sha256Digest m_nonceDigest{};
     BindingDigest m_binding{};
     foundation::CorrelationId m_correlation;
     TransactionState m_state{TransactionState::Pending};
@@ -208,7 +209,7 @@ public:
      *         @ref AuthenticationTransaction::consume otherwise.
      */
     [[nodiscard]] virtual foundation::Result<AuthenticationTransaction>
-    consume(const TransactionId& id, std::string_view presentedNonce,
+    consume(const TransactionId& id, const foundation::SecretString& presentedNonce,
             const BindingDigest& presentedBinding, foundation::Instant now) = 0;
 
     /** @brief Returns a snapshot of a transaction, for diagnostics and audit. */
@@ -246,7 +247,7 @@ public:
     [[nodiscard]] foundation::Status begin(AuthenticationTransaction transaction) override;
 
     [[nodiscard]] foundation::Result<AuthenticationTransaction>
-    consume(const TransactionId& id, std::string_view presentedNonce,
+    consume(const TransactionId& id, const foundation::SecretString& presentedNonce,
             const BindingDigest& presentedBinding, foundation::Instant now) override;
 
     [[nodiscard]] foundation::Result<std::optional<AuthenticationTransaction>>

@@ -28,7 +28,8 @@ std::string_view transactionStateName(TransactionState state) noexcept
 }
 
 AuthenticationTransaction::AuthenticationTransaction(TransactionId id, ProviderId provider,
-                                                     InteractionModel model, std::string nonce,
+                                                     InteractionModel model,
+                                                     security::Sha256Digest nonceDigest,
                                                      BindingDigest binding,
                                                      foundation::CorrelationId correlation,
                                                      foundation::Instant createdAt,
@@ -36,7 +37,7 @@ AuthenticationTransaction::AuthenticationTransaction(TransactionId id, ProviderI
     : m_id(std::move(id))
     , m_provider(std::move(provider))
     , m_interactionModel(model)
-    , m_nonce(std::move(nonce))
+    , m_nonceDigest(nonceDigest)
     , m_binding(binding)
     , m_correlation(std::move(correlation))
     , m_createdAt(createdAt)
@@ -46,7 +47,7 @@ AuthenticationTransaction::AuthenticationTransaction(TransactionId id, ProviderI
 
 foundation::Result<AuthenticationTransaction>
 AuthenticationTransaction::create(TransactionId id, ProviderId provider, InteractionModel model,
-                                  std::string nonce, BindingDigest binding,
+                                  foundation::SecretString nonce, BindingDigest binding,
                                   foundation::CorrelationId correlation,
                                   foundation::Instant createdAt, foundation::Duration lifetime)
 {
@@ -74,8 +75,14 @@ AuthenticationTransaction::create(TransactionId id, ProviderId provider, Interac
             "A non-positive lifetime yields a transaction that is expired at issue time.");
     }
 
+    const foundation::Result<security::Sha256Digest> nonceDigest =
+        security::sha256(nonce.expose());
+    if (!nonceDigest.has_value()) {
+        return foundation::fail(nonceDigest.error());
+    }
+
     return AuthenticationTransaction{std::move(id),          std::move(provider),
-                                     model,                  std::move(nonce),
+                                     model,                  nonceDigest.value(),
                                      binding,                std::move(correlation),
                                      createdAt,              createdAt + lifetime};
 }
@@ -137,7 +144,8 @@ void AuthenticationTransaction::setMetadata(std::string key, std::string value)
     m_metadata.insert_or_assign(std::move(key), std::move(value));
 }
 
-foundation::Status AuthenticationTransaction::consume(std::string_view presentedNonce,
+foundation::Status AuthenticationTransaction::consume(
+                                                      const foundation::SecretString& presentedNonce,
                                                       const BindingDigest& presentedBinding,
                                                       foundation::Instant now)
 {
@@ -161,7 +169,15 @@ foundation::Status AuthenticationTransaction::consume(std::string_view presented
     // Both comparisons run in constant time and both are evaluated before any
     // decision is returned, so the failure path does not reveal which check
     // failed through timing or through the message.
-    const bool nonceMatches = security::constantTimeEquals(m_nonce, presentedNonce);
+    const foundation::Result<security::Sha256Digest> presentedNonceDigest =
+        security::sha256(presentedNonce.expose());
+    if (!presentedNonceDigest.has_value()) {
+        m_state = TransactionState::Failed;
+        return foundation::fail(presentedNonceDigest.error());
+    }
+
+    const bool nonceMatches =
+        security::constantTimeEquals(m_nonceDigest, presentedNonceDigest.value());
     const bool bindingMatches = security::constantTimeEquals(m_binding, presentedBinding);
 
     if (!nonceMatches || !bindingMatches) {
@@ -214,7 +230,7 @@ foundation::Status InMemoryAuthenticationTransactionStore::begin(
 }
 
 foundation::Result<AuthenticationTransaction> InMemoryAuthenticationTransactionStore::consume(
-    const TransactionId& id, std::string_view presentedNonce,
+    const TransactionId& id, const foundation::SecretString& presentedNonce,
     const BindingDigest& presentedBinding, foundation::Instant now)
 {
     // The lock spans validation and state change together. Splitting them would

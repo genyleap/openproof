@@ -146,6 +146,12 @@ class AuthenticationResponse final {
 public:
     AuthenticationResponse(ChallengeId challengeId, ClientContext client);
 
+    AuthenticationResponse(const AuthenticationResponse&) = delete;
+    AuthenticationResponse& operator=(const AuthenticationResponse&) = delete;
+    AuthenticationResponse(AuthenticationResponse&&) noexcept = default;
+    AuthenticationResponse& operator=(AuthenticationResponse&&) noexcept = default;
+    ~AuthenticationResponse() = default;
+
     [[nodiscard]] const ChallengeId& challengeId() const noexcept;
     [[nodiscard]] const ClientContext& client() const noexcept;
 
@@ -155,13 +161,13 @@ public:
      *
      * Entirely untrusted until the provider has verified it.
      */
-    [[nodiscard]] const AttributeMap& parameters() const noexcept;
-    void setParameter(std::string key, std::string value);
+    [[nodiscard]] const SecretAttributeMap& parameters() const noexcept;
+    void setParameter(std::string key, foundation::SecretString value);
 
 private:
     ChallengeId m_challengeId;
     ClientContext m_client;
-    AttributeMap m_parameters;
+    SecretAttributeMap m_parameters;
 };
 
 /**

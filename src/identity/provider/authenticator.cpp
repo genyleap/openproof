@@ -132,12 +132,12 @@ const ClientContext& AuthenticationResponse::client() const noexcept
     return m_client;
 }
 
-const AttributeMap& AuthenticationResponse::parameters() const noexcept
+const SecretAttributeMap& AuthenticationResponse::parameters() const noexcept
 {
     return m_parameters;
 }
 
-void AuthenticationResponse::setParameter(std::string key, std::string value)
+void AuthenticationResponse::setParameter(std::string key, foundation::SecretString value)
 {
     m_parameters.insert_or_assign(std::move(key), std::move(value));
 }

@@ -40,6 +40,17 @@ using ExternalSubject = foundation::StrongId<ExternalSubjectTag>;
 using AttributeMap = std::map<std::string, std::string, std::less<>>;
 
 /**
+ * @brief Credential-bearing attributes received from an untrusted client.
+ *
+ * Authorization codes, assertions, signatures and one-time codes are secrets
+ * even before they are verified. Keeping them in SecretString makes accidental
+ * formatting, logging and copying fail at compile time and wipes their owned
+ * buffers when the response leaves scope.
+ */
+using SecretAttributeMap =
+    std::map<std::string, foundation::SecretString, std::less<>>;
+
+/**
  * @brief Claims that mean the same thing regardless of which provider asserted them.
  *
  * The enumeration is intentionally small and cross-protocol: every entry means
