@@ -15,13 +15,12 @@
  * decided by openproof.policy, and keeping that boundary is what stops
  * authorization rules from accumulating in the membership aggregate.
  *
- * Dependency direction: organization -> policy -> identity.core -> foundation.
- * Policy is depended upon only for the `Role` vocabulary, and policy never
- * queries organizations back: a caller resolves memberships into roles and
- * supplies them to an authorization request. That keeps the graph acyclic.
+ * Dependency direction: policy -> organization.membership -> identity.core ->
+ * foundation. Membership owns the Role vocabulary; policy interprets it. The
+ * primary organization module re-exports that independently consumable module.
  */
 export module openproof.organization;
 
 export import :organization;
-export import :membership;
+export import openproof.organization.membership;
 export import :repository;

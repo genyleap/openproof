@@ -165,8 +165,8 @@ private:
  * domain model.
  *
  * @note The assurance recorded here is what the provider *claims*. It is not the
- *       platform's conclusion. openproof.policy adjudicates whether a given provider
- *       is trusted to claim a given level, which is why the accessor is named
+ *       platform's conclusion. openproof.authentication adjudicates whether a
+ *       given provider is trusted to claim a given level, which is why the accessor is named
  *       @ref claimedAssurance() rather than `assurance()`.
  */
 class AuthenticationOutcome final {

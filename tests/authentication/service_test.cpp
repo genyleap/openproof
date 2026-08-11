@@ -2,17 +2,20 @@
 
 #include <chrono>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 import openproof.authentication;
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
 
 namespace auth = openproof::authentication;
 namespace fnd = openproof::foundation;
+namespace core = openproof::identity::core;
 namespace idp = openproof::identity::provider;
 namespace sec = openproof::security;
 
@@ -54,6 +57,13 @@ public:
     beginAuthentication(const idp::AuthenticationRequest&) override
     {
         ++beginCalls;
+        if (throwOnBegin) {
+            throw std::runtime_error{"provider start failure"};
+        }
+        if (failBegin) {
+            return fnd::fail(fnd::Error{fnd::ErrorCode::NotFound,
+                                        "provider leaked that the account is absent"});
+        }
         return idp::AuthenticationChallenge{idp::ChallengeId{challengeId},
                                             kNow + std::chrono::minutes{10}};
     }
@@ -62,6 +72,13 @@ public:
     completeAuthentication(const idp::AuthenticationResponse& response) override
     {
         ++completeCalls;
+        if (throwOnComplete) {
+            throw std::runtime_error{"provider completion failure"};
+        }
+        if (failComplete) {
+            return fnd::fail(fnd::Error{fnd::ErrorCode::NotFound,
+                                        "provider leaked that the account is absent"});
+        }
         const auto proof = response.parameters().find("proof");
         if (proof == response.parameters().end() || proof->second.expose() != "valid") {
             return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
@@ -69,7 +86,7 @@ public:
 
         return idp::AuthenticationOutcome::create(
             idp::ProviderId{outcomeProvider.empty() ? m_id : outcomeProvider},
-            idp::ExternalSubject{"subject-1"}, idp::VerifiedClaims{}, outcomeAssurance,
+            idp::ExternalSubject{outcomeSubject}, idp::VerifiedClaims{}, outcomeAssurance,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
             idp::ProviderEvidence{}, verifiedAt);
     }
@@ -78,7 +95,12 @@ public:
     idp::AssuranceLevel outcomeAssurance{idp::AssuranceLevel::Ial2};
     fnd::Instant verifiedAt{kNow};
     std::string outcomeProvider;
+    std::string outcomeSubject{"subject-1"};
     std::string challengeId{"challenge-1"};
+    bool failBegin{false};
+    bool failComplete{false};
+    bool throwOnBegin{false};
+    bool throwOnComplete{false};
     int beginCalls{0};
     int completeCalls{0};
 
@@ -93,6 +115,18 @@ struct Fixture {
         auto owned = std::make_unique<ControlledProvider>("provider-a");
         implementation = owned.get();
         EXPECT_TRUE(registry.registerProvider(std::move(owned)).has_value());
+
+        core::IdentityLink link =
+            core::IdentityLink::request(
+                core::IdentityId{"identity-1"},
+                core::ExternalIdentityRef{idp::ProviderId{"provider-a"},
+                                          idp::ExternalSubject{"subject-1"}},
+                kNow, kServiceLifetime)
+                .value();
+        EXPECT_TRUE(link.requireVerification(kNow).has_value());
+        EXPECT_TRUE(link.markVerified(kNow).has_value());
+        EXPECT_TRUE(link.complete(kNow).has_value());
+        EXPECT_TRUE(identities.attach(link).has_value());
     }
 
     [[nodiscard]] auth::AuthenticationService service(
@@ -100,8 +134,8 @@ struct Fixture {
     {
         auth::ProviderTrustPolicy policy;
         EXPECT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, trustedMaximum).has_value());
-        return auth::AuthenticationService{registry, transactions, clock, std::move(policy),
-                                           kServiceLifetime};
+        return auth::AuthenticationService{registry, transactions, identities, clock,
+                                           std::move(policy), kServiceLifetime};
     }
 
     [[nodiscard]] idp::AuthenticationRequest request(
@@ -114,6 +148,7 @@ struct Fixture {
 
     idp::ProviderRegistry registry;
     idp::InMemoryAuthenticationTransactionStore transactions;
+    core::InMemoryExternalIdentityDirectory identities;
     fnd::ManualClockSource clock;
     ControlledProvider* implementation{nullptr};
 };
@@ -140,7 +175,8 @@ TEST(AuthenticationServiceTest, CompletesOnlyThroughASingleUseBoundTransaction)
     const auto completed = service.complete(started->transactionId(),
                                             started->continuationToken(), binding, response);
     ASSERT_TRUE(completed.has_value());
-    EXPECT_EQ(completed->provider(), idp::ProviderId{"provider-a"});
+    EXPECT_EQ(completed->outcome().provider(), idp::ProviderId{"provider-a"});
+    EXPECT_EQ(completed->identity(), core::IdentityId{"identity-1"});
     EXPECT_EQ(fixture.implementation->completeCalls, 1);
 
     const auto replay = service.complete(started->transactionId(),
@@ -154,7 +190,8 @@ TEST(AuthenticationServiceTest, RefusesAProviderWithoutIndependentTrustPolicy)
 {
     Fixture fixture;
     auth::ProviderTrustPolicy emptyPolicy;
-    auth::AuthenticationService service{fixture.registry, fixture.transactions, fixture.clock,
+    auth::AuthenticationService service{fixture.registry, fixture.transactions,
+                                        fixture.identities, fixture.clock,
                                         std::move(emptyPolicy), kServiceLifetime};
 
     const auto started = service.begin(fixture.request(), bindingOf("agent"),
@@ -176,6 +213,58 @@ TEST(AuthenticationServiceTest, RefusesRequestedAssuranceAboveTheEffectiveCap)
     ASSERT_FALSE(started.has_value());
     EXPECT_EQ(started.error().code(), fnd::ErrorCode::AssuranceInsufficient);
     EXPECT_EQ(fixture.implementation->beginCalls, 0);
+}
+
+TEST(AuthenticationServiceTest, NormalizesProviderErrorsAtBothBrokerBoundaries)
+{
+    Fixture startFixture;
+    startFixture.implementation->failBegin = true;
+    auto startService = startFixture.service();
+    const auto started = startService.begin(startFixture.request(), bindingOf("agent"),
+                                            fnd::CorrelationId{"corr-1"});
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(started.error().message(),
+              fnd::defaultErrorMessage(fnd::ErrorCode::AuthenticationFailed));
+
+    Fixture completionFixture;
+    completionFixture.implementation->failComplete = true;
+    auto completionService = completionFixture.service();
+    const idp::BindingDigest binding = bindingOf("agent");
+    auto pending = completionService.begin(completionFixture.request(), binding,
+                                           fnd::CorrelationId{"corr-2"});
+    ASSERT_TRUE(pending.has_value());
+    const auto completed = completionService.complete(
+        pending->transactionId(), pending->continuationToken(), binding,
+        validResponse(pending->challenge().id()));
+    ASSERT_FALSE(completed.has_value());
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(completed.error().message(),
+              fnd::defaultErrorMessage(fnd::ErrorCode::AuthenticationFailed));
+}
+
+TEST(AuthenticationServiceTest, ContainsProviderExceptionsAtBothBrokerBoundaries)
+{
+    Fixture startFixture;
+    startFixture.implementation->throwOnBegin = true;
+    auto startService = startFixture.service();
+    const auto started = startService.begin(startFixture.request(), bindingOf("agent"),
+                                            fnd::CorrelationId{"corr-1"});
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    Fixture completionFixture;
+    completionFixture.implementation->throwOnComplete = true;
+    auto completionService = completionFixture.service();
+    const idp::BindingDigest binding = bindingOf("agent");
+    auto pending = completionService.begin(completionFixture.request(), binding,
+                                           fnd::CorrelationId{"corr-2"});
+    ASSERT_TRUE(pending.has_value());
+    const auto completed = completionService.complete(
+        pending->transactionId(), pending->continuationToken(), binding,
+        validResponse(pending->challenge().id()));
+    ASSERT_FALSE(completed.has_value());
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
 TEST(AuthenticationServiceTest, RefusesAnOutcomeUnderAnotherProviderIdentifier)
@@ -200,6 +289,23 @@ TEST(AuthenticationServiceTest, RefusesAnOutcomeAboveEitherAssuranceCap)
     Fixture fixture;
     fixture.implementation->outcomeAssurance = idp::AssuranceLevel::Ial3;
     auto service = fixture.service(idp::AssuranceLevel::Ial2);
+    const idp::BindingDigest binding = bindingOf("agent");
+    auto started = service.begin(fixture.request(), binding, fnd::CorrelationId{"corr-1"});
+    ASSERT_TRUE(started.has_value());
+
+    const idp::AuthenticationResponse response = validResponse(started->challenge().id());
+    const auto completed = service.complete(started->transactionId(),
+                                            started->continuationToken(), binding, response);
+
+    ASSERT_FALSE(completed.has_value());
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
+TEST(AuthenticationServiceTest, RefusesAnExternalSubjectWithoutAnExplicitIdentityLink)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "unlinked-subject";
+    auto service = fixture.service();
     const idp::BindingDigest binding = bindingOf("agent");
     auto started = service.begin(fixture.request(), binding, fnd::CorrelationId{"corr-1"});
     ASSERT_TRUE(started.has_value());

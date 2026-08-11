@@ -15,8 +15,9 @@
  * The dependency direction is:
  *
  * @verbatim
- *   the OpenProof gateway ──> openproof.policy ──> openproof.identity.core
- *                            └─> openproof.identity.provider (assurance vocabulary)
+ *   the OpenProof gateway ──> openproof.policy ──> openproof.authentication
+ *                            ├─> openproof.organization.membership
+ *                            └─> openproof.identity.core
  * @endverbatim
  *
  * openproof.policy never depends on the OpenProof gateway, and never on a concrete provider.

@@ -5,6 +5,11 @@ returns an error. There is no partially-initialized configuration, and no silent
 default is substituted for a malformed value — a misread security setting is
 indistinguishable from a deliberately weakened one.
 
+The schema is closed. A known key with the wrong TOML type, an unknown setting,
+an unknown top-level section, or a section represented by a scalar is rejected.
+Defaults apply only when a known setting is absent; they never replace a value
+that was present but malformed.
+
 Precedence, lowest to highest:
 
 ```

@@ -204,8 +204,8 @@ public:
     /**
      * @brief Atomically validates and consumes the transaction named by @p id.
      *
-     * @return The consumed transaction on success. ErrorCode::NotFound when the
-     *         identifier is unknown, and the same failures as
+     * @return The consumed transaction on success. ErrorCode::AuthenticationFailed
+     *         when the identifier is unknown, and the same failures as
      *         @ref AuthenticationTransaction::consume otherwise.
      */
     [[nodiscard]] virtual foundation::Result<AuthenticationTransaction>

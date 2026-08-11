@@ -6,6 +6,8 @@ openproof_add_module(openproof_policy
         decision.cpp
     LINK_PUBLIC
         openproof_foundation
+        openproof_authentication
         openproof_identity_core
         openproof_identity_provider
+        openproof_organization
 )

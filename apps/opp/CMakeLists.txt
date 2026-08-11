@@ -30,5 +30,7 @@ target_link_libraries(opp
         openproof_config
         openproof_observability
         openproof_identity_provider
+        openproof_identity_core
+        openproof_authentication
         openproof_compile_options
 )

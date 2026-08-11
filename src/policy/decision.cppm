@@ -8,8 +8,10 @@ module;
 export module openproof.policy:decision;
 
 import openproof.foundation;
+import openproof.authentication;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.organization;
 
 export namespace openproof::policy {
 
@@ -37,11 +39,8 @@ struct EntitlementTag {};
  */
 using Entitlement = foundation::StrongId<EntitlementTag>;
 
-/** @brief Tag for a role name, always interpreted within an organization. */
-struct RoleTag {};
-
 /** @brief A role held by a subject *within a specific organization*. */
-using Role = foundation::StrongId<RoleTag>;
+using Role = organization::Role;
 
 /** @brief Tag for a permission name. */
 struct PermissionTag {};
@@ -58,15 +57,7 @@ using Permission = foundation::StrongId<PermissionTag>;
  */
 class AuthenticationContext final {
 public:
-    AuthenticationContext() = default;
-
-    /** @brief Records that a subject authenticated, and how. */
-    AuthenticationContext(identity::provider::ProviderId providerId,
-                          identity::provider::AssuranceLevel claimedAssurance,
-                          identity::provider::AuthenticationStrength strength,
-                          foundation::Instant authenticatedAt);
-
-    /** @brief Whether any authentication happened at all. */
+    /** @brief Always true: this context can only be built from broker-verified authentication. */
     [[nodiscard]] bool isAuthenticated() const noexcept;
 
     [[nodiscard]] const identity::provider::ProviderId& providerId() const noexcept;
@@ -83,7 +74,11 @@ public:
     [[nodiscard]] foundation::Instant authenticatedAt() const noexcept;
 
 private:
-    bool m_authenticated{false};
+    friend class AuthorizationRequest;
+
+    explicit AuthenticationContext(
+        const authentication::VerifiedAuthentication& authentication);
+
     identity::provider::ProviderId m_providerId;
     identity::provider::AssuranceLevel m_claimedAssurance{identity::provider::AssuranceLevel::Ial0};
     identity::provider::AuthenticationStrength m_strength;
@@ -93,39 +88,49 @@ private:
 /**
  * @brief Everything a policy may consider when deciding one request.
  *
- * Assembled by the caller and passed whole, so that a policy never reaches back
- * into a database mid-decision and so that the same inputs always produce the
- * same decision -- which is what makes decisions reproducible during an incident.
+ * Assembled once from server-owned, validated domain values and passed whole, so
+ * that a policy never reaches back into a database mid-decision and the same
+ * inputs always produce the same decision. Client headers and request bodies
+ * cannot populate authentication state, roles or entitlements through this API.
  *
- * Organization context is a first-class field rather than an optional extra:
+ * Organization context is a required field rather than an optional extra:
  * roles in this platform are organization-scoped, and a decision made without
  * knowing the organization is a decision made without knowing the roles.
  */
 class AuthorizationRequest final {
 public:
-    AuthorizationRequest(identity::core::IdentityId subject, Action action, Resource resource);
+    /**
+     * @brief Builds a request exclusively from server-owned domain objects.
+     *
+     * The factory resolves the broker-authenticated canonical identity, tenant
+     * and membership through their authoritative repositories. All three must be
+     * active. There is intentionally no overload accepting caller-assembled
+     * aggregates and no setter accepting client-supplied roles, permissions,
+     * entitlements or authentication state.
+     */
+    [[nodiscard]] static foundation::Result<AuthorizationRequest>
+    create(const authentication::VerifiedAuthentication& authentication,
+           const identity::core::OrganizationId& organization,
+           const organization::OrganizationRepository& organizations,
+           const identity::core::IdentityRepository& identities,
+           const organization::MembershipRepository& memberships,
+           Action action, Resource resource);
 
     [[nodiscard]] const identity::core::IdentityId& subject() const noexcept;
     [[nodiscard]] const Action& action() const noexcept;
     [[nodiscard]] const Resource& resource() const noexcept;
 
-    /** @brief The organization the request is made within, when there is one. */
-    [[nodiscard]] const std::optional<identity::core::OrganizationId>&
-    organization() const noexcept;
-    AuthorizationRequest& withOrganization(identity::core::OrganizationId organization);
+    /** @brief The organization verified by the active membership. */
+    [[nodiscard]] const identity::core::OrganizationId& organization() const noexcept;
 
     [[nodiscard]] const AuthenticationContext& authentication() const noexcept;
-    AuthorizationRequest& withAuthentication(AuthenticationContext context);
 
     /** @brief Roles held by the subject *in this organization*. */
     [[nodiscard]] const std::vector<Role>& roles() const noexcept;
-    AuthorizationRequest& withRole(Role role);
 
     [[nodiscard]] const std::vector<Permission>& permissions() const noexcept;
-    AuthorizationRequest& withPermission(Permission permission);
 
     [[nodiscard]] const std::vector<Entitlement>& entitlements() const noexcept;
-    AuthorizationRequest& withEntitlement(Entitlement entitlement);
 
     /** @brief Whether the subject holds @p entitlement. */
     [[nodiscard]] bool hasEntitlement(const Entitlement& entitlement) const;
@@ -134,10 +139,15 @@ public:
     [[nodiscard]] bool hasRole(const Role& role) const;
 
 private:
+    AuthorizationRequest(identity::core::IdentityId subject,
+                         identity::core::OrganizationId organization,
+                         AuthenticationContext authentication, std::vector<Role> roles,
+                         Action action, Resource resource);
+
     identity::core::IdentityId m_subject;
     Action m_action;
     Resource m_resource;
-    std::optional<identity::core::OrganizationId> m_organization;
+    identity::core::OrganizationId m_organization;
     AuthenticationContext m_authentication;
     std::vector<Role> m_roles;
     std::vector<Permission> m_permissions;

@@ -6,7 +6,7 @@ module;
 #include <utility>
 #include <vector>
 
-module openproof.organization;
+module openproof.organization.membership;
 
 namespace openproof::organization {
 

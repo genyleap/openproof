@@ -1,6 +1,6 @@
 # OpenProof Protocol — Architecture
 
-Status: **Phase 1 (Foundation) implemented and verified. Phases 2–8 not started.**
+Status: **Phases 1–2 implemented and verified. Phase 3 authentication orchestration in progress.**
 
 This document describes the architecture that exists in the repository today and
 the shape the later phases are built to fit. Anything not yet implemented is
@@ -17,17 +17,30 @@ mechanism: a layer cannot import a layer above it because it does not link it.
 graph TD
     opp["apps/opp<br/>composition root"]
 
+    auth["openproof.authentication<br/>trusted authentication broker"]
     idp["openproof.identity.provider<br/>authentication SPI"]
+    core["openproof.identity.core<br/>canonical identity"]
+    org["openproof.organization<br/>tenants and memberships"]
+    policy["openproof.policy<br/>sealed request + decision model"]
     config["openproof.config<br/>typed configuration"]
     security["openproof.security<br/>crypto boundary"]
     obs["openproof.observability<br/>structured logging"]
     fnd["openproof.foundation<br/>errors, ids, time, secrets, encodings"]
 
-    opp --> idp
+    opp --> auth
     opp --> config
     opp --> obs
     opp --> fnd
 
+    policy --> auth
+    policy --> org
+    policy --> core
+    org --> core
+    core --> idp
+    auth --> core
+    auth --> idp
+    auth --> security
+    idp --> security
     idp --> fnd
     config --> obs
     config --> fnd
@@ -38,7 +51,7 @@ graph TD
 `openproof.foundation` depends on nothing else in the project. It is the only layer
 every other layer may assume.
 
-### Module inventory (Phase 1)
+### Module inventory
 
 | Module | Partitions | Owns |
 |---|---|---|
@@ -46,9 +59,13 @@ every other layer may assume.
 | `openproof.security` | `:random` `:hash` | CSPRNG, SHA-256, constant-time comparison |
 | `openproof.observability` | `:log` | Structured JSON logging with correlation identifiers |
 | `openproof.config` | — | Typed configuration, environment overrides, secret references |
-| `openproof.identity.provider` | `:assurance` `:outcome` `:authenticator` `:registry` | The authentication provider SPI |
+| `openproof.identity.provider` | `:assurance` `:outcome` `:authenticator` `:transaction` `:registry` | The authentication provider SPI |
+| `openproof.authentication` | `:service` | Trusted orchestration, single-use enforcement and assurance adjudication |
+| `openproof.identity.core` | `:identity` `:link` `:repository` `:merge` | Canonical identity and explicit association lifecycle |
+| `openproof.organization` / `.membership` | organization, membership, repository | Tenant and organization-scoped role lifecycle |
+| `openproof.policy` | `:decision` | Sealed authorization request and fail-closed decision contract |
 
-21 module interface units (`.cppm`), 14 implementation units (`.cpp`).
+33 module interface units (`.cppm`), 23 implementation units (`.cpp`).
 Zero `.h` / `.hpp` files. Zero uses of `import std;` (unavailable — see
 [03-CXX26.md](03-CXX26.md) §5).
 
@@ -75,7 +92,7 @@ individual authentication mechanisms. That is expressed structurally:
 
 ```mermaid
 graph LR
-    subgraph providers["Providers (Phase 3 and Phase 7)"]
+    subgraph providers["Providers (Phase 3)"]
         oidc["openproof.identity.oidc<br/>Google, Apple, Microsoft"]
         oauth["openproof.identity.oauth2<br/>GitHub"]
         webauthn["openproof.identity.webauthn<br/>passkeys"]
@@ -95,11 +112,12 @@ graph LR
     farcaster --> spi
     ussd --> spi
     future --> spi
-    spi --> core
+    core --> spi
 ```
 
-Arrows point one way. `openproof_identity_provider` links only `openproof_foundation`; if
-it ever needs to link a concrete provider, the boundary has been broken.
+Arrows point one way. `openproof_identity_provider` links only the protocol-neutral
+foundation and security layers; if it ever needs to link a concrete provider, the
+boundary has been broken.
 
 Every provider — regardless of protocol, transport or era — reduces to one
 value:
@@ -116,13 +134,30 @@ AuthenticationOutcome {
 }
 ```
 
+Provider outcomes are assertions, not trusted authentication. Application and
+transport code use `openproof.authentication::AuthenticationService`, which
+atomically redeems the server-side transaction and then verifies challenge id,
+session binding, provider identity, transaction time, requested assurance, the
+provider-declared cap and an independent operator-configured cap. Only then does
+it resolve the `(ProviderId, ExternalSubject)` through the explicit identity-link
+directory and mint `VerifiedAuthentication`; its constructor is private to the
+broker. An unlinked external subject fails authentication rather than implicitly
+creating or selecting an account.
+
+`openproof.policy::AuthorizationRequest` accepts that sealed value and resolves
+the tenant, canonical identity and membership from their authoritative
+repositories. All three must be active. There is no overload accepting
+caller-assembled aggregates and no public mutator for client-supplied
+authentication, roles, permissions or entitlements.
+
 Three details in that type are deliberate:
 
-1. **`claimedAssurance`, not `assurance`.** A provider *claims* a level; policy
-   *adjudicates* whether that provider is trusted to claim it. The accessor name
-   makes the distinction impossible to overlook at the call site.
+1. **`claimedAssurance`, not `assurance`.** A provider *claims* a level; the broker
+   caps that claim against operator trust, and policy decides whether the accepted
+   level is sufficient for an operation. The accessor name keeps the original
+   source of the value visible at the call site.
 2. **`ExternalSubject` is a distinct type from any OpenProof identifier.** A Google
-   `sub`, a wallet address and a Farcaster id are *linked* to a canonical Geny
+   `sub`, a wallet address and a Farcaster id are *linked* to a canonical OpenProof
    Identity; they never become one. A provider that is compromised, retired, or
    that recycles identifiers would otherwise take the account with it.
 3. **Construction is validated.** `AuthenticationOutcome::create` rejects an
@@ -143,7 +178,7 @@ that this whole class of protocol is prone to.
 
 ---
 
-## 3. Security properties built into Phase 1
+## 3. Security properties built into the implemented layers
 
 These are the decisions that are expensive or impossible to retrofit, so they
 were made now.
@@ -275,14 +310,15 @@ Named explicitly so that no reader infers more than exists.
 
 | Area | State |
 |---|---|
-| Identity core, accounts, linking, sessions, organizations | Phase 2 — not started |
+| Identity core, explicit linking and merge, organizations and memberships | Implemented; in-memory repositories only |
 | Any concrete authentication provider (OIDC, OAuth2, WebAuthn, wallet, ENS, Farcaster) | Phase 3 — not started. The SPI exists; no provider does. |
-| Policy engine, RBAC, ABAC, entitlements | Phase 4 — not started |
-| the OpenProof gateway: HTTP server, routing, proxy, rate limiting, circuit breaker, discovery | Phase 5 — not started. **`opp` starts no network listener.** |
-| Metrics, tracing, audit events, security events | Phase 6 — `:log` only |
-| PostgreSQL adapter, migrations, cache adapter | Phase 2 — repository SPI and in-memory adapter only |
+| Authentication broker | Implemented; sessions, credentials, MFA and recovery are not |
+| Policy engine, RBAC, ABAC, trusted entitlement adapter | Decision contract present; evaluation engines not started |
+| the OpenProof gateway: HTTP server, routing, proxy, rate limiting, circuit breaker, discovery | Phase 7 — not started. **`opp` starts no network listener.** |
+| Metrics, tracing, audit events, security events | Phase 9 — `:log` only |
+| PostgreSQL adapter, migrations, cache adapter | Phase 8 — repository SPI and in-memory adapter only |
 | `opp` administrative CLI | Not started. Not stubbed: an executable that does nothing would be a claim of progress rather than progress. |
-| Threat model, load tests, fuzzing | Phase 8 — not started |
+| Threat model, load tests, fuzzing | Phase 12 — not started |
 | HTTP/3 | Architected for behind a transport abstraction; **not implemented and not claimed** |
 
 ---

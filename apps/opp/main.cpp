@@ -5,11 +5,12 @@
 // registry and wires the layers together. Every other unit receives what it
 // needs and never reaches for a global.
 //
-// Milestone 1 scope: the process starts, validates its configuration, emits a
-// structured startup record and exits cleanly. There is no listener yet, and
-// none is pretended.
+// Current development scope: the process starts, validates its configuration,
+// composes the trusted authentication boundary, emits structured startup state,
+// and exits cleanly. There is no listener yet, and none is pretended.
 
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -20,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <version>
 
@@ -31,7 +33,9 @@
 #endif
 
 import openproof.config;
+import openproof.authentication;
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.observability;
 
@@ -39,7 +43,9 @@ namespace {
 
 namespace fnd = openproof::foundation;
 namespace cfg = openproof::config;
+namespace auth = openproof::authentication;
 namespace obs = openproof::observability;
+namespace identity = openproof::identity::core;
 namespace idp = openproof::identity::provider;
 
 // OPENPROOF_VERSION is injected by the build system, which is the only thing that
@@ -271,9 +277,17 @@ void reportStartupFailure(const fnd::Error& failure)
     const auto clock = std::make_shared<const fnd::SystemClockSource>();
     const obs::Logger logger{makeSink(platform.logging()), clock, platform.logging().level()};
 
-    // The provider registry starts empty by design. Milestone 1 delivers the
-    // provider SPI; no concrete provider exists yet, and none is fabricated.
-    const idp::ProviderRegistry providers;
+    // The provider registry starts empty by design. The SPI and trusted broker
+    // exist, but no concrete provider exists yet, and none is fabricated.
+    idp::ProviderRegistry providers;
+    idp::InMemoryAuthenticationTransactionStore authenticationTransactions;
+    identity::InMemoryExternalIdentityDirectory externalIdentities;
+    auth::ProviderTrustPolicy providerTrust;
+    const auth::AuthenticationService authentication{
+        providers, authenticationTransactions, externalIdentities, *clock,
+        std::move(providerTrust),
+        std::chrono::minutes{5}};
+    static_cast<void>(authentication);
 
     std::vector<obs::LogField> startupFields{
         obs::LogField::text("version", std::string{kVersion}),
@@ -297,7 +311,7 @@ void reportStartupFailure(const fnd::Error& failure)
 
     // Note what is deliberately absent, so a reader of the logs is never left to
     // infer that a listener failed to start.
-    logger.info("milestone 1 scope: foundation only; no network listener is started");
+    logger.info("development scope: authentication broker composed; no network listener is started");
 
     logger.info("openproof server stopped");
     return ExitCode::Success;

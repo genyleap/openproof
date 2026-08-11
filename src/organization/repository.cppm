@@ -12,7 +12,7 @@ export module openproof.organization:repository;
 import openproof.foundation;
 
 import :organization;
-import :membership;
+import openproof.organization.membership;
 
 export namespace openproof::organization {
 

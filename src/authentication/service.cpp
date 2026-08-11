@@ -100,13 +100,32 @@ const foundation::SecretString& AuthenticationStart::continuationToken() const n
     return m_continuationToken;
 }
 
+VerifiedAuthentication::VerifiedAuthentication(provider::AuthenticationOutcome outcome,
+                                               identity::core::IdentityId identity)
+    : m_outcome(std::move(outcome))
+    , m_identity(std::move(identity))
+{
+}
+
+const provider::AuthenticationOutcome& VerifiedAuthentication::outcome() const noexcept
+{
+    return m_outcome;
+}
+
+const identity::core::IdentityId& VerifiedAuthentication::identity() const noexcept
+{
+    return m_identity;
+}
+
 AuthenticationService::AuthenticationService(
     provider::ProviderRegistry& providers,
     provider::AuthenticationTransactionStore& transactions,
+    identity::core::ExternalIdentityDirectory& identities,
     const foundation::ClockSource& clock, ProviderTrustPolicy trustPolicy,
     foundation::Duration maximumTransactionLifetime)
     : m_providers(providers)
     , m_transactions(transactions)
+    , m_identities(identities)
     , m_clock(clock)
     , m_trustPolicy(std::move(trustPolicy))
     , m_maximumTransactionLifetime(maximumTransactionLifetime)
@@ -154,8 +173,22 @@ foundation::Result<AuthenticationStart> AuthenticationService::begin(
             "operator-configured caps.");
     }
 
-    foundation::Result<provider::AuthenticationChallenge> challenge =
-        implementation->beginAuthentication(request);
+    foundation::Result<provider::AuthenticationChallenge> challenge = [&]() {
+        try {
+            foundation::Result<provider::AuthenticationChallenge> providerResult =
+                implementation->beginAuthentication(request);
+            if (!providerResult.has_value()) {
+                return foundation::Result<provider::AuthenticationChallenge>{foundation::fail(
+                    authenticationFailure(
+                        "Authentication provider rejected the start operation."))};
+            }
+            return providerResult;
+        } catch (...) {
+            return foundation::Result<provider::AuthenticationChallenge>{foundation::fail(
+                authenticationFailure(
+                    "Authentication provider threw while starting an exchange."))};
+        }
+    }();
     if (!challenge.has_value()) {
         return foundation::fail(challenge.error());
     }
@@ -207,7 +240,7 @@ foundation::Result<AuthenticationStart> AuthenticationService::begin(
                                std::move(continuationToken)};
 }
 
-foundation::Result<provider::AuthenticationOutcome> AuthenticationService::complete(
+foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     const provider::TransactionId& transactionId,
     const foundation::SecretString& continuationToken,
     const provider::BindingDigest& binding,
@@ -242,8 +275,22 @@ foundation::Result<provider::AuthenticationOutcome> AuthenticationService::compl
             "Authentication completion refused: provider trust policy is absent."));
     }
 
-    foundation::Result<provider::AuthenticationOutcome> outcome =
-        implementation->completeAuthentication(response);
+    foundation::Result<provider::AuthenticationOutcome> outcome = [&]() {
+        try {
+            foundation::Result<provider::AuthenticationOutcome> providerResult =
+                implementation->completeAuthentication(response);
+            if (!providerResult.has_value()) {
+                return foundation::Result<provider::AuthenticationOutcome>{foundation::fail(
+                    authenticationFailure(
+                        "Authentication provider rejected the completion operation."))};
+            }
+            return providerResult;
+        } catch (...) {
+            return foundation::Result<provider::AuthenticationOutcome>{foundation::fail(
+                authenticationFailure(
+                    "Authentication provider threw while completing an exchange."))};
+        }
+    }();
     if (!outcome.has_value()) {
         return foundation::fail(outcome.error());
     }
@@ -275,7 +322,21 @@ foundation::Result<provider::AuthenticationOutcome> AuthenticationService::compl
             "Provider returned a verification timestamp outside the transaction window."));
     }
 
-    return std::move(outcome).value();
+    const identity::core::ExternalIdentityRef external{outcome->provider(), outcome->subject()};
+    foundation::Result<std::optional<identity::core::IdentityId>> owner =
+        m_identities.ownerOf(external);
+    if (!owner.has_value()) {
+        return foundation::fail(authenticationFailure(
+            "Authentication completion could not resolve the external identity directory."));
+    }
+    if (!owner->has_value()) {
+        return foundation::fail(authenticationFailure(
+            "Authentication completion refused: the external identity has no explicit link to "
+            "a canonical identity."));
+    }
+
+    identity::core::IdentityId identity = std::move(owner).value().value();
+    return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
 }
 
 }

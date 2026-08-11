@@ -7,6 +7,7 @@ module;
 export module openproof.authentication:service;
 
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.identity.provider;
 
 export namespace openproof::authentication {
@@ -69,11 +70,38 @@ private:
 };
 
 /**
+ * @brief An authentication outcome accepted by the trusted coordinator.
+ *
+ * AuthenticationOutcome is intentionally constructible by provider code because
+ * it is the SPI result. This wrapper is different: only AuthenticationService
+ * can mint it, after transaction, binding, provider identity, time and assurance
+ * checks have all succeeded and the external subject has been resolved through
+ * an explicit canonical identity link. Authorization consumes this type rather
+ * than a raw provider assertion.
+ */
+class VerifiedAuthentication final {
+public:
+    [[nodiscard]] const provider::AuthenticationOutcome& outcome() const noexcept;
+    [[nodiscard]] const identity::core::IdentityId& identity() const noexcept;
+
+private:
+    friend class AuthenticationService;
+
+    VerifiedAuthentication(provider::AuthenticationOutcome outcome,
+                           identity::core::IdentityId identity);
+
+    provider::AuthenticationOutcome m_outcome;
+    identity::core::IdentityId m_identity;
+};
+
+/**
  * @brief Trusted coordinator for every authentication exchange.
  *
  * The service enforces transaction redemption, cross-session binding, challenge
- * identity, provider identity, requested assurance and independently configured
- * assurance caps. Transport code must not call AuthenticationProvider directly.
+ * identity, provider identity, requested assurance, independently configured
+ * assurance caps, and the external-to-canonical identity link. Transport code
+ * must not call AuthenticationProvider directly. Provider failures are
+ * normalized and provider exceptions are contained at this boundary.
  *
  * @note Thread-safe when the supplied registry, store, providers and clock honour
  *       their documented thread-safety contracts.
@@ -82,6 +110,7 @@ class AuthenticationService final {
 public:
     AuthenticationService(provider::ProviderRegistry& providers,
                           provider::AuthenticationTransactionStore& transactions,
+                          identity::core::ExternalIdentityDirectory& identities,
                           const foundation::ClockSource& clock, ProviderTrustPolicy trustPolicy,
                           foundation::Duration maximumTransactionLifetime);
 
@@ -102,10 +131,11 @@ public:
      *
      * The transaction is consumed before provider verification. A malformed or
      * forged callback therefore burns the exchange instead of leaving a reusable
-     * oracle. Every failure is returned as a generic authentication failure to
-     * the client, with the specific cause confined to operator detail.
+     * oracle. Authentication check failures use a generic client message, with
+     * the specific cause confined to operator detail. A requested-assurance
+     * shortfall remains separately classifiable as AssuranceInsufficient.
      */
-    [[nodiscard]] foundation::Result<provider::AuthenticationOutcome>
+    [[nodiscard]] foundation::Result<VerifiedAuthentication>
     complete(const provider::TransactionId& transactionId,
              const foundation::SecretString& continuationToken,
              const provider::BindingDigest& binding,
@@ -118,6 +148,7 @@ private:
 
     provider::ProviderRegistry& m_providers;
     provider::AuthenticationTransactionStore& m_transactions;
+    identity::core::ExternalIdentityDirectory& m_identities;
     const foundation::ClockSource& m_clock;
     const ProviderTrustPolicy m_trustPolicy;
     foundation::Duration m_maximumTransactionLifetime;

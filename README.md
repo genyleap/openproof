@@ -11,12 +11,15 @@ It is vendor-neutral. Nothing in the protocol core names a particular company,
 cloud, database, blockchain, social network or identity provider — those exist
 only as providers behind extension interfaces.
 
-> ### Status: early. Phases 0–2 of 12 complete.
+> ### Status: early. Phases 0–2 complete; authentication orchestration from Phase 3 is in progress.
 >
 > Implemented and tested: the foundation, the identity core (canonical identity,
 > explicit linking, explicit merge, organization-scoped repositories), the
 > authentication SPI with single-use transactions, multi-tenancy (organizations,
-> memberships, role assignment), and the authorization decision model.
+> memberships, role assignment), a trusted authentication broker with independent
+> provider assurance caps, sealed authorization contexts, and the authorization
+> decision model. Configuration is schema-checked and rejects unknown or mistyped
+> security settings.
 >
 > **There is no network listener, no authentication provider, no proof or
 > evidence subsystem, no trust or risk engine, no gateway and no database.**
@@ -139,10 +142,11 @@ src/
   config/              openproof.config             typed configuration, secret references
   identity/core/       openproof.identity.core      Identity, linking, merge, repositories
   identity/provider/   openproof.identity.provider  authentication SPI, transactions, assurance
+  authentication/      openproof.authentication     trusted orchestration, provider trust caps
   policy/              openproof.policy             authorization decision model
   organization/        openproof.organization       tenants, memberships, role assignment
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 203 tests
+tests/                 225 tests
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties
@@ -153,7 +157,7 @@ docs/
 
 ## Security invariants
 
-Twenty-eight invariants are recorded in
+Thirty-four invariants are recorded in
 [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md), each naming what must
 be true, the mechanism that enforces it, the test that proves it, and what
 happens on failure. Invariants that are true but not yet *mechanically* enforced

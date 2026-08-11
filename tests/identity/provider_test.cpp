@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <format>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -15,6 +18,29 @@ namespace idp = openproof::identity::provider;
 namespace {
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
+
+template <typename T>
+concept StreamInsertable = requires(std::ostream& stream, const T& value) { stream << value; };
+
+template <typename T>
+concept EqualityComparable = requires(const T& left, const T& right) { left == right; };
+
+static_assert(!std::formattable<idp::CredentialValue, char>);
+static_assert(!StreamInsertable<idp::CredentialValue>);
+static_assert(!EqualityComparable<idp::CredentialValue>);
+static_assert(!std::is_convertible_v<idp::CredentialValue, std::string>);
+static_assert(!std::is_copy_constructible_v<idp::CredentialValue>);
+static_assert(!std::is_copy_assignable_v<idp::CredentialValue>);
+static_assert(std::is_nothrow_move_constructible_v<idp::CredentialValue>);
+
+TEST(CredentialValueTest, MoveTransfersAndClearsTheSource)
+{
+    idp::CredentialValue source{"authorization-code"};
+    idp::CredentialValue destination{std::move(source)};
+
+    EXPECT_TRUE(source.empty());
+    EXPECT_EQ(destination.expose(), "authorization-code");
+}
 
 /**
  * A minimal provider used to prove the SPI is implementable and substitutable.

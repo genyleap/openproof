@@ -11,7 +11,7 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 203 passing tests.
+Verified against the tree at 225 passing tests.
 
 ---
 
@@ -21,20 +21,20 @@ Verified against the tree at 203 passing tests.
 |---|---|---|---|---|
 | 1 | External identifiers never become canonical identity keys | Type system: `IdentityId` and `ExternalSubject` are distinct `StrongId` tags with no conversion | `static_assert` in `core_test.cpp` | Compile error |
 | 2 | Authentication never implies authorization | Separate modules; `AuthorizationDecision` carries no identity | `AuthenticationAloneGrantsNothing` | Decision is `NotApplicable`, which is not a permission |
-| 3 | Authorization never implies authentication | `AuthorizationDecision` has no subject field | `AnUnauthenticatedContextIsTheDefault` | Unauthenticated context denies |
+| 3 | Authorization never implies authentication | `AuthorizationDecision` has no subject or authentication field; trusted requests require broker-minted authentication | `RawProviderValuesCannotForgeAuthenticationContext` | No trusted request can be constructed from a decision or raw provider values |
 | 4 | Identity linking never occurs implicitly | Link state machine; `Linked` reachable only from `Verified` | `CannotReachLinkedWithoutVerification`, `MatchingAttributesDoNotMergeIdentities` | `FailedPrecondition`; no association recorded |
 | 5 | Provider protocol logic never enters the identity core | `ProviderId` is opaque; `InteractionModel` is protocol-neutral; no protocol names in SPI or core | Module graph + review | Not mechanically caught — see §Gaps |
 | 6 | The gateway never owns canonical identity | Dependency direction: core links no gateway | Not yet testable — no gateway exists | — |
-| 7 | Billing never owns identity | `Entitlement` is consumed, never computed | `EntitlementsAreConsumedNotComputed` | Absent entitlement denies |
+| 7 | Client input cannot inject an entitlement | `AuthorizationRequest` exposes no entitlement mutator; a trusted adapter type is required before entitlements can be populated | `UntrustedEntitlementsCannotBeInjected` | Entitlement is absent and grants nothing |
 | 8 | Private keys are never accepted or stored | No API accepts key material | Review | Not mechanically caught — see §Gaps |
 | 9 | Protected operations default to deny | `evaluateProtected`, four-valued `DecisionKind` | 4 tests in `decision_test.cpp` | `Indeterminate`/`NotApplicable` deny |
-| 10 | Secrets never appear in logs or errors | `Secret<T>`: no formatter, no stream insertion, no conversion, no comparison | `static_assert` in `secret_test.cpp`; `LoggableAsText` check in `log_test.cpp` | Compile error |
-| 11 | An authentication transaction is redeemable exactly once | Atomic compare-and-consume in the store | `ConcurrentRedemptionYieldsExactlyOneWinner` | Second redemption returns `FailedPrecondition` |
+| 10 | Secrets never appear in logs or errors | `Secret<T>` and provider `CredentialValue`: no formatter, stream insertion, conversion, comparison or copy | `static_assert` in `secret_test.cpp` and `provider_test.cpp`; `LoggableAsText` check in `log_test.cpp` | Compile error |
+| 11 | An authentication transaction is redeemable exactly once and cannot bypass orchestration | Atomic compare-and-consume in the store; only the broker mints `VerifiedAuthentication` | `ConcurrentRedemptionYieldsExactlyOneWinner`, `CompletesOnlyThroughASingleUseBoundTransaction` | Replay is rejected before provider verification runs again |
 | 12 | An external identity belongs to at most one canonical identity | `attach` refuses on conflict; never transfers | `RefusesToTransferAnAlreadyOwnedExternalIdentity` | `Conflict`; existing owner unchanged |
 | 13 | **Tenant isolation cannot be bypassed** | Organization is a parameter of every `IdentityRepository` operation; cross-tenant access is inexpressible | `AnotherTenantCannotReadAnIdentity`, `CrossTenantReadIsIndistinguishableFromAbsence`, `AnotherTenantCannotChangeStatus` | Reported as absent / `NotFound` |
 | 14 | **A deleted identity leaves a tombstone** | No `remove()` on the repository; retirement is a status change; `Deleted` is terminal | `DeletionIsATombstoneNotARemoval` | `FailedPrecondition` on resurrection |
 | 15 | **Identity keys are globally unique** | `add` rejects a duplicate key in any organization | `DuplicateKeysAreRejectedAcrossOrganizations` | `AlreadyExists`; existing record untouched |
-| 16 | **Authentication failure does not reveal which check failed** | `AUTHENTICATION_REQUIRED` and `AUTHENTICATION_FAILED` share a generic message and HTTP 401 | `AuthenticationFailuresDoNotRevealWhichCheckFailed` | Uniform response |
+| 16 | **Authentication failure does not reveal which check failed** | `AUTHENTICATION_REQUIRED` and `AUTHENTICATION_FAILED` use generic messages; the broker normalizes provider errors and contains provider exceptions | `AuthenticationFailuresDoNotRevealWhichCheckFailed`, `NormalizesProviderErrorsAtBothBrokerBoundaries`, `ContainsProviderExceptionsAtBothBrokerBoundaries` | Uniform authentication failure; provider exceptions do not escape |
 | 17 | **Operator-only detail never reaches a client** | `Error` has two channels; `toClientJson` serializes only the client-safe one | `ClientJsonNeverLeaksInternalDetail` | Detail omitted from envelope |
 | 18 | **A nonce has exactly one textual spelling** | `fromBase64Url` rejects non-canonical trailing bits | `Base64UrlRejectsNonCanonicalTrailingBits` | `InvalidArgument` |
 | 19 | **Randomness failure is never silently downgraded** | `randomBytes` returns an error; no fallback source exists | `RejectsAnImpossiblyLargeRequest` | `Internal` error; caller cannot proceed |
@@ -47,6 +47,12 @@ Verified against the tree at 203 passing tests.
 | 26 | **A removed member does not regain authority** | `remove()` drops roles; granting to a removed membership is refused | `RemovalDropsRoles` | Roles cleared; `FailedPrecondition` on re-grant |
 | 27 | **A role held in one tenant does not leak into another** | Roles live on the membership, keyed by (organization, identity) | `RolesAreScopedPerOrganization` | Role simply absent in the other tenant |
 | 28 | **A suspended member holds no effective role** | `hasRole` checks membership state before the role set | `SuspensionMakesRolesInertWithoutDiscardingThem` | `hasRole` returns false while retaining the grant |
+| 29 | **A raw provider outcome is not trusted authentication** | `VerifiedAuthentication` has a private constructor owned by `AuthenticationService`; policy accepts only that wrapper | `RawProviderValuesCannotForgeAuthenticationContext` | Compile error / trusted request cannot be constructed |
+| 30 | **A provider cannot exceed its trusted assurance cap** | Broker uses the lower of provider-declared and independent operator-configured caps, at start and completion | `RefusesRequestedAssuranceAboveTheEffectiveCap`, `RefusesAnOutcomeAboveEitherAssuranceCap` | Authentication fails |
+| 31 | **A provider cannot return an outcome under another provider identity** | Broker compares outcome provider with the provider recorded in the consumed transaction | `RefusesAnOutcomeUnderAnotherProviderIdentifier` | Authentication fails |
+| 32 | **Client-supplied roles and authentication state cannot enter policy input** | `AuthorizationRequest` has no public constructor, aggregate overload or mutators; its factory resolves the broker identity, tenant and membership from authoritative repositories | `RefusesAMembershipBelongingToAnotherIdentity`, `RefusesAnInactiveMembership`, `RefusesAnInactiveCanonicalIdentityFromTheRepository`, `RefusesAnInactiveOrganizationFromTheRepository` plus compile-time constructibility checks | Request construction fails |
+| 33 | **Malformed security configuration never falls back to defaults** | Closed TOML schema validates section, key and exact type before extraction | `RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults`, `RejectsUnknownSectionsAndSettings` | Startup returns `InvalidArgument` |
+| 34 | **A verified external subject cannot be attached to an arbitrary canonical identity at authorization time** | The broker resolves `(provider, external subject)` only through `ExternalIdentityDirectory`, embeds that canonical key in `VerifiedAuthentication`, and policy queries repositories only under that key | `RefusesAnExternalSubjectWithoutAnExplicitIdentityLink`, `RefusesToCombineAuthenticationWithAnotherIdentity` | Authentication or request construction fails closed |
 
 ---
 

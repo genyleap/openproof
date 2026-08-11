@@ -4,21 +4,30 @@ module;
 #include <string_view>
 #include <vector>
 
-export module openproof.organization:membership;
+export module openproof.organization.membership;
 
 import openproof.foundation;
 import openproof.identity.core;
-import openproof.policy;
-
-import :organization;
 
 export namespace openproof::organization {
 
 /** @brief The canonical identity key, owned by the identity domain. */
 using IdentityId = identity::core::IdentityId;
 
-/** @brief A role name. Owned by the policy vocabulary and assigned here. */
-using Role = policy::Role;
+/** @brief The tenant key, owned by the identity vocabulary. */
+using OrganizationId = identity::core::OrganizationId;
+
+/** @brief Tag for a role name, always interpreted within an organization. */
+struct RoleTag {};
+
+/**
+ * @brief A role assigned through an organization membership.
+ *
+ * Organization owns assignment and lifecycle; policy only interprets this
+ * vocabulary. Keeping the type here avoids a dependency from organization up
+ * into the authorization layer.
+ */
+using Role = foundation::StrongId<RoleTag>;
 
 /**
  * @brief Lifecycle of one identity's membership in one organization.

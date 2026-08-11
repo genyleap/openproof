@@ -10,4 +10,5 @@ openproof_add_module(openproof_authentication
         openproof_foundation
         openproof_security
         openproof_identity_provider
+        openproof_identity_core
 )
