@@ -1,6 +1,7 @@
 module;
 
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -148,9 +149,9 @@ public:
 
     AuthenticationResponse(const AuthenticationResponse&) = delete;
     AuthenticationResponse& operator=(const AuthenticationResponse&) = delete;
-    AuthenticationResponse(AuthenticationResponse&&) noexcept = default;
-    AuthenticationResponse& operator=(AuthenticationResponse&&) noexcept = default;
-    ~AuthenticationResponse() = default;
+    AuthenticationResponse(AuthenticationResponse&&) noexcept;
+    AuthenticationResponse& operator=(AuthenticationResponse&&) noexcept;
+    ~AuthenticationResponse();
 
     [[nodiscard]] const ChallengeId& challengeId() const noexcept;
     [[nodiscard]] const ClientContext& client() const noexcept;
@@ -162,12 +163,14 @@ public:
      * Entirely untrusted until the provider has verified it.
      */
     [[nodiscard]] const SecretAttributeMap& parameters() const noexcept;
-    void setParameter(std::string key, foundation::SecretString value);
+    void setParameter(std::string key, CredentialValue value);
 
 private:
+    class Storage;
+
     ChallengeId m_challengeId;
     ClientContext m_client;
-    SecretAttributeMap m_parameters;
+    std::unique_ptr<Storage> m_storage;
 };
 
 /**

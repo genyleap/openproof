@@ -59,7 +59,7 @@ public:
     completeAuthentication(const idp::AuthenticationResponse& response) override
     {
         const auto proof = response.parameters().find("proof");
-        if (proof == response.parameters().end() || proof->second != "valid") {
+        if (proof == response.parameters().end() || proof->second.expose() != "valid") {
             // A failed verification denies; it never downgrades to a weaker
             // outcome.
             return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
@@ -321,7 +321,7 @@ TEST(ProviderSpiTest, DrivesAChallengeResponseExchangeProtocolAgnostically)
     EXPECT_EQ(challenge->parameters().at("nonce"), "server-issued-nonce");
 
     idp::AuthenticationResponse response{challenge->id(), client};
-    response.setParameter("proof", "valid");
+    response.setParameter("proof", idp::CredentialValue{"valid"});
 
     const auto outcome = provider->completeAuthentication(response);
     ASSERT_TRUE(outcome.has_value());
@@ -336,7 +336,7 @@ TEST(ProviderSpiTest, DeniesRatherThanDowngradingOnFailedVerification)
     StubProvider provider{"wallet", idp::InteractionModel::ChallengeResponse, idp::AssuranceLevel::Ial3};
 
     idp::AuthenticationResponse response{idp::ChallengeId{"challenge-1"}, idp::ClientContext{}};
-    response.setParameter("proof", "forged");
+    response.setParameter("proof", idp::CredentialValue{"forged"});
 
     const auto outcome = provider.completeAuthentication(response);
 

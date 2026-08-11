@@ -40,15 +40,34 @@ using ExternalSubject = foundation::StrongId<ExternalSubjectTag>;
 using AttributeMap = std::map<std::string, std::string, std::less<>>;
 
 /**
- * @brief Credential-bearing attributes received from an untrusted client.
+ * @brief One credential-bearing value received from an untrusted client.
  *
- * Authorization codes, assertions, signatures and one-time codes are secrets
- * even before they are verified. Keeping them in SecretString makes accidental
- * formatting, logging and copying fail at compile time and wipes their owned
- * buffers when the response leaves scope.
+ * This purpose-specific wrapper is deliberately not convertible, formattable,
+ * comparable or copyable. Its buffer is wiped on destruction. It mirrors the
+ * platform Secret contract while keeping a concrete, non-template type at the
+ * provider ABI boundary.
  */
-using SecretAttributeMap =
-    std::map<std::string, foundation::SecretString, std::less<>>;
+class CredentialValue final {
+public:
+    explicit CredentialValue(std::string value);
+
+    CredentialValue(const CredentialValue&) = delete;
+    CredentialValue& operator=(const CredentialValue&) = delete;
+    CredentialValue(CredentialValue&& other) noexcept;
+    CredentialValue& operator=(CredentialValue&& other) noexcept;
+    ~CredentialValue();
+
+    [[nodiscard]] const std::string& expose() const noexcept;
+    [[nodiscard]] bool empty() const noexcept;
+
+private:
+    void wipe() noexcept;
+
+    std::string m_value;
+};
+
+/** @brief Move-only credential parameters keyed by protocol field name. */
+using SecretAttributeMap = std::map<std::string, CredentialValue, std::less<>>;
 
 /**
  * @brief Claims that mean the same thing regardless of which provider asserted them.

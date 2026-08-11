@@ -1,6 +1,7 @@
 module;
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -9,6 +10,11 @@ module;
 module openproof.identity.provider;
 
 namespace openproof::identity::provider {
+
+class AuthenticationResponse::Storage final {
+public:
+    SecretAttributeMap parameters;
+};
 
 std::string_view interactionModelName(InteractionModel model) noexcept
 {
@@ -119,8 +125,16 @@ void AuthenticationChallenge::setParameter(std::string key, std::string value)
 AuthenticationResponse::AuthenticationResponse(ChallengeId challengeId, ClientContext client)
     : m_challengeId(std::move(challengeId))
     , m_client(std::move(client))
+    , m_storage(std::make_unique<Storage>())
 {
 }
+
+AuthenticationResponse::AuthenticationResponse(AuthenticationResponse&&) noexcept = default;
+
+AuthenticationResponse&
+AuthenticationResponse::operator=(AuthenticationResponse&&) noexcept = default;
+
+AuthenticationResponse::~AuthenticationResponse() = default;
 
 const ChallengeId& AuthenticationResponse::challengeId() const noexcept
 {
@@ -134,12 +148,12 @@ const ClientContext& AuthenticationResponse::client() const noexcept
 
 const SecretAttributeMap& AuthenticationResponse::parameters() const noexcept
 {
-    return m_parameters;
+    return m_storage->parameters;
 }
 
-void AuthenticationResponse::setParameter(std::string key, foundation::SecretString value)
+void AuthenticationResponse::setParameter(std::string key, CredentialValue value)
 {
-    m_parameters.insert_or_assign(std::move(key), std::move(value));
+    m_storage->parameters.insert_or_assign(std::move(key), std::move(value));
 }
 
 }

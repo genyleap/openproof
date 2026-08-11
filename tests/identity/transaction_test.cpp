@@ -33,7 +33,7 @@ constexpr fnd::Duration kLifetime{std::chrono::milliseconds{300'000}};
 {
     auto transaction = idp::AuthenticationTransaction::create(
         idp::TransactionId{"txn-1"}, idp::ProviderId{"any-provider"},
-        idp::InteractionModel::Redirect, std::move(nonce), bindingOf(agent),
+        idp::InteractionModel::Redirect, fnd::SecretString{std::move(nonce)}, bindingOf(agent),
         fnd::CorrelationId{"corr-1"}, kNow, kLifetime);
     EXPECT_TRUE(transaction.has_value());
     return std::move(transaction).value();
@@ -46,15 +46,18 @@ TEST(AuthenticationTransactionTest, StartsPendingAndRedeemsOnce)
     EXPECT_EQ(transaction.state(), idp::TransactionState::Pending);
     EXPECT_TRUE(transaction.isPendingAt(kNow));
 
-    EXPECT_TRUE(transaction.consume("server-nonce", bindingOf("agent-a"), kNow).has_value());
+    EXPECT_TRUE(transaction
+                    .consume(fnd::SecretString{"server-nonce"}, bindingOf("agent-a"), kNow)
+                    .has_value());
     EXPECT_EQ(transaction.state(), idp::TransactionState::Consumed);
 }
 
 TEST(AuthenticationTransactionTest, RejectsCreationWithoutANonce)
 {
     const auto transaction = idp::AuthenticationTransaction::create(
-        idp::TransactionId{"txn-1"}, idp::ProviderId{"p"}, idp::InteractionModel::Redirect, "",
-        bindingOf("agent-a"), fnd::CorrelationId{"corr-1"}, kNow, kLifetime);
+        idp::TransactionId{"txn-1"}, idp::ProviderId{"p"}, idp::InteractionModel::Redirect,
+        fnd::SecretString{""}, bindingOf("agent-a"), fnd::CorrelationId{"corr-1"}, kNow,
+        kLifetime);
 
     ASSERT_FALSE(transaction.has_value());
     EXPECT_EQ(transaction.error().code(), fnd::ErrorCode::InvalidArgument);
@@ -63,8 +66,9 @@ TEST(AuthenticationTransactionTest, RejectsCreationWithoutANonce)
 TEST(AuthenticationTransactionTest, RejectsNonPositiveLifetime)
 {
     const auto transaction = idp::AuthenticationTransaction::create(
-        idp::TransactionId{"txn-1"}, idp::ProviderId{"p"}, idp::InteractionModel::Redirect, "n",
-        bindingOf("agent-a"), fnd::CorrelationId{"corr-1"}, kNow, fnd::Duration::zero());
+        idp::TransactionId{"txn-1"}, idp::ProviderId{"p"}, idp::InteractionModel::Redirect,
+        fnd::SecretString{"n"}, bindingOf("agent-a"), fnd::CorrelationId{"corr-1"}, kNow,
+        fnd::Duration::zero());
 
     ASSERT_FALSE(transaction.has_value());
     EXPECT_EQ(transaction.error().code(), fnd::ErrorCode::InvalidArgument);
@@ -76,10 +80,12 @@ TEST(AuthenticationTransactionTest, ReplayOfAConsumedTransactionIsRefused)
 {
     idp::AuthenticationTransaction transaction = makeTransaction();
 
-    ASSERT_TRUE(transaction.consume("server-nonce", bindingOf("agent-a"), kNow).has_value());
+    ASSERT_TRUE(transaction
+                    .consume(fnd::SecretString{"server-nonce"}, bindingOf("agent-a"), kNow)
+                    .has_value());
 
     const fnd::Status replay =
-        transaction.consume("server-nonce", bindingOf("agent-a"), kNow);
+        transaction.consume(fnd::SecretString{"server-nonce"}, bindingOf("agent-a"), kNow);
 
     ASSERT_FALSE(replay.has_value());
     EXPECT_EQ(replay.error().code(), fnd::ErrorCode::FailedPrecondition);
@@ -93,7 +99,7 @@ TEST(AuthenticationTransactionTest, WrongNonceFailsTheTransactionTerminally)
     idp::AuthenticationTransaction transaction = makeTransaction();
 
     const fnd::Status attempt =
-        transaction.consume("attacker-nonce", bindingOf("agent-a"), kNow);
+        transaction.consume(fnd::SecretString{"attacker-nonce"}, bindingOf("agent-a"), kNow);
 
     ASSERT_FALSE(attempt.has_value());
     EXPECT_EQ(attempt.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -102,7 +108,7 @@ TEST(AuthenticationTransactionTest, WrongNonceFailsTheTransactionTerminally)
     EXPECT_EQ(transaction.state(), idp::TransactionState::Failed);
 
     const fnd::Status correct =
-        transaction.consume("server-nonce", bindingOf("agent-a"), kNow);
+        transaction.consume(fnd::SecretString{"server-nonce"}, bindingOf("agent-a"), kNow);
     ASSERT_FALSE(correct.has_value())
         << "a transaction must not become redeemable again after a failed attempt";
 }
@@ -118,7 +124,7 @@ TEST(AuthenticationTransactionTest, ExpiryIsEvaluatedAtRedemptionAndIsInclusive)
     EXPECT_TRUE(transaction.isExpiredAt(deadline));
 
     const fnd::Status attempt =
-        transaction.consume("server-nonce", bindingOf("agent-a"), deadline);
+        transaction.consume(fnd::SecretString{"server-nonce"}, bindingOf("agent-a"), deadline);
 
     ASSERT_FALSE(attempt.has_value());
     EXPECT_EQ(attempt.error().code(), fnd::ErrorCode::FailedPrecondition);
@@ -134,7 +140,7 @@ TEST(AuthenticationTransactionTest, AnotherAgentCannotRedeemAValidAnswer)
     // The attacker has the correct nonce -- a stolen or observed callback -- but
     // presents it from their own session.
     const fnd::Status attempt =
-        transaction.consume("server-nonce", bindingOf("attacker-agent"), kNow);
+        transaction.consume(fnd::SecretString{"server-nonce"}, bindingOf("attacker-agent"), kNow);
 
     ASSERT_FALSE(attempt.has_value());
     EXPECT_EQ(attempt.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -147,8 +153,10 @@ TEST(AuthenticationTransactionTest, FailureMessageDoesNotDistinguishNonceFromBin
     idp::AuthenticationTransaction wrongNonce = makeTransaction();
     idp::AuthenticationTransaction wrongBinding = makeTransaction();
 
-    const fnd::Status a = wrongNonce.consume("bad", bindingOf("agent-a"), kNow);
-    const fnd::Status b = wrongBinding.consume("server-nonce", bindingOf("other"), kNow);
+    const fnd::Status a =
+        wrongNonce.consume(fnd::SecretString{"bad"}, bindingOf("agent-a"), kNow);
+    const fnd::Status b = wrongBinding.consume(fnd::SecretString{"server-nonce"},
+                                               bindingOf("other"), kNow);
 
     ASSERT_FALSE(a.has_value());
     ASSERT_FALSE(b.has_value());
@@ -177,7 +185,8 @@ TEST(TransactionStoreTest, UnknownIdentifierFailsAsAuthenticationFailure)
     idp::InMemoryAuthenticationTransactionStore store;
 
     const auto consumed =
-        store.consume(idp::TransactionId{"absent"}, "n", bindingOf("agent-a"), kNow);
+        store.consume(idp::TransactionId{"absent"}, fnd::SecretString{"n"},
+                      bindingOf("agent-a"), kNow);
 
     ASSERT_FALSE(consumed.has_value());
     // Not NotFound: whether a transaction exists must not be a probeable signal.
@@ -190,12 +199,14 @@ TEST(TransactionStoreTest, ConsumeSucceedsExactlyOnce)
     ASSERT_TRUE(store.begin(makeTransaction()).has_value());
 
     const auto first =
-        store.consume(idp::TransactionId{"txn-1"}, "server-nonce", bindingOf("agent-a"), kNow);
+        store.consume(idp::TransactionId{"txn-1"}, fnd::SecretString{"server-nonce"},
+                      bindingOf("agent-a"), kNow);
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->state(), idp::TransactionState::Consumed);
 
     const auto second =
-        store.consume(idp::TransactionId{"txn-1"}, "server-nonce", bindingOf("agent-a"), kNow);
+        store.consume(idp::TransactionId{"txn-1"}, fnd::SecretString{"server-nonce"},
+                      bindingOf("agent-a"), kNow);
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error().code(), fnd::ErrorCode::FailedPrecondition);
 }
@@ -216,7 +227,8 @@ TEST(TransactionStoreTest, ConcurrentRedemptionYieldsExactlyOneWinner)
 
         for (int index = 0; index < kThreads; ++index) {
             racers.emplace_back([&store, &successes] {
-                const auto result = store.consume(idp::TransactionId{"txn-1"}, "server-nonce",
+                const auto result = store.consume(idp::TransactionId{"txn-1"},
+                                                  fnd::SecretString{"server-nonce"},
                                                   bindingOf("agent-a"), kNow);
                 if (result.has_value()) {
                     successes.fetch_add(1, std::memory_order_relaxed);

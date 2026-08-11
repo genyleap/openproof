@@ -10,6 +10,50 @@ module openproof.identity.provider;
 
 namespace openproof::identity::provider {
 
+CredentialValue::CredentialValue(std::string value)
+    : m_value(std::move(value))
+{
+}
+
+CredentialValue::CredentialValue(CredentialValue&& other) noexcept
+    : m_value(std::move(other.m_value))
+{
+    other.wipe();
+}
+
+CredentialValue& CredentialValue::operator=(CredentialValue&& other) noexcept
+{
+    if (this != &other) {
+        wipe();
+        m_value = std::move(other.m_value);
+        other.wipe();
+    }
+    return *this;
+}
+
+CredentialValue::~CredentialValue()
+{
+    wipe();
+}
+
+const std::string& CredentialValue::expose() const noexcept
+{
+    return m_value;
+}
+
+bool CredentialValue::empty() const noexcept
+{
+    return m_value.empty();
+}
+
+void CredentialValue::wipe() noexcept
+{
+    if (!m_value.empty()) {
+        foundation::secureWipe(m_value.data(), m_value.size());
+        m_value.clear();
+    }
+}
+
 std::string_view claimNameKey(ClaimName name) noexcept
 {
     switch (name) {

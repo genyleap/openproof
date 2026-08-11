@@ -17,6 +17,7 @@ add_executable(openproof_tests
     identity/core_test.cpp
     policy/decision_test.cpp
     identity/transaction_test.cpp
+    authentication/service_test.cpp
     identity/merge_test.cpp
     organization/organization_test.cpp
 )
@@ -35,6 +36,7 @@ target_link_libraries(openproof_tests
         openproof_observability
         openproof_config
         openproof_identity_provider
+        openproof_authentication
         openproof_identity_core
         openproof_policy
         openproof_organization
