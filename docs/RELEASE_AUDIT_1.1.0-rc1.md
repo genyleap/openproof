@@ -1,75 +1,99 @@
 # OpenProof 1.1.0-rc1 release audit
 
-Date: 2026-08-11
+Last qualification: 2026-08-14
 
-This audit is grounded in the packaged source tree. It deliberately separates
-implemented capability from target-environment qualification.
+This audit is grounded in the current source tree and separates implemented
+capability from deployment-specific production approval.
 
-## Implemented IAM core
+## Implemented identity core
 
-OpenProof currently implements canonical tenant-scoped identity, local password
-and TOTP authentication, session lifecycle, recovery codes, organization and
-membership administration, application registration, OAuth client management,
-Authorization Code + mandatory S256 PKCE, opaque access/refresh tokens,
-refresh-token rotation and family replay revocation, OAuth introspection and
-revocation, OpenID Connect Discovery/JWKS/RS256 ID Token/UserInfo, PostgreSQL
-persistence, API-gateway policy/routing primitives, administration APIs and four
-SDK integration surfaces.
+OpenProof implements centralized tenant-scoped identities, consumer signup and
+verified email/phone lifecycle, local password/TOTP/recovery authentication,
+passkeys, sessions, profiles, organizations/RBAC, application/client/resource
+registries, service identities, OAuth 2.0/OIDC, federated/social/enterprise/Web3
+providers, SCIM, evidence verification, trust assessment, PostgreSQL durability,
+an enforcing gateway, admin UI/API and four client SDKs. The exact inventory and
+external activation requirements are in `CAPABILITY_STATUS.md`.
 
-## Security hardening added for this candidate
+## Qualification performed
 
-- Native loopback redirect matching accepts registered IPv4/IPv6 loopback IP
-  literals with a variable ephemeral port while preserving host/path/query.
-- Authorization codes are consumed only after client, redirect and PKCE binding
-  match atomically; a mismatched verifier does not burn a valid code.
-- Confidential client-secret digests are compared in constant time.
-- Refresh-token family expiry is absolute and non-sliding.
-- `offline_access` is rejected and not advertised until explicit consent exists.
-- Ambient browser credentials use `__Host-` cookie names.
-- OAuth authorization responses carry `iss`; C++, JavaScript, Swift and Kotlin
-  SDK surfaces validate the returned issuer.
-- The release import/CMake consistency gate covers both `.cpp` and `.cppm`.
-- PostgreSQL integration coverage includes Application/Client/Profile storage,
-  bound single-use authorization-code consumption, access/refresh persistence,
-  rotation, absolute refresh expiry and replay-triggered family revocation.
+The following gates passed on macOS ARM64 with GCC 16.1 on 2026-08-14:
 
-## Deliberately not claimed as complete
+- static release/source/CMake security gates;
+- clean RelWithDebInfo build with warnings as errors;
+- all **340/340** current CTest cases in Debug and RelWithDebInfo, with zero skips;
+- all PostgreSQL integration cases against a dedicated disposable database;
+- clean ASan + UBSan build and the same **340/340** tests with zero sanitizer errors;
+- the deterministic 10,000-input malformed-boundary corpus exercised HTTP,
+  credential, trace-context, redirect-URI and JOSE/JWK parsers under sanitizers;
+- JavaScript SDK tests;
+- Swift package build and native PKCE/issuer-boundary test;
+- Kotlin SDK build through the checksummed Gradle 9.3.1 Wrapper. It uses the
+  compiler embedded in the pinned distribution and does not depend on a
+  host-global `kotlinc` or an unpinned Kotlin plugin download.
 
-OpenProof 1.1.0-rc1 does not yet provide a complete public-consumer CIAM
-experience. Public registration, verified email/phone lifecycle, self-service
-forgot-password, self-service profile editing/deletion/export, WebAuthn/passkeys,
-social providers, consent records/screens and a human admin console remain to be
-implemented when required by a product.
+The reusable CI workflow runs the canonical `scripts/qualify-production.sh`
+gate with two isolated PostgreSQL databases, all SDKs and the TLS identity E2E.
 
-The protocol surface also does not yet include `client_credentials`, Device
-Authorization, Token Exchange, PAR/JAR/JARM, DPoP/mTLS, Dynamic Client
-Registration or OIDC RP-Initiated Logout. A first-class resource-server/audience
-registry is still required before unrelated APIs with overlapping scopes share
-one token ecosystem.
+## Operational hardening in this tree
 
-Operationally, the current tree uses one configured OIDC RSA signing key, does
-not provide online master-secret rotation, and does not implement a trusted
-reverse-proxy client-IP propagation contract. Backup/restore automation,
-disaster recovery, multi-region operation and public-load qualification are
-operator/release work, not proven capabilities of this candidate.
+- `GET /health/live` and PostgreSQL-backed `GET /health/ready` are available for
+  orchestration without exposing configuration or dependency errors.
+- Health, JOSE key-overlap and trusted-proxy client-IP tests are included in the
+  current **340-test** suite; Debug, Release and ASan/UBSan all pass.
+- Safe backup and checksum creation is provided by
+  `scripts/backup-postgres.sh`.
+- Restore refuses a non-empty target and verifies the sidecar checksum before a
+  single-transaction `pg_restore` (`scripts/restore-postgres.sh`).
+- A local drill backed up the qualification database, restored 50 OpenProof
+  tables and all 13 migration records into a new empty database, then verified
+  that a second restore was refused without changing data. The disposable
+  restore database was dropped after validation.
+- Product flows and exact API calls are documented in `API_GUIDE.md`; the
+  OpenAPI 3.1 contract now covers all 70 public paths and 92 operations across
+  account, authentication, OAuth/OIDC, evidence, administration and SCIM. A
+  dependency-free release gate rejects endpoint/operation-ID drift, and the
+  complete document passes an independent OpenAPI semantic validator.
+- The real-process E2E passed through a certificate-validating local TLS edge:
+  authenticated signup delivery and verification, login/MFA/password reset,
+  admin console/local-member/app/client/resource provisioning, Authorization Code + PKCE, independent
+  Node verification of the RS256 ID Token, UserInfo, introspection, protected
+  gateway audience/scope enforcement, refresh-family replay revocation, graceful
+  restart persistence and old/new JWKS key overlap. A 600-request mixed
+  concurrency smoke covers readiness, Discovery, JWKS, UserInfo, introspection
+  and the protected gateway and reports throughput plus p50/p95/p99.
+- The final canonical local mixed-read run completed 600 requests at concurrency
+  24 with zero HTTP failures, about 778.8 requests/second, p50 30.4 ms,
+  p95 36.9 ms and p99 40.9 ms. This is a local smoke measurement, not a target
+  capacity claim.
+- Trusted proxy mode canonicalizes exactly one proxy-overwritten client IP,
+  rejects missing/malformed/chained values, strips the header before routing and
+  cannot be enabled on a non-loopback listener. Hardened systemd/Nginx templates
+  are included under `deploy/`.
+- `opp check-config` validates the closed schema and resolves configured secret
+  references without opening a listener or contacting dependencies. The Linux
+  unit runs it in `ExecStartPre`, while the production TOML template consumes
+  master/database/delivery/OIDC material through a read-only secret-store/KMS
+  file mount instead of service-wide environment values.
+- A representative-data drill backed up that E2E database and restored one
+  organization, two identities, one application, one OAuth client, three session
+  records and all 13 migrations. A second restore into the non-empty target was
+  refused; the disposable restore database was then removed.
 
-## Verification performed while packaging this candidate
+## Remaining promotion evidence
 
-- Static release verification: PASS.
-- C++ test declarations found: 327.
-- JavaScript SDK tests: PASS on Node 22.16.0.
-- Kotlin SDK compilation: PASS with `kotlinc`.
-- Swift source parse: PASS. Full Swift package compilation is not claimed in the
-  Linux packaging environment because Apple CryptoKit is unavailable there.
-- Shell syntax for `scripts/qualify-production.sh`: PASS.
-- Classic project headers (`.h`/`.hpp`): zero.
-- Production TODO/FIXME/HACK/XXX scan: zero in source/SDK/example code.
+This candidate is not labeled production-approved until the target deployment
+also passes:
 
-The owner previously demonstrated a clean GCC 16.1/macOS ARM64 build/link of the
-1.0.13 baseline. Because 1.1.0-rc1 changes security-sensitive code, this
-candidate requires its own clean GCC 16.1 build, full CTest run and zero-skip
-PostgreSQL qualification. Those target-environment results are intentionally not
-inferred from the 1.0.13 result.
+1. repetition through the target deployment's real public TLS edge and selected
+   browser/native OIDC clients;
+2. product-shaped load/soak with target CPU, memory and PostgreSQL observability;
+3. extended coverage-guided fuzzing and an independent focused security review;
+4. a target secret-store/KMS rotation exercise and controlled master-key
+   migration procedure.
+
+These are concrete release gates, not evidence that the implemented account or
+protocol surfaces are missing.
 
 ## Promotion command
 
@@ -78,9 +102,11 @@ Use a disposable PostgreSQL database only:
 ```bash
 export OPENPROOF_TEST_POSTGRES='postgresql://.../openproof_qualification'
 export OPENPROOF_TEST_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_IS_DESTRUCTIVE
+export OPENPROOF_E2E_POSTGRES='postgresql://.../openproof_e2e_qualification'
+export OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
 ./scripts/qualify-production.sh
 ```
 
-Never point this qualification harness at production, staging, or a shared
-development database; the PostgreSQL integration fixture truncates OpenProof
-tables.
+Never point either database at production, staging or shared development. The
+integration fixture truncates tables, while E2E requires a second database with
+zero user tables and intentionally retains its representative result for review.
