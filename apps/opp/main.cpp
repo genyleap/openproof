@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <set>
@@ -63,6 +64,7 @@ import openproof.identity.provider;
 import openproof.observability;
 import openproof.oauth;
 import openproof.oauth.http;
+import openproof.operations.http;
 import openproof.oidc;
 import openproof.gateway;
 import openproof.gateway.http;
@@ -99,6 +101,7 @@ namespace credentials = openproof::credentials;
 namespace obs = openproof::observability;
 namespace oauth = openproof::oauth;
 namespace oauthHttp = openproof::oauth::http;
+namespace operationsHttp = openproof::operations::http;
 namespace oidc = openproof::oidc;
 namespace identity = openproof::identity::core;
 namespace scim = openproof::enterprise::scim;
@@ -194,6 +197,7 @@ public:
 
     [[nodiscard]] bool runServer() const noexcept { return m_runServer; }
     [[nodiscard]] bool bootstrapAdmin() const noexcept { return m_bootstrapAdmin; }
+    [[nodiscard]] bool checkConfig() const noexcept { return m_checkConfig; }
 
     [[nodiscard]] const std::string& organizationName() const noexcept
     { return *m_organizationName; }
@@ -213,6 +217,7 @@ private:
     bool m_printDefaultConfig{false};
     bool m_runServer{false};
     bool m_bootstrapAdmin{false};
+    bool m_checkConfig{false};
     std::optional<std::filesystem::path> m_configPath;
     std::optional<std::string> m_organizationName;
     std::optional<std::string> m_identityId;
@@ -238,6 +243,12 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "The 'bootstrap-admin' subcommand was specified more than once.");
             }
             parsed.m_bootstrapAdmin = true;
+        } else if (argument == "check-config") {
+            if (parsed.m_checkConfig) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'check-config' subcommand was specified more than once.");
+            }
+            parsed.m_checkConfig = true;
         } else if (argument == "--help" || argument == "-h") {
             parsed.m_showHelp = true;
         } else if (argument == "--version" || argument == "-V") {
@@ -280,7 +291,10 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
     }
 
     if (parsed.m_showHelp) return parsed;
-    if (parsed.m_runServer && parsed.m_bootstrapAdmin) {
+    const unsigned subcommandCount = static_cast<unsigned>(parsed.m_runServer)
+        + static_cast<unsigned>(parsed.m_bootstrapAdmin)
+        + static_cast<unsigned>(parsed.m_checkConfig);
+    if (subcommandCount > 1U) {
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
                          "Only one subcommand may be selected.");
     }
@@ -308,6 +322,7 @@ void printUsage()
     std::println("");
     std::println("Usage:");
     std::println("  {} server [options]", kProgramName);
+    std::println("  {} check-config [--config <path>]", kProgramName);
     std::println("  {} bootstrap-admin --config <path> --organization-name <name>",
                  kProgramName);
     std::println("      --identity-id <id> --subject <local-subject>");
@@ -317,6 +332,8 @@ void printUsage()
     std::println("  -c, --config <path>  Load configuration from a TOML file.");
     std::println("                       Without it, configuration comes from the");
     std::println("                       environment and built-in defaults.");
+    std::println("  check-config         Validate configuration and secret references without");
+    std::println("                       opening a listener or connecting to dependencies.");
     std::println("  --print-default-config");
     std::println("                       Print the configuration defaults compiled into");
     std::println("                       this binary and exit.");
@@ -328,6 +345,7 @@ void printUsage()
     std::println("");
     std::println("Environment overrides:");
     std::println("  OPENPROOF_SERVER_BIND_ADDRESS, OPENPROOF_SERVER_PORT,");
+    std::println("  OPENPROOF_SERVER_TRUST_PROXY_CLIENT_IP,");
     std::println("  OPENPROOF_LOGGING_LEVEL, OPENPROOF_LOGGING_CONSOLE,");
     std::println("  OPENPROOF_DATABASE_URL");
     std::println("  OPENPROOF_BOOTSTRAP_PASSWORD (bootstrap-admin only; minimum 16 bytes)");
@@ -442,6 +460,65 @@ addProtectedRoutes(gateway::Router& router,
     return fnd::SecretString{std::move(raw)};
 }
 
+[[nodiscard]] fnd::Result<std::vector<oidc::PublishedVerificationJwk>> loadPreviousOidcKeys(
+    std::string_view directory, std::string_view activeKeyId)
+{
+    if (directory.empty()) return std::vector<oidc::PublishedVerificationJwk>{};
+    const std::filesystem::path root{directory};
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error) || error) {
+        return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                         "The previous OIDC signing-key directory is invalid.");
+    }
+    std::vector<std::filesystem::path> paths;
+    for (std::filesystem::directory_iterator iterator{root, error}, end;
+         !error && iterator != end; iterator.increment(error)) {
+        const auto status = iterator->symlink_status(error);
+        if (error) break;
+        if (std::filesystem::is_symlink(status)) {
+            return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                             "Previous OIDC key entries cannot be symbolic links.");
+        }
+        if (std::filesystem::is_regular_file(status)
+            && iterator->path().extension() == ".pem") {
+            paths.push_back(iterator->path());
+        }
+    }
+    if (error || paths.size() > 8U) {
+        return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                         "The previous OIDC signing-key directory cannot be enumerated.");
+    }
+    std::ranges::sort(paths);
+    std::set<std::string, std::less<>> keyIds;
+    std::vector<oidc::PublishedVerificationJwk> jwks;
+    jwks.reserve(paths.size());
+    for (const auto& path : paths) {
+        const std::string keyId = path.stem().string();
+        const bool validKeyId = !keyId.empty() && keyId.size() <= 128U
+            && std::ranges::all_of(keyId, [](const char value) {
+                   const auto byte = static_cast<unsigned char>(value);
+                   return std::isalnum(byte) != 0 || value == '-' || value == '_' || value == '.';
+               });
+        const auto size = std::filesystem::file_size(path, error);
+        if (!validKeyId || keyId == activeKeyId || !keyIds.emplace(keyId).second
+            || error || size == 0U || size > 64U * 1024U) {
+            return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                             "A previous OIDC verification key entry is invalid.");
+        }
+        std::ifstream input{path, std::ios::binary};
+        std::string pem(static_cast<std::size_t>(size), '\0');
+        input.read(pem.data(), static_cast<std::streamsize>(pem.size()));
+        if (!input || input.gcount() != static_cast<std::streamsize>(pem.size())) {
+            return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                             "A previous OIDC verification key cannot be read.");
+        }
+        auto jwk = oidc::PublishedVerificationJwk::create(pem, keyId);
+        if (!jwk) return fnd::fail(jwk.error());
+        jwks.push_back(std::move(jwk).value());
+    }
+    return jwks;
+}
+
 [[nodiscard]] ExitCode runBootstrapAdmin(
     const cfg::PlatformConfig& platform, const cfg::Environment& environment,
     const CommandLine& commandLine, const fnd::ClockSource& clock)
@@ -545,7 +622,8 @@ addProtectedRoutes(gateway::Router& router,
     auto serverConfig = gatewayHttp::ServerConfig::create(
         std::string{platform.server().bindAddress()}, platform.server().port(),
         64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
-        std::chrono::seconds{15}, 4'096U, workers);
+        std::chrono::seconds{15}, 4'096U, workers,
+        platform.server().trustProxyClientIp());
     if (!serverConfig) {
         reportStartupFailure(serverConfig.error());
         return ExitCode::ConfigurationError;
@@ -1153,11 +1231,14 @@ addProtectedRoutes(gateway::Router& router,
         scimBearerToken.emplace(std::move(*configuredScimToken));
     }
 
+    operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
+
     const auto runWithEvidence = [&](gateway::HttpHandler& fallback) -> ExitCode {
         evidenceHttp::Api evidenceApi{
             evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
             sessions, evidenceProviders, limiter.value(), fallback};
-        return runListener(platform, evidenceApi, logger);
+        operationsHttp::HealthHttpApi healthApi{readiness, evidenceApi};
+        return runListener(platform, healthApi, logger);
     };
 
     const auto runWithScim = [&](gateway::HttpHandler& fallback) -> ExitCode {
@@ -1279,9 +1360,11 @@ addProtectedRoutes(gateway::Router& router,
     auto oidcPolicy = oidc::OidcPolicy::create(std::chrono::minutes{5});
     auto oidcSigner = security::RsaSha256Signer::create(
         platform.oidc().signingKey().clone(), std::string{platform.oidc().keyId()});
+    auto previousOidcKeys = loadPreviousOidcKeys(
+        platform.oidc().previousSigningKeysDirectory(), platform.oidc().keyId());
     if (!clientSecretKey || !authorizationCodeKey || !tokenKey
         || !deviceAuthorizationKey || !tokenPolicy || !oidcIssuer || !oidcPolicy
-        || !oidcSigner) {
+        || !oidcSigner || !previousOidcKeys) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
         return ExitCode::ConfigurationError;
     }
@@ -1313,7 +1396,8 @@ addProtectedRoutes(gateway::Router& router,
     oauth::JarService jarService{identityProviderStore, identityProviderStore, clock};
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
-        identityProviderStore, std::move(oidcPolicy).value()};
+        identityProviderStore, std::move(oidcPolicy).value(),
+        std::move(previousOidcKeys).value()};
     oauth::DpopService dpopService{
         identityProviderStore, clock, std::chrono::minutes{5}};
     std::optional<fnd::SecretString> mtlsForwardingKey;
@@ -1463,7 +1547,8 @@ void reportStartupFailure(const fnd::Error& failure)
             return ExitCode::Success;
         }
     }
-    if (!commandLine->runServer() && !commandLine->bootstrapAdmin()) {
+    if (!commandLine->runServer() && !commandLine->bootstrapAdmin()
+        && !commandLine->checkConfig()) {
         printUsage();
         return ExitCode::UsageError;
     }
@@ -1480,6 +1565,11 @@ void reportStartupFailure(const fnd::Error& failure)
     }
 
     const cfg::PlatformConfig& platform = configuration.value();
+
+    if (commandLine->checkConfig()) {
+        std::println("OpenProof configuration is valid.");
+        return ExitCode::Success;
+    }
 
     const auto clock = std::make_shared<const fnd::SystemClockSource>();
     const obs::Logger logger{makeSink(platform.logging()), clock, platform.logging().level()};
