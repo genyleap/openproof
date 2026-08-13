@@ -12,6 +12,9 @@
 # Loopback by default. Exposing the listener should be a deliberate act.
 bind_address = "127.0.0.1"
 port = 8443
+# Enable only when every connection reaches this loopback listener through a
+# trusted reverse proxy that overwrites X-Forwarded-For with one client IP.
+trust_proxy_client_ip = false
 
 [logging]
 level = "info"
@@ -69,3 +72,6 @@ enabled = false
 # issuer = "https://identity.example.com"
 key_id = "openproof-rs256-1"
 # signing_key = "file:/run/secrets/openproof-oidc-private.pem"
+# Optional directory of previous RSA public keys retained during rotation.
+# Each regular `<kid>.pem` file is published in JWKS but never used for signing.
+# previous_signing_keys_directory = "/run/openproof/previous-oidc-keys"
