@@ -46,9 +46,17 @@ by the type system rather than by reviewer discipline.
 |---|---|---|---|---|
 | `bind_address` | string | `127.0.0.1` | `OPENPROOF_SERVER_BIND_ADDRESS` | Public |
 | `port` | integer 1–65535 | `8443` | `OPENPROOF_SERVER_PORT` | Public |
+| `trust_proxy_client_ip` | boolean | `false` | `OPENPROOF_SERVER_TRUST_PROXY_CLIENT_IP` | Private |
 
 The default binds to loopback rather than `0.0.0.0`: exposure should be a
 deliberate act.
+
+When `trust_proxy_client_ip=true`, the listener must remain on `127.0.0.1` or
+`::1`. Every request must contain exactly one syntactically valid IP address in
+`X-Forwarded-For`; missing values, proxy chains and malformed addresses are
+rejected. The header is consumed and removed before routing. Enable this only
+when the reverse proxy is the exclusive ingress and overwrites—not appends to—
+the client-provided header. This preserves per-client rate limiting behind TLS.
 
 ### `[logging]`
 
@@ -155,6 +163,8 @@ Each `[[auth.route_policies]]` table accepts exactly these fields:
 | `required_roles` | yes | One to 16 unique organization roles |
 | `role_match` | no | `any` (default) or `all` |
 | `minimum_assurance` | no | `ial1` (default), `ial2`, `ial3`, or `ial4` |
+| `required_scope` | no | OAuth scope required for delegated bearer access |
+| `required_audience` | no | Exact OAuth resource/audience required for delegated bearer access |
 
 ```toml
 [[auth.route_policies]]
@@ -368,6 +378,17 @@ The built-in listener accepts only loopback addresses because it is plaintext;
 TLS must terminate in a trusted local proxy. Outbound TLS verifies the peer,
 hostname and SNI. SIGINT and SIGTERM stop the listener cleanly.
 
+Validate the same configuration and resolve every referenced secret without
+opening a listener or connecting to PostgreSQL/upstreams:
+
+```bash
+opp check-config --config /etc/openproof/openproof.toml
+```
+
+Success prints only `OpenProof configuration is valid.`; it never prints secret
+values. Use this as a deployment pre-start check after the secret-store/KMS
+mount is present.
+
 `opp bootstrap-admin` does not open a listener. It requires `[auth].enabled`, a
 database, a master key, a configuration file and all non-secret bootstrap
 arguments. Repeating it returns exit code `2` without printing a new TOTP seed.
@@ -413,11 +434,16 @@ enabled = true
 issuer = "https://identity.example.com"
 key_id = "openproof-rs256-1"
 signing_key = "file:/run/secrets/openproof-oidc-private.pem"
+previous_signing_keys_directory = "/run/openproof/previous-oidc-keys"
 ```
 
 `signing_key` is an RSA private key in PEM format. The server derives the public
 JWK and publishes it through `/.well-known/jwks.json`; private key material is
-never returned by an HTTP endpoint.
+never returned by an HTTP endpoint. The optional previous-key directory may
+contain up to eight regular RSA public-key files named `<kid>.pem`. Those keys
+are published after the active key so relying parties can validate tokens issued
+before a rotation; they are never used to sign new tokens. Symlinks, duplicate
+or active key IDs and RSA keys below 2048 bits fail startup.
 
 Environment overrides:
 
@@ -425,6 +451,7 @@ Environment overrides:
 - `OPENPROOF_OIDC_ISSUER`
 - `OPENPROOF_OIDC_KEY_ID`
 - `OPENPROOF_OIDC_SIGNING_KEY`
+- `OPENPROOF_OIDC_PREVIOUS_KEYS_DIRECTORY`
 - `OPENPROOF_MTLS_FORWARDING_KEY` — optional, at least 32 bytes; authenticates request-bound client-certificate forwarding from the trusted TLS ingress for RFC 8705 sender-constrained tokens.
 
 The environment signing-key override contains PEM text and is a secret. Prefer a
