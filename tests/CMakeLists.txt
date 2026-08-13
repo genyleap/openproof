@@ -14,6 +14,7 @@ add_executable(openproof_tests
     audit/audit_test.cpp
     telemetry/telemetry_test.cpp
     hardening/hardening_test.cpp
+    operations/health_test.cpp
     config/config_test.cpp
     identity/repository_test.cpp
     identity/provider_test.cpp
@@ -69,6 +70,7 @@ target_link_libraries(openproof_tests
         openproof_gateway_http
         Boost::headers
         openproof_storage_postgres
+        openproof_operations_http
         openproof_credentials
         OpenProof::libpq
         openproof_identity_core
