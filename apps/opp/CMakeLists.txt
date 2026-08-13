@@ -57,6 +57,7 @@ target_link_libraries(opp
         openproof_enterprise_scim
         openproof_enterprise_scim_http
         openproof_storage_postgres
+        openproof_operations_http
         openproof_organization
         openproof_session
         openproof_oauth
