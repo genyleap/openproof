@@ -26,8 +26,9 @@ only as providers behind extension interfaces.
 >
 > Production promotion requires a clean GCC 16.1 build, the complete CTest suite,
 > PostgreSQL integration tests without skips, sanitizer/fuzz/load qualification and
-> deployment key/backup/rotation exercises. `scripts/verify-release.sh` is the
-> canonical local release gate.
+> deployment key/backup/rotation exercises. `scripts/qualify-production.sh` is
+> the canonical full gate; it includes a real TLS/PostgreSQL identity E2E against
+> a second empty disposable database.
 
 > Exact implemented/partial/missing capability inventory: [docs/CAPABILITY_STATUS.md](docs/CAPABILITY_STATUS.md).
 
@@ -127,6 +128,10 @@ field at `g++-16` is detected at configure time with the correct driver named.
 ```
 
 ```bash
+./cmake-build-gcc-debug/apps/opp/opp check-config --config openproof.toml
+```
+
+```bash
 OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)" \
   ./cmake-build-gcc-debug/apps/opp/opp server --config openproof.toml
 ```
@@ -178,6 +183,17 @@ the upstream is verified by default, including SNI and hostname verification.
 
 Configuration reference: [docs/02-CONFIGURATION.md](docs/02-CONFIGURATION.md).
 
+Product integration examples for registration, login/MFA, OAuth/OIDC, UserInfo,
+password recovery, profiles, passkeys, service identities, evidence and SCIM are
+in [docs/API_GUIDE.md](docs/API_GUIDE.md); the machine-readable core contract is
+[docs/openapi.yaml](docs/openapi.yaml). Deployment probes, backup/restore and
+incident procedures are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+To exercise the complete local product flow—including signup delivery, email
+verification, MFA, OAuth Authorization Code + PKCE, UserInfo, protected gateway,
+restart persistence and overlapping OIDC key rotation—use the isolated E2E
+procedure in [docs/OPERATIONS.md](docs/OPERATIONS.md#identity-platform-e2e).
+
 ---
 
 ## Repository layout
@@ -209,7 +225,8 @@ src/
   organization/        openproof.organization       tenants, memberships, role assignment
   administration/      openproof.administration     bootstrap and owner-authorized member lifecycle
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 317 discovered tests
+tests/                 340 discovered tests
+deploy/                hardened systemd/Nginx/config templates for Linux
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
   01-ARCHITECTURE.md       layering, provider SPI, security properties
