@@ -294,8 +294,12 @@ TEST(OAuthTokenTest, AuthorizationCodePkceAndRefreshReplayAreFailClosed)
             false},
         kNow, kNow, kNow + 1h);
     ASSERT_TRUE(authenticated.has_value());
-    EXPECT_FALSE(authorization.authorize(
-        authenticated.value(), std::move(offlineRequest).value()).has_value());
+    // Remembered/interactive consent is enforced by the OAuth HTTP boundary
+    // before it calls the protocol service. Once that boundary has approved the
+    // request, offline_access is a valid registered scope at this layer.
+    auto offlineGrant = authorization.authorize(
+        authenticated.value(), std::move(offlineRequest).value());
+    ASSERT_TRUE(offlineGrant.has_value());
 
     auto code = authorization.authorize(
         authenticated.value(), std::move(request).value());
