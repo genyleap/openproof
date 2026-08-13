@@ -8,6 +8,7 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 module openproof.oidc;
 
@@ -144,6 +145,35 @@ OidcPolicy& OidcPolicy::operator=(OidcPolicy&& other)
 }
 OidcPolicy::~OidcPolicy() {}
 
+PublishedVerificationJwk::PublishedVerificationJwk(
+    const PublishedVerificationJwk& other) : m_json(other.m_json) {}
+PublishedVerificationJwk::PublishedVerificationJwk(
+    PublishedVerificationJwk&& other) : m_json(std::move(other.m_json)) {}
+PublishedVerificationJwk& PublishedVerificationJwk::operator=(
+    const PublishedVerificationJwk& other)
+{
+    if (this != &other) m_json = other.m_json;
+    return *this;
+}
+PublishedVerificationJwk& PublishedVerificationJwk::operator=(
+    PublishedVerificationJwk&& other)
+{
+    if (this != &other) m_json = std::move(other.m_json);
+    return *this;
+}
+PublishedVerificationJwk::~PublishedVerificationJwk() {}
+
+PublishedVerificationJwk::PublishedVerificationJwk(std::string json)
+    : m_json(std::move(json)) {}
+
+foundation::Result<PublishedVerificationJwk> PublishedVerificationJwk::create(
+    std::string_view publicKeyPem, std::string keyId)
+{
+    auto jwk = security::rsaPublicJwkJson(publicKeyPem, std::move(keyId));
+    if (!jwk) return foundation::fail(jwk.error());
+    return PublishedVerificationJwk{std::move(jwk).value()};
+}
+
 Issuer::Issuer(std::string value) : m_value(std::move(value)) {}
 foundation::Result<Issuer> Issuer::create(std::string value)
 {
@@ -175,8 +205,10 @@ foundation::Duration OidcPolicy::idTokenLifetime() const noexcept { return m_idT
 OpenIdProvider::OpenIdProvider(
     Issuer issuer, const foundation::ClockSource& clock,
     security::RsaSha256Signer signer,
-    identity::profile::IdentityProfileRepository& profiles, OidcPolicy policy)
+    identity::profile::IdentityProfileRepository& profiles, OidcPolicy policy,
+    std::vector<PublishedVerificationJwk> publishedVerificationJwks)
     : m_issuer(std::move(issuer)), m_clock(&clock), m_signer(std::move(signer)),
+      m_publishedVerificationJwks(std::move(publishedVerificationJwks)),
       m_profiles(&profiles), m_policy(policy) {}
 
 std::string OpenIdProvider::discoveryDocument() const
@@ -214,7 +246,14 @@ foundation::Result<std::string> OpenIdProvider::jwksDocument() const
 {
     auto jwk = m_signer.publicJwkJson();
     if (!jwk.has_value()) return foundation::fail(jwk.error());
-    return std::string{"{\"keys\":["} + jwk.value() + "]}";
+    std::string document{"{\"keys\":["};
+    document += jwk.value();
+    for (const auto& published : m_publishedVerificationJwks) {
+        document.push_back(',');
+        document += published.m_json;
+    }
+    document += "]}";
+    return document;
 }
 
 foundation::Result<std::string> OpenIdProvider::issueIdToken(

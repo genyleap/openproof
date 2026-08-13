@@ -110,6 +110,40 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
     return PkeyPointer{rawKey};
 }
 
+[[nodiscard]] foundation::Result<std::string> exportPublicJwkJson(
+    EVP_PKEY* key, std::string_view keyId)
+{
+    if (key == nullptr || keyId.empty() || keyId.size() > 128U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The JWK key identifier is invalid.");
+    }
+    BIGNUM* modulusRaw = nullptr;
+    BIGNUM* exponentRaw = nullptr;
+    if (EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_N, &modulusRaw) != 1
+        || EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_E, &exponentRaw) != 1) {
+        if (modulusRaw != nullptr) BN_free(modulusRaw);
+        if (exponentRaw != nullptr) BN_free(exponentRaw);
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The RSA public key could not be exported.");
+    }
+    BigNumPointer modulus{modulusRaw};
+    BigNumPointer exponent{exponentRaw};
+    auto encodedModulus = encodeBigNum(modulus.get());
+    auto encodedExponent = encodeBigNum(exponent.get());
+    if (!encodedModulus || !encodedExponent) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The RSA public key could not be encoded.");
+    }
+    foundation::JsonObjectWriter jwk;
+    jwk.add("kty", "RSA")
+        .add("use", "sig")
+        .add("alg", "RS256")
+        .add("kid", keyId)
+        .add("n", encodedModulus.value())
+        .add("e", encodedExponent.value());
+    return jwk.build();
+}
+
 [[nodiscard]] foundation::Result<VerifiedCompactJws> verifyRs256WithKey(
     EVP_PKEY* key, std::string_view compactJwt)
 {
@@ -236,33 +270,7 @@ foundation::Result<std::string> RsaSha256Signer::signJwt(
 
 foundation::Result<std::string> RsaSha256Signer::publicJwkJson() const
 {
-    BIGNUM* modulusRaw = nullptr;
-    BIGNUM* exponentRaw = nullptr;
-    if (EVP_PKEY_get_bn_param(m_implementation->m_key.get(), OSSL_PKEY_PARAM_RSA_N,
-                              &modulusRaw) != 1
-        || EVP_PKEY_get_bn_param(m_implementation->m_key.get(), OSSL_PKEY_PARAM_RSA_E,
-                                 &exponentRaw) != 1) {
-        if (modulusRaw != nullptr) BN_free(modulusRaw);
-        if (exponentRaw != nullptr) BN_free(exponentRaw);
-        return foundation::fail(foundation::ErrorCode::Internal,
-                                "The RSA public key could not be exported.");
-    }
-    BigNumPointer modulus{modulusRaw};
-    BigNumPointer exponent{exponentRaw};
-    auto encodedModulus = encodeBigNum(modulus.get());
-    auto encodedExponent = encodeBigNum(exponent.get());
-    if (!encodedModulus || !encodedExponent) {
-        return foundation::fail(foundation::ErrorCode::Internal,
-                                "The RSA public key could not be encoded.");
-    }
-    foundation::JsonObjectWriter jwk;
-    jwk.add("kty", "RSA")
-        .add("use", "sig")
-        .add("alg", "RS256")
-        .add("kid", m_implementation->m_keyId)
-        .add("n", encodedModulus.value())
-        .add("e", encodedExponent.value());
-    return jwk.build();
+    return exportPublicJwkJson(m_implementation->m_key.get(), m_implementation->m_keyId);
 }
 
 std::string_view RsaSha256Signer::keyId() const noexcept
@@ -288,6 +296,23 @@ foundation::Status validateRs256PublicKey(std::string_view publicKeyPem)
                                 "The registered JWS verification key must be RSA with at least 2048 bits.");
     }
     return foundation::ok();
+}
+
+foundation::Result<std::string> rsaPublicJwkJson(
+    std::string_view publicKeyPem, std::string keyId)
+{
+    if (publicKeyPem.empty() || keyId.empty() || keyId.size() > 128U
+        || publicKeyPem.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The published RSA verification key is invalid.");
+    }
+    BioPointer input{BIO_new_mem_buf(publicKeyPem.data(), static_cast<int>(publicKeyPem.size()))};
+    PkeyPointer key{input ? PEM_read_bio_PUBKEY(input.get(), nullptr, nullptr, nullptr) : nullptr};
+    if (!key || EVP_PKEY_base_id(key.get()) != EVP_PKEY_RSA || EVP_PKEY_bits(key.get()) < 2048) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A published OIDC verification key must be RSA with at least 2048 bits.");
+    }
+    return exportPublicJwkJson(key.get(), keyId);
 }
 
 foundation::Result<VerifiedCompactJws> verifyRs256Jwt(

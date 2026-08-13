@@ -119,11 +119,13 @@ ServerConfig::ServerConfig(std::string bindAddress, std::uint16_t port,
                            std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
                            foundation::Duration readTimeout,
                            foundation::Duration writeTimeout,
-                           std::size_t maximumConnections, std::size_t workerThreads)
+                           std::size_t maximumConnections, std::size_t workerThreads,
+                           bool trustProxyClientIp)
     : m_bindAddress(std::move(bindAddress)), m_port(port),
       m_headerLimitBytes(headerLimitBytes), m_bodyLimitBytes(bodyLimitBytes),
       m_readTimeout(readTimeout), m_writeTimeout(writeTimeout),
-      m_maximumConnections(maximumConnections), m_workerThreads(workerThreads)
+      m_maximumConnections(maximumConnections), m_workerThreads(workerThreads),
+      m_trustProxyClientIp(trustProxyClientIp)
 {
 }
 
@@ -131,18 +133,23 @@ foundation::Result<ServerConfig> ServerConfig::create(
     std::string bindAddress, std::uint16_t port, std::size_t headerLimitBytes,
     std::size_t bodyLimitBytes, foundation::Duration readTimeout,
     foundation::Duration writeTimeout, std::size_t maximumConnections,
-    std::size_t workerThreads)
+    std::size_t workerThreads, bool trustProxyClientIp)
 {
+    boost::system::error_code addressError;
+    const asio::ip::address bindAddressValue = asio::ip::make_address(
+        bindAddress, addressError);
     if (bindAddress.empty() || headerLimitBytes < 1024U || headerLimitBytes > 65536U
         || bodyLimitBytes == 0U || bodyLimitBytes > 64U * 1024U * 1024U
         || readTimeout <= foundation::Duration::zero()
         || writeTimeout <= foundation::Duration::zero()
-        || maximumConnections == 0U || workerThreads == 0U || workerThreads > 256U) {
+        || maximumConnections == 0U || workerThreads == 0U || workerThreads > 256U
+        || (trustProxyClientIp && (addressError || !bindAddressValue.is_loopback()))) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The HTTP server configuration is invalid.");
     }
     return ServerConfig{std::move(bindAddress), port, headerLimitBytes, bodyLimitBytes,
-                        readTimeout, writeTimeout, maximumConnections, workerThreads};
+                        readTimeout, writeTimeout, maximumConnections, workerThreads,
+                        trustProxyClientIp};
 }
 
 std::string_view ServerConfig::bindAddress() const noexcept { return m_bindAddress; }
@@ -153,6 +160,7 @@ foundation::Duration ServerConfig::readTimeout() const noexcept { return m_readT
 foundation::Duration ServerConfig::writeTimeout() const noexcept { return m_writeTimeout; }
 std::size_t ServerConfig::maximumConnections() const noexcept { return m_maximumConnections; }
 std::size_t ServerConfig::workerThreads() const noexcept { return m_workerThreads; }
+bool ServerConfig::trustProxyClientIp() const noexcept { return m_trustProxyClientIp; }
 
 class BeastHttpServer::Implementation final {
 public:
@@ -201,7 +209,15 @@ public:
             auto incoming = m_parser->release();
             auto method = parseHttpMethod(incoming.method_string());
             std::vector<std::pair<std::string, std::string>> headers;
+            std::optional<std::string> forwardedClientIp;
             for (const auto& field : incoming.base()) {
+                if (beast::iequals(field.name_string(), "x-forwarded-for")) {
+                    if (m_owner->m_config.trustProxyClientIp()
+                        && !forwardedClientIp.has_value()) {
+                        forwardedClientIp.emplace(field.value());
+                    }
+                    continue;
+                }
                 headers.emplace_back(std::string{field.name_string()},
                                      std::string{field.value()});
             }
@@ -213,9 +229,32 @@ public:
                                     incoming.version()));
                 return;
             }
+            std::string remoteAddress = remote.address().to_string();
+            if (m_owner->m_config.trustProxyClientIp()) {
+                boost::system::error_code forwardedError;
+                if (!forwardedClientIp.has_value()
+                    || forwardedClientIp->empty()
+                    || forwardedClientIp->contains(',')
+                    || forwardedClientIp->contains(' ')
+                    || forwardedClientIp->contains('\t')) {
+                    write(parserFailure(
+                        make_error_code(boost::system::errc::invalid_argument),
+                        incoming.version()));
+                    return;
+                }
+                const asio::ip::address forwarded = asio::ip::make_address(
+                    *forwardedClientIp, forwardedError);
+                if (forwardedError) {
+                    write(parserFailure(
+                        make_error_code(boost::system::errc::invalid_argument),
+                        incoming.version()));
+                    return;
+                }
+                remoteAddress = forwarded.to_string();
+            }
             auto request = HttpRequest::create(
                 method.value(), std::string{incoming.target()}, std::move(headers),
-                std::move(incoming.body()), remote.address().to_string(),
+                std::move(incoming.body()), std::move(remoteAddress),
                 foundation::CorrelationId{std::move(correlation).value()});
             if (!request.has_value()) {
                 write(parserFailure(make_error_code(boost::system::errc::invalid_argument),

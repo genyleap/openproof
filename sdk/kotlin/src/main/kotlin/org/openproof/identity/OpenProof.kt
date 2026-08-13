@@ -1,6 +1,7 @@
 package org.openproof.identity
 
 import java.net.URLEncoder
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -46,8 +47,14 @@ object OpenProofIdentity {
         require(config.clientId.isNotBlank() && config.redirectUri.isNotBlank())
         require(config.scopes.isNotEmpty())
         val issuer = config.issuer.trimEnd('/')
-        require(issuer.startsWith("https://") || issuer.startsWith("http://127.0.0.1")
-            || issuer.startsWith("http://localhost"))
+        val parsedIssuer = URI(issuer)
+        val loopbackHttp = parsedIssuer.scheme.equals("http", ignoreCase = true)
+            && parsedIssuer.host?.lowercase() in setOf("127.0.0.1", "::1", "localhost")
+        require(parsedIssuer.scheme.equals("https", ignoreCase = true) || loopbackHttp)
+        require(parsedIssuer.host?.isNotBlank() == true && parsedIssuer.rawUserInfo == null
+            && parsedIssuer.rawQuery == null && parsedIssuer.rawFragment == null)
+        val parsedRedirect = URI(config.redirectUri)
+        require(!parsedRedirect.scheme.isNullOrBlank() && parsedRedirect.rawUserInfo == null)
         val verifier = token(32)
         val state = token(32)
         val nonce = token(24)

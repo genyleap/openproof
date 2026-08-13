@@ -1,0 +1,52 @@
+name: production-qualification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: openproof-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-macos-gcc16:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      OPENPROOF_TEST_POSTGRES: postgresql:///openproof_ci
+      OPENPROOF_TEST_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_IS_DESTRUCTIVE
+      OPENPROOF_E2E_POSTGRES: postgresql:///openproof_e2e_ci
+      OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install qualified toolchain and dependencies
+        run: >-
+          brew install gcc cmake ninja openssl@3 tomlplusplus boost
+          postgresql@18
+
+      - name: Start disposable PostgreSQL
+        run: |
+          brew services start postgresql@18
+          for attempt in {1..30}; do
+            if pg_isready -q; then break; fi
+            sleep 1
+          done
+          pg_isready
+          createdb openproof_ci
+          createdb openproof_e2e_ci
+
+      - name: Run release, sanitizer, PostgreSQL and SDK gates
+        run: ./scripts/qualify-production.sh
+
+      - name: Upload CTest failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-failure-logs
+          path: cmake-build-*/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

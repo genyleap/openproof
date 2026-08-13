@@ -104,17 +104,22 @@ public:
      * @brief Validates and constructs listener settings.
      * @return ErrorCode::InvalidArgument when the address is empty or the port is 0.
      */
-    [[nodiscard]] static foundation::Result<ServerConfig> create(std::string bindAddress,
-                                                                 std::uint16_t port);
+    [[nodiscard]] static foundation::Result<ServerConfig> create(
+        std::string bindAddress, std::uint16_t port,
+        bool trustProxyClientIp = false);
 
     [[nodiscard]] std::string_view bindAddress() const noexcept;
     [[nodiscard]] std::uint16_t port() const noexcept;
+    /** Whether one proxy-supplied X-Forwarded-For IP replaces the loopback peer. */
+    [[nodiscard]] bool trustProxyClientIp() const noexcept;
 
 private:
-    ServerConfig(std::string bindAddress, std::uint16_t port);
+    ServerConfig(std::string bindAddress, std::uint16_t port,
+                 bool trustProxyClientIp);
 
     std::string m_bindAddress;
     std::uint16_t m_port;
+    bool m_trustProxyClientIp{};
 };
 
 /** @brief Logging settings. */
@@ -158,7 +163,8 @@ class OidcConfig final {
 public:
     OidcConfig();
     OidcConfig(bool enabled, std::string issuer, std::string keyId,
-               foundation::SecretString signingKey);
+               foundation::SecretString signingKey,
+               std::string previousSigningKeysDirectory);
     OidcConfig(const OidcConfig&) = delete;
     OidcConfig& operator=(const OidcConfig&) = delete;
     OidcConfig(OidcConfig&&) noexcept = default;
@@ -167,11 +173,13 @@ public:
     [[nodiscard]] std::string_view issuer() const noexcept;
     [[nodiscard]] std::string_view keyId() const noexcept;
     [[nodiscard]] const foundation::SecretString& signingKey() const noexcept;
+    [[nodiscard]] std::string_view previousSigningKeysDirectory() const noexcept;
 private:
     bool m_enabled{};
     std::string m_issuer;
     std::string m_keyId;
     foundation::SecretString m_signingKey;
+    std::string m_previousSigningKeysDirectory;
 };
 
 /** Configuration for the runnable single-upstream reverse-gateway process. */

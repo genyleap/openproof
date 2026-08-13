@@ -63,6 +63,10 @@ private:
  */
 [[nodiscard]] foundation::Status validateRs256PublicKey(std::string_view publicKeyPem);
 
+/** Converts a validated RSA public PEM into one publishable RS256 JWK. */
+[[nodiscard]] foundation::Result<std::string> rsaPublicJwkJson(
+    std::string_view publicKeyPem, std::string keyId);
+
 [[nodiscard]] foundation::Result<VerifiedCompactJws> verifyRs256Jwt(
     std::string_view publicKeyPem, std::string_view compactJwt);
 

@@ -40,8 +40,15 @@ public enum OpenProofSDK {
     }
 
     public static func begin(_ config: OpenProofConfiguration) throws -> OpenProofAuthorization {
-        guard config.issuer.scheme == "https" || config.issuer.host == "127.0.0.1"
-                || config.issuer.host == "localhost",
+        let scheme = config.issuer.scheme?.lowercased()
+        let host = config.issuer.host?.lowercased()
+        let loopbackHTTP = scheme == "http"
+            && (host == "127.0.0.1" || host == "::1" || host == "localhost")
+        guard (scheme == "https" || loopbackHTTP),
+              config.issuer.user == nil, config.issuer.password == nil,
+              config.issuer.query == nil, config.issuer.fragment == nil,
+              config.redirectURI.scheme != nil,
+              config.redirectURI.user == nil, config.redirectURI.password == nil,
               !config.clientID.isEmpty, !config.scopes.isEmpty else {
             throw OpenProofError.invalidConfiguration
         }

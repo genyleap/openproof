@@ -12,5 +12,6 @@ let package = Package(
     ],
     targets: [
         .target(name: "OpenProof"),
+        .testTarget(name: "OpenProofTests", dependencies: ["OpenProof"]),
     ]
 )

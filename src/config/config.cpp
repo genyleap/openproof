@@ -89,7 +89,8 @@ constexpr std::uint16_t kDefaultPort = 8443;
 
     if (const toml::table* server = document["server"].as_table(); server != nullptr) {
         const foundation::Status keys =
-            validateTableKeys(*server, "server", {"bind_address", "port"});
+            validateTableKeys(*server, "server", {
+                "bind_address", "port", "trust_proxy_client_ip"});
         if (!keys.has_value()) {
             return foundation::fail(keys.error());
         }
@@ -110,7 +111,8 @@ constexpr std::uint16_t kDefaultPort = 8443;
     }
     if (const toml::table* oidc = document["oidc"].as_table(); oidc != nullptr) {
         const foundation::Status keys =
-            validateTableKeys(*oidc, "oidc", {"enabled", "issuer", "key_id", "signing_key"});
+            validateTableKeys(*oidc, "oidc", {"enabled", "issuer", "key_id", "signing_key",
+                                               "previous_signing_keys_directory"});
         if (!keys.has_value()) return foundation::fail(keys.error());
     }
     if (const toml::table* gateway = document["gateway"].as_table(); gateway != nullptr) {
@@ -206,6 +208,12 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (!port.has_value()) {
         return foundation::fail(port.error());
     }
+    const foundation::Status trustProxyClientIp = requireType(
+        "server", "trust_proxy_client_ip",
+        [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!trustProxyClientIp.has_value()) {
+        return foundation::fail(trustProxyClientIp.error());
+    }
     const foundation::Status level = requireType(
         "logging", "level", [](const auto& node) { return node.is_string(); }, "a string");
     if (!level.has_value()) {
@@ -221,6 +229,15 @@ constexpr std::uint16_t kDefaultPort = 8443;
         "a secret-reference string");
     if (!signingKey.has_value()) {
         return foundation::fail(signingKey.error());
+    }
+    const foundation::Status oidcEnabled = requireType(
+        "oidc", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!oidcEnabled.has_value()) return foundation::fail(oidcEnabled.error());
+    for (const std::string_view key : {
+             "issuer", "key_id", "signing_key", "previous_signing_keys_directory"}) {
+        const foundation::Status type = requireType(
+            "oidc", key, [](const auto& node) { return node.is_string(); }, "a string");
+        if (!type.has_value()) return foundation::fail(type.error());
     }
     for (const std::string_view key : {
              "route_prefix", "upstream_host", "upstream_ca_file"}) {
@@ -438,7 +455,8 @@ resolveSecretReference(std::string_view reference, const Environment& environmen
         "Inline secret values are not accepted.");
 }
 
-foundation::Result<ServerConfig> ServerConfig::create(std::string bindAddress, std::uint16_t port)
+foundation::Result<ServerConfig> ServerConfig::create(
+    std::string bindAddress, std::uint16_t port, bool trustProxyClientIp)
 {
     if (bindAddress.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -448,12 +466,19 @@ foundation::Result<ServerConfig> ServerConfig::create(std::string bindAddress, s
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The server port must be in the range 1-65535.");
     }
-    return ServerConfig{std::move(bindAddress), port};
+    if (trustProxyClientIp && bindAddress != "127.0.0.1" && bindAddress != "::1") {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "Trusted proxy client-IP forwarding requires a loopback listener.");
+    }
+    return ServerConfig{std::move(bindAddress), port, trustProxyClientIp};
 }
 
-ServerConfig::ServerConfig(std::string bindAddress, std::uint16_t port)
+ServerConfig::ServerConfig(
+    std::string bindAddress, std::uint16_t port, bool trustProxyClientIp)
     : m_bindAddress(std::move(bindAddress))
     , m_port(port)
+    , m_trustProxyClientIp(trustProxyClientIp)
 {
 }
 
@@ -465,6 +490,11 @@ std::string_view ServerConfig::bindAddress() const noexcept
 std::uint16_t ServerConfig::port() const noexcept
 {
     return m_port;
+}
+
+bool ServerConfig::trustProxyClientIp() const noexcept
+{
+    return m_trustProxyClientIp;
 }
 
 LoggingConfig::LoggingConfig(observability::LogLevel level, bool console)
@@ -495,13 +525,17 @@ const foundation::SecretString& SecurityConfig::tokenSigningKey() const noexcept
 
 OidcConfig::OidcConfig() = default;
 OidcConfig::OidcConfig(bool enabled, std::string issuer, std::string keyId,
-                       foundation::SecretString signingKey)
+                       foundation::SecretString signingKey,
+                       std::string previousSigningKeysDirectory)
     : m_enabled(enabled), m_issuer(std::move(issuer)), m_keyId(std::move(keyId)),
-      m_signingKey(std::move(signingKey)) {}
+      m_signingKey(std::move(signingKey)),
+      m_previousSigningKeysDirectory(std::move(previousSigningKeysDirectory)) {}
 bool OidcConfig::enabled() const noexcept { return m_enabled; }
 std::string_view OidcConfig::issuer() const noexcept { return m_issuer; }
 std::string_view OidcConfig::keyId() const noexcept { return m_keyId; }
 const foundation::SecretString& OidcConfig::signingKey() const noexcept { return m_signingKey; }
+std::string_view OidcConfig::previousSigningKeysDirectory() const noexcept
+{ return m_previousSigningKeysDirectory; }
 
 GatewayConfig::GatewayConfig(bool enabled, std::string routePrefix,
                              std::string upstreamHost, std::uint16_t upstreamPort,
@@ -794,6 +828,7 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     }
 
     bool console = document["logging"]["console"].value_or(true);
+    bool trustProxyClientIp = document["server"]["trust_proxy_client_ip"].value_or(false);
 
     // Environment overrides are applied after the file so that a deployment can
     // change a setting without rebuilding the image it ships in.
@@ -808,6 +843,12 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
             return foundation::fail(parsed.error());
         }
         port = parsed.value();
+    }
+    if (const auto overrideValue = environment.get("OPENPROOF_SERVER_TRUST_PROXY_CLIENT_IP");
+        overrideValue.has_value()) {
+        auto parsed = parseBoolean(*overrideValue);
+        if (!parsed.has_value()) return foundation::fail(parsed.error());
+        trustProxyClientIp = parsed.value();
     }
     if (const std::optional<std::string> overrideValue = environment.get("OPENPROOF_LOGGING_LEVEL");
         overrideValue.has_value()) {
@@ -830,7 +871,8 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         console = parsed.value();
     }
 
-    foundation::Result<ServerConfig> server = ServerConfig::create(std::move(bindAddress), port);
+    foundation::Result<ServerConfig> server = ServerConfig::create(
+        std::move(bindAddress), port, trustProxyClientIp);
     if (!server.has_value()) {
         return foundation::fail(server.error());
     }
@@ -850,6 +892,8 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     bool oidcEnabled = document["oidc"]["enabled"].value_or(false);
     std::string oidcIssuer = document["oidc"]["issuer"].value_or(std::string{});
     std::string oidcKeyId = document["oidc"]["key_id"].value_or(std::string{"openproof-rs256-1"});
+    std::string oidcPreviousKeysDirectory = document["oidc"]["previous_signing_keys_directory"]
+        .value_or(std::string{});
     foundation::SecretString oidcSigningKey;
     if (const auto reference = document["oidc"]["signing_key"].value<std::string>(); reference.has_value()) {
         auto resolved = resolveSecretReference(*reference, environment);
@@ -864,7 +908,10 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     if (const auto value = environment.get("OPENPROOF_OIDC_KEY_ID"); value.has_value()) oidcKeyId = *value;
     if (const auto value = environment.get("OPENPROOF_OIDC_SIGNING_KEY"); value.has_value())
         oidcSigningKey = foundation::SecretString{*value};
-    OidcConfig oidc{oidcEnabled, std::move(oidcIssuer), std::move(oidcKeyId), std::move(oidcSigningKey)};
+    if (const auto value = environment.get("OPENPROOF_OIDC_PREVIOUS_KEYS_DIRECTORY");
+        value.has_value()) oidcPreviousKeysDirectory = *value;
+    OidcConfig oidc{oidcEnabled, std::move(oidcIssuer), std::move(oidcKeyId),
+                    std::move(oidcSigningKey), std::move(oidcPreviousKeysDirectory)};
 
     const bool gatewayEnabled = document["gateway"]["enabled"].value_or(false);
     std::uint16_t upstreamPortValue = 0U;

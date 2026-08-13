@@ -3,6 +3,7 @@ module;
 #include <string>
 #include <string_view>
 #include <optional>
+#include <vector>
 
 export module openproof.oidc:service;
 
@@ -47,13 +48,31 @@ private:
     foundation::Duration m_idTokenLifetime{};
 };
 
+/** Public verification-only RSA key retained during a signing-key overlap. */
+class PublishedVerificationJwk final {
+public:
+    PublishedVerificationJwk(const PublishedVerificationJwk& other);
+    PublishedVerificationJwk(PublishedVerificationJwk&& other);
+    PublishedVerificationJwk& operator=(const PublishedVerificationJwk& other);
+    PublishedVerificationJwk& operator=(PublishedVerificationJwk&& other);
+    ~PublishedVerificationJwk();
+
+    [[nodiscard]] static foundation::Result<PublishedVerificationJwk>
+    create(std::string_view publicKeyPem, std::string keyId);
+private:
+    friend class OpenIdProvider;
+    explicit PublishedVerificationJwk(std::string json);
+    std::string m_json;
+};
+
 /** @brief OIDC Core service for discovery, JWKS, ID Token and UserInfo. */
 class OpenIdProvider final {
 public:
     OpenIdProvider(Issuer issuer, const foundation::ClockSource& clock,
                    security::RsaSha256Signer signer,
                    identity::profile::IdentityProfileRepository& profiles,
-                   OidcPolicy policy);
+                   OidcPolicy policy,
+                   std::vector<PublishedVerificationJwk> publishedVerificationJwks = {});
 
     [[nodiscard]] std::string discoveryDocument() const;
     [[nodiscard]] foundation::Result<std::string> jwksDocument() const;
@@ -72,6 +91,7 @@ private:
     Issuer m_issuer;
     const foundation::ClockSource* m_clock;
     security::RsaSha256Signer m_signer;
+    std::vector<PublishedVerificationJwk> m_publishedVerificationJwks;
     identity::profile::IdentityProfileRepository* m_profiles;
     OidcPolicy m_policy;
 };

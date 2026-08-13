@@ -340,7 +340,8 @@ const splitLines=v=>v.split(/\n+/).map(x=>x.trim()).filter(Boolean);
 async function api(url,method='GET',body){const r=await fetch(url,{method,headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});const text=await r.text();let data=text;try{data=text?JSON.parse(text):null}catch{}if(!r.ok)throw new Error(typeof data==='string'?data:JSON.stringify(data));return data}
 function show(el,data){el.textContent=JSON.stringify(data,null,2)}function result(data){show(op,data);status.textContent='Operation completed';status.className='ok'}function fail(e){status.textContent=e.message;status.className='error'}
 document.querySelectorAll('[data-load]').forEach(b=>b.onclick=async()=>{try{show(q('#'+b.dataset.target),await api(b.dataset.load))}catch(e){fail(e)}});
-q('#memberCreate').onsubmit=async e=>{e.preventDefault();try{const v=values(e.target);result(await api('/admin/local-members','POST',{subject:v.subject,roles:splitComma(v.roles)}))}catch(x){fail(x)}};
+const memberCreate=q('#memberCreate');memberCreate.insertAdjacentHTML('afterbegin','<input name="identity_id" placeholder="new identity id" required>');
+memberCreate.onsubmit=async e=>{e.preventDefault();try{const v=values(e.target);result(await api('/admin/local-members','POST',{identity_id:v.identity_id,subject:v.subject,roles:splitComma(v.roles)}))}catch(x){fail(x)}};
 q('#applicationCreate').onsubmit=async e=>{e.preventDefault();try{const v=values(e.target);result(await api('/admin/applications','POST',v))}catch(x){fail(x)}};
 q('#applicationState').onsubmit=async e=>{e.preventDefault();try{const v=values(e.target);result(await api('/admin/applications/'+v.action,'POST',{application_id:v.application_id}))}catch(x){fail(x)}};
 q('#clientList').onsubmit=async e=>{e.preventDefault();try{const v=values(e.target);show(q('#clients'),await api('/admin/clients?application_id='+encodeURIComponent(v.application_id)))}catch(x){fail(x)}};

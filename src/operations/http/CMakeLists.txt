@@ -1,0 +1,10 @@
+openproof_add_module(openproof_operations_http
+    MODULES
+        http.cppm
+    SOURCES
+        http.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_gateway
+        openproof_storage_postgres
+)

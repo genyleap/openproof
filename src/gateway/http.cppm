@@ -19,7 +19,8 @@ public:
     create(std::string bindAddress, std::uint16_t port,
            std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
            foundation::Duration readTimeout, foundation::Duration writeTimeout,
-           std::size_t maximumConnections, std::size_t workerThreads);
+           std::size_t maximumConnections, std::size_t workerThreads,
+           bool trustProxyClientIp = false);
 
     [[nodiscard]] std::string_view bindAddress() const noexcept;
     [[nodiscard]] std::uint16_t port() const noexcept;
@@ -29,12 +30,14 @@ public:
     [[nodiscard]] foundation::Duration writeTimeout() const noexcept;
     [[nodiscard]] std::size_t maximumConnections() const noexcept;
     [[nodiscard]] std::size_t workerThreads() const noexcept;
+    [[nodiscard]] bool trustProxyClientIp() const noexcept;
 
 private:
     ServerConfig(std::string bindAddress, std::uint16_t port,
                  std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
                  foundation::Duration readTimeout, foundation::Duration writeTimeout,
-                 std::size_t maximumConnections, std::size_t workerThreads);
+                 std::size_t maximumConnections, std::size_t workerThreads,
+                 bool trustProxyClientIp);
     std::string m_bindAddress;
     std::uint16_t m_port{};
     std::size_t m_headerLimitBytes{};
@@ -43,6 +46,7 @@ private:
     foundation::Duration m_writeTimeout{};
     std::size_t m_maximumConnections{};
     std::size_t m_workerThreads{};
+    bool m_trustProxyClientIp{};
 };
 
 class BeastHttpServer final {
