@@ -9,14 +9,18 @@
 #include <thread>
 #include <vector>
 
+import openproof.client;
 import openproof.credentials;
 import openproof.foundation;
 import openproof.gateway;
+import openproof.security;
 import openproof.telemetry;
 
+namespace client = openproof::client;
 namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
 namespace gw = openproof::gateway;
+namespace security = openproof::security;
 namespace telemetry = openproof::telemetry;
 
 namespace {
@@ -43,6 +47,13 @@ TEST(HardeningTest, MalformedBoundaryCorpusNeverEscapesAsAnException)
                 "192.0.2.1", fnd::CorrelationId{"fuzz"}));
             static_cast<void>(cred::PasswordHash::parse(input));
             static_cast<void>(telemetry::TraceContext::parseTraceParent(input));
+            static_cast<void>(client::RedirectUri::create(
+                input, client::ClientKind::Web));
+            static_cast<void>(client::RedirectUri::create(
+                input, client::ClientKind::Native));
+            static_cast<void>(security::validateRs256PublicKey(input));
+            static_cast<void>(security::rsaJwkThumbprint(input, input));
+            static_cast<void>(security::verifyRs256Jwk(input, input, input));
         });
     }
 }
