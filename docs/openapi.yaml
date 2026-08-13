@@ -1,0 +1,1572 @@
+openapi: 3.1.0
+info:
+  title: OpenProof Identity API
+  version: 1.1.0-rc1
+  description: >-
+    Machine-readable contract for OpenProof consumer accounts, authentication,
+    OAuth/OIDC, identity evidence, administration and SCIM provisioning. Browser
+    ceremonies retain the Set-Cookie values between their documented steps.
+servers:
+  - url: https://identity.example.com
+security: []
+tags:
+  - name: Health
+  - name: Account
+  - name: Authentication
+  - name: Passkeys
+  - name: Federation
+  - name: OAuth
+  - name: Evidence
+  - name: Administration
+  - name: SCIM
+paths:
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveness
+      responses:
+        "200":
+          description: Process is live.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Health"}
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      responses:
+        "200":
+          description: Service and PostgreSQL are ready.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Health"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /account/signup:
+    post:
+      tags: [Account]
+      operationId: signup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, password]
+              properties:
+                email: {type: string, format: email, maxLength: 320}
+                password: {type: string, format: password, maxLength: 1024}
+                display_name: {type: string, maxLength: 256}
+      responses:
+        "201":
+          description: Pending account created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identity_id, verification_required]
+                properties:
+                  identity_id: {type: string}
+                  verification_required: {type: boolean, const: true}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /account/email/verify:
+    post:
+      tags: [Account]
+      operationId: verifySignupEmail
+      requestBody: {$ref: "#/components/requestBodies/VerificationProof"}
+      responses:
+        "200":
+          description: Email verified and account activated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [verified]
+                properties:
+                  verified: {type: boolean, const: true}
+        "400": {$ref: "#/components/responses/Error"}
+  /account/email/resend:
+    post:
+      tags: [Account]
+      operationId: resendSignupEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: {type: string, format: email, maxLength: 320}
+      responses:
+        "202": {description: Accepted without revealing account existence.}
+  /account/email/change:
+    post:
+      tags: [Account]
+      operationId: beginEmailChange
+      description: Starts verified email replacement for the authenticated identity.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EmailInput"}
+      responses:
+        "202": {description: Verification delivery accepted.}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/email/change/verify:
+    post:
+      tags: [Account]
+      operationId: completeEmailChange
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/VerificationProof"}
+      responses:
+        "200":
+          description: Email replaced; returns the updated profile.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/phone:
+    post:
+      tags: [Account]
+      operationId: beginPhoneVerification
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [phone_number]
+              properties:
+                phone_number: {type: string, maxLength: 32, example: "+989121234567"}
+      responses:
+        "202": {description: Verification delivery accepted.}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/phone/verify:
+    post:
+      tags: [Account]
+      operationId: completePhoneVerification
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/VerificationProof"}
+      responses:
+        "200":
+          description: Phone verified; returns the updated profile.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/password/forgot:
+    post:
+      tags: [Account]
+      operationId: beginPasswordReset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: {type: string, format: email, maxLength: 320}
+      responses:
+        "202": {description: Accepted without revealing account existence.}
+  /account/password/reset:
+    post:
+      tags: [Account]
+      operationId: completePasswordReset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PasswordReset"}
+      responses:
+        "200":
+          description: Password replaced and existing sessions revoked.
+        "400": {$ref: "#/components/responses/Error"}
+  /account/profile:
+    get:
+      tags: [Account]
+      operationId: getProfile
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: Current profile.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+        "401": {$ref: "#/components/responses/Error"}
+    patch:
+      tags: [Account]
+      operationId: updateProfile
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                display_name: {type: string, maxLength: 256}
+                preferred_username: {type: string, maxLength: 128}
+                locale: {type: string, maxLength: 64}
+                picture: {type: string, format: uri, maxLength: 2048}
+      responses:
+        "200":
+          description: Updated profile.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+    put:
+      tags: [Account]
+      operationId: replaceProfileFields
+      description: Uses the same partial-update semantics as PATCH for compatibility.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ProfileUpdate"}
+      responses:
+        "200":
+          description: Updated profile.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/passkeys/options:
+    post:
+      tags: [Passkeys]
+      operationId: beginPasskeyRegistration
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: WebAuthn PublicKeyCredentialCreationOptions and a ceremony cookie.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WebAuthnOptions"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/passkeys:
+    get:
+      tags: [Passkeys]
+      operationId: listPasskeys
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Passkeys registered to the current identity.}
+        "401": {$ref: "#/components/responses/Error"}
+    post:
+      tags: [Passkeys]
+      operationId: completePasskeyRegistration
+      description: Preserve the registration ceremony cookie from the options call.
+      security:
+        - {sessionCookie: [], passkeyRegistrationCookie: []}
+        - {bearerAuth: [], passkeyRegistrationCookie: []}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WebAuthnRegistration"}
+      responses:
+        "201": {description: Passkey registered.}
+        "400": {$ref: "#/components/responses/Error"}
+  /account/passkeys/{credential_id}:
+    parameters:
+      - {name: credential_id, in: path, required: true, schema: {type: string, maxLength: 4096}}
+    delete:
+      tags: [Passkeys]
+      operationId: removePasskey
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Passkey removed.}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/login:
+    post:
+      tags: [Authentication]
+      operationId: beginLocalLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [subject]
+              properties:
+                subject: {type: string, maxLength: 320}
+      responses:
+        "202":
+          description: Pre-authentication transaction started; retain Set-Cookie fields.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transaction_id, challenge_id, expires_at_ms]
+                properties:
+                  transaction_id: {type: string}
+                  challenge_id: {type: string}
+                  expires_at_ms: {type: integer, format: int64}
+  /auth/mfa/verify:
+    post:
+      tags: [Authentication]
+      operationId: completeLocalLogin
+      security: [{preauthCookies: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [transaction_id, challenge_id, password]
+              properties:
+                transaction_id: {type: string}
+                challenge_id: {type: string}
+                password: {type: string, format: password}
+                totp: {type: string, pattern: "^[0-9]{6,8}$"}
+      responses:
+        "200":
+          description: Session issued in a secure cookie.
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/session/rotate:
+    post:
+      tags: [Authentication]
+      operationId: rotateSession
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Session atomically rotated.}
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logout
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "204": {description: Current session revoked or cookie cleared.}
+  /auth/logout-all:
+    post:
+      tags: [Authentication]
+      operationId: logoutAll
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "204": {description: All identity sessions revoked.}
+  /auth/recovery-codes:
+    post:
+      tags: [Authentication]
+      operationId: generateRecoveryCodes
+      description: Requires an IAL2 session. The ten returned codes are shown once.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "201":
+          description: New recovery-code batch; replaces the previous batch.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [codes]
+                properties:
+                  codes:
+                    type: array
+                    minItems: 10
+                    maxItems: 10
+                    items: {type: string}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+  /auth/providers:
+    get:
+      tags: [Federation]
+      operationId: listFederatedProviders
+      responses:
+        "200":
+          description: Enabled redirect-based identity providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers: {type: array, items: {type: string}}
+  /auth/federated/start:
+    get:
+      tags: [Federation]
+      operationId: beginFederatedLogin
+      parameters:
+        - {name: provider, in: query, required: true, schema: {type: string, maxLength: 128}}
+        - {name: return_to, in: query, required: false, description: Local absolute path only., schema: {type: string, default: /}}
+      responses:
+        "302":
+          description: Redirect to the upstream provider and set bound ceremony cookies.
+          headers:
+            Location: {schema: {type: string, format: uri}}
+            Set-Cookie: {schema: {type: string}}
+  /auth/federated/callback:
+    get:
+      tags: [Federation]
+      operationId: completeOidcFederatedLogin
+      description: OAuth/OIDC provider callback. Parameters are supplied by the upstream provider.
+      responses:
+        "302": {description: OpenProof session established and redirected to the saved local return target.}
+        "401": {$ref: "#/components/responses/Error"}
+    post:
+      tags: [Federation]
+      operationId: completeFormPostFederatedLogin
+      description: Apple form_post or SAML callback; preserve all ceremony cookies.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "302": {description: OpenProof session established and redirected to the saved local return target.}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/passkey/options:
+    post:
+      tags: [Passkeys]
+      operationId: beginPasskeyLogin
+      responses:
+        "200":
+          description: WebAuthn PublicKeyCredentialRequestOptions and bound ceremony cookies.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WebAuthnOptions"}
+  /auth/passkey/verify:
+    post:
+      tags: [Passkeys]
+      operationId: completePasskeyLogin
+      description: Preserve every cookie returned by /auth/passkey/options.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WebAuthnAssertion"}
+      responses:
+        "200": {description: IAL2 OpenProof session issued in a secure cookie.}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/web3/start:
+    post:
+      tags: [Federation]
+      operationId: beginWeb3Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Web3Start"}
+      responses:
+        "200":
+          description: Provider-specific message to sign and bound ceremony cookies.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+        "400": {$ref: "#/components/responses/Error"}
+  /auth/web3/complete:
+    post:
+      tags: [Federation]
+      operationId: completeWeb3Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message, signature]
+              properties:
+                message: {type: string, maxLength: 8192}
+                signature: {type: string, maxLength: 8192}
+      responses:
+        "200": {description: OpenProof session issued in a secure cookie.}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/ldap/start:
+    post:
+      tags: [Federation]
+      operationId: beginLdapLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username]
+              properties:
+                username: {type: string, maxLength: 320}
+      responses:
+        "202": {description: "LDAP transaction, username binding and ceremony cookies."}
+  /auth/ldap/complete:
+    post:
+      tags: [Federation]
+      operationId: completeLdapLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LdapCompletion"}
+      responses:
+        "200": {description: OpenProof session issued in a secure cookie.}
+        "401": {$ref: "#/components/responses/Error"}
+  /.well-known/openid-configuration:
+    get:
+      tags: [OAuth]
+      operationId: discovery
+      responses:
+        "200": {description: OpenID Provider metadata.}
+  /.well-known/jwks.json:
+    get:
+      tags: [OAuth]
+      operationId: jwks
+      responses:
+        "200": {description: Active public OIDC signing keys.}
+  /login:
+    get:
+      tags: [OAuth]
+      operationId: oauthLoginPage
+      description: Interactive OpenProof login page used by the authorization flow.
+      parameters:
+        - {name: return_to, in: query, required: true, description: Valid local OAuth continuation path., schema: {type: string}}
+      responses:
+        "200": {description: CSP-protected HTML login form and CSRF cookie.}
+    post:
+      tags: [OAuth]
+      operationId: oauthLoginSubmit
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [return_to, csrf, subject, password]
+              properties:
+                return_to: {type: string}
+                csrf: {type: string}
+                subject: {type: string, maxLength: 320}
+                password: {type: string, format: password}
+                totp: {type: string}
+      responses:
+        "303": {description: Session established and browser returned to the authorization flow.}
+        "401": {$ref: "#/components/responses/Error"}
+  /oauth/authorize:
+    get:
+      tags: [OAuth]
+      operationId: authorize
+      description: Browser Authorization Code + PKCE endpoint; use Discovery and an SDK.
+      parameters:
+        - {name: response_type, in: query, required: true, schema: {type: string, const: code}}
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+        - {name: redirect_uri, in: query, required: true, schema: {type: string, format: uri}}
+        - {name: scope, in: query, required: true, schema: {type: string}}
+        - {name: code_challenge, in: query, required: true, schema: {type: string}}
+        - {name: code_challenge_method, in: query, required: true, schema: {type: string, const: S256}}
+        - {name: state, in: query, required: true, schema: {type: string}}
+        - {name: nonce, in: query, required: false, schema: {type: string}}
+        - {name: resource, in: query, required: false, schema: {type: string, format: uri}}
+      responses:
+        "302": {description: Consent/login or exact registered redirect response.}
+  /oauth/consent:
+    post:
+      tags: [OAuth]
+      operationId: submitConsent
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [return_to, csrf, decision]
+              properties:
+                return_to: {type: string}
+                csrf: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+      responses:
+        "303": {description: Consent recorded or denied; browser redirected.}
+  /oauth/consents:
+    get:
+      tags: [OAuth]
+      operationId: listConsents
+      security: [{sessionCookie: []}]
+      responses:
+        "200": {description: Current identity consents and a CSRF value for revocation.}
+        "401": {$ref: "#/components/responses/Error"}
+  /oauth/consents/revoke:
+    post:
+      tags: [OAuth]
+      operationId: revokeConsent
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [consent_id, csrf]
+              properties:
+                consent_id: {type: string}
+                csrf: {type: string}
+      responses:
+        "204": {description: Consent revoked.}
+  /oauth/par:
+    post:
+      tags: [OAuth]
+      operationId: pushedAuthorizationRequest
+      description: RFC 9126 PAR. Confidential clients send client_secret in the form; public clients omit it.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: {$ref: "#/components/schemas/PushedAuthorizationRequest"}
+      responses:
+        "201": {description: Pushed request URI and expiry.}
+        "400": {$ref: "#/components/responses/OAuthError"}
+        "401": {$ref: "#/components/responses/OAuthError"}
+  /oauth/device_authorization:
+    post:
+      tags: [OAuth]
+      operationId: deviceAuthorization
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [client_id, scope]
+              properties:
+                client_id: {type: string}
+                client_secret: {type: string, format: password}
+                scope: {type: string}
+                resource: {type: string, format: uri}
+      responses:
+        "200": {description: "Device code, user code, verification URIs, expiry and polling interval."}
+        "400": {$ref: "#/components/responses/OAuthError"}
+  /oauth/device:
+    get:
+      tags: [OAuth]
+      operationId: deviceVerificationPage
+      parameters:
+        - {name: user_code, in: query, required: false, schema: {type: string}}
+      responses:
+        "200": {description: Interactive device authorization page.}
+    post:
+      tags: [OAuth]
+      operationId: submitDeviceVerification
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [user_code, decision, csrf]
+              properties:
+                user_code: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+                csrf: {type: string}
+      responses:
+        "200": {description: Device authorization decision accepted.}
+  /oauth/token:
+    post:
+      tags: [OAuth]
+      operationId: token
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+              required: [grant_type, client_id]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [authorization_code, refresh_token, client_credentials, urn:ietf:params:oauth:grant-type:device_code, urn:ietf:params:oauth:grant-type:token-exchange]
+                client_id: {type: string}
+                client_secret: {type: string, format: password}
+                code: {type: string}
+                redirect_uri: {type: string, format: uri}
+                code_verifier: {type: string}
+                refresh_token: {type: string}
+                device_code: {type: string}
+                subject_token: {type: string}
+                subject_token_type: {type: string}
+                scope: {type: string}
+                resource: {type: string, format: uri}
+      responses:
+        "200":
+          description: Token response; rotated refresh token replaces the submitted token.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenResponse"}
+        "400": {$ref: "#/components/responses/OAuthError"}
+        "401": {$ref: "#/components/responses/OAuthError"}
+  /oauth/userinfo:
+    get:
+      tags: [OAuth]
+      operationId: userInfo
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {description: OIDC claims for the access-token subject.}
+        "401": {$ref: "#/components/responses/OAuthError"}
+    post:
+      tags: [OAuth]
+      operationId: userInfoPost
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {description: OIDC claims for the access-token subject.}
+        "401": {$ref: "#/components/responses/OAuthError"}
+  /oauth/revoke:
+    post:
+      tags: [OAuth]
+      operationId: revokeToken
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [client_id, token]
+              properties:
+                client_id: {type: string}
+                client_secret: {type: string, format: password}
+                token: {type: string}
+                token_type_hint: {type: string}
+      responses:
+        "200": {description: Revocation is idempotent.}
+  /oauth/introspect:
+    post:
+      tags: [OAuth]
+      operationId: introspectToken
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [client_id, client_secret, token]
+              properties:
+                client_id: {type: string}
+                client_secret: {type: string, format: password}
+                token: {type: string}
+      responses:
+        "200": {description: RFC 7662-compatible token activity response.}
+  /evidence/challenge:
+    post:
+      tags: [Evidence]
+      operationId: issueEvidenceChallenge
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider: {type: string, enum: [signed-jwt-evidence, x509-evidence]}
+      responses:
+        "201": {description: One-time provider-bound challenge.}
+        "401": {$ref: "#/components/responses/Error"}
+  /evidence/verify:
+    post:
+      tags: [Evidence]
+      operationId: verifyIdentityEvidence
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EvidenceVerification"}
+      responses:
+        "201": {description: Accepted normalized evidence records.}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+  /evidence:
+    get:
+      tags: [Evidence]
+      operationId: listIdentityEvidence
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Evidence records for the authenticated identity.}
+        "401": {$ref: "#/components/responses/Error"}
+  /trust:
+    get:
+      tags: [Evidence]
+      operationId: assessIdentityTrust
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: "Derived trust score, risk score, confidence and evidence IDs."}
+        "401": {$ref: "#/components/responses/Error"}
+  /admin/console:
+    get:
+      tags: [Administration]
+      operationId: adminConsole
+      description: Built-in CSP-protected operator console. Requires owner role and IAL2.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Administration HTML console.}
+        "403": {$ref: "#/components/responses/Error"}
+  /admin/local-members:
+    get:
+      tags: [Administration]
+      operationId: listLocalMembers
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: "Local members, roles and lifecycle states."}
+    post:
+      tags: [Administration]
+      operationId: createLocalMember
+      description: Initial password and TOTP secret are returned exactly once.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LocalMemberCreate"}
+      responses:
+        "201": {description: Local member provisioned; capture one-time credentials.}
+        "403": {$ref: "#/components/responses/Error"}
+  /admin/local-members/roles:
+    put:
+      tags: [Administration]
+      operationId: replaceLocalMemberRoles
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/MemberRoles"}
+      responses:
+        "204": {description: Roles replaced.}
+  /admin/local-members/{action}:
+    parameters:
+      - {name: action, in: path, required: true, schema: {type: string, enum: [suspend, reinstate, remove]}}
+    post:
+      tags: [Administration]
+      operationId: changeLocalMemberLifecycle
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/IdentitySelection"}
+      responses:
+        "204": {description: Lifecycle transition applied.}
+  /admin/local-members/credentials/reset:
+    post:
+      tags: [Administration]
+      operationId: resetLocalMemberCredentials
+      description: Replacement password and TOTP secret are returned exactly once.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/IdentitySelection"}
+      responses:
+        "200": {description: Credentials replaced and one-time values returned.}
+  /admin/applications:
+    get:
+      tags: [Administration]
+      operationId: listApplications
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Applications owned by the configured organization.}
+    post:
+      tags: [Administration]
+      operationId: createApplication
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApplicationCreate"}
+      responses:
+        "201": {description: Application registered.}
+  /admin/applications/{action}:
+    parameters:
+      - {name: action, in: path, required: true, schema: {type: string, enum: [activate, suspend, revoke]}}
+    post:
+      tags: [Administration]
+      operationId: changeApplicationState
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [application_id]
+              properties:
+                application_id: {type: string, maxLength: 256}
+      responses:
+        "200": {description: Updated application.}
+  /admin/clients:
+    get:
+      tags: [Administration]
+      operationId: listClients
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      parameters:
+        - {name: application_id, in: query, required: true, schema: {type: string}}
+      responses:
+        "200": {description: OAuth clients belonging to the application.}
+    post:
+      tags: [Administration]
+      operationId: createClient
+      description: Confidential client_secret is returned exactly once; public clients receive none.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ClientCreate"}
+      responses:
+        "201": {description: OAuth client registered.}
+  /admin/clients/{action}:
+    parameters:
+      - {name: action, in: path, required: true, schema: {type: string, enum: [activate, suspend, revoke]}}
+    post:
+      tags: [Administration]
+      operationId: changeClientState
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/ClientSelection"}
+      responses:
+        "200": {description: Updated OAuth client.}
+  /admin/clients/rotate-secret:
+    post:
+      tags: [Administration]
+      operationId: rotateClientSecret
+      description: New client secret is returned exactly once.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/ClientSelection"}
+      responses:
+        "200": {description: Client secret rotated; capture the returned value.}
+  /admin/clients/jar-key:
+    get:
+      tags: [Administration]
+      operationId: getJarKey
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      parameters:
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+      responses:
+        "200": {description: Registered JAR verification key.}
+    post:
+      tags: [Administration]
+      operationId: registerJarKey
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JarKeyRegistration"}
+      responses:
+        "200": {description: JAR key registered or replaced.}
+    delete:
+      tags: [Administration]
+      operationId: removeJarKey
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      parameters:
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+      responses:
+        "204": {description: JAR key removed.}
+  /admin/resources:
+    get:
+      tags: [Administration]
+      operationId: listResources
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200": {description: Registered API resource servers.}
+    post:
+      tags: [Administration]
+      operationId: createResource
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ResourceCreate"}
+      responses:
+        "201": {description: Resource server registered.}
+  /admin/resources/{action}:
+    parameters:
+      - {name: action, in: path, required: true, schema: {type: string, enum: [activate, suspend, revoke]}}
+    post:
+      tags: [Administration]
+      operationId: changeResourceState
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [audience]
+              properties:
+                audience: {type: string, maxLength: 2048}
+      responses:
+        "200": {description: Updated resource server.}
+  /admin/service-identities:
+    get:
+      tags: [Administration]
+      operationId: getServiceIdentity
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      parameters:
+        - {name: client_id, in: query, required: true, schema: {type: string}}
+      responses:
+        "200": {description: Service identity and its allowed audiences/scopes.}
+    post:
+      tags: [Administration]
+      operationId: provisionServiceIdentity
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ServiceIdentityCreate"}
+      responses:
+        "201": {description: Service identity provisioned.}
+  /admin/service-identities/{action}:
+    parameters:
+      - {name: action, in: path, required: true, schema: {type: string, enum: [activate, deactivate]}}
+    post:
+      tags: [Administration]
+      operationId: changeServiceIdentityState
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody: {$ref: "#/components/requestBodies/ClientSelection"}
+      responses:
+        "200": {description: Updated service identity.}
+  /scim/v2/ServiceProviderConfig:
+    get:
+      tags: [SCIM]
+      operationId: scimServiceProviderConfig
+      security: [{scimBearer: []}]
+      responses:
+        "200": {description: RFC 7643/7644 service-provider capabilities.}
+        "401": {$ref: "#/components/responses/ScimError"}
+  /scim/v2/ResourceTypes:
+    get:
+      tags: [SCIM]
+      operationId: scimResourceTypes
+      security: [{scimBearer: []}]
+      responses:
+        "200": {description: Supported SCIM resource types.}
+  /scim/v2/Schemas:
+    get:
+      tags: [SCIM]
+      operationId: scimSchemas
+      security: [{scimBearer: []}]
+      responses:
+        "200": {description: Supported SCIM schemas.}
+  /scim/v2/Users:
+    get:
+      tags: [SCIM]
+      operationId: listScimUsers
+      security: [{scimBearer: []}]
+      parameters:
+        - {name: filter, in: query, required: false, description: Exact userName equality filter., schema: {type: string}}
+      responses:
+        "200": {description: SCIM ListResponse of users.}
+    post:
+      tags: [SCIM]
+      operationId: createScimUser
+      security: [{scimBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: {$ref: "#/components/schemas/ScimUser"}
+          application/json:
+            schema: {$ref: "#/components/schemas/ScimUser"}
+      responses:
+        "201": {description: SCIM user created with Location and ETag.}
+  /scim/v2/Users/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [SCIM]
+      operationId: getScimUser
+      security: [{scimBearer: []}]
+      responses:
+        "200": {description: SCIM user with ETag.}
+    put:
+      tags: [SCIM]
+      operationId: replaceScimUser
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatch"}
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: {$ref: "#/components/schemas/ScimUser"}
+      responses:
+        "200": {description: Replaced SCIM user with a new ETag.}
+    patch:
+      tags: [SCIM]
+      operationId: patchScimUser
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatchRequired"}
+      requestBody: {$ref: "#/components/requestBodies/ScimPatch"}
+      responses:
+        "200": {description: Patched SCIM user with a new ETag.}
+    delete:
+      tags: [SCIM]
+      operationId: deleteScimUser
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatch"}
+      responses:
+        "204": {description: SCIM user removed.}
+  /scim/v2/Groups:
+    get:
+      tags: [SCIM]
+      operationId: listScimGroups
+      security: [{scimBearer: []}]
+      parameters:
+        - {name: filter, in: query, required: false, description: Exact displayName equality filter., schema: {type: string}}
+      responses:
+        "200": {description: SCIM ListResponse of groups.}
+    post:
+      tags: [SCIM]
+      operationId: createScimGroup
+      security: [{scimBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: {$ref: "#/components/schemas/ScimGroup"}
+      responses:
+        "201": {description: SCIM group created with Location and ETag.}
+  /scim/v2/Groups/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [SCIM]
+      operationId: getScimGroup
+      security: [{scimBearer: []}]
+      responses:
+        "200": {description: SCIM group with ETag.}
+    put:
+      tags: [SCIM]
+      operationId: replaceScimGroup
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatch"}
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: {$ref: "#/components/schemas/ScimGroup"}
+      responses:
+        "200": {description: Replaced SCIM group with a new ETag.}
+    patch:
+      tags: [SCIM]
+      operationId: patchScimGroup
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatchRequired"}
+      requestBody: {$ref: "#/components/requestBodies/ScimPatch"}
+      responses:
+        "200": {description: Patched SCIM group with a new ETag.}
+    delete:
+      tags: [SCIM]
+      operationId: deleteScimGroup
+      security: [{scimBearer: []}]
+      parameters:
+        - {$ref: "#/components/parameters/IfMatch"}
+      responses:
+        "204": {description: SCIM group removed.}
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-openproof-session
+    preauthCookies:
+      type: apiKey
+      in: cookie
+      name: __Host-openproof-preauth
+    passkeyRegistrationCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-openproof-webauthn-registration
+    bearerAuth:
+      type: http
+      scheme: bearer
+    scimBearer:
+      type: http
+      scheme: bearer
+      description: Dedicated operator-generated SCIM bearer; not a user OAuth token.
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: ETag returned by the prior read; recommended for concurrency safety.
+      schema: {type: string}
+    IfMatchRequired:
+      name: If-Match
+      in: header
+      required: true
+      description: ETag returned by the prior read.
+      schema: {type: string}
+  requestBodies:
+    VerificationProof:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/VerificationProof"}
+    IdentitySelection:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [identity_id]
+            properties:
+              identity_id: {type: string, maxLength: 200}
+    MemberRoles:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [identity_id, roles]
+            properties:
+              identity_id: {type: string, maxLength: 200}
+              roles: {$ref: "#/components/schemas/Roles"}
+    ClientSelection:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [client_id]
+            properties:
+              client_id: {type: string, maxLength: 256}
+    ScimPatch:
+      required: true
+      content:
+        application/scim+json:
+          schema: {$ref: "#/components/schemas/ScimPatch"}
+  responses:
+    Error:
+      description: Stable client-safe OpenProof error.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    OAuthError:
+      description: OAuth protocol error.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: {type: string}
+              error_description: {type: string}
+    Unavailable:
+      description: Dependency unavailable; details intentionally omitted.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Health"}
+    ScimError:
+      description: RFC 7644 error response.
+      content:
+        application/scim+json:
+          schema:
+            type: object
+            required: [schemas, status, detail]
+            properties:
+              schemas:
+                type: array
+                items: {type: string, const: "urn:ietf:params:scim:api:messages:2.0:Error"}
+              status: {type: string}
+              scimType: {type: string}
+              detail: {type: string}
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, enum: [ok, unavailable]}
+    VerificationProof:
+      type: object
+      additionalProperties: false
+      required: [verification_id, secret]
+      properties:
+        verification_id: {type: string, maxLength: 200}
+        secret: {type: string, maxLength: 512}
+    PasswordReset:
+      type: object
+      additionalProperties: false
+      required: [verification_id, secret, new_password]
+      properties:
+        verification_id: {type: string, maxLength: 200}
+        secret: {type: string, maxLength: 512}
+        new_password: {type: string, format: password, maxLength: 1024}
+    EmailInput:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email: {type: string, format: email, maxLength: 320}
+    ProfileUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        display_name: {type: string, maxLength: 256}
+        preferred_username: {type: string, maxLength: 128}
+        locale: {type: string, maxLength: 64}
+        picture: {type: string, format: uri, maxLength: 2048}
+    WebAuthnOptions:
+      type: object
+      description: PublicKeyCredential options. Pass directly to the platform WebAuthn API after base64url decoding fields as required by that API.
+      required: [publicKey]
+      properties:
+        publicKey: {type: object, additionalProperties: true}
+    WebAuthnRegistration:
+      type: object
+      additionalProperties: false
+      required: [credential_id, client_data_json, attestation_object]
+      properties:
+        credential_id: {type: string, maxLength: 4096, description: base64url rawId}
+        client_data_json: {type: string, maxLength: 32768, description: base64url clientDataJSON}
+        attestation_object: {type: string, maxLength: 131072, description: base64url attestationObject}
+    WebAuthnAssertion:
+      type: object
+      additionalProperties: false
+      required: [credential_id, client_data_json, authenticator_data, signature]
+      properties:
+        credential_id: {type: string, maxLength: 4096}
+        client_data_json: {type: string, maxLength: 32768}
+        authenticator_data: {type: string, maxLength: 131072}
+        signature: {type: string, maxLength: 4096}
+        user_handle: {type: string, maxLength: 4096}
+    Web3Start:
+      type: object
+      additionalProperties: false
+      required: [provider, address]
+      properties:
+        provider: {type: string, enum: [ethereum, solana, farcaster]}
+        address: {type: string, maxLength: 64}
+        fid: {type: string, maxLength: 32, description: Required for Farcaster.}
+    LdapCompletion:
+      type: object
+      additionalProperties: false
+      required: [transaction_id, challenge_id, username, username_binding, password]
+      properties:
+        transaction_id: {type: string, maxLength: 256}
+        challenge_id: {type: string, maxLength: 256}
+        username: {type: string, maxLength: 320}
+        username_binding: {type: string, maxLength: 256}
+        password: {type: string, format: password, maxLength: 4096}
+    PushedAuthorizationRequest:
+      type: object
+      additionalProperties: false
+      required: [client_id]
+      properties:
+        client_id: {type: string}
+        client_secret: {type: string, format: password}
+        response_type: {type: string, const: code}
+        redirect_uri: {type: string, format: uri}
+        scope: {type: string}
+        code_challenge: {type: string}
+        code_challenge_method: {type: string, const: S256}
+        state: {type: string}
+        nonce: {type: string}
+        max_age: {type: string}
+        resource: {type: string, format: uri}
+        response_mode: {type: string, enum: [query, jwt]}
+        request: {type: string, description: Signed JAR request object; cannot be mixed with authorization parameters.}
+    EvidenceVerification:
+      type: object
+      required: [provider, challenge]
+      properties:
+        provider: {type: string, enum: [signed-jwt-evidence, x509-evidence]}
+        challenge: {type: string, maxLength: 256}
+        assertion: {type: string, maxLength: 16384, description: Required for signed-jwt-evidence.}
+        certificate_pem: {type: string, maxLength: 65536, description: Required for x509-evidence.}
+        signature: {type: string, maxLength: 12288, description: Required for x509-evidence.}
+    Roles:
+      type: array
+      minItems: 1
+      maxItems: 64
+      uniqueItems: true
+      items: {type: string, maxLength: 128}
+    LocalMemberCreate:
+      type: object
+      additionalProperties: false
+      required: [identity_id, subject, roles]
+      properties:
+        identity_id: {type: string, maxLength: 200}
+        subject: {type: string, maxLength: 320}
+        roles: {$ref: "#/components/schemas/Roles"}
+    ApplicationCreate:
+      type: object
+      additionalProperties: false
+      required: [identifier, name, environment]
+      properties:
+        identifier: {type: string, maxLength: 64}
+        name: {type: string, maxLength: 120}
+        environment: {type: string, enum: [production, staging, development]}
+    ClientCreate:
+      type: object
+      additionalProperties: false
+      required: [application_id, name, kind, redirect_uris, scopes]
+      properties:
+        application_id: {type: string, maxLength: 256}
+        name: {type: string, maxLength: 120}
+        kind: {type: string, enum: [web, native, browser, service]}
+        redirect_uris:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: {type: string, maxLength: 2048}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, maxLength: 128}
+    JarKeyRegistration:
+      type: object
+      additionalProperties: false
+      required: [client_id, key_id, public_key_pem]
+      properties:
+        client_id: {type: string, maxLength: 256}
+        key_id: {type: string, maxLength: 128}
+        public_key_pem: {type: string, maxLength: 16384}
+    ResourceCreate:
+      type: object
+      additionalProperties: false
+      required: [audience, name, scopes]
+      properties:
+        audience: {type: string, maxLength: 2048}
+        name: {type: string, maxLength: 120}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
+          items: {type: string, maxLength: 128}
+    ServiceIdentityCreate:
+      type: object
+      additionalProperties: false
+      required: [client_id, audiences, scopes]
+      properties:
+        client_id: {type: string, maxLength: 256}
+        audiences:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, maxLength: 2048}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
+          items: {type: string, maxLength: 128}
+    Profile:
+      type: object
+      properties:
+        identity_id: {type: string}
+        display_name: {type: [string, "null"]}
+        preferred_username: {type: [string, "null"]}
+        email: {type: [string, "null"], format: email}
+        email_verified: {type: boolean}
+        phone_number: {type: [string, "null"]}
+        phone_number_verified: {type: boolean}
+        locale: {type: [string, "null"]}
+        picture: {type: [string, "null"], format: uri}
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: {type: string}
+        token_type: {type: string}
+        expires_in: {type: integer}
+        refresh_token: {type: string}
+        id_token: {type: string}
+        scope: {type: string}
+    ScimUser:
+      type: object
+      required: [schemas, userName]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        id: {type: string, readOnly: true}
+        externalId: {type: string, maxLength: 1024}
+        userName: {type: string, maxLength: 320}
+        displayName: {type: string, maxLength: 512}
+        active: {type: boolean, default: true}
+        emails:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: {type: string, format: email}
+              primary: {type: boolean}
+              type: {type: string}
+        meta: {type: object, readOnly: true, additionalProperties: true}
+    ScimGroup:
+      type: object
+      required: [schemas, displayName]
+      properties:
+        schemas:
+          type: array
+          items: {type: string}
+        id: {type: string, readOnly: true}
+        externalId: {type: string, maxLength: 1024}
+        displayName: {type: string, maxLength: 512}
+        members:
+          type: array
+          items:
+            type: object
+            required: [value]
+            properties:
+              value: {type: string}
+              display: {type: string, readOnly: true}
+              $ref: {type: string, readOnly: true}
+        meta: {type: object, readOnly: true, additionalProperties: true}
+    ScimPatch:
+      type: object
+      additionalProperties: false
+      required: [schemas, Operations]
+      properties:
+        schemas:
+          type: array
+          minItems: 1
+          items: {type: string, const: "urn:ietf:params:scim:api:messages:2.0:PatchOp"}
+        Operations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [op]
+            properties:
+              op: {type: string, enum: [add, Add, replace, Replace, remove, Remove]}
+              path: {type: string}
+              value: {}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            request_id: {type: string}
