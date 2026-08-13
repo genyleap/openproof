@@ -67,6 +67,7 @@ TEST(ConfigTest, AppliesDefaultsWhenNothingIsConfigured)
 
     EXPECT_EQ(configuration->server().bindAddress(), "127.0.0.1");
     EXPECT_EQ(configuration->server().port(), 8443);
+    EXPECT_FALSE(configuration->server().trustProxyClientIp());
     EXPECT_EQ(configuration->logging().level(), obs::LogLevel::Info);
     EXPECT_TRUE(configuration->logging().console());
     EXPECT_TRUE(configuration->security().tokenSigningKey().empty());
@@ -373,6 +374,27 @@ TEST(ConfigTest, RejectsANonNumericPort)
     EXPECT_EQ(configuration.error().code(), fnd::ErrorCode::InvalidArgument);
 }
 
+TEST(ConfigTest, TrustedProxyClientIpRequiresAnExplicitLoopbackListener)
+{
+    const cfg::MapEnvironment environment;
+    const auto enabled = cfg::PlatformConfig::loadFromToml(
+        "[server]\ntrust_proxy_client_ip = true\n", environment);
+    ASSERT_TRUE(enabled.has_value());
+    EXPECT_TRUE(enabled->server().trustProxyClientIp());
+
+    const auto exposed = cfg::PlatformConfig::loadFromToml(
+        "[server]\nbind_address = \"0.0.0.0\"\ntrust_proxy_client_ip = true\n",
+        environment);
+    ASSERT_FALSE(exposed.has_value());
+    EXPECT_EQ(exposed.error().code(), fnd::ErrorCode::InvalidArgument);
+
+    cfg::MapEnvironment overridden;
+    overridden.set("OPENPROOF_SERVER_TRUST_PROXY_CLIENT_IP", "true");
+    const auto fromEnvironment = cfg::PlatformConfig::loadFromEnvironment(overridden);
+    ASSERT_TRUE(fromEnvironment.has_value());
+    EXPECT_TRUE(fromEnvironment->server().trustProxyClientIp());
+}
+
 TEST(ConfigTest, RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults)
 {
     const cfg::MapEnvironment environment;
@@ -380,6 +402,7 @@ TEST(ConfigTest, RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults)
     constexpr std::string_view malformedTypes[] = {
         "[server]\nbind_address = 127\n",
         "[server]\nport = \"8443\"\n",
+        "[server]\ntrust_proxy_client_ip = \"yes\"\n",
         "[logging]\nlevel = false\n",
         "[logging]\nconsole = \"false\"\n",
         "[security]\ntoken_signing_key = 123\n",
@@ -512,6 +535,19 @@ TEST(ConfigTest, LoadsASigningKeyThroughASecretReference)
     ASSERT_TRUE(configuration.has_value());
     EXPECT_FALSE(configuration->security().tokenSigningKey().empty());
     EXPECT_EQ(configuration->security().tokenSigningKey().expose(), "signing-key-material");
+}
+
+TEST(ConfigTest, LoadsPreviousOidcVerificationKeyDirectory)
+{
+    const cfg::MapEnvironment environment;
+    const auto configuration = cfg::PlatformConfig::loadFromToml(R"(
+[oidc]
+previous_signing_keys_directory = "/run/openproof/previous-oidc-keys"
+)", environment);
+
+    ASSERT_TRUE(configuration.has_value());
+    EXPECT_EQ(configuration->oidc().previousSigningKeysDirectory(),
+              "/run/openproof/previous-oidc-keys");
 }
 
 TEST(ConfigTest, FailsToLoadWhenAnInlineSecretIsUsed)
