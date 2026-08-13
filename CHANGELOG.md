@@ -14,7 +14,19 @@
 - Added durable trust/evidence challenge handling, pinned RS256 attestation-JWT verification and X.509 chain/SAN/proof-of-possession verification feeding the trust engine.
 - Added PostgreSQL migrations and production composition for the new account, consent, resource, service-identity, OAuth extension, passkey, enterprise/SCIM and evidence state. External trust integrations remain fail-closed until explicitly configured.
 - Removed the obsolete `OpenProofCxx26Runtime.cmake` probe and hardened release-source gates for direct module dependencies, consent-backed `offline_access`, dead runtime dependencies and unfinished production markers.
-- The source/static release gate passes with 332 declared C++ tests. Qualified production promotion still requires the repository-mandated GCC 16.1 + Ninja build and full CTest/integration qualification.
+- Added a complete 70-path/92-operation OpenAPI 3.1 contract, dependency-free
+  endpoint-coverage gate and product integration examples for account,
+  authentication, OAuth/OIDC, evidence, administration and SCIM calls.
+- Added `opp check-config` for listener-free deployment preflight, wired it into
+  the hardened systemd template, and changed the production example to consume
+  core secrets from a read-only secret-store/KMS file mount.
+- Fixed the built-in admin console's local-member form so it sends the required
+  `identity_id`; the real-process E2E now provisions and verifies a local member.
+- The browser SDK now verifies RS256 ID Tokens and the OIDC issuer/audience/time/
+  nonce boundary before returning claims. JavaScript, Swift and Kotlin reject
+  credential-bearing, query-bearing and loopback-lookalike issuer URLs; native
+  SDK checks are part of the canonical SDK gate.
+- The source/static release gate passes with 340 declared C++ tests. Qualified production promotion still requires the repository-mandated GCC 16.1 + Ninja build and full CTest/integration qualification.
 
 ### Production qualification and capability audit
 
