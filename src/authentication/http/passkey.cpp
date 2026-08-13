@@ -16,6 +16,7 @@ module;
 
 module openproof.authentication.passkey.http;
 
+import openproof.identity.core;
 import openproof.security;
 
 namespace openproof::authentication::http {
