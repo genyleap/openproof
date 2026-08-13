@@ -149,8 +149,9 @@ struct Fixture {
                                           std::chrono::minutes{30}).value()),
           limiter(gw::TokenBucketRateLimiter::create(
               clock, 1000.0, 1000.0, 1000U).value()),
-          api(sessions, provisioner, limiter, core::OrganizationId{"org"},
-              idp::ProviderId{"local"}, clock, fallback)
+          api(sessions, provisioner, identities, memberships, limiter,
+              core::OrganizationId{"org"}, idp::ProviderId{"local"},
+              clock, fallback)
     {
     }
 
@@ -178,6 +179,8 @@ struct Fixture {
     sess::InMemorySessionRepository repository;
     sess::SessionService sessions;
     RecordingProvisioner provisioner;
+    core::InMemoryIdentityRepository identities;
+    org::InMemoryMembershipRepository memberships;
     gw::TokenBucketRateLimiter limiter;
     Fallback fallback;
     adminHttp::AdministrationHttpApi api;
