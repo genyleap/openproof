@@ -15,6 +15,33 @@ namespace sec = openproof::security;
 
 namespace {
 
+constexpr std::string_view kTestRsaPublicKey = R"PEM(-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxQQ9mwfAEgVMWUY1rcqU
+Q4YMPqUwXvppmoB2ffh5TXTN2YGR14AmL5wcCvxvA/LdmJ55vLWryzt6CBjp+1Ym
+1pkT5jKpfKGPF+BC4PmqHo7SSR/Hr/e9lHHVQr1BHvxPHw8tC6jOWueB6HrZLUar
++xg6ix+x/mJmB85zL2C21LgKzLbiIOkPWpOE29CQ4RgnpFLtUegBFJTn+7op70O1
+MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
+7D1jmGHYDJZCA2E/GuOinFTHuQIHt/dQtJ73GX2SH+TniwPrYZQmJbPS1QQxdJeb
+2wIDAQAB
+-----END PUBLIC KEY-----
+)PEM";
+
+TEST(JoseTest, ExportsPreviousPublicKeyAsPublishableJwk)
+{
+    auto jwk = sec::rsaPublicJwkJson(kTestRsaPublicKey, "previous-2026-08");
+    ASSERT_TRUE(jwk.has_value());
+    EXPECT_NE(jwk->find(R"("kid":"previous-2026-08")"), std::string::npos);
+    EXPECT_NE(jwk->find(R"("alg":"RS256")"), std::string::npos);
+    EXPECT_NE(jwk->find(R"("kty":"RSA")"), std::string::npos);
+    EXPECT_EQ(jwk->find("PRIVATE"), std::string::npos);
+}
+
+TEST(JoseTest, RejectsInvalidPreviousVerificationKeys)
+{
+    EXPECT_FALSE(sec::rsaPublicJwkJson("not a key", "previous").has_value());
+    EXPECT_FALSE(sec::rsaPublicJwkJson(kTestRsaPublicKey, "").has_value());
+}
+
 TEST(RandomTest, ReturnsTheRequestedNumberOfBytes)
 {
     for (const std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{32},
