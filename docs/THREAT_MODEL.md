@@ -44,8 +44,8 @@ proof, trust and authorization remain separate decisions.
 | OAuth authorization-code interception | Mandatory PKCE S256, code/client/redirect binding, short code lifetime, atomic single use | Compromised endpoint/client device can still expose its own verifier/code |
 | OAuth redirect confusion/open redirect | Registration validates URI authority; exact runtime redirect match; native HTTP allowed only on explicit loopback host+numeric port | Relying applications must not add an open redirect behind their registered callback |
 | OAuth client impersonation | Confidential secrets are generated once, stored only as keyed digests and can rotate/revoke independently; public clients never receive a secret | Secret distribution/storage for confidential clients remains an operator/client duty |
-| Refresh-token theft/replay | Opaque token, keyed digest storage, rotation on use, token-family replay revocation, client binding | Theft before legitimate use can still win the race; device-bound/token-bound extensions are future hardening |
-| Access-token disclosure | Short default lifetime, opaque token, no durable plaintext, per-client scopes, revocation/introspection | Bearer semantics mean a stolen live token can be replayed until inactive |
+| Refresh-token theft/replay | Opaque token, keyed digest storage, rotation on use, token-family replay revocation, client binding and optional DPoP/mTLS sender constraint | Theft of an unbound token before legitimate use can still win the race |
+| Access-token disclosure | Short default lifetime, opaque token, no durable plaintext, per-client scope/audience, revocation/introspection and optional DPoP/mTLS | Unbound bearer tokens can be replayed until inactive |
 | OIDC issuer/redirect authority confusion | Strict issuer validation; HTTPS except loopback development; no userinfo/query/fragment/control forms | Public DNS/TLS integrity remains external to the process |
 | OIDC signing-key theft | Private PEM enters only through secret configuration; `SecretString`; JWKS exposes public key only; RS256 minimum key checks | Secret store, file permissions and key rotation procedure are operator duties |
 | Browser credential confusion/CSRF | Session and bearer sources are unambiguous; login CSRF token; Secure/HttpOnly/SameSite cookies; protocol routes reserved | Front proxy must preserve host/origin/TLS invariants |
@@ -68,20 +68,21 @@ proof, trust and authorization remain separate decisions.
 
 - The built-in listener is HTTP/1.1 plaintext and `opp server` refuses
   non-loopback binds. TLS terminates in a trusted local proxy/sidecar.
-- OpenProof is an **OIDC Provider / OAuth Authorization Server** in 1.0. Generic
-  upstream OIDC login providers (Google/Microsoft/etc.) and WebAuthn/passkeys are
-  separate provider-SPI integrations and are not represented as implemented.
-- The concrete local authentication provider supports password and
-  password+TOTP. Central identities are bootstrap/admin provisioned by default;
-  public self-service signup is intentionally not opened without a deployment-
-  specific anti-abuse and verification policy.
-- OAuth 1.0 supports Authorization Code + PKCE and refresh tokens. It does not
-  enable implicit, resource-owner-password or client-credentials grants.
+- OpenProof is an **OIDC Provider / OAuth Authorization Server** and can also act
+  as a relying party for configured Google, Apple and Microsoft OIDC providers;
+  GitHub, passkey, SAML, LDAP and Web3 adapters live behind the provider SPI.
+- Local authentication supports password, password+TOTP, recovery codes and
+  passkeys. Public self-service signup remains disabled unless the operator
+  explicitly enables `[account]` with an authenticated delivery channel.
+- OAuth supports Authorization Code + mandatory PKCE, refresh,
+  `client_credentials`, Device Authorization, Token Exchange, PAR/JAR/JARM and
+  optional DPoP/mTLS sender constraints. Implicit and password grants are not
+  enabled.
 - Application and client lifecycle management exists only behind an IAL2 active
   owner check. Confidential secrets are returned once after durable success.
-- Evidence/Trust is provider-neutral. Concrete GitHub, Farcaster, ENS, wallet or
-  enterprise verifiers require separate real API/protocol adapters; fake network
-  adapters are not included.
+- Evidence/Trust is provider-neutral. Concrete signed-attestation JWT and X.509
+  proof-of-possession verifiers are included; every external issuer/CA remains
+  disabled until its trust anchors are configured.
 - Trust assessment does not automatically grant access. A product/policy must
   explicitly decide how evidence/trust/risk affects authorization.
 - PostgreSQL stores durable identities, sessions, credentials, applications,
