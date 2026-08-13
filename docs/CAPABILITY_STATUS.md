@@ -69,8 +69,9 @@ external trust dependency is absent:
 
 The completed list above does not imply that every possible IAM feature belongs
 inside OpenProof. Dynamic Client Registration, pairwise OIDC subjects, RP-initiated
-logout, automated master-key rekeying, multi-region replication, backup/restore
-orchestration, external SIEM integration, and a trusted public TLS edge remain
+logout, automated master-key rekeying, multi-region replication, scheduled
+backup/restore orchestration beyond the included safe scripts, external SIEM
+integration, and a trusted public TLS edge remain
 separate protocol/deployment capabilities unless a relying deployment adds them.
 Self-service privacy workflows such as account export/deletion are also distinct
 from the 19 completed identity-platform capabilities above.
@@ -79,6 +80,7 @@ from the 19 completed identity-platform capabilities above.
 
 The repository continues to require its qualified **GCC 16.1 + Ninja** C++26
 modules toolchain. Promotion to production still requires the release gates in
-`scripts/verify-release.sh`: a clean qualified build, complete CTest run,
+`scripts/qualify-production.sh`: a clean qualified build, complete CTest run,
 PostgreSQL integration tests without skips, sanitizers/fuzzing where configured,
-load/soak qualification and deployment key/backup exercises.
+the repository TLS identity E2E, load/soak qualification and deployment
+key/backup exercises.
