@@ -1,5 +1,7 @@
 # OpenProof — Security Invariants
 
+> v1.0.13 production note: fail-closed internal invariants are enforced by `foundation::requireInvariant`; GCC experimental Contracts are opt-in qualification-only because of module ICEs on the qualified GCC 16.1/Darwin toolchain.
+
 Required by brief §59. Every invariant states four things:
 
 1. **What must always be true.**
@@ -11,8 +13,11 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-Verified against the tree at 317 discovered tests, with all ten PostgreSQL tests also
-run against an isolated PostgreSQL 18 instance.
+The pre-1.0 baseline was verified by the project owner at 317/317 discovered tests
+on GCC 16.1/macOS; the ten PostgreSQL integration cases were skipped in that run.
+OpenProof 1.0 adds identity-platform tests. Exact release verification status is
+recorded in `RELEASE_VERIFICATION.md`; this document does not inflate skipped or
+unavailable target-toolchain checks into passes.
 
 ---
 
@@ -27,7 +32,7 @@ run against an isolated PostgreSQL 18 instance.
 | 5 | Provider protocol logic never enters the identity core | `ProviderId` is opaque; `InteractionModel` is protocol-neutral; no protocol names in SPI or core | Module graph + review | Not mechanically caught — see §Gaps |
 | 6 | The gateway never owns canonical identity | Dependency direction: gateway consumes `AuthenticatedSession`; canonical records remain behind identity repositories | gateway protected-route tests and module graph | Authentication/authorization fails closed; no identity is created at the edge |
 | 7 | Client input cannot inject an entitlement | `AuthorizationRequest` exposes no entitlement mutator; a trusted adapter type is required before entitlements can be populated | `UntrustedEntitlementsCannotBeInjected` | Entitlement is absent and grants nothing |
-| 8 | Private keys are never accepted or stored | No API accepts key material | Review | Not mechanically caught — see §Gaps |
+| 8 | **End-user/wallet private keys are never accepted or custodied** | No identity, proof, wallet or provider API accepts subject private-key material. The only private key accepted by the core process is the operator-controlled OIDC RS256 signing key loaded through the secret configuration boundary | Module/API review plus OIDC signer secret typing | Subject key material has no ingestion path; invalid OIDC signing material prevents startup |
 | 9 | Protected operations default to deny | `evaluateProtected`, four-valued `DecisionKind` | 4 tests in `decision_test.cpp` | `Indeterminate`/`NotApplicable` deny |
 | 10 | Secrets never appear in logs or errors | `Secret<T>` and provider `CredentialValue`: no formatter, stream insertion, conversion, comparison or copy | `static_assert` in `secret_test.cpp` and `provider_test.cpp`; `LoggableAsText` check in `log_test.cpp` | Compile error |
 | 11 | An authentication transaction is redeemable exactly once and cannot bypass orchestration | Atomic compare-and-consume in the store; only the broker mints `VerifiedAuthentication` | `ConcurrentRedemptionYieldsExactlyOneWinner`, `CompletesOnlyThroughASingleUseBoundTransaction` | Replay is rejected before provider verification runs again |
@@ -64,7 +69,7 @@ run against an isolated PostgreSQL 18 instance.
 | 42 | **Audit history is tamper-evident and linearly ordered** | Append, sequence allocation and previous-hash HMAC occur under one atomic repository operation | audit repository tests | Chain verification fails closed |
 | 43 | **Untrusted metric labels cannot cause unbounded memory growth** | Label syntax/size/count validation and a hard series-cardinality ceiling | metric registry and hardening tests | New series is rejected |
 | 44 | **The plaintext listener is never exposed on a network interface by the runnable process** | `validateServerDeployment` accepts only `127.0.0.1` or `::1`; deployment must terminate TLS locally | `ServerDeploymentRequiresGatewayKeyAndLoopbackListener` | Startup fails before bind |
-| 45 | **A browser session credential has one unambiguous source and never reaches an upstream** | Credential extraction accepts exactly one Bearer or `openproof_session` cookie, removes it, and rejects conflicts or duplicates | `SessionCookieIsAcceptedStrippedAndCannotConflictWithBearer`, `LogoutRejectsAmbiguousCredentials` | Generic authentication failure; no proxy call |
+| 45 | **A browser session credential has one unambiguous source and never reaches an upstream** | Credential extraction accepts exactly one Bearer or `__Host-openproof-session` cookie, removes it, and rejects conflicts or duplicates | `SessionCookieIsAcceptedStrippedAndCannotConflictWithBearer`, `LogoutRejectsAmbiguousCredentials` | Generic authentication failure; no proxy call |
 | 46 | **A pre-authentication exchange is short-lived, client-bound and single-use** | Separate `Secure`/`HttpOnly`/`SameSite=Strict` continuation and binding cookies feed the broker's atomic transaction consume | `LoginMfaRecoveryRotationAndLogoutAreEndToEnd`, `WrongPasswordBurnsExchangeAndClearsPreauthCookies` | Failure burns the exchange and clears both cookies |
 | 47 | **A persisted TOTP seed is confidential and a time step succeeds at most once** | AES-256-GCM with identity-bound AAD protects the seed; a conditional PostgreSQL update advances the last accepted step | `PersistentLocalTotpIsEncryptedAndConsumedOnce`, `RoundTripsWithAssociatedDataAndRejectsTampering` | Tampering fails decryption; concurrent replay has one winner |
 | 48 | **The public auth plane is bounded and does not reveal account/check existence** | 16 KiB strict JSON boundary, closed fields, normalized auth errors, dummy password verification and dual IP/subject throttles | auth HTTP tests and local-provider unknown-account tests | Generic 4xx/429 with no operator detail |
@@ -74,6 +79,14 @@ run against an isolated PostgreSQL 18 instance.
 | 52 | **Local-member authority and credentials are created only by an active IAL2 owner and never partially** | HTTP requires IAL2; PostgreSQL re-authorizes the actor's active `owner` role and locks authoritative tenant/identity/membership rows inside the same serializable transaction that creates the identity, explicit link, membership/roles, server-generated password, encrypted TOTP, chained audit record and outbox event; secrets are returned only after commit | `LocalMemberEnrollmentTest.*`, `AdministrationHttpApiTest.*`, `OwnerProvisioningIsAtomicAuditedAndDeniedToMembers`, executable owner-to-new-member login smoke test | Non-owner/invalid/conflicting requests roll back completely and receive no generated secret |
 | 53 | **Administrative member changes cannot orphan the tenant or leave stale authority live** | PostgreSQL serializes all owner mutations, re-authorizes the actor, prevents the final active owner from losing `owner`/being suspended/being removed, and atomically revokes target sessions; removal clears roles, while credential reset rotates password/TOTP replay state and deletes recovery codes | `MemberRoleReplacementTest.*`, `MemberLifecycleChangeTest.*`, `LocalCredentialResetTest.*`, `AdministrationHttpApiTest.*`, `OwnerProvisioningIsAtomicAuditedAndDeniedToMembers`, executable full-lifecycle smoke test | The complete transaction, audit record and outbox event roll back; old sessions or credentials are invalid after a successful commit |
 | 54 | **No route, role or assurance requirement is implicit or client-injectable** | Closed TOML requires at least one explicit method/path rule when auth is enabled; immutable exact-match rules require a bounded role set and IAL; policy inputs contain only broker/session authentication and PostgreSQL roles; every non-Allow denies, and rejected authenticated decisions enter the HMAC chain and outbox | `RolePolicyRuleTest.*`, `RolePolicyEngineTest.*`, `PolicyAccessControllerTest.UsesDurableRolesAssuranceAndAuditsDenials`, `ProtectedAuthenticationRequiresExplicitClosedRoutePolicies`, `RejectedAuthorizationIsChainedAndPublished`, executable policy/RBAC E2E | Invalid policy prevents startup; missing route returns 404, missing authentication 401, and membership/role/assurance failure 403 with no upstream call |
+| 55 | **A product registration is not an OAuth client credential** | `Application` and `Client` are separate aggregates; clients reference applications and have independent lifecycle, scopes and redirect policy | `ApplicationRegistryTest.*`, `ClientManagementTest.*` | A client can be suspended/revoked/rotated without changing the application identity |
+| 56 | **Authorization codes are bound, short-lived and single-use** | Codes persist only as keyed digests and bind client, exact redirect, PKCE challenge, identity, scopes and authentication context; repositories atomically consume before validation completes | `OAuthTokenTest.AuthorizationCodePkceAndRefreshReplayAreFailClosed` plus PostgreSQL transaction/row-lock implementation | Replay or binding mismatch fails closed and the code is not reusable |
+| 57 | **All interactive OAuth clients use PKCE S256 and exact registered redirects** | Authorization requests require `code_challenge_method=S256`; client registration validates redirect authority and runtime comparison is exact | `OAuthTokenTest.*`, `ClientManagementTest.*` including hostile-authority cases | Invalid registration/request is rejected before a code is issued |
+| 58 | **OAuth bearer plaintext is never durable state** | Access/refresh tokens are generated from CSPRNG material and repositories receive only HMAC digests; refresh tokens are grouped in a revocable family | `OAuthTokenTest.*` plus repository schema/review | Database disclosure does not reveal usable bearer strings |
+| 59 | **Refresh-token replay revokes the token family** | Rotation consumes the current refresh token atomically; reuse is treated as replay and repository family revocation invalidates derived access/refresh state | `OAuthTokenTest.AuthorizationCodePkceAndRefreshReplayAreFailClosed` | Replay fails and tokens from the affected family become inactive |
+| 60 | **OIDC subject is always the canonical OpenProof identity** | ID Token/UserInfo take `sub` only from `IdentityId` carried in redeemed/token context; provider external subjects are different strong types | OIDC module type graph and identity-platform flow tests | External provider identifiers cannot replace canonical `sub` |
+| 61 | **OIDC signing keys never cross the public protocol edge** | RSA private PEM is loaded as `SecretString`; JWKS derives and emits only public modulus/exponent; ID Tokens are signed RS256 | JOSE implementation and discovery/JWKS boundary review | Invalid/weak signing key prevents OIDC startup; public endpoints expose only public JWK |
+| 62 | **Trust is derived from current verified evidence, not persisted as permanent truth** | Evidence has verification/revocation/expiry state; `TrustEngine` takes one clock snapshot and computes from active weighted evidence plus validated risk signals | `TrustEvidenceTest.*` | Revoked/expired evidence is excluded on the next assessment; malformed risk input is rejected |
 
 ---
 
@@ -88,30 +101,29 @@ Listed so their weakness is visible rather than implied.
 - **#6 — gateway never owns identity.** Enforced by dependency direction and the
   fact that it consumes broker-issued `AuthenticatedSession`; a CI link-graph
   assertion would make this structural rule mechanically visible.
-- **#8 — private keys never enter the system.** True by inspection: no API
-  accepts key material. There is no type-level prohibition, so a future
-  signature could violate it silently. A `PrivateKeyMaterial` type that nothing
-  can construct would make this mechanical.
+- **#8 — subject private keys never enter the system.** The OIDC provider now
+  intentionally accepts an operator-owned RS256 signing private key through the
+  secret configuration boundary. The remaining invariant is specifically that
+  user, wallet and external-provider private keys have no ingestion/custody API.
+  A future provider must preserve that boundary.
 - **Contracts guard internals, `Result` guards the perimeter.** This is the rule
   that keeps a contract from becoming a remote shutdown under `enforce`. It is
   documented in `03-CXX26.md` and enforced in review only.
 
 ---
 
-## Invariants owed by later phases
+## Provider-specific proof invariants
 
-Named now so they are designed in rather than retrofitted. Each is required by
-the brief but has no subsystem to attach to yet.
-
-| Invariant | Brief | Phase |
-|---|---|---|
-| Proof freshness is policy-controlled; stale evidence is never presented as current | §14, §59 | 4 |
-| Evidence is untrusted until verified; inference is never presented as fact | §61 | 4 |
-| Risk evaluation failure cannot silently become authorization success | §59 | 5 |
-| A trust decision is explainable, not an opaque number | §16, §62 | 5 |
-| Deployment operators own their data; the protocol phones no one home | §4, §63 | 8 |
-
----
+Bundled provider adapters now enforce their protocol-specific trust boundaries:
+OIDC uses issuer/audience/nonce/signature checks; GitHub revalidates the immutable
+account subject; WebAuthn binds RP/origin/challenge and authenticator signatures;
+SIWE wallet/Farcaster proofs bind nonce/domain/chain and verify the signing wallet;
+Farcaster additionally rechecks current FID custody; LDAPS authenticates with a
+search-then-bind flow; SAML pins the IdP certificate and constrains XMLDSIG; SCIM
+provisioning is bearer-protected; and evidence JWT/X.509 verification consumes
+durable one-time challenges. New adapters must preserve proof freshness,
+provenance, replay resistance, rate limits and provider-specific revocation or
+current-state checks before production enablement.
 
 ## How to add an invariant
 

@@ -126,45 +126,22 @@ TEST(SecureWipeTest, ToleratesEmptyRequests)
     EXPECT_EQ(buffer.front(), 9U);
 }
 
-// These assert termination, which is a property of the `enforce` semantic. Under
-// `observe` a violation is reported and execution continues by design, so the
-// same assertions would be wrong rather than merely inapplicable.
-#if OPENPROOF_CONTRACTS_TERMINATE
-
-// A null pointer with a non-zero length means a caller believes it is erasing a
-// credential that is not there. Returning quietly would leave that belief
-// intact, so the contract stops the process instead.
-TEST(SecureWipeContractTest, RejectsNullPointerWithNonZeroLength)
+// A null pointer with a non-zero length is an internal caller defect. The
+// production stability profile terminates through foundation::requireInvariant
+// rather than GCC's experimental Contracts front-end.
+TEST(SecureWipeInvariantTest, RejectsNullPointerWithNonZeroLength)
 {
     ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
-    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "contract violation");
+    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "OpenProof invariant violation");
 }
 
-// The diagnostic comes from GCC's standard contract-violation handler, not from
-// a project-supplied one. Its shape is the operator's evidence during an
-// incident, so the essential parts are pinned here.
-TEST(SecureWipeContractTest, ViolationDiagnosticIdentifiesThePredicate)
+TEST(SecureWipeInvariantTest, DiagnosticIdentifiesTheInvariant)
 {
     ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
-
-    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "contract violation");
-    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "assertion_kind: assert");
-    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), "semantic: enforce");
-    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U), R"(size == 0U \|\| data != nullptr)");
+    EXPECT_DEATH(fnd::secureWipe(nullptr, 16U),
+                 "secureWipe received a null pointer with non-zero size");
 }
 
-#else
-
-// Under `observe` the guarantee is the opposite one, and it is worth proving:
-// the violation is reported but the process survives. A build configured this
-// way must not be mistaken for one that fails closed.
-TEST(SecureWipeContractTest, ObserveSemanticReportsWithoutTerminating)
-{
-    fnd::secureWipe(nullptr, 16U);
-    SUCCEED() << "observe semantic: violation reported, execution continued";
-}
-
-#endif
 
 
 }

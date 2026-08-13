@@ -394,14 +394,14 @@ TEST(GatewayTest, SessionCookieIsAcceptedStrippedAndCannotConflictWithBearer)
     auto grant = fixture.sessions.issue(verifiedAuthentication()).value();
     const std::string token = grant.token().expose();
     auto accepted = gateway.handle(request({
-        {"Cookie", "theme=dark; openproof_session=" + token}}));
+        {"Cookie", "theme=dark; __Host-openproof-session=" + token}}));
     EXPECT_EQ(accepted.status(), 200);
     ASSERT_TRUE(proxy.cookieHeader);
     EXPECT_EQ(proxy.cookieHeader.value(), "theme=dark");
 
     auto ambiguous = gateway.handle(request({
         {"Authorization", "Bearer " + token},
-        {"Cookie", "openproof_session=" + token}}));
+        {"Cookie", "__Host-openproof-session=" + token}}));
     EXPECT_EQ(ambiguous.status(), 401);
 }
 

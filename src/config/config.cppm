@@ -152,6 +152,28 @@ private:
     foundation::SecretString m_tokenSigningKey;
 };
 
+
+/** @brief OpenID Provider configuration and asymmetric signing material. */
+class OidcConfig final {
+public:
+    OidcConfig();
+    OidcConfig(bool enabled, std::string issuer, std::string keyId,
+               foundation::SecretString signingKey);
+    OidcConfig(const OidcConfig&) = delete;
+    OidcConfig& operator=(const OidcConfig&) = delete;
+    OidcConfig(OidcConfig&&) noexcept = default;
+    OidcConfig& operator=(OidcConfig&&) noexcept = default;
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] std::string_view issuer() const noexcept;
+    [[nodiscard]] std::string_view keyId() const noexcept;
+    [[nodiscard]] const foundation::SecretString& signingKey() const noexcept;
+private:
+    bool m_enabled{};
+    std::string m_issuer;
+    std::string m_keyId;
+    foundation::SecretString m_signingKey;
+};
+
 /** Configuration for the runnable single-upstream reverse-gateway process. */
 class GatewayConfig final {
 public:
@@ -201,21 +223,63 @@ public:
     [[nodiscard]] static foundation::Result<RoutePolicyConfig>
     create(std::string pathPrefix, std::vector<std::string> methods,
            std::vector<std::string> requiredRoles, std::string roleMatch,
-           std::string minimumAssurance);
+           std::string minimumAssurance, std::string requiredScope = {},
+           std::string requiredAudience = {});
     [[nodiscard]] std::string_view pathPrefix() const noexcept;
     [[nodiscard]] const std::vector<std::string>& methods() const noexcept;
     [[nodiscard]] const std::vector<std::string>& requiredRoles() const noexcept;
     [[nodiscard]] std::string_view roleMatch() const noexcept;
     [[nodiscard]] std::string_view minimumAssurance() const noexcept;
+    /** OAuth scope required when the protected route is accessed with a delegated token. */
+    [[nodiscard]] std::string_view requiredScope() const noexcept;
+    /** OAuth audience required when the protected route uses delegated access. */
+    [[nodiscard]] std::string_view requiredAudience() const noexcept;
 private:
     RoutePolicyConfig(std::string pathPrefix, std::vector<std::string> methods,
                       std::vector<std::string> requiredRoles,
-                      std::string roleMatch, std::string minimumAssurance);
+                      std::string roleMatch, std::string minimumAssurance,
+                      std::string requiredScope, std::string requiredAudience);
     std::string m_pathPrefix;
     std::vector<std::string> m_methods;
     std::vector<std::string> m_requiredRoles;
     std::string m_roleMatch;
     std::string m_minimumAssurance;
+    std::string m_requiredScope;
+    std::string m_requiredAudience;
+};
+
+/** @brief Consumer account lifecycle and verification-delivery settings. */
+class AccountConfig final {
+public:
+    AccountConfig();
+    AccountConfig(bool enabled, std::string phoneProviderId,
+                  std::string deliveryHost, std::uint16_t deliveryPort,
+                  bool deliveryTls, std::string deliveryPath,
+                  std::string deliveryCaFile,
+                  foundation::SecretString deliveryAuthorization);
+    AccountConfig(const AccountConfig&) = delete;
+    AccountConfig& operator=(const AccountConfig&) = delete;
+    AccountConfig(AccountConfig&&) noexcept = default;
+    AccountConfig& operator=(AccountConfig&&) noexcept = default;
+
+    [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] std::string_view phoneProviderId() const noexcept;
+    [[nodiscard]] std::string_view deliveryHost() const noexcept;
+    [[nodiscard]] std::uint16_t deliveryPort() const noexcept;
+    [[nodiscard]] bool deliveryTls() const noexcept;
+    [[nodiscard]] std::string_view deliveryPath() const noexcept;
+    [[nodiscard]] std::string_view deliveryCaFile() const noexcept;
+    [[nodiscard]] const foundation::SecretString& deliveryAuthorization() const noexcept;
+
+private:
+    bool m_enabled{};
+    std::string m_phoneProviderId{"phone"};
+    std::string m_deliveryHost;
+    std::uint16_t m_deliveryPort{};
+    bool m_deliveryTls{true};
+    std::string m_deliveryPath{"/v1/openproof/verification"};
+    std::string m_deliveryCaFile;
+    foundation::SecretString m_deliveryAuthorization;
 };
 
 class AuthConfig final {
@@ -284,12 +348,15 @@ public:
     [[nodiscard]] const GatewayConfig& gateway() const noexcept;
     [[nodiscard]] const DatabaseConfig& database() const noexcept;
     [[nodiscard]] const AuthConfig& auth() const noexcept;
+    [[nodiscard]] const AccountConfig& account() const noexcept;
+    [[nodiscard]] const OidcConfig& oidc() const noexcept;
     /** Validates the additional fail-closed requirements of `opp server`. */
     [[nodiscard]] foundation::Status validateServerDeployment() const;
 
 private:
     PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security,
-                   GatewayConfig gateway, DatabaseConfig database, AuthConfig auth);
+                   GatewayConfig gateway, DatabaseConfig database, AuthConfig auth,
+                   AccountConfig account, OidcConfig oidc);
 
     ServerConfig m_server;
     LoggingConfig m_logging;
@@ -297,6 +364,8 @@ private:
     GatewayConfig m_gateway;
     DatabaseConfig m_database;
     AuthConfig m_auth;
+    AccountConfig m_account;
+    OidcConfig m_oidc;
 };
 
 }

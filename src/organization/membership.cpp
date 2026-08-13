@@ -140,7 +140,7 @@ foundation::Status Membership::remove()
     // member would silently regain whatever authority they held before.
     m_roles.clear();
 
-    contract_assert(m_roles.empty());
+    foundation::requireInvariant(m_roles.empty(), "revoked membership retained roles");
     return foundation::ok();
 }
 

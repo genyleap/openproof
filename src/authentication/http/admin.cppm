@@ -9,6 +9,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.organization;
 import openproof.session;
 
 export namespace openproof::administration::http {
@@ -19,6 +20,8 @@ public:
     AdministrationHttpApi(
         session::SessionService& sessions,
         LocalMemberAdministrator& members,
+        identity::core::IdentityRepository& identities,
+        organization::MembershipRepository& memberships,
         gateway::TokenBucketRateLimiter& rateLimiter,
         identity::core::OrganizationId organization,
         identity::provider::ProviderId provider,
@@ -28,6 +31,7 @@ public:
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] gateway::HttpResponse listLocalMembers(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse createLocalMember(
         gateway::HttpRequest request,
         const identity::core::IdentityId& actor);
@@ -44,6 +48,8 @@ private:
 
     session::SessionService* m_sessions;
     LocalMemberAdministrator* m_members;
+    identity::core::IdentityRepository* m_identities;
+    organization::MembershipRepository* m_memberships;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     identity::core::OrganizationId m_organization;
     identity::provider::ProviderId m_provider;

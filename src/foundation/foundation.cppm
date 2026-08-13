@@ -26,3 +26,4 @@ export import :encoding;
 export import :secret;
 export import :id;
 export import :time;
+export import :invariant;

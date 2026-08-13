@@ -162,7 +162,7 @@ Result<std::vector<std::byte>> fromBase64Url(std::string_view text)
             pendingBits -= 8U;
             // Only whole bytes are emitted, and never more than the input can
             // justify; a drift here would silently fabricate output bytes.
-            contract_assert(pendingBits < 8U);
+            foundation::requireInvariant(pendingBits < 8U, "base64 decoder retained an invalid pending bit count");
             const auto emitted =
                 static_cast<unsigned char>((accumulator >> pendingBits) & 0xFFU);
             out.push_back(static_cast<std::byte>(emitted));

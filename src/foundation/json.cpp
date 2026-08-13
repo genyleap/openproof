@@ -69,7 +69,7 @@ void JsonObjectWriter::beginEntry(std::string_view key)
 {
     // An unnamed entry would produce {"":...}, which is legal JSON but means a
     // caller lost a field name somewhere upstream.
-    contract_assert(!key.empty());
+    foundation::requireInvariant(!key.empty(), "JSON object writer received an empty key");
 
     if (!m_body.empty()) {
         m_body.push_back(',');

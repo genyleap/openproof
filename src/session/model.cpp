@@ -1,5 +1,6 @@
 module;
 
+#include <optional>
 #include <chrono>
 #include <string>
 #include <string_view>

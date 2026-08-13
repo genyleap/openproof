@@ -1,0 +1,20 @@
+openproof_add_module(openproof_token
+    MODULES
+        token.cppm
+        model.cppm
+        repository.cppm
+        service.cppm
+    SOURCES
+        model.cpp
+        repository.cpp
+        service.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_client
+        openproof_identity_core
+        openproof_identity_provider
+        openproof_session
+        openproof_oauth
+        openproof_resource
+)

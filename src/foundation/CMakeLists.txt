@@ -8,10 +8,12 @@ openproof_add_module(openproof_foundation
         secret.cppm
         id.cppm
         time.cppm
+        invariant.cppm
     SOURCES
         error.cpp
         json.cpp
         encoding.cpp
         secret.cpp
         time.cpp
+        invariant.cpp
 )

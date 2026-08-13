@@ -8,4 +8,5 @@ openproof_add_module(openproof_provider_local
         openproof_security
         openproof_credentials
         openproof_identity_provider
+        openproof_identity_core
 )

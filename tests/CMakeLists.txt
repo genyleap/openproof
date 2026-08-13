@@ -32,6 +32,9 @@ add_executable(openproof_tests
     storage/postgres_integration_test.cpp
     identity/merge_test.cpp
     organization/organization_test.cpp
+    platform/identity_platform_test.cpp
+    enterprise/scim_test.cpp
+    evidence/verification_test.cpp
 )
 
 target_compile_features(openproof_tests PRIVATE cxx_std_26)
@@ -69,8 +72,19 @@ target_link_libraries(openproof_tests
         openproof_credentials
         OpenProof::libpq
         openproof_identity_core
+        openproof_identity_profile
         openproof_policy
         openproof_organization
+        openproof_application
+        openproof_client
+        openproof_oauth
+        openproof_token
+        openproof_oidc
+        openproof_evidence
+        openproof_evidence_verifiers
+        openproof_enterprise_scim
+        openproof_trust
+        openproof_sdk_cpp
         GTest::gtest
         GTest::gtest_main
         openproof_test_compile_options

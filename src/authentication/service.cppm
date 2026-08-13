@@ -28,14 +28,19 @@ public:
 
     /** @brief Adds a provider cap. Duplicate or empty identifiers are rejected. */
     [[nodiscard]] foundation::Status trust(provider::ProviderId providerId,
-                                           provider::AssuranceLevel maximum);
+                                           provider::AssuranceLevel maximum,
+                                           bool allowSelfProvisioning = false);
 
     /** @brief Returns the configured cap, or no value when the provider is untrusted. */
     [[nodiscard]] std::optional<provider::AssuranceLevel>
     maximumFor(const provider::ProviderId& providerId) const noexcept;
 
+    /** @brief Whether a verified, previously unseen subject may create a new canonical identity. */
+    [[nodiscard]] bool maySelfProvision(const provider::ProviderId& providerId) const noexcept;
+
 private:
     std::map<provider::ProviderId, provider::AssuranceLevel> m_maximums;
+    std::map<provider::ProviderId, bool> m_selfProvisioning;
 };
 
 /**
@@ -112,7 +117,9 @@ public:
                           provider::AuthenticationTransactionStore& transactions,
                           identity::core::ExternalIdentityDirectory& identities,
                           const foundation::ClockSource& clock, ProviderTrustPolicy trustPolicy,
-                          foundation::Duration maximumTransactionLifetime);
+                          foundation::Duration maximumTransactionLifetime,
+                          identity::core::IdentityRepository* lifecycleRepository = nullptr,
+                          identity::core::OrganizationId organization = {});
 
     AuthenticationService(const AuthenticationService&) = delete;
     AuthenticationService& operator=(const AuthenticationService&) = delete;
@@ -152,6 +159,8 @@ private:
     const foundation::ClockSource& m_clock;
     const ProviderTrustPolicy m_trustPolicy;
     foundation::Duration m_maximumTransactionLifetime;
+    identity::core::IdentityRepository* m_lifecycleRepository{};
+    identity::core::OrganizationId m_organization;
 };
 
 }

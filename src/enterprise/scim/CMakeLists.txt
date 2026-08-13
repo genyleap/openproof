@@ -1,0 +1,13 @@
+openproof_add_module(openproof_enterprise_scim
+    MODULES
+        scim.cppm
+    SOURCES
+        scim.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_identity_core
+        openproof_identity_profile
+        openproof_organization
+    LINK_PRIVATE
+        openproof_security
+)

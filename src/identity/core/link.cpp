@@ -1,5 +1,6 @@
 module;
 
+#include <chrono>
 #include <cstddef>
 #include <mutex>
 #include <optional>
@@ -310,7 +311,7 @@ InMemoryExternalIdentityDirectory::reassign(const ExternalIdentityRef& external,
     // association is never briefly unowned, which a detach-then-attach pair
     // could not guarantee.
     position->second = newOwner;
-    contract_assert(m_owners.at(external) == newOwner);
+    foundation::requireInvariant(m_owners.at(external) == newOwner, "external identity reassignment did not persist new owner");
     return foundation::ok();
 }
 

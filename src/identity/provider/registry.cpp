@@ -40,7 +40,7 @@ ProviderRegistry::registerProvider(std::unique_ptr<AuthenticationProvider> provi
     // failed, find() would return nullptr for a provider the caller believes is
     // registered, and authentication for it would fail closed with a confusing
     // error rather than a clear one.
-    contract_assert(provider == nullptr);
+    foundation::requireInvariant(provider == nullptr, "provider registry duplicate identifier");
     return foundation::ok();
 }
 

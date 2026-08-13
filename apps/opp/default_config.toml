@@ -45,4 +45,27 @@ provider_id = "local"
 protected_route_prefix = "/"
 # Enabling auth also requires at least one explicit [[auth.route_policies]]
 # table. Each table declares path_prefix, methods, required_roles, role_match
-# ("any" or "all"), and minimum_assurance ("ial1" through "ial4").
+# ("any" or "all"), minimum_assurance ("ial1" through "ial4"), and an optional
+# required_scope and required_audience for OAuth/OIDC access tokens.
+
+
+[account]
+# Consumer signup, verified email/phone, password reset and profile self-service.
+enabled = false
+phone_provider_id = "phone"
+# Verification delivery is delegated to a private authenticated webhook that
+# delivers email or SMS based on the payload channel.
+# delivery_host = "notifications.internal.example"
+# delivery_port = 443
+delivery_tls = true
+delivery_path = "/v1/openproof/verification"
+# delivery_ca_file = "/etc/openproof/internal-ca.pem"
+# delivery_authorization = "env:OPENPROOF_VERIFICATION_WEBHOOK_TOKEN"
+
+[oidc]
+# Enables the central OAuth/OIDC identity provider. Requires auth, PostgreSQL,
+# the master security key, and an RSA private key supplied by secret reference.
+enabled = false
+# issuer = "https://identity.example.com"
+key_id = "openproof-rs256-1"
+# signing_key = "file:/run/secrets/openproof-oidc-private.pem"

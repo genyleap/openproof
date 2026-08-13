@@ -25,7 +25,7 @@ export namespace openproof::foundation {
  * @pre @p data is non-null whenever @p size is non-zero. A null pointer with a
  *      non-zero length would mean a caller believes it is erasing a credential
  *      that is not there -- a silent no-op is the wrong answer to that.
- *      Enforced by contract_assert in the definition rather than by `pre` on
+ *      Enforced by foundation::requireInvariant in the definition rather than
  *      this declaration: GCC 16.1.0 silently drops a precondition attached to a
  *      declaration whose definition is out-of-line in a module implementation
  *      unit (verified by reduced test case).

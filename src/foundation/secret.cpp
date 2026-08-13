@@ -12,7 +12,7 @@ void secureWipe(void* data, const std::size_t size) noexcept
     // Documented as @pre on the declaration and enforced here: GCC 16.1.0
     // silently drops a precondition attached to a declaration whose definition
     // is out-of-line in a module implementation unit.
-    contract_assert(size == 0U || data != nullptr);
+    foundation::requireInvariant(size == 0U || data != nullptr, "secureWipe received a null pointer with non-zero size");
 
     if (data == nullptr || size == 0U) {
         return;

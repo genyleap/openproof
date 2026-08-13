@@ -1,8 +1,12 @@
 module;
 
 #include <chrono>
+#include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 #include <utility>
 
 module openproof.session;
@@ -87,6 +91,98 @@ AuthenticatedSession::AuthenticatedSession(Session session)
 }
 
 const Session& AuthenticatedSession::session() const noexcept { return m_session; }
+
+foundation::Result<AuthenticatedSession> AuthenticatedSession::fromDelegatedAccess(
+    identity::core::IdentityId identity, identity::provider::ProviderId provider,
+    identity::provider::AssuranceLevel assurance,
+    identity::provider::AuthenticationStrength strength,
+    foundation::Instant authenticatedAt, foundation::Instant now,
+    foundation::Instant expiresAt)
+{
+    if (identity.empty() || provider.empty() || authenticatedAt > now || expiresAt <= now) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The delegated access context is invalid.");
+    }
+    auto restored = Session::restore(
+        SessionId{"delegated-access"}, std::move(identity), std::move(provider),
+        assurance, strength, SessionState::Active, authenticatedAt,
+        TokenDigest{security::Sha256Digest{}}, now, now, expiresAt,
+        expiresAt - now, std::nullopt);
+    if (!restored.has_value()) {
+        return foundation::fail(restored.error());
+    }
+    return AuthenticatedSession{std::move(restored).value()};
+}
+
+DelegatedSenderConstraint::DelegatedSenderConstraint(
+    DelegatedSenderConstraintKind kind, std::string value)
+    : m_kind(kind), m_value(std::move(value))
+{
+}
+
+DelegatedSenderConstraintKind DelegatedSenderConstraint::kind() const noexcept
+{
+    return m_kind;
+}
+
+std::string_view DelegatedSenderConstraint::value() const noexcept
+{
+    return m_value;
+}
+
+DelegatedAccess::DelegatedAccess(AuthenticatedSession authenticated,
+                                 std::string clientId,
+                                 std::vector<std::string> scopes,
+                                 std::vector<std::string> audiences,
+                                 std::optional<DelegatedSenderConstraint> senderConstraint)
+    : m_authenticated(std::move(authenticated))
+    , m_clientId(std::move(clientId))
+    , m_scopes(std::move(scopes))
+    , m_audiences(std::move(audiences))
+    , m_senderConstraint(std::move(senderConstraint))
+{
+    std::ranges::sort(m_scopes);
+    m_scopes.erase(std::unique(m_scopes.begin(), m_scopes.end()), m_scopes.end());
+    std::ranges::sort(m_audiences);
+    m_audiences.erase(
+        std::unique(m_audiences.begin(), m_audiences.end()), m_audiences.end());
+}
+
+const AuthenticatedSession& DelegatedAccess::authenticated() const noexcept
+{
+    return m_authenticated;
+}
+
+std::string_view DelegatedAccess::clientId() const noexcept
+{
+    return m_clientId;
+}
+
+const std::vector<std::string>& DelegatedAccess::scopes() const noexcept
+{
+    return m_scopes;
+}
+
+const std::vector<std::string>& DelegatedAccess::audiences() const noexcept
+{
+    return m_audiences;
+}
+
+const std::optional<DelegatedSenderConstraint>& DelegatedAccess::senderConstraint() const noexcept
+{
+    return m_senderConstraint;
+}
+
+bool DelegatedAccess::permits(std::string_view scope) const noexcept
+{
+    return scope.empty() || std::ranges::binary_search(m_scopes, std::string{scope});
+}
+
+bool DelegatedAccess::permitsAudience(std::string_view audience) const noexcept
+{
+    return audience.empty()
+        || std::ranges::binary_search(m_audiences, std::string{audience});
+}
 
 SessionService::SessionService(SessionRepository& sessions,
                                const foundation::ClockSource& clock,

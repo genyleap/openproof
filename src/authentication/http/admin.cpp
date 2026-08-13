@@ -126,11 +126,14 @@ requiredRoles(const json::object& object)
 
 AdministrationHttpApi::AdministrationHttpApi(
     session::SessionService& sessions, LocalMemberAdministrator& members,
+    identity::core::IdentityRepository& identities,
+    organization::MembershipRepository& memberships,
     gateway::TokenBucketRateLimiter& rateLimiter,
     identity::core::OrganizationId organization,
     idp::ProviderId provider, const foundation::ClockSource& clock,
     gateway::HttpHandler& fallback)
-    : m_sessions(&sessions), m_members(&members), m_rateLimiter(&rateLimiter),
+    : m_sessions(&sessions), m_members(&members), m_identities(&identities),
+      m_memberships(&memberships), m_rateLimiter(&rateLimiter),
       m_organization(std::move(organization)), m_provider(std::move(provider)),
       m_clock(&clock), m_fallback(&fallback)
 {
@@ -163,6 +166,8 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
             "admin-ip:" + std::string{request.remoteAddress()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
+    const bool list = request.method() == gateway::HttpMethod::Get
+        && request.path() == "/admin/local-members";
     const bool create = request.method() == gateway::HttpMethod::Post
         && request.path() == "/admin/local-members";
     const bool roles = request.method() == gateway::HttpMethod::Put
@@ -175,7 +180,7 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
         && request.path() == "/admin/local-members/remove";
     const bool reset = request.method() == gateway::HttpMethod::Post
         && request.path() == "/admin/local-members/credentials/reset";
-    if (!create && !roles && !suspend && !reinstate && !remove && !reset) {
+    if (!list && !create && !roles && !suspend && !reinstate && !remove && !reset) {
         return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
     }
     auto credential = gateway::takeSessionCredential(request);
@@ -196,6 +201,7 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
     if (!m_rateLimiter->allow("admin-identity:" + std::string{actor.value()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
+    if (list) return listLocalMembers(std::move(request));
     if (create) return createLocalMember(std::move(request), actor);
     if (roles) return replaceRoles(std::move(request), actor);
     if (suspend) {
@@ -211,6 +217,33 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
                                MemberLifecycleAction::Remove);
     }
     return resetCredentials(std::move(request), actor);
+}
+
+gateway::HttpResponse AdministrationHttpApi::listLocalMembers(gateway::HttpRequest request)
+{
+    auto ids = m_memberships->membersOf(m_organization);
+    if (!ids) return error(ids.error(), request);
+    json::array items;
+    for (const auto& id : ids.value()) {
+        auto membership = m_memberships->find(m_organization, id);
+        auto identity = m_identities->findById(m_organization, id);
+        if (!membership) return error(membership.error(), request);
+        if (!identity) return error(identity.error(), request);
+        if (!membership->has_value() || !identity->has_value()) continue;
+        json::object item;
+        item["identity_id"] = std::string{id.value()};
+        item["identity_status"] = std::string{identity::core::identityStatusName(identity->value().status())};
+        item["membership_state"] = std::string{organization::membershipStateName(membership->value().state())};
+        json::array roles;
+        for (const auto& role : membership->value().roles()) {
+            roles.emplace_back(std::string{role.value()});
+        }
+        item["roles"] = std::move(roles);
+        items.emplace_back(std::move(item));
+    }
+    json::object body;
+    body["members"] = std::move(items);
+    return jsonResponse(200, std::move(body));
 }
 
 gateway::HttpResponse AdministrationHttpApi::createLocalMember(

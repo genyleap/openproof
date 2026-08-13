@@ -1,12 +1,17 @@
 module;
 
 #include <cstddef>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 export module openproof.session:service;
 
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.provider;
 
 import :model;
 import :repository;
@@ -64,12 +69,73 @@ private:
 /** @brief Session accepted by the repository after expiry and revocation checks. */
 class AuthenticatedSession final {
 public:
+    [[nodiscard]] static foundation::Result<AuthenticatedSession>
+    fromDelegatedAccess(identity::core::IdentityId identity,
+                        identity::provider::ProviderId provider,
+                        identity::provider::AssuranceLevel assurance,
+                        identity::provider::AuthenticationStrength strength,
+                        foundation::Instant authenticatedAt,
+                        foundation::Instant now,
+                        foundation::Instant expiresAt);
+
     [[nodiscard]] const Session& session() const noexcept;
 
 private:
     friend class SessionService;
     explicit AuthenticatedSession(Session session);
     Session m_session;
+};
+
+/** @brief Sender-constraining mechanism carried by delegated OAuth access. */
+enum class DelegatedSenderConstraintKind { Dpop, Mtls };
+
+/** @brief Trusted proof-of-possession binding attached to a delegated token family. */
+class DelegatedSenderConstraint final {
+public:
+    DelegatedSenderConstraint(DelegatedSenderConstraintKind kind, std::string value);
+    [[nodiscard]] DelegatedSenderConstraintKind kind() const noexcept;
+    [[nodiscard]] std::string_view value() const noexcept;
+private:
+    DelegatedSenderConstraintKind m_kind{DelegatedSenderConstraintKind::Dpop};
+    std::string m_value;
+};
+
+/** @brief Trusted delegated OAuth access accepted by the gateway. */
+class DelegatedAccess final {
+public:
+    DelegatedAccess(AuthenticatedSession authenticated, std::string clientId,
+                    std::vector<std::string> scopes,
+                    std::vector<std::string> audiences = {},
+                    std::optional<DelegatedSenderConstraint> senderConstraint = std::nullopt);
+
+    [[nodiscard]] const AuthenticatedSession& authenticated() const noexcept;
+    [[nodiscard]] std::string_view clientId() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& scopes() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& audiences() const noexcept;
+    [[nodiscard]] const std::optional<DelegatedSenderConstraint>& senderConstraint() const noexcept;
+    [[nodiscard]] bool permits(std::string_view scope) const noexcept;
+    [[nodiscard]] bool permitsAudience(std::string_view audience) const noexcept;
+
+private:
+    AuthenticatedSession m_authenticated;
+    std::string m_clientId;
+    std::vector<std::string> m_scopes;
+    std::vector<std::string> m_audiences;
+    std::optional<DelegatedSenderConstraint> m_senderConstraint;
+};
+
+/** @brief Port implemented by token services that authenticate delegated bearer access. */
+class DelegatedAccessAuthenticator {
+public:
+    DelegatedAccessAuthenticator(const DelegatedAccessAuthenticator&) = delete;
+    DelegatedAccessAuthenticator& operator=(const DelegatedAccessAuthenticator&) = delete;
+    virtual ~DelegatedAccessAuthenticator() = default;
+
+    [[nodiscard]] virtual foundation::Result<DelegatedAccess>
+    authenticateDelegated(const foundation::SecretString& token) = 0;
+
+protected:
+    DelegatedAccessAuthenticator() = default;
 };
 
 class SessionService final {

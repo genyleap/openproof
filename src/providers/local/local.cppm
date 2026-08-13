@@ -11,6 +11,7 @@ export module openproof.provider.local;
 
 import openproof.credentials;
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.identity.provider;
 
 export namespace openproof::provider::local {
@@ -34,6 +35,28 @@ public:
     [[nodiscard]] virtual foundation::Status enroll(
         idp::ExternalSubject subject, const foundation::SecretString& password,
         std::optional<credentials::TotpSecret> totp) = 0;
+
+    /**
+     * @brief Stores a credential before an external identity link is verified.
+     *
+     * Used by public signup. The canonical identity must already exist but may
+     * remain non-authenticating until the verification ceremony completes.
+     */
+    [[nodiscard]] virtual foundation::Status enrollPending(
+        identity::core::IdentityId canonicalIdentity, idp::ExternalSubject subject,
+        const foundation::SecretString& password,
+        std::optional<credentials::TotpSecret> totp) = 0;
+
+    /** @brief Rebinds an in-memory/login alias after a verified email change. */
+    [[nodiscard]] virtual foundation::Status rebindSubject(
+        const identity::core::IdentityId& identity,
+        const idp::ExternalSubject& previous,
+        idp::ExternalSubject replacement) = 0;
+
+    /** @brief Removes a pending credential during failed signup compensation. */
+    [[nodiscard]] virtual foundation::Status removePending(
+        const identity::core::IdentityId& identity,
+        const idp::ExternalSubject& subject) = 0;
     [[nodiscard]] virtual foundation::Status changePassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) = 0;
@@ -58,6 +81,17 @@ public:
     [[nodiscard]] foundation::Status enroll(
         idp::ExternalSubject subject, const foundation::SecretString& password,
         std::optional<credentials::TotpSecret> totp) override;
+    [[nodiscard]] foundation::Status enrollPending(
+        identity::core::IdentityId canonicalIdentity, idp::ExternalSubject subject,
+        const foundation::SecretString& password,
+        std::optional<credentials::TotpSecret> totp) override;
+    [[nodiscard]] foundation::Status rebindSubject(
+        const identity::core::IdentityId& identity,
+        const idp::ExternalSubject& previous,
+        idp::ExternalSubject replacement) override;
+    [[nodiscard]] foundation::Status removePending(
+        const identity::core::IdentityId& identity,
+        const idp::ExternalSubject& subject) override;
     [[nodiscard]] foundation::Status changePassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) override;

@@ -77,6 +77,27 @@ public:
     return {};
 }
 
+[[nodiscard]] std::string setCookieHeader(const gw::HttpResponse& response,
+                                          std::string_view name)
+{
+    const std::string prefix = std::string{name} + "=";
+    for (const auto& header : setCookies(response)) {
+        if (header.starts_with(prefix)) return header;
+    }
+    return {};
+}
+
+void expectHostCookie(const gw::HttpResponse& response, std::string_view name)
+{
+    const auto header = setCookieHeader(response, name);
+    ASSERT_FALSE(header.empty());
+    EXPECT_TRUE(name.starts_with("__Host-"));
+    EXPECT_NE(header.find("; Path=/"), std::string::npos);
+    EXPECT_NE(header.find("; Secure"), std::string::npos);
+    EXPECT_NE(header.find("; HttpOnly"), std::string::npos);
+    EXPECT_EQ(header.find("; Domain="), std::string::npos);
+}
+
 struct Fixture {
     Fixture()
         : clock(kNow),
@@ -148,10 +169,12 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     const auto started = fixture.api->handle(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(started.status(), 202);
-    const std::string continuation = cookieValue(started, "openproof_preauth");
-    const std::string binding = cookieValue(started, "openproof_preauth_binding");
+    const std::string continuation = cookieValue(started, "__Host-openproof-preauth");
+    const std::string binding = cookieValue(started, "__Host-openproof-preauth-binding");
     ASSERT_FALSE(continuation.empty());
     ASSERT_FALSE(binding.empty());
+    expectHostCookie(started, "__Host-openproof-preauth");
+    expectHostCookie(started, "__Host-openproof-preauth-binding");
     const json::object startBody = json::parse(started.body()).as_object();
 
     json::object completionBody;
@@ -159,31 +182,32 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     completionBody["challenge_id"] = startBody.at("challenge_id");
     completionBody["password"] = "correct-password";
     completionBody["totp"] = fixture.totpCode;
-    const std::string preauthCookies = "openproof_preauth=" + continuation
-        + "; openproof_preauth_binding=" + binding;
+    const std::string preauthCookies = "__Host-openproof-preauth=" + continuation
+        + "; __Host-openproof-preauth-binding=" + binding;
     const auto completed = fixture.api->handle(request(
         "/auth/mfa/verify", json::serialize(completionBody), preauthCookies));
     ASSERT_EQ(completed.status(), 200) << completed.body();
-    const std::string firstToken = cookieValue(completed, "openproof_session");
+    const std::string firstToken = cookieValue(completed, "__Host-openproof-session");
     ASSERT_FALSE(firstToken.empty());
+    expectHostCookie(completed, "__Host-openproof-session");
     EXPECT_EQ(json::parse(completed.body()).as_object().at("assurance"), "ial2");
 
     const auto recovery = fixture.api->handle(request(
-        "/auth/recovery-codes", {}, "openproof_session=" + firstToken));
+        "/auth/recovery-codes", {}, "__Host-openproof-session=" + firstToken));
     ASSERT_EQ(recovery.status(), 201);
     EXPECT_EQ(json::parse(recovery.body()).as_object().at("codes").as_array().size(), 10U);
 
     const auto rotated = fixture.api->handle(request(
-        "/auth/session/rotate", {}, "openproof_session=" + firstToken));
+        "/auth/session/rotate", {}, "__Host-openproof-session=" + firstToken));
     ASSERT_EQ(rotated.status(), 200);
-    const std::string replacement = cookieValue(rotated, "openproof_session");
+    const std::string replacement = cookieValue(rotated, "__Host-openproof-session");
     ASSERT_FALSE(replacement.empty());
     EXPECT_NE(firstToken, replacement);
     EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{firstToken}));
     EXPECT_TRUE(fixture.sessionService.authenticate(fnd::SecretString{replacement}));
 
     const auto loggedOut = fixture.api->handle(request(
-        "/auth/logout", {}, "openproof_session=" + replacement));
+        "/auth/logout", {}, "__Host-openproof-session=" + replacement));
     EXPECT_EQ(loggedOut.status(), 204);
     EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{replacement}));
 }
@@ -199,15 +223,15 @@ TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookie
     completion["challenge_id"] = body.at("challenge_id");
     completion["password"] = "wrong-password";
     completion["totp"] = fixture.totpCode;
-    const std::string cookies = "openproof_preauth="
-        + cookieValue(started, "openproof_preauth")
-        + "; openproof_preauth_binding="
-        + cookieValue(started, "openproof_preauth_binding");
+    const std::string cookies = "__Host-openproof-preauth="
+        + cookieValue(started, "__Host-openproof-preauth")
+        + "; __Host-openproof-preauth-binding="
+        + cookieValue(started, "__Host-openproof-preauth-binding");
     const auto rejected = fixture.api->handle(request(
         "/auth/mfa/verify", json::serialize(completion), cookies));
     EXPECT_EQ(rejected.status(), 401);
-    EXPECT_EQ(cookieValue(rejected, "openproof_preauth"), "");
-    EXPECT_EQ(cookieValue(rejected, "openproof_preauth_binding"), "");
+    EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth"), "");
+    EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth-binding"), "");
 }
 
 TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
@@ -216,7 +240,7 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
     auto ambiguous = gw::HttpRequest::create(
         gw::HttpMethod::Post, "/auth/logout",
         {{"authorization", "Bearer bearer-token"},
-         {"cookie", "openproof_session=cookie-token"}},
+         {"cookie", "__Host-openproof-session=cookie-token"}},
         {}, "127.0.0.1", fnd::CorrelationId{"request"});
     ASSERT_TRUE(ambiguous);
 

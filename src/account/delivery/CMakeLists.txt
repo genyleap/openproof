@@ -1,0 +1,12 @@
+openproof_add_module(openproof_account_delivery
+    MODULES
+        delivery.cppm
+    PRIVATE_MODULES
+        delivery_impl.cppm
+    LINK_PUBLIC
+        openproof_account
+        openproof_foundation
+        openproof_gateway
+    LINK_PRIVATE
+        openproof_security
+)

@@ -1,5 +1,7 @@
 # OpenProof Protocol — Phase 0: Repository Audit
 
+> v1.0.13 production note: fail-closed internal invariants are enforced by `foundation::requireInvariant`; GCC experimental Contracts are opt-in qualification-only because of module ICEs on the qualified GCC 16.1/Darwin toolchain.
+
 Status: **Audit only. No OpenProof code written. Stop-and-verify gate before Phase 1.**
 Date: 2026-08-05
 Method: every claim below was produced by running a command or reading a file in

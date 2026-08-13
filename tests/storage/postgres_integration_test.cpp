@@ -9,36 +9,47 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <libpq-fe.h>
 
 import openproof.foundation;
 import openproof.administration;
+import openproof.application;
+import openproof.client;
 import openproof.audit;
 import openproof.credentials;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.identity.profile;
+import openproof.oauth;
 import openproof.organization;
 import openproof.policy;
 import openproof.provider.local;
 import openproof.security;
 import openproof.session;
+import openproof.token;
 import openproof.storage.postgres;
 
 namespace {
 
+namespace app = openproof::application;
+namespace cli = openproof::client;
 namespace core = openproof::identity::core;
 namespace admin = openproof::administration;
 namespace audit = openproof::audit;
 namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
 namespace idp = openproof::identity::provider;
+namespace profile = openproof::identity::profile;
+namespace oauth = openproof::oauth;
 namespace pg = openproof::storage::postgres;
 namespace pol = openproof::policy;
 namespace org = openproof::organization;
 namespace local = openproof::provider::local;
 namespace sec = openproof::security;
 namespace sess = openproof::session;
+namespace tok = openproof::token;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
 
@@ -669,6 +680,152 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
     EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 1), "6");
     EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 2), "0");
     EXPECT_STREQ(PQgetvalue(lifecycleEvidence.get(), 0, 3), "0");
+}
+
+
+TEST_F(PostgresIntegrationTest, IdentityPlatformPersistenceAndOneTimeOAuthStateAreTransactional)
+{
+    pg::PostgresIdentityProviderStore store{*pool};
+
+    const app::ApplicationId applicationId{"ride-app"};
+    auto application = app::Application::create(
+        applicationId, core::OrganizationId{"org"}, "ride", "Ride",
+        app::Environment::Production, kNow);
+    ASSERT_TRUE(application);
+    ASSERT_TRUE(store.add(std::move(application).value()));
+
+    auto loadedApplication = store.findById(applicationId);
+    ASSERT_TRUE(loadedApplication && loadedApplication->has_value());
+    EXPECT_EQ(loadedApplication->value().identifier(), "ride");
+    EXPECT_EQ(loadedApplication->value().environment(), app::Environment::Production);
+
+    auto redirect = cli::RedirectUri::create(
+        "http://127.0.0.1:49152/callback", cli::ClientKind::Native);
+    auto openid = cli::Scope::create("openid");
+    auto profileScope = cli::Scope::create("profile");
+    ASSERT_TRUE(redirect && openid && profileScope);
+
+    const cli::ClientId clientId{"ride-native"};
+    auto client = cli::Client::create(
+        clientId, applicationId, "Ride Native", cli::ClientKind::Native,
+        std::vector<cli::RedirectUri>{redirect.value()},
+        std::vector<cli::Scope>{openid.value(), profileScope.value()},
+        std::nullopt, kNow);
+    ASSERT_TRUE(client);
+    ASSERT_TRUE(store.add(std::move(client).value()));
+
+    auto loadedClient = store.findById(clientId);
+    ASSERT_TRUE(loadedClient && loadedClient->has_value());
+    EXPECT_TRUE(loadedClient->value().isPublic());
+    EXPECT_TRUE(loadedClient->value().permitsRedirect(
+        "http://127.0.0.1:55001/callback"));
+
+    auto identityProfile = profile::IdentityProfile::restore(
+        core::IdentityId{"identity-1"}, std::string{"Rider One"},
+        std::string{"rider-one"}, std::string{"rider@example.test"}, true,
+        std::nullopt, false, std::string{"fa-IR"}, std::nullopt, kNow, kNow);
+    ASSERT_TRUE(identityProfile);
+    ASSERT_TRUE(store.save(identityProfile.value()));
+    auto loadedProfile = store.find(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(loadedProfile && loadedProfile->has_value());
+    ASSERT_TRUE(loadedProfile->value().email().has_value());
+    EXPECT_EQ(loadedProfile->value().email().value(), "rider@example.test");
+    EXPECT_TRUE(loadedProfile->value().emailVerified());
+
+    constexpr std::string_view verifier =
+        "0123456789012345678901234567890123456789012";
+    auto verifierDigest = sec::sha256(verifier);
+    ASSERT_TRUE(verifierDigest);
+    auto challenge = oauth::PkceChallenge::create(
+        fnd::toBase64Url(verifierDigest.value()));
+    ASSERT_TRUE(challenge);
+
+    const oauth::CodeDigest codeDigest{sec::sha256("stored-code").value()};
+    auto authorizationCode = oauth::AuthorizationCode::create(
+        codeDigest, clientId, core::IdentityId{"identity-1"},
+        "http://127.0.0.1:55001/callback",
+        std::vector<cli::Scope>{openid.value(), profileScope.value()},
+        challenge.value(), std::string{"nonce-pg"}, idp::ProviderId{"local"},
+        idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{
+            idp::AuthenticationFactor::Knowledge
+                | idp::AuthenticationFactor::Possession,
+            false},
+        kNow, kNow, std::chrono::minutes{2});
+    ASSERT_TRUE(authorizationCode);
+    ASSERT_TRUE(store.add(std::move(authorizationCode).value()));
+
+    const std::string wrongChallenge = fnd::toBase64Url(
+        sec::sha256("1123456789012345678901234567890123456789012").value());
+    EXPECT_FALSE(store.consumeBound(
+        codeDigest, kNow + std::chrono::seconds{10}, clientId.value(),
+        "http://127.0.0.1:55001/callback", wrongChallenge));
+
+    auto consumed = store.consumeBound(
+        codeDigest, kNow + std::chrono::seconds{11}, clientId.value(),
+        "http://127.0.0.1:55001/callback", challenge->value());
+    ASSERT_TRUE(consumed);
+    EXPECT_EQ(consumed->identity(), core::IdentityId{"identity-1"});
+    EXPECT_FALSE(store.consumeBound(
+        codeDigest, kNow + std::chrono::seconds{12}, clientId.value(),
+        "http://127.0.0.1:55001/callback", challenge->value()));
+
+    const tok::TokenFamilyId family{"family-pg"};
+    tok::TokenContext context{
+        clientId, core::IdentityId{"identity-1"}, idp::ProviderId{"local"},
+        idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{
+            idp::AuthenticationFactor::Knowledge
+                | idp::AuthenticationFactor::Possession,
+            false},
+        std::vector<std::string>{"openid", "profile"}, kNow};
+    const tok::TokenDigest accessDigest{sec::sha256("access-pg-0").value()};
+    const tok::TokenDigest refreshDigest{sec::sha256("refresh-pg-0").value()};
+    const auto absoluteRefreshExpiry = kNow + std::chrono::hours{24 * 30};
+    ASSERT_TRUE(store.storeInitial(
+        tok::AccessTokenRecord{
+            accessDigest, family, context, kNow, kNow + std::chrono::minutes{15}},
+        tok::RefreshTokenRecord{
+            refreshDigest, family, 0U, context, kNow, absoluteRefreshExpiry}));
+
+    auto storedAccess = store.findAccess(accessDigest);
+    auto storedRefresh = store.findRefresh(refreshDigest);
+    ASSERT_TRUE(storedAccess && storedRefresh);
+    EXPECT_EQ(storedAccess->context().client(), clientId);
+    EXPECT_EQ(storedRefresh->state(), tok::RefreshTokenState::Active);
+
+    const tok::TokenDigest nextAccessDigest{sec::sha256("access-pg-1").value()};
+    const tok::TokenDigest nextRefreshDigest{sec::sha256("refresh-pg-1").value()};
+    ASSERT_TRUE(store.rotateRefresh(
+        refreshDigest, kNow + std::chrono::minutes{1},
+        tok::AccessTokenRecord{
+            nextAccessDigest, family, context, kNow + std::chrono::minutes{1},
+            kNow + std::chrono::minutes{16}},
+        tok::RefreshTokenRecord{
+            nextRefreshDigest, family, 1U, context,
+            kNow + std::chrono::minutes{1}, absoluteRefreshExpiry}));
+
+    auto usedRefresh = store.findRefresh(refreshDigest);
+    auto rotatedRefresh = store.findRefresh(nextRefreshDigest);
+    ASSERT_TRUE(usedRefresh && rotatedRefresh);
+    EXPECT_EQ(usedRefresh->state(), tok::RefreshTokenState::Used);
+    EXPECT_EQ(rotatedRefresh->state(), tok::RefreshTokenState::Active);
+    EXPECT_EQ(rotatedRefresh->expiresAt(), absoluteRefreshExpiry);
+
+    const auto replay = store.rotateRefresh(
+        refreshDigest, kNow + std::chrono::minutes{2},
+        tok::AccessTokenRecord{
+            tok::TokenDigest{sec::sha256("access-pg-replay").value()}, family,
+            context, kNow + std::chrono::minutes{2},
+            kNow + std::chrono::minutes{17}},
+        tok::RefreshTokenRecord{
+            tok::TokenDigest{sec::sha256("refresh-pg-replay").value()}, family,
+            1U, context, kNow + std::chrono::minutes{2}, absoluteRefreshExpiry});
+    EXPECT_FALSE(replay);
+
+    auto revokedReplacement = store.findRefresh(nextRefreshDigest);
+    ASSERT_TRUE(revokedReplacement);
+    EXPECT_EQ(revokedReplacement->state(), tok::RefreshTokenState::Revoked);
 }
 
 }

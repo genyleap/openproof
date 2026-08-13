@@ -7,6 +7,7 @@ module;
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 export module openproof.gateway;
@@ -107,7 +108,8 @@ public:
     create(RouteId id, HttpMethod method, std::string pathPrefix,
            ServiceId service, bool protectedRoute,
            identity::core::OrganizationId organization,
-           policy::Action action, policy::Resource resource);
+           policy::Action action, policy::Resource resource,
+           std::string requiredScope = {}, std::string requiredAudience = {});
 
     [[nodiscard]] const RouteId& id() const noexcept;
     [[nodiscard]] HttpMethod method() const noexcept;
@@ -117,12 +119,15 @@ public:
     [[nodiscard]] const identity::core::OrganizationId& organization() const noexcept;
     [[nodiscard]] const policy::Action& action() const noexcept;
     [[nodiscard]] const policy::Resource& resource() const noexcept;
+    [[nodiscard]] std::string_view requiredScope() const noexcept;
+    [[nodiscard]] std::string_view requiredAudience() const noexcept;
 
 private:
     Route(RouteId id, HttpMethod method, std::string pathPrefix,
           ServiceId service, bool protectedRoute,
           identity::core::OrganizationId organization,
-          policy::Action action, policy::Resource resource);
+          policy::Action action, policy::Resource resource, std::string requiredScope,
+          std::string requiredAudience);
     RouteId m_id;
     HttpMethod m_method{HttpMethod::Get};
     std::string m_pathPrefix;
@@ -131,6 +136,8 @@ private:
     identity::core::OrganizationId m_organization;
     policy::Action m_action;
     policy::Resource m_resource;
+    std::string m_requiredScope;
+    std::string m_requiredAudience;
 };
 
 class Router final {
@@ -339,6 +346,21 @@ private:
     foundation::Duration m_maximumAge{};
 };
 
+/** @brief Verifies proof-of-possession material for sender-constrained delegated tokens. */
+class SenderConstraintVerifier {
+public:
+    SenderConstraintVerifier(const SenderConstraintVerifier&) = delete;
+    SenderConstraintVerifier& operator=(const SenderConstraintVerifier&) = delete;
+    virtual ~SenderConstraintVerifier() = default;
+
+    [[nodiscard]] virtual foundation::Status verify(
+        HttpRequest& request, const session::DelegatedSenderConstraint& constraint,
+        const foundation::SecretString& accessToken, bool dpopAuthorizationScheme) = 0;
+
+protected:
+    SenderConstraintVerifier() = default;
+};
+
 class Gateway final : public HttpHandler {
 public:
     Gateway(const Router& router, session::SessionService& sessions,
@@ -346,7 +368,9 @@ public:
             ServiceDiscovery& discovery, WeightedRoundRobin& loadBalancer,
             CircuitBreaker& circuits, ProxyTransport& proxy,
             TrustedContextSigner& contextSigner,
-            foundation::Duration upstreamTimeout);
+            foundation::Duration upstreamTimeout,
+            session::DelegatedAccessAuthenticator* delegatedAccess = nullptr,
+            SenderConstraintVerifier* senderConstraintVerifier = nullptr);
 
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
 
@@ -355,6 +379,8 @@ private:
                                              const HttpRequest& request) const;
     const Router* m_router;
     session::SessionService* m_sessions;
+    session::DelegatedAccessAuthenticator* m_delegatedAccess{};
+    SenderConstraintVerifier* m_senderConstraintVerifier{};
     AccessController* m_access;
     TokenBucketRateLimiter* m_rateLimiter;
     ServiceDiscovery* m_discovery;

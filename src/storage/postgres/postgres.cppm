@@ -1,24 +1,38 @@
 module;
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 export module openproof.storage.postgres;
 
+import openproof.account;
 import openproof.administration;
+import openproof.application;
+import openproof.client;
+import openproof.consent;
 import openproof.audit;
 import openproof.foundation;
 import openproof.credentials;
+import openproof.evidence;
+import openproof.evidence.verifiers;
+import openproof.enterprise.scim;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.identity.profile;
 import openproof.organization;
+import openproof.oauth;
 import openproof.policy;
 import openproof.provider.local;
+import openproof.provider.passkey;
+import openproof.resource;
 import openproof.security;
 import openproof.session;
+import openproof.token;
 
 export namespace openproof::storage::postgres {
 
@@ -65,6 +79,13 @@ private:
     friend class PostgresLocalAccountDirectory;
     friend class PostgresAdministrationRepository;
     friend class PostgresAuthorizationDecisionSink;
+    friend class PostgresIdentityProviderStore;
+    friend class PostgresAccountRepository;
+    friend class PostgresResourceRepository;
+    friend class PostgresConsentRepository;
+    friend class PostgresPasskeyRepository;
+    friend class PostgresScimDirectoryRepository;
+    friend class PostgresEvidenceChallengeStore;
     class Implementation;
     explicit ConnectionPool(std::unique_ptr<Implementation> implementation);
     std::unique_ptr<Implementation> m_implementation;
@@ -232,6 +253,18 @@ public:
         identity::provider::ExternalSubject subject,
         const foundation::SecretString& password,
         std::optional<credentials::TotpSecret> totp) override;
+    [[nodiscard]] foundation::Status enrollPending(
+        identity::core::IdentityId identity,
+        identity::provider::ExternalSubject subject,
+        const foundation::SecretString& password,
+        std::optional<credentials::TotpSecret> totp) override;
+    [[nodiscard]] foundation::Status rebindSubject(
+        const identity::core::IdentityId& identity,
+        const identity::provider::ExternalSubject& previous,
+        identity::provider::ExternalSubject replacement) override;
+    [[nodiscard]] foundation::Status removePending(
+        const identity::core::IdentityId& identity,
+        const identity::provider::ExternalSubject& subject) override;
     [[nodiscard]] foundation::Status changePassword(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password) override;
@@ -318,5 +351,269 @@ private:
     audit::AuditKey m_auditKey;
     const foundation::ClockSource* m_clock;
 };
+
+/**
+ * @brief Durable store for the central application registry and OAuth/OIDC state.
+ *
+ * One adapter implements the related repository ports so authorization-code and
+ * refresh-token transitions can use PostgreSQL transactions without leaking SQL
+ * into the protocol/domain modules.
+ */
+/** Durable account verification challenges and pending external-subject reservations. */
+class PostgresAccountRepository final : public account::AccountRepository {
+public:
+    explicit PostgresAccountRepository(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status replace(account::VerificationChallenge challenge) override;
+    [[nodiscard]] foundation::Result<account::VerificationChallenge> consume(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts) override;
+    [[nodiscard]] foundation::Status reserveSubject(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& identity,
+        foundation::Instant now, foundation::Instant expiresAt) override;
+    [[nodiscard]] foundation::Result<std::optional<identity::core::IdentityId>>
+    reservedOwner(const identity::core::ExternalIdentityRef& external,
+                  foundation::Instant now) const override;
+    [[nodiscard]] foundation::Status releaseSubject(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner) override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
+/** @brief PostgreSQL-backed OAuth resource and service-identity registry. */
+class PostgresResourceRepository final : public resource::ResourceRepository {
+public:
+    explicit PostgresResourceRepository(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status add(resource::ResourceServer resource) override;
+    [[nodiscard]] foundation::Status save(const resource::ResourceServer& resource) override;
+    [[nodiscard]] foundation::Result<std::optional<resource::ResourceServer>>
+    findByAudience(std::string_view audience) const override;
+    [[nodiscard]] foundation::Result<std::vector<resource::ResourceServer>> list() const override;
+    [[nodiscard]] foundation::Status saveService(resource::ServiceIdentity service) override;
+    [[nodiscard]] foundation::Result<std::optional<resource::ServiceIdentity>>
+    serviceForClient(const client::ClientId& clientId) const override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
+/** @brief PostgreSQL-backed remembered authorization consent store. */
+class PostgresConsentRepository final : public consent::ConsentRepository {
+public:
+    explicit PostgresConsentRepository(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status save(consent::ConsentGrant grant) override;
+    [[nodiscard]] foundation::Result<std::optional<consent::ConsentGrant>> findActive(
+        const identity::core::IdentityId& identity, const client::ClientId& clientId,
+        std::string_view audience, foundation::Instant now) const override;
+    [[nodiscard]] foundation::Result<std::vector<consent::ConsentGrant>> list(
+        const identity::core::IdentityId& identity) const override;
+    [[nodiscard]] foundation::Status revoke(
+        const consent::ConsentId& id, const identity::core::IdentityId& identity,
+        foundation::Instant now) override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
+/** @brief PostgreSQL-backed WebAuthn credential and registration-ceremony store. */
+class PostgresPasskeyRepository final : public provider::passkey::PasskeyRepository {
+public:
+    explicit PostgresPasskeyRepository(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status addCeremony(
+        provider::passkey::RegistrationCeremony ceremony) override;
+    [[nodiscard]] foundation::Status consumeCeremony(
+        const identity::provider::ChallengeId& id,
+        const identity::core::IdentityId& identity,
+        foundation::Instant now) override;
+    [[nodiscard]] foundation::Status addCredential(
+        provider::passkey::PasskeyCredential credential) override;
+    [[nodiscard]] foundation::Result<std::optional<provider::passkey::PasskeyCredential>>
+    findCredential(std::string_view credentialId) const override;
+    [[nodiscard]] foundation::Result<std::vector<provider::passkey::PasskeyCredential>>
+    listCredentials(const identity::core::IdentityId& identity) const override;
+    [[nodiscard]] foundation::Status advanceCounter(
+        std::string_view credentialId, std::uint32_t expected,
+        std::uint32_t replacement, foundation::Instant usedAt) override;
+    [[nodiscard]] foundation::Status removeCredential(
+        const identity::core::IdentityId& identity,
+        std::string_view credentialId) override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
+
+/** @brief PostgreSQL-backed durable SCIM directory metadata and group membership. */
+class PostgresScimDirectoryRepository final : public enterprise::scim::DirectoryRepository {
+public:
+    explicit PostgresScimDirectoryRepository(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status addUser(enterprise::scim::UserRecord user) override;
+    [[nodiscard]] foundation::Status saveUser(const enterprise::scim::UserRecord& user) override;
+    [[nodiscard]] foundation::Status removeUser(
+        const identity::core::OrganizationId& organization,
+        const identity::core::IdentityId& identity) override;
+    [[nodiscard]] foundation::Result<std::optional<enterprise::scim::UserRecord>> findUser(
+        const identity::core::OrganizationId& organization,
+        const identity::core::IdentityId& identity) const override;
+    [[nodiscard]] foundation::Result<std::optional<enterprise::scim::UserRecord>> findUserByName(
+        const identity::core::OrganizationId& organization, std::string_view userName) const override;
+    [[nodiscard]] foundation::Result<std::vector<enterprise::scim::UserRecord>> users(
+        const identity::core::OrganizationId& organization) const override;
+
+    [[nodiscard]] foundation::Status addGroup(enterprise::scim::GroupRecord group) override;
+    [[nodiscard]] foundation::Status saveGroup(const enterprise::scim::GroupRecord& group) override;
+    [[nodiscard]] foundation::Status removeGroup(
+        const identity::core::OrganizationId& organization,
+        const enterprise::scim::GroupId& id) override;
+    [[nodiscard]] foundation::Result<std::optional<enterprise::scim::GroupRecord>> findGroup(
+        const identity::core::OrganizationId& organization,
+        const enterprise::scim::GroupId& id) const override;
+    [[nodiscard]] foundation::Result<std::optional<enterprise::scim::GroupRecord>> findGroupByName(
+        const identity::core::OrganizationId& organization, std::string_view displayName) const override;
+    [[nodiscard]] foundation::Result<std::vector<enterprise::scim::GroupRecord>> groups(
+        const identity::core::OrganizationId& organization) const override;
+    [[nodiscard]] foundation::Result<std::vector<identity::core::IdentityId>> groupMembers(
+        const identity::core::OrganizationId& organization,
+        const enterprise::scim::GroupId& id) const override;
+    [[nodiscard]] foundation::Status replaceGroupMembers(
+        const identity::core::OrganizationId& organization,
+        const enterprise::scim::GroupId& id,
+        std::vector<identity::core::IdentityId> members) override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
+/** @brief Durable one-time challenge store for evidence verification ceremonies. */
+class PostgresEvidenceChallengeStore final
+    : public evidence::verification::ChallengeStore {
+public:
+    explicit PostgresEvidenceChallengeStore(ConnectionPool& pool);
+    [[nodiscard]] foundation::Status add(
+        evidence::verification::Challenge challenge) override;
+    [[nodiscard]] foundation::Status consume(
+        const evidence::verification::ChallengeDigest& digest,
+        const identity::core::IdentityId& identity,
+        const identity::provider::ProviderId& provider,
+        foundation::Instant now) override;
+private:
+    ConnectionPool* m_pool;
+};
+
+class PostgresIdentityProviderStore final
+    : public application::ApplicationRepository,
+      public client::ClientRepository,
+      public identity::profile::IdentityProfileRepository,
+      public evidence::EvidenceRepository,
+      public oauth::AuthorizationCodeStore,
+      public oauth::DeviceAuthorizationStore,
+      public oauth::PushedAuthorizationRequestStore,
+      public oauth::ClientRequestSigningKeyStore,
+      public oauth::JarReplayStore,
+      public oauth::DpopReplayStore,
+      public oauth::MtlsForwardingReplayStore,
+      public token::TokenRepository {
+public:
+    explicit PostgresIdentityProviderStore(ConnectionPool& pool);
+
+    [[nodiscard]] foundation::Status add(application::Application application) override;
+    [[nodiscard]] foundation::Status save(const application::Application& application) override;
+    [[nodiscard]] foundation::Result<std::optional<application::Application>>
+    findById(const application::ApplicationId& id) const override;
+    [[nodiscard]] foundation::Result<std::optional<application::Application>>
+    findByIdentifier(const identity::core::OrganizationId& owner,
+                     std::string_view identifier) const override;
+    [[nodiscard]] foundation::Result<std::vector<application::Application>> list() const override;
+
+    [[nodiscard]] foundation::Status add(client::Client client) override;
+    [[nodiscard]] foundation::Status save(const client::Client& client) override;
+    [[nodiscard]] foundation::Result<std::optional<client::Client>>
+    findById(const client::ClientId& id) const override;
+    [[nodiscard]] foundation::Result<std::vector<client::Client>>
+    clientsOf(const application::ApplicationId& applicationId) const override;
+
+    [[nodiscard]] foundation::Status save(const identity::profile::IdentityProfile& profile) override;
+    [[nodiscard]] foundation::Result<std::optional<identity::profile::IdentityProfile>>
+    find(const identity::core::IdentityId& identity) const override;
+
+    [[nodiscard]] foundation::Status add(evidence::Evidence evidence) override;
+    [[nodiscard]] foundation::Status addBatch(std::vector<evidence::Evidence> evidence) override;
+    [[nodiscard]] foundation::Status revoke(const evidence::EvidenceId& id) override;
+    [[nodiscard]] foundation::Result<std::optional<evidence::Evidence>>
+    find(const evidence::EvidenceId& id) const override;
+    [[nodiscard]] foundation::Result<std::vector<evidence::Evidence>>
+    forIdentity(const identity::core::IdentityId& identity) const override;
+
+    [[nodiscard]] foundation::Status add(oauth::AuthorizationCode code) override;
+    [[nodiscard]] foundation::Result<oauth::AuthorizationCode>
+    consumeBound(const oauth::CodeDigest& digest, foundation::Instant now,
+                 std::string_view expectedClientId,
+                 std::string_view expectedRedirectUri,
+                 std::string_view expectedCodeChallenge) override;
+
+    [[nodiscard]] foundation::Status add(oauth::DeviceAuthorization authorization) override;
+    [[nodiscard]] foundation::Result<oauth::DeviceAuthorization> findByUserCode(
+        const oauth::DeviceUserCodeDigest& userCode, foundation::Instant now) override;
+    [[nodiscard]] foundation::Result<oauth::DeviceAuthorization> approve(
+        const oauth::DeviceUserCodeDigest& userCode,
+        const session::AuthenticatedSession& authenticated,
+        foundation::Instant now) override;
+    [[nodiscard]] foundation::Status deny(
+        const oauth::DeviceUserCodeDigest& userCode, foundation::Instant now) override;
+    [[nodiscard]] foundation::Result<oauth::DevicePollResult> poll(
+        const oauth::DeviceCodeDigest& deviceCode, const client::ClientId& expectedClient,
+        foundation::Instant now) override;
+
+    [[nodiscard]] foundation::Status add(
+        oauth::PushedAuthorizationRequest request) override;
+    [[nodiscard]] foundation::Result<oauth::PushedAuthorizationRequest> find(
+        const oauth::PushedRequestDigest& digest, foundation::Instant now) const override;
+    [[nodiscard]] foundation::Result<oauth::PushedAuthorizationRequest> consume(
+        const oauth::PushedRequestDigest& digest, const client::ClientId& expectedClient,
+        foundation::Instant now) override;
+
+    [[nodiscard]] foundation::Status save(
+        oauth::ClientRequestSigningKey key) override;
+    [[nodiscard]] foundation::Result<std::optional<oauth::ClientRequestSigningKey>> find(
+        const client::ClientId& clientId) const override;
+    [[nodiscard]] foundation::Status remove(const client::ClientId& clientId) override;
+    [[nodiscard]] foundation::Status consume(
+        const client::ClientId& clientId, std::string_view jwtId,
+        foundation::Instant expiresAt, foundation::Instant now) override;
+    [[nodiscard]] foundation::Status consumeDpopReplay(
+        std::string_view jwkThumbprint, std::string_view jwtId,
+        foundation::Instant expiresAt, foundation::Instant now) override;
+    [[nodiscard]] foundation::Status consumeMtlsForwardingReplay(
+        std::string_view certificateThumbprint, std::string_view nonce,
+        foundation::Instant expiresAt, foundation::Instant now) override;
+
+    [[nodiscard]] foundation::Status storeInitial(
+        token::AccessTokenRecord access, token::RefreshTokenRecord refresh) override;
+    [[nodiscard]] foundation::Status storeAccessOnly(
+        token::AccessTokenRecord access) override;
+    [[nodiscard]] foundation::Result<token::AccessTokenRecord>
+    findAccess(const token::TokenDigest& digest) override;
+    [[nodiscard]] foundation::Result<token::RefreshTokenRecord>
+    findRefresh(const token::TokenDigest& digest) override;
+    [[nodiscard]] foundation::Status rotateRefresh(
+        const token::TokenDigest& presented, foundation::Instant now,
+        token::AccessTokenRecord replacementAccess,
+        token::RefreshTokenRecord replacementRefresh) override;
+    [[nodiscard]] foundation::Status revokeFamily(
+        const token::TokenFamilyId& family, foundation::Instant now) override;
+    [[nodiscard]] foundation::Status revokeToken(
+        const token::TokenDigest& digest, foundation::Instant now) override;
+
+private:
+    ConnectionPool* m_pool;
+};
+
 
 }

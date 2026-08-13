@@ -49,7 +49,8 @@ parseAssurance(std::string_view value) noexcept
 }
 
 foundation::Status ProviderTrustPolicy::trust(provider::ProviderId providerId,
-                                              provider::AssuranceLevel maximum)
+                                              provider::AssuranceLevel maximum,
+                                              bool allowSelfProvisioning)
 {
     if (providerId.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -62,8 +63,15 @@ foundation::Status ProviderTrustPolicy::trust(provider::ProviderId providerId,
             "Duplicate provider assurance policy was rejected instead of silently replacing "
             "the operator-reviewed cap.");
     }
+    m_selfProvisioning.emplace(providerId, allowSelfProvisioning);
     m_maximums.emplace(std::move(providerId), maximum);
     return foundation::ok();
+}
+
+bool ProviderTrustPolicy::maySelfProvision(const provider::ProviderId& providerId) const noexcept
+{
+    const auto found = m_selfProvisioning.find(providerId);
+    return found != m_selfProvisioning.end() && found->second;
 }
 
 std::optional<provider::AssuranceLevel>
@@ -122,15 +130,19 @@ AuthenticationService::AuthenticationService(
     provider::AuthenticationTransactionStore& transactions,
     identity::core::ExternalIdentityDirectory& identities,
     const foundation::ClockSource& clock, ProviderTrustPolicy trustPolicy,
-    foundation::Duration maximumTransactionLifetime)
+    foundation::Duration maximumTransactionLifetime,
+    identity::core::IdentityRepository* lifecycleRepository,
+    identity::core::OrganizationId organization)
     : m_providers(providers)
     , m_transactions(transactions)
     , m_identities(identities)
     , m_clock(clock)
     , m_trustPolicy(std::move(trustPolicy))
     , m_maximumTransactionLifetime(maximumTransactionLifetime)
+    , m_lifecycleRepository(lifecycleRepository)
+    , m_organization(std::move(organization))
 {
-    contract_assert(maximumTransactionLifetime > foundation::Duration::zero());
+    foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
 }
 
 std::optional<provider::AssuranceLevel> AuthenticationService::effectiveMaximum(
@@ -335,13 +347,71 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
         return foundation::fail(authenticationFailure(
             "Authentication completion could not resolve the external identity directory."));
     }
+    identity::core::IdentityId identity;
     if (!owner->has_value()) {
-        return foundation::fail(authenticationFailure(
-            "Authentication completion refused: the external identity has no explicit link to "
-            "a canonical identity."));
+        if (!m_trustPolicy.maySelfProvision(outcome->provider())
+            || m_lifecycleRepository == nullptr || m_organization.empty()) {
+            return foundation::fail(authenticationFailure(
+                "Authentication completion refused: the external identity has no explicit link to "
+                "a canonical identity."));
+        }
+        auto generated = security::randomTokenBase64Url(24U);
+        if (!generated) return foundation::fail(generated.error());
+        identity = identity::core::IdentityId{"opi_" + std::move(generated).value()};
+        auto canonical = identity::core::Identity::create(
+            identity, identity::core::SubjectKind::Human, completionFinishedAt);
+        if (!canonical) return foundation::fail(canonical.error());
+        auto added = m_lifecycleRepository->add(m_organization, canonical.value());
+        if (!added) return foundation::fail(added.error());
+        auto link = identity::core::IdentityLink::request(
+            identity, external, completionFinishedAt, std::chrono::minutes{5});
+        if (!link) {
+            static_cast<void>(m_lifecycleRepository->changeStatus(
+                m_organization, identity, identity::core::IdentityStatus::Deleted));
+            return foundation::fail(link.error());
+        }
+        auto required = link->requireVerification(completionFinishedAt);
+        if (!required) {
+            static_cast<void>(m_lifecycleRepository->changeStatus(
+                m_organization, identity, identity::core::IdentityStatus::Deleted));
+            return foundation::fail(required.error());
+        }
+        auto verified = link->markVerified(completionFinishedAt);
+        if (!verified) {
+            static_cast<void>(m_lifecycleRepository->changeStatus(
+                m_organization, identity, identity::core::IdentityStatus::Deleted));
+            return foundation::fail(verified.error());
+        }
+        auto completed = link->complete(completionFinishedAt);
+        if (!completed) {
+            static_cast<void>(m_lifecycleRepository->changeStatus(
+                m_organization, identity, identity::core::IdentityStatus::Deleted));
+            return foundation::fail(completed.error());
+        }
+        auto attached = m_identities.attach(link.value());
+        if (!attached) {
+            static_cast<void>(m_lifecycleRepository->changeStatus(
+                m_organization, identity, identity::core::IdentityStatus::Deleted));
+            return foundation::fail(attached.error());
+        }
+    } else {
+        identity = std::move(owner).value().value();
     }
-
-    identity::core::IdentityId identity = std::move(owner).value().value();
+    if (m_lifecycleRepository != nullptr) {
+        if (m_organization.empty()) {
+            return foundation::fail(authenticationFailure(
+                "Authentication lifecycle gate is configured without an organization."));
+        }
+        auto canonical = m_lifecycleRepository->findById(m_organization, identity);
+        if (!canonical.has_value()) {
+            return foundation::fail(authenticationFailure(
+                "Authentication lifecycle gate could not read the canonical identity."));
+        }
+        if (!canonical->has_value() || !canonical->value().canAuthenticate()) {
+            return foundation::fail(authenticationFailure(
+                "Authentication refused by canonical identity lifecycle state."));
+        }
+    }
     return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
 }
 

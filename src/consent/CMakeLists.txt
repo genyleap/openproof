@@ -1,0 +1,16 @@
+openproof_add_module(openproof_consent
+    MODULES
+        consent.cppm
+        model.cppm
+        repository.cppm
+        service.cppm
+    SOURCES
+        model.cpp
+        repository.cpp
+        service.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_client
+        openproof_identity_core
+)

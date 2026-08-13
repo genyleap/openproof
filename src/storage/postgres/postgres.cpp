@@ -1,6 +1,7 @@
 module;
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -22,9 +23,13 @@ module;
 
 module openproof.storage.postgres;
 
+import openproof.account;
 import openproof.administration;
 import openproof.audit;
+import openproof.consent;
 import openproof.identity.core;
+import openproof.provider.passkey;
+import openproof.resource;
 import openproof.security;
 
 namespace openproof::storage::postgres {
@@ -1512,6 +1517,148 @@ foundation::Status PostgresLocalAccountDirectory::enroll(
     return commit(connection);
 }
 
+foundation::Status PostgresLocalAccountDirectory::enrollPending(
+    identity::core::IdentityId canonicalIdentity,
+    identity::provider::ExternalSubject subject,
+    const foundation::SecretString& password,
+    std::optional<credentials::TotpSecret> totp)
+{
+    if (canonicalIdentity.empty() || subject.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A pending local account requires identity and subject.");
+    }
+    auto passwordHash = m_passwordHasher.hash(password);
+    if (!passwordHash) return foundation::fail(passwordHash.error());
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+
+    ResultPointer canonical = execParams(connection,
+        "SELECT status FROM openproof.identities WHERE id=$1",
+        {std::string{canonicalIdentity.value()}});
+    if (!tuplesOk(canonical.get())) {
+        return foundation::fail(databaseError(canonical.get(), "resolve pending local identity"));
+    }
+    if (PQntuples(canonical.get()) != 1) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "The canonical identity does not exist.");
+    }
+    auto status = parseInteger<unsigned int>(field(canonical.get(), 0, 0));
+    if (!status || status.value() == static_cast<unsigned int>(identity::core::IdentityStatus::Deleted)
+        || status.value() == static_cast<unsigned int>(identity::core::IdentityStatus::Merged)) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "The canonical identity cannot receive credentials.");
+    }
+
+    std::optional<std::vector<std::byte>> sealed;
+    if (totp.has_value()) {
+        auto encrypted = security::sealAes256Gcm(
+            m_totpKey, totp->bytes(),
+            "openproof/totp/v1:" + std::string{canonicalIdentity.value()});
+        if (!encrypted) return foundation::fail(encrypted.error());
+        sealed = std::move(encrypted).value();
+    }
+
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+
+    ResultPointer duplicate = execParams(connection,
+        "SELECT 1 FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(duplicate.get())) {
+        return failTransaction(databaseError(duplicate.get(), "check pending local subject"));
+    }
+    if (PQntuples(duplicate.get()) != 0) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::AlreadyExists,
+            "The local account already exists."});
+    }
+
+    ResultPointer insertedPassword = execParams(connection,
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,$2,(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+        {std::string{canonicalIdentity.value()}, std::string{passwordHash->encoded()}});
+    if (!commandOk(insertedPassword.get())) {
+        return failTransaction(databaseError(insertedPassword.get(), "enroll pending local password"));
+    }
+    if (sealed.has_value()) {
+        ResultPointer insertedTotp = execParams(connection,
+            "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES($1,decode($2,'hex'),$3,NULL,(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+            {std::string{canonicalIdentity.value()}, foundation::toHex(sealed.value()),
+             std::to_string(m_keyVersion)});
+        if (!commandOk(insertedTotp.get())) {
+            return failTransaction(databaseError(insertedTotp.get(), "enroll pending local TOTP"));
+        }
+    }
+    return commit(connection);
+}
+
+foundation::Status PostgresLocalAccountDirectory::rebindSubject(
+    const identity::core::IdentityId& identity,
+    const identity::provider::ExternalSubject& previous,
+    identity::provider::ExternalSubject replacement)
+{
+    if (identity.empty() || previous.empty() || replacement.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A local account rebind requires valid identifiers.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer credential = execParams(lease->get(),
+        "SELECT 1 FROM openproof.password_credentials WHERE identity_id=$1",
+        {std::string{identity.value()}});
+    if (!tuplesOk(credential.get())) {
+        return foundation::fail(databaseError(credential.get(), "confirm local credential for rebind"));
+    }
+    return PQntuples(credential.get()) == 1
+        ? foundation::ok()
+        : foundation::fail(authenticationFailure("Local account is unknown."));
+}
+
+foundation::Status PostgresLocalAccountDirectory::removePending(
+    const identity::core::IdentityId& identity,
+    const identity::provider::ExternalSubject& subject)
+{
+    if (identity.empty() || subject.empty()) return foundation::ok();
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    ResultPointer linked = execParams(connection,
+        "SELECT 1 FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(linked.get())) {
+        rollback(connection);
+        return foundation::fail(databaseError(linked.get(), "check pending local link"));
+    }
+    if (PQntuples(linked.get()) != 0) {
+        rollback(connection);
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "A linked local credential cannot be removed as pending.");
+    }
+    ResultPointer totp = execParams(connection,
+        "DELETE FROM openproof.totp_credentials WHERE identity_id=$1",
+        {std::string{identity.value()}});
+    if (!commandOk(totp.get())) {
+        rollback(connection);
+        return foundation::fail(databaseError(totp.get(), "remove pending local TOTP"));
+    }
+    ResultPointer password = execParams(connection,
+        "DELETE FROM openproof.password_credentials WHERE identity_id=$1",
+        {std::string{identity.value()}});
+    if (!commandOk(password.get())) {
+        rollback(connection);
+        return foundation::fail(databaseError(password.get(), "remove pending local password"));
+    }
+    return commit(connection);
+}
+
 foundation::Status PostgresLocalAccountDirectory::changePassword(
     const identity::provider::ExternalSubject& subject,
     const foundation::SecretString& password)
@@ -2372,5 +2519,2965 @@ foundation::Status PostgresAuthorizationDecisionSink::record(
     auto committed = commit(connection);
     return committed ? committed : failTransaction(committed.error());
 }
+
+}
+
+namespace openproof::storage::postgres {
+    namespace {
+
+        [[nodiscard]] foundation::Instant storedInstant(std::int64_t milliseconds) noexcept
+        {
+            return foundation::Instant{foundation::Duration{milliseconds}};
+        }
+
+        [[nodiscard]] foundation::Result<application::Application>
+        applicationFromRow(PGresult* result, int row)
+        {
+            auto environment = parseInteger<unsigned int>(field(result, row, 4));
+            auto status = parseInteger<unsigned int>(field(result, row, 5));
+            auto created = parseInteger<std::int64_t>(field(result, row, 6));
+            auto updated = parseInteger<std::int64_t>(field(result, row, 7));
+            if (!environment || !status || !created || !updated
+            || environment.value() > 2U || status.value() > 2U) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                "PostgreSQL returned malformed application data.");
+            }
+            return application::Application::restore(
+            application::ApplicationId{field(result, row, 0)},
+            identity::core::OrganizationId{field(result, row, 1)},
+            field(result, row, 2), field(result, row, 3),
+            static_cast<application::Environment>(environment.value()),
+            static_cast<application::ApplicationStatus>(status.value()),
+            storedInstant(created.value()), storedInstant(updated.value()));
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<client::RedirectUri>>
+        loadRedirectUris(PGconn* connection, const client::ClientId& id, client::ClientKind kind)
+        {
+            ResultPointer result = execParams(connection,
+            "SELECT redirect_uri FROM openproof.oauth_client_redirect_uris "
+            "WHERE client_id=$1 ORDER BY redirect_uri",
+            {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(databaseError(result.get(), "load OAuth client redirect URIs"));
+            }
+            std::vector<client::RedirectUri> values;
+            values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                auto parsed = client::RedirectUri::create(field(result.get(), row, 0), kind);
+                if (!parsed) return foundation::fail(parsed.error());
+                values.push_back(std::move(parsed).value());
+            }
+            return values;
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<client::Scope>>
+        loadClientScopes(PGconn* connection, const client::ClientId& id)
+        {
+            ResultPointer result = execParams(connection,
+            "SELECT scope FROM openproof.oauth_client_scopes WHERE client_id=$1 ORDER BY scope",
+            {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(databaseError(result.get(), "load OAuth client scopes"));
+            }
+            std::vector<client::Scope> values;
+            values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                auto parsed = client::Scope::create(field(result.get(), row, 0));
+                if (!parsed) return foundation::fail(parsed.error());
+                values.push_back(std::move(parsed).value());
+            }
+            return values;
+        }
+
+        [[nodiscard]] foundation::Result<client::Client>
+        clientFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            auto kind = parseInteger<unsigned int>(field(result, row, 3));
+            auto status = parseInteger<unsigned int>(field(result, row, 4));
+            auto created = parseInteger<std::int64_t>(field(result, row, 6));
+            auto updated = parseInteger<std::int64_t>(field(result, row, 7));
+            if (!kind || !status || !created || !updated || kind.value() > 3U || status.value() > 2U) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                "PostgreSQL returned malformed OAuth client data.");
+            }
+            const auto clientKind = static_cast<client::ClientKind>(kind.value());
+            client::ClientId id{field(result, row, 0)};
+            auto redirects = loadRedirectUris(connection, id, clientKind);
+            auto scopes = loadClientScopes(connection, id);
+            if (!redirects || !scopes) return foundation::fail(redirects ? scopes.error() : redirects.error());
+            std::optional<client::ClientSecretDigest> secret;
+            if (!PQgetisnull(result, row, 5)) {
+                auto digest = parseDigest(field(result, row, 5));
+                if (!digest) return foundation::fail(digest.error());
+                secret.emplace(digest.value());
+            }
+            return client::Client::restore(
+            std::move(id), application::ApplicationId{field(result, row, 1)},
+            field(result, row, 2), clientKind,
+            static_cast<client::ClientStatus>(status.value()),
+            std::move(redirects).value(), std::move(scopes).value(), std::move(secret),
+            storedInstant(created.value()), storedInstant(updated.value()));
+        }
+
+        [[nodiscard]] foundation::Status insertClientChildren(PGconn* connection,
+        const client::Client& value)
+        {
+            for (const auto& redirect : value.redirectUris()) {
+                auto status = runCommand(connection,
+                "INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) VALUES($1,$2)",
+                {std::string{value.id().value()}, std::string{redirect.value()}},
+                "insert OAuth client redirect URI");
+                if (!status) return status;
+            }
+            for (const auto& scope : value.scopes()) {
+                auto status = runCommand(connection,
+                "INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,$2)",
+                {std::string{value.id().value()}, std::string{scope.value()}},
+                "insert OAuth client scope");
+                if (!status) return status;
+            }
+            return foundation::ok();
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<std::string>>
+        loadResourceScopes(PGconn* connection, const resource::ResourceId& id)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT scope FROM openproof.oauth_resource_scopes "
+                "WHERE resource_id=$1 ORDER BY scope",
+                {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(
+                    databaseError(result.get(), "load OAuth resource scopes"));
+            }
+            std::vector<std::string> scopes;
+            scopes.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                scopes.push_back(field(result.get(), row, 0));
+            }
+            return scopes;
+        }
+
+        [[nodiscard]] foundation::Result<resource::ResourceServer>
+        resourceFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            auto status = parseInteger<unsigned int>(field(result, row, 3));
+            auto created = parseInteger<std::int64_t>(field(result, row, 4));
+            auto updated = parseInteger<std::int64_t>(field(result, row, 5));
+            if (!status || !created || !updated || status.value() > 2U) {
+                return foundation::fail(
+                    foundation::ErrorCode::Internal,
+                    "PostgreSQL returned malformed OAuth resource data.");
+            }
+            resource::ResourceId id{field(result, row, 0)};
+            auto scopes = loadResourceScopes(connection, id);
+            if (!scopes) return foundation::fail(scopes.error());
+            return resource::ResourceServer::restore(
+                std::move(id), field(result, row, 1), field(result, row, 2),
+                std::move(scopes).value(),
+                static_cast<resource::ResourceStatus>(status.value()),
+                storedInstant(created.value()), storedInstant(updated.value()));
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<std::string>>
+        loadServiceAudiences(PGconn* connection, const client::ClientId& id)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT audience FROM openproof.service_identity_audiences "
+                "WHERE client_id=$1 ORDER BY audience",
+                {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(
+                    databaseError(result.get(), "load service identity audiences"));
+            }
+            std::vector<std::string> values;
+            values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                values.push_back(field(result.get(), row, 0));
+            }
+            return values;
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<std::string>>
+        loadServiceScopes(PGconn* connection, const client::ClientId& id)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT scope FROM openproof.service_identity_scopes "
+                "WHERE client_id=$1 ORDER BY scope",
+                {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(
+                    databaseError(result.get(), "load service identity scopes"));
+            }
+            std::vector<std::string> values;
+            values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                values.push_back(field(result.get(), row, 0));
+            }
+            return values;
+        }
+
+        [[nodiscard]] foundation::Result<resource::ServiceIdentity>
+        serviceIdentityFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            auto created = parseInteger<std::int64_t>(field(result, row, 3));
+            auto updated = parseInteger<std::int64_t>(field(result, row, 4));
+            if (!created || !updated) {
+                return foundation::fail(
+                    foundation::ErrorCode::Internal,
+                    "PostgreSQL returned malformed service identity data.");
+            }
+            client::ClientId clientId{field(result, row, 0)};
+            auto audiences = loadServiceAudiences(connection, clientId);
+            auto scopes = loadServiceScopes(connection, clientId);
+            if (!audiences || !scopes) {
+                return foundation::fail(audiences ? scopes.error() : audiences.error());
+            }
+            return resource::ServiceIdentity::restore(
+                identity::core::IdentityId{field(result, row, 1)},
+                std::move(clientId), std::move(audiences).value(),
+                std::move(scopes).value(), field(result, row, 2) == "t",
+                storedInstant(created.value()), storedInstant(updated.value()));
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<std::string>>
+        loadConsentScopes(PGconn* connection, const consent::ConsentId& id)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT scope FROM openproof.oauth_consent_scopes "
+                "WHERE consent_id=$1 ORDER BY scope",
+                {std::string{id.value()}});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(
+                    databaseError(result.get(), "load OAuth consent scopes"));
+            }
+            std::vector<std::string> scopes;
+            scopes.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                scopes.push_back(field(result.get(), row, 0));
+            }
+            return scopes;
+        }
+
+        [[nodiscard]] foundation::Result<consent::ConsentGrant>
+        consentFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            auto granted = parseInteger<std::int64_t>(field(result, row, 4));
+            if (!granted) return foundation::fail(granted.error());
+            std::optional<foundation::Instant> expires;
+            if (!PQgetisnull(result, row, 5)) {
+                auto parsed = parseInteger<std::int64_t>(field(result, row, 5));
+                if (!parsed) return foundation::fail(parsed.error());
+                expires = storedInstant(parsed.value());
+            }
+            std::optional<foundation::Instant> revoked;
+            if (!PQgetisnull(result, row, 6)) {
+                auto parsed = parseInteger<std::int64_t>(field(result, row, 6));
+                if (!parsed) return foundation::fail(parsed.error());
+                revoked = storedInstant(parsed.value());
+            }
+            consent::ConsentId id{field(result, row, 0)};
+            auto scopes = loadConsentScopes(connection, id);
+            if (!scopes) return foundation::fail(scopes.error());
+            return consent::ConsentGrant::restore(
+                std::move(id), identity::core::IdentityId{field(result, row, 1)},
+                client::ClientId{field(result, row, 2)}, field(result, row, 3),
+                std::move(scopes).value(), storedInstant(granted.value()),
+                expires, revoked);
+        }
+
+        [[nodiscard]] unsigned int factorsValue(
+        const identity::provider::AuthenticationStrength& strength) noexcept
+        {
+            return static_cast<unsigned int>(strength.factors());
+        }
+
+        [[nodiscard]] foundation::Result<std::vector<client::Scope>>
+        loadDeviceScopes(PGconn* connection, const oauth::DeviceCodeDigest& deviceCode)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT scope FROM openproof.oauth_device_authorization_scopes "
+                "WHERE device_digest=decode($1,'hex') ORDER BY scope",
+                {foundation::toHex(deviceCode.bytes())});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(databaseError(result.get(), "load device authorization scopes"));
+            }
+            std::vector<client::Scope> scopes;
+            scopes.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                auto scope = client::Scope::create(field(result.get(), row, 0));
+                if (!scope) return foundation::fail(scope.error());
+                scopes.push_back(std::move(scope).value());
+            }
+            return scopes;
+        }
+
+        [[nodiscard]] foundation::Result<oauth::DeviceAuthorization>
+        deviceAuthorizationFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            if (PQnfields(result) != 15) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                                        "PostgreSQL returned an invalid device authorization shape.");
+            }
+            auto deviceDigest = parseDigest(field(result, row, 0));
+            auto userDigest = parseDigest(field(result, row, 1));
+            auto status = parseInteger<unsigned int>(field(result, row, 4));
+            auto issuedAt = parseInteger<std::int64_t>(field(result, row, 5));
+            auto expiresAt = parseInteger<std::int64_t>(field(result, row, 6));
+            auto pollInterval = parseInteger<std::int64_t>(field(result, row, 7));
+            if (!deviceDigest || !userDigest || !status || !issuedAt || !expiresAt
+                || !pollInterval || status.value() > 3U || pollInterval.value() <= 0) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                                        "PostgreSQL returned malformed device authorization data.");
+            }
+
+            oauth::DeviceCodeDigest deviceCode{deviceDigest.value()};
+            auto scopes = loadDeviceScopes(connection, deviceCode);
+            if (!scopes) return foundation::fail(scopes.error());
+
+            std::optional<std::string> resource;
+            if (PQgetisnull(result, row, 3) == 0) resource = field(result, row, 3);
+            std::optional<identity::core::IdentityId> identity;
+            std::optional<identity::provider::ProviderId> provider;
+            std::optional<identity::provider::AssuranceLevel> assurance;
+            std::optional<identity::provider::AuthenticationStrength> strength;
+            std::optional<foundation::Instant> authenticatedAt;
+            if (PQgetisnull(result, row, 8) == 0) {
+                if (PQgetisnull(result, row, 9) != 0 || PQgetisnull(result, row, 10) != 0
+                    || PQgetisnull(result, row, 11) != 0 || PQgetisnull(result, row, 12) != 0
+                    || PQgetisnull(result, row, 13) != 0) {
+                    return foundation::fail(foundation::ErrorCode::Internal,
+                                            "PostgreSQL returned incomplete device authorization claims.");
+                }
+                auto assuranceValue = parseInteger<unsigned int>(field(result, row, 10));
+                auto factors = parseInteger<unsigned int>(field(result, row, 11));
+                auto authenticated = parseInteger<std::int64_t>(field(result, row, 13));
+                if (!assuranceValue || !factors || !authenticated
+                    || assuranceValue.value() > 4U || factors.value() > 7U) {
+                    return foundation::fail(foundation::ErrorCode::Internal,
+                                            "PostgreSQL returned malformed device authorization claims.");
+                }
+                identity = identity::core::IdentityId{field(result, row, 8)};
+                provider = identity::provider::ProviderId{field(result, row, 9)};
+                assurance = static_cast<identity::provider::AssuranceLevel>(assuranceValue.value());
+                strength = identity::provider::AuthenticationStrength{
+                    static_cast<identity::provider::AuthenticationFactor>(factors.value()),
+                    field(result, row, 12) == "t"};
+                authenticatedAt = storedInstant(authenticated.value());
+            }
+            std::optional<foundation::Instant> lastPollAt;
+            if (PQgetisnull(result, row, 14) == 0) {
+                auto lastPoll = parseInteger<std::int64_t>(field(result, row, 14));
+                if (!lastPoll) return foundation::fail(lastPoll.error());
+                lastPollAt = storedInstant(lastPoll.value());
+            }
+            return oauth::DeviceAuthorization::restore(
+                std::move(deviceCode), oauth::DeviceUserCodeDigest{userDigest.value()},
+                client::ClientId{field(result, row, 2)}, std::move(scopes).value(),
+                std::move(resource), storedInstant(issuedAt.value()),
+                storedInstant(expiresAt.value()), foundation::Duration{pollInterval.value()},
+                static_cast<oauth::DeviceAuthorizationStatus>(status.value()),
+                std::move(identity), std::move(provider), std::move(assurance),
+                std::move(strength), authenticatedAt, lastPollAt);
+        }
+
+        constexpr std::string_view kDeviceAuthorizationColumns =
+            "encode(device_digest,'hex'),encode(user_code_digest,'hex'),client_id,resource,status,"
+            "issued_at_ms,expires_at_ms,poll_interval_ms,identity_id,provider,assurance,factors,"
+            "phishing_resistant,authenticated_at_ms,last_poll_at_ms";
+
+        [[nodiscard]] foundation::Result<std::vector<client::Scope>>
+        loadPushedAuthorizationScopes(PGconn* connection,
+                                      const oauth::PushedRequestDigest& digest)
+        {
+            ResultPointer result = execParams(
+                connection,
+                "SELECT scope FROM openproof.oauth_pushed_authorization_request_scopes "
+                "WHERE request_digest=decode($1,'hex') ORDER BY scope",
+                {foundation::toHex(digest.bytes())});
+            if (!tuplesOk(result.get())) {
+                return foundation::fail(
+                    databaseError(result.get(), "load pushed authorization request scopes"));
+            }
+            std::vector<client::Scope> scopes;
+            scopes.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+            for (int row = 0; row < PQntuples(result.get()); ++row) {
+                auto parsed = client::Scope::create(field(result.get(), row, 0));
+                if (!parsed) return foundation::fail(parsed.error());
+                scopes.push_back(std::move(parsed).value());
+            }
+            return scopes;
+        }
+
+        [[nodiscard]] foundation::Result<oauth::PushedAuthorizationRequest>
+        pushedAuthorizationFromRow(PGconn* connection, PGresult* result, int row)
+        {
+            if (PQnfields(result) != 11) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                                        "PostgreSQL returned an invalid PAR shape.");
+            }
+            auto digestValue = parseDigest(field(result, row, 0));
+            auto responseMode = parseInteger<unsigned int>(field(result, row, 8));
+            auto issuedAt = parseInteger<std::int64_t>(field(result, row, 9));
+            auto expiresAt = parseInteger<std::int64_t>(field(result, row, 10));
+            if (!digestValue || !responseMode || !issuedAt || !expiresAt
+                || responseMode.value() > 1U) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                                        "PostgreSQL returned malformed PAR data.");
+            }
+            oauth::PushedRequestDigest digest{digestValue.value()};
+            auto requestedScopes = loadPushedAuthorizationScopes(connection, digest);
+            if (!requestedScopes) return foundation::fail(requestedScopes.error());
+            auto challenge = oauth::PkceChallenge::create(field(result, row, 3));
+            if (!challenge) return foundation::fail(challenge.error());
+            std::optional<std::string> state;
+            if (PQgetisnull(result, row, 4) == 0) state = field(result, row, 4);
+            std::optional<std::string> nonce;
+            if (PQgetisnull(result, row, 5) == 0) nonce = field(result, row, 5);
+            std::optional<foundation::Duration> maximumAuthenticationAge;
+            if (PQgetisnull(result, row, 6) == 0) {
+                auto value = parseInteger<std::int64_t>(field(result, row, 6));
+                if (!value || value.value() < 0) {
+                    return foundation::fail(foundation::ErrorCode::Internal,
+                                            "PostgreSQL returned malformed PAR max_age.");
+                }
+                maximumAuthenticationAge = foundation::Duration{value.value()};
+            }
+            std::optional<std::string> resource;
+            if (PQgetisnull(result, row, 7) == 0) resource = field(result, row, 7);
+            auto request = oauth::AuthorizationRequest::create(
+                client::ClientId{field(result, row, 1)}, field(result, row, 2),
+                std::move(requestedScopes).value(), std::move(challenge).value(),
+                std::move(state), std::move(nonce), maximumAuthenticationAge,
+                std::move(resource),
+                static_cast<oauth::AuthorizationResponseMode>(responseMode.value()));
+            if (!request) return foundation::fail(request.error());
+            return oauth::PushedAuthorizationRequest::restore(
+                std::move(digest), std::move(request).value(),
+                storedInstant(issuedAt.value()), storedInstant(expiresAt.value()));
+        }
+
+        constexpr std::string_view kPushedAuthorizationColumns =
+            "encode(request_digest,'hex'),client_id,redirect_uri,code_challenge,state,nonce,"
+            "maximum_authentication_age_ms,resource,response_mode,issued_at_ms,expires_at_ms";
+
+        [[nodiscard]] foundation::Result<token::TokenContext>
+        loadTokenContext(PGconn* connection, const token::TokenFamilyId& family)
+        {
+            ResultPointer base = execParams(connection,
+            "SELECT client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms,"
+            "sender_constraint_kind,sender_constraint_value "
+            "FROM openproof.oauth_token_families WHERE id=$1",
+            {std::string{family.value()}});
+            if (!tuplesOk(base.get())) return foundation::fail(databaseError(base.get(), "load OAuth token family"));
+            if (PQntuples(base.get()) != 1) {
+                return foundation::fail(authenticationFailure("OAuth token family is unavailable."));
+            }
+            auto assurance = parseInteger<unsigned int>(field(base.get(), 0, 3));
+            auto factors = parseInteger<unsigned int>(field(base.get(), 0, 4));
+            auto authenticatedAt = parseInteger<std::int64_t>(field(base.get(), 0, 6));
+            if (!assurance || !factors || !authenticatedAt || assurance.value() > 4U || factors.value() > 7U) {
+                return foundation::fail(foundation::ErrorCode::Internal,
+                "PostgreSQL returned malformed OAuth token context.");
+            }
+            ResultPointer scopesResult = execParams(connection,
+            "SELECT scope FROM openproof.oauth_token_family_scopes WHERE family_id=$1 ORDER BY scope",
+            {std::string{family.value()}});
+            if (!tuplesOk(scopesResult.get())) {
+                return foundation::fail(databaseError(scopesResult.get(), "load OAuth token scopes"));
+            }
+            std::vector<std::string> scopes;
+            for (int row = 0; row < PQntuples(scopesResult.get()); ++row) {
+                scopes.push_back(field(scopesResult.get(), row, 0));
+            }
+            ResultPointer audiencesResult = execParams(
+                connection,
+                "SELECT audience FROM openproof.oauth_token_family_audiences "
+                "WHERE family_id=$1 ORDER BY audience",
+                {std::string{family.value()}});
+            if (!tuplesOk(audiencesResult.get())) {
+                return foundation::fail(
+                    databaseError(audiencesResult.get(), "load OAuth token audiences"));
+            }
+            std::vector<std::string> audiences;
+            for (int row = 0; row < PQntuples(audiencesResult.get()); ++row) {
+                audiences.push_back(field(audiencesResult.get(), row, 0));
+            }
+            std::optional<token::SenderConstraint> senderConstraint;
+            if (PQgetisnull(base.get(), 0, 7) == 0 || PQgetisnull(base.get(), 0, 8) == 0) {
+                if (PQgetisnull(base.get(), 0, 7) != 0 || PQgetisnull(base.get(), 0, 8) != 0) {
+                    return foundation::fail(foundation::ErrorCode::Internal,
+                                            "PostgreSQL returned malformed OAuth sender constraint.");
+                }
+                auto kind = parseInteger<unsigned int>(field(base.get(), 0, 7));
+                if (!kind || kind.value() > 1U) {
+                    return foundation::fail(foundation::ErrorCode::Internal,
+                                            "PostgreSQL returned malformed OAuth sender constraint.");
+                }
+                auto constraint = token::SenderConstraint::create(
+                    static_cast<token::SenderConstraintKind>(kind.value()),
+                    field(base.get(), 0, 8));
+                if (!constraint) return foundation::fail(constraint.error());
+                senderConstraint = std::move(constraint).value();
+            }
+            return token::TokenContext{
+                client::ClientId{field(base.get(), 0, 0)},
+                identity::core::IdentityId{field(base.get(), 0, 1)},
+                identity::provider::ProviderId{field(base.get(), 0, 2)},
+                static_cast<identity::provider::AssuranceLevel>(assurance.value()),
+                identity::provider::AuthenticationStrength{
+                    static_cast<identity::provider::AuthenticationFactor>(factors.value()),
+                    field(base.get(), 0, 5) == "t"},
+                std::move(scopes), storedInstant(authenticatedAt.value()),
+                std::move(audiences), std::move(senderConstraint)};
+        }
+
+        [[nodiscard]] foundation::Status revokeTokenFamilySql(
+        PGconn* connection, const token::TokenFamilyId& family, foundation::Instant now)
+        {
+            auto familyStatus = runCommand(connection,
+            "UPDATE openproof.oauth_token_families SET revoked_at_ms=COALESCE(revoked_at_ms,$2) WHERE id=$1",
+            {std::string{family.value()}, instant(now)}, "revoke OAuth token family");
+            if (!familyStatus) return familyStatus;
+            auto accessStatus = runCommand(connection,
+            "UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=COALESCE(revoked_at_ms,$2) "
+            "WHERE family_id=$1 AND state=0",
+            {std::string{family.value()}, instant(now)}, "revoke OAuth family access tokens");
+            if (!accessStatus) return accessStatus;
+            return runCommand(connection,
+            "UPDATE openproof.oauth_refresh_tokens SET state=2,changed_at_ms=COALESCE(changed_at_ms,$2) "
+            "WHERE family_id=$1 AND state<>2",
+            {std::string{family.value()}, instant(now)}, "revoke OAuth family refresh tokens");
+        }
+
+    }
+
+    PostgresAccountRepository::PostgresAccountRepository(ConnectionPool& pool)
+        : m_pool(&pool)
+    {
+    }
+
+    foundation::Status PostgresAccountRepository::replace(account::VerificationChallenge challenge)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const auto failTransaction = [&](const foundation::Error& error) {
+            rollback(connection);
+            return foundation::fail(error);
+        };
+
+        auto removed = runCommand(
+            connection,
+            "DELETE FROM openproof.account_verification_challenges "
+            "WHERE identity_id=$1 AND purpose=$2",
+            {std::string{challenge.identity().value()},
+             integer(static_cast<unsigned int>(challenge.purpose()))},
+            "replace account verification challenge");
+        if (!removed) return failTransaction(removed.error());
+
+        auto inserted = runCommand(
+            connection,
+            "INSERT INTO openproof.account_verification_challenges("
+            "id,identity_id,purpose,channel,destination,secret_digest,attempts,created_at_ms,expires_at_ms) "
+            "VALUES($1,$2,$3,$4,$5,decode($6,'hex'),$7,$8,$9)",
+            {std::string{challenge.id().value()}, std::string{challenge.identity().value()},
+             integer(static_cast<unsigned int>(challenge.purpose())),
+             integer(static_cast<unsigned int>(challenge.channel())),
+             std::string{challenge.destination()}, foundation::toHex(challenge.digest().bytes()),
+             integer(static_cast<std::int64_t>(challenge.attempts())),
+             instant(challenge.createdAt()), instant(challenge.expiresAt())},
+            "insert account verification challenge");
+        if (!inserted) return failTransaction(inserted.error());
+
+        auto committed = commit(connection);
+        return committed ? committed : failTransaction(committed.error());
+    }
+
+    foundation::Result<account::VerificationChallenge> PostgresAccountRepository::consume(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts)
+    {
+        if (maximumAttempts == 0U) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "Verification attempt policy is invalid.");
+        }
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return foundation::fail(begun.error());
+        const auto failTransaction = [&](const foundation::Error& error)
+            -> foundation::Result<account::VerificationChallenge> {
+            rollback(connection);
+            return foundation::fail(error);
+        };
+
+        ResultPointer row = execParams(
+            connection,
+            "SELECT identity_id,purpose,channel,destination,encode(secret_digest,'hex'),"
+            "attempts,created_at_ms,expires_at_ms "
+            "FROM openproof.account_verification_challenges WHERE id=$1 FOR UPDATE",
+            {std::string{id.value()}});
+        if (!tuplesOk(row.get())) {
+            return failTransaction(databaseError(row.get(), "consume account verification challenge"));
+        }
+        if (PQntuples(row.get()) != 1) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure(
+                "Verification challenge is unknown or consumed."));
+        }
+
+        auto purpose = parseInteger<unsigned int>(field(row.get(), 0, 1));
+        auto channel = parseInteger<unsigned int>(field(row.get(), 0, 2));
+        auto attempts = parseInteger<std::uint32_t>(field(row.get(), 0, 5));
+        auto created = parseInteger<std::int64_t>(field(row.get(), 0, 6));
+        auto expires = parseInteger<std::int64_t>(field(row.get(), 0, 7));
+        auto decoded = foundation::fromHex(field(row.get(), 0, 4));
+        if (!purpose || !channel || !attempts || !created || !expires
+            || purpose.value() > 3U || channel.value() > 1U
+            || !decoded.has_value() || decoded->size() != 32U) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::Internal,
+                std::string{foundation::defaultErrorMessage(foundation::ErrorCode::Internal)},
+                "PostgreSQL returned malformed account verification data."});
+        }
+
+        std::array<std::byte, 32> storedBytes{};
+        std::ranges::copy(decoded.value(), storedBytes.begin());
+        const account::VerificationDigest stored{storedBytes};
+        const foundation::Instant expiresAt = storedInstant(expires.value());
+        if (now >= expiresAt || attempts.value() >= maximumAttempts) {
+            auto removed = runCommand(
+                connection,
+                "DELETE FROM openproof.account_verification_challenges WHERE id=$1",
+                {std::string{id.value()}}, "expire account verification challenge");
+            if (!removed) return failTransaction(removed.error());
+            auto committed = commit(connection);
+            if (!committed) return failTransaction(committed.error());
+            return foundation::fail(authenticationFailure(
+                "Verification challenge expired or exhausted."));
+        }
+
+        if (!security::constantTimeEquals(stored.bytes(), presented.bytes())) {
+            const std::uint32_t nextAttempts = attempts.value() + 1U;
+            foundation::Status changed = nextAttempts >= maximumAttempts
+                ? runCommand(connection,
+                    "DELETE FROM openproof.account_verification_challenges WHERE id=$1",
+                    {std::string{id.value()}}, "exhaust account verification challenge")
+                : runCommand(connection,
+                    "UPDATE openproof.account_verification_challenges SET attempts=$2 WHERE id=$1",
+                    {std::string{id.value()}, integer(static_cast<std::int64_t>(nextAttempts))},
+                    "record account verification mismatch");
+            if (!changed) return failTransaction(changed.error());
+            auto committed = commit(connection);
+            if (!committed) return failTransaction(committed.error());
+            return foundation::fail(authenticationFailure(
+                "Verification secret did not match."));
+        }
+
+        auto restored = account::VerificationChallenge::restore(
+            id, identity::core::IdentityId{field(row.get(), 0, 0)},
+            static_cast<account::VerificationPurpose>(purpose.value()),
+            static_cast<account::VerificationChannel>(channel.value()),
+            field(row.get(), 0, 3), stored,
+            storedInstant(created.value()), expiresAt, attempts.value());
+        if (!restored) return failTransaction(restored.error());
+
+        auto removed = runCommand(
+            connection,
+            "DELETE FROM openproof.account_verification_challenges WHERE id=$1",
+            {std::string{id.value()}}, "consume account verification challenge");
+        if (!removed) return failTransaction(removed.error());
+        auto committed = commit(connection);
+        if (!committed) return failTransaction(committed.error());
+        return std::move(restored).value();
+    }
+
+    foundation::Status PostgresAccountRepository::reserveSubject(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& identity,
+        foundation::Instant now, foundation::Instant expiresAt)
+    {
+        if (external.providerId().empty() || external.subject().empty() || identity.empty()
+            || expiresAt <= now) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "An account subject reservation is invalid.");
+        }
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const auto failTransaction = [&](const foundation::Error& error) {
+            rollback(connection);
+            return foundation::fail(error);
+        };
+
+        auto expired = runCommand(
+            connection,
+            "DELETE FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 AND expires_at_ms<=$3",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()},
+             instant(now)}, "expire pending external identity reservation");
+        if (!expired) return failTransaction(expired.error());
+
+        ResultPointer existing = execParams(
+            connection,
+            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()}});
+        if (!tuplesOk(existing.get())) {
+            return failTransaction(databaseError(existing.get(), "read pending external identity reservation"));
+        }
+        foundation::Status changed = foundation::ok();
+        if (PQntuples(existing.get()) == 1) {
+            if (field(existing.get(), 0, 0) != identity.value()) {
+                rollback(connection);
+                return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                        "That account identifier is already reserved.");
+            }
+            changed = runCommand(
+                connection,
+                "UPDATE openproof.pending_external_identity_reservations SET expires_at_ms=$3 "
+                "WHERE provider=$1 AND external_subject=$2",
+                {std::string{external.providerId().value()}, std::string{external.subject().value()},
+                 instant(expiresAt)}, "extend pending external identity reservation");
+        } else {
+            changed = runCommand(
+                connection,
+                "INSERT INTO openproof.pending_external_identity_reservations("
+                "provider,external_subject,identity_id,expires_at_ms) VALUES($1,$2,$3,$4)",
+                {std::string{external.providerId().value()}, std::string{external.subject().value()},
+                 std::string{identity.value()}, instant(expiresAt)},
+                "reserve pending external identity subject");
+        }
+        if (!changed) return failTransaction(changed.error());
+        auto committed = commit(connection);
+        return committed ? committed : failTransaction(committed.error());
+    }
+
+    foundation::Result<std::optional<identity::core::IdentityId>>
+    PostgresAccountRepository::reservedOwner(
+        const identity::core::ExternalIdentityRef& external,
+        foundation::Instant now) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 AND expires_at_ms>$3",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()},
+             instant(now)});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "read pending external identity reservation"));
+        }
+        if (PQntuples(result.get()) == 0) {
+            return std::optional<identity::core::IdentityId>{};
+        }
+        return std::optional<identity::core::IdentityId>{
+            identity::core::IdentityId{field(result.get(), 0, 0)}};
+    }
+
+    foundation::Status PostgresAccountRepository::releaseSubject(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const auto failTransaction = [&](const foundation::Error& error) {
+            rollback(connection);
+            return foundation::fail(error);
+        };
+        ResultPointer existing = execParams(
+            connection,
+            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()}});
+        if (!tuplesOk(existing.get())) {
+            return failTransaction(databaseError(existing.get(), "release pending external identity reservation"));
+        }
+        if (PQntuples(existing.get()) == 0) {
+            auto committed = commit(connection);
+            return committed ? committed : failTransaction(committed.error());
+        }
+        if (field(existing.get(), 0, 0) != expectedOwner.value()) {
+            rollback(connection);
+            return foundation::fail(foundation::ErrorCode::PermissionDenied,
+                                    "That account reservation belongs to another identity.");
+        }
+        auto removed = runCommand(
+            connection,
+            "DELETE FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()}},
+            "release pending external identity reservation");
+        if (!removed) return failTransaction(removed.error());
+        auto committed = commit(connection);
+        return committed ? committed : failTransaction(committed.error());
+    }
+
+    PostgresResourceRepository::PostgresResourceRepository(ConnectionPool& pool)
+        : m_pool(&pool)
+    {
+    }
+
+    foundation::Status PostgresResourceRepository::add(resource::ResourceServer value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_resources"
+            "(id,audience,display_name,status,created_at_ms,updated_at_ms) "
+            "VALUES($1,$2,$3,$4,$5,$6)",
+            {std::string{value.id().value()}, std::string{value.audience()},
+             std::string{value.displayName()},
+             integer(static_cast<unsigned int>(value.status())),
+             instant(value.createdAt()), instant(value.updatedAt())});
+        if (!commandOk(inserted.get())) {
+            auto failure = databaseError(inserted.get(), "insert OAuth resource");
+            rollback(connection);
+            return foundation::fail(failure);
+        }
+        for (const auto& scope : value.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) "
+                "VALUES($1,$2)",
+                {std::string{value.id().value()}, scope},
+                "insert OAuth resource scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresResourceRepository::save(
+        const resource::ResourceServer& value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        ResultPointer updated = execParams(
+            connection,
+            "UPDATE openproof.oauth_resources SET display_name=$2,status=$3,updated_at_ms=$4 "
+            "WHERE id=$1 AND audience=$5",
+            {std::string{value.id().value()}, std::string{value.displayName()},
+             integer(static_cast<unsigned int>(value.status())), instant(value.updatedAt()),
+             std::string{value.audience()}});
+        if (!commandOk(updated.get()) || std::string_view{PQcmdTuples(updated.get())} != "1") {
+            const auto failure = commandOk(updated.get())
+                ? foundation::Error{foundation::ErrorCode::NotFound}
+                : databaseError(updated.get(), "save OAuth resource");
+            rollback(connection);
+            return foundation::fail(failure);
+        }
+        auto removed = runCommand(
+            connection,
+            "DELETE FROM openproof.oauth_resource_scopes WHERE resource_id=$1",
+            {std::string{value.id().value()}}, "replace OAuth resource scopes");
+        if (!removed) {
+            rollback(connection);
+            return removed;
+        }
+        for (const auto& scope : value.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,$2)",
+                {std::string{value.id().value()}, scope}, "insert OAuth resource scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<std::optional<resource::ResourceServer>>
+    PostgresResourceRepository::findByAudience(std::string_view audience) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT id,audience,display_name,status,created_at_ms,updated_at_ms "
+            "FROM openproof.oauth_resources WHERE audience=$1",
+            {std::string{audience}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find OAuth resource"));
+        }
+        if (PQntuples(result.get()) == 0) return std::optional<resource::ResourceServer>{};
+        auto restored = resourceFromRow(lease->get(), result.get(), 0);
+        if (!restored) return foundation::fail(restored.error());
+        return std::optional<resource::ResourceServer>{std::move(restored).value()};
+    }
+
+    foundation::Result<std::vector<resource::ResourceServer>>
+    PostgresResourceRepository::list() const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = exec(
+            lease->get(),
+            "SELECT id,audience,display_name,status,created_at_ms,updated_at_ms "
+            "FROM openproof.oauth_resources ORDER BY audience");
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "list OAuth resources"));
+        }
+        std::vector<resource::ResourceServer> values;
+        values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+        for (int row = 0; row < PQntuples(result.get()); ++row) {
+            auto restored = resourceFromRow(lease->get(), result.get(), row);
+            if (!restored) return foundation::fail(restored.error());
+            values.push_back(std::move(restored).value());
+        }
+        return values;
+    }
+
+    foundation::Status PostgresResourceRepository::saveService(
+        resource::ServiceIdentity value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        ResultPointer current = execParams(
+            connection,
+            "SELECT identity_id FROM openproof.service_identities WHERE client_id=$1 FOR UPDATE",
+            {std::string{value.client().value()}});
+        if (!tuplesOk(current.get())) {
+            auto failure = databaseError(current.get(), "lock service identity");
+            rollback(connection);
+            return foundation::fail(failure);
+        }
+        if (PQntuples(current.get()) == 1
+            && field(current.get(), 0, 0) != value.identity().value()) {
+            rollback(connection);
+            return foundation::fail(
+                foundation::ErrorCode::FailedPrecondition,
+                "A service client cannot be rebound to another canonical identity.");
+        }
+        ResultPointer stored = execParams(
+            connection,
+            "INSERT INTO openproof.service_identities"
+            "(client_id,identity_id,active,created_at_ms,updated_at_ms) VALUES($1,$2,$3,$4,$5) "
+            "ON CONFLICT(client_id) DO UPDATE SET active=EXCLUDED.active,updated_at_ms=EXCLUDED.updated_at_ms",
+            {std::string{value.client().value()}, std::string{value.identity().value()},
+             value.active() ? "true" : "false", instant(value.createdAt()),
+             instant(value.updatedAt())});
+        if (!commandOk(stored.get())) {
+            auto failure = databaseError(stored.get(), "save service identity");
+            rollback(connection);
+            return foundation::fail(failure);
+        }
+        auto removedAudiences = runCommand(
+            connection,
+            "DELETE FROM openproof.service_identity_audiences WHERE client_id=$1",
+            {std::string{value.client().value()}}, "replace service identity audiences");
+        auto removedScopes = runCommand(
+            connection,
+            "DELETE FROM openproof.service_identity_scopes WHERE client_id=$1",
+            {std::string{value.client().value()}}, "replace service identity scopes");
+        if (!removedAudiences || !removedScopes) {
+            rollback(connection);
+            return foundation::fail(
+                (!removedAudiences ? removedAudiences : removedScopes).error());
+        }
+        for (const auto& audience : value.audiences()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.service_identity_audiences(client_id,audience) "
+                "VALUES($1,$2)",
+                {std::string{value.client().value()}, audience},
+                "insert service identity audience");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        for (const auto& scope : value.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.service_identity_scopes(client_id,scope) VALUES($1,$2)",
+                {std::string{value.client().value()}, scope},
+                "insert service identity scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<std::optional<resource::ServiceIdentity>>
+    PostgresResourceRepository::serviceForClient(const client::ClientId& clientId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT client_id,identity_id,active,created_at_ms,updated_at_ms "
+            "FROM openproof.service_identities WHERE client_id=$1",
+            {std::string{clientId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find service identity"));
+        }
+        if (PQntuples(result.get()) == 0) return std::optional<resource::ServiceIdentity>{};
+        auto restored = serviceIdentityFromRow(lease->get(), result.get(), 0);
+        if (!restored) return foundation::fail(restored.error());
+        return std::optional<resource::ServiceIdentity>{std::move(restored).value()};
+    }
+
+    PostgresConsentRepository::PostgresConsentRepository(ConnectionPool& pool)
+        : m_pool(&pool)
+    {
+    }
+
+    foundation::Status PostgresConsentRepository::save(consent::ConsentGrant value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        auto superseded = runCommand(
+            connection,
+            "UPDATE openproof.oauth_consents SET revoked_at_ms=$5 "
+            "WHERE identity_id=$1 AND client_id=$2 AND audience=$3 AND revoked_at_ms IS NULL "
+            "AND (expires_at_ms IS NULL OR expires_at_ms>$4)",
+            {std::string{value.identity().value()}, std::string{value.client().value()},
+             std::string{value.audience()}, instant(value.grantedAt()),
+             instant(value.grantedAt())},
+            "supersede OAuth consent");
+        if (!superseded) {
+            rollback(connection);
+            return superseded;
+        }
+        const std::string expires = value.expiresAt()
+            ? instant(*value.expiresAt()) : std::string{};
+        const std::string revoked = value.revokedAt()
+            ? instant(*value.revokedAt()) : std::string{};
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_consents"
+            "(id,identity_id,client_id,audience,granted_at_ms,expires_at_ms,revoked_at_ms) "
+            "VALUES($1,$2,$3,$4,$5,CASE WHEN $6='' THEN NULL ELSE $6::bigint END,"
+            "CASE WHEN $7='' THEN NULL ELSE $7::bigint END)",
+            {std::string{value.id().value()}, std::string{value.identity().value()},
+             std::string{value.client().value()}, std::string{value.audience()},
+             instant(value.grantedAt()), expires, revoked});
+        if (!commandOk(inserted.get())) {
+            auto failure = databaseError(inserted.get(), "insert OAuth consent");
+            rollback(connection);
+            return foundation::fail(failure);
+        }
+        for (const auto& scope : value.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) VALUES($1,$2)",
+                {std::string{value.id().value()}, scope}, "insert OAuth consent scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<std::optional<consent::ConsentGrant>>
+    PostgresConsentRepository::findActive(
+        const identity::core::IdentityId& identityId, const client::ClientId& clientId,
+        std::string_view audience, foundation::Instant now) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT id,identity_id,client_id,audience,granted_at_ms,expires_at_ms,revoked_at_ms "
+            "FROM openproof.oauth_consents WHERE identity_id=$1 AND client_id=$2 AND audience=$3 "
+            "AND revoked_at_ms IS NULL AND (expires_at_ms IS NULL OR expires_at_ms>$4) "
+            "ORDER BY granted_at_ms DESC LIMIT 1",
+            {std::string{identityId.value()}, std::string{clientId.value()},
+             std::string{audience}, instant(now)});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find active OAuth consent"));
+        }
+        if (PQntuples(result.get()) == 0) return std::optional<consent::ConsentGrant>{};
+        auto restored = consentFromRow(lease->get(), result.get(), 0);
+        if (!restored) return foundation::fail(restored.error());
+        return std::optional<consent::ConsentGrant>{std::move(restored).value()};
+    }
+
+    foundation::Result<std::vector<consent::ConsentGrant>>
+    PostgresConsentRepository::list(const identity::core::IdentityId& identityId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT id,identity_id,client_id,audience,granted_at_ms,expires_at_ms,revoked_at_ms "
+            "FROM openproof.oauth_consents WHERE identity_id=$1 ORDER BY granted_at_ms DESC,id",
+            {std::string{identityId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "list OAuth consents"));
+        }
+        std::vector<consent::ConsentGrant> values;
+        values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+        for (int row = 0; row < PQntuples(result.get()); ++row) {
+            auto restored = consentFromRow(lease->get(), result.get(), row);
+            if (!restored) return foundation::fail(restored.error());
+            values.push_back(std::move(restored).value());
+        }
+        return values;
+    }
+
+    foundation::Status PostgresConsentRepository::revoke(
+        const consent::ConsentId& id, const identity::core::IdentityId& identityId,
+        foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "UPDATE openproof.oauth_consents SET revoked_at_ms=COALESCE(revoked_at_ms,$3) "
+            "WHERE id=$1 AND identity_id=$2",
+            {std::string{id.value()}, std::string{identityId.value()}, instant(now)});
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "revoke OAuth consent"));
+        }
+        if (std::string_view{PQcmdTuples(result.get())} != "1") {
+            return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        return foundation::ok();
+    }
+
+    PostgresPasskeyRepository::PostgresPasskeyRepository(ConnectionPool& pool)
+        : m_pool(&pool)
+    {
+    }
+
+    foundation::Status PostgresPasskeyRepository::addCeremony(
+        provider::passkey::RegistrationCeremony ceremony)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        return runCommand(
+            lease->get(),
+            "INSERT INTO openproof.passkey_registration_ceremonies"
+            "(id,identity_id,expires_at_ms) VALUES($1,$2,$3)",
+            {std::string{ceremony.id.value()}, std::string{ceremony.identity.value()},
+             instant(ceremony.expiresAt)},
+            "insert passkey registration ceremony");
+    }
+
+    foundation::Status PostgresPasskeyRepository::consumeCeremony(
+        const identity::provider::ChallengeId& id,
+        const identity::core::IdentityId& identityId,
+        foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "UPDATE openproof.passkey_registration_ceremonies "
+            "SET consumed_at_ms=$3 WHERE id=$1 AND identity_id=$2 "
+            "AND consumed_at_ms IS NULL AND expires_at_ms>$3",
+            {std::string{id.value()}, std::string{identityId.value()}, instant(now)});
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "consume passkey registration ceremony"));
+        }
+        if (std::string_view{PQcmdTuples(result.get())} != "1") {
+            return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        return foundation::ok();
+    }
+
+    foundation::Status PostgresPasskeyRepository::addCredential(
+        provider::passkey::PasskeyCredential credential)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        return runCommand(
+            lease->get(),
+            "INSERT INTO openproof.passkey_credentials"
+            "(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7)",
+            {credential.credentialId, std::string{credential.identity.value()},
+             credential.publicKeyX, credential.publicKeyY,
+             integer(static_cast<std::int64_t>(credential.signCount)),
+             instant(credential.createdAt), instant(credential.lastUsedAt)},
+            "insert passkey credential");
+    }
+
+    foundation::Result<std::optional<provider::passkey::PasskeyCredential>>
+    PostgresPasskeyRepository::findCredential(std::string_view credentialId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms "
+            "FROM openproof.passkey_credentials WHERE credential_id=$1",
+            {std::string{credentialId}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find passkey credential"));
+        }
+        if (PQntuples(result.get()) == 0) {
+            return std::optional<provider::passkey::PasskeyCredential>{};
+        }
+        auto count = parseInteger<std::uint32_t>(field(result.get(), 0, 4));
+        auto created = parseInteger<std::int64_t>(field(result.get(), 0, 5));
+        auto used = parseInteger<std::int64_t>(field(result.get(), 0, 6));
+        if (!count || !created || !used) return foundation::fail(foundation::ErrorCode::Internal);
+        return std::optional<provider::passkey::PasskeyCredential>{
+            provider::passkey::PasskeyCredential{
+                std::string{field(result.get(), 0, 0)},
+                identity::core::IdentityId{std::string{field(result.get(), 0, 1)}},
+                std::string{field(result.get(), 0, 2)},
+                std::string{field(result.get(), 0, 3)}, count.value(),
+                foundation::Instant{foundation::Duration{created.value()}},
+                foundation::Instant{foundation::Duration{used.value()}}}};
+    }
+
+    foundation::Result<std::vector<provider::passkey::PasskeyCredential>>
+    PostgresPasskeyRepository::listCredentials(
+        const identity::core::IdentityId& identityId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms "
+            "FROM openproof.passkey_credentials WHERE identity_id=$1 ORDER BY created_at_ms,credential_id",
+            {std::string{identityId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "list passkey credentials"));
+        }
+        std::vector<provider::passkey::PasskeyCredential> output;
+        output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+        for (int row = 0; row < PQntuples(result.get()); ++row) {
+            auto count = parseInteger<std::uint32_t>(field(result.get(), row, 4));
+            auto created = parseInteger<std::int64_t>(field(result.get(), row, 5));
+            auto used = parseInteger<std::int64_t>(field(result.get(), row, 6));
+            if (!count || !created || !used) return foundation::fail(foundation::ErrorCode::Internal);
+            output.push_back(provider::passkey::PasskeyCredential{
+                std::string{field(result.get(), row, 0)},
+                identity::core::IdentityId{std::string{field(result.get(), row, 1)}},
+                std::string{field(result.get(), row, 2)},
+                std::string{field(result.get(), row, 3)}, count.value(),
+                foundation::Instant{foundation::Duration{created.value()}},
+                foundation::Instant{foundation::Duration{used.value()}}});
+        }
+        return output;
+    }
+
+    foundation::Status PostgresPasskeyRepository::advanceCounter(
+        std::string_view credentialId, std::uint32_t expected,
+        std::uint32_t replacement, foundation::Instant usedAt)
+    {
+        if (replacement <= expected) return foundation::fail(foundation::ErrorCode::Conflict);
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "UPDATE openproof.passkey_credentials SET sign_count=$3,last_used_at_ms=$4 "
+            "WHERE credential_id=$1 AND sign_count=$2",
+            {std::string{credentialId}, integer(static_cast<std::int64_t>(expected)),
+             integer(static_cast<std::int64_t>(replacement)), instant(usedAt)});
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "advance passkey signature counter"));
+        }
+        return std::string_view{PQcmdTuples(result.get())} == "1"
+            ? foundation::ok() : foundation::fail(foundation::ErrorCode::Conflict);
+    }
+
+    foundation::Status PostgresPasskeyRepository::removeCredential(
+        const identity::core::IdentityId& identityId,
+        std::string_view credentialId)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "DELETE FROM openproof.passkey_credentials WHERE credential_id=$1 AND identity_id=$2",
+            {std::string{credentialId}, std::string{identityId.value()}});
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "remove passkey credential"));
+        }
+        return std::string_view{PQcmdTuples(result.get())} == "1"
+            ? foundation::ok() : foundation::fail(foundation::ErrorCode::NotFound);
+    }
+
+
+PostgresScimDirectoryRepository::PostgresScimDirectoryRepository(ConnectionPool& pool)
+    : m_pool(&pool) {}
+
+foundation::Status PostgresScimDirectoryRepository::addUser(enterprise::scim::UserRecord user)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.scim_users(identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,$3,NULLIF($4,''),$5,$6)",
+        {std::string{user.identity().value()}, std::string{user.organization().value()},
+         std::string{user.userName()}, user.externalId().value_or(std::string{}),
+         instant(user.createdAt()), instant(user.updatedAt())});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "insert SCIM user"));
+    return foundation::ok();
+}
+
+foundation::Status PostgresScimDirectoryRepository::saveUser(const enterprise::scim::UserRecord& user)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.scim_users SET user_name=$3,external_id=NULLIF($4,''),updated_at_ms=$5 "
+        "WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{user.organization().value()}, std::string{user.identity().value()},
+         std::string{user.userName()}, user.externalId().value_or(std::string{}), instant(user.updatedAt())});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "save SCIM user"));
+    if (std::string_view{PQcmdTuples(result.get())} != "1") return foundation::fail(foundation::ErrorCode::NotFound);
+    return foundation::ok();
+}
+
+foundation::Status PostgresScimDirectoryRepository::removeUser(
+    const identity::core::OrganizationId& organization,
+    const identity::core::IdentityId& identityId)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "DELETE FROM openproof.scim_users WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{organization.value()}, std::string{identityId.value()}});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "remove SCIM user"));
+    if (std::string_view{PQcmdTuples(result.get())} != "1") return foundation::fail(foundation::ErrorCode::NotFound);
+    return foundation::ok();
+}
+
+foundation::Result<std::optional<enterprise::scim::UserRecord>>
+PostgresScimDirectoryRepository::findUser(
+    const identity::core::OrganizationId& organization,
+    const identity::core::IdentityId& identityId) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_users WHERE organization_id=$1 AND identity_id=$2",
+        {std::string{organization.value()}, std::string{identityId.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find SCIM user"));
+    if (PQntuples(result.get()) == 0) return std::optional<enterprise::scim::UserRecord>{};
+    auto created = parseInteger<std::int64_t>(field(result.get(), 0, 4));
+    auto updated = parseInteger<std::int64_t>(field(result.get(), 0, 5));
+    if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+    std::optional<std::string> external;
+    if (!PQgetisnull(result.get(), 0, 3)) external = field(result.get(), 0, 3);
+    auto record = enterprise::scim::UserRecord::create(
+        identity::core::IdentityId{field(result.get(), 0, 0)},
+        identity::core::OrganizationId{field(result.get(), 0, 1)}, field(result.get(), 0, 2),
+        std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+    if (!record) return foundation::fail(record.error());
+    return std::optional<enterprise::scim::UserRecord>{std::move(record).value()};
+}
+
+foundation::Result<std::optional<enterprise::scim::UserRecord>>
+PostgresScimDirectoryRepository::findUserByName(
+    const identity::core::OrganizationId& organization, std::string_view userName) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_users WHERE organization_id=$1 AND user_name=$2",
+        {std::string{organization.value()}, std::string{userName}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find SCIM user by name"));
+    if (PQntuples(result.get()) == 0) return std::optional<enterprise::scim::UserRecord>{};
+    auto created = parseInteger<std::int64_t>(field(result.get(), 0, 4));
+    auto updated = parseInteger<std::int64_t>(field(result.get(), 0, 5));
+    if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+    std::optional<std::string> external;
+    if (!PQgetisnull(result.get(), 0, 3)) external = field(result.get(), 0, 3);
+    auto record = enterprise::scim::UserRecord::create(
+        identity::core::IdentityId{field(result.get(), 0, 0)},
+        identity::core::OrganizationId{field(result.get(), 0, 1)}, field(result.get(), 0, 2),
+        std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+    if (!record) return foundation::fail(record.error());
+    return std::optional<enterprise::scim::UserRecord>{std::move(record).value()};
+}
+
+foundation::Result<std::vector<enterprise::scim::UserRecord>>
+PostgresScimDirectoryRepository::users(const identity::core::OrganizationId& organization) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_users WHERE organization_id=$1 ORDER BY user_name,identity_id",
+        {std::string{organization.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list SCIM users"));
+    std::vector<enterprise::scim::UserRecord> output;
+    output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+    for (int row = 0; row < PQntuples(result.get()); ++row) {
+        auto created = parseInteger<std::int64_t>(field(result.get(), row, 4));
+        auto updated = parseInteger<std::int64_t>(field(result.get(), row, 5));
+        if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+        std::optional<std::string> external;
+        if (!PQgetisnull(result.get(), row, 3)) external = field(result.get(), row, 3);
+        auto record = enterprise::scim::UserRecord::create(
+            identity::core::IdentityId{field(result.get(), row, 0)},
+            identity::core::OrganizationId{field(result.get(), row, 1)}, field(result.get(), row, 2),
+            std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+        if (!record) return foundation::fail(record.error());
+        output.push_back(std::move(record).value());
+    }
+    return output;
+}
+
+foundation::Status PostgresScimDirectoryRepository::addGroup(enterprise::scim::GroupRecord group)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.scim_groups(id,organization_id,display_name,external_id,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,$3,NULLIF($4,''),$5,$6)",
+        {std::string{group.id().value()}, std::string{group.organization().value()},
+         std::string{group.displayName()}, group.externalId().value_or(std::string{}),
+         instant(group.createdAt()), instant(group.updatedAt())});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "insert SCIM group"));
+    return foundation::ok();
+}
+
+foundation::Status PostgresScimDirectoryRepository::saveGroup(const enterprise::scim::GroupRecord& group)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.scim_groups SET display_name=$3,external_id=NULLIF($4,''),updated_at_ms=$5 "
+        "WHERE organization_id=$1 AND id=$2",
+        {std::string{group.organization().value()}, std::string{group.id().value()},
+         std::string{group.displayName()}, group.externalId().value_or(std::string{}), instant(group.updatedAt())});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "save SCIM group"));
+    if (std::string_view{PQcmdTuples(result.get())} != "1") return foundation::fail(foundation::ErrorCode::NotFound);
+    return foundation::ok();
+}
+
+foundation::Status PostgresScimDirectoryRepository::removeGroup(
+    const identity::core::OrganizationId& organization, const enterprise::scim::GroupId& id)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "DELETE FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "remove SCIM group"));
+    if (std::string_view{PQcmdTuples(result.get())} != "1") return foundation::fail(foundation::ErrorCode::NotFound);
+    return foundation::ok();
+}
+
+foundation::Result<std::optional<enterprise::scim::GroupRecord>>
+PostgresScimDirectoryRepository::findGroup(
+    const identity::core::OrganizationId& organization, const enterprise::scim::GroupId& id) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id,organization_id,display_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find SCIM group"));
+    if (PQntuples(result.get()) == 0) return std::optional<enterprise::scim::GroupRecord>{};
+    auto created = parseInteger<std::int64_t>(field(result.get(), 0, 4));
+    auto updated = parseInteger<std::int64_t>(field(result.get(), 0, 5));
+    if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+    std::optional<std::string> external;
+    if (!PQgetisnull(result.get(), 0, 3)) external = field(result.get(), 0, 3);
+    auto record = enterprise::scim::GroupRecord::create(
+        enterprise::scim::GroupId{field(result.get(), 0, 0)},
+        identity::core::OrganizationId{field(result.get(), 0, 1)}, field(result.get(), 0, 2),
+        std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+    if (!record) return foundation::fail(record.error());
+    return std::optional<enterprise::scim::GroupRecord>{std::move(record).value()};
+}
+
+foundation::Result<std::optional<enterprise::scim::GroupRecord>>
+PostgresScimDirectoryRepository::findGroupByName(
+    const identity::core::OrganizationId& organization, std::string_view displayName) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id,organization_id,display_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_groups WHERE organization_id=$1 AND display_name=$2",
+        {std::string{organization.value()}, std::string{displayName}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find SCIM group by name"));
+    if (PQntuples(result.get()) == 0) return std::optional<enterprise::scim::GroupRecord>{};
+    auto created = parseInteger<std::int64_t>(field(result.get(), 0, 4));
+    auto updated = parseInteger<std::int64_t>(field(result.get(), 0, 5));
+    if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+    std::optional<std::string> external;
+    if (!PQgetisnull(result.get(), 0, 3)) external = field(result.get(), 0, 3);
+    auto record = enterprise::scim::GroupRecord::create(
+        enterprise::scim::GroupId{field(result.get(), 0, 0)},
+        identity::core::OrganizationId{field(result.get(), 0, 1)}, field(result.get(), 0, 2),
+        std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+    if (!record) return foundation::fail(record.error());
+    return std::optional<enterprise::scim::GroupRecord>{std::move(record).value()};
+}
+
+foundation::Result<std::vector<enterprise::scim::GroupRecord>>
+PostgresScimDirectoryRepository::groups(const identity::core::OrganizationId& organization) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT id,organization_id,display_name,external_id,created_at_ms,updated_at_ms "
+        "FROM openproof.scim_groups WHERE organization_id=$1 ORDER BY display_name,id",
+        {std::string{organization.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list SCIM groups"));
+    std::vector<enterprise::scim::GroupRecord> output;
+    output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+    for (int row = 0; row < PQntuples(result.get()); ++row) {
+        auto created = parseInteger<std::int64_t>(field(result.get(), row, 4));
+        auto updated = parseInteger<std::int64_t>(field(result.get(), row, 5));
+        if (!created || !updated) return foundation::fail(foundation::ErrorCode::Internal);
+        std::optional<std::string> external;
+        if (!PQgetisnull(result.get(), row, 3)) external = field(result.get(), row, 3);
+        auto record = enterprise::scim::GroupRecord::create(
+            enterprise::scim::GroupId{field(result.get(), row, 0)},
+            identity::core::OrganizationId{field(result.get(), row, 1)}, field(result.get(), row, 2),
+            std::move(external), storedInstant(created.value()), storedInstant(updated.value()));
+        if (!record) return foundation::fail(record.error());
+        output.push_back(std::move(record).value());
+    }
+    return output;
+}
+
+foundation::Result<std::vector<identity::core::IdentityId>>
+PostgresScimDirectoryRepository::groupMembers(
+    const identity::core::OrganizationId& organization, const enterprise::scim::GroupId& id) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer exists = execParams(lease->get(),
+        "SELECT 1 FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!tuplesOk(exists.get())) return foundation::fail(databaseError(exists.get(), "find SCIM group for membership"));
+    if (PQntuples(exists.get()) == 0) return foundation::fail(foundation::ErrorCode::NotFound);
+    ResultPointer result = execParams(lease->get(),
+        "SELECT identity_id FROM openproof.scim_group_members WHERE organization_id=$1 AND group_id=$2 ORDER BY identity_id",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list SCIM group members"));
+    std::vector<identity::core::IdentityId> output;
+    output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+    for (int row = 0; row < PQntuples(result.get()); ++row) output.emplace_back(field(result.get(), row, 0));
+    return output;
+}
+
+foundation::Status PostgresScimDirectoryRepository::replaceGroupMembers(
+    const identity::core::OrganizationId& organization, const enterprise::scim::GroupId& id,
+    std::vector<identity::core::IdentityId> members)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) {
+        return foundation::fail(lease.error());
+    }
+
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) {
+        return begun;
+    }
+
+    ResultPointer group = execParams(
+        connection,
+        "SELECT 1 FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2 FOR UPDATE",
+        {std::string{organization.value()}, std::string{id.value()}});
+    if (!tuplesOk(group.get())) {
+        auto error = databaseError(group.get(), "lock SCIM group");
+        rollback(connection);
+        return foundation::fail(error);
+    }
+    if (PQntuples(group.get()) != 1) {
+        rollback(connection);
+        return foundation::fail(foundation::ErrorCode::NotFound);
+    }
+
+    auto removed = runCommand(
+        connection,
+        "DELETE FROM openproof.scim_group_members WHERE organization_id=$1 AND group_id=$2",
+        {std::string{organization.value()}, std::string{id.value()}},
+        "replace SCIM group members");
+    if (!removed) {
+        rollback(connection);
+        return removed;
+    }
+
+    for (const auto& member : members) {
+        auto inserted = runCommand(
+            connection,
+            "INSERT INTO openproof.scim_group_members(organization_id,group_id,identity_id) "
+            "VALUES($1,$2,$3)",
+            {std::string{organization.value()}, std::string{id.value()},
+             std::string{member.value()}},
+            "insert SCIM group member");
+        if (!inserted) {
+            rollback(connection);
+            return inserted;
+        }
+    }
+    return commit(connection);
+}
+
+    PostgresEvidenceChallengeStore::PostgresEvidenceChallengeStore(ConnectionPool& pool)
+    : m_pool(&pool)
+{
+}
+
+foundation::Status PostgresEvidenceChallengeStore::add(
+    evidence::verification::Challenge challenge)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "INSERT INTO openproof.evidence_verification_challenges"
+        "(digest,identity_id,provider,issued_at_ms,expires_at_ms,consumed_at_ms) "
+        "VALUES($1,$2,$3,$4,$5,NULL)",
+        {std::string{challenge.digest().value()}, std::string{challenge.identity().value()},
+         std::string{challenge.provider().value()}, instant(challenge.issuedAt()),
+         instant(challenge.expiresAt())});
+    if (!commandOk(result.get())) {
+        return foundation::fail(databaseError(result.get(), "insert evidence verification challenge"));
+    }
+    return foundation::ok();
+}
+
+foundation::Status PostgresEvidenceChallengeStore::consume(
+    const evidence::verification::ChallengeDigest& digest,
+    const identity::core::IdentityId& identity,
+    const identity::provider::ProviderId& provider,
+    foundation::Instant now)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.evidence_verification_challenges "
+        "SET consumed_at_ms=$4 "
+        "WHERE digest=$1 AND identity_id=$2 AND provider=$3 "
+        "AND consumed_at_ms IS NULL AND expires_at_ms>$4",
+        {std::string{digest.value()}, std::string{identity.value()},
+         std::string{provider.value()}, instant(now)});
+    if (!commandOk(result.get())) {
+        return foundation::fail(databaseError(result.get(), "consume evidence verification challenge"));
+    }
+    if (std::string_view{PQcmdTuples(result.get())} != "1") {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The evidence verification challenge is invalid or expired.");
+    }
+    return foundation::ok();
+}
+
+PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& pool)
+    : m_pool(&pool) {}
+
+    foundation::Status PostgresIdentityProviderStore::add(application::Application value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        return runCommand(lease->get(),
+        "INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+        {std::string{value.id().value()}, std::string{value.owner().value()},
+            std::string{value.identifier()}, std::string{value.displayName()},
+            integer(static_cast<unsigned int>(value.environment())),
+            integer(static_cast<unsigned int>(value.status())),
+            instant(value.createdAt()), instant(value.updatedAt())},
+        "insert application");
+    }
+
+    foundation::Status PostgresIdentityProviderStore::save(const application::Application& value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.applications SET display_name=$2,status=$3,updated_at_ms=$4 "
+        "WHERE id=$1 AND organization_id=$5 AND identifier=$6 AND environment=$7",
+        {std::string{value.id().value()}, std::string{value.displayName()},
+            integer(static_cast<unsigned int>(value.status())), instant(value.updatedAt()),
+            std::string{value.owner().value()}, std::string{value.identifier()},
+            integer(static_cast<unsigned int>(value.environment()))});
+        if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "save application"));
+        return std::string_view{PQcmdTuples(result.get())} == "1" ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::NotFound);
+    }
+
+    foundation::Result<std::optional<application::Application>>
+    PostgresIdentityProviderStore::findById(const application::ApplicationId& id) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "SELECT id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms "
+        "FROM openproof.applications WHERE id=$1", {std::string{id.value()}});
+        if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find application"));
+        if (PQntuples(result.get()) == 0) return std::optional<application::Application>{};
+        auto value = applicationFromRow(result.get(), 0);
+        if (!value) return foundation::fail(value.error());
+        return std::optional<application::Application>{std::move(value).value()};
+    }
+
+    foundation::Result<std::optional<application::Application>>
+    PostgresIdentityProviderStore::findByIdentifier(
+    const identity::core::OrganizationId& owner, std::string_view identifierValue) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "SELECT id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms "
+        "FROM openproof.applications WHERE organization_id=$1 AND identifier=$2",
+        {std::string{owner.value()}, std::string{identifierValue}});
+        if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "find application by identifier"));
+        if (PQntuples(result.get()) == 0) return std::optional<application::Application>{};
+        auto value = applicationFromRow(result.get(), 0);
+        if (!value) return foundation::fail(value.error());
+        return std::optional<application::Application>{std::move(value).value()};
+    }
+
+    foundation::Result<std::vector<application::Application>> PostgresIdentityProviderStore::list() const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = exec(lease->get(),
+        "SELECT id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms "
+        "FROM openproof.applications ORDER BY identifier");
+        if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list applications"));
+        std::vector<application::Application> output;
+        for (int row = 0; row < PQntuples(result.get()); ++row) {
+            auto value = applicationFromRow(result.get(), row);
+            if (!value) return foundation::fail(value.error());
+            output.push_back(std::move(value).value());
+        }
+        return output;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::add(client::Client value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const std::string secretHex = value.secretDigest() ? foundation::toHex(value.secretDigest()->bytes()) : std::string{};
+        ResultPointer inserted = execParams(connection,
+        "INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,$3,$4,$5,CASE WHEN $6='' THEN NULL ELSE decode($6,'hex') END,$7,$8)",
+        {std::string{value.id().value()}, std::string{value.applicationId().value()},
+            std::string{value.displayName()}, integer(static_cast<unsigned int>(value.kind())),
+            integer(static_cast<unsigned int>(value.status())), secretHex,
+            instant(value.createdAt()), instant(value.updatedAt())});
+        if (!commandOk(inserted.get())) { auto error=databaseError(inserted.get(),"insert OAuth client");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        auto children = insertClientChildren(connection, value);
+        if (!children) { rollback(connection);
+            return children;
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::save(const client::Client& value)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return begun;
+        const std::string secretHex=value.secretDigest()?foundation::toHex(value.secretDigest()->bytes()):std::string{};
+        ResultPointer updated=execParams(connection,
+        "UPDATE openproof.oauth_clients SET display_name=$2,status=$3,secret_digest=CASE WHEN $4='' THEN NULL ELSE decode($4,'hex') END,updated_at_ms=$5 "
+        "WHERE id=$1 AND application_id=$6 AND kind=$7",
+        {std::string{value.id().value()},std::string{value.displayName()},integer(static_cast<unsigned int>(value.status())),secretHex,instant(value.updatedAt()),std::string{value.applicationId().value()},integer(static_cast<unsigned int>(value.kind()))});
+        if(!commandOk(updated.get())||std::string_view{PQcmdTuples(updated.get())}!="1"){auto error=commandOk(updated.get())?foundation::Error{foundation::ErrorCode::NotFound}:databaseError(updated.get(),"save OAuth client");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        auto deletedRedirects=runCommand(connection,"DELETE FROM openproof.oauth_client_redirect_uris WHERE client_id=$1",{std::string{value.id().value()}},"replace OAuth client redirect URIs");
+        auto deletedScopes=runCommand(connection,"DELETE FROM openproof.oauth_client_scopes WHERE client_id=$1",{std::string{value.id().value()}},"replace OAuth client scopes");
+        if(!deletedRedirects||!deletedScopes){rollback(connection);
+            return foundation::fail((!deletedRedirects?deletedRedirects:deletedScopes).error());
+        }
+        auto children=insertClientChildren(connection,value);
+        if(!children){rollback(connection);
+            return children;
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<std::optional<client::Client>>
+    PostgresIdentityProviderStore::findById(const client::ClientId& id) const
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(lease->get(),
+        "SELECT id,application_id,display_name,kind,status,CASE WHEN secret_digest IS NULL THEN NULL ELSE encode(secret_digest,'hex') END,created_at_ms,updated_at_ms "
+        "FROM openproof.oauth_clients WHERE id=$1",{std::string{id.value()}});
+        if(!tuplesOk(result.get()))return foundation::fail(databaseError(result.get(),"find OAuth client"));
+        if(PQntuples(result.get())==0)return std::optional<client::Client>{};
+        auto value=clientFromRow(lease->get(),result.get(),0);
+        if(!value)return foundation::fail(value.error());
+        return std::optional<client::Client>{std::move(value).value()};
+    }
+
+    foundation::Result<std::vector<client::Client>>
+    PostgresIdentityProviderStore::clientsOf(const application::ApplicationId& applicationId) const
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(lease->get(),
+        "SELECT id,application_id,display_name,kind,status,CASE WHEN secret_digest IS NULL THEN NULL ELSE encode(secret_digest,'hex') END,created_at_ms,updated_at_ms "
+        "FROM openproof.oauth_clients WHERE application_id=$1 ORDER BY id",{std::string{applicationId.value()}});
+        if(!tuplesOk(result.get()))return foundation::fail(databaseError(result.get(),"list OAuth clients"));
+        std::vector<client::Client> output;
+        for(int row=0;row<PQntuples(result.get());++row){auto value=clientFromRow(lease->get(),result.get(),row);
+            if(!value)return foundation::fail(value.error());
+            output.push_back(std::move(value).value());
+        }
+        return output;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::save(const identity::profile::IdentityProfile& value)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        const auto optionalText = [](const std::optional<std::string>& optionalValue) {
+            return optionalValue.value_or(std::string{});
+        };
+        return runCommand(lease->get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,created_at_ms,updated_at_ms) "
+        "VALUES($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11) "
+        "ON CONFLICT(identity_id) DO UPDATE SET display_name=EXCLUDED.display_name,preferred_username=EXCLUDED.preferred_username,email=EXCLUDED.email,email_verified=EXCLUDED.email_verified,phone_number=EXCLUDED.phone_number,phone_number_verified=EXCLUDED.phone_number_verified,locale=EXCLUDED.locale,picture_url=EXCLUDED.picture_url,updated_at_ms=EXCLUDED.updated_at_ms",
+        {std::string{value.identity().value()}, optionalText(value.displayName()),
+            optionalText(value.preferredUsername()), optionalText(value.email()),
+            value.emailVerified() ? "true" : "false", optionalText(value.phoneNumber()),
+            value.phoneNumberVerified() ? "true" : "false", optionalText(value.locale()),
+            optionalText(value.pictureUrl()), instant(value.createdAt()), instant(value.updatedAt())},
+        "save identity profile");
+    }
+
+    foundation::Result<std::optional<identity::profile::IdentityProfile>>
+    PostgresIdentityProviderStore::find(const identity::core::IdentityId& identityId) const
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(lease->get(),"SELECT identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,created_at_ms,updated_at_ms FROM openproof.identity_profiles WHERE identity_id=$1",{std::string{identityId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find identity profile"));
+        }
+        if (PQntuples(result.get()) == 0) {
+            return std::optional<identity::profile::IdentityProfile>{};
+        }
+        const auto nullable=[&](int column)->std::optional<std::string>{return PQgetisnull(result.get(),0,column)?std::nullopt:std::optional<std::string>{field(result.get(),0,column)};
+        };
+        auto created=parseInteger<std::int64_t>(field(result.get(),0,9));
+        auto updated=parseInteger<std::int64_t>(field(result.get(),0,10));
+        if(!created||!updated)return foundation::fail(foundation::ErrorCode::Internal);
+        auto profile=identity::profile::IdentityProfile::restore(identity::core::IdentityId{field(result.get(),0,0)},nullable(1),nullable(2),nullable(3),field(result.get(),0,4)=="t",nullable(5),field(result.get(),0,6)=="t",nullable(7),nullable(8),storedInstant(created.value()),storedInstant(updated.value()));
+        if(!profile)return foundation::fail(profile.error());
+        return std::optional<identity::profile::IdentityProfile>{std::move(profile).value()};
+    }
+
+    foundation::Status PostgresIdentityProviderStore::add(evidence::Evidence value)
+    {
+        std::vector<evidence::Evidence> batch;
+        batch.push_back(std::move(value));
+        return addBatch(std::move(batch));
+    }
+
+    foundation::Status PostgresIdentityProviderStore::addBatch(
+    std::vector<evidence::Evidence> values)
+    {
+        if (values.empty()) return foundation::ok();
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        for (const auto& value : values) {
+            const std::string expires = value.expiresAt().has_value()
+            ? instant(value.expiresAt().value()) : std::string{};
+            auto status = runCommand(connection,
+            "INSERT INTO openproof.evidence(id,identity_id,provider,kind,claim,value,confidence,status,verified_at_ms,expires_at_ms) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $10='' THEN NULL ELSE $10::bigint END)",
+            {std::string{value.id().value()}, std::string{value.identity().value()},
+                std::string{value.provider().value()}, std::string{value.kind()},
+                std::string{value.claim()}, std::string{value.value()},
+                integer(value.confidence()), integer(static_cast<unsigned int>(value.status())),
+                instant(value.verifiedAt()), expires}, "insert evidence");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::revoke(
+    const evidence::EvidenceId& id)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.evidence SET status=1 WHERE id=$1 AND status=0",
+        {std::string{id.value()}});
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "revoke evidence"));
+        }
+        if (std::string_view{PQcmdTuples(result.get())} != "1") {
+            return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        return foundation::ok();
+    }
+
+    foundation::Result<std::optional<evidence::Evidence>>
+    PostgresIdentityProviderStore::find(const evidence::EvidenceId& id) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "SELECT id,identity_id,provider,kind,claim,value,confidence,status,verified_at_ms,expires_at_ms "
+        "FROM openproof.evidence WHERE id=$1", {std::string{id.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find evidence"));
+        }
+        if (PQntuples(result.get()) == 0) return std::optional<evidence::Evidence>{};
+        auto confidence = parseInteger<unsigned int>(field(result.get(), 0, 6));
+        auto status = parseInteger<unsigned int>(field(result.get(), 0, 7));
+        auto verified = parseInteger<std::int64_t>(field(result.get(), 0, 8));
+        if (!confidence || !status || !verified || confidence.value() > 100U
+        || status.value() > 1U) {
+            return foundation::fail(foundation::ErrorCode::Internal);
+        }
+        std::optional<foundation::Instant> expires;
+        if (!PQgetisnull(result.get(), 0, 9)) {
+            auto parsed = parseInteger<std::int64_t>(field(result.get(), 0, 9));
+            if (!parsed) return foundation::fail(parsed.error());
+            expires = storedInstant(parsed.value());
+        }
+        auto restored = evidence::Evidence::restore(
+        evidence::EvidenceId{field(result.get(), 0, 0)},
+        identity::core::IdentityId{field(result.get(), 0, 1)},
+        identity::provider::ProviderId{field(result.get(), 0, 2)},
+        field(result.get(), 0, 3), field(result.get(), 0, 4),
+        field(result.get(), 0, 5), confidence.value(),
+        static_cast<evidence::EvidenceStatus>(status.value()),
+        storedInstant(verified.value()), expires);
+        if (!restored) return foundation::fail(restored.error());
+        return std::optional<evidence::Evidence>{std::move(restored).value()};
+    }
+
+    foundation::Result<std::vector<evidence::Evidence>>
+    PostgresIdentityProviderStore::forIdentity(
+    const identity::core::IdentityId& identityId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+        "SELECT id,identity_id,provider,kind,claim,value,confidence,status,verified_at_ms,expires_at_ms "
+        "FROM openproof.evidence WHERE identity_id=$1 ORDER BY verified_at_ms,id",
+        {std::string{identityId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "list identity evidence"));
+        }
+        std::vector<evidence::Evidence> output;
+        output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+        for (int row = 0; row < PQntuples(result.get()); ++row) {
+            auto confidence = parseInteger<unsigned int>(field(result.get(), row, 6));
+            auto status = parseInteger<unsigned int>(field(result.get(), row, 7));
+            auto verified = parseInteger<std::int64_t>(field(result.get(), row, 8));
+            if (!confidence || !status || !verified || confidence.value() > 100U
+            || status.value() > 1U) {
+                return foundation::fail(foundation::ErrorCode::Internal);
+            }
+            std::optional<foundation::Instant> expires;
+            if (!PQgetisnull(result.get(), row, 9)) {
+                auto parsed = parseInteger<std::int64_t>(field(result.get(), row, 9));
+                if (!parsed) return foundation::fail(parsed.error());
+                expires = storedInstant(parsed.value());
+            }
+            auto restored = evidence::Evidence::restore(
+            evidence::EvidenceId{field(result.get(), row, 0)},
+            identity::core::IdentityId{field(result.get(), row, 1)},
+            identity::provider::ProviderId{field(result.get(), row, 2)},
+            field(result.get(), row, 3), field(result.get(), row, 4),
+            field(result.get(), row, 5), confidence.value(),
+            static_cast<evidence::EvidenceStatus>(status.value()),
+            storedInstant(verified.value()), expires);
+            if (!restored) return foundation::fail(restored.error());
+            output.push_back(std::move(restored).value());
+        }
+        return output;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::add(oauth::AuthorizationCode value)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return begun;
+        const std::string digest=foundation::toHex(value.digest().bytes());
+        ResultPointer inserted=execParams(connection,
+        "INSERT INTO openproof.oauth_authorization_codes(code_digest,client_id,identity_id,redirect_uri,code_challenge,nonce,provider,assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms,resource) "
+        "VALUES(decode($1,'hex'),$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''))",
+        {digest,std::string{value.clientId().value()},std::string{value.identity().value()},std::string{value.redirectUri()},std::string{value.codeChallenge().value()},value.nonce().value_or(std::string{}),std::string{value.provider().value()},integer(static_cast<unsigned int>(value.assurance())),integer(factorsValue(value.strength())),value.strength().isPhishingResistant()?"true":"false",instant(value.authenticatedAt()),instant(value.issuedAt()),instant(value.expiresAt()),value.resource().value_or(std::string{})});
+        if(!commandOk(inserted.get())){auto error=databaseError(inserted.get(),"insert OAuth authorization code");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        for(const auto& scope:value.scopes()){auto status=runCommand(connection,"INSERT INTO openproof.oauth_authorization_code_scopes(code_digest,scope) VALUES(decode($1,'hex'),$2)",{digest,std::string{scope.value()}},"insert authorization code scope");
+            if(!status){rollback(connection);
+                return status;
+            }}
+        return commit(connection);
+    }
+
+    foundation::Result<oauth::AuthorizationCode> PostgresIdentityProviderStore::consumeBound(
+    const oauth::CodeDigest& digestValue, foundation::Instant now,
+    std::string_view expectedClientId, std::string_view expectedRedirectUri,
+    std::string_view expectedCodeChallenge)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return foundation::fail(begun.error());
+        const std::string digest=foundation::toHex(digestValue.bytes());
+        ResultPointer base=execParams(connection,"SELECT client_id,identity_id,redirect_uri,code_challenge,nonce,provider,assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms,resource FROM openproof.oauth_authorization_codes WHERE code_digest=decode($1,'hex') FOR UPDATE",{digest});
+        if(!tuplesOk(base.get())){auto error=databaseError(base.get(),"consume authorization code");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if(PQntuples(base.get())!=1){rollback(connection);
+            return foundation::fail(authenticationFailure("Authorization code was not found or was already consumed."));
+        }
+        ResultPointer scopeRows=execParams(connection,"SELECT scope FROM openproof.oauth_authorization_code_scopes WHERE code_digest=decode($1,'hex') ORDER BY scope",{digest});
+        if(!tuplesOk(scopeRows.get())){auto error=databaseError(scopeRows.get(),"load authorization code scopes");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        std::vector<client::Scope> scopes;
+        for(int row=0;row<PQntuples(scopeRows.get());++row){auto parsed=client::Scope::create(field(scopeRows.get(),row,0));
+            if(!parsed){rollback(connection);
+                return foundation::fail(parsed.error());
+            }scopes.push_back(std::move(parsed).value());
+        }
+        auto assurance=parseInteger<unsigned int>(field(base.get(),0,6));
+        auto factors=parseInteger<unsigned int>(field(base.get(),0,7));
+        auto authenticated=parseInteger<std::int64_t>(field(base.get(),0,9));
+        auto issued=parseInteger<std::int64_t>(field(base.get(),0,10));
+        auto expires=parseInteger<std::int64_t>(field(base.get(),0,11));
+        if(!assurance||!factors||!authenticated||!issued||!expires||assurance.value()>4U||factors.value()>7U){rollback(connection);
+            return foundation::fail(foundation::ErrorCode::Internal);
+        }
+        auto challenge=oauth::PkceChallenge::create(field(base.get(),0,3));
+        if(!challenge){rollback(connection);
+            return foundation::fail(challenge.error());
+        }
+        std::optional<std::string> nonce=PQgetisnull(base.get(),0,4)?std::nullopt:std::optional<std::string>{field(base.get(),0,4)};
+        std::optional<std::string> resourceValue=PQgetisnull(base.get(),0,12)?std::nullopt:std::optional<std::string>{field(base.get(),0,12)};
+        auto code=oauth::AuthorizationCode::restore(oauth::CodeDigest{digestValue},client::ClientId{field(base.get(),0,0)},identity::core::IdentityId{field(base.get(),0,1)},field(base.get(),0,2),std::move(scopes),std::move(challenge).value(),std::move(nonce),identity::provider::ProviderId{field(base.get(),0,5)},static_cast<identity::provider::AssuranceLevel>(assurance.value()),identity::provider::AuthenticationStrength{static_cast<identity::provider::AuthenticationFactor>(factors.value()),field(base.get(),0,8)=="t"},storedInstant(authenticated.value()),storedInstant(issued.value()),storedInstant(expires.value()),std::move(resourceValue));
+        if(!code){rollback(connection);
+            return foundation::fail(code.error());
+        }
+        if(code->expiredAt(now)){
+            auto deleted=runCommand(connection,"DELETE FROM openproof.oauth_authorization_codes WHERE code_digest=decode($1,'hex')",{digest},"delete expired authorization code");
+            if(!deleted){rollback(connection);
+                return foundation::fail(deleted.error());
+            }
+            auto committed=commit(connection);
+            if(!committed)return foundation::fail(committed.error());
+            return foundation::fail(authenticationFailure("Authorization code was not found or was already consumed."));
+        }
+        if(code->clientId().value()!=expectedClientId
+            || code->redirectUri()!=expectedRedirectUri
+            || code->codeChallenge().value()!=expectedCodeChallenge){
+            rollback(connection);
+            return foundation::fail(authenticationFailure("Authorization code was not found or was already consumed."));
+        }
+        auto deleted=runCommand(connection,"DELETE FROM openproof.oauth_authorization_codes WHERE code_digest=decode($1,'hex')",{digest},"delete consumed authorization code");
+        if(!deleted){rollback(connection);
+            return foundation::fail(deleted.error());
+        }
+        auto committed=commit(connection);
+        if(!committed)return foundation::fail(committed.error());
+        return code;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::add(
+        oauth::DeviceAuthorization authorization)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const std::string deviceDigest = foundation::toHex(authorization.deviceCode().bytes());
+        const std::string userDigest = foundation::toHex(authorization.userCode().bytes());
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_device_authorizations("
+            "device_digest,user_code_digest,client_id,resource,status,issued_at_ms,expires_at_ms,"
+            "poll_interval_ms) VALUES(decode($1,'hex'),decode($2,'hex'),$3,NULLIF($4,''),0,$5,$6,$7)",
+            {deviceDigest, userDigest, std::string{authorization.clientId().value()},
+             authorization.resource().value_or(std::string{}), instant(authorization.issuedAt()),
+             instant(authorization.expiresAt()), integer(authorization.pollInterval().count())});
+        if (!commandOk(inserted.get())) {
+            auto error = databaseError(inserted.get(), "insert device authorization");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        for (const auto& scope : authorization.scopes()) {
+            auto stored = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_device_authorization_scopes(device_digest,scope) "
+                "VALUES(decode($1,'hex'),$2)",
+                {deviceDigest, std::string{scope.value()}}, "insert device authorization scope");
+            if (!stored) {
+                rollback(connection);
+                return stored;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<oauth::DeviceAuthorization>
+    PostgresIdentityProviderStore::findByUserCode(
+        const oauth::DeviceUserCodeDigest& userCode, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        const std::string query = "SELECT " + std::string{kDeviceAuthorizationColumns}
+            + " FROM openproof.oauth_device_authorizations "
+              "WHERE user_code_digest=decode($1,'hex')";
+        ResultPointer result = execParams(
+            lease->get(), query, {foundation::toHex(userCode.bytes())});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find device user code"));
+        }
+        if (PQntuples(result.get()) != 1) return foundation::fail(foundation::ErrorCode::NotFound);
+        auto authorization = deviceAuthorizationFromRow(lease->get(), result.get(), 0);
+        if (!authorization) return foundation::fail(authorization.error());
+        if (authorization->expiredAt(now)
+            || authorization->status() != oauth::DeviceAuthorizationStatus::Pending) {
+            return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        return authorization;
+    }
+
+    foundation::Result<oauth::DeviceAuthorization> PostgresIdentityProviderStore::approve(
+        const oauth::DeviceUserCodeDigest& userCode,
+        const session::AuthenticatedSession& authenticated, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return foundation::fail(begun.error());
+        const std::string query = "SELECT " + std::string{kDeviceAuthorizationColumns}
+            + " FROM openproof.oauth_device_authorizations "
+              "WHERE user_code_digest=decode($1,'hex') FOR UPDATE";
+        ResultPointer row = execParams(connection, query, {foundation::toHex(userCode.bytes())});
+        if (!tuplesOk(row.get())) {
+            auto error = databaseError(row.get(), "lock device authorization for approval");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if (PQntuples(row.get()) != 1) {
+            rollback(connection);
+            return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        auto authorization = deviceAuthorizationFromRow(connection, row.get(), 0);
+        if (!authorization) {
+            rollback(connection);
+            return foundation::fail(authorization.error());
+        }
+        auto approved = authorization->approve(authenticated, now);
+        if (!approved) {
+            rollback(connection);
+            return foundation::fail(approved.error());
+        }
+        const auto& sessionValue = authenticated.session();
+        auto updated = runCommand(
+            connection,
+            "UPDATE openproof.oauth_device_authorizations SET status=1,identity_id=$2,provider=$3,"
+            "assurance=$4,factors=$5,phishing_resistant=$6,authenticated_at_ms=$7 "
+            "WHERE user_code_digest=decode($1,'hex') AND status=0",
+            {foundation::toHex(userCode.bytes()), std::string{sessionValue.identity().value()},
+             std::string{sessionValue.provider().value()},
+             integer(static_cast<unsigned int>(sessionValue.assurance())),
+             integer(factorsValue(sessionValue.strength())),
+             sessionValue.strength().isPhishingResistant() ? "true" : "false",
+             instant(sessionValue.authenticatedAt())},
+            "approve device authorization");
+        if (!updated) {
+            rollback(connection);
+            return foundation::fail(updated.error());
+        }
+        auto committed = commit(connection);
+        if (!committed) return foundation::fail(committed.error());
+        return authorization;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::deny(
+        const oauth::DeviceUserCodeDigest& userCode, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const std::string query = "SELECT " + std::string{kDeviceAuthorizationColumns}
+            + " FROM openproof.oauth_device_authorizations "
+              "WHERE user_code_digest=decode($1,'hex') FOR UPDATE";
+        ResultPointer row = execParams(connection, query, {foundation::toHex(userCode.bytes())});
+        if (!tuplesOk(row.get())) {
+            auto error = databaseError(row.get(), "lock device authorization for denial");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if (PQntuples(row.get()) != 1) {
+            rollback(connection);
+            return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        auto authorization = deviceAuthorizationFromRow(connection, row.get(), 0);
+        if (!authorization) {
+            rollback(connection);
+            return foundation::fail(authorization.error());
+        }
+        auto denied = authorization->deny(now);
+        if (!denied) {
+            rollback(connection);
+            return denied;
+        }
+        auto updated = runCommand(
+            connection,
+            "UPDATE openproof.oauth_device_authorizations SET status=2 "
+            "WHERE user_code_digest=decode($1,'hex') AND status=0",
+            {foundation::toHex(userCode.bytes())}, "deny device authorization");
+        if (!updated) {
+            rollback(connection);
+            return updated;
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<oauth::DevicePollResult> PostgresIdentityProviderStore::poll(
+        const oauth::DeviceCodeDigest& deviceCode, const client::ClientId& expectedClient,
+        foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return foundation::fail(begun.error());
+        const std::string query = "SELECT " + std::string{kDeviceAuthorizationColumns}
+            + " FROM openproof.oauth_device_authorizations "
+              "WHERE device_digest=decode($1,'hex') FOR UPDATE";
+        const std::string digest = foundation::toHex(deviceCode.bytes());
+        ResultPointer row = execParams(connection, query, {digest});
+        if (!tuplesOk(row.get())) {
+            auto error = databaseError(row.get(), "lock device authorization for poll");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if (PQntuples(row.get()) != 1) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure("Unknown device code."));
+        }
+        auto authorization = deviceAuthorizationFromRow(connection, row.get(), 0);
+        if (!authorization) {
+            rollback(connection);
+            return foundation::fail(authorization.error());
+        }
+        auto value = std::move(authorization).value();
+        if (value.clientId() != expectedClient) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure(
+                "The device code is not bound to this client."));
+        }
+        if (value.expiredAt(now)) {
+            auto committed = commit(connection);
+            if (!committed) return foundation::fail(committed.error());
+            return oauth::DevicePollResult{
+                oauth::DevicePollDisposition::Expired, std::nullopt, value.pollInterval()};
+        }
+        if (value.status() == oauth::DeviceAuthorizationStatus::Denied) {
+            auto committed = commit(connection);
+            if (!committed) return foundation::fail(committed.error());
+            return oauth::DevicePollResult{
+                oauth::DevicePollDisposition::Denied, std::nullopt, value.pollInterval()};
+        }
+        if (value.status() == oauth::DeviceAuthorizationStatus::Consumed) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure("The device code has already been consumed."));
+        }
+        if (value.lastPollAt() && now < *value.lastPollAt() + value.pollInterval()) {
+            auto slowed = value.slowDown(now);
+            if (!slowed) {
+                rollback(connection);
+                return foundation::fail(slowed.error());
+            }
+            auto updated = runCommand(
+                connection,
+                "UPDATE openproof.oauth_device_authorizations "
+                "SET poll_interval_ms=$2,last_poll_at_ms=$3 WHERE device_digest=decode($1,'hex')",
+                {digest, integer(value.pollInterval().count()), instant(now)},
+                "slow device authorization polling");
+            if (!updated) {
+                rollback(connection);
+                return foundation::fail(updated.error());
+            }
+            auto committed = commit(connection);
+            if (!committed) return foundation::fail(committed.error());
+            return oauth::DevicePollResult{
+                oauth::DevicePollDisposition::SlowDown, std::nullopt, value.pollInterval()};
+        }
+        if (value.status() == oauth::DeviceAuthorizationStatus::Approved) {
+            auto consumed = value.consume(now);
+            if (!consumed) {
+                rollback(connection);
+                return foundation::fail(consumed.error());
+            }
+            auto updated = runCommand(
+                connection,
+                "UPDATE openproof.oauth_device_authorizations SET status=3,last_poll_at_ms=$2 "
+                "WHERE device_digest=decode($1,'hex') AND status=1",
+                {digest, instant(now)}, "consume device authorization");
+            if (!updated) {
+                rollback(connection);
+                return foundation::fail(updated.error());
+            }
+            auto committed = commit(connection);
+            if (!committed) return foundation::fail(committed.error());
+            const auto retryAfter = value.pollInterval();
+            return oauth::DevicePollResult{
+                oauth::DevicePollDisposition::Approved, std::move(value), retryAfter};
+        }
+        auto polled = value.markPolled(now);
+        if (!polled) {
+            rollback(connection);
+            return foundation::fail(polled.error());
+        }
+        auto updated = runCommand(
+            connection,
+            "UPDATE openproof.oauth_device_authorizations SET last_poll_at_ms=$2 "
+            "WHERE device_digest=decode($1,'hex') AND status=0",
+            {digest, instant(now)}, "record device authorization poll");
+        if (!updated) {
+            rollback(connection);
+            return foundation::fail(updated.error());
+        }
+        auto committed = commit(connection);
+        if (!committed) return foundation::fail(committed.error());
+        return oauth::DevicePollResult{
+            oauth::DevicePollDisposition::Pending, std::nullopt, value.pollInterval()};
+    }
+
+    foundation::Status PostgresIdentityProviderStore::add(
+        oauth::PushedAuthorizationRequest pushed)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const auto& request = pushed.request();
+        const std::string digest = foundation::toHex(pushed.digest().bytes());
+        const std::string maximumAge = request.maximumAuthenticationAge()
+            ? integer(request.maximumAuthenticationAge()->count()) : std::string{};
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_pushed_authorization_requests("
+            "request_digest,client_id,redirect_uri,code_challenge,state,nonce,"
+            "maximum_authentication_age_ms,resource,response_mode,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,$3,$4,NULLIF($5,''),NULLIF($6,''),"
+            "NULLIF($7,'')::bigint,NULLIF($8,''),$9,$10,$11)",
+            {digest, std::string{request.clientId().value()}, std::string{request.redirectUri()},
+             std::string{request.codeChallenge().value()}, request.state().value_or(std::string{}),
+             request.nonce().value_or(std::string{}), maximumAge,
+             request.resource().value_or(std::string{}),
+             integer(static_cast<unsigned int>(request.responseMode())),
+             instant(pushed.issuedAt()), instant(pushed.expiresAt())});
+        if (!commandOk(inserted.get())) {
+            auto error = databaseError(inserted.get(), "insert pushed authorization request");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        for (const auto& scope : request.scopes()) {
+            auto stored = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_pushed_authorization_request_scopes("
+                "request_digest,scope) VALUES(decode($1,'hex'),$2)",
+                {digest, std::string{scope.value()}}, "insert PAR scope");
+            if (!stored) {
+                rollback(connection);
+                return stored;
+            }
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<oauth::PushedAuthorizationRequest>
+    PostgresIdentityProviderStore::find(
+        const oauth::PushedRequestDigest& digest, foundation::Instant now) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        const std::string query = "SELECT " + std::string{kPushedAuthorizationColumns}
+            + " FROM openproof.oauth_pushed_authorization_requests "
+              "WHERE request_digest=decode($1,'hex')";
+        ResultPointer row = execParams(
+            lease->get(), query, {foundation::toHex(digest.bytes())});
+        if (!tuplesOk(row.get())) {
+            return foundation::fail(databaseError(row.get(), "find pushed authorization request"));
+        }
+        if (PQntuples(row.get()) != 1) return foundation::fail(foundation::ErrorCode::NotFound);
+        auto pushed = pushedAuthorizationFromRow(lease->get(), row.get(), 0);
+        if (!pushed) return foundation::fail(pushed.error());
+        if (pushed->expiredAt(now)) return foundation::fail(foundation::ErrorCode::NotFound);
+        return pushed;
+    }
+
+    foundation::Result<oauth::PushedAuthorizationRequest>
+    PostgresIdentityProviderStore::consume(
+        const oauth::PushedRequestDigest& digest, const client::ClientId& expectedClient,
+        foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return foundation::fail(begun.error());
+        const std::string query = "SELECT " + std::string{kPushedAuthorizationColumns}
+            + " FROM openproof.oauth_pushed_authorization_requests "
+              "WHERE request_digest=decode($1,'hex') FOR UPDATE";
+        const std::string encodedDigest = foundation::toHex(digest.bytes());
+        ResultPointer row = execParams(connection, query, {encodedDigest});
+        if (!tuplesOk(row.get())) {
+            auto error = databaseError(row.get(), "lock pushed authorization request");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if (PQntuples(row.get()) != 1) {
+            rollback(connection);
+            return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                    "The pushed authorization request is invalid.");
+        }
+        auto pushed = pushedAuthorizationFromRow(connection, row.get(), 0);
+        if (!pushed || pushed->expiredAt(now)
+            || pushed->request().clientId() != expectedClient) {
+            rollback(connection);
+            return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                    "The pushed authorization request is invalid.");
+        }
+        auto removed = runCommand(
+            connection,
+            "DELETE FROM openproof.oauth_pushed_authorization_requests "
+            "WHERE request_digest=decode($1,'hex')",
+            {encodedDigest}, "consume pushed authorization request");
+        if (!removed) {
+            rollback(connection);
+            return foundation::fail(removed.error());
+        }
+        auto committed = commit(connection);
+        if (!committed) return foundation::fail(committed.error());
+        return pushed;
+    }
+
+    foundation::Status PostgresIdentityProviderStore::save(
+        oauth::ClientRequestSigningKey key)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        return runCommand(
+            lease->get(),
+            "INSERT INTO openproof.oauth_client_request_signing_keys("
+            "client_id,key_id,public_key_pem,updated_at_ms) VALUES($1,$2,$3,$4) "
+            "ON CONFLICT(client_id) DO UPDATE SET key_id=EXCLUDED.key_id,"
+            "public_key_pem=EXCLUDED.public_key_pem,updated_at_ms=EXCLUDED.updated_at_ms",
+            {std::string{key.clientId().value()}, std::string{key.keyId()},
+             std::string{key.publicKeyPem()}, instant(key.updatedAt())},
+            "save JAR client request signing key");
+    }
+
+    foundation::Result<std::optional<oauth::ClientRequestSigningKey>>
+    PostgresIdentityProviderStore::find(const client::ClientId& clientId) const
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(
+            lease->get(),
+            "SELECT key_id,public_key_pem,updated_at_ms "
+            "FROM openproof.oauth_client_request_signing_keys WHERE client_id=$1",
+            {std::string{clientId.value()}});
+        if (!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), "find JAR client request signing key"));
+        }
+        if (PQntuples(result.get()) == 0) {
+            return std::optional<oauth::ClientRequestSigningKey>{};
+        }
+        auto updatedAt = parseInteger<std::int64_t>(field(result.get(), 0, 2));
+        if (!updatedAt) return foundation::fail(updatedAt.error());
+        auto key = oauth::ClientRequestSigningKey::create(
+            clientId, field(result.get(), 0, 0), field(result.get(), 0, 1),
+            storedInstant(updatedAt.value()));
+        if (!key) return foundation::fail(foundation::ErrorCode::Internal,
+                                          "Stored JAR client key is invalid.");
+        return std::optional<oauth::ClientRequestSigningKey>{std::move(key).value()};
+    }
+
+    foundation::Status PostgresIdentityProviderStore::remove(const client::ClientId& clientId)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        return runCommand(
+            lease->get(),
+            "DELETE FROM openproof.oauth_client_request_signing_keys WHERE client_id=$1",
+            {std::string{clientId.value()}}, "remove JAR client request signing key");
+    }
+
+    foundation::Status PostgresIdentityProviderStore::consume(
+        const client::ClientId& clientId, std::string_view jwtId,
+        foundation::Instant expiresAt, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        auto purged = runCommand(
+            connection, "DELETE FROM openproof.oauth_jar_replays WHERE expires_at_ms <= $1",
+            {instant(now)}, "purge expired JAR replay identifiers");
+        if (!purged) {
+            rollback(connection);
+            return purged;
+        }
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_jar_replays(client_id,jwt_id,expires_at_ms) "
+            "VALUES($1,$2,$3)",
+            {std::string{clientId.value()}, std::string{jwtId}, instant(expiresAt)});
+        if (!commandOk(inserted.get())) {
+            auto error = databaseError(inserted.get(), "consume JAR replay identifier");
+            rollback(connection);
+            if (error.code() == foundation::ErrorCode::AlreadyExists) {
+                return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                        "The JAR request object was replayed.");
+            }
+            return foundation::fail(error);
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::consumeDpopReplay(
+        std::string_view jwkThumbprint, std::string_view jwtId,
+        foundation::Instant expiresAt, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        auto purged = runCommand(
+            connection, "DELETE FROM openproof.oauth_dpop_replays WHERE expires_at_ms <= $1",
+            {instant(now)}, "purge expired DPoP replay identifiers");
+        if (!purged) {
+            rollback(connection);
+            return purged;
+        }
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_dpop_replays(jwk_thumbprint,jwt_id,expires_at_ms) "
+            "VALUES($1,$2,$3)",
+            {std::string{jwkThumbprint}, std::string{jwtId}, instant(expiresAt)});
+        if (!commandOk(inserted.get())) {
+            auto error = databaseError(inserted.get(), "consume DPoP replay identifier");
+            rollback(connection);
+            if (error.code() == foundation::ErrorCode::AlreadyExists) {
+                return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                        "The DPoP proof was replayed.");
+            }
+            return foundation::fail(error);
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::consumeMtlsForwardingReplay(
+        std::string_view certificateThumbprint, std::string_view nonce,
+        foundation::Instant expiresAt, foundation::Instant now)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        auto purged = runCommand(
+            connection, "DELETE FROM openproof.oauth_mtls_forwarding_replays WHERE expires_at_ms <= $1",
+            {instant(now)}, "purge expired mTLS forwarding replay identifiers");
+        if (!purged) {
+            rollback(connection);
+            return purged;
+        }
+        ResultPointer inserted = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_mtls_forwarding_replays"
+            "(certificate_thumbprint,nonce,expires_at_ms) VALUES($1,$2,$3)",
+            {std::string{certificateThumbprint}, std::string{nonce}, instant(expiresAt)});
+        if (!commandOk(inserted.get())) {
+            auto error = databaseError(inserted.get(), "consume mTLS forwarding replay identifier");
+            rollback(connection);
+            if (error.code() == foundation::ErrorCode::AlreadyExists) {
+                return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                        "The authenticated mTLS forwarding assertion was replayed.");
+            }
+            return foundation::fail(error);
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::storeInitial(
+        token::AccessTokenRecord access, token::RefreshTokenRecord refresh)
+    {
+        if (access.family() != refresh.family()
+            || access.context().client() != refresh.context().client()
+            || access.context().identity() != refresh.context().identity()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "OAuth token records disagree.");
+        }
+
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) {
+            return foundation::fail(lease.error());
+        }
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) {
+            return begun;
+        }
+
+        const auto& context = access.context();
+        const std::string senderKind = context.senderConstraint()
+            ? integer(static_cast<unsigned int>(context.senderConstraint()->kind()))
+            : std::string{};
+        const std::string senderValue = context.senderConstraint()
+            ? std::string{context.senderConstraint()->value()}
+            : std::string{};
+        ResultPointer family = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_token_families"
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,"
+            "authenticated_at_ms,sender_constraint_kind,sender_constraint_value) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::smallint,NULLIF($10,''))",
+            {std::string{access.family().value()}, std::string{context.client().value()},
+             std::string{context.identity().value()}, std::string{context.provider().value()},
+             integer(static_cast<unsigned int>(context.assurance())),
+             integer(factorsValue(context.strength())),
+             context.strength().isPhishingResistant() ? "true" : "false",
+             instant(context.authenticatedAt()), senderKind, senderValue});
+        if (!commandOk(family.get())) {
+            auto error = databaseError(family.get(), "insert token family");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+
+        for (const auto& scope : context.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) "
+                "VALUES($1,$2)",
+                {std::string{access.family().value()}, scope},
+                "insert token family scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        for (const auto& audience : context.audiences()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_token_family_audiences(family_id,audience) "
+                "VALUES($1,$2)",
+                {std::string{access.family().value()}, audience},
+                "insert token family audience");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+
+        auto accessStatus = runCommand(
+            connection,
+            "INSERT INTO openproof.oauth_access_tokens"
+            "(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",
+            {foundation::toHex(access.digest().bytes()), std::string{access.family().value()},
+             instant(access.issuedAt()), instant(access.expiresAt())},
+            "insert access token");
+        if (!accessStatus) {
+            rollback(connection);
+            return accessStatus;
+        }
+
+        auto refreshStatus = runCommand(
+            connection,
+            "INSERT INTO openproof.oauth_refresh_tokens"
+            "(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,$3,0,$4,$5)",
+            {foundation::toHex(refresh.digest().bytes()), std::string{refresh.family().value()},
+             integer(static_cast<std::int64_t>(refresh.sequence())), instant(refresh.issuedAt()),
+             instant(refresh.expiresAt())},
+            "insert refresh token");
+        if (!refreshStatus) {
+            rollback(connection);
+            return refreshStatus;
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::storeAccessOnly(
+        token::AccessTokenRecord access)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) {
+            return foundation::fail(lease.error());
+        }
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) {
+            return begun;
+        }
+
+        const auto& context = access.context();
+        const std::string senderKind = context.senderConstraint()
+            ? integer(static_cast<unsigned int>(context.senderConstraint()->kind()))
+            : std::string{};
+        const std::string senderValue = context.senderConstraint()
+            ? std::string{context.senderConstraint()->value()}
+            : std::string{};
+        ResultPointer family = execParams(
+            connection,
+            "INSERT INTO openproof.oauth_token_families"
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,"
+            "authenticated_at_ms,sender_constraint_kind,sender_constraint_value) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::smallint,NULLIF($10,''))",
+            {std::string{access.family().value()}, std::string{context.client().value()},
+             std::string{context.identity().value()}, std::string{context.provider().value()},
+             integer(static_cast<unsigned int>(context.assurance())),
+             integer(factorsValue(context.strength())),
+             context.strength().isPhishingResistant() ? "true" : "false",
+             instant(context.authenticatedAt()), senderKind, senderValue});
+        if (!commandOk(family.get())) {
+            auto error = databaseError(family.get(), "insert access-only token family");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+
+        for (const auto& scope : context.scopes()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) "
+                "VALUES($1,$2)",
+                {std::string{access.family().value()}, scope},
+                "insert token family scope");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+        for (const auto& audience : context.audiences()) {
+            auto status = runCommand(
+                connection,
+                "INSERT INTO openproof.oauth_token_family_audiences(family_id,audience) "
+                "VALUES($1,$2)",
+                {std::string{access.family().value()}, audience},
+                "insert token family audience");
+            if (!status) {
+                rollback(connection);
+                return status;
+            }
+        }
+
+        auto accessStatus = runCommand(
+            connection,
+            "INSERT INTO openproof.oauth_access_tokens"
+            "(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",
+            {foundation::toHex(access.digest().bytes()), std::string{access.family().value()},
+             instant(access.issuedAt()), instant(access.expiresAt())},
+            "insert access-only token");
+        if (!accessStatus) {
+            rollback(connection);
+            return accessStatus;
+        }
+        return commit(connection);
+    }
+
+    foundation::Result<token::AccessTokenRecord> PostgresIdentityProviderStore::findAccess(const token::TokenDigest& digestValue)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(lease->get(),"SELECT family_id,state,issued_at_ms,expires_at_ms,revoked_at_ms FROM openproof.oauth_access_tokens WHERE token_digest=decode($1,'hex')",{foundation::toHex(digestValue.bytes())});
+        if(!tuplesOk(result.get()))return foundation::fail(databaseError(result.get(),"find access token"));
+        if(PQntuples(result.get())!=1)return foundation::fail(authenticationFailure("Unknown access token."));
+        auto state=parseInteger<unsigned int>(field(result.get(),0,1));
+        auto issued=parseInteger<std::int64_t>(field(result.get(),0,2));
+        auto expires=parseInteger<std::int64_t>(field(result.get(),0,3));
+        if(!state||!issued||!expires||state.value()>1U)return foundation::fail(foundation::ErrorCode::Internal);
+        token::TokenFamilyId family{field(result.get(),0,0)};
+        auto context=loadTokenContext(lease->get(),family);
+        if(!context)return foundation::fail(context.error());
+        std::optional<foundation::Instant> revoked;
+        if(!PQgetisnull(result.get(),0,4)){auto value=parseInteger<std::int64_t>(field(result.get(),0,4));
+            if(!value)return foundation::fail(value.error());
+            revoked=storedInstant(value.value());
+        }
+        return token::AccessTokenRecord{digestValue,std::move(family),std::move(context).value(),storedInstant(issued.value()),storedInstant(expires.value()),static_cast<token::AccessTokenState>(state.value()),revoked};
+    }
+
+    foundation::Result<token::RefreshTokenRecord> PostgresIdentityProviderStore::findRefresh(const token::TokenDigest& digestValue)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(lease->get(),"SELECT family_id,sequence,state,issued_at_ms,expires_at_ms,changed_at_ms FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex')",{foundation::toHex(digestValue.bytes())});
+        if(!tuplesOk(result.get()))return foundation::fail(databaseError(result.get(),"find refresh token"));
+        if(PQntuples(result.get())!=1)return foundation::fail(authenticationFailure("Unknown refresh token."));
+        auto sequence=parseInteger<std::uint64_t>(field(result.get(),0,1));
+        auto state=parseInteger<unsigned int>(field(result.get(),0,2));
+        auto issued=parseInteger<std::int64_t>(field(result.get(),0,3));
+        auto expires=parseInteger<std::int64_t>(field(result.get(),0,4));
+        if(!sequence||!state||!issued||!expires||state.value()>2U)return foundation::fail(foundation::ErrorCode::Internal);
+        token::TokenFamilyId family{field(result.get(),0,0)};
+        auto context=loadTokenContext(lease->get(),family);
+        if(!context)return foundation::fail(context.error());
+        std::optional<foundation::Instant> changed;
+        if(!PQgetisnull(result.get(),0,5)){auto value=parseInteger<std::int64_t>(field(result.get(),0,5));
+            if(!value)return foundation::fail(value.error());
+            changed=storedInstant(value.value());
+        }
+        return token::RefreshTokenRecord{digestValue,std::move(family),sequence.value(),std::move(context).value(),storedInstant(issued.value()),storedInstant(expires.value()),static_cast<token::RefreshTokenState>(state.value()),changed};
+    }
+
+    foundation::Status PostgresIdentityProviderStore::rotateRefresh(
+    const token::TokenDigest& presented, foundation::Instant now,
+    token::AccessTokenRecord replacementAccess, token::RefreshTokenRecord replacementRefresh)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return begun;
+        ResultPointer current=execParams(connection,"SELECT family_id,sequence,state,expires_at_ms FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{foundation::toHex(presented.bytes())});
+        if(!tuplesOk(current.get())){auto error=databaseError(current.get(),"lock refresh token");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if(PQntuples(current.get())!=1){rollback(connection);
+            return foundation::fail(authenticationFailure("Unknown refresh token."));
+        }
+        auto sequence=parseInteger<std::uint64_t>(field(current.get(),0,1));
+        auto state=parseInteger<unsigned int>(field(current.get(),0,2));
+        auto expires=parseInteger<std::int64_t>(field(current.get(),0,3));
+        if(!sequence||!state||!expires){rollback(connection);
+            return foundation::fail(foundation::ErrorCode::Internal);
+        }
+        token::TokenFamilyId family{field(current.get(),0,0)};
+        if(state.value()!=0U||storedInstant(expires.value())<=now){auto revoked=revokeTokenFamilySql(connection,family,now);
+            if(!revoked){rollback(connection);
+                return revoked;
+            }
+            auto committed=commit(connection);
+            if(!committed)return committed;
+            return foundation::fail(authenticationFailure("Refresh token reuse or expiry detected; family revoked."));
+        }
+        if(replacementAccess.family()!=family||replacementRefresh.family()!=family||replacementRefresh.sequence()!=sequence.value()+1U){rollback(connection);
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,"The refresh rotation replacement is inconsistent.");
+        }
+        auto used=runCommand(connection,"UPDATE openproof.oauth_refresh_tokens SET state=1,changed_at_ms=$2 WHERE token_digest=decode($1,'hex') AND state=0",{foundation::toHex(presented.bytes()),instant(now)},"consume refresh token");
+        if(!used){rollback(connection);
+            return used;
+        }
+        auto accessStatus=runCommand(connection,"INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms) VALUES(decode($1,'hex'),$2,0,$3,$4)",{foundation::toHex(replacementAccess.digest().bytes()),std::string{family.value()},instant(replacementAccess.issuedAt()),instant(replacementAccess.expiresAt())},"rotate access token");
+        auto refreshStatus=runCommand(connection,"INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) VALUES(decode($1,'hex'),$2,$3,0,$4,$5)",{foundation::toHex(replacementRefresh.digest().bytes()),std::string{family.value()},integer(static_cast<std::int64_t>(replacementRefresh.sequence())),instant(replacementRefresh.issuedAt()),instant(replacementRefresh.expiresAt())},"rotate refresh token");
+        if(!accessStatus||!refreshStatus){rollback(connection);
+            return foundation::fail((!accessStatus?accessStatus:refreshStatus).error());
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::revokeFamily(const token::TokenFamilyId& family, foundation::Instant now)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return begun;
+        auto status=revokeTokenFamilySql(connection,family,now);
+        if(!status){rollback(connection);
+            return status;
+        }
+        return commit(connection);
+    }
+
+    foundation::Status PostgresIdentityProviderStore::revokeToken(const token::TokenDigest& digestValue, foundation::Instant now)
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        PGconn* connection=lease->get();
+        auto begun=beginTransaction(connection);
+        if(!begun)return begun;
+        const std::string digest=foundation::toHex(digestValue.bytes());
+        ResultPointer access=execParams(connection,"SELECT family_id FROM openproof.oauth_access_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{digest});
+        if(!tuplesOk(access.get())){auto error=databaseError(access.get(),"find token to revoke");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if(PQntuples(access.get())==1){auto status=runCommand(connection,"UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=COALESCE(revoked_at_ms,$2) WHERE token_digest=decode($1,'hex')",{digest,instant(now)},"revoke access token");
+            if(!status){rollback(connection);
+                return status;
+            }
+            return commit(connection);
+        }
+        ResultPointer refresh=execParams(connection,"SELECT family_id FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{digest});
+        if(!tuplesOk(refresh.get())){auto error=databaseError(refresh.get(),"find refresh token to revoke");
+            rollback(connection);
+            return foundation::fail(error);
+        }
+        if(PQntuples(refresh.get())==1){auto status=revokeTokenFamilySql(connection,token::TokenFamilyId{field(refresh.get(),0,0)},now);
+            if(!status){rollback(connection);
+                return status;
+            }}
+        return commit(connection);
+    }
 
 }

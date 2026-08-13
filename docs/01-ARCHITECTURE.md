@@ -1,10 +1,13 @@
 # OpenProof Protocol — Architecture
 
-Status: **Authentication, gateway, critical PostgreSQL stores and observability implemented and verified.**
+> v1.0.13 production note: fail-closed internal invariants are enforced by `foundation::requireInvariant`; GCC experimental Contracts are opt-in qualification-only because of module ICEs on the qualified GCC 16.1/Darwin toolchain.
 
-This document describes the architecture that exists in the repository today and
-the shape the later phases are built to fit. Anything not yet implemented is
-marked as such rather than described as if it were done.
+Status: **OpenProof 1.0 identity platform implemented in source: centralized authentication, application/client registry, OAuth/OIDC authorization server, opaque token service, delegated gateway access, SDKs, PostgreSQL persistence and provider-neutral evidence/trust foundation.**
+
+This document describes the architecture that exists in the repository today.
+Target-toolchain release verification status is tracked separately in
+`RELEASE_VERIFICATION.md`; unsupported or unexecuted checks are not described as
+passes.
 
 ---
 
@@ -77,6 +80,14 @@ every other layer may assume.
 | `openproof.identity.provider` | `:assurance` `:outcome` `:authenticator` `:transaction` `:registry` | The authentication provider SPI |
 | `openproof.authentication` | `:service` | Trusted orchestration, single-use enforcement and assurance adjudication |
 | `openproof.identity.core` | `:identity` `:link` `:repository` `:merge` | Canonical identity and explicit association lifecycle |
+| `openproof.identity.profile` | `:model` `:repository` | OIDC-facing identity profile claims |
+| `openproof.application` | `:model` `:repository` `:service` | Tenant-owned logical product registry |
+| `openproof.client` | `:model` `:repository` `:service` | OAuth client registration, redirects, scopes, secret/lifecycle policy |
+| `openproof.oauth` | `:model` `:repository` `:service` | Authorization Code + mandatory PKCE S256 |
+| `openproof.token` | `:model` `:repository` `:service` | Opaque access tokens, refresh rotation/replay families |
+| `openproof.oidc` | `:service` | Discovery, UserInfo, JWKS and RS256 ID Tokens |
+| `openproof.evidence` | `:model` `:repository` `:service` | Verified evidence and provider verifier SPI |
+| `openproof.trust` | `:model` `:engine` | Derived trust/risk assessment |
 | `openproof.organization` / `.membership` | organization, membership, repository | Tenant and organization-scoped role lifecycle |
 | `openproof.policy` | `:decision` | Sealed authorization request plus immutable exact-route RBAC/assurance engine |
 | `openproof.session` | model, repository, service | Opaque sessions, absolute/idle expiry, rotation and revocation |
@@ -87,7 +98,7 @@ every other layer may assume.
 | `openproof.storage.postgres` | — | Bounded pool, migrations, durable auth/identity stores and atomic owner-authorized administration adapter |
 | `openproof.audit` / `.telemetry` | — | HMAC audit chain, security events, bounded metrics and trace context |
 
-48 module interface units (`.cppm`), 38 implementation units (`.cpp`).
+81 project module interface units (`.cppm`) and 65 project implementation/test-example integration units (`.cpp`) across the identity platform, SDK and reference consumer surfaces.
 Zero `.h` / `.hpp` files. Zero uses of `import std;` (unavailable — see
 [03-CXX26.md](03-CXX26.md) §5).
 
@@ -131,7 +142,7 @@ individual authentication mechanisms. That is expressed structurally:
 
 ```mermaid
 graph LR
-    subgraph providers["Providers (Phase 3)"]
+    subgraph providers["Authentication providers behind the SPI"]
         oidc["openproof.identity.oidc<br/>Google, Apple, Microsoft"]
         oauth["openproof.identity.oauth2<br/>GitHub"]
         webauthn["openproof.identity.webauthn<br/>passkeys"]
@@ -142,7 +153,7 @@ graph LR
     end
 
     spi["openproof.identity.provider<br/><b>SPI — implemented</b>"]
-    core["openproof.identity.core<br/>(Phase 2)"]
+    core["openproof.identity.core"]
 
     oidc --> spi
     oauth --> spi
@@ -343,28 +354,32 @@ its types reach a module implementation unit.
 
 ---
 
-## 5. What is deliberately not built yet
-
-Named explicitly so that no reader infers more than exists.
+## 5. Implemented boundary and deliberate extensions
 
 | Area | State |
 |---|---|
-| Identity core, explicit linking and merge, organizations and memberships | Implemented with PostgreSQL identity, external-link, organization and membership adapters |
-| Authentication providers | Local password and password+TOTP implemented; OIDC, WebAuthn, wallet, social and enterprise providers pending |
-| Authentication broker, sessions and credentials | Implemented; operational HTTP auth plane and durable sessions, transactions, recovery codes, password verifiers and encrypted TOTP seeds |
-| Policy engine, RBAC, ABAC, trusted entitlement adapter | Exact method/path RBAC (`any`/`all`) and minimum-assurance evaluation implemented; ABAC, trust/risk and entitlement adapters pending |
-| OpenProof gateway | HTTP/1.1 edge, explicit fail-closed route policies, cookie/Bearer sessions, enforcement, proxy, rate limiting, LB, circuit breaker and static discovery implemented; dynamic discovery pending |
-| Metrics, tracing, audit events, security events | Core adapters plus durable chained administrative and rejected-authorization events implemented; production exporters and general-purpose durable audit repository pending |
-| PostgreSQL adapter, migrations, cache adapter | Pool, checksummed migrations and critical authentication/identity/organization adapters implemented; cache and remaining domains pending |
-| Administration | One-time offline `bootstrap-admin` plus IAL2 owner-only local-member creation, role replacement, suspension/reinstatement/removal and credential reset implemented; tenant/policy lifecycle remains pending |
-| Threat model, load tests, fuzzing | Baseline implemented; sustained distributed load and protocol-specific fuzz targets remain ongoing work |
-| HTTP/3 | Architected for behind a transport abstraction; **not implemented and not claimed** |
-
----
+| Canonical identity, explicit linking/merge, organizations and memberships | Implemented, including PostgreSQL adapters |
+| Local authentication | Password + TOTP, recovery, session rotation/revocation and centralized browser login implemented |
+| Application Registry / Client Management | Implemented with tenant ownership, independent lifecycle, exact redirects, scopes and secret rotation |
+| OAuth authorization server | Authorization Code + mandatory PKCE S256, opaque code/token storage, refresh rotation/replay-family revocation, introspection and revocation implemented |
+| OpenID Connect Provider | Discovery, UserInfo, JWKS and RS256 ID Tokens implemented |
+| Gateway | Platform-session and delegated OAuth bearer access, required scope, trusted signed upstream context, rate limiting/LB/circuit breaker implemented |
+| SDKs | C++ module, JavaScript, Swift (Apple), and Kotlin SDK cores implemented |
+| Reference relying product | Tegra-style C++ consumer example implemented; the external Tegra repository was not part of the supplied source and therefore was not mutated |
+| Evidence / Trust | Provider-neutral verifier SPI, durable evidence and derived weighted trust/risk assessment implemented |
+| External authentication providers | Local, Google/Apple/Microsoft OIDC, GitHub OAuth, WebAuthn/passkeys, SIWE wallet, Farcaster custody/SIWE, LDAPS and SAML providers are implemented behind the provider SPI |
+| Concrete evidence verifiers | Signed RS256 attestation JWT and X.509 chain/SAN/proof-of-possession verifiers are implemented with durable one-time challenges; additional provider-specific evidence adapters remain SPI extensions |
+| ABAC / trust-aware authorization | RBAC, assurance and OAuth scope enforcement exist; consuming trust/risk as policy input remains an explicit later policy extension |
+| Public self-service account lifecycle | Signup, email/phone verification, forgot/reset password and profile maintenance are implemented; the verification delivery channel is an authenticated operator-configured HTTPS adapter |
+| HTTP/3 | Not implemented or claimed; deployment may terminate newer transports in the front proxy |
 
 ## 6. Conventions
 
-- `.cppm` holds exported declarations; non-trivial implementation lives in `.cpp`.
+- Public `.cppm` units hold exported declarations; non-trivial implementation normally
+  lives in `.cpp`. A private `.cppm` implementation partition is permitted when a
+  qualified compiler cannot reliably reload the primary CMI from an implementation
+  unit. Such partitions are never exported and use named `detail` namespaces rather
+  than anonymous namespaces so GCC can serialize template references safely.
 - `.h` and `.hpp` are forbidden in project code. Third-party headers appear only
   in the global module fragment of a dedicated adapter implementation unit, and
   no third-party type crosses a OpenProof module interface.

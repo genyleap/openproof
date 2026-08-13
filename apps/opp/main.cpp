@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <charconv>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <set>
 #include <print>
 #include <span>
 #include <string>
@@ -27,51 +30,96 @@
 #include <vector>
 #include <version>
 
-#if defined(__cpp_lib_text_encoding) && __cpp_lib_text_encoding >= 202306
-#include <text_encoding>
-#define OPENPROOF_HAS_TEXT_ENCODING 1
-#else
-#define OPENPROOF_HAS_TEXT_ENCODING 0
-#endif
 
+
+import openproof.account;
+import openproof.account.delivery;
+import openproof.account.http;
 import openproof.administration;
 import openproof.administration.http;
+import openproof.application;
+import openproof.application.http;
+import openproof.client;
+import openproof.consent;
+import openproof.resource;
 import openproof.audit;
 import openproof.config;
 import openproof.authentication;
+import openproof.authentication.federated.http;
 import openproof.authentication.http;
+import openproof.authentication.passkey.http;
+import openproof.authentication.web3.http;
+import openproof.authentication.enterprise.http;
 import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.enterprise.scim;
+import openproof.enterprise.scim.http;
+import openproof.evidence;
+import openproof.evidence.verifiers;
+import openproof.evidence.http;
+import openproof.trust;
 import openproof.identity.provider;
 import openproof.observability;
+import openproof.oauth;
+import openproof.oauth.http;
+import openproof.oidc;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.policy;
+import openproof.provider.github;
 import openproof.provider.local;
+import openproof.provider.oidc;
+import openproof.provider.passkey;
+import openproof.provider.web3;
+import openproof.provider.enterprise;
 import openproof.security;
 import openproof.session;
 import openproof.storage.postgres;
+import openproof.token;
 
 namespace {
 
 namespace fnd = openproof::foundation;
+namespace account = openproof::account;
+namespace accountDelivery = openproof::account::delivery;
+namespace accountHttp = openproof::account::http;
 namespace administration = openproof::administration;
 namespace adminHttp = openproof::administration::http;
+namespace application = openproof::application;
+namespace applicationHttp = openproof::application::http;
+namespace client = openproof::client;
+namespace consent = openproof::consent;
+namespace resource = openproof::resource;
 namespace audit = openproof::audit;
 namespace cfg = openproof::config;
 namespace auth = openproof::authentication;
 namespace authHttp = openproof::authentication::http;
 namespace credentials = openproof::credentials;
 namespace obs = openproof::observability;
+namespace oauth = openproof::oauth;
+namespace oauthHttp = openproof::oauth::http;
+namespace oidc = openproof::oidc;
 namespace identity = openproof::identity::core;
+namespace scim = openproof::enterprise::scim;
+namespace scimHttp = openproof::enterprise::scim::http;
+namespace evidence = openproof::evidence;
+namespace evidenceVerification = openproof::evidence::verification;
+namespace evidenceHttp = openproof::evidence::http;
+namespace trustModel = openproof::trust;
 namespace gateway = openproof::gateway;
 namespace gatewayHttp = openproof::gateway::http;
 namespace policy = openproof::policy;
+namespace github = openproof::provider::github;
 namespace local = openproof::provider::local;
+namespace externalOidc = openproof::provider::oidc;
+namespace passkey = openproof::provider::passkey;
+namespace web3 = openproof::provider::web3;
+namespace enterprise = openproof::provider::enterprise;
 namespace security = openproof::security;
 namespace session = openproof::session;
 namespace postgres = openproof::storage::postgres;
+namespace token = openproof::token;
 namespace idp = openproof::identity::provider;
 
 // OPENPROOF_VERSION is injected by the build system, which is the only thing that
@@ -362,7 +410,9 @@ addProtectedRoutes(gateway::Router& router,
                 gateway::RouteId{"policy-" + std::to_string(routeIndex++)},
                 method.value(), std::string{routePolicy.pathPrefix()},
                 gateway::ServiceId{"default"}, true, organization,
-                policy::Action{actionName}, policy::Resource{resourceName});
+                policy::Action{actionName}, policy::Resource{resourceName},
+                std::string{routePolicy.requiredScope()},
+                std::string{routePolicy.requiredAudience()});
             auto rule = policy::RolePolicyRule::create(
                 policy::Action{actionName}, policy::Resource{resourceName},
                 requiredRoles,
@@ -524,6 +574,7 @@ addProtectedRoutes(gateway::Router& router,
 }
 
 [[nodiscard]] ExitCode runGatewayServer(const cfg::PlatformConfig& platform,
+                                        const cfg::Environment& environment,
                                         const fnd::ClockSource& clock,
                                         const obs::Logger& logger)
 {
@@ -633,6 +684,7 @@ addProtectedRoutes(gateway::Router& router,
     postgres::PostgresSessionRepository sessionRepository{*pool.value()};
     postgres::PostgresAuthenticationTransactionStore transactions{*pool.value()};
     postgres::PostgresRecoveryCodeRepository recoveryRepository{*pool.value()};
+    postgres::PostgresPasskeyRepository passkeyRepository{*pool.value()};
 
     auto configuredOrganization = organizations.findById(
         identity::OrganizationId{std::string{platform.auth().organizationId()}});
@@ -701,11 +753,321 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
+
+    std::optional<passkey::PasskeyConfig> passkeyConfig;
+    if (const auto relyingPartyId = environment.get("OPENPROOF_WEBAUTHN_RP_ID");
+        relyingPartyId && !relyingPartyId->empty()) {
+        const auto origin = environment.get("OPENPROOF_WEBAUTHN_ORIGIN");
+        if (!origin || origin->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_WEBAUTHN_ORIGIN is required when passkeys are enabled."});
+            return ExitCode::ConfigurationError;
+        }
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/webauthn-challenge-key/v1");
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
+            return ExitCode::InternalError;
+        }
+        auto configured = passkey::PasskeyConfig::create(
+            *relyingPartyId,
+            environment.get("OPENPROOF_WEBAUTHN_RP_NAME").value_or("OpenProof"),
+            *origin, std::move(derivationKey).value(), std::chrono::minutes{5});
+        if (!configured) {
+            reportStartupFailure(configured.error());
+            return ExitCode::ConfigurationError;
+        }
+        passkeyConfig.emplace(std::move(configured).value());
+        auto implementation = std::make_unique<passkey::PasskeyAuthenticationProvider>(
+            passkeyRepository, clock, *passkeyConfig);
+        auto status = providers.registerProvider(std::move(implementation));
+        if (status) {
+            status = trust.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2);
+        }
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
+    const auto federationCallback = environment.get("OPENPROOF_FEDERATION_CALLBACK_URI");
+    const auto federationCaFile = environment.get("OPENPROOF_FEDERATION_CA_FILE");
+    const auto registerOidcProvider = [&](std::string_view name,
+                                          std::string issuer,
+                                          std::vector<std::string> scopes,
+                                          std::string_view keyLabel) -> fnd::Status {
+        const std::string upperName = [&] {
+            std::string output{name};
+            std::ranges::transform(output, output.begin(), [](unsigned char symbol) {
+                return static_cast<char>(std::toupper(symbol));
+            });
+            return output;
+        }();
+        const auto clientId = environment.get("OPENPROOF_" + upperName + "_CLIENT_ID");
+        if (!clientId || clientId->empty()) return fnd::ok();
+        const auto clientSecret = environment.get("OPENPROOF_" + upperName + "_CLIENT_SECRET");
+        if (!clientSecret || clientSecret->empty() || !federationCallback
+            || federationCallback->empty()) {
+            return fnd::fail(fnd::ErrorCode::FailedPrecondition,
+                "Federated OIDC providers require a client secret and callback URI.");
+        }
+        auto derivationKey = deriveSecret(platform.security().tokenSigningKey(), keyLabel);
+        if (!derivationKey) return fnd::fail(derivationKey.error());
+        auto config = externalOidc::OidcProviderConfig::create(
+            idp::ProviderId{std::string{name}}, std::move(issuer), *clientId,
+            fnd::SecretString{*clientSecret}, *federationCallback, std::move(scopes),
+            std::move(derivationKey).value(), std::chrono::minutes{5});
+        if (!config) return fnd::fail(config.error());
+        auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
+            std::move(config).value(), clock, federationCaFile.value_or(std::string{}));
+        auto status = providers.registerProvider(std::move(implementation));
+        if (!status) return status;
+        return trust.trust(idp::ProviderId{std::string{name}}, idp::AssuranceLevel::Ial1, true);
+    };
+
+    {
+        const auto googleIssuer = environment.get("OPENPROOF_GOOGLE_ISSUER");
+        auto status = registerOidcProvider(
+            "google", googleIssuer.value_or("https://accounts.google.com"),
+            {"openid", "profile", "email"}, "openproof/federation/google/v1");
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    {
+        const auto appleIssuer = environment.get("OPENPROOF_APPLE_ISSUER");
+        auto status = registerOidcProvider(
+            "apple", appleIssuer.value_or("https://appleid.apple.com"),
+            {"name", "email"}, "openproof/federation/apple/v1");
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    if (const auto microsoftClientId = environment.get("OPENPROOF_MICROSOFT_CLIENT_ID");
+        microsoftClientId && !microsoftClientId->empty()) {
+        const auto microsoftIssuer = environment.get("OPENPROOF_MICROSOFT_ISSUER");
+        if (!microsoftIssuer || microsoftIssuer->empty()
+            || microsoftIssuer->contains("{tenantid}")
+            || microsoftIssuer->contains("/common/")
+            || microsoftIssuer->contains("/organizations/")
+            || microsoftIssuer->contains("/consumers/")) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_MICROSOFT_ISSUER must be a tenant-specific v2 issuer."});
+            return ExitCode::ConfigurationError;
+        }
+        auto status = registerOidcProvider(
+            "microsoft", *microsoftIssuer, {"openid", "profile", "email"},
+            "openproof/federation/microsoft/v1");
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    if (const auto githubClientId = environment.get("OPENPROOF_GITHUB_CLIENT_ID");
+        githubClientId && !githubClientId->empty()) {
+        const auto githubClientSecret = environment.get("OPENPROOF_GITHUB_CLIENT_SECRET");
+        if (!githubClientSecret || githubClientSecret->empty()
+            || !federationCallback || federationCallback->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "GitHub federation requires a client secret and callback URI."});
+            return ExitCode::ConfigurationError;
+        }
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/github/v1");
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
+            return ExitCode::InternalError;
+        }
+        auto githubConfig = github::GitHubProviderConfig::create(
+            *githubClientId, fnd::SecretString{*githubClientSecret}, *federationCallback,
+            std::move(derivationKey).value(), std::chrono::minutes{5});
+        if (!githubConfig) {
+            reportStartupFailure(githubConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto githubProvider = std::make_unique<github::GitHubAuthenticationProvider>(
+            std::move(githubConfig).value(), clock,
+            federationCaFile.value_or(std::string{}));
+        auto status = providers.registerProvider(std::move(githubProvider));
+        if (status) {
+            status = trust.trust(idp::ProviderId{"github"}, idp::AssuranceLevel::Ial1, true);
+        }
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    const auto parseChainId = [&](std::string_view name, std::uint64_t fallback)
+        -> fnd::Result<std::uint64_t> {
+        const auto configured = environment.get(std::string{name});
+        if (!configured || configured->empty()) return fallback;
+        std::uint64_t value{};
+        const auto parsed = std::from_chars(
+            configured->data(), configured->data() + configured->size(), value, 10);
+        if (parsed.ec != std::errc{} || parsed.ptr != configured->data() + configured->size()
+            || value == 0U) {
+            return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                             "A configured Web3 chain id is invalid.");
+        }
+        return value;
+    };
+    const auto web3Domain = environment.get("OPENPROOF_WEB3_DOMAIN");
+    const auto web3Uri = environment.get("OPENPROOF_WEB3_URI");
+    const auto web3CaFile = environment.get("OPENPROOF_WEB3_CA_FILE").value_or(std::string{});
+    if (const auto ethereumRpc = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINT");
+        ethereumRpc && !ethereumRpc->empty()) {
+        if (!web3Domain || web3Domain->empty() || !web3Uri || web3Uri->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_WEB3_DOMAIN and OPENPROOF_WEB3_URI are required for Web3 login."});
+            return ExitCode::ConfigurationError;
+        }
+        auto chainId = parseChainId("OPENPROOF_ETHEREUM_CHAIN_ID", 1U);
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/ethereum-wallet/v1");
+        if (!chainId || !derivationKey) {
+            reportStartupFailure(chainId ? derivationKey.error() : chainId.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto walletConfig = web3::WalletProviderConfig::create(
+            *web3Domain, *web3Uri, chainId.value(), *ethereumRpc,
+            std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
+            fnd::SecretString{environment.get("OPENPROOF_ETHEREUM_RPC_AUTHORIZATION").value_or(std::string{})});
+        if (!walletConfig) {
+            reportStartupFailure(walletConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(
+            std::make_unique<web3::WalletAuthenticationProvider>(std::move(walletConfig).value(), clock));
+        if (status) {
+            status = trust.trust(idp::ProviderId{"ethereum-wallet"}, idp::AssuranceLevel::Ial1, true);
+        }
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    if (const auto farcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
+        farcasterRpc && !farcasterRpc->empty()) {
+        const auto registry = environment.get("OPENPROOF_FARCASTER_ID_REGISTRY");
+        if (!web3Domain || web3Domain->empty() || !web3Uri || web3Uri->empty()
+            || !registry || registry->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "Farcaster login requires WEB3 domain/URI and OPENPROOF_FARCASTER_ID_REGISTRY."});
+            return ExitCode::ConfigurationError;
+        }
+        auto chainId = parseChainId("OPENPROOF_FARCASTER_CHAIN_ID", 10U);
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/farcaster/v1");
+        if (!chainId || !derivationKey) {
+            reportStartupFailure(chainId ? derivationKey.error() : chainId.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto farcasterConfig = web3::FarcasterProviderConfig::create(
+            *web3Domain, *web3Uri, chainId.value(), *farcasterRpc, *registry,
+            std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
+            fnd::SecretString{environment.get("OPENPROOF_FARCASTER_RPC_AUTHORIZATION").value_or(std::string{})});
+        if (!farcasterConfig) {
+            reportStartupFailure(farcasterConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(
+            std::make_unique<web3::FarcasterAuthenticationProvider>(
+                std::move(farcasterConfig).value(), clock));
+        if (status) {
+            status = trust.trust(idp::ProviderId{"farcaster"}, idp::AssuranceLevel::Ial1, true);
+        }
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
+    if (const auto ldapUri = environment.get("OPENPROOF_LDAP_URI"); ldapUri && !ldapUri->empty()) {
+        const auto baseDn = environment.get("OPENPROOF_LDAP_BASE_DN");
+        if (!baseDn || baseDn->empty()) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_LDAP_BASE_DN is required when LDAP login is enabled."});
+            return ExitCode::ConfigurationError;
+        }
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/ldap/v1");
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
+            return ExitCode::InternalError;
+        }
+        auto ldapConfig = enterprise::LdapProviderConfig::create(
+            *ldapUri, *baseDn,
+            environment.get("OPENPROOF_LDAP_USERNAME_ATTRIBUTE").value_or("uid"),
+            environment.get("OPENPROOF_LDAP_SUBJECT_ATTRIBUTE").value_or("entryUUID"),
+            environment.get("OPENPROOF_LDAP_DISPLAY_NAME_ATTRIBUTE").value_or("cn"),
+            environment.get("OPENPROOF_LDAP_EMAIL_ATTRIBUTE").value_or("mail"),
+            environment.get("OPENPROOF_LDAP_BIND_DN").value_or(std::string{}),
+            fnd::SecretString{environment.get("OPENPROOF_LDAP_BIND_PASSWORD").value_or(std::string{})},
+            std::move(derivationKey).value(),
+            environment.get("OPENPROOF_LDAP_CA_FILE").value_or(std::string{}),
+            std::chrono::minutes{5});
+        if (!ldapConfig) {
+            reportStartupFailure(ldapConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(std::make_unique<enterprise::LdapAuthenticationProvider>(
+            std::move(ldapConfig).value(), clock));
+        if (status) status = trust.trust(idp::ProviderId{"ldap"}, idp::AssuranceLevel::Ial1, true);
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
+    if (const auto samlSso = environment.get("OPENPROOF_SAML_IDP_SSO_URL"); samlSso && !samlSso->empty()) {
+        const auto spEntity = environment.get("OPENPROOF_SAML_SP_ENTITY_ID");
+        const auto idpEntity = environment.get("OPENPROOF_SAML_IDP_ENTITY_ID");
+        const auto certificate = environment.get("OPENPROOF_SAML_IDP_CERTIFICATE_PEM");
+        if (!spEntity || spEntity->empty() || !idpEntity || idpEntity->empty()
+            || !certificate || certificate->empty() || !federationCallback || federationCallback->empty()) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "SAML login requires SP/IdP entity IDs, IdP certificate PEM and the federation callback URI."});
+            return ExitCode::ConfigurationError;
+        }
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/saml/v1");
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
+            return ExitCode::InternalError;
+        }
+        auto samlConfig = enterprise::SamlProviderConfig::create(
+            *spEntity, *federationCallback, *idpEntity, *samlSso, *certificate,
+            std::move(derivationKey).value(), std::chrono::minutes{5}, std::chrono::minutes{2});
+        if (!samlConfig) {
+            reportStartupFailure(samlConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(std::make_unique<enterprise::SamlAuthenticationProvider>(
+            std::move(samlConfig).value(), clock));
+        if (status) status = trust.trust(idp::ProviderId{"saml"}, idp::AssuranceLevel::Ial1, true);
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
     auth::AuthenticationService authentication{
         providers, transactions, externalIdentities, clock, std::move(trust),
-        std::chrono::minutes{5}};
+        std::chrono::minutes{5}, &identities,
+        identity::OrganizationId{std::string{platform.auth().organizationId()}}};
     session::SessionService sessions{
         sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
+    std::optional<passkey::PasskeyService> passkeyService;
+    if (passkeyConfig) {
+        passkeyService.emplace(passkeyRepository, externalIdentities, clock, *passkeyConfig);
+    }
     auto memberPolicy = policy::RolePolicyEngine::create(
         std::move(authorizationRules));
     if (!memberPolicy) {
@@ -717,17 +1079,284 @@ addProtectedRoutes(gateway::Router& router,
     gateway::PolicyAccessController access{
         memberPolicy->get(), organizations, identities, memberships,
         &authorizationAudit};
+
+    postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
+    postgres::PostgresEvidenceChallengeStore evidenceChallengeStore{*pool.value()};
+    evidence::EvidenceService evidenceService{identityProviderStore, clock};
+    evidenceVerification::ChallengeService evidenceChallenges{
+        evidenceChallengeStore, clock, std::chrono::minutes{5}};
+    std::set<std::string, std::less<>> evidenceProviders;
+
+    if (const auto publicKey = environment.get("OPENPROOF_EVIDENCE_JWT_PUBLIC_KEY_PEM");
+        publicKey && !publicKey->empty()) {
+        const auto issuer = environment.get("OPENPROOF_EVIDENCE_JWT_ISSUER");
+        const auto audience = environment.get("OPENPROOF_EVIDENCE_JWT_AUDIENCE");
+        if (!issuer || issuer->empty() || !audience || audience->empty()) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "Signed evidence JWT verification requires issuer and audience configuration."});
+            return ExitCode::ConfigurationError;
+        }
+        auto verifier = evidenceVerification::SignedJwtVerifier::create(
+            idp::ProviderId{"signed-jwt-evidence"}, *issuer, *audience, *publicKey,
+            std::chrono::minutes{10});
+        if (!verifier) {
+            reportStartupFailure(verifier.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = evidenceService.registerVerifier(std::move(verifier).value());
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+        evidenceProviders.emplace("signed-jwt-evidence");
+    }
+
+    if (const auto caFile = environment.get("OPENPROOF_EVIDENCE_X509_CA_FILE");
+        caFile && !caFile->empty()) {
+        auto verifier = evidenceVerification::X509Verifier::create(
+            idp::ProviderId{"x509-evidence"}, *caFile,
+            environment.get("OPENPROOF_EVIDENCE_X509_CRL_FILE").value_or(std::string{}));
+        if (!verifier) {
+            reportStartupFailure(verifier.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto status = evidenceService.registerVerifier(std::move(verifier).value());
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+        evidenceProviders.emplace("x509-evidence");
+    }
+
+    trustModel::TrustPolicy evidenceTrustPolicy;
+    if (!evidenceTrustPolicy.setWeight("jwt.attestation", 85U)
+        || !evidenceTrustPolicy.setWeight("x509.identity", 95U)
+        || !evidenceTrustPolicy.setWeight("x509.certificate", 75U)) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    trustModel::TrustEngine evidenceTrust{identityProviderStore, clock, std::move(evidenceTrustPolicy)};
+
+    postgres::PostgresAccountRepository accountRepository{*pool.value()};
+    postgres::PostgresScimDirectoryRepository scimDirectory{*pool.value()};
+    scim::Service scimService{
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        scimDirectory, identities, identityProviderStore, memberships, clock};
+    std::optional<fnd::SecretString> scimBearerToken;
+    if (auto configuredScimToken = environment.get("OPENPROOF_SCIM_BEARER_TOKEN");
+        configuredScimToken && !configuredScimToken->empty()) {
+        if (configuredScimToken->size() < 32U) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_SCIM_BEARER_TOKEN must contain at least 32 bytes."});
+            return ExitCode::ConfigurationError;
+        }
+        scimBearerToken.emplace(std::move(*configuredScimToken));
+    }
+
+    const auto runWithEvidence = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        evidenceHttp::Api evidenceApi{
+            evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
+            sessions, evidenceProviders, limiter.value(), fallback};
+        return runListener(platform, evidenceApi, logger);
+    };
+
+    const auto runWithScim = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        if (!scimBearerToken) return runWithEvidence(fallback);
+        scimHttp::Api scimApi{
+            scimService, scimBearerToken->clone(), limiter.value(), fallback};
+        return runWithEvidence(scimApi);
+    };
+
+    const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
+            authentication, sessions, limiter.value(), fallback};
+        return runWithScim(enterpriseApi);
+    };
+
+    const auto runWithWeb3 = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        authHttp::Web3AuthenticationHttpApi web3Api{
+            authentication, providers, sessions, limiter.value(), fallback};
+        return runWithEnterprise(web3Api);
+    };
+
+    const auto runWithPasskey = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        if (!passkeyService) return runWithWeb3(fallback);
+        authHttp::PasskeyAuthenticationHttpApi passkeyApi{
+            *passkeyService, authentication, sessions, limiter.value(), fallback};
+        return runWithWeb3(passkeyApi);
+    };
+
+    const auto runWithAccount = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        if (!platform.account().enabled()) return runWithPasskey(fallback);
+
+        auto verificationMaterial = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/account-verification-key/v1");
+        if (!verificationMaterial) {
+            reportStartupFailure(verificationMaterial.error());
+            return ExitCode::InternalError;
+        }
+        auto verificationKey = account::VerificationKey::create(
+            std::move(verificationMaterial).value());
+        auto accountPolicy = account::AccountPolicy::create(
+            std::chrono::hours{24}, std::chrono::minutes{10},
+            std::chrono::minutes{30}, 8U);
+        auto deliveryProxyConfig = gatewayHttp::ProxyConfig::create(
+            32U * 1024U, 256U * 1024U,
+            std::string{platform.account().deliveryCaFile()});
+        if (!verificationKey || !accountPolicy || !deliveryProxyConfig) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
+            return ExitCode::ConfigurationError;
+        }
+        auto deliveryTransport = gatewayHttp::BeastProxyTransport::create(
+            std::move(deliveryProxyConfig).value());
+        if (!deliveryTransport) {
+            reportStartupFailure(deliveryTransport.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto delivery = accountDelivery::createWebhookVerificationDelivery(
+            *deliveryTransport.value(),
+            std::string{platform.account().deliveryHost()},
+            platform.account().deliveryPort(), platform.account().deliveryTls(),
+            std::string{platform.account().deliveryPath()},
+            platform.account().deliveryAuthorization().clone(),
+            std::chrono::seconds{10});
+        if (!delivery) {
+            reportStartupFailure(delivery.error());
+            return ExitCode::ConfigurationError;
+        }
+        account::AccountService accountService{
+            identity::OrganizationId{std::string{platform.auth().organizationId()}},
+            providerId,
+            idp::ProviderId{std::string{platform.account().phoneProviderId()}},
+            identities, externalIdentities, identityProviderStore,
+            *accounts.value(), accountRepository, sessions, clock,
+            std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
+        accountHttp::AccountHttpApi accountApi{
+            accountService, sessions, limiter.value(), fallback};
+        return runWithPasskey(accountApi);
+    };
+
+    if (!platform.oidc().enabled()) {
+        gateway::Gateway gatewayCore{
+            router, sessions, access, limiter.value(), discovery, loadBalancer,
+            circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+        adminHttp::AdministrationHttpApi administrationApi{
+            sessions, *administrationRepository.value(), identities, memberships,
+            limiter.value(),
+            identity::OrganizationId{std::string{platform.auth().organizationId()}},
+            providerId, clock, gatewayCore};
+        authHttp::AuthenticationHttpApi authApi{
+            authentication, sessions, recoveryCodes.value(), limiter.value(),
+            providerId, administrationApi};
+        authHttp::FederatedAuthenticationHttpApi federatedApi{
+            authentication, providers, sessions, limiter.value(), authApi};
+        return runWithAccount(federatedApi);
+    }
+
+    auto clientSecretMaterial = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/oauth-client-secret-key/v1");
+    auto authorizationCodeMaterial = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/oauth-authorization-code-key/v1");
+    auto tokenMaterial = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/oauth-token-key/v1");
+    auto deviceAuthorizationMaterial = deriveSecret(
+        platform.security().tokenSigningKey(), "openproof/oauth-device-authorization-key/v1");
+    if (!clientSecretMaterial || !authorizationCodeMaterial || !tokenMaterial
+        || !deviceAuthorizationMaterial) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auto clientSecretKey = client::ClientSecretKey::create(
+        std::move(clientSecretMaterial).value());
+    auto authorizationCodeKey = oauth::AuthorizationCodeKey::create(
+        std::move(authorizationCodeMaterial).value());
+    auto tokenKey = token::TokenKey::create(std::move(tokenMaterial).value());
+    auto deviceAuthorizationKey = oauth::DeviceAuthorizationKey::create(
+        std::move(deviceAuthorizationMaterial).value());
+    auto tokenPolicy = token::TokenPolicy::create(
+        std::chrono::minutes{15}, std::chrono::hours{24 * 30});
+    auto oidcIssuer = oidc::Issuer::create(std::string{platform.oidc().issuer()});
+    auto oidcPolicy = oidc::OidcPolicy::create(std::chrono::minutes{5});
+    auto oidcSigner = security::RsaSha256Signer::create(
+        platform.oidc().signingKey().clone(), std::string{platform.oidc().keyId()});
+    if (!clientSecretKey || !authorizationCodeKey || !tokenKey
+        || !deviceAuthorizationKey || !tokenPolicy || !oidcIssuer || !oidcPolicy
+        || !oidcSigner) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
+        return ExitCode::ConfigurationError;
+    }
+
+    postgres::PostgresResourceRepository resourceRepository{*pool.value()};
+    postgres::PostgresConsentRepository consentRepository{*pool.value()};
+    resource::ResourceRegistry resourceRegistry{resourceRepository, clock};
+    consent::ConsentService consentService{consentRepository, clock};
+
+    application::ApplicationRegistry applicationRegistry{identityProviderStore, clock};
+    client::ClientManager clientManager{
+        identityProviderStore, identityProviderStore, clock,
+        std::move(clientSecretKey).value()};
+    resource::ServiceIdentityService serviceIdentityService{
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        identities, resourceRepository, clientManager, clock};
+    oauth::AuthorizationService authorizationService{
+        clientManager, identityProviderStore, clock,
+        std::move(authorizationCodeKey).value(), std::chrono::minutes{5}};
+    token::TokenService tokenService{
+        identityProviderStore, clientManager, clock, std::move(tokenKey).value(),
+        std::move(tokenPolicy).value()};
+    oauth::DeviceAuthorizationService deviceAuthorizationService{
+        identityProviderStore, clientManager, clock,
+        std::move(deviceAuthorizationKey).value(), std::chrono::minutes{10},
+        std::chrono::seconds{5}};
+    oauth::PushedAuthorizationService pushedAuthorizationService{
+        identityProviderStore, clock, std::chrono::seconds{90}};
+    oauth::JarService jarService{identityProviderStore, identityProviderStore, clock};
+    oidc::OpenIdProvider openIdProvider{
+        std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
+        identityProviderStore, std::move(oidcPolicy).value()};
+    oauth::DpopService dpopService{
+        identityProviderStore, clock, std::chrono::minutes{5}};
+    std::optional<fnd::SecretString> mtlsForwardingKey;
+    if (auto configuredKey = environment.get("OPENPROOF_MTLS_FORWARDING_KEY");
+        configuredKey.has_value()) {
+        if (configuredKey->size() < 32U) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "OPENPROOF_MTLS_FORWARDING_KEY must contain at least 32 bytes."});
+            return ExitCode::ConfigurationError;
+        }
+        mtlsForwardingKey.emplace(std::move(configuredKey).value());
+    }
+    oauthHttp::SenderProofVerifier senderProof{
+        dpopService, identityProviderStore, clock, std::string{openIdProvider.issuer()},
+        std::move(mtlsForwardingKey)};
+
     gateway::Gateway gatewayCore{
         router, sessions, access, limiter.value(), discovery, loadBalancer,
-        circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+        circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10},
+        &tokenService, &senderProof};
     adminHttp::AdministrationHttpApi administrationApi{
-        sessions, *administrationRepository.value(), limiter.value(),
+        sessions, *administrationRepository.value(), identities, memberships,
+        limiter.value(),
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
         providerId, clock, gatewayCore};
     authHttp::AuthenticationHttpApi authApi{
         authentication, sessions, recoveryCodes.value(), limiter.value(),
         providerId, administrationApi};
-    return runListener(platform, authApi, logger);
+    authHttp::FederatedAuthenticationHttpApi federatedApi{
+        authentication, providers, sessions, limiter.value(), authApi};
+    oauthHttp::OAuthHttpApi oauthApi{
+        authorizationService, tokenService, openIdProvider, clientManager,
+        authentication, sessions, providerId, consentService, resourceRegistry,
+        serviceIdentityService, deviceAuthorizationService, pushedAuthorizationService,
+        jarService, senderProof, limiter.value(), federatedApi};
+    applicationHttp::ApplicationManagementHttpApi applicationApi{
+        applicationRegistry, identityProviderStore, clientManager,
+        identityProviderStore, resourceRegistry, serviceIdentityService, jarService,
+        sessions, memberships, limiter.value(),
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        oauthApi};
+    return runWithAccount(applicationApi);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
@@ -743,32 +1372,55 @@ void reportStartupFailure(const fnd::Error& failure)
 }
 
 /**
- * @brief Describes the environment's text encoding for the startup record.
+ * @brief Reports the process locale without making wire encoding depend on it.
  *
- * Not decoration. The platform emits JSON log records and JSON error envelopes,
- * and its escaper passes bytes at or above 0x80 through unchanged on the
- * assumption that they are UTF-8. On a host whose environment encoding is not
- * UTF-8, that assumption produces malformed records precisely when an operator
- * is reading them during an incident. Recording the encoding at startup makes
- * the assumption auditable instead of implicit.
+ * OpenProof protocol, JSON and log text are UTF-8 by contract. The host locale
+ * is diagnostic metadata only; changing LC_ALL/LC_CTYPE/LANG must never alter
+ * protocol encoding or require an experimental standard-library runtime.
  */
+[[nodiscard]] std::optional<std::string> localeEnvironment()
+{
+    constexpr std::string_view names[]{"LC_ALL", "LC_CTYPE", "LANG"};
+    for (const std::string_view name : names) {
+        const std::string key{name};
+        const char* const value = std::getenv(key.c_str());
+        if (value != nullptr && value[0] != '\0') {
+            return std::string{value};
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] bool localeDeclaresUtf8(std::string_view locale)
+{
+    std::string normalized;
+    normalized.reserve(locale.size());
+    for (const char symbol : locale) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        if (std::isalnum(byte) != 0) {
+            normalized.push_back(static_cast<char>(std::tolower(byte)));
+        }
+    }
+    return normalized.find("utf8") != std::string::npos;
+}
+
 [[nodiscard]] std::vector<obs::LogField> textEncodingFields()
 {
-#if OPENPROOF_HAS_TEXT_ENCODING
-    const std::text_encoding environment = std::text_encoding::environment();
-    const std::text_encoding literal = std::text_encoding::literal();
-
-    return {
-        obs::LogField::text("text_encoding_environment", std::string{environment.name()}),
-        obs::LogField::text("text_encoding_literal", std::string{literal.name()}),
-        obs::LogField::boolean("text_encoding_is_utf8",
-                               environment.mib() == std::text_encoding::id::UTF8),
+    std::vector<obs::LogField> fields{
+        obs::LogField::text("text_encoding_policy", "UTF-8"),
     };
-#else
-    // The field is emitted as an explicit null rather than omitted: "this build
-    // could not determine the encoding" is a different fact from "nobody asked".
-    return {obs::LogField::null("text_encoding_environment")};
-#endif
+
+    const std::optional<std::string> locale = localeEnvironment();
+    if (!locale.has_value()) {
+        fields.push_back(obs::LogField::null("locale_environment"));
+        fields.push_back(obs::LogField::null("locale_environment_declares_utf8"));
+        return fields;
+    }
+
+    fields.push_back(obs::LogField::text("locale_environment", *locale));
+    fields.push_back(obs::LogField::boolean("locale_environment_declares_utf8",
+                                            localeDeclaresUtf8(*locale)));
+    return fields;
 }
 
 [[nodiscard]] std::shared_ptr<obs::LogSink> makeSink(const cfg::LoggingConfig& logging)
@@ -854,7 +1506,7 @@ void reportStartupFailure(const fnd::Error& failure)
 
     logger.info("openproof server starting", startupFields);
 
-    return runGatewayServer(platform, *clock, logger);
+    return runGatewayServer(platform, environment, *clock, logger);
 }
 
 }

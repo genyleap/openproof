@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.30)
 
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/OpenProofDarwinSdk.cmake")
+openproof_configure_darwin_sdk()
+
 # INI-001/INI-003: "OpenProof Protocol" is the human-approved product name
 # supplied in the engagement brief. All technical identifiers below are derived
 # from it rather than invented.
@@ -16,8 +19,8 @@ cmake_minimum_required(VERSION 3.30)
 # The protocol is vendor-neutral. No deployment-specific name appears in the
 # core; a particular ecosystem is at most an example deployment.
 project(openproof
-    VERSION 0.1.0
-    DESCRIPTION "OpenProof Protocol: an open protocol for identity, proof, trust and secure access"
+    VERSION 1.1.0
+    DESCRIPTION "OpenProof Protocol: centralized identity, OAuth/OIDC, API gateway, proof and trust platform"
     LANGUAGES CXX
 )
 
@@ -36,6 +39,7 @@ include(OpenProofCompileOptions)
 include(OpenProofModule)
 
 option(OPENPROOF_BUILD_TESTS "Build the OpenProof test suites" ON)
+option(OPENPROOF_BUILD_EXAMPLES "Build OpenProof integration examples" ON)
 
 # External dependencies. SEC-006 requires a concrete reason for each.
 #   OpenSSL        cryptographic primitives; the project never implements them.
@@ -69,18 +73,21 @@ add_library(OpenProof::libpq ALIAS openproof_libpq)
 
 add_subdirectory(src)
 add_subdirectory(apps)
+add_subdirectory(sdk/cpp)
+
+if(OPENPROOF_BUILD_EXAMPLES)
+    add_subdirectory(examples/tegra-client)
+endif()
 
 if(OPENPROOF_BUILD_TESTS)
     enable_testing()
 
     # GoogleTest is built from source rather than taken from a system package.
     #
-    # A prebuilt GoogleTest is compiled against one standard library, and this
-    # project supports two toolchains: GCC 16 with libstdc++ and Clang 22 with
-    # libc++. Linking a libc++ build of GoogleTest into a libstdc++ build fails
-    # with hundreds of undefined std::__1:: symbols -- an ABI mismatch, not a
-    # code defect. Building it here means the test framework always matches the
-    # compiler under test.
+    # A prebuilt GoogleTest may be compiled against a different C++ standard
+    # library or ABI than the verified GCC 16 toolchain. Building it here keeps
+    # the test framework on the same compiler/runtime ABI as OpenProof instead
+    # of relying on a machine-specific prebuilt package.
     #
     # Pinned by URL and SHA-256 so the dependency is reproducible and cannot be
     # silently replaced upstream (SEC-006).

@@ -101,6 +101,31 @@ already secret-bearing deployment channels; the TOML value must still use an
 process opens a bounded pool and applies every checksummed migration before it
 opens the listener.
 
+### `[account]`
+
+The consumer account lifecycle is disabled by default. When enabled it requires
+`[auth].enabled = true`, PostgreSQL, and an authenticated verification-delivery
+webhook. Verification secrets are persisted only as keyed digests and are sent
+to the configured delivery service over the operator-selected TLS connection.
+
+| Key | Type | Default | Class |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Public |
+| `phone_provider_id` | non-empty string | `phone` | Private |
+| `delivery_host` | hostname/IP | unset | Private |
+| `delivery_port` | integer 1–65535 | unset | Private |
+| `delivery_tls` | boolean | `true` | Private |
+| `delivery_path` | origin path | `/v1/openproof/verification` | Private |
+| `delivery_ca_file` | path | system trust store | Private |
+| `delivery_authorization` | secret reference | unset | Secret |
+
+The webhook receives the verification identifier, delivery kind, destination and
+one-time secret needed to construct the user-facing email/SMS action. Non-2xx
+responses fail the request; the server does not silently report successful
+delivery. Public/self-service routes include signup and email verification,
+forgot/reset password, authenticated profile maintenance, verified email change,
+and phone verification.
+
 ### `[auth]`
 
 | Key | Type | Default | Class |
@@ -117,9 +142,9 @@ router; an undeclared pair returns `404` and cannot fall through to a broader
 allow. Every declared route requires a valid session, active identity,
 organization and membership. The auth plane owns `/auth` and `/auth/*`, while
 the administration plane owns `/admin` and `/admin/*`; policies cannot claim
-either namespace. There is no
-public registration or self-service password/TOTP enrollment endpoint. Member
-administration is owner-only; policy administration is not implemented.
+either namespace. Public account enrollment and recovery are exposed only when `[account].enabled`
+is true; administrative membership changes remain owner-only. Gateway route policy
+administration is intentionally static process configuration.
 
 Each `[[auth.route_policies]]` table accepts exactly these fields:
 
@@ -365,7 +390,7 @@ opp: The configured port is outside the range 1-65535. [INVALID_ARGUMENT]
 A successful start emits one structured JSON record per line:
 
 ```json
-{"timestamp":"2026-08-05T00:47:47.082Z","level":"info","message":"openproof server starting","fields":{"version":"0.1.0","bind_address":"127.0.0.1","port":8443,"log_level":"info","registered_providers":0,"token_signing_key_configured":false}}
+{"timestamp":"2026-08-05T00:47:47.082Z","level":"info","message":"openproof server starting","fields":{"version":"1.0.0","bind_address":"127.0.0.1","port":8443,"log_level":"info","registered_providers":0,"token_signing_key_configured":false}}
 ```
 
 Note `token_signing_key_configured` records *whether* a key is present, never
@@ -373,3 +398,174 @@ the key. That is the general pattern for logging anything secret-adjacent.
 
 Caller-supplied fields are nested under `fields` so that they can never shadow
 an envelope key such as `level` or `timestamp`.
+
+---
+
+## OpenID Connect identity-platform mode
+
+OpenID Connect is opt-in and requires the persistent authentication deployment.
+The issuer must be HTTPS in production. Plain HTTP is accepted only for an exact
+loopback host to support local development.
+
+```toml
+[oidc]
+enabled = true
+issuer = "https://identity.example.com"
+key_id = "openproof-rs256-1"
+signing_key = "file:/run/secrets/openproof-oidc-private.pem"
+```
+
+`signing_key` is an RSA private key in PEM format. The server derives the public
+JWK and publishes it through `/.well-known/jwks.json`; private key material is
+never returned by an HTTP endpoint.
+
+Environment overrides:
+
+- `OPENPROOF_OIDC_ENABLED`
+- `OPENPROOF_OIDC_ISSUER`
+- `OPENPROOF_OIDC_KEY_ID`
+- `OPENPROOF_OIDC_SIGNING_KEY`
+- `OPENPROOF_MTLS_FORWARDING_KEY` — optional, at least 32 bytes; authenticates request-bound client-certificate forwarding from the trusted TLS ingress for RFC 8705 sender-constrained tokens.
+
+The environment signing-key override contains PEM text and is a secret. Prefer a
+file-backed secret in production so process environment inspection does not
+become a key-disclosure path.
+
+### External federated login
+
+Redirect-based federation is enabled per provider by configuring its client ID.
+Every enabled provider also requires `OPENPROOF_FEDERATION_CALLBACK_URI`, which
+must be the exact HTTPS callback registered with the upstream provider (normally
+`https://identity.example.com/auth/federated/callback`). The optional
+`OPENPROOF_FEDERATION_CA_FILE` pins an additional CA bundle for discovery, token
+and JWKS HTTPS requests.
+
+- Google: `OPENPROOF_GOOGLE_CLIENT_ID`, `OPENPROOF_GOOGLE_CLIENT_SECRET`; optional
+  `OPENPROOF_GOOGLE_ISSUER` (default `https://accounts.google.com`).
+- Apple: `OPENPROOF_APPLE_CLIENT_ID`, `OPENPROOF_APPLE_CLIENT_SECRET`; optional
+  `OPENPROOF_APPLE_ISSUER` (default `https://appleid.apple.com`). The configured
+  Apple client secret may be the signed client-secret JWT managed by the operator.
+- Microsoft: `OPENPROOF_MICROSOFT_CLIENT_ID`, `OPENPROOF_MICROSOFT_CLIENT_SECRET`,
+  and a required tenant-specific `OPENPROOF_MICROSOFT_ISSUER`. Multi-tenant
+  `common`, `organizations`, `consumers`, and issuer templates are rejected so an
+  ID Token is never accepted under an ambiguous issuer policy.
+- GitHub: `OPENPROOF_GITHUB_CLIENT_ID`, `OPENPROOF_GITHUB_CLIENT_SECRET`. The
+  provider uses Authorization Code with PKCE, revalidates the authenticated user
+  through the GitHub REST API after every sign-in, and accepts an email claim only
+  when GitHub reports the primary address as verified.
+
+OIDC discovery metadata and JWKS are fetched over certificate-verified TLS. The
+browser flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
+accepted only after signature, issuer, audience, expiry, issued-at and nonce
+validation. A previously unseen verified upstream subject may create a new
+canonical identity only for explicitly trusted federation providers; email
+claims are never used to silently link an existing account.
+
+### WebAuthn / passkeys
+
+Passkeys are enabled by setting `OPENPROOF_WEBAUTHN_RP_ID` and the exact HTTPS
+`OPENPROOF_WEBAUTHN_ORIGIN`. `OPENPROOF_WEBAUTHN_RP_NAME` is optional and
+defaults to `OpenProof`. Registration is authenticated self-service under
+`/account/passkeys`; assertion login is exposed under `/auth/passkey/*`.
+
+The built-in relying party requires discoverable credentials, user verification,
+privacy-preserving `none` attestation and ES256/P-256 credentials. Registration
+validates the challenge, origin, RP-ID hash, authenticator flags and COSE public
+key. Assertion login validates the same browser/RP bindings, verifies the
+authenticator signature and performs an atomic signature-counter advance when
+the authenticator supplies a non-zero counter. Passkeys are treated as a
+phishing-resistant possession factor; biometric unlock is not promoted to a
+server-side inherence claim.
+
+### Wallet and Farcaster login
+
+Web3 login is enabled only when its RPC configuration is present. Common browser
+bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS `OPENPROOF_WEB3_URI`;
+`OPENPROOF_WEB3_CA_FILE` optionally supplies an additional CA bundle.
+
+- Wallet/SIWE: `OPENPROOF_ETHEREUM_RPC_ENDPOINT`; optional
+  `OPENPROOF_ETHEREUM_CHAIN_ID` (default `1`) and
+  `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION`. EOA signatures are recovered on
+  secp256k1 and contract wallets are verified through ERC-1271.
+- Farcaster: `OPENPROOF_FARCASTER_RPC_ENDPOINT`,
+  `OPENPROOF_FARCASTER_ID_REGISTRY`; optional
+  `OPENPROOF_FARCASTER_CHAIN_ID` (default `10`) and
+  `OPENPROOF_FARCASTER_RPC_AUTHORIZATION`. The signed SIWE proof is bound to the
+  FID and current custody is independently rechecked against the configured
+  IdRegistry.
+
+Web3 authentication is classified as a possession factor but is not promoted to
+WebAuthn-style phishing resistance.
+
+### LDAP and SAML federation
+
+LDAP is enabled by `OPENPROOF_LDAP_URI` and requires
+`OPENPROOF_LDAP_BASE_DN`. The URI must be `ldaps://`; certificate validation is
+mandatory. Optional settings are `OPENPROOF_LDAP_CA_FILE`, service-bind
+`OPENPROOF_LDAP_BIND_DN` / `OPENPROOF_LDAP_BIND_PASSWORD`, and attribute names:
+`OPENPROOF_LDAP_USERNAME_ATTRIBUTE` (`uid`),
+`OPENPROOF_LDAP_SUBJECT_ATTRIBUTE` (`entryUUID`),
+`OPENPROOF_LDAP_DISPLAY_NAME_ATTRIBUTE` (`cn`) and
+`OPENPROOF_LDAP_EMAIL_ATTRIBUTE` (`mail`). Authentication searches for exactly
+one directory entry and then performs an LDAP bind as that user.
+
+SAML is enabled by `OPENPROOF_SAML_IDP_SSO_URL` and additionally requires
+`OPENPROOF_SAML_SP_ENTITY_ID`, `OPENPROOF_SAML_IDP_ENTITY_ID`,
+`OPENPROOF_SAML_IDP_CERTIFICATE_PEM`, and the exact
+`OPENPROOF_FEDERATION_CALLBACK_URI` used as ACS. The adapter emits a SAML 2.0
+AuthnRequest and validates destination, `InResponseTo`, issuer, status, audience,
+conditions, bearer subject confirmation and NameID. XML signatures are pinned to
+the configured IdP certificate and constrained to the supported RSA-SHA256 /
+SHA-256 / exclusive-canonicalization profile.
+
+### SCIM provisioning
+
+Set `OPENPROOF_SCIM_BEARER_TOKEN` to an operator-generated secret of at least 32
+bytes to enable `/scim/v2/*`. Users provision canonical identities, profiles and
+organization memberships; Groups and membership metadata are durable in
+PostgreSQL. The service exposes Users/Groups CRUD and PATCH, equality filtering,
+`ServiceProviderConfig`, `ResourceTypes` and `Schemas`. Bulk provisioning is not
+advertised.
+
+### Evidence verification and Trust
+
+The authenticated `/evidence/*` surface supports one-time proof challenges,
+verification, evidence listing and current trust assessment. Verifiers are
+fail-closed and enabled only when their trust anchors are configured:
+
+- Signed attestation JWT: `OPENPROOF_EVIDENCE_JWT_PUBLIC_KEY_PEM`,
+  `OPENPROOF_EVIDENCE_JWT_ISSUER`, and `OPENPROOF_EVIDENCE_JWT_AUDIENCE`. The
+  verifier requires RS256 and binds `sub` and `nonce` to the authenticated
+  canonical identity and one-time challenge.
+- X.509 proof: `OPENPROOF_EVIDENCE_X509_CA_FILE`; optional
+  `OPENPROOF_EVIDENCE_X509_CRL_FILE`. The certificate chain must validate to the
+  configured CA, a URI SAN must bind the OpenProof identity, and the subject must
+  prove possession of the leaf private key by signing the challenge transcript.
+
+### SCIM, evidence, and integration secrets
+
+Environment-only integration values above are operational secrets/configuration
+that are not projected into public discovery documents. Store authorization
+tokens, provider client secrets and private trust material using the deployment's
+secret manager rather than source-controlled shell files.
+
+When `[oidc].enabled = true`, OpenProof reserves `/login`, `/oauth/*` and
+`/.well-known/*`; gateway upstream routes cannot shadow these protocol endpoints.
+
+A protected gateway route can additionally require an OAuth scope:
+
+```toml
+[[auth.route_policies]]
+path_prefix = "/api/orders"
+methods = ["GET", "POST"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial1"
+required_scope = "orders"
+```
+
+The role/assurance checks remain authoritative for platform sessions. Delegated
+OAuth access additionally carries a verified client ID and scopes from the token
+service; caller-provided scope headers are removed at the gateway boundary.
+
+See `examples/openproof.identity-platform.toml` for a complete deployment sample.

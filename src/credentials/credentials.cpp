@@ -1,5 +1,6 @@
 module;
 
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <charconv>

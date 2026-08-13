@@ -1,27 +1,47 @@
-# Layering is enforced by the link graph: every edge below points downward.
-#
-#   identity.provider ──┐
-#   storage ────────────┤
-#   config ─────────────┼──> observability ──> foundation
-#   security ───────────┘
-#
-# foundation depends on nothing. No layer imports a layer above it, and the
-# identity provider SPI never imports a concrete provider (brief section 2).
+# Layering is encoded by target dependencies. Every target referenced by a
+# module below is defined before its consumer so CMake never degrades a target
+# name into a plain linker token.
 add_subdirectory(foundation)
 add_subdirectory(security)
 add_subdirectory(observability)
 add_subdirectory(audit)
 add_subdirectory(telemetry)
 add_subdirectory(config)
+
 add_subdirectory(identity/provider)
 add_subdirectory(identity/core)
+add_subdirectory(identity/profile)
+add_subdirectory(application)
+add_subdirectory(client)
+add_subdirectory(resource)
+add_subdirectory(consent)
 add_subdirectory(authentication)
 add_subdirectory(session)
+add_subdirectory(oauth)
+add_subdirectory(token)
+add_subdirectory(oidc)
+add_subdirectory(evidence)
+add_subdirectory(evidence/verifiers)
+add_subdirectory(trust)
+
 add_subdirectory(credentials)
 add_subdirectory(providers/local)
+add_subdirectory(providers/oidc)
+add_subdirectory(providers/github)
+add_subdirectory(providers/passkey)
+add_subdirectory(providers/web3)
+add_subdirectory(providers/enterprise)
+add_subdirectory(account)
 add_subdirectory(organization)
+add_subdirectory(enterprise/scim)
 add_subdirectory(administration)
 add_subdirectory(policy)
 add_subdirectory(gateway)
+add_subdirectory(evidence/http)
+add_subdirectory(enterprise/scim/http)
+add_subdirectory(account/http)
+add_subdirectory(account/delivery)
 add_subdirectory(authentication/http)
+add_subdirectory(application/http)
+add_subdirectory(oauth/http)
 add_subdirectory(storage/postgres)

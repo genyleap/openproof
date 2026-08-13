@@ -449,3 +449,35 @@ TEST(ProviderTrustPolicyTest, DuplicateRulesCannotSilentlyReplaceAReviewedCap)
 }
 
 }
+
+TEST(AuthenticationServiceTest, SelfProvisioningCreatesOnlyANewCanonicalIdentityForVerifiedSubject)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "new-federated-subject";
+    core::InMemoryIdentityRepository lifecycle;
+    const core::OrganizationId organization{"organization-a"};
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization};
+    const auto binding = bindingOf("federated-browser");
+    auto started = service.begin(fixture.request(), binding, fnd::CorrelationId{"corr-federated"});
+    ASSERT_TRUE(started);
+
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(lifecycle.size(), 1U);
+    auto owner = fixture.identities.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"new-federated-subject"}});
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), completed->identity());
+    auto canonical = lifecycle.findById(organization, completed->identity());
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(canonical->has_value());
+    EXPECT_TRUE(canonical->value().canAuthenticate());
+}

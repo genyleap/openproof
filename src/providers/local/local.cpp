@@ -39,11 +39,14 @@ constexpr std::size_t kIdentifierEntropyBytes = 32U;
 
 struct InMemoryLocalAccountDirectory::Account final {
     Account(credentials::PasswordHash passwordHash,
-            std::optional<credentials::TotpSecret> totpSecret)
-        : password(std::move(passwordHash)), totp(std::move(totpSecret))
+            std::optional<credentials::TotpSecret> totpSecret,
+            std::optional<identity::core::IdentityId> canonicalIdentity = std::nullopt)
+        : identity(std::move(canonicalIdentity)),
+          password(std::move(passwordHash)), totp(std::move(totpSecret))
     {
     }
 
+    std::optional<identity::core::IdentityId> identity;
     credentials::PasswordHash password;
     std::optional<credentials::TotpSecret> totp;
     std::optional<std::uint64_t> lastAcceptedTotpStep;
@@ -96,6 +99,72 @@ foundation::Status InMemoryLocalAccountDirectory::enroll(
     }
     m_accounts.emplace(std::move(subject), std::make_unique<Account>(
         std::move(passwordHash).value(), std::move(totp)));
+    return foundation::ok();
+}
+
+
+foundation::Status InMemoryLocalAccountDirectory::enrollPending(
+    identity::core::IdentityId canonicalIdentity, idp::ExternalSubject subject,
+    const foundation::SecretString& password,
+    std::optional<credentials::TotpSecret> totp)
+{
+    if (canonicalIdentity.empty() || subject.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A pending local account requires identity and subject.");
+    }
+    auto passwordHash = m_passwordHasher.hash(password);
+    if (!passwordHash.has_value()) return foundation::fail(passwordHash.error());
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    if (m_accounts.contains(subject)) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "The local account already exists.");
+    }
+    m_accounts.emplace(std::move(subject), std::make_unique<Account>(
+        std::move(passwordHash).value(), std::move(totp), std::move(canonicalIdentity)));
+    return foundation::ok();
+}
+
+foundation::Status InMemoryLocalAccountDirectory::rebindSubject(
+    const identity::core::IdentityId& identity,
+    const idp::ExternalSubject& previous,
+    idp::ExternalSubject replacement)
+{
+    if (identity.empty() || previous.empty() || replacement.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A local account rebind requires valid identifiers.");
+    }
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    if (m_accounts.contains(replacement)) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "The replacement local account subject already exists.");
+    }
+    const auto found = m_accounts.find(previous);
+    if (found == m_accounts.end()) {
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    if (found->second->identity.has_value() && found->second->identity.value() != identity) {
+        return foundation::fail(foundation::ErrorCode::PermissionDenied,
+                                "The local account is owned by another identity.");
+    }
+    auto account = std::move(found->second);
+    account->identity = identity;
+    m_accounts.erase(found);
+    m_accounts.emplace(std::move(replacement), std::move(account));
+    return foundation::ok();
+}
+
+foundation::Status InMemoryLocalAccountDirectory::removePending(
+    const identity::core::IdentityId& identity,
+    const idp::ExternalSubject& subject)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const auto found = m_accounts.find(subject);
+    if (found == m_accounts.end()) return foundation::ok();
+    if (!found->second->identity.has_value() || found->second->identity.value() != identity) {
+        return foundation::fail(foundation::ErrorCode::PermissionDenied,
+                                "The pending local account is owned by another identity.");
+    }
+    m_accounts.erase(found);
     return foundation::ok();
 }
 

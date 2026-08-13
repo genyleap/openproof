@@ -1,0 +1,15 @@
+openproof_add_module(openproof_evidence
+    MODULES
+        evidence.cppm
+        model.cppm
+        repository.cppm
+        service.cppm
+    SOURCES
+        model.cpp
+        repository.cpp
+        service.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_identity_core
+        openproof_identity_provider
+)

@@ -73,7 +73,7 @@ constexpr std::uint16_t kDefaultPort = 8443;
 {
     for (const auto& [key, value] : document) {
         if (!isAllowedKey(key.str(), {"server", "logging", "security", "gateway",
-                                      "database", "auth"})) {
+                                      "database", "auth", "account", "oidc"})) {
             return foundation::fail(
                 foundation::ErrorCode::InvalidArgument,
                 "The configuration contains an unknown section.",
@@ -108,6 +108,11 @@ constexpr std::uint16_t kDefaultPort = 8443;
             return foundation::fail(keys.error());
         }
     }
+    if (const toml::table* oidc = document["oidc"].as_table(); oidc != nullptr) {
+        const foundation::Status keys =
+            validateTableKeys(*oidc, "oidc", {"enabled", "issuer", "key_id", "signing_key"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
+    }
     if (const toml::table* gateway = document["gateway"].as_table(); gateway != nullptr) {
         const foundation::Status keys = validateTableKeys(
             *gateway, "gateway", {"enabled", "route_prefix", "upstream_host",
@@ -117,6 +122,13 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (const toml::table* database = document["database"].as_table(); database != nullptr) {
         const foundation::Status keys = validateTableKeys(
             *database, "database", {"connection_string", "pool_size", "migration_directory"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
+    }
+    if (const toml::table* account = document["account"].as_table(); account != nullptr) {
+        const foundation::Status keys = validateTableKeys(
+            *account, "account", {"enabled", "phone_provider_id", "delivery_host",
+                                   "delivery_port", "delivery_tls", "delivery_path",
+                                   "delivery_ca_file", "delivery_authorization"});
         if (!keys.has_value()) return foundation::fail(keys.error());
     }
     if (const toml::table* auth = document["auth"].as_table(); auth != nullptr) {
@@ -142,7 +154,7 @@ constexpr std::uint16_t kDefaultPort = 8443;
                 const foundation::Status policyKeys = validateTableKeys(
                     *policy, "auth.route_policies",
                     {"path_prefix", "methods", "required_roles", "role_match",
-                     "minimum_assurance"});
+                     "minimum_assurance", "required_scope", "required_audience"});
                 if (!policyKeys) return foundation::fail(policyKeys.error());
                 const auto requiredString = [&](std::string_view key) {
                     const toml::node* value = policy->get(key);
@@ -160,7 +172,9 @@ constexpr std::uint16_t kDefaultPort = 8443;
                     || !requiredArray("methods")
                     || !requiredArray("required_roles")
                     || !optionalString("role_match")
-                    || !optionalString("minimum_assurance")) {
+                    || !optionalString("minimum_assurance")
+                    || !optionalString("required_scope")
+                    || !optionalString("required_audience")) {
                     return foundation::fail(
                         foundation::ErrorCode::InvalidArgument,
                         "A route policy setting has the wrong type.");
@@ -232,6 +246,21 @@ constexpr std::uint16_t kDefaultPort = 8443;
     const foundation::Status poolSize = requireType(
         "database", "pool_size", [](const auto& node) { return node.is_integer(); }, "an integer");
     if (!poolSize.has_value()) return foundation::fail(poolSize.error());
+    const foundation::Status accountEnabled = requireType(
+        "account", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!accountEnabled.has_value()) return foundation::fail(accountEnabled.error());
+    for (const std::string_view key : {"phone_provider_id", "delivery_host", "delivery_path",
+                                       "delivery_ca_file", "delivery_authorization"}) {
+        const foundation::Status type = requireType(
+            "account", key, [](const auto& node) { return node.is_string(); }, "a string");
+        if (!type.has_value()) return foundation::fail(type.error());
+    }
+    const foundation::Status deliveryPort = requireType(
+        "account", "delivery_port", [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!deliveryPort.has_value()) return foundation::fail(deliveryPort.error());
+    const foundation::Status deliveryTls = requireType(
+        "account", "delivery_tls", [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!deliveryTls.has_value()) return foundation::fail(deliveryTls.error());
     const foundation::Status authEnabled = requireType(
         "auth", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
     if (!authEnabled.has_value()) return foundation::fail(authEnabled.error());
@@ -464,6 +493,16 @@ const foundation::SecretString& SecurityConfig::tokenSigningKey() const noexcept
     return m_tokenSigningKey;
 }
 
+OidcConfig::OidcConfig() = default;
+OidcConfig::OidcConfig(bool enabled, std::string issuer, std::string keyId,
+                       foundation::SecretString signingKey)
+    : m_enabled(enabled), m_issuer(std::move(issuer)), m_keyId(std::move(keyId)),
+      m_signingKey(std::move(signingKey)) {}
+bool OidcConfig::enabled() const noexcept { return m_enabled; }
+std::string_view OidcConfig::issuer() const noexcept { return m_issuer; }
+std::string_view OidcConfig::keyId() const noexcept { return m_keyId; }
+const foundation::SecretString& OidcConfig::signingKey() const noexcept { return m_signingKey; }
+
 GatewayConfig::GatewayConfig(bool enabled, std::string routePrefix,
                              std::string upstreamHost, std::uint16_t upstreamPort,
                              bool upstreamTls, std::string upstreamCaFile)
@@ -524,17 +563,21 @@ const std::filesystem::path& DatabaseConfig::migrationDirectory() const noexcept
 RoutePolicyConfig::RoutePolicyConfig(
     std::string pathPrefix, std::vector<std::string> methods,
     std::vector<std::string> requiredRoles, std::string roleMatch,
-    std::string minimumAssurance)
+    std::string minimumAssurance, std::string requiredScope,
+    std::string requiredAudience)
     : m_pathPrefix(std::move(pathPrefix)), m_methods(std::move(methods)),
       m_requiredRoles(std::move(requiredRoles)), m_roleMatch(std::move(roleMatch)),
-      m_minimumAssurance(std::move(minimumAssurance))
+      m_minimumAssurance(std::move(minimumAssurance)),
+      m_requiredScope(std::move(requiredScope)),
+      m_requiredAudience(std::move(requiredAudience))
 {
 }
 
 foundation::Result<RoutePolicyConfig> RoutePolicyConfig::create(
     std::string pathPrefix, std::vector<std::string> methods,
     std::vector<std::string> requiredRoles, std::string roleMatch,
-    std::string minimumAssurance)
+    std::string minimumAssurance, std::string requiredScope,
+    std::string requiredAudience)
 {
     const auto invalidText = [](std::string_view text, std::size_t maximum) {
         return text.empty() || text.size() > maximum
@@ -551,11 +594,16 @@ foundation::Result<RoutePolicyConfig> RoutePolicyConfig::create(
         || (pathPrefix.size() > 1U && pathPrefix.ends_with('/'))
         || pathPrefix == "/auth" || pathPrefix.starts_with("/auth/")
         || pathPrefix == "/admin" || pathPrefix.starts_with("/admin/")
+        || pathPrefix == "/oauth" || pathPrefix.starts_with("/oauth/")
+        || pathPrefix == "/login" || pathPrefix.starts_with("/login/")
+        || pathPrefix == "/.well-known" || pathPrefix.starts_with("/.well-known/")
         || methods.empty() || methods.size() > std::size(allowedMethods)
         || requiredRoles.empty() || requiredRoles.size() > 16U
         || (roleMatch != "any" && roleMatch != "all")
         || (minimumAssurance != "ial1" && minimumAssurance != "ial2"
             && minimumAssurance != "ial3" && minimumAssurance != "ial4")
+        || (!requiredScope.empty() && invalidText(requiredScope, 128U))
+        || (!requiredAudience.empty() && invalidText(requiredAudience, 2048U))
         || std::ranges::any_of(methods, [&](const std::string& method) {
                return std::ranges::find(allowedMethods, method)
                    == std::ranges::end(allowedMethods);
@@ -575,7 +623,8 @@ foundation::Result<RoutePolicyConfig> RoutePolicyConfig::create(
     }
     return RoutePolicyConfig{std::move(pathPrefix), std::move(methods),
                              std::move(requiredRoles), std::move(roleMatch),
-                             std::move(minimumAssurance)};
+                             std::move(minimumAssurance), std::move(requiredScope),
+                             std::move(requiredAudience)};
 }
 
 std::string_view RoutePolicyConfig::pathPrefix() const noexcept
@@ -588,6 +637,10 @@ std::string_view RoutePolicyConfig::roleMatch() const noexcept
 { return m_roleMatch; }
 std::string_view RoutePolicyConfig::minimumAssurance() const noexcept
 { return m_minimumAssurance; }
+std::string_view RoutePolicyConfig::requiredScope() const noexcept
+{ return m_requiredScope; }
+std::string_view RoutePolicyConfig::requiredAudience() const noexcept
+{ return m_requiredAudience; }
 
 AuthConfig::AuthConfig(bool enabled, std::string providerId,
                        std::string organizationId, std::string protectedRoutePrefix,
@@ -596,6 +649,30 @@ AuthConfig::AuthConfig(bool enabled, std::string providerId,
       m_organizationId(std::move(organizationId)),
       m_protectedRoutePrefix(std::move(protectedRoutePrefix)),
       m_routePolicies(std::move(routePolicies)) {}
+
+AccountConfig::AccountConfig() = default;
+
+AccountConfig::AccountConfig(
+    bool enabled, std::string phoneProviderId, std::string deliveryHost,
+    std::uint16_t deliveryPort, bool deliveryTls, std::string deliveryPath,
+    std::string deliveryCaFile, foundation::SecretString deliveryAuthorization)
+    : m_enabled(enabled), m_phoneProviderId(std::move(phoneProviderId)),
+      m_deliveryHost(std::move(deliveryHost)), m_deliveryPort(deliveryPort),
+      m_deliveryTls(deliveryTls), m_deliveryPath(std::move(deliveryPath)),
+      m_deliveryCaFile(std::move(deliveryCaFile)),
+      m_deliveryAuthorization(std::move(deliveryAuthorization))
+{
+}
+
+bool AccountConfig::enabled() const noexcept { return m_enabled; }
+std::string_view AccountConfig::phoneProviderId() const noexcept { return m_phoneProviderId; }
+std::string_view AccountConfig::deliveryHost() const noexcept { return m_deliveryHost; }
+std::uint16_t AccountConfig::deliveryPort() const noexcept { return m_deliveryPort; }
+bool AccountConfig::deliveryTls() const noexcept { return m_deliveryTls; }
+std::string_view AccountConfig::deliveryPath() const noexcept { return m_deliveryPath; }
+std::string_view AccountConfig::deliveryCaFile() const noexcept { return m_deliveryCaFile; }
+const foundation::SecretString& AccountConfig::deliveryAuthorization() const noexcept
+{ return m_deliveryAuthorization; }
 
 foundation::Result<AuthConfig> AuthConfig::create(
     bool enabled, std::string providerId, std::string organizationId,
@@ -653,13 +730,16 @@ const std::vector<RoutePolicyConfig>& AuthConfig::routePolicies() const noexcept
 
 PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging,
                                SecurityConfig security, GatewayConfig gateway,
-                               DatabaseConfig database, AuthConfig auth)
+                               DatabaseConfig database, AuthConfig auth,
+                               AccountConfig account, OidcConfig oidc)
     : m_server(std::move(server))
     , m_logging(logging)
     , m_security(std::move(security))
     , m_gateway(std::move(gateway))
     , m_database(std::move(database))
     , m_auth(std::move(auth))
+    , m_account(std::move(account))
+    , m_oidc(std::move(oidc))
 {
 }
 
@@ -767,6 +847,25 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         security = SecurityConfig{std::move(resolved).value()};
     }
 
+    bool oidcEnabled = document["oidc"]["enabled"].value_or(false);
+    std::string oidcIssuer = document["oidc"]["issuer"].value_or(std::string{});
+    std::string oidcKeyId = document["oidc"]["key_id"].value_or(std::string{"openproof-rs256-1"});
+    foundation::SecretString oidcSigningKey;
+    if (const auto reference = document["oidc"]["signing_key"].value<std::string>(); reference.has_value()) {
+        auto resolved = resolveSecretReference(*reference, environment);
+        if (!resolved) return foundation::fail(resolved.error());
+        oidcSigningKey = std::move(resolved).value();
+    }
+    if (const auto value = environment.get("OPENPROOF_OIDC_ENABLED"); value.has_value()) {
+        auto parsed = parseBoolean(*value); if (!parsed) return foundation::fail(parsed.error());
+        oidcEnabled = parsed.value();
+    }
+    if (const auto value = environment.get("OPENPROOF_OIDC_ISSUER"); value.has_value()) oidcIssuer = *value;
+    if (const auto value = environment.get("OPENPROOF_OIDC_KEY_ID"); value.has_value()) oidcKeyId = *value;
+    if (const auto value = environment.get("OPENPROOF_OIDC_SIGNING_KEY"); value.has_value())
+        oidcSigningKey = foundation::SecretString{*value};
+    OidcConfig oidc{oidcEnabled, std::move(oidcIssuer), std::move(oidcKeyId), std::move(oidcSigningKey)};
+
     const bool gatewayEnabled = document["gateway"]["enabled"].value_or(false);
     std::uint16_t upstreamPortValue = 0U;
     if (const auto configured = document["gateway"]["upstream_port"].value<std::int64_t>();
@@ -831,7 +930,9 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
                 std::move(methods).value(), std::move(roles).value(),
                 (*configured)["role_match"].value_or(std::string{"any"}),
                 (*configured)["minimum_assurance"].value_or(
-                    std::string{"ial1"}));
+                    std::string{"ial1"}),
+                (*configured)["required_scope"].value_or(std::string{}),
+                (*configured)["required_audience"].value_or(std::string{}));
             if (!policy) return foundation::fail(policy.error());
             routePolicies.push_back(std::move(policy).value());
         }
@@ -844,9 +945,37 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         std::move(routePolicies));
     if (!auth) return foundation::fail(auth.error());
 
+    const bool accountEnabledValue = document["account"]["enabled"].value_or(false);
+    std::uint16_t accountDeliveryPort = 0U;
+    if (const auto configured = document["account"]["delivery_port"].value<std::int64_t>();
+        configured.has_value()) {
+        if (*configured < 1 || *configured > 65535) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The account delivery port is invalid.");
+        }
+        accountDeliveryPort = static_cast<std::uint16_t>(*configured);
+    }
+    foundation::SecretString accountDeliveryAuthorization;
+    if (const auto reference = document["account"]["delivery_authorization"].value<std::string>();
+        reference.has_value()) {
+        auto resolved = resolveSecretReference(*reference, environment);
+        if (!resolved) return foundation::fail(resolved.error());
+        accountDeliveryAuthorization = std::move(resolved).value();
+    }
+    AccountConfig account{
+        accountEnabledValue,
+        document["account"]["phone_provider_id"].value_or(std::string{"phone"}),
+        document["account"]["delivery_host"].value_or(std::string{}),
+        accountDeliveryPort,
+        document["account"]["delivery_tls"].value_or(true),
+        document["account"]["delivery_path"].value_or(std::string{"/v1/openproof/verification"}),
+        document["account"]["delivery_ca_file"].value_or(std::string{}),
+        std::move(accountDeliveryAuthorization)};
+
     return PlatformConfig{std::move(server).value(), LoggingConfig{level, console},
                           std::move(security), std::move(gateway).value(),
-                          std::move(database), std::move(auth).value()};
+                          std::move(database), std::move(auth).value(), std::move(account),
+                          std::move(oidc)};
 }
 
 foundation::Result<PlatformConfig> PlatformConfig::loadFromFile(const std::filesystem::path& path,
@@ -883,6 +1012,8 @@ const SecurityConfig& PlatformConfig::security() const noexcept
 const GatewayConfig& PlatformConfig::gateway() const noexcept { return m_gateway; }
 const DatabaseConfig& PlatformConfig::database() const noexcept { return m_database; }
 const AuthConfig& PlatformConfig::auth() const noexcept { return m_auth; }
+const AccountConfig& PlatformConfig::account() const noexcept { return m_account; }
+const OidcConfig& PlatformConfig::oidc() const noexcept { return m_oidc; }
 
 foundation::Status PlatformConfig::validateServerDeployment() const
 {
@@ -905,6 +1036,22 @@ foundation::Status PlatformConfig::validateServerDeployment() const
         return foundation::fail(
             foundation::ErrorCode::FailedPrecondition,
             "Authentication requires a PostgreSQL connection.");
+    }
+    if (m_account.enabled()
+        && (!m_auth.enabled() || !m_database.enabled() || m_account.deliveryHost().empty()
+            || m_account.deliveryPort() == 0U || m_account.deliveryPath().empty()
+            || m_account.deliveryAuthorization().size() < 16U
+            || m_account.phoneProviderId().empty())) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "Consumer account lifecycle requires auth, PostgreSQL and an authenticated delivery webhook.");
+    }
+    if (m_oidc.enabled()
+        && (!m_auth.enabled() || !m_database.enabled() || m_oidc.issuer().empty()
+            || m_oidc.keyId().empty() || m_oidc.signingKey().empty())) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "OIDC requires authentication, PostgreSQL, an issuer, key id and RSA signing key.");
     }
     return foundation::ok();
 }

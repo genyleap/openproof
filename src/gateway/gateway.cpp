@@ -139,7 +139,8 @@ void appendSignedPart(std::string& output, std::string_view value)
     for (std::string_view name : {
              "x-openproof-request-id", "x-openproof-identity",
              "x-openproof-organization", "x-openproof-provider",
-             "x-openproof-assurance", "x-openproof-context-issued-at"}) {
+             "x-openproof-assurance", "x-openproof-client-id",
+             "x-openproof-scopes", "x-openproof-context-issued-at"}) {
         appendSignedPart(output, request.header(name).value_or(std::string_view{}));
     }
     return output;
@@ -291,8 +292,11 @@ takeSessionCredential(HttpRequest& request)
 {
     std::optional<std::string> bearer;
     if (const auto authorization = request.header("authorization"); authorization.has_value()) {
-        constexpr std::string_view prefix{"Bearer "};
-        if (!authorization->starts_with(prefix) || authorization->size() <= prefix.size()
+        constexpr std::string_view bearerPrefix{"Bearer "};
+        constexpr std::string_view dpopPrefix{"DPoP "};
+        const std::string_view prefix = authorization->starts_with(bearerPrefix)
+            ? bearerPrefix : authorization->starts_with(dpopPrefix) ? dpopPrefix : std::string_view{};
+        if (prefix.empty() || authorization->size() <= prefix.size()
             || authorization->substr(prefix.size()).contains(' ')
             || authorization->substr(prefix.size()).contains('\t')) {
             request.eraseHeader("authorization");
@@ -319,7 +323,7 @@ takeSessionCredential(HttpRequest& request)
             }
             const std::size_t equals = item.find('=');
             if (equals != std::string_view::npos
-                && item.substr(0U, equals) == "openproof_session") {
+                && item.substr(0U, equals) == "__Host-openproof-session") {
                 const std::string_view value = item.substr(equals + 1U);
                 const bool valid = !value.empty() && value.size() <= 128U
                     && std::ranges::all_of(value, [](char symbol) {
@@ -369,23 +373,28 @@ takeSessionCredential(HttpRequest& request)
 Route::Route(RouteId id, HttpMethod method, std::string pathPrefix,
              ServiceId service, bool protectedRoute,
              identity::core::OrganizationId organization,
-             policy::Action action, policy::Resource resource)
+             policy::Action action, policy::Resource resource, std::string requiredScope,
+             std::string requiredAudience)
     : m_id(std::move(id)), m_method(method), m_pathPrefix(std::move(pathPrefix)),
       m_service(std::move(service)), m_protected(protectedRoute),
       m_organization(std::move(organization)), m_action(std::move(action)),
-      m_resource(std::move(resource))
+      m_resource(std::move(resource)), m_requiredScope(std::move(requiredScope)),
+      m_requiredAudience(std::move(requiredAudience))
 {
 }
 
 foundation::Result<Route> Route::create(
     RouteId id, HttpMethod method, std::string pathPrefix, ServiceId service,
     bool protectedRoute, identity::core::OrganizationId organization,
-    policy::Action action, policy::Resource resource)
+    policy::Action action, policy::Resource resource, std::string requiredScope,
+    std::string requiredAudience)
 {
     if (id.empty() || service.empty() || pathPrefix.empty() || pathPrefix.front() != '/'
         || pathPrefix.starts_with("//")
         || pathPrefix.contains('?') || pathPrefix.contains('#') || hasControl(pathPrefix)
-        || (pathPrefix.size() > 1U && pathPrefix.back() == '/')) {
+        || (pathPrefix.size() > 1U && pathPrefix.back() == '/')
+        || requiredScope.size() > 128U || hasControl(requiredScope)
+        || requiredAudience.size() > 2048U || hasControl(requiredAudience)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The gateway route is invalid.");
     }
@@ -395,7 +404,8 @@ foundation::Result<Route> Route::create(
     }
     return Route{std::move(id), method, std::move(pathPrefix), std::move(service),
                  protectedRoute, std::move(organization), std::move(action),
-                 std::move(resource)};
+                 std::move(resource), std::move(requiredScope),
+                 std::move(requiredAudience)};
 }
 
 const RouteId& Route::id() const noexcept { return m_id; }
@@ -406,6 +416,8 @@ bool Route::isProtected() const noexcept { return m_protected; }
 const identity::core::OrganizationId& Route::organization() const noexcept { return m_organization; }
 const policy::Action& Route::action() const noexcept { return m_action; }
 const policy::Resource& Route::resource() const noexcept { return m_resource; }
+std::string_view Route::requiredScope() const noexcept { return m_requiredScope; }
+std::string_view Route::requiredAudience() const noexcept { return m_requiredAudience; }
 
 foundation::Status Router::add(Route route)
 {
@@ -769,8 +781,11 @@ Gateway::Gateway(const Router& router, session::SessionService& sessions,
                  ServiceDiscovery& discovery, WeightedRoundRobin& loadBalancer,
                  CircuitBreaker& circuits, ProxyTransport& proxy,
                  TrustedContextSigner& contextSigner,
-                 foundation::Duration upstreamTimeout)
-    : m_router(&router), m_sessions(&sessions), m_access(&access),
+                 foundation::Duration upstreamTimeout,
+                 session::DelegatedAccessAuthenticator* delegatedAccess,
+                 SenderConstraintVerifier* senderConstraintVerifier)
+    : m_router(&router), m_sessions(&sessions), m_delegatedAccess(delegatedAccess),
+      m_senderConstraintVerifier(senderConstraintVerifier), m_access(&access),
       m_rateLimiter(&rateLimiter), m_discovery(&discovery),
       m_loadBalancer(&loadBalancer), m_circuits(&circuits), m_proxy(&proxy),
       m_contextSigner(&contextSigner),
@@ -801,6 +816,8 @@ HttpResponse Gateway::handle(HttpRequest request)
     stripHopByHop(request);
 
     if (route->isProtected()) {
+        const bool dpopAuthorizationScheme = request.header("authorization").has_value()
+            && request.header("authorization")->starts_with("DPoP ");
         auto credential = takeSessionCredential(request);
         if (!credential.has_value() || !credential->has_value()) {
             return errorResponse(
@@ -808,29 +825,75 @@ HttpResponse Gateway::handle(HttpRequest request)
                     ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
                     : credential.error(), request);
         }
+        std::optional<session::DelegatedAccess> delegated;
         auto authenticated = m_sessions->authenticate(credential->value());
         if (!authenticated.has_value()) {
-            return errorResponse(authenticated.error(), request);
+            if (m_delegatedAccess == nullptr) {
+                return errorResponse(authenticated.error(), request);
+            }
+            auto delegatedResult = m_delegatedAccess->authenticateDelegated(credential->value());
+            if (!delegatedResult.has_value()) {
+                return errorResponse(delegatedResult.error(), request);
+            }
+            delegated.emplace(std::move(delegatedResult).value());
+        }
+        if (delegated.has_value()) {
+            if (delegated->senderConstraint()) {
+                if (m_senderConstraintVerifier == nullptr) {
+                    return errorResponse(
+                        foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+                }
+                auto proof = m_senderConstraintVerifier->verify(
+                    request, *delegated->senderConstraint(), credential->value(),
+                    dpopAuthorizationScheme);
+                if (!proof) return errorResponse(proof.error(), request);
+            } else if (dpopAuthorizationScheme) {
+                return errorResponse(
+                    foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+            }
+        } else if (dpopAuthorizationScheme) {
+            return errorResponse(
+                foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+        }
+        const session::AuthenticatedSession& accepted = delegated.has_value()
+            ? delegated->authenticated() : authenticated.value();
+        if (!route->requiredScope().empty()
+            && (!delegated.has_value() || !delegated->permits(route->requiredScope()))) {
+            return errorResponse(foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
+        }
+        if (!route->requiredAudience().empty()
+            && (!delegated.has_value()
+                || !delegated->permitsAudience(route->requiredAudience()))) {
+            return errorResponse(
+                foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
         }
         if (!m_rateLimiter->allow(
-                std::string{"identity:"} + authenticated->session().identity().value())) {
+                std::string{"identity:"} + accepted.session().identity().value())) {
             return errorResponse(foundation::Error{foundation::ErrorCode::RateLimited}, request);
         }
         const policy::AuthorizationDecision decision =
-            m_access->authorize(authenticated.value(), route.value(),
-                                request.correlation());
+            m_access->authorize(accepted, route.value(), request.correlation());
         if (!decision.isPermitted()) {
             return errorResponse(foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
         }
         request.setHeader("x-openproof-identity",
-                          std::string{authenticated->session().identity().value()});
+                          std::string{accepted.session().identity().value()});
         request.setHeader("x-openproof-provider",
-                          std::string{authenticated->session().provider().value()});
+                          std::string{accepted.session().provider().value()});
         request.setHeader("x-openproof-assurance",
                           std::string{identity::provider::assuranceLevelName(
-                              authenticated->session().assurance())});
+                              accepted.session().assurance())});
         request.setHeader("x-openproof-organization",
                           std::string{route->organization().value()});
+        if (delegated.has_value()) {
+            request.setHeader("x-openproof-client-id", std::string{delegated->clientId()});
+            std::string scopes;
+            for (const auto& scope : delegated->scopes()) {
+                if (!scopes.empty()) scopes.push_back(' ');
+                scopes.append(scope);
+            }
+            request.setHeader("x-openproof-scopes", std::move(scopes));
+        }
     }
     request.setHeader("x-openproof-request-id",
                       std::string{request.correlation().value()});

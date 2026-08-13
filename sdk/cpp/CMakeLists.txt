@@ -1,0 +1,9 @@
+openproof_add_module(openproof_sdk_cpp
+    MODULES
+        openproof_sdk.cppm
+    SOURCES
+        openproof_sdk.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+)

@@ -1,0 +1,42 @@
+[server]
+bind_address = "127.0.0.1"
+port = 18443
+
+[logging]
+level = "info"
+console = true
+
+[security]
+token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+
+[gateway]
+enabled = true
+route_prefix = "/"
+upstream_host = "127.0.0.1"
+upstream_port = 18080
+upstream_tls = false
+
+[database]
+connection_string = "env:OPENPROOF_DATABASE_URL"
+pool_size = 8
+migration_directory = "migrations"
+
+[auth]
+enabled = true
+provider_id = "local"
+organization_id = "org"
+protected_route_prefix = "/api"
+
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial1"
+required_scope = "api"
+
+[oidc]
+enabled = true
+issuer = "https://identity.example.com"
+key_id = "openproof-rs256-1"
+signing_key = "file:/run/secrets/openproof-oidc-private.pem"

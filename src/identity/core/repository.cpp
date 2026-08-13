@@ -92,7 +92,7 @@ InMemoryIdentityRepository::countIn(const OrganizationId& organization) const
         }
     }
 
-    contract_assert(total <= m_entries.size());
+    foundation::requireInvariant(total <= m_entries.size(), "identity repository count exceeds storage size");
     return total;
 }
 

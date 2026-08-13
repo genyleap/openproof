@@ -142,7 +142,7 @@ InMemoryMembershipRepository::countIn(const OrganizationId& organization) const
         }
     }
 
-    contract_assert(total <= m_entries.size());
+    foundation::requireInvariant(total <= m_entries.size(), "organization repository count exceeds storage size");
     return total;
 }
 

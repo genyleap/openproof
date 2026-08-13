@@ -22,8 +22,8 @@ namespace {
 namespace json = boost::json;
 namespace idp = identity::provider;
 constexpr std::size_t kMaximumAuthBody = 16U * 1024U;
-constexpr std::string_view kPreauthCookie = "openproof_preauth";
-constexpr std::string_view kBindingCookie = "openproof_preauth_binding";
+constexpr std::string_view kPreauthCookie = "__Host-openproof-preauth";
+constexpr std::string_view kBindingCookie = "__Host-openproof-preauth-binding";
 
 [[nodiscard]] gateway::HttpResponse response(int status, json::object body)
 {
@@ -56,20 +56,20 @@ constexpr std::string_view kBindingCookie = "openproof_preauth_binding";
 
 void clearPreauth(gateway::HttpResponse& output)
 {
-    output.addHeader("set-cookie", cookie(kPreauthCookie, "", "/auth", 0));
-    output.addHeader("set-cookie", cookie(kBindingCookie, "", "/auth", 0));
+    output.addHeader("set-cookie", cookie(kPreauthCookie, "", "/", 0));
+    output.addHeader("set-cookie", cookie(kBindingCookie, "", "/", 0));
 }
 
 void setSessionCookie(gateway::HttpResponse& output,
                       const foundation::SecretString& token)
 {
     output.addHeader("set-cookie", cookie(
-        "openproof_session", token.expose(), "/", 8 * 60 * 60));
+        "__Host-openproof-session", token.expose(), "/", 8 * 60 * 60));
 }
 
 void clearSessionCookie(gateway::HttpResponse& output)
 {
-    output.addHeader("set-cookie", cookie("openproof_session", "", "/", 0));
+    output.addHeader("set-cookie", cookie("__Host-openproof-session", "", "/", 0));
 }
 
 [[nodiscard]] foundation::Result<json::object> parseObject(const gateway::HttpRequest& request)
@@ -262,9 +262,9 @@ gateway::HttpResponse AuthenticationHttpApi::login(gateway::HttpRequest request)
     payload["expires_at_ms"] = started->challenge().expiresAt().time_since_epoch().count();
     auto output = response(202, std::move(payload));
     output.addHeader("set-cookie", cookie(
-        kPreauthCookie, started->continuationToken().expose(), "/auth", 300));
+        kPreauthCookie, started->continuationToken().expose(), "/", 300));
     output.addHeader("set-cookie", cookie(
-        kBindingCookie, bindingToken.value(), "/auth", 300));
+        kBindingCookie, bindingToken.value(), "/", 300));
     return output;
 }
 

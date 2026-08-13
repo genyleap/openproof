@@ -1,0 +1,19 @@
+openproof_add_module(openproof_account
+    MODULES
+        account.cppm
+        model.cppm
+        repository.cppm
+        service.cppm
+    SOURCES
+        model.cpp
+        repository.cpp
+        service.cpp
+    LINK_PUBLIC
+        openproof_foundation
+        openproof_security
+        openproof_identity_core
+        openproof_identity_profile
+        openproof_identity_provider
+        openproof_provider_local
+        openproof_session
+)

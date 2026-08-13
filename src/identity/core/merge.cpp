@@ -317,8 +317,8 @@ foundation::Result<MergeRecord> applyMerge(IdentityMerge& merge, IdentityReposit
         return foundation::fail(applied.error());
     }
 
-    contract_assert(merge.state() == MergeState::Applied);
-    contract_assert(moved.size() == owned.value().size());
+    foundation::requireInvariant(merge.state() == MergeState::Applied, "identity merge did not reach applied state");
+    foundation::requireInvariant(moved.size() == owned.value().size(), "identity merge moved an unexpected number of external identities");
 
     return MergeRecord{merge.organization(), merge.source(), merge.target(), now,
                        std::move(moved)};

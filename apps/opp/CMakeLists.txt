@@ -33,13 +33,36 @@ target_link_libraries(opp
         openproof_observability
         openproof_identity_provider
         openproof_identity_core
+        openproof_application
+        openproof_account
+        openproof_account_http
+        openproof_account_delivery
+        openproof_consent
+        openproof_evidence
+        openproof_evidence_verifiers
+        openproof_evidence_http
+        openproof_trust
+        openproof_resource
+        openproof_client
+        openproof_application_http
         openproof_authentication
         openproof_authentication_http
         openproof_credentials
+        openproof_provider_github
         openproof_provider_local
+        openproof_provider_oidc
+        openproof_provider_passkey
+        openproof_provider_web3
+        openproof_provider_enterprise
+        openproof_enterprise_scim
+        openproof_enterprise_scim_http
         openproof_storage_postgres
         openproof_organization
         openproof_session
+        openproof_oauth
+        openproof_oauth_http
+        openproof_token
+        openproof_oidc
         openproof_gateway
         openproof_gateway_http
         openproof_security

@@ -5,14 +5,26 @@ openproof_add_module(openproof_storage_postgres
         postgres.cpp
     LINK_PUBLIC
         openproof_foundation
+        openproof_account
         openproof_administration
         openproof_audit
         openproof_security
         openproof_identity_core
         openproof_identity_provider
+        openproof_identity_profile
+        openproof_application
+        openproof_client
+        openproof_resource
+        openproof_consent
+        openproof_evidence
+        openproof_evidence_verifiers
+        openproof_enterprise_scim
+        openproof_oauth
+        openproof_token
         openproof_session
         openproof_credentials
         openproof_provider_local
+        openproof_provider_passkey
         openproof_organization
         openproof_policy
     LINK_PRIVATE
