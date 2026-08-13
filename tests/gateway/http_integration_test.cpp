@@ -52,6 +52,17 @@ public:
     }
 };
 
+class ClientIpHandler final : public gw::HttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest request) override
+    {
+        const bool forwardingHeaderRemoved = !request.header("x-forwarded-for").has_value();
+        return gw::HttpResponse{
+            forwardingHeaderRemoved ? 200 : 500, {},
+            std::string{request.remoteAddress()}};
+    }
+};
+
 struct CoreFixture {
     CoreFixture()
         : clock(kNow), signer(gw::TrustedContextSigner::create(
@@ -94,7 +105,8 @@ struct CoreFixture {
 
 [[nodiscard]] beastHttp::response<beastHttp::string_body>
 sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
-            std::string body = {}, std::string largeHeader = {})
+            std::string body = {}, std::string largeHeader = {},
+            std::string forwardedClientIp = {})
 {
     asio::io_context context;
     Tcp::resolver resolver{context};
@@ -104,6 +116,9 @@ sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
     beastHttp::request<beastHttp::string_body> request{method, std::move(target), 11};
     request.set(beastHttp::field::host, "localhost");
     if (!largeHeader.empty()) request.set("x-large", largeHeader);
+    if (!forwardedClientIp.empty()) {
+        request.set("x-forwarded-for", std::move(forwardedClientIp));
+    }
     request.body() = std::move(body);
     request.prepare_payload();
     beastHttp::write(stream, request);
@@ -111,6 +126,37 @@ sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
     beastHttp::response<beastHttp::string_body> response;
     beastHttp::read(stream, buffer, response);
     return response;
+}
+
+TEST(BeastHttpIntegrationTest, TrustedLoopbackProxySuppliesOneValidatedClientIp)
+{
+    ClientIpHandler handler;
+    auto configuration = httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 64U, 2U, true);
+    ASSERT_TRUE(configuration.has_value());
+    httpAdapter::BeastHttpServer server{handler, std::move(configuration).value()};
+    ASSERT_TRUE(server.start());
+
+    const auto accepted = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/", {}, {}, "203.0.113.42");
+    EXPECT_EQ(accepted.result(), beastHttp::status::ok);
+    EXPECT_EQ(accepted.body(), "203.0.113.42");
+
+    const auto missing = sendRequest(server.boundPort(), beastHttp::verb::get, "/");
+    EXPECT_EQ(missing.result(), beastHttp::status::bad_request);
+    const auto chain = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/", {}, {},
+        "203.0.113.42, 127.0.0.1");
+    EXPECT_EQ(chain.result(), beastHttp::status::bad_request);
+    const auto malformed = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/", {}, {}, "not-an-ip");
+    EXPECT_EQ(malformed.result(), beastHttp::status::bad_request);
+    server.stop();
+
+    EXPECT_FALSE(httpAdapter::ServerConfig::create(
+        "0.0.0.0", 8443U, 8192U, 1024U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 64U, 2U, true).has_value());
 }
 
 TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
