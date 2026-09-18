@@ -1,0 +1,70 @@
+[server]
+bind_address = "127.0.0.1"
+port = 18443
+trust_proxy_client_ip = true
+
+[logging]
+level = "info"
+console = true
+
+[operations]
+metrics_enabled = true
+metrics_bearer_token = "file:/run/openproof/secrets/metrics-bearer.token"
+metrics_maximum_series = 512
+
+[security]
+token_signing_key = "file:/run/openproof/secrets/master.key"
+master_key_version = 1
+credential_encryption_key = "file:/run/openproof/secrets/credential-encryption.key"
+credential_encryption_key_version = 1
+password_pepper = "file:/run/openproof/secrets/password-pepper.key"
+recovery_code_pepper = "file:/run/openproof/secrets/recovery-code-pepper.key"
+audit_chain_key = "file:/run/openproof/secrets/audit-chain.key"
+oauth_client_secret_key = "file:/run/openproof/secrets/oauth-client-secret.key"
+
+[gateway]
+enabled = true
+route_prefix = "/"
+upstream_host = "127.0.0.1"
+upstream_port = 18080
+upstream_tls = false
+rate_limit_capacity = 1000
+rate_limit_refill_per_second = 100
+rate_limit_maximum_keys = 100000
+
+[database]
+connection_string = "file:/run/openproof/secrets/database.url"
+pool_size = 16
+migration_directory = "/opt/openproof/migrations"
+
+[auth]
+enabled = true
+provider_id = "local"
+organization_id = "REPLACE_WITH_ORGANIZATION_ID"
+protected_route_prefix = "/api"
+
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial1"
+required_scope = "api"
+required_audience = "https://api.example.com"
+
+[account]
+enabled = true
+phone_provider_id = "phone"
+delivery_host = "notifications.internal.example"
+delivery_port = 443
+delivery_tls = true
+delivery_path = "/v1/openproof/verification"
+delivery_ca_file = "/etc/openproof/notification-ca.pem"
+delivery_authorization = "file:/run/openproof/secrets/verification-webhook.token"
+
+[oidc]
+enabled = true
+issuer = "https://identity.example.com"
+key_id = "openproof-rs256-1"
+signing_key = "file:/run/openproof/secrets/oidc-private.pem"
+previous_signing_keys_directory = "/etc/openproof/previous-oidc-keys"

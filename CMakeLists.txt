@@ -40,6 +40,8 @@ include(OpenProofModule)
 
 option(OPENPROOF_BUILD_TESTS "Build the OpenProof test suites" ON)
 option(OPENPROOF_BUILD_EXAMPLES "Build OpenProof integration examples" ON)
+option(OPENPROOF_BUILD_COVERAGE_FUZZER
+    "Build the GCC sanitizer-coverage guided boundary fuzzer" OFF)
 
 # External dependencies. SEC-006 requires a concrete reason for each.
 #   OpenSSL        cryptographic primitives; the project never implements them.
@@ -72,6 +74,11 @@ set_target_properties(openproof_libpq PROPERTIES
 add_library(OpenProof::libpq ALIAS openproof_libpq)
 
 add_subdirectory(src)
+
+if(OPENPROOF_BUILD_COVERAGE_FUZZER)
+    add_subdirectory(fuzz)
+endif()
+
 add_subdirectory(apps)
 add_subdirectory(sdk/cpp)
 

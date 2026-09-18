@@ -5,6 +5,7 @@
 [server]
 bind_address = "127.0.0.1"
 port = 18443
+trust_proxy_client_ip = true
 
 [logging]
 level = "info"

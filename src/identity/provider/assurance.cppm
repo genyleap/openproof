@@ -40,8 +40,7 @@ enum class AssuranceLevel : std::uint8_t {
 // every consumer that instantiates such a function. The invariant it would
 // state -- that Ial0 never satisfies a non-zero requirement -- is covered by
 // AssuranceTest instead.
-[[nodiscard]] constexpr bool meetsAssurance(const AssuranceLevel actual,
-                                            const AssuranceLevel required) noexcept
+[[nodiscard]] constexpr bool meetsAssurance(const AssuranceLevel actual, const AssuranceLevel required) noexcept
 {
     return static_cast<std::uint8_t>(actual) >= static_cast<std::uint8_t>(required);
 }
@@ -56,23 +55,18 @@ enum class AuthenticationFactor : std::uint8_t {
     Inherence = 1U << 2U,  ///< Something the subject is, such as a biometric.
 };
 
-[[nodiscard]] constexpr AuthenticationFactor operator|(AuthenticationFactor left,
-                                                       AuthenticationFactor right) noexcept
+[[nodiscard]] constexpr AuthenticationFactor operator|(AuthenticationFactor left, AuthenticationFactor right) noexcept
 {
-    return static_cast<AuthenticationFactor>(static_cast<std::uint8_t>(left)
-                                             | static_cast<std::uint8_t>(right));
+    return static_cast<AuthenticationFactor>(static_cast<std::uint8_t>(left) | static_cast<std::uint8_t>(right));
 }
 
-[[nodiscard]] constexpr AuthenticationFactor operator&(AuthenticationFactor left,
-                                                       AuthenticationFactor right) noexcept
+[[nodiscard]] constexpr AuthenticationFactor operator&(AuthenticationFactor left, AuthenticationFactor right) noexcept
 {
-    return static_cast<AuthenticationFactor>(static_cast<std::uint8_t>(left)
-                                             & static_cast<std::uint8_t>(right));
+    return static_cast<AuthenticationFactor>(static_cast<std::uint8_t>(left) & static_cast<std::uint8_t>(right));
 }
 
 /** @brief Returns whether @p set includes every factor in @p wanted. */
-[[nodiscard]] constexpr bool containsFactor(AuthenticationFactor set,
-                                            AuthenticationFactor wanted) noexcept
+[[nodiscard]] constexpr bool containsFactor(AuthenticationFactor set, AuthenticationFactor wanted) noexcept
 {
     return (set & wanted) == wanted;
 }

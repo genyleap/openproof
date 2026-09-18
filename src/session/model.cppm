@@ -27,10 +27,8 @@ public:
     ~TokenDigest() noexcept;
 
     [[nodiscard]] const security::Sha256Digest& bytes() const noexcept;
-    friend bool operator==(const TokenDigest& left,
-                           const TokenDigest& right) noexcept;
-    friend std::strong_ordering
-    operator<=>(const TokenDigest& left, const TokenDigest& right) noexcept;
+    friend bool operator==(const TokenDigest& left, const TokenDigest& right) noexcept;
+    friend std::strong_ordering operator<=>(const TokenDigest& left, const TokenDigest& right) noexcept;
 
 private:
     security::Sha256Digest m_bytes{};
@@ -95,11 +93,8 @@ public:
     [[nodiscard]] const std::optional<foundation::Instant>& revokedAt() const noexcept;
 
     [[nodiscard]] bool isExpiredAt(foundation::Instant now) const noexcept;
-    [[nodiscard]] foundation::Status use(const TokenDigest& presented,
-                                         foundation::Instant now);
-    [[nodiscard]] foundation::Status rotateToken(const TokenDigest& expected,
-                                                 TokenDigest replacement,
-                                                 foundation::Instant now);
+    [[nodiscard]] foundation::Status use(const TokenDigest& presented, foundation::Instant now);
+    [[nodiscard]] foundation::Status rotateToken(const TokenDigest& expected, TokenDigest replacement, foundation::Instant now);
     [[nodiscard]] foundation::Status revoke(foundation::Instant now);
     void markExpired() noexcept;
 
@@ -115,8 +110,7 @@ private:
     SessionId m_id;
     identity::core::IdentityId m_identity;
     identity::provider::ProviderId m_provider;
-    identity::provider::AssuranceLevel m_assurance{
-        identity::provider::AssuranceLevel::Ial0};
+    identity::provider::AssuranceLevel m_assurance{identity::provider::AssuranceLevel::Ial0};
     identity::provider::AuthenticationStrength m_strength;
     SessionState m_state{SessionState::Active};
     foundation::Instant m_authenticatedAt{};

@@ -77,6 +77,8 @@ private:
     friend class PostgresOrganizationRepository;
     friend class PostgresMembershipRepository;
     friend class PostgresLocalAccountDirectory;
+    friend class PostgresCredentialRekeyer;
+    friend class PostgresMasterKeyRotator;
     friend class PostgresAdministrationRepository;
     friend class PostgresAuthorizationDecisionSink;
     friend class PostgresIdentityProviderStore;
@@ -102,6 +104,71 @@ public:
     /** Applies lexically ordered .sql files and rejects changed applied files. */
     [[nodiscard]] foundation::Result<MigrationReport>
     applyDirectory(const std::filesystem::path& directory);
+private:
+    ConnectionPool* m_pool;
+};
+
+struct CredentialRekeyReport final {
+    std::size_t rekeyed{};
+    std::size_t alreadyCurrent{};
+    bool dryRun{};
+};
+
+/** Offline, transactionally atomic rotation of encrypted credential envelopes. */
+class PostgresCredentialRekeyer final {
+public:
+    explicit PostgresCredentialRekeyer(ConnectionPool& pool);
+    /**
+     * Validates every TOTP envelope, then replaces old-version ciphertexts in one
+     * serializable transaction. The TOTP table is exclusively locked so no
+     * credential can enter between inventory and commit. A dry run always rolls back.
+     */
+    [[nodiscard]] foundation::Result<CredentialRekeyReport> rotateTotp(
+        const security::AeadKey& currentKey, unsigned int currentVersion,
+        const security::AeadKey& replacementKey, unsigned int replacementVersion,
+        bool dryRun);
+
+private:
+    ConnectionPool* m_pool;
+};
+
+struct MasterKeyRotationReport final {
+    std::size_t authenticationTransactions{};
+    std::size_t sessions{};
+    std::size_t accountChallenges{};
+    std::size_t passkeyRegistrations{};
+    std::size_t authorizationCodes{};
+    std::size_t tokenFamilies{};
+    std::size_t deviceAuthorizations{};
+    std::size_t pushedRequests{};
+    bool dryRun{};
+
+    [[nodiscard]] std::size_t invalidated() const noexcept
+    {
+        return authenticationTransactions + sessions + accountChallenges
+            + passkeyRegistrations
+            + authorizationCodes + tokenFamilies + deviceAuthorizations
+            + pushedRequests;
+    }
+};
+
+/** Offline atomic retirement of every state verifier derived from a master key. */
+class PostgresMasterKeyRotator final {
+public:
+    explicit PostgresMasterKeyRotator(ConnectionPool& pool);
+    /** Fails closed when configured version/material disagrees with journal head. */
+    [[nodiscard]] foundation::Status verifyActive(
+        unsigned int version, const security::Sha256Digest& fingerprint) const;
+    /**
+     * Deletes all short-lived state tied to the retired master and records the
+     * non-secret key fingerprints in the same serializable transaction. A dry
+     * run performs the full locked mutation and then always rolls it back.
+     */
+    [[nodiscard]] foundation::Result<MasterKeyRotationReport> rotate(
+        unsigned int currentVersion, const security::Sha256Digest& currentFingerprint,
+        unsigned int replacementVersion,
+        const security::Sha256Digest& replacementFingerprint, bool dryRun);
+
 private:
     ConnectionPool* m_pool;
 };
@@ -197,6 +264,10 @@ public:
     [[nodiscard]] foundation::Status detach(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedOwner) override;
+    [[nodiscard]] foundation::Status detachIfAnotherAuthenticationMethod(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner,
+        const std::vector<identity::provider::ProviderId>& authenticationProviders) override;
     [[nodiscard]] foundation::Status reassign(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedCurrentOwner,

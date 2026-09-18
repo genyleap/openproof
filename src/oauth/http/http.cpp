@@ -198,7 +198,7 @@ using Parameters = std::map<std::string, std::string, std::less<>>;
 [[nodiscard]] bool oidcOnlyScope(std::string_view scope) noexcept
 {
     return scope == "openid" || scope == "profile" || scope == "email"
-        || scope == "phone" || scope == "offline_access";
+        || scope == "phone" || scope == "offline_access" || scope == "account";
 }
 
 [[nodiscard]] std::vector<std::string> scopeStrings(

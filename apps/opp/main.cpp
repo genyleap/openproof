@@ -8,6 +8,8 @@
 // The `server` subcommand composes and runs the bounded HTTP reverse gateway.
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -30,6 +32,10 @@
 #include <utility>
 #include <vector>
 #include <version>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 
 
@@ -78,6 +84,7 @@ import openproof.provider.enterprise;
 import openproof.security;
 import openproof.session;
 import openproof.storage.postgres;
+import openproof.telemetry;
 import openproof.token;
 
 namespace {
@@ -122,6 +129,7 @@ namespace enterprise = openproof::provider::enterprise;
 namespace security = openproof::security;
 namespace session = openproof::session;
 namespace postgres = openproof::storage::postgres;
+namespace telemetry = openproof::telemetry;
 namespace token = openproof::token;
 namespace idp = openproof::identity::provider;
 
@@ -198,6 +206,22 @@ public:
     [[nodiscard]] bool runServer() const noexcept { return m_runServer; }
     [[nodiscard]] bool bootstrapAdmin() const noexcept { return m_bootstrapAdmin; }
     [[nodiscard]] bool checkConfig() const noexcept { return m_checkConfig; }
+    [[nodiscard]] bool rekeyTotp() const noexcept { return m_rekeyTotp; }
+    [[nodiscard]] bool rotateMasterKey() const noexcept { return m_rotateMasterKey; }
+    [[nodiscard]] bool materializePersistentKeys() const noexcept
+    { return m_materializePersistentKeys; }
+    [[nodiscard]] bool dryRun() const noexcept { return m_dryRun; }
+    [[nodiscard]] bool acknowledgedOffline() const noexcept
+    { return m_acknowledgedOffline; }
+    [[nodiscard]] bool acknowledgedSecretExport() const noexcept
+    { return m_acknowledgedSecretExport; }
+
+    [[nodiscard]] const std::string& newKeyReference() const noexcept
+    { return *m_newKeyReference; }
+    [[nodiscard]] unsigned int newKeyVersion() const noexcept
+    { return *m_newKeyVersion; }
+    [[nodiscard]] const std::filesystem::path& outputDirectory() const noexcept
+    { return *m_outputDirectory; }
 
     [[nodiscard]] const std::string& organizationName() const noexcept
     { return *m_organizationName; }
@@ -218,10 +242,19 @@ private:
     bool m_runServer{false};
     bool m_bootstrapAdmin{false};
     bool m_checkConfig{false};
+    bool m_rekeyTotp{false};
+    bool m_rotateMasterKey{false};
+    bool m_materializePersistentKeys{false};
+    bool m_dryRun{false};
+    bool m_acknowledgedOffline{false};
+    bool m_acknowledgedSecretExport{false};
     std::optional<std::filesystem::path> m_configPath;
     std::optional<std::string> m_organizationName;
     std::optional<std::string> m_identityId;
     std::optional<std::string> m_externalSubject;
+    std::optional<std::string> m_newKeyReference;
+    std::optional<unsigned int> m_newKeyVersion;
+    std::optional<std::filesystem::path> m_outputDirectory;
 };
 
 fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> arguments)
@@ -249,6 +282,24 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "The 'check-config' subcommand was specified more than once.");
             }
             parsed.m_checkConfig = true;
+        } else if (argument == "rekey-totp") {
+            if (parsed.m_rekeyTotp) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'rekey-totp' subcommand was specified more than once.");
+            }
+            parsed.m_rekeyTotp = true;
+        } else if (argument == "rotate-master-key") {
+            if (parsed.m_rotateMasterKey) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'rotate-master-key' subcommand was specified more than once.");
+            }
+            parsed.m_rotateMasterKey = true;
+        } else if (argument == "materialize-persistent-keys") {
+            if (parsed.m_materializePersistentKeys) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "The 'materialize-persistent-keys' subcommand was specified more than once.");
+            }
+            parsed.m_materializePersistentKeys = true;
         } else if (argument == "--help" || argument == "-h") {
             parsed.m_showHelp = true;
         } else if (argument == "--version" || argument == "-V") {
@@ -284,6 +335,51 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "Option '--subject' requires one unique value.");
             }
             parsed.m_externalSubject = std::string{arguments[++index]};
+        } else if (argument == "--new-key-ref") {
+            if ((index + 1U) >= arguments.size() || parsed.m_newKeyReference.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--new-key-ref' requires one unique value.");
+            }
+            parsed.m_newKeyReference = std::string{arguments[++index]};
+        } else if (argument == "--new-key-version") {
+            if ((index + 1U) >= arguments.size() || parsed.m_newKeyVersion.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--new-key-version' requires one unique value.");
+            }
+            const std::string_view raw = arguments[++index];
+            unsigned int version{};
+            const auto converted = std::from_chars(
+                raw.data(), raw.data() + raw.size(), version);
+            if (converted.ec != std::errc{}
+                || converted.ptr != raw.data() + raw.size() || version == 0U) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--new-key-version' must be a positive integer.");
+            }
+            parsed.m_newKeyVersion = version;
+        } else if (argument == "--dry-run") {
+            if (parsed.m_dryRun) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--dry-run' was specified more than once.");
+            }
+            parsed.m_dryRun = true;
+        } else if (argument == "--acknowledge-offline") {
+            if (parsed.m_acknowledgedOffline) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--acknowledge-offline' was specified more than once.");
+            }
+            parsed.m_acknowledgedOffline = true;
+        } else if (argument == "--output-directory") {
+            if ((index + 1U) >= arguments.size() || parsed.m_outputDirectory.has_value()) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--output-directory' requires one unique path.");
+            }
+            parsed.m_outputDirectory = std::filesystem::path{arguments[++index]};
+        } else if (argument == "--acknowledge-secret-export") {
+            if (parsed.m_acknowledgedSecretExport) {
+                return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                                 "Option '--acknowledge-secret-export' was specified more than once.");
+            }
+            parsed.m_acknowledgedSecretExport = true;
         } else {
             return fnd::fail(fnd::ErrorCode::InvalidArgument,
                              std::string{"Unrecognized option: "} + std::string{argument});
@@ -293,7 +389,10 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
     if (parsed.m_showHelp) return parsed;
     const unsigned subcommandCount = static_cast<unsigned>(parsed.m_runServer)
         + static_cast<unsigned>(parsed.m_bootstrapAdmin)
-        + static_cast<unsigned>(parsed.m_checkConfig);
+        + static_cast<unsigned>(parsed.m_checkConfig)
+        + static_cast<unsigned>(parsed.m_rekeyTotp)
+        + static_cast<unsigned>(parsed.m_rotateMasterKey)
+        + static_cast<unsigned>(parsed.m_materializePersistentKeys);
     if (subcommandCount > 1U) {
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
                          "Only one subcommand may be selected.");
@@ -312,6 +411,41 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
                          "Bootstrap options require the bootstrap-admin subcommand.");
     }
+    const bool hasRekeyOption = parsed.m_newKeyReference.has_value()
+        || parsed.m_newKeyVersion.has_value() || parsed.m_dryRun
+        || parsed.m_acknowledgedOffline;
+    if ((parsed.m_rekeyTotp || parsed.m_rotateMasterKey)
+        && (!parsed.m_configPath.has_value() || !parsed.m_newKeyReference.has_value()
+            || !parsed.m_newKeyVersion.has_value()
+            || (!parsed.m_dryRun && !parsed.m_acknowledgedOffline))) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "Key rotation requires --config, --new-key-ref and --new-key-version; "
+            "a committed run also requires --acknowledge-offline.");
+    }
+    if (parsed.m_dryRun && parsed.m_acknowledgedOffline) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "Options '--dry-run' and '--acknowledge-offline' are mutually exclusive.");
+    }
+    if (!parsed.m_rekeyTotp && !parsed.m_rotateMasterKey && hasRekeyOption) {
+        return fnd::fail(fnd::ErrorCode::InvalidArgument,
+                         "Key rotation options require a key-rotation subcommand.");
+    }
+    const bool hasMaterializeOption = parsed.m_outputDirectory.has_value()
+        || parsed.m_acknowledgedSecretExport;
+    if (parsed.m_materializePersistentKeys
+        && (!parsed.m_configPath.has_value() || !parsed.m_outputDirectory.has_value()
+            || !parsed.m_acknowledgedSecretExport)) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "materialize-persistent-keys requires --config, --output-directory and --acknowledge-secret-export.");
+    }
+    if (!parsed.m_materializePersistentKeys && hasMaterializeOption) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "Persistent-key materialization options require the materialize-persistent-keys subcommand.");
+    }
 
     return parsed;
 }
@@ -323,6 +457,14 @@ void printUsage()
     std::println("Usage:");
     std::println("  {} server [options]", kProgramName);
     std::println("  {} check-config [--config <path>]", kProgramName);
+    std::println("  {} rekey-totp --config <path> --new-key-ref <secret-ref>",
+                 kProgramName);
+    std::println("      --new-key-version <version> [--dry-run | --acknowledge-offline]");
+    std::println("  {} rotate-master-key --config <path> --new-key-ref <secret-ref>",
+                 kProgramName);
+    std::println("      --new-key-version <version> [--dry-run | --acknowledge-offline]");
+    std::println("  {} materialize-persistent-keys --config <path>", kProgramName);
+    std::println("      --output-directory <empty-dir> --acknowledge-secret-export");
     std::println("  {} bootstrap-admin --config <path> --organization-name <name>",
                  kProgramName);
     std::println("      --identity-id <id> --subject <local-subject>");
@@ -334,6 +476,16 @@ void printUsage()
     std::println("                       environment and built-in defaults.");
     std::println("  check-config         Validate configuration and secret references without");
     std::println("                       opening a listener or connecting to dependencies.");
+    std::println("  rekey-totp           Offline atomic re-encryption of all persisted TOTP seeds.");
+    std::println("  rotate-master-key    Offline atomic invalidation of master-derived state.");
+    std::println("  materialize-persistent-keys");
+    std::println("                       Export legacy-derived persistent subkeys as hex files.");
+    std::println("  --new-key-ref        env:, file: or hexfile: reference for replacement key material.");
+    std::println("  --new-key-version    Monotonically increasing key version.");
+    std::println("  --dry-run            Perform the locked ceremony, then roll back.");
+    std::println("  --acknowledge-offline Confirm the server is stopped for a committed rotation.");
+    std::println("  --output-directory   Existing empty owner-only directory for derived subkeys.");
+    std::println("  --acknowledge-secret-export Confirm protected secret material will be written.");
     std::println("  --print-default-config");
     std::println("                       Print the configuration defaults compiled into");
     std::println("                       this binary and exit.");
@@ -460,6 +612,208 @@ addProtectedRoutes(gateway::Router& router,
     return fnd::SecretString{std::move(raw)};
 }
 
+[[nodiscard]] fnd::Result<fnd::SecretString> credentialEncryptionMaterial(
+    const cfg::SecurityConfig& configuration)
+{
+    if (!configuration.credentialEncryptionKey().empty()) {
+        return configuration.credentialEncryptionKey().clone();
+    }
+    return deriveSecret(
+        configuration.tokenSigningKey(), "openproof/totp-encryption-key/v1");
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> persistentSecurityMaterial(
+    const fnd::SecretString& dedicated, const cfg::SecurityConfig& configuration,
+    std::string_view legacyLabel)
+{
+    if (!dedicated.empty()) return dedicated.clone();
+    return deriveSecret(configuration.tokenSigningKey(), legacyLabel);
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> passwordPepperMaterial(
+    const cfg::SecurityConfig& configuration)
+{
+    return persistentSecurityMaterial(
+        configuration.passwordPepper(), configuration,
+        "openproof/password-pepper/v1");
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> recoveryCodePepperMaterial(
+    const cfg::SecurityConfig& configuration)
+{
+    return persistentSecurityMaterial(
+        configuration.recoveryCodePepper(), configuration,
+        "openproof/recovery-code-pepper/v1");
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> auditChainMaterial(
+    const cfg::SecurityConfig& configuration)
+{
+    return persistentSecurityMaterial(
+        configuration.auditChainKey(), configuration,
+        "openproof/audit-chain-key/v1");
+}
+
+[[nodiscard]] fnd::Result<fnd::SecretString> oauthClientSecretMaterial(
+    const cfg::SecurityConfig& configuration)
+{
+    return persistentSecurityMaterial(
+        configuration.oauthClientSecretKey(), configuration,
+        "openproof/oauth-client-secret-key/v1");
+}
+
+[[nodiscard]] fnd::Result<security::Sha256Digest> masterKeyFingerprint(
+    const cfg::SecurityConfig& configuration)
+{
+    return security::hmacSha256(
+        configuration.tokenSigningKey(),
+        "openproof/master-key-fingerprint/v1");
+}
+
+[[nodiscard]] fnd::Status verifyActiveMasterKey(
+    postgres::ConnectionPool& pool, const cfg::SecurityConfig& configuration)
+{
+    auto fingerprint = masterKeyFingerprint(configuration);
+    if (!fingerprint) return fnd::fail(fingerprint.error());
+    postgres::PostgresMasterKeyRotator rotator{pool};
+    return rotator.verifyActive(
+        configuration.masterKeyVersion(), fingerprint.value());
+}
+
+[[nodiscard]] ExitCode runPersistentKeyMaterialization(
+    const cfg::PlatformConfig& platform, const CommandLine& commandLine)
+{
+    const auto& securityConfig = platform.security();
+    if (securityConfig.tokenSigningKey().expose().size() < 32U
+        || securityConfig.masterKeyVersion() != 1U
+        || securityConfig.credentialEncryptionKeyVersion() != 1U) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Persistent-key materialization requires the legacy version-1 master configuration."});
+        return ExitCode::ConfigurationError;
+    }
+    if (securityConfig.hasDedicatedPersistentKeys()
+        || !securityConfig.credentialEncryptionKey().empty()
+        || !securityConfig.passwordPepper().empty()
+        || !securityConfig.recoveryCodePepper().empty()
+        || !securityConfig.auditChainKey().empty()
+        || !securityConfig.oauthClientSecretKey().empty()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Persistent-key materialization refuses a mixed or already dedicated key configuration."});
+        return ExitCode::ConfigurationError;
+    }
+
+    const std::filesystem::path& directory = commandLine.outputDirectory();
+    std::error_code filesystemError;
+    const auto directoryStatus = std::filesystem::symlink_status(directory, filesystemError);
+    if (filesystemError || std::filesystem::is_symlink(directoryStatus)
+        || !std::filesystem::is_directory(directoryStatus)) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The persistent-key output path must be an existing real directory."});
+        return ExitCode::UsageError;
+    }
+    struct stat metadata {};
+    if (::stat(directory.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode)
+        || metadata.st_uid != ::geteuid() || (metadata.st_mode & 0077) != 0) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::PermissionDenied,
+            "The persistent-key output directory must be owned by this user and inaccessible to group/other."});
+        return ExitCode::ConfigurationError;
+    }
+    if (!std::filesystem::is_empty(directory, filesystemError) || filesystemError) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "The persistent-key output directory must be empty."});
+        return ExitCode::ConfigurationError;
+    }
+
+    struct DerivedFile final {
+        std::string_view name;
+        std::string_view label;
+    };
+    constexpr std::array<DerivedFile, 5> files{{
+        {"credential-encryption.key", "openproof/totp-encryption-key/v1"},
+        {"password-pepper.key", "openproof/password-pepper/v1"},
+        {"recovery-code-pepper.key", "openproof/recovery-code-pepper/v1"},
+        {"audit-chain.key", "openproof/audit-chain-key/v1"},
+        {"oauth-client-secret.key", "openproof/oauth-client-secret-key/v1"},
+    }};
+    std::vector<std::filesystem::path> created;
+    const auto cleanup = [&created] {
+        for (auto iterator = created.rbegin(); iterator != created.rend(); ++iterator) {
+            std::error_code ignored;
+            std::filesystem::remove(*iterator, ignored);
+        }
+    };
+    for (const DerivedFile& file : files) {
+        auto material = security::hmacSha256(
+            securityConfig.tokenSigningKey(), file.label);
+        if (!material) {
+            cleanup();
+            reportStartupFailure(material.error());
+            return ExitCode::InternalError;
+        }
+        const std::string encoded = fnd::toHex(material.value());
+        const std::filesystem::path target = directory / file.name;
+        const int descriptor = ::open(
+            target.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR);
+        if (descriptor < 0) {
+            cleanup();
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::Unavailable,
+                "A persistent-key output file could not be created."});
+            return ExitCode::ConfigurationError;
+        }
+        created.push_back(target);
+        std::size_t offset = 0U;
+        bool written = true;
+        while (offset < encoded.size()) {
+            const ssize_t count = ::write(
+                descriptor, encoded.data() + offset, encoded.size() - offset);
+            if (count <= 0) {
+                written = false;
+                break;
+            }
+            offset += static_cast<std::size_t>(count);
+        }
+        const bool synced = written && ::fsync(descriptor) == 0;
+        const bool closed = ::close(descriptor) == 0;
+        if (!written || !synced || !closed) {
+            cleanup();
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::Unavailable,
+                "A persistent-key output file could not be committed."});
+            return ExitCode::ConfigurationError;
+        }
+    }
+    const int directoryDescriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (directoryDescriptor < 0) {
+        cleanup();
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::Unavailable,
+            "The persistent-key output directory could not be committed."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool directorySynced = ::fsync(directoryDescriptor) == 0;
+    const bool directoryClosed = ::close(directoryDescriptor) == 0;
+    if (!directorySynced || !directoryClosed) {
+        cleanup();
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::Unavailable,
+            "The persistent-key output directory could not be committed."});
+        return ExitCode::ConfigurationError;
+    }
+    std::println(
+        "Materialized 5 legacy-compatible persistent subkeys in {}.",
+        directory.string());
+    std::println(
+        "Reference each file with hexfile: and run opp check-config before restart; "
+        "the master key itself was not exported.");
+    return ExitCode::Success;
+}
+
 [[nodiscard]] fnd::Result<std::vector<oidc::PublishedVerificationJwk>> loadPreviousOidcKeys(
     std::string_view directory, std::string_view activeKeyId)
 {
@@ -519,6 +873,200 @@ addProtectedRoutes(gateway::Router& router,
     return jwks;
 }
 
+[[nodiscard]] ExitCode runTotpRekey(
+    const cfg::PlatformConfig& platform, const cfg::Environment& environment,
+    const CommandLine& commandLine)
+{
+    if (!platform.database().enabled()
+        || (platform.security().credentialEncryptionKey().empty()
+            && platform.security().tokenSigningKey().expose().size() < 32U)) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "rekey-totp requires PostgreSQL and either the dedicated credential key "
+            "or the legacy master key used to derive it."});
+        return ExitCode::ConfigurationError;
+    }
+    if (commandLine.newKeyVersion()
+        <= platform.security().credentialEncryptionKeyVersion()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The replacement credential key version must be greater than the active version."});
+        return ExitCode::UsageError;
+    }
+    auto replacementMaterial = cfg::resolveSecretReference(
+        commandLine.newKeyReference(), environment);
+    if (!replacementMaterial) {
+        reportStartupFailure(replacementMaterial.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto currentMaterial = credentialEncryptionMaterial(platform.security());
+    if (!currentMaterial) {
+        reportStartupFailure(currentMaterial.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto currentKey = security::AeadKey::create(
+        std::move(currentMaterial).value());
+    auto replacementKey = security::AeadKey::create(
+        std::move(replacementMaterial).value());
+    if (!currentKey || !replacementKey) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "Credential encryption keys must contain exactly 32 bytes."});
+        return ExitCode::ConfigurationError;
+    }
+    if (currentKey->matches(replacementKey.value())) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The replacement credential key must use different key material."});
+        return ExitCode::ConfigurationError;
+    }
+
+    auto poolConfig = postgres::PoolConfig::create(
+        platform.database().connectionString().clone(), platform.database().poolSize(),
+        std::chrono::seconds{5});
+    if (!poolConfig) {
+        reportStartupFailure(poolConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+    if (!pool) {
+        reportStartupFailure(pool.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::Migrator migrator{*pool.value()};
+    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
+    const fnd::Status activeMaster = verifyActiveMasterKey(
+        *pool.value(), platform.security());
+    if (!activeMaster) {
+        reportStartupFailure(activeMaster.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::PostgresCredentialRekeyer rekeyer{*pool.value()};
+    auto report = rekeyer.rotateTotp(
+        currentKey.value(), platform.security().credentialEncryptionKeyVersion(),
+        replacementKey.value(), commandLine.newKeyVersion(), commandLine.dryRun());
+    if (!report) {
+        reportStartupFailure(report.error());
+        return ExitCode::InternalError;
+    }
+    std::println(
+        "TOTP credential rekey {}: {} row(s) re-encrypted, {} already current.",
+        report->dryRun ? "dry run passed" : "committed",
+        report->rekeyed, report->alreadyCurrent);
+    if (!report->dryRun) {
+        std::println(
+            "Before restarting OpenProof, update credential_encryption_key and "
+            "credential_encryption_key_version to the replacement values.");
+    }
+    return ExitCode::Success;
+}
+
+[[nodiscard]] ExitCode runMasterKeyRotation(
+    const cfg::PlatformConfig& platform, const cfg::Environment& environment,
+    const CommandLine& commandLine)
+{
+    const auto& securityConfig = platform.security();
+    if (!platform.database().enabled()
+        || securityConfig.tokenSigningKey().expose().size() < 32U) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "rotate-master-key requires PostgreSQL and an active master key of at least 32 bytes."});
+        return ExitCode::ConfigurationError;
+    }
+    if (!securityConfig.hasDedicatedPersistentKeys()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Master-key rotation requires explicit credential, password, recovery, audit and OAuth client-secret keys."});
+        return ExitCode::ConfigurationError;
+    }
+    if (commandLine.newKeyVersion() <= securityConfig.masterKeyVersion()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The replacement master key version must be greater than the active version."});
+        return ExitCode::UsageError;
+    }
+    auto replacement = cfg::resolveSecretReference(
+        commandLine.newKeyReference(), environment);
+    if (!replacement) {
+        reportStartupFailure(replacement.error());
+        return ExitCode::ConfigurationError;
+    }
+    if (replacement->expose().size() < 32U) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The replacement master key must contain at least 32 bytes."});
+        return ExitCode::ConfigurationError;
+    }
+    auto currentFingerprint = masterKeyFingerprint(securityConfig);
+    auto replacementFingerprint = security::hmacSha256(
+        replacement.value(), "openproof/master-key-fingerprint/v1");
+    if (!currentFingerprint || !replacementFingerprint) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    if (security::constantTimeEquals(
+            currentFingerprint.value(), replacementFingerprint.value())) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "The replacement master key must use different key material."});
+        return ExitCode::ConfigurationError;
+    }
+    auto poolConfig = postgres::PoolConfig::create(
+        platform.database().connectionString().clone(), platform.database().poolSize(),
+        std::chrono::seconds{5});
+    if (!poolConfig) {
+        reportStartupFailure(poolConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+    if (!pool) {
+        reportStartupFailure(pool.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::Migrator migrator{*pool.value()};
+    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::PostgresMasterKeyRotator rotator{*pool.value()};
+    const fnd::Status activeMaster = rotator.verifyActive(
+        securityConfig.masterKeyVersion(), currentFingerprint.value());
+    if (!activeMaster) {
+        reportStartupFailure(activeMaster.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto report = rotator.rotate(
+        securityConfig.masterKeyVersion(), currentFingerprint.value(),
+        commandLine.newKeyVersion(), replacementFingerprint.value(),
+        commandLine.dryRun());
+    if (!report) {
+        reportStartupFailure(report.error());
+        return ExitCode::InternalError;
+    }
+    std::println(
+        "Master key rotation {}: {} state row(s) invalidated "
+        "(transactions={}, sessions={}, account_challenges={}, passkey_registrations={}, authorization_codes={}, "
+        "token_families={}, device_authorizations={}, pushed_requests={}).",
+        report->dryRun ? "dry run passed" : "committed", report->invalidated(),
+        report->authenticationTransactions, report->sessions,
+        report->accountChallenges, report->passkeyRegistrations,
+        report->authorizationCodes,
+        report->tokenFamilies, report->deviceAuthorizations,
+        report->pushedRequests);
+    if (!report->dryRun) {
+        std::println(
+            "Before restarting OpenProof, update token_signing_key and "
+            "master_key_version to the replacement values; keep every dedicated "
+            "persistent key unchanged.");
+    }
+    return ExitCode::Success;
+}
+
 [[nodiscard]] ExitCode runBootstrapAdmin(
     const cfg::PlatformConfig& platform, const cfg::Environment& environment,
     const CommandLine& commandLine, const fnd::ClockSource& clock)
@@ -556,13 +1104,16 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
+    const fnd::Status activeMaster = verifyActiveMasterKey(
+        *pool.value(), platform.security());
+    if (!activeMaster) {
+        reportStartupFailure(activeMaster.error());
+        return ExitCode::ConfigurationError;
+    }
 
-    auto passwordSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/password-pepper/v1");
-    auto totpSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/totp-encryption-key/v1");
-    auto auditSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/audit-chain-key/v1");
+    auto passwordSecret = passwordPepperMaterial(platform.security());
+    auto totpSecret = credentialEncryptionMaterial(platform.security());
+    auto auditSecret = auditChainMaterial(platform.security());
     if (!passwordSecret || !totpSecret || !auditSecret) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
@@ -590,7 +1141,8 @@ addProtectedRoutes(gateway::Router& router,
     }
     auto repository = postgres::PostgresAdministrationRepository::create(
         *pool.value(), std::move(passwordHasher).value(),
-        std::move(totpKey).value(), 1U,
+        std::move(totpKey).value(),
+        platform.security().credentialEncryptionKeyVersion(),
         idp::ProviderId{std::string{platform.auth().providerId()}},
         std::move(auditKey).value());
     if (!repository) {
@@ -628,7 +1180,20 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(serverConfig.error());
         return ExitCode::ConfigurationError;
     }
-    gatewayHttp::BeastHttpServer server{handler, std::move(serverConfig).value()};
+    std::unique_ptr<telemetry::MetricRegistry> metrics;
+    std::unique_ptr<operationsHttp::MetricsHttpApi> metricsApi;
+    gateway::HttpHandler* listenerHandler = &handler;
+    if (platform.operations().metricsEnabled()) {
+        metrics = std::make_unique<telemetry::MetricRegistry>(
+            platform.operations().metricsMaximumSeries());
+        static_cast<void>(metrics->increment(
+            "openproof_process_starts_total", {{"version", std::string{kVersion}}}));
+        metricsApi = std::make_unique<operationsHttp::MetricsHttpApi>(
+            *metrics, platform.operations().metricsBearerToken().clone(), handler);
+        listenerHandler = metricsApi.get();
+    }
+    gatewayHttp::BeastHttpServer server{
+        *listenerHandler, std::move(serverConfig).value()};
     const fnd::Status started = server.start();
     if (!started) {
         reportStartupFailure(started.error());
@@ -638,7 +1203,9 @@ addProtectedRoutes(gateway::Router& router,
         obs::LogField::integer("bound_port", static_cast<std::int64_t>(server.boundPort())),
         obs::LogField::text("upstream_host", std::string{platform.gateway().upstreamHost()}),
         obs::LogField::boolean("upstream_tls", platform.gateway().upstreamTls()),
-        obs::LogField::boolean("authentication_enabled", platform.auth().enabled())};
+        obs::LogField::boolean("authentication_enabled", platform.auth().enabled()),
+        obs::LogField::boolean(
+            "metrics_enabled", platform.operations().metricsEnabled())};
     logger.info("openproof gateway listener started", listenerFields);
     g_shutdownRequested = 0;
     std::signal(SIGINT, requestShutdown);
@@ -680,7 +1247,9 @@ addProtectedRoutes(gateway::Router& router,
     }
 
     auto limiter = gateway::TokenBucketRateLimiter::create(
-        clock, 1'000.0, 100.0, 100'000U);
+        clock, static_cast<double>(platform.gateway().rateLimitCapacity()),
+        static_cast<double>(platform.gateway().rateLimitRefillPerSecond()),
+        platform.gateway().rateLimitMaximumKeys());
     auto circuits = gateway::CircuitBreaker::create(
         clock, 5U, std::chrono::seconds{30});
     auto signer = gateway::TrustedContextSigner::create(
@@ -754,6 +1323,12 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
+    const fnd::Status activeMaster = verifyActiveMasterKey(
+        *pool.value(), platform.security());
+    if (!activeMaster) {
+        reportStartupFailure(activeMaster.error());
+        return ExitCode::ConfigurationError;
+    }
 
     postgres::PostgresIdentityRepository identities{*pool.value()};
     postgres::PostgresExternalIdentityDirectory externalIdentities{*pool.value()};
@@ -778,14 +1353,10 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    auto passwordSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/password-pepper/v1");
-    auto totpSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/totp-encryption-key/v1");
-    auto recoverySecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/recovery-code-pepper/v1");
-    auto auditSecret = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/audit-chain-key/v1");
+    auto passwordSecret = passwordPepperMaterial(platform.security());
+    auto totpSecret = credentialEncryptionMaterial(platform.security());
+    auto recoverySecret = recoveryCodePepperMaterial(platform.security());
+    auto auditSecret = auditChainMaterial(platform.security());
     if (!passwordSecret || !totpSecret || !recoverySecret || !auditSecret) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
@@ -808,13 +1379,15 @@ addProtectedRoutes(gateway::Router& router,
     const idp::ProviderId providerId{std::string{platform.auth().providerId()}};
     auto accounts = postgres::PostgresLocalAccountDirectory::create(
         *pool.value(), std::move(passwordHasher).value(),
-        credentials::TotpPolicy::recommended(), std::move(totpKey).value(), 1U,
+        credentials::TotpPolicy::recommended(), std::move(totpKey).value(),
+        platform.security().credentialEncryptionKeyVersion(),
         providerId);
     auto recoveryCodes = credentials::RecoveryCodeService::create(
         recoveryRepository, std::move(recoverySecret).value());
     auto administrationRepository = postgres::PostgresAdministrationRepository::create(
         *pool.value(), std::move(administrationPasswordHasher).value(),
-        std::move(administrationTotpKey).value(), 1U, providerId,
+        std::move(administrationTotpKey).value(),
+        platform.security().credentialEncryptionKeyVersion(), providerId,
         std::move(administrationAuditKey).value());
     if (!accounts || !recoveryCodes || !administrationRepository) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
@@ -874,7 +1447,11 @@ addProtectedRoutes(gateway::Router& router,
     const auto registerOidcProvider = [&](std::string_view name,
                                           std::string issuer,
                                           std::vector<std::string> scopes,
-                                          std::string_view keyLabel) -> fnd::Status {
+                                          std::string_view keyLabel,
+                                          externalOidc::OidcClientAuthenticationMethod
+                                              clientAuthentication = externalOidc::
+                                                  OidcClientAuthenticationMethod::
+                                                      ClientSecretPost) -> fnd::Status {
         const std::string upperName = [&] {
             std::string output{name};
             std::ranges::transform(output, output.begin(), [](unsigned char symbol) {
@@ -895,7 +1472,8 @@ addProtectedRoutes(gateway::Router& router,
         auto config = externalOidc::OidcProviderConfig::create(
             idp::ProviderId{std::string{name}}, std::move(issuer), *clientId,
             fnd::SecretString{*clientSecret}, *federationCallback, std::move(scopes),
-            std::move(derivationKey).value(), std::chrono::minutes{5});
+            std::move(derivationKey).value(), std::chrono::minutes{5},
+            clientAuthentication);
         if (!config) return fnd::fail(config.error());
         auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
             std::move(config).value(), clock, federationCaFile.value_or(std::string{}));
@@ -919,6 +1497,27 @@ addProtectedRoutes(gateway::Router& router,
         auto status = registerOidcProvider(
             "apple", appleIssuer.value_or("https://appleid.apple.com"),
             {"name", "email"}, "openproof/federation/apple/v1");
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    {
+        const auto linkedinIssuer = environment.get("OPENPROOF_LINKEDIN_ISSUER");
+        auto status = registerOidcProvider(
+            "linkedin", linkedinIssuer.value_or("https://www.linkedin.com/oauth"),
+            {"openid", "profile", "email"}, "openproof/federation/linkedin/v1");
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    {
+        const auto telegramIssuer = environment.get("OPENPROOF_TELEGRAM_ISSUER");
+        auto status = registerOidcProvider(
+            "telegram", telegramIssuer.value_or("https://oauth.telegram.org"),
+            {"openid", "profile"}, "openproof/federation/telegram/v1",
+            externalOidc::OidcClientAuthenticationMethod::ClientSecretBasic);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;
@@ -1032,12 +1631,19 @@ addProtectedRoutes(gateway::Router& router,
     }
     if (const auto farcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
         farcasterRpc && !farcasterRpc->empty()) {
-        const auto registry = environment.get("OPENPROOF_FARCASTER_ID_REGISTRY");
+        constexpr std::string_view canonicalIdRegistry{
+            "0x00000000fc6c5f01fc30151999387bb99a9f489b"};
+        constexpr std::string_view canonicalKeyRegistry{
+            "0x00000000fc1237824fb747abde0ff18990e59b7e"};
+        const auto registry = environment.get("OPENPROOF_FARCASTER_ID_REGISTRY")
+            .value_or(std::string{canonicalIdRegistry});
+        const auto keyRegistry = environment.get("OPENPROOF_FARCASTER_KEY_REGISTRY")
+            .value_or(std::string{canonicalKeyRegistry});
         if (!web3Domain || web3Domain->empty() || !web3Uri || web3Uri->empty()
-            || !registry || registry->empty()) {
+            || registry.empty() || keyRegistry.empty()) {
             reportStartupFailure(fnd::Error{
                 fnd::ErrorCode::FailedPrecondition,
-                "Farcaster login requires WEB3 domain/URI and OPENPROOF_FARCASTER_ID_REGISTRY."});
+                "Farcaster login requires WEB3 domain/URI and valid registry addresses."});
             return ExitCode::ConfigurationError;
         }
         auto chainId = parseChainId("OPENPROOF_FARCASTER_CHAIN_ID", 10U);
@@ -1048,9 +1654,10 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
         auto farcasterConfig = web3::FarcasterProviderConfig::create(
-            *web3Domain, *web3Uri, chainId.value(), *farcasterRpc, *registry,
+            *web3Domain, *web3Uri, chainId.value(), *farcasterRpc, registry,
             std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
-            fnd::SecretString{environment.get("OPENPROOF_FARCASTER_RPC_AUTHORIZATION").value_or(std::string{})});
+            fnd::SecretString{environment.get("OPENPROOF_FARCASTER_RPC_AUTHORIZATION").value_or(std::string{})},
+            keyRegistry);
         if (!farcasterConfig) {
             reportStartupFailure(farcasterConfig.error());
             return ExitCode::ConfigurationError;
@@ -1136,10 +1743,12 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
+    postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
     auth::AuthenticationService authentication{
         providers, transactions, externalIdentities, clock, std::move(trust),
         std::chrono::minutes{5}, &identities,
-        identity::OrganizationId{std::string{platform.auth().organizationId()}}};
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        &identityProviderStore};
     session::SessionService sessions{
         sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
     std::optional<passkey::PasskeyService> passkeyService;
@@ -1158,7 +1767,6 @@ addProtectedRoutes(gateway::Router& router,
         memberPolicy->get(), organizations, identities, memberships,
         &authorizationAudit};
 
-    postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
     postgres::PostgresEvidenceChallengeStore evidenceChallengeStore{*pool.value()};
     evidence::EvidenceService evidenceService{identityProviderStore, clock};
     evidenceVerification::ChallengeService evidenceChallenges{
@@ -1254,21 +1862,24 @@ addProtectedRoutes(gateway::Router& router,
         return runWithScim(enterpriseApi);
     };
 
-    const auto runWithWeb3 = [&](gateway::HttpHandler& fallback) -> ExitCode {
+    const auto runWithWeb3 = [&](gateway::HttpHandler& fallback,
+                                 session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
         authHttp::Web3AuthenticationHttpApi web3Api{
-            authentication, providers, sessions, limiter.value(), fallback};
+            authentication, providers, sessions, limiter.value(), fallback, delegated};
         return runWithEnterprise(web3Api);
     };
 
-    const auto runWithPasskey = [&](gateway::HttpHandler& fallback) -> ExitCode {
-        if (!passkeyService) return runWithWeb3(fallback);
+    const auto runWithPasskey = [&](gateway::HttpHandler& fallback,
+                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
+        if (!passkeyService) return runWithWeb3(fallback, delegated);
         authHttp::PasskeyAuthenticationHttpApi passkeyApi{
             *passkeyService, authentication, sessions, limiter.value(), fallback};
-        return runWithWeb3(passkeyApi);
+        return runWithWeb3(passkeyApi, delegated);
     };
 
-    const auto runWithAccount = [&](gateway::HttpHandler& fallback) -> ExitCode {
-        if (!platform.account().enabled()) return runWithPasskey(fallback);
+    const auto runWithAccount = [&](gateway::HttpHandler& fallback,
+                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
+        if (!platform.account().enabled()) return runWithPasskey(fallback, delegated);
 
         auto verificationMaterial = deriveSecret(
             platform.security().tokenSigningKey(), "openproof/account-verification-key/v1");
@@ -1313,8 +1924,8 @@ addProtectedRoutes(gateway::Router& router,
             *accounts.value(), accountRepository, sessions, clock,
             std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
         accountHttp::AccountHttpApi accountApi{
-            accountService, sessions, limiter.value(), fallback};
-        return runWithPasskey(accountApi);
+            accountService, authentication, sessions, limiter.value(), fallback, delegated};
+        return runWithPasskey(accountApi, delegated);
     };
 
     if (!platform.oidc().enabled()) {
@@ -1331,11 +1942,10 @@ addProtectedRoutes(gateway::Router& router,
             providerId, administrationApi};
         authHttp::FederatedAuthenticationHttpApi federatedApi{
             authentication, providers, sessions, limiter.value(), authApi};
-        return runWithAccount(federatedApi);
+        return runWithAccount(federatedApi, nullptr);
     }
 
-    auto clientSecretMaterial = deriveSecret(
-        platform.security().tokenSigningKey(), "openproof/oauth-client-secret-key/v1");
+    auto clientSecretMaterial = oauthClientSecretMaterial(platform.security());
     auto authorizationCodeMaterial = deriveSecret(
         platform.security().tokenSigningKey(), "openproof/oauth-authorization-code-key/v1");
     auto tokenMaterial = deriveSecret(
@@ -1428,7 +2038,7 @@ addProtectedRoutes(gateway::Router& router,
         authentication, sessions, recoveryCodes.value(), limiter.value(),
         providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
-        authentication, providers, sessions, limiter.value(), authApi};
+        authentication, providers, sessions, limiter.value(), authApi, &tokenService};
     oauthHttp::OAuthHttpApi oauthApi{
         authorizationService, tokenService, openIdProvider, clientManager,
         authentication, sessions, providerId, consentService, resourceRegistry,
@@ -1440,7 +2050,7 @@ addProtectedRoutes(gateway::Router& router,
         sessions, memberships, limiter.value(),
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
         oauthApi};
-    return runWithAccount(applicationApi);
+    return runWithAccount(applicationApi, &tokenService);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
@@ -1548,7 +2158,9 @@ void reportStartupFailure(const fnd::Error& failure)
         }
     }
     if (!commandLine->runServer() && !commandLine->bootstrapAdmin()
-        && !commandLine->checkConfig()) {
+        && !commandLine->checkConfig() && !commandLine->rekeyTotp()
+        && !commandLine->rotateMasterKey()
+        && !commandLine->materializePersistentKeys()) {
         printUsage();
         return ExitCode::UsageError;
     }
@@ -1569,6 +2181,17 @@ void reportStartupFailure(const fnd::Error& failure)
     if (commandLine->checkConfig()) {
         std::println("OpenProof configuration is valid.");
         return ExitCode::Success;
+    }
+
+    if (commandLine->materializePersistentKeys()) {
+        return runPersistentKeyMaterialization(platform, commandLine.value());
+    }
+
+    if (commandLine->rekeyTotp()) {
+        return runTotpRekey(platform, environment, commandLine.value());
+    }
+    if (commandLine->rotateMasterKey()) {
+        return runMasterKeyRotation(platform, environment, commandLine.value());
     }
 
     const auto clock = std::make_shared<const fnd::SystemClockSource>();

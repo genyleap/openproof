@@ -258,6 +258,28 @@ foundation::Result<AuthenticatedSession> SessionService::authenticate(
     return AuthenticatedSession{std::move(session).value()};
 }
 
+foundation::Result<AuthenticatedSession> SessionService::authenticate(
+    const foundation::SecretString& token,
+    DelegatedAccessAuthenticator* delegated,
+    std::string_view requiredScope)
+{
+    auto firstParty = authenticate(token);
+    if (firstParty) return firstParty;
+    if (delegated == nullptr) return foundation::fail(firstParty.error());
+    auto access = delegated->authenticateDelegated(token);
+    if (!access) return foundation::fail(access.error());
+    if (access->senderConstraint().has_value()) {
+        return foundation::fail(
+            foundation::ErrorCode::AuthenticationFailed,
+            "Sender-constrained delegated access requires proof verification at the protocol edge.");
+    }
+    if (!access->permits(requiredScope)) {
+        return foundation::fail(foundation::ErrorCode::PermissionDenied,
+                                "The delegated access token lacks the required scope.");
+    }
+    return access->authenticated();
+}
+
 foundation::Result<SessionGrant> SessionService::rotate(
     const foundation::SecretString& token)
 {

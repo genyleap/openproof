@@ -20,6 +20,8 @@ public:
     AeadKey& operator=(const AeadKey&) = delete;
     AeadKey(AeadKey&&) noexcept = default;
     AeadKey& operator=(AeadKey&&) noexcept = default;
+    /** Constant-time comparison for rejecting accidental no-op rotations. */
+    [[nodiscard]] bool matches(const AeadKey& other) const noexcept;
 private:
     friend foundation::Result<std::vector<std::byte>> sealAes256Gcm(
         const AeadKey&, const foundation::SecretString&, std::string_view);
@@ -39,4 +41,3 @@ openAes256Gcm(const AeadKey& key, std::span<const std::byte> envelope,
               std::string_view associatedData);
 
 }
-

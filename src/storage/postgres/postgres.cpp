@@ -14,6 +14,7 @@ module;
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -656,6 +657,373 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
     return report;
 }
 
+PostgresCredentialRekeyer::PostgresCredentialRekeyer(ConnectionPool& pool)
+    : m_pool(&pool)
+{
+}
+
+foundation::Result<CredentialRekeyReport> PostgresCredentialRekeyer::rotateTotp(
+    const security::AeadKey& currentKey, unsigned int currentVersion,
+    const security::AeadKey& replacementKey, unsigned int replacementVersion,
+    bool dryRun)
+{
+    if (currentVersion == 0U || replacementVersion <= currentVersion
+        || replacementVersion > 2'147'483'647U) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "Credential key versions must increase monotonically.");
+    }
+    if (currentKey.matches(replacementKey)) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The replacement credential key must use different key material.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error)
+        -> foundation::Result<CredentialRekeyReport> {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+
+    ResultPointer isolated = exec(
+        connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return failTransaction(databaseError(
+            isolated.get(), "set credential rekey isolation"));
+    }
+    ResultPointer advisory = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673316)");
+    if (!tuplesOk(advisory.get())) {
+        return failTransaction(databaseError(
+            advisory.get(), "lock credential rekey"));
+    }
+    ResultPointer tableLock = exec(
+        connection, "LOCK TABLE openproof.totp_credentials IN ACCESS EXCLUSIVE MODE");
+    if (!commandOk(tableLock.get())) {
+        return failTransaction(databaseError(
+            tableLock.get(), "lock TOTP credentials"));
+    }
+    ResultPointer duplicate = execParams(
+        connection,
+        "SELECT 1 FROM openproof.credential_key_rotations "
+        "WHERE purpose='totp' AND to_version=$1",
+        {std::to_string(replacementVersion)});
+    if (!tuplesOk(duplicate.get())) {
+        return failTransaction(databaseError(
+            duplicate.get(), "read credential rekey journal"));
+    }
+    if (PQntuples(duplicate.get()) != 0) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::AlreadyExists,
+            "That credential key version was already committed."});
+    }
+
+    ResultPointer rows = exec(
+        connection,
+        "SELECT identity_id,encode(encrypted_seed,'hex'),key_version "
+        "FROM openproof.totp_credentials ORDER BY identity_id FOR UPDATE");
+    if (!tuplesOk(rows.get())) {
+        return failTransaction(databaseError(rows.get(), "inventory TOTP credentials"));
+    }
+
+    CredentialRekeyReport report{0U, 0U, dryRun};
+    for (int row = 0; row < PQntuples(rows.get()); ++row) {
+        const std::string identityId = field(rows.get(), row, 0);
+        const std::string encryptedHex = field(rows.get(), row, 1);
+        auto version = parseInteger<unsigned int>(field(rows.get(), row, 2));
+        auto envelope = foundation::fromHex(encryptedHex);
+        if (!version || !envelope) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::Internal,
+                "A persisted credential envelope is malformed."});
+        }
+        const std::string associatedData = "openproof/totp/v1:" + identityId;
+        if (version.value() == replacementVersion) {
+            auto validated = security::openAes256Gcm(
+                replacementKey, envelope.value(), associatedData);
+            if (!validated) return failTransaction(validated.error());
+            ++report.alreadyCurrent;
+            continue;
+        }
+        if (version.value() != currentVersion) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "A TOTP credential uses an unavailable key version."});
+        }
+        auto plaintext = security::openAes256Gcm(
+            currentKey, envelope.value(), associatedData);
+        if (!plaintext) return failTransaction(plaintext.error());
+        auto replacement = security::sealAes256Gcm(
+            replacementKey, plaintext.value(), associatedData);
+        if (!replacement) return failTransaction(replacement.error());
+        ResultPointer updated = execParams(
+            connection,
+            "UPDATE openproof.totp_credentials "
+            "SET encrypted_seed=decode($2,'hex'),key_version=$3 "
+            "WHERE identity_id=$1 AND key_version=$4 "
+            "AND encrypted_seed=decode($5,'hex') RETURNING identity_id",
+            {identityId, foundation::toHex(replacement.value()),
+             std::to_string(replacementVersion), std::to_string(currentVersion),
+             encryptedHex});
+        if (!tuplesOk(updated.get())) {
+            return failTransaction(databaseError(
+                updated.get(), "replace TOTP credential envelope"));
+        }
+        if (PQntuples(updated.get()) != 1) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::Conflict,
+                "A TOTP credential changed during the offline rekey operation."});
+        }
+        ++report.rekeyed;
+    }
+
+    if (dryRun) {
+        rollback(connection);
+        return report;
+    }
+    ResultPointer journal = execParams(
+        connection,
+        "INSERT INTO openproof.credential_key_rotations"
+        "(purpose,from_version,to_version,rekeyed_rows,unchanged_rows,rotated_at_ms) "
+        "VALUES('totp',$1,$2,$3,$4,"
+        "(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+        {std::to_string(currentVersion), std::to_string(replacementVersion),
+         std::to_string(report.rekeyed), std::to_string(report.alreadyCurrent)});
+    if (!commandOk(journal.get())) {
+        return failTransaction(databaseError(
+            journal.get(), "record credential rekey"));
+    }
+    auto committed = commit(connection);
+    if (!committed) return foundation::fail(committed.error());
+    return report;
+}
+
+PostgresMasterKeyRotator::PostgresMasterKeyRotator(ConnectionPool& pool)
+    : m_pool(&pool)
+{
+}
+
+foundation::Status PostgresMasterKeyRotator::verifyActive(
+    unsigned int version, const security::Sha256Digest& fingerprint) const
+{
+    if (version == 0U) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The active master key version is invalid.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer head = exec(
+        lease->get(),
+        "SELECT to_version,encode(to_fingerprint,'hex') "
+        "FROM openproof.master_key_rotations ORDER BY sequence DESC LIMIT 1");
+    if (!tuplesOk(head.get())) {
+        return foundation::fail(databaseError(
+            head.get(), "verify active master-key journal"));
+    }
+    if (PQntuples(head.get()) == 0) {
+        return version == 1U ? foundation::ok() : foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The configured master key version has no committed rotation journal.");
+    }
+    auto journalVersion = parseInteger<unsigned int>(field(head.get(), 0, 0));
+    auto journalBytes = foundation::fromHex(field(head.get(), 0, 1));
+    if (!journalVersion || !journalBytes
+        || journalBytes->size() != fingerprint.size()
+        || journalVersion.value() != version
+        || !security::constantTimeEquals(
+            std::span<const std::byte>{journalBytes->data(), journalBytes->size()},
+            std::span<const std::byte>{fingerprint.data(), fingerprint.size()})) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The configured master key does not match the committed rotation journal.");
+    }
+    return foundation::ok();
+}
+
+foundation::Result<MasterKeyRotationReport> PostgresMasterKeyRotator::rotate(
+    unsigned int currentVersion, const security::Sha256Digest& currentFingerprint,
+    unsigned int replacementVersion,
+    const security::Sha256Digest& replacementFingerprint, bool dryRun)
+{
+    if (currentVersion == 0U || replacementVersion <= currentVersion
+        || replacementVersion > 2'147'483'647U) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "Master key versions must increase monotonically.");
+    }
+    if (security::constantTimeEquals(currentFingerprint, replacementFingerprint)) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The replacement master key must use different key material.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& error)
+        -> foundation::Result<MasterKeyRotationReport> {
+        rollback(connection);
+        return foundation::fail(error);
+    };
+    ResultPointer isolated = exec(
+        connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return failTransaction(databaseError(
+            isolated.get(), "set master-key rotation isolation"));
+    }
+    ResultPointer advisory = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673317)");
+    if (!tuplesOk(advisory.get())) {
+        return failTransaction(databaseError(
+            advisory.get(), "lock master-key rotation"));
+    }
+    ResultPointer locked = exec(
+        connection,
+        "LOCK TABLE openproof.authentication_transactions,openproof.sessions,"
+        "openproof.account_verification_challenges,"
+        "openproof.passkey_registration_ceremonies,"
+        "openproof.oauth_authorization_codes,openproof.oauth_token_families,"
+        "openproof.oauth_device_authorizations,"
+        "openproof.oauth_pushed_authorization_requests IN ACCESS EXCLUSIVE MODE");
+    if (!commandOk(locked.get())) {
+        return failTransaction(databaseError(
+            locked.get(), "lock master-derived state"));
+    }
+    ResultPointer duplicate = execParams(
+        connection,
+        "SELECT 1 FROM openproof.master_key_rotations WHERE to_version=$1",
+        {std::to_string(replacementVersion)});
+    if (!tuplesOk(duplicate.get())) {
+        return failTransaction(databaseError(
+            duplicate.get(), "read master-key rotation journal"));
+    }
+    if (PQntuples(duplicate.get()) != 0) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::AlreadyExists,
+            "That master key version was already committed."});
+    }
+    ResultPointer previous = exec(
+        connection,
+        "SELECT to_version,encode(to_fingerprint,'hex') "
+        "FROM openproof.master_key_rotations ORDER BY sequence DESC LIMIT 1");
+    if (!tuplesOk(previous.get())) {
+        return failTransaction(databaseError(
+            previous.get(), "read previous master-key rotation"));
+    }
+    if (PQntuples(previous.get()) == 1) {
+        auto priorVersion = parseInteger<unsigned int>(field(previous.get(), 0, 0));
+        const auto priorFingerprint = foundation::fromHex(field(previous.get(), 0, 1));
+        if (!priorVersion || !priorFingerprint
+            || priorFingerprint->size() != currentFingerprint.size()
+            || priorVersion.value() != currentVersion
+            || !security::constantTimeEquals(
+                std::span<const std::byte>{priorFingerprint->data(), priorFingerprint->size()},
+                std::span<const std::byte>{currentFingerprint.data(), currentFingerprint.size()})) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "The configured master key does not match the rotation journal head."});
+        }
+    }
+
+    const auto remove = [&](std::string_view sql, std::string_view operation)
+        -> foundation::Result<std::size_t> {
+        ResultPointer result = exec(connection, sql);
+        if (!commandOk(result.get())) {
+            return foundation::fail(databaseError(result.get(), operation));
+        }
+        const char* affected = PQcmdTuples(result.get());
+        if (affected == nullptr || *affected == '\0') {
+            return foundation::fail(
+                foundation::ErrorCode::Internal,
+                "PostgreSQL did not report the invalidated state count.");
+        }
+        return parseInteger<std::size_t>(affected);
+    };
+
+    MasterKeyRotationReport report{};
+    report.dryRun = dryRun;
+    auto authenticationTransactions = remove(
+        "DELETE FROM openproof.authentication_transactions",
+        "invalidate authentication transactions");
+    auto sessions = remove(
+        "DELETE FROM openproof.sessions", "invalidate sessions");
+    auto accountChallenges = remove(
+        "DELETE FROM openproof.account_verification_challenges",
+        "invalidate account verification challenges");
+    auto passkeyRegistrations = remove(
+        "DELETE FROM openproof.passkey_registration_ceremonies",
+        "invalidate passkey registration ceremonies");
+    auto authorizationCodes = remove(
+        "DELETE FROM openproof.oauth_authorization_codes",
+        "invalidate authorization codes");
+    auto tokenFamilies = remove(
+        "DELETE FROM openproof.oauth_token_families",
+        "invalidate OAuth token families");
+    auto deviceAuthorizations = remove(
+        "DELETE FROM openproof.oauth_device_authorizations",
+        "invalidate device authorizations");
+    auto pushedRequests = remove(
+        "DELETE FROM openproof.oauth_pushed_authorization_requests",
+        "invalidate pushed authorization requests");
+    if (!authenticationTransactions || !sessions || !accountChallenges
+        || !passkeyRegistrations
+        || !authorizationCodes || !tokenFamilies || !deviceAuthorizations
+        || !pushedRequests) {
+        if (!authenticationTransactions) return failTransaction(authenticationTransactions.error());
+        if (!sessions) return failTransaction(sessions.error());
+        if (!accountChallenges) return failTransaction(accountChallenges.error());
+        if (!passkeyRegistrations) return failTransaction(passkeyRegistrations.error());
+        if (!authorizationCodes) return failTransaction(authorizationCodes.error());
+        if (!tokenFamilies) return failTransaction(tokenFamilies.error());
+        if (!deviceAuthorizations) return failTransaction(deviceAuthorizations.error());
+        return failTransaction(pushedRequests.error());
+    }
+    report.authenticationTransactions = authenticationTransactions.value();
+    report.sessions = sessions.value();
+    report.accountChallenges = accountChallenges.value();
+    report.passkeyRegistrations = passkeyRegistrations.value();
+    report.authorizationCodes = authorizationCodes.value();
+    report.tokenFamilies = tokenFamilies.value();
+    report.deviceAuthorizations = deviceAuthorizations.value();
+    report.pushedRequests = pushedRequests.value();
+    if (dryRun) {
+        rollback(connection);
+        return report;
+    }
+    ResultPointer journal = execParams(
+        connection,
+        "INSERT INTO openproof.master_key_rotations"
+        "(from_version,to_version,from_fingerprint,to_fingerprint,"
+        "authentication_transactions,sessions,account_challenges,"
+        "passkey_registrations,authorization_codes,token_families,"
+        "device_authorizations,pushed_requests,"
+        "rotated_at_ms) VALUES($1,$2,decode($3,'hex'),decode($4,'hex'),"
+        "$5,$6,$7,$8,$9,$10,$11,$12,"
+        "(extract(epoch FROM clock_timestamp())*1000)::bigint)",
+        {std::to_string(currentVersion), std::to_string(replacementVersion),
+         foundation::toHex(currentFingerprint), foundation::toHex(replacementFingerprint),
+         std::to_string(report.authenticationTransactions),
+         std::to_string(report.sessions), std::to_string(report.accountChallenges),
+         std::to_string(report.passkeyRegistrations),
+         std::to_string(report.authorizationCodes),
+         std::to_string(report.tokenFamilies),
+         std::to_string(report.deviceAuthorizations),
+         std::to_string(report.pushedRequests)});
+    if (!commandOk(journal.get())) {
+        return failTransaction(databaseError(
+            journal.get(), "record master-key rotation"));
+    }
+    auto committed = commit(connection);
+    if (!committed) return foundation::fail(committed.error());
+    return report;
+}
+
 PostgresSessionRepository::PostgresSessionRepository(ConnectionPool& pool) : m_pool(&pool) {}
 
 foundation::Status PostgresSessionRepository::add(session::Session value)
@@ -1205,6 +1573,89 @@ foundation::Status PostgresExternalIdentityDirectory::detach(
     return owner->has_value()
         ? foundation::fail(foundation::ErrorCode::PermissionDenied)
         : foundation::fail(foundation::ErrorCode::NotFound);
+}
+
+foundation::Status
+PostgresExternalIdentityDirectory::detachIfAnotherAuthenticationMethod(
+    const identity::core::ExternalIdentityRef& external,
+    const identity::core::IdentityId& expectedOwner,
+    const std::vector<identity::provider::ProviderId>& authenticationProviders)
+{
+    if (authenticationProviders.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Authentication providers are required.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    auto begun = beginTransaction(connection);
+    if (!begun) return begun;
+    const auto failTransaction = [&](foundation::Error error) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(std::move(error));
+    };
+    ResultPointer locked = execParams(
+        connection,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+        {std::string{expectedOwner.value()}});
+    if (!tuplesOk(locked.get())) {
+        return failTransaction(databaseError(
+            locked.get(), "lock external identity methods"));
+    }
+    ResultPointer owner = execParams(
+        connection,
+        "SELECT identity_id FROM openproof.external_identities "
+        "WHERE provider=$1 AND external_subject=$2",
+        {std::string{external.providerId().value()},
+         std::string{external.subject().value()}});
+    if (!tuplesOk(owner.get())) {
+        return failTransaction(databaseError(owner.get(), "find external identity"));
+    }
+    if (PQntuples(owner.get()) == 0) {
+        return failTransaction(foundation::Error{foundation::ErrorCode::NotFound});
+    }
+    if (field(owner.get(), 0, 0) != expectedOwner.value()) {
+        return failTransaction(foundation::Error{foundation::ErrorCode::PermissionDenied});
+    }
+
+    std::string countSql =
+        "SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1 "
+        "AND provider IN (";
+    std::vector<std::string> countParameters{std::string{expectedOwner.value()}};
+    countParameters.reserve(authenticationProviders.size() + 1U);
+    for (std::size_t index = 0; index < authenticationProviders.size(); ++index) {
+        if (index != 0U) countSql.push_back(',');
+        countSql.push_back('$');
+        countSql.append(std::to_string(index + 2U));
+        countParameters.emplace_back(authenticationProviders[index].value());
+    }
+    countSql.push_back(')');
+    ResultPointer count = execParams(connection, countSql, countParameters);
+    if (!tuplesOk(count.get()) || PQntuples(count.get()) != 1) {
+        return failTransaction(databaseError(
+            count.get(), "count authentication methods"));
+    }
+    auto methodCount = parseInteger<std::size_t>(field(count.get(), 0, 0));
+    if (!methodCount) return failTransaction(methodCount.error());
+    if (methodCount.value() <= 1U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "The last available sign-in method cannot be disconnected."});
+    }
+    ResultPointer removed = execParams(
+        connection,
+        "DELETE FROM openproof.external_identities WHERE provider=$1 "
+        "AND external_subject=$2 AND identity_id=$3 RETURNING identity_id",
+        {std::string{external.providerId().value()},
+         std::string{external.subject().value()},
+         std::string{expectedOwner.value()}});
+    if (!tuplesOk(removed.get()) || PQntuples(removed.get()) != 1) {
+        return failTransaction(databaseError(
+            removed.get(), "detach authentication method"));
+    }
+    auto committed = commit(connection);
+    if (!committed) return foundation::fail(committed.error());
+    return foundation::ok();
 }
 
 foundation::Status PostgresExternalIdentityDirectory::reassign(

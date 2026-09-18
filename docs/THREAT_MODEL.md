@@ -15,7 +15,8 @@ changes.
 - OIDC operator signing private key and public JWKS;
 - verified evidence, trust-policy inputs and derived assessments;
 - policy decisions and the trusted context delivered upstream;
-- master secret material, audit-chain integrity and security telemetry.
+- master and versioned credential-encryption secret material, audit-chain
+  integrity and security telemetry.
 
 ## Trust boundaries
 
@@ -41,6 +42,8 @@ proof, trust and authorization remain separate decisions.
 | Session database theft | 256-bit opaque bearers; only keyed digests persist; absolute+idle expiry; rotation/revocation | A stolen live client-side bearer remains usable until expiry/revocation |
 | Authentication replay/substitution | Hashed single-use nonce, binding digest, challenge id, deadline, atomic PostgreSQL consume | Correct binding material must come from the TLS-facing adapter |
 | TOTP/recovery replay | Encrypted TOTP seed with atomic last-step update; atomic recovery `DELETE ... RETURNING` | TOTP is not phishing-resistant; add WebAuthn for stronger deployments |
+| TOTP encryption-key exposure or rotation error | Dedicated versioned key; offline all-row decrypt/re-encrypt dry run; exclusive table/advisory locks; atomic ciphertext+journal commit; unknown, wrong and identical keys fail closed | Stop every writer, back up database and matching keys, update key+version before restart |
+| Master-key exposure or stale-key rollback | Independently generated durable password/recovery/TOTP/audit/OAuth-client keys are separated; guarded legacy materialization; offline dry-run/commit invalidates all transient master-derived state, including incomplete passkey registration; version/fingerprint journal binds startup to the committed head | Rotation logs every user out and invalidates in-flight OAuth/account/passkey-registration ceremonies; materialized legacy keys remain derivable from an exposed old master and require their own credential/client/audit incident response |
 | OAuth authorization-code interception | Mandatory PKCE S256, code/client/redirect binding, short code lifetime, atomic single use | Compromised endpoint/client device can still expose its own verifier/code |
 | OAuth redirect confusion/open redirect | Registration validates URI authority; exact runtime redirect match; native HTTP allowed only on explicit loopback host+numeric port | Relying applications must not add an open redirect behind their registered callback |
 | OAuth client impersonation | Confidential secrets are generated once, stored only as keyed digests and can rotate/revoke independently; public clients never receive a secret | Secret distribution/storage for confidential clients remains an operator/client duty |
@@ -58,11 +61,11 @@ proof, trust and authorization remain separate decisions.
 | Database race/replay | Conditional UPDATE/DELETE, row locks, serializable admin mutations and transactional migrations | HA semantics depend on PostgreSQL consistency/failover configuration |
 | Evidence poisoning | Provider-neutral verifier SPI; evidence is accepted only from a registered verifier and bound to canonical identity/provider; validation and revocation/expiry | Each concrete provider adapter needs its own provenance, replay and freshness review |
 | Stale trust score | Trust is derived per request from currently active evidence and one clock snapshot; no permanent trust-score row | Policy weights and risk-source quality remain operator/application responsibilities |
-| Log/metric injection and secret leakage | Secret types are non-formatable; JSON escaping; label validation/cardinality cap | Operator-added sinks must preserve the same contracts |
+| Log/metric injection, cardinality abuse or secret leakage | Secret types are non-formatable; JSON escaping; closed bounded metrics configuration; constant-time private-scraper bearer; fixed method/status-class HTTP labels; public edge blocks `/metrics` | Operator-added sinks and private management ingress must preserve the same contracts; bearer rotation is deployment-coordinated |
 | Audit tampering | HMAC-linked sequence chain; sensitive admin/authorization mutations share transaction/outbox boundaries | Off-host checkpoints and external retention remain deployment work |
 | Bootstrap privilege creation | Offline-only command, environment-only password, generated TOTP, fixed owner role, serializable transaction and one-time refusal | Operator shell and master-key access are trusted during bootstrap |
 | Administrative privilege escalation | IAL2 boundary; active owner re-read in the mutation transaction; final active owner protection; target session revocation | An authorized owner can deliberately grant another owner role |
-| Denial of service | Size/time/connection limits, scrypt resource ceilings, per-process rate limits, circuit breaker | Front proxy should add fleet-wide throttling and abuse controls |
+| Denial of service | Size/time/connection limits, scrypt resource ceilings, bounded deployment-tunable per-process token buckets and circuit breaker | Front proxy should add fleet-wide throttling and abuse controls; capacity/refill/key-cardinality settings require measured review |
 
 ## Deliberate constraints
 
@@ -96,6 +99,9 @@ proof, trust and authorization remain separate decisions.
 - `gcc-asan` enables AddressSanitizer and UndefinedBehaviorSanitizer.
 - Boundary, concurrency, gateway and PostgreSQL integration tests are part of
   the C++ suite; database tests require an enabled test PostgreSQL instance.
+- The opt-in `gcc-fuzz` profile instruments security-critical parser
+  implementation units with execution-coverage feedback and runs its retained
+  mutation corpus under ASan/UBSan.
 - JavaScript SDK smoke tests and Kotlin compile checks are separately runnable.
 - Target-toolchain release status is recorded in
   [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md).

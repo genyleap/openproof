@@ -2,6 +2,7 @@ module;
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -71,14 +72,15 @@ private:
     std::unique_ptr<Implementation> m_implementation;
 };
 
-/** @brief Validated Farcaster custody-proof authentication configuration. */
+/** @brief Validated Farcaster FIP-11 signer-authentication configuration. */
 class FarcasterProviderConfig final {
 public:
     [[nodiscard]] static foundation::Result<FarcasterProviderConfig> create(
         std::string domain, std::string uri, std::uint64_t optimismChainId,
         std::string optimismRpcEndpoint, std::string idRegistryAddress,
         foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
-        std::string caFile = {}, foundation::SecretString authorizationHeader = {});
+        std::string caFile = {}, foundation::SecretString authorizationHeader = {},
+        std::string keyRegistryAddress = {});
 
     FarcasterProviderConfig(const FarcasterProviderConfig&) = delete;
     FarcasterProviderConfig& operator=(const FarcasterProviderConfig&) = delete;
@@ -90,6 +92,7 @@ public:
     [[nodiscard]] std::uint64_t chainId() const noexcept;
     [[nodiscard]] std::string_view rpcEndpoint() const noexcept;
     [[nodiscard]] std::string_view idRegistryAddress() const noexcept;
+    [[nodiscard]] std::string_view keyRegistryAddress() const noexcept;
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
     [[nodiscard]] std::string_view caFile() const noexcept;
@@ -103,24 +106,57 @@ private:
                             foundation::SecretString derivationKey,
                             foundation::Duration challengeLifetime,
                             std::string caFile,
-                            foundation::SecretString authorizationHeader);
+                            foundation::SecretString authorizationHeader,
+                            std::string keyRegistryAddress);
 
     std::string m_domain;
     std::string m_uri;
     std::uint64_t m_chainId{};
     std::string m_rpcEndpoint;
     std::string m_idRegistryAddress;
+    std::string m_keyRegistryAddress;
     foundation::SecretString m_derivationKey;
     foundation::Duration m_challengeLifetime{};
     std::string m_caFile;
     foundation::SecretString m_authorizationHeader;
 };
 
+/** @brief How a SIWF signer is currently authorized for an FID. */
+enum class FarcasterSignerKind : std::uint8_t {
+    Custody,
+    AuthAddress,
+};
+
+/**
+ * @brief Narrow Optimism verification boundary used by the Farcaster adapter.
+ *
+ * The production implementation uses authenticated HTTPS JSON-RPC. Tests and
+ * embedded deployments may inject an equivalent verifier without weakening
+ * the provider's SIWF message and challenge validation.
+ */
+class FarcasterChainVerifier {
+public:
+    FarcasterChainVerifier(const FarcasterChainVerifier&) = delete;
+    FarcasterChainVerifier& operator=(const FarcasterChainVerifier&) = delete;
+    virtual ~FarcasterChainVerifier() = default;
+
+    [[nodiscard]] virtual foundation::Result<bool> chainMatches() = 0;
+    [[nodiscard]] virtual foundation::Result<bool> verifySignature(
+        std::string_view address, std::string_view message,
+        std::string_view signature) = 0;
+    [[nodiscard]] virtual foundation::Result<std::optional<FarcasterSignerKind>>
+    authorizeSigner(std::uint64_t fid, std::string_view address) = 0;
+
+protected:
+    FarcasterChainVerifier() = default;
+};
+
 /** @brief Farcaster provider proving a FID through its current on-chain custody address. */
 class FarcasterAuthenticationProvider final : public identity::provider::AuthenticationProvider {
 public:
     FarcasterAuthenticationProvider(FarcasterProviderConfig config,
-                                    const foundation::ClockSource& clock);
+                                    const foundation::ClockSource& clock,
+                                    std::unique_ptr<FarcasterChainVerifier> verifier = {});
     ~FarcasterAuthenticationProvider() override;
 
     [[nodiscard]] identity::provider::ProviderId id() const override;

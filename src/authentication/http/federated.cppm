@@ -1,5 +1,6 @@
 module;
 
+#include <optional>
 #include <string>
 
 export module openproof.authentication.federated.http;
@@ -7,6 +8,7 @@ export module openproof.authentication.federated.http;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.gateway;
+import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.session;
 
@@ -19,13 +21,22 @@ public:
                                    identity::provider::ProviderRegistry& providers,
                                    session::SessionService& sessions,
                                    gateway::TokenBucketRateLimiter& rateLimiter,
-                                   gateway::HttpHandler& fallback);
+                                   gateway::HttpHandler& fallback,
+                                   session::DelegatedAccessAuthenticator* delegated = nullptr);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
 private:
     [[nodiscard]] gateway::HttpResponse providers();
-    [[nodiscard]] gateway::HttpResponse start(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse connectionComplete();
+    [[nodiscard]] gateway::HttpResponse start(gateway::HttpRequest request, bool connection);
+    [[nodiscard]] gateway::HttpResponse issueHandoff(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse redeemHandoff(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse startPrepared(
+        gateway::HttpRequest request,
+        identity::provider::ProviderId providerId,
+        std::string returnTarget,
+        std::optional<identity::core::IdentityId> connectionTarget);
     [[nodiscard]] gateway::HttpResponse callback(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse error(const foundation::Error& failure,
                                               const gateway::HttpRequest& request,
@@ -34,6 +45,7 @@ private:
     AuthenticationService* m_authentication;
     identity::provider::ProviderRegistry* m_providers;
     session::SessionService* m_sessions;
+    session::DelegatedAccessAuthenticator* m_delegated;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;
 };

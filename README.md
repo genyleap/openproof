@@ -17,7 +17,7 @@ only as providers behind extension interfaces.
 > ### Status: **1.1.0-rc1 — integration-ready production qualification candidate.**
 >
 > Implemented: centralized identity, public verified account lifecycle, local
-> authentication/MFA/recovery, passkeys, Google/Apple/Microsoft/GitHub federation,
+> authentication/MFA/recovery, passkeys, Google/Apple/Microsoft/GitHub/LinkedIn/Telegram federation,
 > SIWE wallet and Farcaster login, SAML/LDAPS federation, SCIM provisioning,
 > organizations/RBAC and the Admin Console, consent and resource/audience registries,
 > Authorization Code + PKCE, `client_credentials`, Device Flow, Token Exchange,
@@ -119,6 +119,39 @@ field at `g++-16` is detected at configure time with the correct driver named.
 
 ## Run
 
+### One-command local identity demo
+
+After building the Release preset, run a disposable end-to-end identity flow:
+
+```bash
+./scripts/quickstart-local-demo.sh
+```
+
+The script creates an isolated Unix-socket-only PostgreSQL cluster under
+`/tmp`, starts the real Release server behind a validating local TLS edge and
+executes signup, authenticated delivery, email verification, password/MFA,
+OAuth Authorization Code + PKCE, UserInfo, restart/key rotation and a small
+concurrent request smoke. It never connects to an existing database and stops
+its temporary PostgreSQL process before returning.
+
+For an interactive desktop client implemented with C++20 and Qt 6/QML, run:
+
+```bash
+./scripts/run-qml-demo.sh
+```
+
+It builds and opens the real API-backed app in
+[`examples/qml-identity-client`](examples/qml-identity-client/README.md) with a
+disposable verified test account, a certificate-validating local TLS stack, a
+loopback-only verification inbox and a fully direction-aware bilingual
+Developer Portal. Its Identity Workbench runs the complete real account,
+verification, two-call login, full profile and logout flow; its reference and
+Explorer expose all OpenAPI operations through purpose-built forms or raw
+request bodies and generate syntax-highlighted cURL, JavaScript, PHP, C++/STL
+(libcurl), C++/Qt, C++/Boost (Beast/Asio) and Web3 examples. The native client
+is bilingual as well. The matching written
+guide is [`docs/INTEGRATION_COOKBOOK.md`](docs/INTEGRATION_COOKBOOK.md).
+
 ```bash
 ./cmake-build-gcc-debug/apps/opp/opp --help
 ```
@@ -194,6 +227,21 @@ verification, MFA, OAuth Authorization Code + PKCE, UserInfo, protected gateway,
 restart persistence and overlapping OIDC key rotation—use the isolated E2E
 procedure in [docs/OPERATIONS.md](docs/OPERATIONS.md#identity-platform-e2e).
 
+Persisted TOTP seeds use a dedicated versioned envelope key. The offline
+`opp rekey-totp` command validates every row in a rollback-only dry run and can
+then atomically commit ciphertexts plus its rotation journal; see the exact
+[rotation runbook](docs/OPERATIONS.md#totp-credential-key-rotation). The separate
+`opp materialize-persistent-keys` and `opp rotate-master-key` ceremony safely
+separates durable legacy subkeys, invalidates transient master-derived state and
+binds startup to the committed version/fingerprint; see
+[master-key rotation](docs/OPERATIONS.md#master-key-rotation).
+
+Security-critical HTTP, redirect, trace-context, password-hash, encoding and
+JOSE/JWK boundaries also have an ASan/UBSan coverage-guided profile. Run the
+bounded/resumable campaign with `./scripts/qualify-fuzzing.sh`; operational
+controls and corpus handling are in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#coverage-guided-boundary-fuzzing).
+
 ---
 
 ## Repository layout
@@ -225,7 +273,7 @@ src/
   organization/        openproof.organization       tenants, memberships, role assignment
   administration/      openproof.administration     bootstrap and owner-authorized member lifecycle
 apps/opp/              single binary; `opp server` will run the daemon
-tests/                 340 discovered tests
+tests/                 356 discovered tests
 deploy/                hardened systemd/Nginx/config templates for Linux
 docs/
   00-AUDIT.md              Phase 0 audit, conflicts, phase plan
@@ -238,7 +286,7 @@ docs/
 
 ## Security invariants
 
-Fifty-one invariants are recorded in
+Sixty-four invariants are recorded in
 [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md), each naming what must
 be true, the mechanism that enforces it, the test that proves it, and what
 happens on failure. Invariants that are true but not yet *mechanically* enforced

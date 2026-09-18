@@ -1,13 +1,17 @@
 module;
 
 #include <map>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 export module openproof.authentication:service;
 
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.profile;
 import openproof.identity.provider;
 
 export namespace openproof::authentication {
@@ -99,6 +103,32 @@ private:
     identity::core::IdentityId m_identity;
 };
 
+/** @brief Short-lived, one-time bridge from an authenticated native client to a browser. */
+class BrowserConnectionHandoff final {
+public:
+    BrowserConnectionHandoff(const BrowserConnectionHandoff&) = delete;
+    BrowserConnectionHandoff& operator=(const BrowserConnectionHandoff&) = delete;
+    BrowserConnectionHandoff(BrowserConnectionHandoff&&) noexcept = default;
+    BrowserConnectionHandoff& operator=(BrowserConnectionHandoff&&) noexcept = default;
+
+    [[nodiscard]] const foundation::SecretString& ticket() const noexcept;
+    [[nodiscard]] foundation::Instant expiresAt() const noexcept;
+
+private:
+    friend class AuthenticationService;
+    BrowserConnectionHandoff(foundation::SecretString ticket,
+                             foundation::Instant expiresAt);
+    foundation::SecretString m_ticket;
+    foundation::Instant m_expiresAt{};
+};
+
+/** @brief Server-bound values recovered after a browser handoff is consumed. */
+struct BrowserConnectionTarget final {
+    identity::core::IdentityId identity;
+    provider::ProviderId providerId;
+    std::string returnTarget;
+};
+
 /**
  * @brief Trusted coordinator for every authentication exchange.
  *
@@ -119,7 +149,8 @@ public:
                           const foundation::ClockSource& clock, ProviderTrustPolicy trustPolicy,
                           foundation::Duration maximumTransactionLifetime,
                           identity::core::IdentityRepository* lifecycleRepository = nullptr,
-                          identity::core::OrganizationId organization = {});
+                          identity::core::OrganizationId organization = {},
+                          identity::profile::IdentityProfileRepository* profileRepository = nullptr);
 
     AuthenticationService(const AuthenticationService&) = delete;
     AuthenticationService& operator=(const AuthenticationService&) = delete;
@@ -132,6 +163,13 @@ public:
     begin(const provider::AuthenticationRequest& request,
           const provider::BindingDigest& binding,
           foundation::CorrelationId correlation);
+
+    /** @brief Starts a provider proof that may only attach to @p identity. */
+    [[nodiscard]] foundation::Result<AuthenticationStart>
+    beginConnection(const provider::AuthenticationRequest& request,
+                    const provider::BindingDigest& binding,
+                    foundation::CorrelationId correlation,
+                    const identity::core::IdentityId& identity);
 
     /**
      * @brief Redeems an exchange exactly once and validates the provider outcome.
@@ -148,7 +186,74 @@ public:
              const provider::BindingDigest& binding,
              const provider::AuthenticationResponse& response);
 
+    /**
+     * @brief Completes a server-bound connection ceremony without creating a session.
+     *
+     * The target identity is recovered exclusively from the consumed server-side
+     * transaction created by @c beginConnection. A normal login transaction cannot
+     * be upgraded into a connection, and a connection transaction cannot mint a
+     * login session.
+     */
+    [[nodiscard]] foundation::Result<identity::core::ExternalIdentityRef>
+    completeConnection(const provider::TransactionId& transactionId,
+                       const foundation::SecretString& continuationToken,
+                       const provider::BindingDigest& binding,
+                       const provider::AuthenticationResponse& response);
+
+    /** @brief Lists the authentication-capable external accounts attached to an identity. */
+    [[nodiscard]] foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
+    connections(const identity::core::IdentityId& identity) const;
+
+    /** @brief Disconnects one login method while refusing to remove the last one. */
+    [[nodiscard]] foundation::Status disconnect(
+        const identity::core::IdentityId& identity,
+        const identity::core::ExternalIdentityRef& external);
+
+    /**
+     * @brief Issues a one-time native-to-browser connection ticket.
+     *
+     * The canonical identity, redirect provider and local return path are kept in
+     * the atomic transaction store. The browser receives no session or bearer token.
+     */
+    [[nodiscard]] foundation::Result<BrowserConnectionHandoff>
+    issueBrowserConnectionHandoff(
+        const identity::core::IdentityId& identity,
+        const provider::ProviderId& providerId,
+        std::string returnTarget,
+        foundation::CorrelationId correlation);
+
+    /** @brief Atomically consumes a native-to-browser connection ticket. */
+    [[nodiscard]] foundation::Result<BrowserConnectionTarget>
+    consumeBrowserConnectionHandoff(const foundation::SecretString& ticket);
+
 private:
+    struct CompletedExchange final {
+        provider::AuthenticationOutcome outcome;
+        std::optional<identity::core::IdentityId> connectionTarget;
+        foundation::Instant completedAt{};
+    };
+
+    [[nodiscard]] foundation::Result<AuthenticationStart>
+    beginInternal(const provider::AuthenticationRequest& request,
+                  const provider::BindingDigest& binding,
+                  foundation::CorrelationId correlation,
+                  const identity::core::IdentityId* connectionTarget);
+
+    [[nodiscard]] foundation::Result<CompletedExchange>
+    completeExchange(const provider::TransactionId& transactionId,
+                     const foundation::SecretString& continuationToken,
+                     const provider::BindingDigest& binding,
+                     const provider::AuthenticationResponse& response,
+                     bool requireConnection);
+
+    [[nodiscard]] foundation::Status requireActiveIdentity(
+        const identity::core::IdentityId& identity) const;
+
+    [[nodiscard]] foundation::Status attachVerified(
+        const identity::core::IdentityId& identity,
+        const identity::core::ExternalIdentityRef& external,
+        foundation::Instant verifiedAt);
+
     [[nodiscard]] std::optional<provider::AssuranceLevel>
     effectiveMaximum(provider::AuthenticationProvider& implementation,
                      const provider::ProviderId& providerId) const noexcept;
@@ -161,6 +266,8 @@ private:
     foundation::Duration m_maximumTransactionLifetime;
     identity::core::IdentityRepository* m_lifecycleRepository{};
     identity::core::OrganizationId m_organization;
+    identity::profile::IdentityProfileRepository* m_profileRepository{};
+    mutable std::mutex m_connectionMutex;
 };
 
 }

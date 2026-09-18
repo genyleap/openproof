@@ -114,10 +114,14 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
 
 }
 
-AccountHttpApi::AccountHttpApi(AccountService& accounts, session::SessionService& sessions,
+AccountHttpApi::AccountHttpApi(AccountService& accounts,
+                               authentication::AuthenticationService& authentication,
+                               session::SessionService& sessions,
                                gateway::TokenBucketRateLimiter& limiter,
-                               gateway::HttpHandler& fallback)
-    : m_accounts(&accounts), m_sessions(&sessions), m_limiter(&limiter), m_fallback(&fallback)
+                               gateway::HttpHandler& fallback,
+                               session::DelegatedAccessAuthenticator* delegated)
+    : m_accounts(&accounts), m_authentication(&authentication), m_sessions(&sessions),
+      m_delegated(delegated), m_limiter(&limiter), m_fallback(&fallback)
 {
 }
 
@@ -147,7 +151,8 @@ AccountHttpApi::authorize(gateway::HttpRequest& request) const
         return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
                                 "Authentication is required.");
     }
-    auto authenticated = m_sessions->authenticate(credential->value());
+    auto authenticated = m_sessions->authenticate(
+        credential->value(), m_delegated, "account");
     if (!authenticated) return foundation::fail(authenticated.error());
     return authenticated->session().identity();
 }
@@ -176,6 +181,30 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Get && request.path() == "/account/profile") return getProfile(std::move(request));
     if ((request.method() == HttpMethod::Patch || request.method() == HttpMethod::Put)
         && request.path() == "/account/profile") return updateProfile(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/connections") {
+        return connections(std::move(request));
+    }
+    if (request.method() == HttpMethod::Post
+        && request.path() == "/account/connections/disconnect") {
+        return disconnect(std::move(request));
+    }
+    if (request.method() == HttpMethod::Get
+        && request.path() == "/account/connections/start") {
+        return m_fallback->handle(std::move(request));
+    }
+    if (request.method() == HttpMethod::Get
+        && request.path() == "/account/connections/complete") {
+        return m_fallback->handle(std::move(request));
+    }
+    if ((request.method() == HttpMethod::Get || request.method() == HttpMethod::Post)
+        && request.path() == "/account/connections/handoff") {
+        return m_fallback->handle(std::move(request));
+    }
+    if (request.method() == HttpMethod::Post
+        && (request.path() == "/account/connections/web3/start"
+            || request.path() == "/account/connections/web3/complete")) {
+        return m_fallback->handle(std::move(request));
+    }
     return jsonResponse(404, json::object{{"error", "not_found"}});
 }
 
@@ -306,6 +335,41 @@ gateway::HttpResponse AccountHttpApi::updateProfile(gateway::HttpRequest request
     if (!status) return error(status.error(), request);
     auto profile = m_accounts->profile(actor.value());
     return profile ? jsonResponse(200, profileJson(profile.value())) : error(profile.error(), request);
+}
+
+gateway::HttpResponse AccountHttpApi::connections(gateway::HttpRequest request)
+{
+    auto actor = authorize(request);
+    if (!actor) return error(actor.error(), request);
+    auto values = m_authentication->connections(actor.value());
+    if (!values) return error(values.error(), request);
+    json::array connectionsJson;
+    for (const auto& external : values.value()) {
+        connectionsJson.emplace_back(json::object{
+            {"provider", external.providerId().value()},
+            {"subject", external.subject().value()}});
+    }
+    return jsonResponse(200, json::object{{"connections", std::move(connectionsJson)}});
+}
+
+gateway::HttpResponse AccountHttpApi::disconnect(gateway::HttpRequest request)
+{
+    auto actor = authorize(request);
+    if (!actor) return error(actor.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"provider", "subject"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto provider = requiredString(body.value(), "provider", 128U);
+    auto subject = requiredString(body.value(), "subject", 512U);
+    if (!provider || !subject) return error(provider ? subject.error() : provider.error(), request);
+    const identity::core::ExternalIdentityRef external{
+        identity::provider::ProviderId{std::move(provider).value()},
+        identity::provider::ExternalSubject{std::move(subject).value()}};
+    auto status = m_authentication->disconnect(actor.value(), external);
+    if (!status) return error(status.error(), request);
+    return jsonResponse(200, json::object{{"disconnected", true}});
 }
 
 }

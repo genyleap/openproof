@@ -43,8 +43,7 @@ public:
     [[nodiscard]] foundation::Duration idleTimeout() const noexcept;
 
 private:
-    SessionPolicy(foundation::Duration absoluteLifetime,
-                  foundation::Duration idleTimeout) noexcept;
+    SessionPolicy(foundation::Duration absoluteLifetime, foundation::Duration idleTimeout) noexcept;
     foundation::Duration m_absoluteLifetime{};
     foundation::Duration m_idleTimeout{};
 };
@@ -140,9 +139,7 @@ protected:
 
 class SessionService final {
 public:
-    SessionService(SessionRepository& sessions, const foundation::ClockSource& clock,
-                   SessionKey key, SessionPolicy policy);
-
+    SessionService(SessionRepository& sessions, const foundation::ClockSource& clock, SessionKey key, SessionPolicy policy);
     SessionService(const SessionService&) = delete;
     SessionService& operator=(const SessionService&) = delete;
     SessionService(SessionService&&) = delete;
@@ -152,6 +149,17 @@ public:
     issue(const authentication::VerifiedAuthentication& authentication);
     [[nodiscard]] foundation::Result<AuthenticatedSession>
     authenticate(const foundation::SecretString& token);
+    /**
+     * @brief Accepts either an OpenProof session or delegated OAuth access.
+     *
+     * Native account APIs use this overload so a bearer is accepted only when
+     * its token family carries the explicitly required scope. Session cookies
+     * remain first-party and are not scope-limited.
+     */
+    [[nodiscard]] foundation::Result<AuthenticatedSession>
+    authenticate(const foundation::SecretString& token,
+                 DelegatedAccessAuthenticator* delegated,
+                 std::string_view requiredScope);
     [[nodiscard]] foundation::Result<SessionGrant>
     rotate(const foundation::SecretString& token);
     [[nodiscard]] foundation::Status revoke(const SessionId& id);

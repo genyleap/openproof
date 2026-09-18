@@ -2,6 +2,7 @@ module;
 
 #include <charconv>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -43,6 +44,7 @@ namespace {
 
 constexpr std::string_view kEnvironmentPrefix = "env:";
 constexpr std::string_view kFilePrefix = "file:";
+constexpr std::string_view kHexFilePrefix = "hexfile:";
 
 constexpr std::string_view kDefaultBindAddress = "127.0.0.1";
 constexpr std::uint16_t kDefaultPort = 8443;
@@ -72,8 +74,8 @@ constexpr std::uint16_t kDefaultPort = 8443;
 [[nodiscard]] foundation::Status validateConfigurationSchema(const toml::table& document)
 {
     for (const auto& [key, value] : document) {
-        if (!isAllowedKey(key.str(), {"server", "logging", "security", "gateway",
-                                      "database", "auth", "account", "oidc"})) {
+        if (!isAllowedKey(key.str(), {"server", "logging", "operations", "security",
+                                      "gateway", "database", "auth", "account", "oidc"})) {
             return foundation::fail(
                 foundation::ErrorCode::InvalidArgument,
                 "The configuration contains an unknown section.",
@@ -102,9 +104,20 @@ constexpr std::uint16_t kDefaultPort = 8443;
             return foundation::fail(keys.error());
         }
     }
+    if (const toml::table* operations = document["operations"].as_table();
+        operations != nullptr) {
+        const foundation::Status keys = validateTableKeys(
+            *operations, "operations",
+            {"metrics_enabled", "metrics_bearer_token", "metrics_maximum_series"});
+        if (!keys.has_value()) return foundation::fail(keys.error());
+    }
     if (const toml::table* security = document["security"].as_table(); security != nullptr) {
         const foundation::Status keys =
-            validateTableKeys(*security, "security", {"token_signing_key"});
+            validateTableKeys(*security, "security", {
+                "token_signing_key", "credential_encryption_key",
+                "credential_encryption_key_version", "master_key_version",
+                "password_pepper", "recovery_code_pepper", "audit_chain_key",
+                "oauth_client_secret_key"});
         if (!keys.has_value()) {
             return foundation::fail(keys.error());
         }
@@ -118,7 +131,9 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (const toml::table* gateway = document["gateway"].as_table(); gateway != nullptr) {
         const foundation::Status keys = validateTableKeys(
             *gateway, "gateway", {"enabled", "route_prefix", "upstream_host",
-                                   "upstream_port", "upstream_tls", "upstream_ca_file"});
+                                   "upstream_port", "upstream_tls", "upstream_ca_file",
+                                   "rate_limit_capacity", "rate_limit_refill_per_second",
+                                   "rate_limit_maximum_keys"});
         if (!keys.has_value()) return foundation::fail(keys.error());
     }
     if (const toml::table* database = document["database"].as_table(); database != nullptr) {
@@ -224,11 +239,48 @@ constexpr std::uint16_t kDefaultPort = 8443;
     if (!console.has_value()) {
         return foundation::fail(console.error());
     }
+    const foundation::Status metricsEnabled = requireType(
+        "operations", "metrics_enabled",
+        [](const auto& node) { return node.is_boolean(); }, "a boolean");
+    if (!metricsEnabled.has_value()) return foundation::fail(metricsEnabled.error());
+    const foundation::Status metricsBearerToken = requireType(
+        "operations", "metrics_bearer_token",
+        [](const auto& node) { return node.is_string(); }, "a secret-reference string");
+    if (!metricsBearerToken.has_value()) return foundation::fail(metricsBearerToken.error());
+    const foundation::Status metricsMaximumSeries = requireType(
+        "operations", "metrics_maximum_series",
+        [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!metricsMaximumSeries.has_value()) return foundation::fail(metricsMaximumSeries.error());
     const foundation::Status signingKey = requireType(
         "security", "token_signing_key", [](const auto& node) { return node.is_string(); },
         "a secret-reference string");
     if (!signingKey.has_value()) {
         return foundation::fail(signingKey.error());
+    }
+    const foundation::Status credentialEncryptionKey = requireType(
+        "security", "credential_encryption_key",
+        [](const auto& node) { return node.is_string(); },
+        "a secret-reference string");
+    if (!credentialEncryptionKey.has_value()) {
+        return foundation::fail(credentialEncryptionKey.error());
+    }
+    const foundation::Status credentialEncryptionKeyVersion = requireType(
+        "security", "credential_encryption_key_version",
+        [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!credentialEncryptionKeyVersion.has_value()) {
+        return foundation::fail(credentialEncryptionKeyVersion.error());
+    }
+    const foundation::Status masterKeyVersion = requireType(
+        "security", "master_key_version",
+        [](const auto& node) { return node.is_integer(); }, "an integer");
+    if (!masterKeyVersion.has_value()) return foundation::fail(masterKeyVersion.error());
+    for (const std::string_view key : {
+             "password_pepper", "recovery_code_pepper", "audit_chain_key",
+             "oauth_client_secret_key"}) {
+        const foundation::Status type = requireType(
+            "security", key, [](const auto& node) { return node.is_string(); },
+            "a secret-reference string");
+        if (!type.has_value()) return foundation::fail(type.error());
     }
     const foundation::Status oidcEnabled = requireType(
         "oidc", "enabled", [](const auto& node) { return node.is_boolean(); }, "a boolean");
@@ -252,6 +304,12 @@ constexpr std::uint16_t kDefaultPort = 8443;
     const foundation::Status upstreamPort = requireType(
         "gateway", "upstream_port", [](const auto& node) { return node.is_integer(); }, "an integer");
     if (!upstreamPort.has_value()) return foundation::fail(upstreamPort.error());
+    for (const std::string_view key : {"rate_limit_capacity",
+             "rate_limit_refill_per_second", "rate_limit_maximum_keys"}) {
+        const foundation::Status type = requireType(
+            "gateway", key, [](const auto& node) { return node.is_integer(); }, "an integer");
+        if (!type.has_value()) return foundation::fail(type.error());
+    }
     const foundation::Status upstreamTls = requireType(
         "gateway", "upstream_tls", [](const auto& node) { return node.is_boolean(); }, "a boolean");
     if (!upstreamTls.has_value()) return foundation::fail(upstreamTls.error());
@@ -429,11 +487,13 @@ resolveSecretReference(std::string_view reference, const Environment& environmen
         return foundation::SecretString{std::move(value).value()};
     }
 
-    if (reference.starts_with(kFilePrefix)) {
-        const std::string_view rawPath = reference.substr(kFilePrefix.size());
+    const bool hexadecimalFile = reference.starts_with(kHexFilePrefix);
+    if (hexadecimalFile || reference.starts_with(kFilePrefix)) {
+        const std::string_view rawPath = reference.substr(
+            hexadecimalFile ? kHexFilePrefix.size() : kFilePrefix.size());
         if (rawPath.empty()) {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A secret reference of the form 'file:' is missing a path.");
+                                    "A file-backed secret reference is missing a path.");
         }
 
         foundation::Result<std::string> contents =
@@ -444,6 +504,20 @@ resolveSecretReference(std::string_view reference, const Environment& environmen
 
         std::string value = std::move(contents).value();
         stripOneTrailingNewline(value);
+        if (hexadecimalFile) {
+            auto decoded = foundation::fromHex(value);
+            if (!decoded) {
+                return foundation::fail(
+                    foundation::ErrorCode::InvalidArgument,
+                    "A hexfile secret does not contain valid hexadecimal bytes.");
+            }
+            std::string raw;
+            raw.reserve(decoded->size());
+            for (const std::byte byte : decoded.value()) {
+                raw.push_back(static_cast<char>(std::to_integer<unsigned char>(byte)));
+            }
+            return foundation::SecretString{std::move(raw)};
+        }
         return foundation::SecretString{std::move(value)};
     }
 
@@ -451,7 +525,7 @@ resolveSecretReference(std::string_view reference, const Environment& environmen
     // credential, quoting it here would copy it straight into the logs.
     return foundation::fail(
         foundation::ErrorCode::InvalidArgument,
-        "A secret must be given as a reference of the form 'env:NAME' or 'file:/path'. "
+        "A secret must be given as 'env:NAME', 'file:/path' or 'hexfile:/path'. "
         "Inline secret values are not accepted.");
 }
 
@@ -513,14 +587,103 @@ bool LoggingConfig::console() const noexcept
     return m_console;
 }
 
-SecurityConfig::SecurityConfig(foundation::SecretString tokenSigningKey)
-    : m_tokenSigningKey(std::move(tokenSigningKey))
+OperationsConfig::OperationsConfig(
+    bool metricsEnabled, foundation::SecretString metricsBearerToken,
+    std::size_t metricsMaximumSeries)
+    : m_metricsEnabled(metricsEnabled),
+      m_metricsBearerToken(std::move(metricsBearerToken)),
+      m_metricsMaximumSeries(metricsMaximumSeries)
+{
+}
+
+foundation::Result<OperationsConfig> OperationsConfig::create(
+    bool metricsEnabled, foundation::SecretString metricsBearerToken,
+    std::size_t metricsMaximumSeries)
+{
+    if (metricsMaximumSeries < 128U || metricsMaximumSeries > 10'000U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The metrics series limit is invalid.");
+    }
+    if (metricsEnabled && metricsBearerToken.size() < 32U) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "Enabled metrics require a bearer token of at least 32 bytes.");
+    }
+    return OperationsConfig{
+        metricsEnabled, std::move(metricsBearerToken), metricsMaximumSeries};
+}
+
+bool OperationsConfig::metricsEnabled() const noexcept { return m_metricsEnabled; }
+const foundation::SecretString& OperationsConfig::metricsBearerToken() const noexcept
+{ return m_metricsBearerToken; }
+std::size_t OperationsConfig::metricsMaximumSeries() const noexcept
+{ return m_metricsMaximumSeries; }
+
+SecurityConfig::SecurityConfig(
+    foundation::SecretString tokenSigningKey,
+    foundation::SecretString credentialEncryptionKey,
+    unsigned int credentialEncryptionKeyVersion,
+    unsigned int masterKeyVersion,
+    foundation::SecretString passwordPepper,
+    foundation::SecretString recoveryCodePepper,
+    foundation::SecretString auditChainKey,
+    foundation::SecretString oauthClientSecretKey)
+    : m_tokenSigningKey(std::move(tokenSigningKey)),
+      m_credentialEncryptionKey(std::move(credentialEncryptionKey)),
+      m_credentialEncryptionKeyVersion(credentialEncryptionKeyVersion),
+      m_masterKeyVersion(masterKeyVersion),
+      m_passwordPepper(std::move(passwordPepper)),
+      m_recoveryCodePepper(std::move(recoveryCodePepper)),
+      m_auditChainKey(std::move(auditChainKey)),
+      m_oauthClientSecretKey(std::move(oauthClientSecretKey))
 {
 }
 
 const foundation::SecretString& SecurityConfig::tokenSigningKey() const noexcept
 {
     return m_tokenSigningKey;
+}
+
+const foundation::SecretString& SecurityConfig::credentialEncryptionKey() const noexcept
+{
+    return m_credentialEncryptionKey;
+}
+
+unsigned int SecurityConfig::credentialEncryptionKeyVersion() const noexcept
+{
+    return m_credentialEncryptionKeyVersion;
+}
+
+unsigned int SecurityConfig::masterKeyVersion() const noexcept
+{
+    return m_masterKeyVersion;
+}
+
+const foundation::SecretString& SecurityConfig::passwordPepper() const noexcept
+{
+    return m_passwordPepper;
+}
+
+const foundation::SecretString& SecurityConfig::recoveryCodePepper() const noexcept
+{
+    return m_recoveryCodePepper;
+}
+
+const foundation::SecretString& SecurityConfig::auditChainKey() const noexcept
+{
+    return m_auditChainKey;
+}
+
+const foundation::SecretString& SecurityConfig::oauthClientSecretKey() const noexcept
+{
+    return m_oauthClientSecretKey;
+}
+
+bool SecurityConfig::hasDedicatedPersistentKeys() const noexcept
+{
+    return !m_credentialEncryptionKey.empty() && !m_passwordPepper.empty()
+        && !m_recoveryCodePepper.empty() && !m_auditChainKey.empty()
+        && !m_oauthClientSecretKey.empty();
 }
 
 OidcConfig::OidcConfig() = default;
@@ -539,14 +702,22 @@ std::string_view OidcConfig::previousSigningKeysDirectory() const noexcept
 
 GatewayConfig::GatewayConfig(bool enabled, std::string routePrefix,
                              std::string upstreamHost, std::uint16_t upstreamPort,
-                             bool upstreamTls, std::string upstreamCaFile)
+                             bool upstreamTls, std::string upstreamCaFile,
+                             std::size_t rateLimitCapacity,
+                             std::size_t rateLimitRefillPerSecond,
+                             std::size_t rateLimitMaximumKeys)
     : m_enabled(enabled), m_routePrefix(std::move(routePrefix)),
       m_upstreamHost(std::move(upstreamHost)), m_upstreamPort(upstreamPort),
-      m_upstreamTls(upstreamTls), m_upstreamCaFile(std::move(upstreamCaFile)) {}
+      m_upstreamTls(upstreamTls), m_upstreamCaFile(std::move(upstreamCaFile)),
+      m_rateLimitCapacity(rateLimitCapacity),
+      m_rateLimitRefillPerSecond(rateLimitRefillPerSecond),
+      m_rateLimitMaximumKeys(rateLimitMaximumKeys) {}
 
 foundation::Result<GatewayConfig> GatewayConfig::create(
     bool enabled, std::string routePrefix, std::string upstreamHost,
-    std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile)
+    std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile,
+    std::size_t rateLimitCapacity, std::size_t rateLimitRefillPerSecond,
+    std::size_t rateLimitMaximumKeys)
 {
     const auto invalidText = [](std::string_view text) {
         return std::ranges::any_of(text, [](char value) {
@@ -570,8 +741,19 @@ foundation::Result<GatewayConfig> GatewayConfig::create(
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "A CA file is only valid for a TLS upstream.");
     }
+    constexpr std::size_t kMaximumRateLimitValue = 1'000'000U;
+    if (rateLimitCapacity == 0U || rateLimitCapacity > kMaximumRateLimitValue
+        || rateLimitRefillPerSecond == 0U
+        || rateLimitRefillPerSecond > kMaximumRateLimitValue
+        || rateLimitMaximumKeys == 0U
+        || rateLimitMaximumKeys > kMaximumRateLimitValue) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The gateway rate-limit policy is invalid.");
+    }
     return GatewayConfig{enabled, std::move(routePrefix), std::move(upstreamHost),
-                         upstreamPort, upstreamTls, std::move(upstreamCaFile)};
+                         upstreamPort, upstreamTls, std::move(upstreamCaFile),
+                         rateLimitCapacity, rateLimitRefillPerSecond,
+                         rateLimitMaximumKeys};
 }
 
 bool GatewayConfig::enabled() const noexcept { return m_enabled; }
@@ -580,6 +762,11 @@ std::string_view GatewayConfig::upstreamHost() const noexcept { return m_upstrea
 std::uint16_t GatewayConfig::upstreamPort() const noexcept { return m_upstreamPort; }
 bool GatewayConfig::upstreamTls() const noexcept { return m_upstreamTls; }
 std::string_view GatewayConfig::upstreamCaFile() const noexcept { return m_upstreamCaFile; }
+std::size_t GatewayConfig::rateLimitCapacity() const noexcept { return m_rateLimitCapacity; }
+std::size_t GatewayConfig::rateLimitRefillPerSecond() const noexcept
+{ return m_rateLimitRefillPerSecond; }
+std::size_t GatewayConfig::rateLimitMaximumKeys() const noexcept
+{ return m_rateLimitMaximumKeys; }
 
 DatabaseConfig::DatabaseConfig() = default;
 DatabaseConfig::DatabaseConfig(foundation::SecretString connectionString,
@@ -763,11 +950,13 @@ const std::vector<RoutePolicyConfig>& AuthConfig::routePolicies() const noexcept
 { return m_routePolicies; }
 
 PlatformConfig::PlatformConfig(ServerConfig server, LoggingConfig logging,
-                               SecurityConfig security, GatewayConfig gateway,
+                               OperationsConfig operations, SecurityConfig security,
+                               GatewayConfig gateway,
                                DatabaseConfig database, AuthConfig auth,
                                AccountConfig account, OidcConfig oidc)
     : m_server(std::move(server))
     , m_logging(logging)
+    , m_operations(std::move(operations))
     , m_security(std::move(security))
     , m_gateway(std::move(gateway))
     , m_database(std::move(database))
@@ -830,6 +1019,30 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     bool console = document["logging"]["console"].value_or(true);
     bool trustProxyClientIp = document["server"]["trust_proxy_client_ip"].value_or(false);
 
+    bool metricsEnabledValue = document["operations"]["metrics_enabled"].value_or(false);
+    std::size_t metricsMaximumSeriesValue = 512U;
+    if (const auto configured =
+            document["operations"]["metrics_maximum_series"].value<std::int64_t>();
+        configured.has_value()) {
+        if (*configured < 128 || *configured > 10'000) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The metrics series limit is invalid.");
+        }
+        metricsMaximumSeriesValue = static_cast<std::size_t>(*configured);
+    }
+    foundation::SecretString metricsBearerTokenValue;
+    if (const auto reference =
+            document["operations"]["metrics_bearer_token"].value<std::string>();
+        reference.has_value()) {
+        auto resolved = resolveSecretReference(*reference, environment);
+        if (!resolved) return foundation::fail(resolved.error());
+        metricsBearerTokenValue = std::move(resolved).value();
+    }
+    auto operations = OperationsConfig::create(
+        metricsEnabledValue, std::move(metricsBearerTokenValue),
+        metricsMaximumSeriesValue);
+    if (!operations) return foundation::fail(operations.error());
+
     // Environment overrides are applied after the file so that a deployment can
     // change a setting without rebuilding the image it ships in.
     if (const std::optional<std::string> overrideValue = environment.get("OPENPROOF_SERVER_BIND_ADDRESS");
@@ -878,6 +1091,7 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
     }
 
     SecurityConfig security;
+    foundation::SecretString masterKey;
     if (const std::optional<std::string> signingKeyReference =
             document["security"]["token_signing_key"].value<std::string>();
         signingKeyReference.has_value()) {
@@ -886,8 +1100,91 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         if (!resolved.has_value()) {
             return foundation::fail(resolved.error());
         }
-        security = SecurityConfig{std::move(resolved).value()};
+        masterKey = std::move(resolved).value();
     }
+    foundation::SecretString credentialEncryptionKey;
+    if (const auto reference =
+            document["security"]["credential_encryption_key"].value<std::string>();
+        reference.has_value()) {
+        auto resolved = resolveSecretReference(*reference, environment);
+        if (!resolved.has_value()) return foundation::fail(resolved.error());
+        credentialEncryptionKey = std::move(resolved).value();
+    }
+    const auto resolveOptionalSecuritySecret = [&document, &environment](
+        std::string_view key) -> foundation::Result<foundation::SecretString> {
+        const auto reference = document["security"][key].value<std::string>();
+        if (!reference.has_value()) return foundation::SecretString{};
+        return resolveSecretReference(*reference, environment);
+    };
+    auto passwordPepper = resolveOptionalSecuritySecret("password_pepper");
+    auto recoveryCodePepper = resolveOptionalSecuritySecret("recovery_code_pepper");
+    auto auditChainKey = resolveOptionalSecuritySecret("audit_chain_key");
+    auto oauthClientSecretKey = resolveOptionalSecuritySecret("oauth_client_secret_key");
+    if (!passwordPepper || !recoveryCodePepper || !auditChainKey
+        || !oauthClientSecretKey) {
+        if (!passwordPepper) return foundation::fail(passwordPepper.error());
+        if (!recoveryCodePepper) return foundation::fail(recoveryCodePepper.error());
+        if (!auditChainKey) return foundation::fail(auditChainKey.error());
+        return foundation::fail(oauthClientSecretKey.error());
+    }
+    const auto configuredCredentialVersion =
+        document["security"]["credential_encryption_key_version"].value<std::int64_t>();
+    if (configuredCredentialVersion.has_value()
+        && (*configuredCredentialVersion < 1
+            || *configuredCredentialVersion > 2'147'483'647LL)) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The credential encryption key version is invalid.");
+    }
+    const unsigned int credentialEncryptionKeyVersion =
+        configuredCredentialVersion.has_value()
+            ? static_cast<unsigned int>(*configuredCredentialVersion) : 1U;
+    const auto configuredMasterVersion =
+        document["security"]["master_key_version"].value<std::int64_t>();
+    if (configuredMasterVersion.has_value()
+        && (*configuredMasterVersion < 1
+            || *configuredMasterVersion > 2'147'483'647LL)) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The master key version is invalid.");
+    }
+    const unsigned int masterKeyVersion = configuredMasterVersion.has_value()
+        ? static_cast<unsigned int>(*configuredMasterVersion) : 1U;
+    if (credentialEncryptionKey.empty() && credentialEncryptionKeyVersion != 1U) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "A non-default credential key version requires an explicit credential encryption key.");
+    }
+    if (!credentialEncryptionKey.empty()
+        && credentialEncryptionKey.expose().size() != 32U) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The credential encryption key must contain exactly 32 bytes.");
+    }
+    const auto persistentKeyTooShort = [](const foundation::SecretString& value) {
+        return !value.empty() && value.expose().size() < 32U;
+    };
+    if (persistentKeyTooShort(passwordPepper.value())
+        || persistentKeyTooShort(recoveryCodePepper.value())
+        || persistentKeyTooShort(auditChainKey.value())
+        || persistentKeyTooShort(oauthClientSecretKey.value())) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "Dedicated persistent security keys must contain at least 32 bytes.");
+    }
+    const bool allPersistentKeysDedicated = !credentialEncryptionKey.empty()
+        && !passwordPepper->empty() && !recoveryCodePepper->empty()
+        && !auditChainKey->empty() && !oauthClientSecretKey->empty();
+    if (masterKeyVersion != 1U && !allPersistentKeysDedicated) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "A rotated master key requires every persistent security key to be explicit.");
+    }
+    security = SecurityConfig{
+        std::move(masterKey), std::move(credentialEncryptionKey),
+        credentialEncryptionKeyVersion, masterKeyVersion,
+        std::move(passwordPepper).value(), std::move(recoveryCodePepper).value(),
+        std::move(auditChainKey).value(), std::move(oauthClientSecretKey).value()};
 
     bool oidcEnabled = document["oidc"]["enabled"].value_or(false);
     std::string oidcIssuer = document["oidc"]["issuer"].value_or(std::string{});
@@ -929,7 +1226,10 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         document["gateway"]["upstream_host"].value_or(std::string{}),
         upstreamPortValue,
         document["gateway"]["upstream_tls"].value_or(true),
-        document["gateway"]["upstream_ca_file"].value_or(std::string{}));
+        document["gateway"]["upstream_ca_file"].value_or(std::string{}),
+        static_cast<std::size_t>(document["gateway"]["rate_limit_capacity"].value_or<std::int64_t>(1'000)),
+        static_cast<std::size_t>(document["gateway"]["rate_limit_refill_per_second"].value_or<std::int64_t>(100)),
+        static_cast<std::size_t>(document["gateway"]["rate_limit_maximum_keys"].value_or<std::int64_t>(100'000)));
     if (!gateway.has_value()) return foundation::fail(gateway.error());
 
     foundation::SecretString databaseConnection;
@@ -1020,7 +1320,8 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
         std::move(accountDeliveryAuthorization)};
 
     return PlatformConfig{std::move(server).value(), LoggingConfig{level, console},
-                          std::move(security), std::move(gateway).value(),
+                          std::move(operations).value(), std::move(security),
+                          std::move(gateway).value(),
                           std::move(database), std::move(auth).value(), std::move(account),
                           std::move(oidc)};
 }
@@ -1049,6 +1350,11 @@ const ServerConfig& PlatformConfig::server() const noexcept
 const LoggingConfig& PlatformConfig::logging() const noexcept
 {
     return m_logging;
+}
+
+const OperationsConfig& PlatformConfig::operations() const noexcept
+{
+    return m_operations;
 }
 
 const SecurityConfig& PlatformConfig::security() const noexcept

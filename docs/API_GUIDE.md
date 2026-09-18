@@ -1,5 +1,11 @@
 # OpenProof API integration guide
 
+For language-specific cURL, JavaScript, PHP, C++/STL, C++/Qt, C++/Boost and
+Web3 examples, see the
+[integration cookbook](INTEGRATION_COOKBOOK.md). The local Developer Portal
+renders all OpenAPI operations, explains their authentication model and creates
+copyable code for the request currently open in its API Explorer.
+
 This guide is the product-facing Golden Path for using OpenProof as the shared
 identity core behind multiple applications. In production replace
 `https://identity.example.com` with the public TLS origin in `[oidc].issuer`.
@@ -12,6 +18,39 @@ OpenProof exposes two different credentials:
   self-service;
 - OAuth access tokens for applications and APIs. Product backends should use
   OAuth/OIDC—not copy the OpenProof session cookie into their own domain.
+
+To prove the complete flow locally before integrating an application, build the
+Release preset and run `./scripts/quickstart-local-demo.sh`. It creates only an
+isolated temporary PostgreSQL cluster, exercises the real TLS/signup/MFA/OIDC
+flow and stops the database process on exit.
+
+For an interactive native example, `./scripts/run-qml-demo.sh` builds and opens
+the C++20/Qt 6 application under `examples/qml-identity-client`. The launcher
+creates a disposable verified account and passes the local TLS origin, generated
+CA, subject and password through a mode-`0600` file. The app demonstrates the
+exact readiness, signup/verification, cookie-bound login/MFA, profile and logout
+calls in this guide without disabling TLS verification.
+
+The deterministic launcher intentionally uses a synthetic FID and local
+ERC-1271 registry. For an interactive personal-account check, run
+`OPENPROOF_DEMO_REAL_AUTH=1 ./scripts/run-qml-demo.sh`; the Farcaster button then
+uses the public relay and live Optimism registries. Redirect-provider login is
+exposed dynamically when a complete Google, Apple, Microsoft, GitHub, LinkedIn
+or Telegram `OPENPROOF_<PROVIDER>_CLIENT_ID`/`CLIENT_SECRET` pair is set and the
+upstream application has registered
+`https://127.0.0.1:18443/auth/federated/callback`. The QML application shows the
+supported provider catalog but enables only those reported by `/auth/providers`;
+it is a public native OAuth
+client and completes the OpenProof Authorization Code flow with a random
+loopback callback and PKCE. Browser-based account linking is followed by an
+automatic authenticated refresh, so the attached method appears without
+copying a session or token into the browser URL.
+
+The interactive launcher also starts a loopback-only delivery inbox and API
+Explorer. Open it from **Web tools** in the QML overview to inspect deliveries,
+verify a newly created account and execute selected API calls against the same
+disposable TLS stack. See [DELIVERY_WEBHOOK.md](DELIVERY_WEBHOOK.md) for the
+development and production delivery flows.
 
 ## 1. Register and verify a consumer
 
@@ -86,6 +125,49 @@ For Google, Apple, Microsoft, GitHub, SAML and other configured providers, query
 
 The callback is `/auth/federated/callback`; upstream consoles must register the
 exact public callback URI.
+
+### Keep one OpenProof identity across providers
+
+OpenProof has its own native account: signup plus verified email, password,
+optional TOTP and passkeys. Google, Farcaster and other providers are login
+methods attached to that same canonical identity; their upstream identifiers
+never replace the OpenProof identity ID.
+
+After signing in with any existing method, list connections with
+`GET /account/connections`. Connect a redirect provider by navigating to:
+
+```text
+/account/connections/start?provider=google&return_to=%2F
+```
+
+For Farcaster or a wallet use `/account/connections/web3/start` and
+`/account/connections/web3/complete` with the same bodies as the login ceremony.
+Completion attaches the verified FID/address to the existing identity and does
+not issue or switch to another session. Disconnect with:
+
+Native/mobile/desktop clients must not copy their session or OAuth bearer into
+the system browser. They instead call `POST /account/connections/handoff` with
+`provider` and a local `return_to`, then open the returned `handoff_url`. That
+URL contains only a two-minute, one-time ticket; the canonical identity,
+provider and return path are already fixed in shared server-side transaction
+state. The provider callback completes the connection without replacing the
+app's current session.
+
+Delegated access to `/account/*` requires the explicit first-party `account`
+scope. Register that scope on the native client and request it during the OAuth
+authorization flow; `openid profile` alone is intentionally read-only with
+respect to OpenProof account self-service.
+
+```bash
+curl --fail-with-body -b owner.cookies \
+  https://identity.example.com/account/connections/disconnect \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"google","subject":"UPSTREAM_SUBJECT"}'
+```
+
+The server refuses cross-identity attachment and refuses removal of the final
+available sign-in method. It never links accounts merely because two providers
+return the same email address.
 
 ## 3. Connect a product with OAuth/OIDC
 
@@ -272,15 +354,18 @@ the platform WebAuthn API and preserve the returned challenge exactly.
 Other challenge/response providers also use a cookie-bound start/complete pair:
 
 - Web3: `POST /auth/web3/start` with
-  `{"provider":"ethereum","address":"0x..."}` (or `solana`; Farcaster also
-  requires `fid`), sign the exact returned `message`, then call
+  `{"provider":"ethereum-wallet","address":"0x..."}`. For Farcaster,
+  `{"provider":"farcaster"}` returns the nonce/domain/URI used by AuthKit;
+  optionally include both `address` and `fid` to receive a complete direct-sign
+  FIP-11 message. Sign the exact resulting SIWE message, then call
   `POST /auth/web3/complete` with `{"message":"...","signature":"..."}`.
 - LDAP: `POST /auth/ldap/start` with `{"username":"..."}`, then preserve its
   cookies and send the returned `transaction_id`, `challenge_id`, `username`
   and `username_binding` plus `password` to `POST /auth/ldap/complete`.
 
-Never allow a wallet or LDAP client to substitute its own challenge,
-transaction identifier or username binding.
+Never allow a wallet or LDAP client to substitute its own nonce, transaction
+identifier or username binding. Farcaster messages must use statement
+`Farcaster Auth`, Optimism chain 10 and resource `farcaster://fids/<fid>`.
 
 ## 7. Service-to-service authentication
 
@@ -353,6 +438,27 @@ curl --fail-with-body https://identity.example.com/scim/v2/Users \
 Users and Groups support list, create, get, replace, patch and delete under
 `/scim/v2/Users` and `/scim/v2/Groups`. Preserve `ETag` and send `If-Match` on
 updates to prevent overwriting concurrent provisioning changes.
+
+## 10. Operational metrics
+
+Metrics are for the private operations plane, not product clients. After
+enabling `[operations]` with a dedicated secret reference, a local scraper calls
+the loopback listener directly:
+
+```bash
+export OPENPROOF_METRICS_TOKEN="$(tr -d '\r\n' \
+  </run/prometheus/secrets/openproof-metrics.token)"
+curl --fail-with-body http://127.0.0.1:18443/metrics \
+  -H "Authorization: Bearer ${OPENPROOF_METRICS_TOKEN}"
+unset OPENPROOF_METRICS_TOKEN
+```
+
+`HEAD /metrics` verifies the same credential without returning the exposition
+body. Missing or incorrect credentials return `401`; non-read methods return
+`405`. The shipped public Nginx edge returns `404` for this path, so Prometheus
+must use the loopback listener or a separately protected private management
+ingress. See the [operations runbook](OPERATIONS.md#metrics-and-alerting) for a
+`scrape_config`, metric names and alert expressions.
 
 ## Error contract and client rules
 

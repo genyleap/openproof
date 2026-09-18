@@ -28,6 +28,8 @@ add_executable(openproof_tests
     session/session_test.cpp
     credentials/credentials_test.cpp
     providers/local_test.cpp
+    providers/oidc_test.cpp
+    providers/web3_test.cpp
     gateway/gateway_test.cpp
     gateway/http_integration_test.cpp
     storage/postgres_integration_test.cpp
@@ -39,6 +41,14 @@ add_executable(openproof_tests
 )
 
 target_compile_features(openproof_tests PRIVATE cxx_std_26)
+
+# Homebrew dependencies contribute `/opt/homebrew/include` for OpenSSL/libpq.
+# That broad directory may also contain an unrelated system GoogleTest version;
+# if it precedes the pinned FetchContent headers, test objects compile against a
+# different ABI than libgtest.a. Put the pinned headers first explicitly.
+target_include_directories(openproof_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include"
+    "${googletest_SOURCE_DIR}/googletest")
 
 # Same Boost.Config Darwin/GCC correction as the HTTP adapter target. This test
 # includes Beast directly to exercise the wire boundary.
@@ -66,6 +76,8 @@ target_link_libraries(openproof_tests
         openproof_session
         openproof_credentials
         openproof_provider_local
+        openproof_provider_oidc
+        openproof_provider_web3
         openproof_gateway
         openproof_gateway_http
         Boost::headers

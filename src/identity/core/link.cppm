@@ -181,6 +181,18 @@ public:
     [[nodiscard]] virtual foundation::Status detach(const ExternalIdentityRef& external, const IdentityId& expectedOwner) = 0;
 
     /**
+     * @brief Atomically removes one authentication link only when another remains.
+     *
+     * Implementations must serialize the ownership check, provider-filtered
+     * count and deletion across processes. This closes the two-node race where
+     * concurrent requests could otherwise each observe two methods and remove
+     * both.
+     */
+    [[nodiscard]] virtual foundation::Status detachIfAnotherAuthenticationMethod(
+        const ExternalIdentityRef& external, const IdentityId& expectedOwner,
+        const std::vector<provider::ProviderId>& authenticationProviders) = 0;
+
+    /**
      * @brief Moves an association from one canonical identity to another.
      *
      * Exists for identity merge, which must move associations without
@@ -224,6 +236,10 @@ public:
     ownerOf(const ExternalIdentityRef& external) const override;
 
     [[nodiscard]] foundation::Status detach(const ExternalIdentityRef& external, const IdentityId& expectedOwner) override;
+
+    [[nodiscard]] foundation::Status detachIfAnotherAuthenticationMethod(
+        const ExternalIdentityRef& external, const IdentityId& expectedOwner,
+        const std::vector<provider::ProviderId>& authenticationProviders) override;
 
     [[nodiscard]] foundation::Status reassign(const ExternalIdentityRef& external,
                                               const IdentityId& expectedCurrentOwner,

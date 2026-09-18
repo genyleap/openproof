@@ -77,7 +77,11 @@ protected:
         direct.reset(PQconnectdb(connectionString.c_str()));
         ASSERT_NE(direct.get(), nullptr);
         ASSERT_EQ(PQstatus(direct.get()), CONNECTION_OK);
-        execute("TRUNCATE openproof.authentication_transactions, "
+        execute("TRUNCATE openproof.master_key_rotations, "
+                "openproof.credential_key_rotations, "
+                "openproof.audit_events, "
+                "openproof.security_event_outbox, "
+                "openproof.authentication_transactions, "
                 "openproof.organizations CASCADE");
         execute("INSERT INTO openproof.organizations(id,name,state,created_at_ms) "
                 "VALUES('org','Test',0,1770000000000)");
@@ -96,7 +100,8 @@ protected:
     {
         std::unique_ptr<PGresult, ResultDeleter> result{PQexec(direct.get(), sql)};
         ASSERT_NE(result.get(), nullptr);
-        ASSERT_EQ(PQresultStatus(result.get()), PGRES_COMMAND_OK);
+        ASSERT_EQ(PQresultStatus(result.get()), PGRES_COMMAND_OK)
+            << PQresultErrorMessage(result.get());
     }
 
     std::string connectionString;
@@ -371,6 +376,273 @@ TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)
     first.join();
     second.join();
     EXPECT_EQ(winners.load(), 1U);
+}
+
+TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnable)
+{
+    pg::PostgresExternalIdentityDirectory external{*pool};
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-1"},
+        core::ExternalIdentityRef{idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"rekey-user"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(external.attach(link));
+
+    const auto passwordPolicy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
+    auto oldHasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
+    auto oldDirectoryKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto oldDirectory = pg::PostgresLocalAccountDirectory::create(
+        *pool, std::move(oldHasher), cred::TotpPolicy::recommended(),
+        std::move(oldDirectoryKey), 1U, idp::ProviderId{"local"});
+    ASSERT_TRUE(oldDirectory);
+    auto seed = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    const std::string firstCode = cred::totpAt(
+        seed, cred::TotpPolicy::recommended(), kNow).value();
+    ASSERT_TRUE(oldDirectory.value()->enroll(
+        idp::ExternalSubject{"rekey-user"},
+        fnd::SecretString{"correct-password"},
+        std::optional<cred::TotpSecret>{std::move(seed)}));
+    ASSERT_TRUE(oldDirectory.value()->verify(
+        idp::ExternalSubject{"rekey-user"},
+        fnd::SecretString{"correct-password"}, firstCode, kNow));
+
+    std::unique_ptr<PGresult, ResultDeleter> before{PQexec(
+        direct.get(),
+        "SELECT encode(encrypted_seed,'hex'),key_version,last_accepted_step "
+        "FROM openproof.totp_credentials WHERE identity_id='identity-1'")};
+    ASSERT_NE(before.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(before.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(before.get()), 1);
+    const std::string oldCiphertext = PQgetvalue(before.get(), 0, 0);
+    const std::string acceptedStep = PQgetvalue(before.get(), 0, 2);
+
+    pg::PostgresCredentialRekeyer rekeyer{*pool};
+    auto unchangedOldKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto unchangedNewKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto unchanged = rekeyer.rotateTotp(
+        unchangedOldKey, 1U, unchangedNewKey, 2U, true);
+    ASSERT_FALSE(unchanged);
+    EXPECT_EQ(unchanged.error().code(), fnd::ErrorCode::InvalidArgument);
+
+    auto oldDryKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto newDryKey = sec::AeadKey::create(
+        fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
+    auto dryRun = rekeyer.rotateTotp(oldDryKey, 1U, newDryKey, 2U, true);
+    ASSERT_TRUE(dryRun);
+    EXPECT_EQ(dryRun->rekeyed, 1U);
+    EXPECT_EQ(dryRun->alreadyCurrent, 0U);
+    EXPECT_TRUE(dryRun->dryRun);
+
+    std::unique_ptr<PGresult, ResultDeleter> afterDryRun{PQexec(
+        direct.get(),
+        "SELECT key_version,encode(encrypted_seed,'hex'),"
+        "(SELECT count(*) FROM openproof.credential_key_rotations) "
+        "FROM openproof.totp_credentials WHERE identity_id='identity-1'")};
+    ASSERT_NE(afterDryRun.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(afterDryRun.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 0), "1");
+    EXPECT_EQ(PQgetvalue(afterDryRun.get(), 0, 1), oldCiphertext);
+    EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 2), "0");
+
+    auto wrongOldKey = sec::AeadKey::create(
+        fnd::SecretString{std::string(32U, 'x')}).value();
+    auto newAttemptKey = sec::AeadKey::create(
+        fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
+    auto refused = rekeyer.rotateTotp(
+        wrongOldKey, 1U, newAttemptKey, 2U, false);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    auto oldKey = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto newKey = sec::AeadKey::create(
+        fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
+    auto rotated = rekeyer.rotateTotp(oldKey, 1U, newKey, 2U, false);
+    ASSERT_TRUE(rotated) << rotated.error().internalDetail();
+    EXPECT_EQ(rotated->rekeyed, 1U);
+    EXPECT_FALSE(rotated->dryRun);
+
+    std::unique_ptr<PGresult, ResultDeleter> after{PQexec(
+        direct.get(),
+        "SELECT key_version,encode(encrypted_seed,'hex'),last_accepted_step,"
+        "(SELECT count(*) FROM openproof.credential_key_rotations "
+        "WHERE purpose='totp' AND from_version=1 AND to_version=2 "
+        "AND rekeyed_rows=1) FROM openproof.totp_credentials "
+        "WHERE identity_id='identity-1'")};
+    ASSERT_NE(after.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(after.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(after.get()), 1);
+    EXPECT_STREQ(PQgetvalue(after.get(), 0, 0), "2");
+    EXPECT_NE(PQgetvalue(after.get(), 0, 1), oldCiphertext);
+    EXPECT_EQ(PQgetvalue(after.get(), 0, 2), acceptedStep);
+    EXPECT_STREQ(PQgetvalue(after.get(), 0, 3), "1");
+
+    auto newHasher = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
+    auto newDirectoryKey = sec::AeadKey::create(
+        fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
+    auto newDirectory = pg::PostgresLocalAccountDirectory::create(
+        *pool, std::move(newHasher), cred::TotpPolicy::recommended(),
+        std::move(newDirectoryKey), 2U, idp::ProviderId{"local"});
+    ASSERT_TRUE(newDirectory);
+    auto verifierSeed = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    const auto nextInstant = kNow + std::chrono::seconds{30};
+    const std::string nextCode = cred::totpAt(
+        verifierSeed, cred::TotpPolicy::recommended(), nextInstant).value();
+    ASSERT_TRUE(newDirectory.value()->verify(
+        idp::ExternalSubject{"rekey-user"},
+        fnd::SecretString{"correct-password"}, nextCode, nextInstant));
+}
+
+TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState)
+{
+    pg::PostgresAuthenticationTransactionStore transactions{*pool};
+    auto transaction = idp::AuthenticationTransaction::create(
+        idp::TransactionId{"master-rotation-transaction"},
+        idp::ProviderId{"local"}, idp::InteractionModel::ChallengeResponse,
+        fnd::SecretString{"master-rotation-nonce"}, sec::sha256("binding").value(),
+        fnd::CorrelationId{"master-rotation"}, kNow,
+        std::chrono::minutes{5}).value();
+    ASSERT_TRUE(transactions.begin(std::move(transaction)));
+
+    pg::PostgresSessionRepository sessions{*pool};
+    ASSERT_TRUE(sessions.add(sessionValue(
+        "master-rotation-session", "master-rotation-session")));
+
+    execute("INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES('identity-1','scrypt$v1$1024$8$1$2097152$c2FsdHNhbHRzYWx0c2FsdA$"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',1770000000000)");
+    execute("INSERT INTO openproof.totp_credentials"
+            "(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES('identity-1',decode('00','hex'),1,NULL,1770000000000)");
+    execute("INSERT INTO openproof.recovery_codes(identity_id,code_digest,issued_at_ms) "
+            "VALUES('identity-1',decode(repeat('11',32),'hex'),1770000000000)");
+    execute("INSERT INTO openproof.audit_events"
+            "(event_id,occurred_at_ms,correlation_id,category,action,outcome,detail,event_hash) "
+            "VALUES('master-rotation-audit',1770000000000,'master-rotation',"
+            "'security','master.rotate','planned','{}',decode(repeat('22',32),'hex'))");
+    execute("INSERT INTO openproof.applications"
+            "(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+            "VALUES('master-app','org','master-app','Master App',2,0,1770000000000,1770000000000)");
+    execute("INSERT INTO openproof.oauth_clients"
+            "(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+            "VALUES('master-client','master-app','Master Client',0,0,"
+            "decode(repeat('33',32),'hex'),1770000000000,1770000000000)");
+    execute("INSERT INTO openproof.account_verification_challenges"
+            "(id,identity_id,purpose,channel,destination,secret_digest,attempts,created_at_ms,expires_at_ms) "
+            "VALUES('master-account-challenge','identity-1',0,0,'user@example.test',"
+            "decode(repeat('44',32),'hex'),0,1770000000000,1770003600000)");
+    execute("INSERT INTO openproof.passkey_registration_ceremonies"
+            "(id,identity_id,expires_at_ms,consumed_at_ms) "
+            "VALUES('master-passkey-registration','identity-1',1770003600000,NULL)");
+    execute("INSERT INTO openproof.oauth_authorization_codes"
+            "(code_digest,client_id,identity_id,redirect_uri,code_challenge,provider,"
+            "assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms) "
+            "VALUES(decode(repeat('55',32),'hex'),'master-client','identity-1',"
+            "'https://client.example/callback',repeat('a',43),'local',2,3,false,"
+            "1770000000000,1770000000000,1770000300000)");
+    execute("INSERT INTO openproof.oauth_token_families"
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,"
+            "authenticated_at_ms,revoked_at_ms) VALUES('master-family','master-client',"
+            "'identity-1','local',2,3,false,1770000000000,NULL)");
+    execute("INSERT INTO openproof.oauth_device_authorizations"
+            "(device_digest,user_code_digest,client_id,status,issued_at_ms,expires_at_ms,poll_interval_ms) "
+            "VALUES(decode(repeat('66',32),'hex'),decode(repeat('77',32),'hex'),"
+            "'master-client',0,1770000000000,1770000600000,5000)");
+    execute("INSERT INTO openproof.oauth_pushed_authorization_requests"
+            "(request_digest,client_id,redirect_uri,code_challenge,response_mode,issued_at_ms,expires_at_ms) "
+            "VALUES(decode(repeat('88',32),'hex'),'master-client',"
+            "'https://client.example/callback',repeat('b',43),0,1770000000000,1770000090000)");
+
+    const auto oldFingerprint = sec::hmacSha256(
+        fnd::SecretString{std::string(32U, 'm')},
+        "openproof/master-key-fingerprint/v1").value();
+    const auto newFingerprint = sec::hmacSha256(
+        fnd::SecretString{std::string(32U, 'n')},
+        "openproof/master-key-fingerprint/v1").value();
+    pg::PostgresMasterKeyRotator rotator{*pool};
+    EXPECT_TRUE(rotator.verifyActive(1U, oldFingerprint));
+    EXPECT_FALSE(rotator.verifyActive(2U, newFingerprint));
+    auto dryRun = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, true);
+    ASSERT_TRUE(dryRun) << dryRun.error().internalDetail();
+    EXPECT_TRUE(dryRun->dryRun);
+    EXPECT_EQ(dryRun->invalidated(), 8U);
+
+    std::unique_ptr<PGresult, ResultDeleter> afterDryRun{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.authentication_transactions)+"
+        "(SELECT count(*) FROM openproof.sessions)+"
+        "(SELECT count(*) FROM openproof.account_verification_challenges)+"
+        "(SELECT count(*) FROM openproof.passkey_registration_ceremonies)+"
+        "(SELECT count(*) FROM openproof.oauth_authorization_codes)+"
+        "(SELECT count(*) FROM openproof.oauth_token_families)+"
+        "(SELECT count(*) FROM openproof.oauth_device_authorizations)+"
+        "(SELECT count(*) FROM openproof.oauth_pushed_authorization_requests),"
+        "(SELECT count(*) FROM openproof.master_key_rotations)")};
+    ASSERT_NE(afterDryRun.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(afterDryRun.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 0), "8");
+    EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 1), "0");
+
+    auto committed = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, false);
+    ASSERT_TRUE(committed) << committed.error().internalDetail();
+    EXPECT_FALSE(committed->dryRun);
+    EXPECT_EQ(committed->invalidated(), 8U);
+    EXPECT_FALSE(rotator.verifyActive(1U, oldFingerprint));
+    EXPECT_TRUE(rotator.verifyActive(2U, newFingerprint));
+
+    std::unique_ptr<PGresult, ResultDeleter> afterCommit{PQexec(
+        direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.authentication_transactions)+"
+        "(SELECT count(*) FROM openproof.sessions)+"
+        "(SELECT count(*) FROM openproof.account_verification_challenges)+"
+        "(SELECT count(*) FROM openproof.passkey_registration_ceremonies)+"
+        "(SELECT count(*) FROM openproof.oauth_authorization_codes)+"
+        "(SELECT count(*) FROM openproof.oauth_token_families)+"
+        "(SELECT count(*) FROM openproof.oauth_device_authorizations)+"
+        "(SELECT count(*) FROM openproof.oauth_pushed_authorization_requests),"
+        "(SELECT count(*) FROM openproof.password_credentials),"
+        "(SELECT count(*) FROM openproof.totp_credentials),"
+        "(SELECT count(*) FROM openproof.recovery_codes),"
+        "(SELECT count(*) FROM openproof.audit_events "
+        "WHERE event_id='master-rotation-audit'),"
+        "(SELECT count(*) FROM openproof.oauth_clients),"
+        "(SELECT count(*) FROM openproof.master_key_rotations WHERE from_version=1 "
+        "AND to_version=2 AND authentication_transactions=1 AND sessions=1 "
+        "AND account_challenges=1 AND passkey_registrations=1 "
+        "AND authorization_codes=1 AND token_families=1 "
+        "AND device_authorizations=1 AND pushed_requests=1)")};
+    ASSERT_NE(afterCommit.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(afterCommit.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(afterCommit.get(), 0, 0), "0");
+    for (int column = 1; column <= 6; ++column) {
+        EXPECT_STREQ(PQgetvalue(afterCommit.get(), 0, column), "1");
+    }
+
+    auto duplicate = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, false);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(), fnd::ErrorCode::AlreadyExists);
+    const auto wrongFingerprint = sec::hmacSha256(
+        fnd::SecretString{std::string(32U, 'x')},
+        "openproof/master-key-fingerprint/v1").value();
+    const auto thirdFingerprint = sec::hmacSha256(
+        fnd::SecretString{std::string(32U, 'z')},
+        "openproof/master-key-fingerprint/v1").value();
+    auto wrongHead = rotator.rotate(
+        2U, wrongFingerprint, 3U, thirdFingerprint, true);
+    ASSERT_FALSE(wrongHead);
+    EXPECT_EQ(wrongHead.error().code(), fnd::ErrorCode::FailedPrecondition);
 }
 
 TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndOneTime)

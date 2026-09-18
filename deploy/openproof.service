@@ -1,0 +1,50 @@
+[Unit]
+Description=OpenProof identity and authorization service
+Documentation=file:/opt/openproof/docs/OPERATIONS.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=openproof
+Group=openproof
+EnvironmentFile=-/etc/openproof/openproof.env
+ExecStartPre=/usr/bin/test -r /etc/openproof/openproof.toml
+ExecStartPre=/usr/bin/test -x /opt/openproof/bin/opp
+ExecStartPre=/opt/openproof/bin/opp check-config --config /etc/openproof/openproof.toml
+ExecStart=/opt/openproof/bin/opp server --config /etc/openproof/openproof.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/run/openproof/secrets
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openproof
+
+[Install]
+WantedBy=multi-user.target

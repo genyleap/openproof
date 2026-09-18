@@ -159,7 +159,8 @@ struct HttpResult final {
 
 [[nodiscard]] foundation::Result<HttpResult> httpsRequest(
     const HttpsUrl& endpoint, http::verb method, std::string body,
-    std::string_view contentType, std::string_view caFile)
+    std::string_view contentType, std::string_view caFile,
+    std::string_view authorization = {})
 {
     try {
         asio::io_context io;
@@ -186,6 +187,9 @@ struct HttpResult final {
         request.set(http::field::user_agent, "OpenProof/1");
         request.set(http::field::accept, "application/json");
         request.set(http::field::cache_control, "no-store");
+        if (!authorization.empty()) {
+            request.set(http::field::authorization, authorization);
+        }
         if (!body.empty()) {
             request.set(http::field::content_type, contentType);
             request.body() = std::move(body);
@@ -204,6 +208,20 @@ struct HttpResult final {
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The OIDC HTTPS request failed.");
     }
+}
+
+[[nodiscard]] std::string standardBase64(std::string_view input)
+{
+    std::vector<std::byte> bytes;
+    bytes.reserve(input.size());
+    for (const char value : input) {
+        bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(value)));
+    }
+    std::string encoded = foundation::toBase64Url(bytes);
+    std::ranges::replace(encoded, '-', '+');
+    std::ranges::replace(encoded, '_', '/');
+    while ((encoded.size() % 4U) != 0U) encoded.push_back('=');
+    return encoded;
 }
 
 [[nodiscard]] foundation::Result<json::object> parseJsonObject(std::string_view body)
@@ -292,6 +310,7 @@ public:
         std::string authorizationEndpoint;
         std::string tokenEndpoint;
         std::string jwksUri;
+        std::vector<std::string> tokenAuthenticationMethods;
         foundation::Instant expiresAt{};
     };
 
@@ -325,7 +344,34 @@ public:
             || !parseHttpsUrl(*authorization) || !parseHttpsUrl(*token) || !parseHttpsUrl(*jwks)) {
             return foundation::fail(authFailure("OIDC discovery metadata failed validation."));
         }
-        Discovery value{*authorization, *token, *jwks, now + std::chrono::hours{1}};
+        std::vector<std::string> tokenAuthenticationMethods;
+        if (const auto* methods = object->if_contains(
+                "token_endpoint_auth_methods_supported"); methods != nullptr) {
+            if (!methods->is_array()) {
+                return foundation::fail(authFailure(
+                    "OIDC discovery token authentication metadata is malformed."));
+            }
+            for (const auto& method : methods->as_array()) {
+                if (!method.is_string() || method.as_string().size() > 128U) {
+                    return foundation::fail(authFailure(
+                        "OIDC discovery token authentication metadata is malformed."));
+                }
+                tokenAuthenticationMethods.emplace_back(method.as_string());
+            }
+        }
+        const std::string_view requiredMethod =
+            config.clientAuthentication()
+                    == OidcClientAuthenticationMethod::ClientSecretBasic
+                ? "client_secret_basic" : "client_secret_post";
+        if (!tokenAuthenticationMethods.empty()
+            && std::ranges::find(tokenAuthenticationMethods, requiredMethod)
+                == tokenAuthenticationMethods.end()) {
+            return foundation::fail(authFailure(
+                "OIDC discovery does not support the configured client authentication method."));
+        }
+        Discovery value{*authorization, *token, *jwks,
+                        std::move(tokenAuthenticationMethods),
+                        now + std::chrono::hours{1}};
         {
             const std::lock_guard guard{mutex};
             cached = value;
@@ -344,11 +390,13 @@ OidcProviderConfig::OidcProviderConfig(
     idp::ProviderId providerId, std::string issuer, std::string clientId,
     foundation::SecretString clientSecret, std::string callbackUri,
     std::vector<std::string> scopes, foundation::SecretString derivationKey,
-    foundation::Duration challengeLifetime)
+    foundation::Duration challengeLifetime,
+    OidcClientAuthenticationMethod clientAuthentication)
     : m_providerId(std::move(providerId)), m_issuer(std::move(issuer)),
       m_clientId(std::move(clientId)), m_clientSecret(std::move(clientSecret)),
       m_callbackUri(std::move(callbackUri)), m_scopes(std::move(scopes)),
-      m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime) {}
+      m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
+      m_clientAuthentication(clientAuthentication) {}
 
 
 const idp::ProviderId& OidcProviderConfig::providerId() const noexcept { return m_providerId; }
@@ -359,12 +407,15 @@ std::string_view OidcProviderConfig::callbackUri() const noexcept { return m_cal
 const std::vector<std::string>& OidcProviderConfig::scopes() const noexcept { return m_scopes; }
 const foundation::SecretString& OidcProviderConfig::derivationKey() const noexcept { return m_derivationKey; }
 foundation::Duration OidcProviderConfig::challengeLifetime() const noexcept { return m_challengeLifetime; }
+OidcClientAuthenticationMethod OidcProviderConfig::clientAuthentication() const noexcept
+{ return m_clientAuthentication; }
 
 foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     idp::ProviderId providerId, std::string issuer, std::string clientId,
     foundation::SecretString clientSecret, std::string callbackUri,
     std::vector<std::string> scopes, foundation::SecretString derivationKey,
-    foundation::Duration challengeLifetime)
+    foundation::Duration challengeLifetime,
+    OidcClientAuthenticationMethod clientAuthentication)
 {
     while (issuer.size() > 8U && issuer.ends_with('/')) issuer.pop_back();
     if (providerId.empty() || !safeText(clientId, 512U) || clientSecret.empty()
@@ -372,6 +423,8 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
         || challengeLifetime <= foundation::Duration::zero()
         || challengeLifetime > std::chrono::minutes{15}
         || !parseHttpsUrl(issuer) || !parseHttpsUrl(callbackUri)
+        || (clientAuthentication == OidcClientAuthenticationMethod::ClientSecretBasic
+            && (clientId.contains(':') || clientSecret.expose().contains(':')))
         || scopes.empty() || scopes.size() > 32U
         || std::ranges::any_of(scopes, [](const std::string& scope) {
                return !safeText(scope, 128U) || scope.contains(' ');
@@ -381,7 +434,8 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     }
     return OidcProviderConfig{std::move(providerId), std::move(issuer),
         std::move(clientId), std::move(clientSecret), std::move(callbackUri),
-        std::move(scopes), std::move(derivationKey), challengeLifetime};
+        std::move(scopes), std::move(derivationKey), challengeLifetime,
+        clientAuthentication};
 }
 
 OidcAuthenticationProvider::OidcAuthenticationProvider(
@@ -473,10 +527,21 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     append("code", *code);
     append("redirect_uri", m_implementation->config.callbackUri());
     append("client_id", m_implementation->config.clientId());
-    append("client_secret", m_implementation->config.clientSecret().expose());
+    std::string authorization;
+    if (m_implementation->config.clientAuthentication()
+        == OidcClientAuthenticationMethod::ClientSecretPost) {
+        append("client_secret", m_implementation->config.clientSecret().expose());
+    } else {
+        std::string credentials{m_implementation->config.clientId()};
+        credentials.push_back(':');
+        credentials.append(m_implementation->config.clientSecret().expose());
+        authorization = "Basic " + standardBase64(credentials);
+        std::ranges::fill(credentials, '\0');
+    }
     append("code_verifier", verifier.value());
     auto tokenResponse = httpsRequest(tokenEndpoint.value(), http::verb::post, std::move(form),
-                                      "application/x-www-form-urlencoded", m_implementation->caFile);
+                                      "application/x-www-form-urlencoded", m_implementation->caFile,
+                                      authorization);
     if (!tokenResponse || tokenResponse->status != 200U) {
         return foundation::fail(authFailure("The OIDC token exchange failed."));
     }

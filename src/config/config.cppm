@@ -82,6 +82,8 @@ private:
  *
  *   - `env:NAME`   reads the environment variable NAME.
  *   - `file:/path` reads the contents of /path, stripping one trailing newline.
+ *   - `hexfile:/path` decodes an even-length hexadecimal file after stripping
+ *     one trailing newline; this is used for binary derived-key material.
  *
  * Any other form is rejected with ErrorCode::InvalidArgument, including a plain
  * literal. Rejecting literals is the point: a configuration file is routinely
@@ -138,11 +140,44 @@ private:
     bool m_console{true};
 };
 
+/** @brief Authenticated operational metrics settings. */
+class OperationsConfig final {
+public:
+    [[nodiscard]] static foundation::Result<OperationsConfig>
+    create(bool metricsEnabled, foundation::SecretString metricsBearerToken,
+           std::size_t metricsMaximumSeries = 512U);
+    OperationsConfig(const OperationsConfig&) = delete;
+    OperationsConfig& operator=(const OperationsConfig&) = delete;
+    OperationsConfig(OperationsConfig&&) noexcept = default;
+    OperationsConfig& operator=(OperationsConfig&&) noexcept = default;
+    ~OperationsConfig() = default;
+
+    [[nodiscard]] bool metricsEnabled() const noexcept;
+    [[nodiscard]] const foundation::SecretString& metricsBearerToken() const noexcept;
+    [[nodiscard]] std::size_t metricsMaximumSeries() const noexcept;
+
+private:
+    OperationsConfig(bool metricsEnabled,
+                     foundation::SecretString metricsBearerToken,
+                     std::size_t metricsMaximumSeries);
+    bool m_metricsEnabled{};
+    foundation::SecretString m_metricsBearerToken;
+    std::size_t m_metricsMaximumSeries{512U};
+};
+
 /** @brief Secret material required at startup. */
 class SecurityConfig final {
 public:
     SecurityConfig() = default;
-    explicit SecurityConfig(foundation::SecretString tokenSigningKey);
+    explicit SecurityConfig(
+        foundation::SecretString tokenSigningKey,
+        foundation::SecretString credentialEncryptionKey = {},
+        unsigned int credentialEncryptionKeyVersion = 1U,
+        unsigned int masterKeyVersion = 1U,
+        foundation::SecretString passwordPepper = {},
+        foundation::SecretString recoveryCodePepper = {},
+        foundation::SecretString auditChainKey = {},
+        foundation::SecretString oauthClientSecretKey = {});
 
     SecurityConfig(const SecurityConfig&) = delete;
     SecurityConfig& operator=(const SecurityConfig&) = delete;
@@ -152,9 +187,32 @@ public:
 
     /** @brief Master key used to derive platform signing and token keys. */
     [[nodiscard]] const foundation::SecretString& tokenSigningKey() const noexcept;
+    /** Optional dedicated AES-256 key for persisted credential envelopes. */
+    [[nodiscard]] const foundation::SecretString& credentialEncryptionKey() const noexcept;
+    /** Monotonic version stored beside every encrypted credential envelope. */
+    [[nodiscard]] unsigned int credentialEncryptionKeyVersion() const noexcept;
+    /** Monotonic operator-controlled version of the multi-purpose master key. */
+    [[nodiscard]] unsigned int masterKeyVersion() const noexcept;
+    /** Optional dedicated pepper for durable password hashes. */
+    [[nodiscard]] const foundation::SecretString& passwordPepper() const noexcept;
+    /** Optional dedicated pepper for durable recovery-code digests. */
+    [[nodiscard]] const foundation::SecretString& recoveryCodePepper() const noexcept;
+    /** Optional dedicated key for the durable audit chain. */
+    [[nodiscard]] const foundation::SecretString& auditChainKey() const noexcept;
+    /** Optional dedicated key for durable confidential-client secret digests. */
+    [[nodiscard]] const foundation::SecretString& oauthClientSecretKey() const noexcept;
+    /** True only when every long-lived one-way/envelope secret is master-independent. */
+    [[nodiscard]] bool hasDedicatedPersistentKeys() const noexcept;
 
 private:
     foundation::SecretString m_tokenSigningKey;
+    foundation::SecretString m_credentialEncryptionKey;
+    unsigned int m_credentialEncryptionKeyVersion{1U};
+    unsigned int m_masterKeyVersion{1U};
+    foundation::SecretString m_passwordPepper;
+    foundation::SecretString m_recoveryCodePepper;
+    foundation::SecretString m_auditChainKey;
+    foundation::SecretString m_oauthClientSecretKey;
 };
 
 
@@ -187,23 +245,34 @@ class GatewayConfig final {
 public:
     [[nodiscard]] static foundation::Result<GatewayConfig>
     create(bool enabled, std::string routePrefix, std::string upstreamHost,
-           std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile);
+           std::uint16_t upstreamPort, bool upstreamTls, std::string upstreamCaFile,
+           std::size_t rateLimitCapacity = 1'000U,
+           std::size_t rateLimitRefillPerSecond = 100U,
+           std::size_t rateLimitMaximumKeys = 100'000U);
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] std::string_view routePrefix() const noexcept;
     [[nodiscard]] std::string_view upstreamHost() const noexcept;
     [[nodiscard]] std::uint16_t upstreamPort() const noexcept;
     [[nodiscard]] bool upstreamTls() const noexcept;
     [[nodiscard]] std::string_view upstreamCaFile() const noexcept;
+    [[nodiscard]] std::size_t rateLimitCapacity() const noexcept;
+    [[nodiscard]] std::size_t rateLimitRefillPerSecond() const noexcept;
+    [[nodiscard]] std::size_t rateLimitMaximumKeys() const noexcept;
 private:
     GatewayConfig(bool enabled, std::string routePrefix, std::string upstreamHost,
                   std::uint16_t upstreamPort, bool upstreamTls,
-                  std::string upstreamCaFile);
+                  std::string upstreamCaFile, std::size_t rateLimitCapacity,
+                  std::size_t rateLimitRefillPerSecond,
+                  std::size_t rateLimitMaximumKeys);
     bool m_enabled{};
     std::string m_routePrefix;
     std::string m_upstreamHost;
     std::uint16_t m_upstreamPort{};
     bool m_upstreamTls{};
     std::string m_upstreamCaFile;
+    std::size_t m_rateLimitCapacity{1'000U};
+    std::size_t m_rateLimitRefillPerSecond{100U};
+    std::size_t m_rateLimitMaximumKeys{100'000U};
 };
 
 class DatabaseConfig final {
@@ -352,6 +421,7 @@ public:
 
     [[nodiscard]] const ServerConfig& server() const noexcept;
     [[nodiscard]] const LoggingConfig& logging() const noexcept;
+    [[nodiscard]] const OperationsConfig& operations() const noexcept;
     [[nodiscard]] const SecurityConfig& security() const noexcept;
     [[nodiscard]] const GatewayConfig& gateway() const noexcept;
     [[nodiscard]] const DatabaseConfig& database() const noexcept;
@@ -362,12 +432,14 @@ public:
     [[nodiscard]] foundation::Status validateServerDeployment() const;
 
 private:
-    PlatformConfig(ServerConfig server, LoggingConfig logging, SecurityConfig security,
+    PlatformConfig(ServerConfig server, LoggingConfig logging, OperationsConfig operations,
+                   SecurityConfig security,
                    GatewayConfig gateway, DatabaseConfig database, AuthConfig auth,
                    AccountConfig account, OidcConfig oidc);
 
     ServerConfig m_server;
     LoggingConfig m_logging;
+    OperationsConfig m_operations;
     SecurityConfig m_security;
     GatewayConfig m_gateway;
     DatabaseConfig m_database;

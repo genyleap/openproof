@@ -10,12 +10,14 @@
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.profile;
 import openproof.identity.provider;
 import openproof.security;
 
 namespace auth = openproof::authentication;
 namespace fnd = openproof::foundation;
 namespace core = openproof::identity::core;
+namespace profile = openproof::identity::profile;
 namespace idp = openproof::identity::provider;
 namespace sec = openproof::security;
 
@@ -90,7 +92,7 @@ public:
 
         return idp::AuthenticationOutcome::create(
             idp::ProviderId{outcomeProvider.empty() ? m_id : outcomeProvider},
-            idp::ExternalSubject{outcomeSubject}, idp::VerifiedClaims{}, outcomeAssurance,
+            idp::ExternalSubject{outcomeSubject}, claims, outcomeAssurance,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
             idp::ProviderEvidence{}, verifiedAt);
     }
@@ -100,6 +102,7 @@ public:
     fnd::Instant verifiedAt{kNow};
     std::string outcomeProvider;
     std::string outcomeSubject{"subject-1"};
+    idp::VerifiedClaims claims;
     std::string challengeId{"challenge-1"};
     bool failBegin{false};
     bool failComplete{false};
@@ -480,4 +483,181 @@ TEST(AuthenticationServiceTest, SelfProvisioningCreatesOnlyANewCanonicalIdentity
     ASSERT_TRUE(canonical);
     ASSERT_TRUE(canonical->has_value());
     EXPECT_TRUE(canonical->value().canAuthenticate());
+}
+
+TEST(AuthenticationServiceTest, ConnectionCeremonyAttachesToItsServerBoundIdentity)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "subject-2";
+    auto service = fixture.service();
+    const auto binding = bindingOf("authenticated-browser");
+    auto started = service.beginConnection(
+        fixture.request(), binding, fnd::CorrelationId{"corr-connect"},
+        core::IdentityId{"identity-1"});
+    ASSERT_TRUE(started) << started.error().internalDetail();
+
+    auto connected = service.completeConnection(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(connected) << connected.error().internalDetail();
+    EXPECT_EQ(connected->providerId(), idp::ProviderId{"provider-a"});
+    EXPECT_EQ(connected->subject(), idp::ExternalSubject{"subject-2"});
+    auto owner = fixture.identities.ownerOf(*connected);
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), core::IdentityId{"identity-1"});
+}
+
+TEST(AuthenticationServiceTest, LoginAndConnectionCeremoniesCannotBeSwapped)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "subject-2";
+    auto service = fixture.service();
+    const auto binding = bindingOf("authenticated-browser");
+
+    auto connection = service.beginConnection(
+        fixture.request(), binding, fnd::CorrelationId{"corr-connect"},
+        core::IdentityId{"identity-1"});
+    ASSERT_TRUE(connection);
+    auto connectionAsLogin = service.complete(
+        connection->transactionId(), connection->continuationToken(), binding,
+        validResponse(connection->challenge().id()));
+    ASSERT_FALSE(connectionAsLogin);
+    EXPECT_EQ(connectionAsLogin.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    auto login = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-login"});
+    ASSERT_TRUE(login);
+    auto loginAsConnection = service.completeConnection(
+        login->transactionId(), login->continuationToken(), binding,
+        validResponse(login->challenge().id()));
+    ASSERT_FALSE(loginAsConnection);
+    EXPECT_EQ(loginAsConnection.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
+TEST(AuthenticationServiceTest, ConnectionRefusesAnAccountOwnedByAnotherIdentity)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    const auto binding = bindingOf("authenticated-browser");
+    auto started = service.beginConnection(
+        fixture.request(), binding, fnd::CorrelationId{"corr-connect"},
+        core::IdentityId{"identity-2"});
+    ASSERT_TRUE(started);
+
+    auto connected = service.completeConnection(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_FALSE(connected);
+    EXPECT_EQ(connected.error().code(), fnd::ErrorCode::Conflict);
+    auto owner = fixture.identities.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"subject-1"}});
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), core::IdentityId{"identity-1"});
+}
+
+TEST(AuthenticationServiceTest, DisconnectRefusesTheLastSignInMethod)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    const core::ExternalIdentityRef first{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"subject-1"}};
+
+    auto last = service.disconnect(core::IdentityId{"identity-1"}, first);
+    ASSERT_FALSE(last);
+    EXPECT_EQ(last.error().code(), fnd::ErrorCode::FailedPrecondition);
+
+    fixture.implementation->outcomeSubject = "subject-2";
+    const auto binding = bindingOf("authenticated-browser");
+    auto started = service.beginConnection(
+        fixture.request(), binding, fnd::CorrelationId{"corr-connect"},
+        core::IdentityId{"identity-1"});
+    ASSERT_TRUE(started);
+    auto second = service.completeConnection(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(second);
+
+    auto removed = service.disconnect(core::IdentityId{"identity-1"}, *second);
+    ASSERT_TRUE(removed) << removed.error().internalDetail();
+    auto remaining = service.connections(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->size(), 1U);
+    EXPECT_EQ(remaining->front().providerId(), first.providerId());
+    EXPECT_EQ(remaining->front().subject(), first.subject());
+}
+
+TEST(AuthenticationServiceTest, SelfProvisioningPersistsVerifiedProfileClaims)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "new-profile-subject";
+    fixture.implementation->claims.set(idp::ClaimName::DisplayName, "Ada Example");
+    fixture.implementation->claims.set(idp::ClaimName::PreferredUsername, "ada");
+    fixture.implementation->claims.set(idp::ClaimName::Email, "ada@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+    const auto binding = bindingOf("federated-browser");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-profile"});
+    ASSERT_TRUE(started);
+
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+    auto stored = profiles.find(completed->identity());
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().displayName(), "Ada Example");
+    EXPECT_EQ(stored->value().preferredUsername(), "ada");
+    EXPECT_EQ(stored->value().email(), "ada@example.test");
+    EXPECT_TRUE(stored->value().emailVerified());
+}
+
+TEST(AuthenticationServiceTest, BrowserConnectionHandoffIsBoundAndSingleUse)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto issued = service.issueBrowserConnectionHandoff(
+        core::IdentityId{"identity-1"}, idp::ProviderId{"provider-a"},
+        "/connections?completed=1", fnd::CorrelationId{"corr-handoff"});
+    ASSERT_TRUE(issued) << issued.error().internalDetail();
+    EXPECT_EQ(issued->expiresAt(), kNow + std::chrono::minutes{2});
+
+    auto consumed = service.consumeBrowserConnectionHandoff(issued->ticket());
+    ASSERT_TRUE(consumed) << consumed.error().internalDetail();
+    EXPECT_EQ(consumed->identity, core::IdentityId{"identity-1"});
+    EXPECT_EQ(consumed->providerId, idp::ProviderId{"provider-a"});
+    EXPECT_EQ(consumed->returnTarget, "/connections?completed=1");
+
+    auto replay = service.consumeBrowserConnectionHandoff(issued->ticket());
+    ASSERT_FALSE(replay);
+    EXPECT_EQ(replay.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
+TEST(AuthenticationServiceTest, BrowserConnectionHandoffExpiresClosed)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto issued = service.issueBrowserConnectionHandoff(
+        core::IdentityId{"identity-1"}, idp::ProviderId{"provider-a"},
+        "/connections", fnd::CorrelationId{"corr-handoff"});
+    ASSERT_TRUE(issued);
+    fixture.clock.advance(std::chrono::minutes{2});
+
+    auto expired = service.consumeBrowserConnectionHandoff(issued->ticket());
+
+    ASSERT_FALSE(expired);
+    EXPECT_EQ(expired.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }

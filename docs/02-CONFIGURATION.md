@@ -70,15 +70,62 @@ fallback to `info`.
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`.
 
+### `[operations]`
+
+| Key | Type | Default | Class |
+|---|---|---|---|
+| `metrics_enabled` | boolean | `false` | Private |
+| `metrics_bearer_token` | secret reference resolving to at least 32 bytes | unset | Secret |
+| `metrics_maximum_series` | integer 128–10,000 | `512` | Private |
+
+When enabled, `GET /metrics` exposes Prometheus text only after an exact
+`Authorization: Bearer ...` match using constant-time comparison. `HEAD
+/metrics` performs the same authentication without returning a body. Enabling
+the endpoint without a sufficiently strong token fails configuration loading;
+unknown keys, wrong types and an out-of-range series ceiling also fail closed.
+
+The built-in HTTP series use only the finite `method` and `status_class` labels.
+They are held in a fixed-size atomic matrix and therefore cannot grow with
+traffic; `metrics_maximum_series` bounds additional registry series.
+Raw paths, query strings, tenant/user/client identifiers, IP addresses and
+credentials are never labels. Keep the endpoint on the loopback/private
+management plane: the shipped public Nginx configuration returns `404` for
+`/metrics` even when application metrics are enabled.
+
 ### `[security]`
 
 | Key | Type | Default | Class |
 |---|---|---|---|
 | `token_signing_key` | secret reference | unset | Secret |
+| `master_key_version` | integer 1–2147483647 | `1` | Private |
+| `credential_encryption_key` | secret reference resolving to exactly 32 bytes | derived legacy key | Secret |
+| `credential_encryption_key_version` | integer 1–2147483647 | `1` | Private |
+| `password_pepper` | secret reference resolving to at least 32 bytes | derived legacy key | Secret |
+| `recovery_code_pepper` | secret reference resolving to at least 32 bytes | derived legacy key | Secret |
+| `audit_chain_key` | secret reference resolving to at least 32 bytes | derived legacy key | Secret |
+| `oauth_client_secret_key` | secret reference resolving to at least 32 bytes | derived legacy key | Secret |
 
 Required by `opp server`, with a minimum resolved length of 32 bytes. The process
 derives independent session and trusted-context keys using HMAC domain labels;
 the configured master is not used directly as either operational key.
+
+`credential_encryption_key` is the versioned AES-256-GCM envelope key for
+persisted TOTP seeds. New deployments should configure it explicitly. When it
+is absent at version `1`, OpenProof derives the legacy TOTP key from
+`token_signing_key` so existing databases remain readable. Any version other
+than `1` requires an explicit key. A key file may end with one line ending,
+which the secret-reference loader strips; `openssl rand -base64 24` therefore
+produces exactly 32 key bytes after loading.
+
+The four additional dedicated keys protect long-lived one-way state: password
+hashes, recovery-code digests, the append-only audit chain and confidential
+OAuth client-secret digests. Version-1 deployments may omit them for backward
+compatibility, in which case domain-separated values are derived from
+`token_signing_key`. New deployments should configure all four plus the TOTP
+key immediately. A `master_key_version` greater than `1` fails configuration
+validation unless every persistent key is explicit; this prevents an operator
+from silently making dormant passwords or client secrets unverifiable during a
+master cutover.
 
 ### `[gateway]`
 
@@ -90,6 +137,9 @@ the configured master is not used directly as either operational key.
 | `upstream_port` | integer 1–65535 | unset | Private |
 | `upstream_tls` | boolean | `true` | Private |
 | `upstream_ca_file` | path | system trust store | Private |
+| `rate_limit_capacity` | integer 1–1000000 | `1000` | Private |
+| `rate_limit_refill_per_second` | integer 1–1000000 | `100` | Private |
+| `rate_limit_maximum_keys` | integer 1–1000000 | `100000` | Private |
 
 When enabled, host and port are mandatory. A CA file is rejected for a plaintext
 upstream. Route prefixes must be canonical segment prefixes: no query, fragment,
@@ -105,7 +155,7 @@ control character, `//` prefix or trailing slash (except `/`).
 
 `OPENPROOF_DATABASE_URL` is accepted directly because process environments are
 already secret-bearing deployment channels; the TOML value must still use an
-`env:` or `file:` reference. Enabling authentication requires a database. The
+`env:`, `file:` or `hexfile:` reference. Enabling authentication requires a database. The
 process opens a bounded pool and applies every checksummed migration before it
 opens the listener.
 
@@ -304,6 +354,7 @@ reference, and the loader dereferences it:
 |---|---|
 | `env:NAME` | The value of environment variable `NAME` |
 | `file:/path` | The contents of `/path`, with one trailing line ending stripped |
+| `hexfile:/path` | Lower/uppercase hexadecimal decoded to exact binary bytes; one trailing line ending is allowed |
 
 Anything else — including a plain literal — is rejected with
 `INVALID_ARGUMENT`. Rejecting literals is the point: a configuration file is
@@ -316,8 +367,11 @@ operator did inline a credential, quoting it back would copy it straight into
 the logs.
 
 An `env:` reference to an unset variable fails with `FAILED_PRECONDITION`; a
-`file:` reference to a missing file fails with `NOT_FOUND`. Neither is treated
-as "no secret configured".
+`file:` or `hexfile:` reference to a missing file fails with `NOT_FOUND`.
+Malformed or odd-length hexadecimal is rejected. `hexfile:` is intended for
+binary-safe secret-store files and the legacy persistent-key materialization
+ceremony; it never treats encoded bytes as their printable hex text. None of
+these failures is treated as "no secret configured".
 
 ---
 
@@ -334,8 +388,20 @@ port = 8443
 level = "info"
 console = true
 
+[operations]
+metrics_enabled = true
+metrics_bearer_token = "file:/run/openproof/secrets/metrics-bearer.token"
+metrics_maximum_series = 512
+
 [security]
 token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+master_key_version = 1
+credential_encryption_key = "env:OPENPROOF_CREDENTIAL_ENCRYPTION_KEY"
+credential_encryption_key_version = 1
+password_pepper = "file:/run/openproof/secrets/password-pepper.key"
+recovery_code_pepper = "file:/run/openproof/secrets/recovery-code-pepper.key"
+audit_chain_key = "file:/run/openproof/secrets/audit-chain.key"
+oauth_client_secret_key = "file:/run/openproof/secrets/oauth-client-secret.key"
 
 [gateway]
 enabled = true
@@ -343,6 +409,9 @@ route_prefix = "/api"
 upstream_host = "api.internal.example"
 upstream_port = 443
 upstream_tls = true
+rate_limit_capacity = 1000
+rate_limit_refill_per_second = 100
+rate_limit_maximum_keys = 100000
 
 [database]
 connection_string = "env:OPENPROOF_DATABASE_URL"
@@ -365,6 +434,7 @@ minimum_assurance = "ial2"
 
 ```bash
 export OPENPROOF_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
+export OPENPROOF_CREDENTIAL_ENCRYPTION_KEY="$(openssl rand -base64 24)"
 export OPENPROOF_DATABASE_URL="postgresql://openproof@127.0.0.1/openproof"
 opp server --config openproof.toml
 ```
@@ -392,6 +462,41 @@ mount is present.
 `opp bootstrap-admin` does not open a listener. It requires `[auth].enabled`, a
 database, a master key, a configuration file and all non-secret bootstrap
 arguments. Repeating it returns exit code `2` without printing a new TOTP seed.
+
+`opp rekey-totp` is the offline operator command for atomically rotating the
+dedicated TOTP envelope key. Its complete call sequence and rollback rules are
+in [the operations runbook](OPERATIONS.md#totp-credential-key-rotation). This
+command is separate from `opp rotate-master-key`.
+
+`opp rotate-master-key` retires a multi-purpose master after verifying that all
+long-lived one-way/encrypted state uses independent keys. In a serializable,
+locked transaction it deletes sessions, authentication/account challenges,
+incomplete passkey-registration ceremonies, authorization codes, token families,
+device grants and PAR objects derived from the old master, then writes their
+exact counts plus a non-secret fingerprint/version journal. Passwords, TOTP,
+registered passkey credentials, recovery codes, audit records and OAuth client
+secrets are deliberately preserved. See [the exact
+runbook](OPERATIONS.md#master-key-rotation).
+
+Legacy version-1 deployments must first export the exact domain-separated
+durable subkeys derived from their current master into an existing empty,
+owner-only directory:
+
+```bash
+opp materialize-persistent-keys \
+  --config /etc/openproof/openproof.toml \
+  --output-directory /run/openproof/materialized-v1 \
+  --acknowledge-secret-export
+```
+
+Configure the five generated values through `hexfile:` references while keeping
+`master_key_version = 1`, verify a restart and credential flows, and only then
+run the master rotation ceremony. The materializer refuses mixed/already-
+dedicated configurations, unsafe directories and existing output files; it
+never prints the master or generated key values. These values preserve legacy
+credentials but remain derivable from the old master; materialization is not a
+remedy for an already compromised legacy master. See the incident distinction
+in the operations runbook.
 
 | Exit code | Meaning |
 |---|---|
@@ -480,6 +585,18 @@ and JWKS HTTPS requests.
   provider uses Authorization Code with PKCE, revalidates the authenticated user
   through the GitHub REST API after every sign-in, and accepts an email claim only
   when GitHub reports the primary address as verified.
+- LinkedIn: `OPENPROOF_LINKEDIN_CLIENT_ID`, `OPENPROOF_LINKEDIN_CLIENT_SECRET`;
+  optional `OPENPROOF_LINKEDIN_ISSUER` (default
+  `https://www.linkedin.com/oauth`). Enable the **Sign in with LinkedIn using
+  OpenID Connect** product for the application; OpenProof requests only
+  `openid profile email`.
+- Telegram: `OPENPROOF_TELEGRAM_CLIENT_ID`,
+  `OPENPROOF_TELEGRAM_CLIENT_SECRET`; optional `OPENPROOF_TELEGRAM_ISSUER`
+  (default `https://oauth.telegram.org`). Obtain both values and register the
+  exact callback through BotFather. Telegram token exchange uses
+  `client_secret_basic`; keep the bot's ID-token algorithm at the OpenProof-
+  supported default `RS256`. The default scopes are `openid profile`; phone and
+  bot messaging permission are deliberately not requested.
 
 OIDC discovery metadata and JWKS are fetched over certificate-verified TLS. The
 browser flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
@@ -487,6 +604,15 @@ accepted only after signature, issuer, audience, expiry, issued-at and nonce
 validation. A previously unseen verified upstream subject may create a new
 canonical identity only for explicitly trusted federation providers; email
 claims are never used to silently link an existing account.
+
+An authenticated user may explicitly attach any enabled redirect provider with
+`GET /account/connections/start`. This uses the same registered federation
+callback URI. The target OpenProof identity is captured from the authenticated
+session at start and stored only in the server-side transaction; callback query
+parameters cannot choose or replace it. Connection completion does not issue a
+new session. Operators should expose `GET /account/connections` and disconnect
+controls only over the authenticated account UI; the final sign-in method is
+protected from removal.
 
 ### WebAuthn / passkeys
 
@@ -515,11 +641,16 @@ bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS `OPENPROOF_WEB3_URI`;
   `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION`. EOA signatures are recovered on
   secp256k1 and contract wallets are verified through ERC-1271.
 - Farcaster: `OPENPROOF_FARCASTER_RPC_ENDPOINT`,
-  `OPENPROOF_FARCASTER_ID_REGISTRY`; optional
-  `OPENPROOF_FARCASTER_CHAIN_ID` (default `10`) and
-  `OPENPROOF_FARCASTER_RPC_AUTHORIZATION`. The signed SIWE proof is bound to the
-  FID and current custody is independently rechecked against the configured
-  IdRegistry.
+  optional `OPENPROOF_FARCASTER_ID_REGISTRY` and
+  `OPENPROOF_FARCASTER_KEY_REGISTRY` overrides, and optional
+  `OPENPROOF_FARCASTER_RPC_AUTHORIZATION`. SIWF is fixed to Optimism mainnet
+  chain ID `10`; the default registries are the canonical Farcaster IdRegistry
+  (`0x00000000fc6c5f01fc30151999387bb99a9f489b`) and KeyRegistry
+  (`0x00000000fc1237824fb747abde0ff18990e59b7e`). The signed FIP-11 proof binds
+  statement `Farcaster Auth` and resource `farcaster://fids/<fid>`. OpenProof
+  independently rechecks custody or an active type-2 auth address after
+  signature verification. Setting `OPENPROOF_FARCASTER_CHAIN_ID` to a value
+  other than `10` is rejected.
 
 Web3 authentication is classified as a possession factor but is not promoted to
 WebAuthn-style phishing resistance.

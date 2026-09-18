@@ -43,31 +43,25 @@ public:
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
 private:
-    [[nodiscard]] foundation::Result<identity::core::IdentityId>
-    authorize(gateway::HttpRequest& request) const;
+    [[nodiscard]] foundation::Result<identity::core::IdentityId> authorize(gateway::HttpRequest& request) const;
     [[nodiscard]] gateway::HttpResponse consolePage(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse listApplications(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse createApplication(gateway::HttpRequest request);
-    [[nodiscard]] gateway::HttpResponse changeApplication(gateway::HttpRequest request,
-                                                            std::string_view action);
+    [[nodiscard]] gateway::HttpResponse changeApplication(gateway::HttpRequest request, std::string_view action);
     [[nodiscard]] gateway::HttpResponse listClients(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse createClient(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse rotateClientSecret(gateway::HttpRequest request);
-    [[nodiscard]] gateway::HttpResponse changeClient(gateway::HttpRequest request,
-                                                       std::string_view action);
+    [[nodiscard]] gateway::HttpResponse changeClient(gateway::HttpRequest request, std::string_view action);
     [[nodiscard]] gateway::HttpResponse jarKey(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse registerJarKey(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse removeJarKey(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse listResources(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse createResource(gateway::HttpRequest request);
-    [[nodiscard]] gateway::HttpResponse changeResource(
-        gateway::HttpRequest request, std::string_view action);
+    [[nodiscard]] gateway::HttpResponse changeResource(gateway::HttpRequest request, std::string_view action);
     [[nodiscard]] gateway::HttpResponse provisionServiceIdentity(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse serviceIdentity(gateway::HttpRequest request);
-    [[nodiscard]] gateway::HttpResponse changeServiceIdentity(
-        gateway::HttpRequest request, bool active);
-    [[nodiscard]] gateway::HttpResponse error(const foundation::Error& failure,
-                                               const gateway::HttpRequest& request) const;
+    [[nodiscard]] gateway::HttpResponse changeServiceIdentity(gateway::HttpRequest request, bool active);
+    [[nodiscard]] gateway::HttpResponse error(const foundation::Error& failure,const gateway::HttpRequest& request) const;
 
     ApplicationRegistry* m_applications;
     ApplicationRepository* m_applicationRepository;

@@ -11,6 +11,7 @@ module;
 #include <utility>
 
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 
 module openproof.security;
 
@@ -56,6 +57,11 @@ foundation::Result<AeadKey> AeadKey::create(foundation::SecretString key)
                                 "An authenticated-encryption key must contain exactly 32 bytes.");
     }
     return AeadKey{std::move(key)};
+}
+
+bool AeadKey::matches(const AeadKey& other) const noexcept
+{
+    return CRYPTO_memcmp(m_key.expose().data(), other.m_key.expose().data(), 32U) == 0;
 }
 
 foundation::Result<std::vector<std::byte>> sealAes256Gcm(

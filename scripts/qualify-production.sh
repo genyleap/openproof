@@ -12,6 +12,10 @@ fail() {
     || fail "OPENPROOF_TEST_POSTGRES must name a disposable PostgreSQL test database"
 [[ "${OPENPROOF_TEST_DATABASE_ACK:-}" == "YES_I_UNDERSTAND_THIS_DATABASE_IS_DESTRUCTIVE" ]] \
     || fail "set OPENPROOF_TEST_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_IS_DESTRUCTIVE"
+[[ -n "${OPENPROOF_E2E_POSTGRES:-}" ]] \
+    || fail "OPENPROOF_E2E_POSTGRES must name a second, empty disposable PostgreSQL database"
+[[ "${OPENPROOF_E2E_DATABASE_ACK:-}" == "YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE" ]] \
+    || fail "set OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
 
 # The PostgreSQL integration fixture truncates OpenProof tables. Never point this
 # script at production, staging, or a shared development database.
@@ -23,9 +27,11 @@ OPENPROOF_STATIC_ONLY=1 "${ROOT_DIR}/scripts/verify-release.sh"
 run_preset() {
     local preset="$1"
     local build_dir="${ROOT_DIR}/cmake-build-${preset}"
-    rm -rf "${build_dir}"
     cmake --preset "${preset}"
-    cmake --build --preset "${preset}"
+    # CMake owns the clean operation and the preset fixes the build directory;
+    # avoid a shell-recursive deletion whose target could be broadened by a
+    # future path-editing mistake.
+    cmake --build --preset "${preset}" --clean-first
 
     local ctest_log
     ctest_log="$(mktemp)"
@@ -65,19 +71,24 @@ else
     fail "Node/npm are required to qualify the JavaScript SDK"
 fi
 
-if command -v kotlinc >/dev/null 2>&1; then
-    KOTLIN_TMP="$(mktemp -d)"
-    kotlinc "${ROOT_DIR}/sdk/kotlin/src/main/kotlin/org/openproof/identity/OpenProof.kt" \
-        -d "${KOTLIN_TMP}/openproof-sdk.jar"
-    rm -rf "${KOTLIN_TMP}"
+if [[ -x "${ROOT_DIR}/sdk/kotlin/gradlew" ]]; then
+    (cd "${ROOT_DIR}/sdk/kotlin" && ./gradlew --no-daemon build)
 else
-    fail "kotlinc is required to qualify the Kotlin SDK"
+    fail "the pinned Kotlin Gradle Wrapper is required to qualify the Kotlin SDK"
 fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     command -v swift >/dev/null 2>&1 || fail "Swift is required on Darwin to qualify the Swift SDK"
-    swift build --package-path "${ROOT_DIR}/sdk/swift"
+    swift test --package-path "${ROOT_DIR}/sdk/swift"
 fi
 
-printf 'OpenProof production qualification build/test/sanitizer gates passed.\n'
-printf 'Remaining launch gates are deployment E2E, load/soak, backup/restore and product-required P0 capabilities.\n'
+node "${ROOT_DIR}/scripts/e2e-identity-platform.mjs"
+
+fuzz_artifacts="$(mktemp -d)"
+OPENPROOF_FUZZ_RUNS="${OPENPROOF_QUALIFICATION_FUZZ_RUNS:-100000}" \
+OPENPROOF_FUZZ_ARTIFACTS="${fuzz_artifacts}" \
+    "${ROOT_DIR}/scripts/qualify-fuzzing.sh"
+printf 'Coverage-guided fuzz artifacts retained for review: %s\n' "${fuzz_artifacts}"
+
+printf 'OpenProof production qualification build/test/sanitizer/SDK/TLS-identity-E2E/fuzz gates passed.\n'
+printf 'Remaining target launch gates are real-edge interoperability, target-environment product-shaped load/soak, an extended release fuzz campaign, independent security review and target secret-store/KMS rotation rehearsal.\n'

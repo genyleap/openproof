@@ -32,15 +32,11 @@ public:
     [[nodiscard]] virtual foundation::Result<Session>
     use(const TokenDigest& token, foundation::Instant now) = 0;
     [[nodiscard]] virtual foundation::Status
-    rotate(const SessionId& id, const TokenDigest& expected,
-           TokenDigest replacement, foundation::Instant now) = 0;
-    [[nodiscard]] virtual foundation::Status revoke(const SessionId& id,
-                                                    foundation::Instant now) = 0;
+    rotate(const SessionId& id, const TokenDigest& expected, TokenDigest replacement, foundation::Instant now) = 0;
+    [[nodiscard]] virtual foundation::Status revoke(const SessionId& id, foundation::Instant now) = 0;
     [[nodiscard]] virtual foundation::Result<std::size_t>
-    revokeAll(const identity::core::IdentityId& identity,
-              foundation::Instant now) = 0;
-    [[nodiscard]] virtual foundation::Result<std::optional<Session>>
-    find(const SessionId& id) const = 0;
+    revokeAll(const identity::core::IdentityId& identity, foundation::Instant now) = 0;
+    [[nodiscard]] virtual foundation::Result<std::optional<Session>> find(const SessionId& id) const = 0;
     [[nodiscard]] virtual std::size_t purgeExpired(foundation::Instant now) = 0;
     [[nodiscard]] virtual std::size_t size() const = 0;
 
@@ -54,13 +50,10 @@ public:
     [[nodiscard]] foundation::Result<Session>
     use(const TokenDigest& token, foundation::Instant now) override;
     [[nodiscard]] foundation::Status
-    rotate(const SessionId& id, const TokenDigest& expected,
-           TokenDigest replacement, foundation::Instant now) override;
-    [[nodiscard]] foundation::Status revoke(const SessionId& id,
-                                            foundation::Instant now) override;
+    rotate(const SessionId& id, const TokenDigest& expected, TokenDigest replacement, foundation::Instant now) override;
+    [[nodiscard]] foundation::Status revoke(const SessionId& id, foundation::Instant now) override;
     [[nodiscard]] foundation::Result<std::size_t>
-    revokeAll(const identity::core::IdentityId& identity,
-              foundation::Instant now) override;
+    revokeAll(const identity::core::IdentityId& identity, foundation::Instant now) override;
     [[nodiscard]] foundation::Result<std::optional<Session>>
     find(const SessionId& id) const override;
     [[nodiscard]] std::size_t purgeExpired(foundation::Instant now) override;

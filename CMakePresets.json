@@ -64,6 +64,18 @@
       "cacheVariables": {
         "OPENPROOF_ENABLE_SANITIZERS": "ON"
       }
+    },
+    {
+      "name": "gcc-fuzz",
+      "displayName": "GCC 16 coverage-guided boundary fuzzing",
+      "description": "ASan/UBSan plus GCC trace-pc feedback over security-critical parsers.",
+      "inherits": "gcc-debug",
+      "cacheVariables": {
+        "OPENPROOF_BUILD_TESTS": "OFF",
+        "OPENPROOF_BUILD_EXAMPLES": "OFF",
+        "OPENPROOF_BUILD_COVERAGE_FUZZER": "ON",
+        "OPENPROOF_ENABLE_SANITIZERS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -86,6 +98,12 @@
       "name": "gcc-asan",
       "displayName": "GCC 16 Debug (ASan + UBSan)",
       "configurePreset": "gcc-asan"
+    },
+    {
+      "name": "gcc-fuzz",
+      "displayName": "GCC 16 coverage-guided boundary fuzzer",
+      "configurePreset": "gcc-fuzz",
+      "targets": ["openproof_boundary_fuzzer"]
     }
   ],
   "testPresets": [

@@ -234,7 +234,7 @@ std::string OpenIdProvider::discoveryDocument() const
         + ",\"grant_types_supported\":[\"authorization_code\",\"refresh_token\",\"client_credentials\",\"urn:ietf:params:oauth:grant-type:device_code\",\"urn:ietf:params:oauth:grant-type:token-exchange\"]"
         + ",\"subject_types_supported\":[\"public\"]"
         + ",\"id_token_signing_alg_values_supported\":[\"RS256\"]"
-        + ",\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"phone\",\"offline_access\"]"
+        + ",\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"phone\",\"offline_access\",\"account\"]"
         + ",\"token_endpoint_auth_methods_supported\":[\"client_secret_post\",\"none\"]"
         + ",\"code_challenge_methods_supported\":[\"S256\"]"
         + ",\"dpop_signing_alg_values_supported\":[\"RS256\"]"

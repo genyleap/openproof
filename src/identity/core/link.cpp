@@ -1,5 +1,6 @@
 module;
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <mutex>
@@ -283,6 +284,38 @@ InMemoryExternalIdentityDirectory::detach(const ExternalIdentityRef& external,
             "identity.");
     }
 
+    m_owners.erase(position);
+    return foundation::ok();
+}
+
+foundation::Status
+InMemoryExternalIdentityDirectory::detachIfAnotherAuthenticationMethod(
+    const ExternalIdentityRef& external, const IdentityId& expectedOwner,
+    const std::vector<provider::ProviderId>& authenticationProviders)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const auto position = m_owners.find(external);
+    if (position == m_owners.end()) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That connected account was not found.");
+    }
+    if (position->second != expectedOwner) {
+        return foundation::fail(foundation::ErrorCode::PermissionDenied,
+                                "The request was denied.");
+    }
+    const auto isAuthenticationProvider = [&](const provider::ProviderId& providerId) {
+        return std::ranges::find(authenticationProviders, providerId)
+            != authenticationProviders.end();
+    };
+    const auto methods = std::ranges::count_if(m_owners, [&](const auto& entry) {
+        return entry.second == expectedOwner
+            && isAuthenticationProvider(entry.first.providerId());
+    });
+    if (methods <= 1) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The last available sign-in method cannot be disconnected.");
+    }
     m_owners.erase(position);
     return foundation::ok();
 }

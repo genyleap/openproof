@@ -4,8 +4,8 @@ OpenProof 1.1.0-rc1 is an **integration-ready production qualification
 candidate**, not a production-approved public release.
 
 The current 1.1.0-rc1 tree completed clean GCC 16.1 Release and ASan/UBSan
-builds on macOS ARM64 on 2026-08-14. Debug, Release and ASan/UBSan passed all
-340 current tests, including PostgreSQL integration against a dedicated
+builds on macOS ARM64 on 2026-08-21. Debug, Release and ASan/UBSan passed all
+356 current tests, including PostgreSQL integration against a dedicated
 disposable database, with zero skips. JavaScript tests, the checksummed Kotlin
 Gradle build and Swift package tests also passed. See
 `RELEASE_AUDIT_1.1.0-rc1.md` for the exact qualification record.
@@ -31,9 +31,10 @@ class:
    a rehearsal with target storage, retention and secret-store versions.
 8. Load/soak testing of authorization, token, introspection, UserInfo and gateway
    paths with resource limits observed.
-9. Coverage-guided fuzzing beyond the shipped deterministic malformed-input
-   corpus, plus independent security review of HTTP parsing, redirect URI,
-   JOSE/JWK and persistence-decoding boundaries.
+9. Run the shipped coverage-guided GCC/ASan/UBSan boundary fuzzer for an
+   extended target campaign, merge reviewed corpus growth, and obtain an
+   independent security review of HTTP parsing, redirect URI, JOSE/JWK and
+   persistence-decoding boundaries.
 10. Resolution of any product-specific launch gate not exercised by the generic suite.
 
 ## Security deltas in 1.1.0-rc1
@@ -58,6 +59,27 @@ class:
   the Linux template reads core secret material from a read-only
   secret-store/KMS mount. Target promotion still requires exercising the actual
   provider and recording the selected secret versions with the restore drill.
+- Persisted TOTP seeds may use an explicit, versioned credential-encryption key.
+  The offline `opp rekey-totp` ceremony performs a rollback-only dry run before
+  atomically committing every envelope and its durable journal; canonical E2E
+  verifies login after restart on the new key.
+- Durable password, recovery-code, audit-chain and OAuth-client key material is
+  separable from the master. `opp materialize-persistent-keys` preserves exact
+  legacy-derived values through binary-safe `hexfile:` references; the offline
+  master command then atomically invalidates transient state, journals version
+  and fingerprint, and makes stale-key startup fail closed. The real E2E proves
+  passwords, TOTP and OAuth client secrets survive that retirement.
+- Gateway token-bucket capacity, refill rate and maximum tracked keys are now
+  explicit bounded deployment settings rather than hard-coded constants. A
+  100,000-request local TLS/PostgreSQL E2E soak passed with zero failures; target
+  promotion still requires observation on the selected infrastructure.
+- Runtime Prometheus metrics are now wired around the complete listener rather
+  than existing only as a library. The endpoint is disabled by default,
+  requires a dedicated 32-byte bearer, uses only finite method/status-class
+  labels in a fixed-size atomic fast path, enforces a hard ceiling for extension
+  series and is blocked by the public Nginx template. The TLS E2E verifies both
+  denied and authenticated scrapes without leaking paths, identities or
+  credentials.
 
 ## Toolchain note
 

@@ -26,7 +26,36 @@
   nonce boundary before returning claims. JavaScript, Swift and Kotlin reject
   credential-bearing, query-bearing and loopback-lookalike issuer URLs; native
   SDK checks are part of the canonical SDK gate.
-- The source/static release gate passes with 340 declared C++ tests. Qualified production promotion still requires the repository-mandated GCC 16.1 + Ninja build and full CTest/integration qualification.
+- The canonical GCC 16.1 qualification passes all 356 C++ tests in Release and
+  ASan/UBSan with zero skips, all 13 real PostgreSQL integration tests, the
+  JavaScript/Kotlin/Swift SDK gates and the TLS identity-platform E2E.
+- Added a dedicated, exactly-32-byte, versioned TOTP credential-encryption key
+  with legacy version-1 derivation compatibility, plus `opp rekey-totp` for
+  offline transactional dry-run/commit rotation and an atomic PostgreSQL audit
+  journal. Wrong, identical, unknown and repeated key versions fail closed.
+- Extended the real PostgreSQL and TLS identity E2E suites through credential
+  rekey and post-restart MFA login, and documented the exact backup, cutover and
+  restore-only rollback ceremony.
+- Added binary-safe `hexfile:` secret references and the guarded
+  `opp materialize-persistent-keys` ceremony for separating legacy durable
+  password, recovery, TOTP, audit and OAuth-client key material. Added offline
+  `opp rotate-master-key` dry-run/commit, atomic transient-state invalidation,
+  a version/fingerprint journal and fail-closed startup binding. The E2E proves
+  the retired key cannot restart while durable credentials continue working.
+  Master retirement also atomically invalidates and journals incomplete
+  passkey-registration ceremonies while preserving registered credentials.
+- Added an opt-in GCC `trace-pc` coverage-guided fuzzer for HTTP, redirect,
+  trace-context, password-hash, encoding and JOSE/JWK boundaries. It runs under
+  ASan/UBSan, persists coverage-increasing corpus inputs, preserves crash
+  artifacts and has a bounded qualification entrypoint.
+- Made gateway rate-limit capacity, refill rate and tracked-key cardinality
+  closed-schema bounded deployment settings with secure existing defaults. A
+  100,000-request TLS/PostgreSQL mixed E2E soak then passed with zero failures.
+- Wired bounded Prometheus metrics around the real server listener. Metrics are
+  disabled by default, require a dedicated 32-byte bearer with constant-time
+  verification, use only method/status-class request labels and are explicitly
+  blocked from the public Nginx edge. Unit and TLS E2E coverage prove denied and
+  authenticated scrapes without path, identity or credential leakage.
 
 ### Production qualification and capability audit
 

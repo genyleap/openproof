@@ -70,8 +70,42 @@ TEST(ConfigTest, AppliesDefaultsWhenNothingIsConfigured)
     EXPECT_FALSE(configuration->server().trustProxyClientIp());
     EXPECT_EQ(configuration->logging().level(), obs::LogLevel::Info);
     EXPECT_TRUE(configuration->logging().console());
+    EXPECT_FALSE(configuration->operations().metricsEnabled());
+    EXPECT_TRUE(configuration->operations().metricsBearerToken().empty());
+    EXPECT_EQ(configuration->operations().metricsMaximumSeries(), 512U);
     EXPECT_TRUE(configuration->security().tokenSigningKey().empty());
     EXPECT_FALSE(configuration->gateway().enabled());
+}
+
+TEST(ConfigTest, ReadsAuthenticatedMetricsConfigurationFromASecretReference)
+{
+    cfg::MapEnvironment environment;
+    environment.set("METRICS_TOKEN", "0123456789abcdef0123456789abcdef");
+
+    const auto configuration = cfg::PlatformConfig::loadFromToml(R"(
+[operations]
+metrics_enabled = true
+metrics_bearer_token = "env:METRICS_TOKEN"
+metrics_maximum_series = 1024
+)", environment);
+    ASSERT_TRUE(configuration.has_value());
+    EXPECT_TRUE(configuration->operations().metricsEnabled());
+    EXPECT_EQ(configuration->operations().metricsBearerToken().size(), 32U);
+    EXPECT_EQ(configuration->operations().metricsMaximumSeries(), 1024U);
+}
+
+TEST(ConfigTest, MetricsConfigurationFailsClosed)
+{
+    const cfg::MapEnvironment environment;
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[operations]\nmetrics_enabled=true\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[operations]\nmetrics_enabled=true\n"
+        "metrics_bearer_token=\"env:MISSING\"\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[operations]\nmetrics_maximum_series=127\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[operations]\nmetrics_maximum_series=10001\n", environment).has_value());
 }
 
 TEST(ConfigTest, ReadsTypedValuesFromToml)
@@ -98,6 +132,9 @@ upstream_host = "api.internal.example"
 upstream_port = 443
 upstream_tls = true
 upstream_ca_file = "/etc/openproof/ca.pem"
+rate_limit_capacity = 25000
+rate_limit_refill_per_second = 5000
+rate_limit_maximum_keys = 200000
 )", environment);
     ASSERT_TRUE(configuration.has_value());
     EXPECT_TRUE(configuration->gateway().enabled());
@@ -105,6 +142,9 @@ upstream_ca_file = "/etc/openproof/ca.pem"
     EXPECT_EQ(configuration->gateway().upstreamHost(), "api.internal.example");
     EXPECT_EQ(configuration->gateway().upstreamPort(), 443U);
     EXPECT_TRUE(configuration->gateway().upstreamTls());
+    EXPECT_EQ(configuration->gateway().rateLimitCapacity(), 25'000U);
+    EXPECT_EQ(configuration->gateway().rateLimitRefillPerSecond(), 5'000U);
+    EXPECT_EQ(configuration->gateway().rateLimitMaximumKeys(), 200'000U);
 
     EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
         "[gateway]\nenabled=true\nroute_prefix=\"//evil\"\n"
@@ -116,6 +156,10 @@ upstream_ca_file = "/etc/openproof/ca.pem"
         "[gateway]\nenabled=true\nupstream_host=\"host\"\n"
         "upstream_port=80\nupstream_tls=false\nupstream_ca_file=\"ca.pem\"\n",
         environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[gateway]\nrate_limit_capacity=-1\n", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[gateway]\nrate_limit_refill_per_second=1000001\n", environment).has_value());
 }
 
 TEST(ConfigTest, ServerDeploymentRequiresGatewayKeyAndLoopbackListener)
@@ -405,6 +449,9 @@ TEST(ConfigTest, RejectsWrongTomlTypesInsteadOfSilentlyUsingDefaults)
         "[server]\ntrust_proxy_client_ip = \"yes\"\n",
         "[logging]\nlevel = false\n",
         "[logging]\nconsole = \"false\"\n",
+        "[operations]\nmetrics_enabled = \"yes\"\n",
+        "[operations]\nmetrics_bearer_token = 123\n",
+        "[operations]\nmetrics_maximum_series = \"512\"\n",
         "[security]\ntoken_signing_key = 123\n",
         "[gateway]\nenabled = \"yes\"\n",
         "[gateway]\nupstream_port = \"443\"\n",
@@ -498,6 +545,19 @@ TEST(SecretReferenceTest, RejectsAReferenceWithNoTarget)
 
     EXPECT_FALSE(cfg::resolveSecretReference("env:", environment).has_value());
     EXPECT_FALSE(cfg::resolveSecretReference("file:", environment).has_value());
+    EXPECT_FALSE(cfg::resolveSecretReference("hexfile:", environment).has_value());
+}
+
+TEST(SecretReferenceTest, DecodesAHexadecimalFileWithoutLosingBinaryBytes)
+{
+    const TemporaryFile file{"openproof_hex_secret_test.key", "000aff\n"};
+    const cfg::MapEnvironment environment;
+
+    const auto resolved =
+        cfg::resolveSecretReference("hexfile:" + file.path().string(), environment);
+
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->expose(), std::string("\0\n\xff", 3));
 }
 
 TEST(SecretReferenceTest, ResolvesAFileReferenceAndStripsOneTrailingNewline)
@@ -535,6 +595,109 @@ TEST(ConfigTest, LoadsASigningKeyThroughASecretReference)
     ASSERT_TRUE(configuration.has_value());
     EXPECT_FALSE(configuration->security().tokenSigningKey().empty());
     EXPECT_EQ(configuration->security().tokenSigningKey().expose(), "signing-key-material");
+    EXPECT_TRUE(configuration->security().credentialEncryptionKey().empty());
+    EXPECT_EQ(configuration->security().credentialEncryptionKeyVersion(), 1U);
+    EXPECT_EQ(configuration->security().masterKeyVersion(), 1U);
+    EXPECT_FALSE(configuration->security().hasDedicatedPersistentKeys());
+}
+
+TEST(ConfigTest, LoadsDedicatedVersionedCredentialEncryptionKey)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", std::string(32U, 'm'));
+    environment.set("CREDENTIAL_KEY", std::string(32U, 'c'));
+
+    const auto configuration = cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+credential_encryption_key = "env:CREDENTIAL_KEY"
+credential_encryption_key_version = 7
+)", environment);
+
+    ASSERT_TRUE(configuration.has_value());
+    EXPECT_EQ(configuration->security().credentialEncryptionKey().expose(),
+              std::string(32U, 'c'));
+    EXPECT_EQ(configuration->security().credentialEncryptionKeyVersion(), 7U);
+}
+
+TEST(ConfigTest, RejectsInvalidCredentialEncryptionKeyConfiguration)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", std::string(32U, 'm'));
+    environment.set("SHORT", "short");
+
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+credential_encryption_key_version = 2
+)", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+credential_encryption_key = "env:SHORT"
+credential_encryption_key_version = 2
+)", environment).has_value());
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+credential_encryption_key_version = 0
+)", environment).has_value());
+}
+
+TEST(ConfigTest, LoadsAllDedicatedPersistentKeysRequiredForMasterRotation)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", std::string(32U, 'm'));
+    environment.set("CREDENTIAL", std::string(32U, 'c'));
+    environment.set("PASSWORD", std::string(32U, 'p'));
+    environment.set("RECOVERY", std::string(32U, 'r'));
+    environment.set("AUDIT", std::string(32U, 'a'));
+    environment.set("CLIENT", std::string(32U, 'o'));
+
+    const auto configuration = cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+master_key_version = 2
+credential_encryption_key = "env:CREDENTIAL"
+credential_encryption_key_version = 7
+password_pepper = "env:PASSWORD"
+recovery_code_pepper = "env:RECOVERY"
+audit_chain_key = "env:AUDIT"
+oauth_client_secret_key = "env:CLIENT"
+)", environment);
+
+    ASSERT_TRUE(configuration.has_value());
+    EXPECT_EQ(configuration->security().masterKeyVersion(), 2U);
+    EXPECT_TRUE(configuration->security().hasDedicatedPersistentKeys());
+    EXPECT_EQ(configuration->security().passwordPepper().expose(), std::string(32U, 'p'));
+    EXPECT_EQ(configuration->security().recoveryCodePepper().expose(), std::string(32U, 'r'));
+    EXPECT_EQ(configuration->security().auditChainKey().expose(), std::string(32U, 'a'));
+    EXPECT_EQ(configuration->security().oauthClientSecretKey().expose(), std::string(32U, 'o'));
+}
+
+TEST(ConfigTest, RejectsRotatedMasterWithoutEveryDedicatedPersistentKey)
+{
+    cfg::MapEnvironment environment;
+    environment.set("MASTER", std::string(32U, 'm'));
+    environment.set("CREDENTIAL", std::string(32U, 'c'));
+
+    const auto incomplete = cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+master_key_version = 2
+credential_encryption_key = "env:CREDENTIAL"
+credential_encryption_key_version = 1
+)", environment);
+    ASSERT_FALSE(incomplete.has_value());
+    EXPECT_EQ(incomplete.error().code(), fnd::ErrorCode::FailedPrecondition);
+
+    const auto invalidVersion = cfg::PlatformConfig::loadFromToml(R"(
+[security]
+token_signing_key = "env:MASTER"
+master_key_version = 0
+)", environment);
+    ASSERT_FALSE(invalidVersion.has_value());
+    EXPECT_EQ(invalidVersion.error().code(), fnd::ErrorCode::InvalidArgument);
 }
 
 TEST(ConfigTest, LoadsPreviousOidcVerificationKeyDirectory)

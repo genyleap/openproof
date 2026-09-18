@@ -46,8 +46,10 @@ using Tcp = asio::ip::tcp;
 
 constexpr std::size_t kMaximumRpcResponse = 2U * 1024U * 1024U;
 constexpr std::string_view kWalletStatement{"Sign in to OpenProof with your Ethereum account."};
-constexpr std::string_view kFarcasterStatement{"Sign in to OpenProof with the custody account for this Farcaster FID."};
+constexpr std::string_view kFarcasterStatement{"Farcaster Auth"};
 constexpr std::string_view kErc1271Magic{"0x1626ba7e"};
+constexpr std::uint64_t kOptimismMainnetChainId = 10U;
+constexpr std::uint64_t kFarcasterAuthAddressKeyType = 2U;
 
 struct HttpsUrl final {
     std::string host;
@@ -399,7 +401,7 @@ struct RpcResponse final { json::value result; };
     return encodeHex(std::span{digest->data(), 4U}, false);
 }
 
-[[nodiscard]] foundation::Result<bool> chainMatches(
+[[nodiscard]] foundation::Result<bool> rpcChainMatches(
     std::string_view endpoint, std::uint64_t expected, std::string_view caFile,
     const foundation::SecretString& authorization)
 {
@@ -491,6 +493,51 @@ struct RpcResponse final { json::value result; };
     return value;
 }
 
+[[nodiscard]] foundation::Result<std::uint64_t> abiUint64(
+    std::string_view result, std::size_t word)
+{
+    if (!result.starts_with("0x")) return foundation::fail(foundation::ErrorCode::Unavailable);
+    result.remove_prefix(2U);
+    const std::size_t begin = word * 64U;
+    if (result.size() < begin + 64U) return foundation::fail(foundation::ErrorCode::Unavailable);
+    std::string_view text = result.substr(begin, 64U);
+    while (text.size() > 16U && text.front() == '0') text.remove_prefix(1U);
+    if (text.size() > 16U) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    std::uint64_t value{};
+    if (text.empty()) return value;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+    return value;
+}
+
+[[nodiscard]] foundation::Result<bool> farcasterAuthAddressValid(
+    std::string_view endpoint, std::string_view registry, std::uint64_t fid,
+    std::string_view address, std::string_view caFile,
+    const foundation::SecretString& authorization)
+{
+    auto selector = functionSelector("keyDataOf(uint256,bytes)");
+    if (!selector) return foundation::fail(selector.error());
+    std::string data{"0x"};
+    data.append(*selector);
+    data.append(uint256Hex(fid));
+    data.append(uint256Hex(64U));
+    data.append(uint256Hex(32U));
+    data.append(24U, '0');
+    data.append(address.substr(2U));
+    json::object call;
+    call["to"] = registry;
+    call["data"] = std::move(data);
+    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"},
+                            caFile, authorization);
+    if (!result) return foundation::fail(result.error());
+    auto state = abiUint64(*result, 0U);
+    auto keyType = abiUint64(*result, 1U);
+    if (!state || !keyType) return foundation::fail(state ? keyType.error() : state.error());
+    return state.value() == 1U && keyType.value() == kFarcasterAuthAddressKeyType;
+}
+
 [[nodiscard]] std::optional<std::string_view> publicParameter(
     const idp::AttributeMap& values, std::string_view name)
 {
@@ -556,8 +603,7 @@ struct RpcResponse final { json::value result; };
 [[nodiscard]] std::string buildSiweMessage(
     std::string_view domain, std::string_view address, std::string_view statement,
     std::string_view uri, std::uint64_t chainId, std::string_view nonce,
-    foundation::Instant issuedAt, foundation::Instant expiresAt,
-    std::optional<std::string_view> requestId = std::nullopt)
+    foundation::Instant issuedAt, foundation::Instant expiresAt)
 {
     std::string output;
     output.reserve(768U);
@@ -576,24 +622,31 @@ struct RpcResponse final { json::value result; };
     output.append(foundation::toIso8601(issuedAt));
     output.append("\nExpiration Time: ");
     output.append(foundation::toIso8601(expiresAt));
-    if (requestId) {
-        output.append("\nRequest ID: ");
-        output.append(*requestId);
-    }
+    return output;
+}
+
+[[nodiscard]] std::string buildFarcasterMessage(
+    std::string_view domain, std::string_view address, std::string_view uri,
+    std::string_view nonce, foundation::Instant issuedAt,
+    foundation::Instant expiresAt, std::uint64_t fid)
+{
+    std::string output = buildSiweMessage(
+        domain, address, kFarcasterStatement, uri, kOptimismMainnetChainId,
+        nonce, issuedAt, expiresAt);
+    output.append("\nResources:\n- farcaster://fids/");
+    output.append(std::to_string(fid));
     return output;
 }
 
 struct ParsedSiwe final {
     std::string address;
-    std::optional<std::string> requestId;
 };
 
 [[nodiscard]] foundation::Result<ParsedSiwe> validateSiweMessage(
     std::string_view message, const idp::ChallengeId& challenge,
     std::string_view challengePrefix, std::string_view domain, std::string_view uri,
     std::uint64_t chainId, std::string_view statement,
-    const foundation::SecretString& derivationKey, foundation::Duration lifetime,
-    std::optional<std::string_view> expectedRequestPrefix = std::nullopt)
+    const foundation::SecretString& derivationKey, foundation::Duration lifetime)
 {
     if (message.empty() || message.size() > 8192U || message.contains('\r')) {
         return foundation::fail(authenticationFailure("The SIWE message encoding is invalid."));
@@ -606,8 +659,7 @@ struct ParsedSiwe final {
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
-    const std::size_t expectedLineCount = expectedRequestPrefix ? 12U : 11U;
-    if (lines.size() != expectedLineCount
+    if (lines.size() != 11U
         || lines[0] != std::string{domain} + " wants you to sign in with your Ethereum account:"
         || lines[2] != "" || lines[3] != statement || lines[4] != ""
         || lines[5] != std::string{"URI: "} + std::string{uri}
@@ -627,20 +679,155 @@ struct ParsedSiwe final {
         || lines[10] != std::string{"Expiration Time: "} + foundation::toIso8601(expiresAt)) {
         return foundation::fail(authenticationFailure("The SIWE challenge binding is invalid."));
     }
-    ParsedSiwe parsed{std::move(*address), std::nullopt};
-    if (expectedRequestPrefix) {
-        constexpr std::string_view label{"Request ID: "};
-        if (!lines[11].starts_with(label)) {
-            return foundation::fail(authenticationFailure("The Farcaster SIWE request identifier is absent."));
-        }
-        const std::string_view requestId = lines[11].substr(label.size());
-        if (!requestId.starts_with(*expectedRequestPrefix)) {
-            return foundation::fail(authenticationFailure("The Farcaster SIWE request identifier is invalid."));
-        }
-        parsed.requestId = std::string{requestId};
-    }
-    return parsed;
+    return ParsedSiwe{std::move(*address)};
 }
+
+[[nodiscard]] std::optional<unsigned int> fixedDecimal(
+    std::string_view text, std::size_t begin, std::size_t count)
+{
+    if (begin + count > text.size()) return std::nullopt;
+    unsigned int value{};
+    const auto part = text.substr(begin, count);
+    const auto parsed = std::from_chars(part.data(), part.data() + part.size(), value, 10);
+    if (parsed.ec != std::errc{} || parsed.ptr != part.data() + part.size()) return std::nullopt;
+    return value;
+}
+
+[[nodiscard]] std::optional<foundation::Instant> parseSiweInstant(std::string_view text)
+{
+    const bool milliseconds = text.size() == 24U;
+    if ((text.size() != 20U && !milliseconds)
+        || text[4] != '-' || text[7] != '-' || text[10] != 'T'
+        || text[13] != ':' || text[16] != ':' || text.back() != 'Z'
+        || (milliseconds && text[19] != '.')) return std::nullopt;
+    const auto year = fixedDecimal(text, 0U, 4U);
+    const auto month = fixedDecimal(text, 5U, 2U);
+    const auto day = fixedDecimal(text, 8U, 2U);
+    const auto hour = fixedDecimal(text, 11U, 2U);
+    const auto minute = fixedDecimal(text, 14U, 2U);
+    const auto second = fixedDecimal(text, 17U, 2U);
+    const auto fraction = milliseconds ? fixedDecimal(text, 20U, 3U)
+                                       : std::optional<unsigned int>{0U};
+    if (!year || !month || !day || !hour || !minute || !second || !fraction
+        || *hour > 23U || *minute > 59U || *second > 59U) return std::nullopt;
+    const std::chrono::year_month_day date{
+        std::chrono::year{static_cast<int>(*year)},
+        std::chrono::month{*month}, std::chrono::day{*day}};
+    if (!date.ok()) return std::nullopt;
+    const auto value = std::chrono::sys_days{date} + std::chrono::hours{*hour}
+        + std::chrono::minutes{*minute} + std::chrono::seconds{*second}
+        + std::chrono::milliseconds{*fraction};
+    return std::chrono::time_point_cast<foundation::Duration>(value);
+}
+
+struct ParsedFarcasterSiwe final {
+    std::string address;
+    std::uint64_t fid{};
+};
+
+[[nodiscard]] foundation::Result<ParsedFarcasterSiwe> validateFarcasterMessage(
+    std::string_view message, const idp::ChallengeId& challenge,
+    std::string_view domain, std::string_view uri,
+    const foundation::SecretString& derivationKey, foundation::Duration lifetime,
+    foundation::Instant now)
+{
+    if (message.empty() || message.size() > 8192U || message.contains('\r')) {
+        return foundation::fail(authenticationFailure("The SIWF message encoding is invalid."));
+    }
+    std::vector<std::string_view> lines;
+    std::size_t begin = 0U;
+    while (begin <= message.size()) {
+        const auto end = message.find('\n', begin);
+        lines.push_back(message.substr(begin,
+            end == std::string_view::npos ? message.size() - begin : end - begin));
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    if (lines.size() != 13U
+        || lines[0] != std::string{domain} + " wants you to sign in with your Ethereum account:"
+        || lines[2] != "" || lines[3] != kFarcasterStatement || lines[4] != ""
+        || lines[5] != std::string{"URI: "} + std::string{uri}
+        || lines[6] != "Version: 1" || lines[7] != "Chain ID: 10"
+        || lines[11] != "Resources:") {
+        return foundation::fail(authenticationFailure(
+            "The SIWF message is not a Farcaster FIP-11 message for this relying party."));
+    }
+    auto address = normalizeAddress(lines[1]);
+    constexpr std::string_view resourcePrefix{"- farcaster://fids/"};
+    if (!address || !lines[12].starts_with(resourcePrefix)) {
+        return foundation::fail(authenticationFailure("The SIWF signer or FID resource is invalid."));
+    }
+    auto fid = parseDecimal(lines[12].substr(resourcePrefix.size()));
+    if (!fid || fid.value() == 0U) {
+        return foundation::fail(authenticationFailure("The SIWF Farcaster FID is invalid."));
+    }
+    auto nonce = challengeNonce(derivationKey, challenge);
+    auto timestamp = challengeTimestamp(challenge, "fcsiwf_");
+    constexpr std::string_view nonceLabel{"Nonce: "};
+    constexpr std::string_view issuedLabel{"Issued At: "};
+    constexpr std::string_view expirationLabel{"Expiration Time: "};
+    if (!nonce || !timestamp || !lines[8].starts_with(nonceLabel)
+        || lines[8].substr(nonceLabel.size()) != nonce.value()
+        || !lines[9].starts_with(issuedLabel)
+        || !lines[10].starts_with(expirationLabel)) {
+        return foundation::fail(authenticationFailure("The SIWF challenge binding is invalid."));
+    }
+    const auto issuedAt = parseSiweInstant(lines[9].substr(issuedLabel.size()));
+    const auto expiresAt = parseSiweInstant(lines[10].substr(expirationLabel.size()));
+    const foundation::Instant challengeStart{foundation::Duration{timestamp.value()}};
+    const foundation::Instant challengeEnd = challengeStart + lifetime;
+    constexpr auto clockSkew = std::chrono::minutes{1};
+    if (!issuedAt || !expiresAt || *issuedAt < challengeStart - clockSkew
+        || *issuedAt > now + clockSkew || *expiresAt != challengeEnd
+        || *expiresAt <= *issuedAt || now >= challengeEnd) {
+        return foundation::fail(authenticationFailure("The SIWF time window is invalid."));
+    }
+    return ParsedFarcasterSiwe{std::move(*address), fid.value()};
+}
+
+class RpcFarcasterChainVerifier final : public FarcasterChainVerifier {
+public:
+    explicit RpcFarcasterChainVerifier(const FarcasterProviderConfig& config)
+        : m_config(&config) {}
+
+    [[nodiscard]] foundation::Result<bool> chainMatches() override
+    {
+        return rpcChainMatches(m_config->rpcEndpoint(), m_config->chainId(),
+                               m_config->caFile(), m_config->authorizationHeader());
+    }
+
+    [[nodiscard]] foundation::Result<bool> verifySignature(
+        std::string_view address, std::string_view message,
+        std::string_view signature) override
+    {
+        auto digest = ethereumMessageHash(message);
+        if (!digest) return foundation::fail(digest.error());
+        return contractWalletValid(m_config->rpcEndpoint(), address, digest.value(), signature,
+                                   m_config->caFile(), m_config->authorizationHeader());
+    }
+
+    [[nodiscard]] foundation::Result<std::optional<FarcasterSignerKind>>
+    authorizeSigner(std::uint64_t fid, std::string_view address) override
+    {
+        auto custodyFid = farcasterIdOf(m_config->rpcEndpoint(),
+            m_config->idRegistryAddress(), address, m_config->caFile(),
+            m_config->authorizationHeader());
+        if (!custodyFid) return foundation::fail(custodyFid.error());
+        if (custodyFid.value() == fid) return FarcasterSignerKind::Custody;
+        if (m_config->keyRegistryAddress().empty()) {
+            return std::optional<FarcasterSignerKind>{};
+        }
+        auto valid = farcasterAuthAddressValid(m_config->rpcEndpoint(),
+            m_config->keyRegistryAddress(), fid, address, m_config->caFile(),
+            m_config->authorizationHeader());
+        if (!valid) return foundation::fail(valid.error());
+        if (valid.value()) return FarcasterSignerKind::AuthAddress;
+        return std::optional<FarcasterSignerKind>{};
+    }
+
+private:
+    const FarcasterProviderConfig* m_config;
+};
 
 } // namespace
 
@@ -705,7 +892,7 @@ WalletAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
     auto address = addressValue ? normalizeAddress(*addressValue) : std::nullopt;
     if (!address) return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                           "Wallet authentication requires a valid Ethereum address.");
-    auto chain = chainMatches(m_implementation->config.rpcEndpoint(), m_implementation->config.chainId(),
+    auto chain = rpcChainMatches(m_implementation->config.rpcEndpoint(), m_implementation->config.chainId(),
                               m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
     if (!chain || !chain.value()) return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
                                                             : chain.error());
@@ -762,9 +949,11 @@ FarcasterProviderConfig::FarcasterProviderConfig(
     std::string domain, std::string uri, std::uint64_t optimismChainId,
     std::string optimismRpcEndpoint, std::string idRegistryAddress,
     foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
-    std::string caFile, foundation::SecretString authorizationHeader)
+    std::string caFile, foundation::SecretString authorizationHeader,
+    std::string keyRegistryAddress)
     : m_domain(std::move(domain)), m_uri(std::move(uri)), m_chainId(optimismChainId),
       m_rpcEndpoint(std::move(optimismRpcEndpoint)), m_idRegistryAddress(std::move(idRegistryAddress)),
+      m_keyRegistryAddress(std::move(keyRegistryAddress)),
       m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
       m_caFile(std::move(caFile)), m_authorizationHeader(std::move(authorizationHeader)) {}
 
@@ -772,11 +961,16 @@ foundation::Result<FarcasterProviderConfig> FarcasterProviderConfig::create(
     std::string domain, std::string uri, std::uint64_t optimismChainId,
     std::string optimismRpcEndpoint, std::string idRegistryAddress,
     foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
-    std::string caFile, foundation::SecretString authorizationHeader)
+    std::string caFile, foundation::SecretString authorizationHeader,
+    std::string keyRegistryAddress)
 {
     auto registry = normalizeAddress(idRegistryAddress);
+    auto keyRegistry = keyRegistryAddress.empty()
+        ? std::optional<std::string>{std::string{}}
+        : normalizeAddress(keyRegistryAddress);
     if (!validDomain(domain) || !parseHttpsUrl(uri) || !parseHttpsUrl(optimismRpcEndpoint)
-        || !registry || optimismChainId == 0U || derivationKey.expose().size() < 32U
+        || !registry || !keyRegistry || optimismChainId != kOptimismMainnetChainId
+        || derivationKey.expose().size() < 32U
         || challengeLifetime < std::chrono::seconds{30}
         || challengeLifetime > std::chrono::minutes{15}) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -784,7 +978,8 @@ foundation::Result<FarcasterProviderConfig> FarcasterProviderConfig::create(
     }
     return FarcasterProviderConfig{std::move(domain), std::move(uri), optimismChainId,
         std::move(optimismRpcEndpoint), std::move(*registry), std::move(derivationKey),
-        challengeLifetime, std::move(caFile), std::move(authorizationHeader)};
+        challengeLifetime, std::move(caFile), std::move(authorizationHeader),
+        std::move(*keyRegistry)};
 }
 
 std::string_view FarcasterProviderConfig::domain() const noexcept { return m_domain; }
@@ -792,6 +987,7 @@ std::string_view FarcasterProviderConfig::uri() const noexcept { return m_uri; }
 std::uint64_t FarcasterProviderConfig::chainId() const noexcept { return m_chainId; }
 std::string_view FarcasterProviderConfig::rpcEndpoint() const noexcept { return m_rpcEndpoint; }
 std::string_view FarcasterProviderConfig::idRegistryAddress() const noexcept { return m_idRegistryAddress; }
+std::string_view FarcasterProviderConfig::keyRegistryAddress() const noexcept { return m_keyRegistryAddress; }
 const foundation::SecretString& FarcasterProviderConfig::derivationKey() const noexcept { return m_derivationKey; }
 foundation::Duration FarcasterProviderConfig::challengeLifetime() const noexcept { return m_challengeLifetime; }
 std::string_view FarcasterProviderConfig::caFile() const noexcept { return m_caFile; }
@@ -799,15 +995,21 @@ const foundation::SecretString& FarcasterProviderConfig::authorizationHeader() c
 
 class FarcasterAuthenticationProvider::Implementation final {
 public:
-    Implementation(FarcasterProviderConfig value, const foundation::ClockSource& source)
-        : config(std::move(value)), clock(&source) {}
+    Implementation(FarcasterProviderConfig value, const foundation::ClockSource& source,
+                   std::unique_ptr<FarcasterChainVerifier> injected)
+        : config(std::move(value)), clock(&source),
+          verifier(injected ? std::move(injected)
+                            : std::make_unique<RpcFarcasterChainVerifier>(config)) {}
     FarcasterProviderConfig config;
     const foundation::ClockSource* clock;
+    std::unique_ptr<FarcasterChainVerifier> verifier;
 };
 
 FarcasterAuthenticationProvider::FarcasterAuthenticationProvider(
-    FarcasterProviderConfig config, const foundation::ClockSource& clock)
-    : m_implementation(std::make_unique<Implementation>(std::move(config), clock)) {}
+    FarcasterProviderConfig config, const foundation::ClockSource& clock,
+    std::unique_ptr<FarcasterChainVerifier> verifier)
+    : m_implementation(std::make_unique<Implementation>(
+          std::move(config), clock, std::move(verifier))) {}
 FarcasterAuthenticationProvider::~FarcasterAuthenticationProvider() = default;
 idp::ProviderId FarcasterAuthenticationProvider::id() const { return idp::ProviderId{"farcaster"}; }
 idp::InteractionModel FarcasterAuthenticationProvider::interactionModel() const noexcept { return idp::InteractionModel::ChallengeResponse; }
@@ -819,37 +1021,53 @@ FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRe
     if (request.provider() != id()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
     const auto addressValue = publicParameter(request.parameters(), "address");
     const auto fidValue = publicParameter(request.parameters(), "fid");
-    auto address = addressValue ? normalizeAddress(*addressValue) : std::nullopt;
-    auto fid = fidValue ? parseDecimal(*fidValue) : foundation::Result<std::uint64_t>{foundation::fail(foundation::ErrorCode::InvalidArgument)};
-    if (!address || !fid || fid.value() == 0U) {
+    if (addressValue.has_value() != fidValue.has_value()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "Farcaster authentication requires a custody address and non-zero FID.");
+                                "A direct SIWF request must provide both address and FID.");
     }
-    auto chain = chainMatches(m_implementation->config.rpcEndpoint(), m_implementation->config.chainId(),
-                              m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
+    auto chain = m_implementation->verifier->chainMatches();
     if (!chain || !chain.value()) return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
                                                             : chain.error());
-    auto currentFid = farcasterIdOf(m_implementation->config.rpcEndpoint(),
-        m_implementation->config.idRegistryAddress(), *address,
-        m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
-    if (!currentFid || currentFid.value() != fid.value()) {
-        return foundation::fail(currentFid ? authenticationFailure("The address does not currently custody that Farcaster FID.")
-                                           : currentFid.error());
+    std::optional<std::string> address;
+    std::optional<std::uint64_t> fid;
+    std::optional<FarcasterSignerKind> signerKind;
+    if (addressValue && fidValue) {
+        address = normalizeAddress(*addressValue);
+        auto parsedFid = parseDecimal(*fidValue);
+        if (!address || !parsedFid || parsedFid.value() == 0U) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The direct SIWF address or FID is invalid.");
+        }
+        fid = parsedFid.value();
+        auto authorized = m_implementation->verifier->authorizeSigner(*fid, *address);
+        if (!authorized || !authorized.value()) {
+            return foundation::fail(authorized
+                ? authenticationFailure("The address is not an active custody or auth address for that FID.")
+                : authorized.error());
+        }
+        signerKind = *authorized.value();
     }
     const auto now = m_implementation->clock->now();
-    auto challengeId = makeChallengeId("fcsiwe_", now);
+    auto challengeId = makeChallengeId("fcsiwf_", now);
     if (!challengeId) return foundation::fail(challengeId.error());
     auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
     if (!nonce) return foundation::fail(nonce.error());
-    const std::string requestId = "farcaster:" + std::to_string(fid.value());
     idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
-    challenge.setParameter("message", buildSiweMessage(
-        m_implementation->config.domain(), *address, kFarcasterStatement,
-        m_implementation->config.uri(), m_implementation->config.chainId(), nonce.value(),
-        now, now + m_implementation->config.challengeLifetime(), requestId));
-    challenge.setParameter("address", *address);
-    challenge.setParameter("fid", std::to_string(fid.value()));
+    challenge.setParameter("nonce", nonce.value());
+    challenge.setParameter("domain", std::string{m_implementation->config.domain()});
+    challenge.setParameter("uri", std::string{m_implementation->config.uri()});
+    challenge.setParameter("statement", std::string{kFarcasterStatement});
+    challenge.setParameter("resource_prefix", "farcaster://fids/");
     challenge.setParameter("chain_id", std::to_string(m_implementation->config.chainId()));
+    if (address && fid && signerKind) {
+        challenge.setParameter("message", buildFarcasterMessage(
+            m_implementation->config.domain(), *address, m_implementation->config.uri(),
+            nonce.value(), now, now + m_implementation->config.challengeLifetime(), *fid));
+        challenge.setParameter("address", *address);
+        challenge.setParameter("fid", std::to_string(*fid));
+        challenge.setParameter("signer_kind",
+            *signerKind == FarcasterSignerKind::Custody ? "custody" : "auth_address");
+    }
     return challenge;
 }
 
@@ -859,44 +1077,43 @@ FarcasterAuthenticationProvider::completeAuthentication(const idp::Authenticatio
     const auto message = credential(response.parameters(), "message");
     const auto signature = credential(response.parameters(), "signature");
     if (!message || !signature || signature->size() > 8192U) {
-        return foundation::fail(authenticationFailure("The Farcaster SIWE completion is incomplete."));
+        return foundation::fail(authenticationFailure("The Farcaster SIWF completion is incomplete."));
     }
-    auto parsed = validateSiweMessage(*message, response.challengeId(), "fcsiwe_",
+    auto parsed = validateFarcasterMessage(*message, response.challengeId(),
         m_implementation->config.domain(), m_implementation->config.uri(),
-        m_implementation->config.chainId(), kFarcasterStatement,
         m_implementation->config.derivationKey(), m_implementation->config.challengeLifetime(),
-        "farcaster:");
-    if (!parsed || !parsed->requestId) return foundation::fail(parsed ? authenticationFailure("The Farcaster request id is absent.") : parsed.error());
-    const std::string_view fidText = std::string_view{*parsed->requestId}.substr(std::string_view{"farcaster:"}.size());
-    auto fid = parseDecimal(fidText);
-    if (!fid || fid.value() == 0U) return foundation::fail(authenticationFailure("The Farcaster FID is invalid."));
-    auto digest = ethereumMessageHash(*message);
-    if (!digest) return foundation::fail(digest.error());
-    auto signatureValid = contractWalletValid(
-        m_implementation->config.rpcEndpoint(), parsed->address, digest.value(), *signature,
-        m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
+        m_implementation->clock->now());
+    if (!parsed) return foundation::fail(parsed.error());
+    auto signatureValid = m_implementation->verifier->verifySignature(
+        parsed->address, *message, *signature);
     if (!signatureValid || !signatureValid.value()) {
-        return foundation::fail(signatureValid ? authenticationFailure("The Farcaster custody signature is invalid.")
+        return foundation::fail(signatureValid ? authenticationFailure("The Farcaster SIWF signature is invalid.")
                                                : signatureValid.error());
     }
-    auto currentFid = farcasterIdOf(m_implementation->config.rpcEndpoint(),
-        m_implementation->config.idRegistryAddress(), parsed->address,
-        m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
-    if (!currentFid || currentFid.value() != fid.value()) {
-        return foundation::fail(currentFid ? authenticationFailure("Farcaster custody changed before verification completed.")
-                                           : currentFid.error());
+    auto authorized = m_implementation->verifier->authorizeSigner(parsed->fid, parsed->address);
+    if (!authorized || !authorized.value()) {
+        return foundation::fail(authorized
+            ? authenticationFailure("The Farcaster signer was revoked or changed before verification completed.")
+            : authorized.error());
     }
+    const bool custody = *authorized.value() == FarcasterSignerKind::Custody;
     idp::VerifiedClaims claims;
-    claims.setExtension("fid", std::to_string(fid.value()));
-    claims.setExtension("custody_address", parsed->address);
+    claims.setExtension("fid", std::to_string(parsed->fid));
+    claims.setExtension("signer_address", parsed->address);
+    claims.setExtension("signer_kind", custody ? "custody" : "auth_address");
+    if (custody) claims.setExtension("custody_address", parsed->address);
     claims.setExtension("chain_id", std::to_string(m_implementation->config.chainId()));
     idp::ProviderEvidence evidence;
-    evidence.add("protocol", "farcaster_custody_siwe");
-    evidence.add("fid", std::to_string(fid.value()));
-    evidence.add("custody_address", parsed->address);
+    evidence.add("protocol", "farcaster_fip11_siwf");
+    evidence.add("fid", std::to_string(parsed->fid));
+    evidence.add("signer_address", parsed->address);
+    evidence.add("signer_kind", custody ? "custody" : "auth_address");
     evidence.add("id_registry", std::string{m_implementation->config.idRegistryAddress()});
+    if (!m_implementation->config.keyRegistryAddress().empty()) {
+        evidence.add("key_registry", std::string{m_implementation->config.keyRegistryAddress()});
+    }
     return idp::AuthenticationOutcome::create(
-        id(), idp::ExternalSubject{std::to_string(fid.value())}, std::move(claims),
+        id(), idp::ExternalSubject{std::to_string(parsed->fid)}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
         std::move(evidence), m_implementation->clock->now());

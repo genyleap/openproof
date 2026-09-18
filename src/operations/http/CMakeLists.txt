@@ -6,5 +6,7 @@ openproof_add_module(openproof_operations_http
     LINK_PUBLIC
         openproof_foundation
         openproof_gateway
+        openproof_security
         openproof_storage_postgres
+        openproof_telemetry
 )

@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 import openproof.foundation;
 import openproof.identity.core;
@@ -325,6 +328,37 @@ TEST(ExternalIdentityDirectoryTest, ListsExternalIdentitiesOfAnOwner)
     const auto none = directory.externalIdentitiesOf(core::IdentityId{"id-absent"});
     ASSERT_TRUE(none.has_value());
     EXPECT_TRUE(none.value().empty());
+}
+
+TEST(ExternalIdentityDirectoryTest, ConcurrentProtectedDetachAlwaysLeavesOneSignInMethod)
+{
+    core::InMemoryExternalIdentityDirectory directory;
+    const auto first = externalRef("provider-a", "sub-1");
+    const auto second = externalRef("provider-b", "sub-2");
+    const core::IdentityId owner{"id-1"};
+    ASSERT_TRUE(directory.attach(linkedRequest("id-1", first)));
+    ASSERT_TRUE(directory.attach(linkedRequest("id-1", second)));
+    const std::vector<idp::ProviderId> providers{
+        idp::ProviderId{"provider-a"}, idp::ProviderId{"provider-b"}};
+    std::atomic<int> successes{0};
+    std::atomic<int> preconditions{0};
+    const auto remove = [&](const core::ExternalIdentityRef& external) {
+        auto status = directory.detachIfAnotherAuthenticationMethod(
+            external, owner, providers);
+        if (status) ++successes;
+        else if (status.error().code() == fnd::ErrorCode::FailedPrecondition) {
+            ++preconditions;
+        }
+    };
+
+    std::thread firstRemoval{remove, std::cref(first)};
+    std::thread secondRemoval{remove, std::cref(second)};
+    firstRemoval.join();
+    secondRemoval.join();
+
+    EXPECT_EQ(successes.load(), 1);
+    EXPECT_EQ(preconditions.load(), 1);
+    EXPECT_EQ(directory.size(), 1U);
 }
 
 }

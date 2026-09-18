@@ -3,10 +3,12 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 import openproof.authentication;
 import openproof.foundation;
@@ -130,6 +132,38 @@ struct Fixture {
     sess::SessionService service;
 };
 
+class DelegatedAuthenticator final : public sess::DelegatedAccessAuthenticator {
+public:
+    explicit DelegatedAuthenticator(std::vector<std::string> scopes,
+                                    bool senderConstrained = false)
+        : m_scopes(std::move(scopes)), m_senderConstrained(senderConstrained) {}
+
+    [[nodiscard]] fnd::Result<sess::DelegatedAccess>
+    authenticateDelegated(const fnd::SecretString& token) override
+    {
+        if (token.expose() != "delegated-token") {
+            return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        }
+        auto authenticated = sess::AuthenticatedSession::fromDelegatedAccess(
+            core::IdentityId{"delegated-identity"}, idp::ProviderId{"oauth"},
+            idp::AssuranceLevel::Ial2,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge, false},
+            kNow, kNow, kNow + std::chrono::minutes{15});
+        if (!authenticated) return fnd::fail(authenticated.error());
+        std::optional<sess::DelegatedSenderConstraint> constraint;
+        if (m_senderConstrained) {
+            constraint.emplace(sess::DelegatedSenderConstraintKind::Dpop, "thumbprint");
+        }
+        return sess::DelegatedAccess{
+            std::move(authenticated).value(), "native-client", m_scopes, {},
+            std::move(constraint)};
+    }
+
+private:
+    std::vector<std::string> m_scopes;
+    bool m_senderConstrained{};
+};
+
 TEST(SessionKeyTest, RejectsKeysShorterThanThirtyTwoBytes)
 {
     const auto key = sess::SessionKey::create(fnd::SecretString{"too-short"});
@@ -162,6 +196,47 @@ TEST(SessionServiceTest, IssuesAndAuthenticatesAnOpaqueSession)
     ASSERT_TRUE(accepted.has_value());
     EXPECT_EQ(accepted->session().identity(), core::IdentityId{"identity-1"});
     EXPECT_EQ(accepted->session().assurance(), idp::AssuranceLevel::Ial3);
+}
+
+TEST(SessionServiceTest, DelegatedAccountAccessRequiresExplicitScope)
+{
+    Fixture fixture;
+    DelegatedAuthenticator permitted{{"openid", "account"}};
+    DelegatedAuthenticator insufficient{{"openid", "profile"}};
+    const fnd::SecretString token{"delegated-token"};
+
+    auto accepted = fixture.service.authenticate(token, &permitted, "account");
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->session().identity(), core::IdentityId{"delegated-identity"});
+
+    auto rejected = fixture.service.authenticate(token, &insufficient, "account");
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::PermissionDenied);
+}
+
+TEST(SessionServiceTest, FirstPartySessionDoesNotNeedDelegatedScope)
+{
+    Fixture fixture;
+    auto grant = fixture.service.issue(verifiedAuthentication()).value();
+    DelegatedAuthenticator insufficient{{"openid"}};
+
+    auto accepted = fixture.service.authenticate(
+        grant.token(), &insufficient, "account");
+
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->session().identity(), core::IdentityId{"identity-1"});
+}
+
+TEST(SessionServiceTest, SenderConstrainedAccessFailsClosedWithoutProofVerifier)
+{
+    Fixture fixture;
+    DelegatedAuthenticator constrained{{"account"}, true};
+
+    auto rejected = fixture.service.authenticate(
+        fnd::SecretString{"delegated-token"}, &constrained, "account");
+
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
 TEST(SessionServiceTest, RotationImmediatelyInvalidatesTheOldToken)

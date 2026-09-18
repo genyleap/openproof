@@ -12,6 +12,12 @@ import openproof.identity.provider;
 
 export namespace openproof::provider::oidc {
 
+/** @brief Client authentication used at the upstream token endpoint. */
+enum class OidcClientAuthenticationMethod {
+    ClientSecretPost,
+    ClientSecretBasic,
+};
+
 /** @brief Validated configuration for an external OpenID Connect authentication provider. */
 class OidcProviderConfig final {
 public:
@@ -20,7 +26,9 @@ public:
         std::string clientId, foundation::SecretString clientSecret,
         std::string callbackUri, std::vector<std::string> scopes,
         foundation::SecretString derivationKey,
-        foundation::Duration challengeLifetime);
+        foundation::Duration challengeLifetime,
+        OidcClientAuthenticationMethod clientAuthentication =
+            OidcClientAuthenticationMethod::ClientSecretPost);
 
     OidcProviderConfig(const OidcProviderConfig&) = delete;
     OidcProviderConfig& operator=(const OidcProviderConfig&) = delete;
@@ -35,6 +43,7 @@ public:
     [[nodiscard]] const std::vector<std::string>& scopes() const noexcept;
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
+    [[nodiscard]] OidcClientAuthenticationMethod clientAuthentication() const noexcept;
 
 private:
     friend class OidcAuthenticationProvider;
@@ -42,7 +51,8 @@ private:
                        std::string clientId, foundation::SecretString clientSecret,
                        std::string callbackUri, std::vector<std::string> scopes,
                        foundation::SecretString derivationKey,
-                       foundation::Duration challengeLifetime);
+                       foundation::Duration challengeLifetime,
+                       OidcClientAuthenticationMethod clientAuthentication);
 
     identity::provider::ProviderId m_providerId;
     std::string m_issuer;
@@ -52,6 +62,8 @@ private:
     std::vector<std::string> m_scopes;
     foundation::SecretString m_derivationKey;
     foundation::Duration m_challengeLifetime{};
+    OidcClientAuthenticationMethod m_clientAuthentication{
+        OidcClientAuthenticationMethod::ClientSecretPost};
 };
 
 /**

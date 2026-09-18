@@ -11,6 +11,7 @@
 #include <boost/json.hpp>
 
 import openproof.authentication;
+import openproof.authentication.federated.http;
 import openproof.authentication.http;
 import openproof.credentials;
 import openproof.foundation;
@@ -43,6 +44,49 @@ public:
     }
 };
 
+class RedirectProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override
+    {
+        return idp::ProviderId{"redirect"};
+    }
+
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
+    {
+        return idp::InteractionModel::Redirect;
+    }
+
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
+    {
+        return idp::AssuranceLevel::Ial1;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override
+    {
+        idp::AuthenticationChallenge challenge{
+            idp::ChallengeId{"redirect-challenge"}, kNow + std::chrono::minutes{5}};
+        challenge.setParameter("authorization_url", "https://provider.example/authorize");
+        return challenge;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse& response) override
+    {
+        const auto code = response.parameters().find("code");
+        const auto state = response.parameters().find("state");
+        if (code == response.parameters().end() || code->second.expose() != "accepted"
+            || state == response.parameters().end() || state->second.expose() != "provider-state") {
+            return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        }
+        return idp::AuthenticationOutcome::create(
+            idp::ProviderId{"redirect"}, idp::ExternalSubject{"redirect-subject"},
+            idp::VerifiedClaims{}, idp::AssuranceLevel::Ial1,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
+            idp::ProviderEvidence{}, kNow);
+    }
+};
+
 [[nodiscard]] gw::HttpRequest request(
     std::string path, std::string body = {}, std::string cookie = {})
 {
@@ -51,6 +95,15 @@ public:
     if (!cookie.empty()) headers.emplace_back("cookie", std::move(cookie));
     return gw::HttpRequest::create(
         gw::HttpMethod::Post, std::move(path), std::move(headers), std::move(body),
+        "127.0.0.1", fnd::CorrelationId{"request"}).value();
+}
+
+[[nodiscard]] gw::HttpRequest getRequest(std::string target, std::string cookie = {})
+{
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!cookie.empty()) headers.emplace_back("cookie", std::move(cookie));
+    return gw::HttpRequest::create(
+        gw::HttpMethod::Get, std::move(target), std::move(headers), {},
         "127.0.0.1", fnd::CorrelationId{"request"}).value();
 }
 
@@ -247,6 +300,65 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
     const auto rejected = fixture.api->handle(std::move(ambiguous).value());
     EXPECT_EQ(rejected.status(), 401);
     EXPECT_TRUE(setCookies(rejected).empty());
+}
+
+TEST(FederatedAuthenticationHttpApiTest, CallbackSessionSurvivesCrossSiteOAuthRedirect)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<RedirectProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-redirect"},
+        core::ExternalIdentityRef{idp::ProviderId{"redirect"},
+                                  idp::ExternalSubject{"redirect-subject"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(externalIdentities.attach(link));
+
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"redirect"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto started = api.handle(getRequest(
+        "/auth/federated/start?provider=redirect&return_to="
+        "%2Foauth%2Fauthorize%3Fclient_id%3Dqml-demo"));
+    ASSERT_EQ(started.status(), 302) << started.body();
+    ASSERT_EQ(started.headers().at("location"), "https://provider.example/authorize");
+
+    std::string callbackCookies;
+    for (const auto& header : setCookies(started)) {
+        if (!callbackCookies.empty()) callbackCookies.append("; ");
+        callbackCookies.append(header.substr(0U, header.find(';')));
+    }
+    const auto completed = api.handle(getRequest(
+        "/auth/federated/callback?code=accepted&state=provider-state",
+        std::move(callbackCookies)));
+    ASSERT_EQ(completed.status(), 302) << completed.body();
+    EXPECT_EQ(completed.headers().at("location"),
+              "/oauth/authorize?client_id=qml-demo");
+    const auto sessionHeader = setCookieHeader(completed, "__Host-openproof-session");
+    ASSERT_FALSE(sessionHeader.empty());
+    EXPECT_NE(sessionHeader.find("; SameSite=Lax"), std::string::npos);
+    EXPECT_EQ(sessionHeader.find("; SameSite=Strict"), std::string::npos);
 }
 
 }

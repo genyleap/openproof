@@ -196,4 +196,17 @@ TEST(AeadTest, RoundTripsWithAssociatedDataAndRejectsTampering)
     EXPECT_FALSE(sec::openAes256Gcm(key.value(), envelope.value(), "identity-1"));
 }
 
+TEST(AeadTest, ComparesKeyMaterialWithoutExposingIt)
+{
+    auto first = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"});
+    auto same = sec::AeadKey::create(
+        fnd::SecretString{"0123456789abcdef0123456789abcdef"});
+    auto different = sec::AeadKey::create(
+        fnd::SecretString{"fedcba9876543210fedcba9876543210"});
+    ASSERT_TRUE(first && same && different);
+    EXPECT_TRUE(first->matches(same.value()));
+    EXPECT_FALSE(first->matches(different.value()));
+}
+
 }

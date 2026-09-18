@@ -1,0 +1,9 @@
+# Test/operator example: every credential remains an external secret reference.
+[security]
+token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+credential_encryption_key_version = 1
+
+[database]
+connection_string = "env:OPENPROOF_DATABASE_URL"
+pool_size = 2
+migration_directory = "migrations"

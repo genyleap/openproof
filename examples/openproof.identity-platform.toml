@@ -1,6 +1,7 @@
 [server]
 bind_address = "127.0.0.1"
 port = 18443
+trust_proxy_client_ip = true
 
 [logging]
 level = "info"
@@ -34,9 +35,20 @@ required_roles = ["member", "owner"]
 role_match = "any"
 minimum_assurance = "ial1"
 required_scope = "api"
+required_audience = "https://api.example.com"
+
+[account]
+enabled = true
+phone_provider_id = "phone"
+delivery_host = "notifications.internal.example"
+delivery_port = 443
+delivery_tls = true
+delivery_path = "/v1/openproof/verification"
+delivery_authorization = "env:OPENPROOF_VERIFICATION_WEBHOOK_TOKEN"
 
 [oidc]
 enabled = true
 issuer = "https://identity.example.com"
 key_id = "openproof-rs256-1"
 signing_key = "file:/run/secrets/openproof-oidc-private.pem"
+# previous_signing_keys_directory = "/run/openproof/previous-oidc-keys"

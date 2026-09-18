@@ -11,6 +11,7 @@ servers:
 security: []
 tags:
   - name: Health
+  - name: Operations
   - name: Account
   - name: Authentication
   - name: Passkeys
@@ -41,6 +42,28 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Health"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: scrapeMetrics
+      security: [{metricsBearer: []}]
+      description: >-
+        Private Prometheus exposition endpoint. Deployments must keep it off the
+        public identity edge and use the dedicated metrics bearer credential.
+      responses:
+        "200":
+          description: Prometheus text exposition with bounded, low-cardinality series.
+          content:
+            text/plain:
+              schema: {type: string}
+        "401": {$ref: "#/components/responses/Error"}
+    head:
+      tags: [Operations]
+      operationId: probeMetricsAuthentication
+      security: [{metricsBearer: []}]
+      responses:
+        "200": {description: Metrics authentication succeeded; no body is returned.}
+        "401": {$ref: "#/components/responses/Error"}
   /account/signup:
     post:
       tags: [Account]
@@ -243,6 +266,192 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Profile"}
         "401": {$ref: "#/components/responses/Error"}
+  /account/connections:
+    get:
+      tags: [Account, Federation]
+      operationId: listAccountConnections
+      description: >-
+        Lists authentication-capable external accounts attached to the current
+        canonical OpenProof identity. Provider subjects are returned only to the
+        authenticated account owner.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: Connected sign-in methods.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [connections]
+                properties:
+                  connections:
+                    type: array
+                    items: {$ref: "#/components/schemas/AccountConnection"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/connections/complete:
+    get:
+      tags: [Account, Federation]
+      operationId: showAccountConnectionComplete
+      description: >-
+        Browser landing page shown after a redirect provider has been attached
+        to the existing canonical identity. It contains no account data and is
+        safe to open after the connection ceremony state has been cleared.
+      security: []
+      responses:
+        "200":
+          description: Bilingual account-connected confirmation page.
+          content:
+            text/html:
+              schema: {type: string}
+  /account/connections/start:
+    get:
+      tags: [Account, Federation]
+      operationId: beginFederatedAccountConnection
+      description: >-
+        Starts a redirect-based proof for an already authenticated identity. The
+        target identity and ceremony purpose are stored server-side; a normal
+        login callback cannot be substituted for this connection ceremony.
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: provider, in: query, required: true, schema: {type: string, maxLength: 128}}
+        - {name: return_to, in: query, required: false, description: Local absolute path only., schema: {type: string, default: /}}
+      responses:
+        "302":
+          description: Redirect to the upstream provider and set bound connection-ceremony cookies.
+          headers:
+            Location: {schema: {type: string, format: uri}}
+            Set-Cookie: {schema: {type: string}}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/connections/handoff:
+    post:
+      tags: [Account, Federation]
+      operationId: issueNativeConnectionHandoff
+      description: >-
+        Creates a two-minute, one-time browser handoff for an authenticated
+        native client. The canonical identity, redirect provider and local
+        return path are bound in server-side transaction state; no session or
+        bearer token is placed in the browser URL.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider, return_to]
+              properties:
+                provider: {type: string, maxLength: 128}
+                return_to: {type: string, maxLength: 2048, description: Local absolute path only.}
+      responses:
+        "201":
+          description: One-time browser handoff issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [handoff_url, expires_at]
+                properties:
+                  handoff_url: {type: string, description: Local URL containing only the one-time ticket.}
+                  expires_at: {type: string, format: date-time}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Account, Federation]
+      operationId: redeemNativeConnectionHandoff
+      description: >-
+        Atomically consumes the one-time native handoff, starts the bound
+        redirect-provider connection ceremony and redirects to that provider.
+      parameters:
+        - {name: ticket, in: query, required: true, schema: {type: string, maxLength: 256}}
+      responses:
+        "302":
+          description: Handoff consumed and browser redirected to the bound upstream provider.
+          headers:
+            Location: {schema: {type: string, format: uri}}
+            Set-Cookie: {schema: {type: string}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/connections/disconnect:
+    post:
+      tags: [Account, Federation]
+      operationId: disconnectAccountConnection
+      description: >-
+        Disconnects an authentication provider from the current canonical
+        identity. The last available sign-in method cannot be removed.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountConnection"}
+      responses:
+        "200":
+          description: Connection removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [disconnected]
+                properties:
+                  disconnected: {type: boolean, const: true}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
+  /account/connections/web3/start:
+    post:
+      tags: [Account, Federation]
+      operationId: beginWeb3AccountConnection
+      description: Starts a cookie-bound wallet or Farcaster proof for the current identity.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Web3Start"}
+      responses:
+        "200":
+          description: Bound Web3 connection challenge; no new login session is issued.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Web3Challenge"}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/connections/web3/complete:
+    post:
+      tags: [Account, Federation]
+      operationId: completeWeb3AccountConnection
+      description: >-
+        Verifies the exact Web3 message from the connection start and attaches
+        the external subject to the existing identity without issuing a session.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Web3Completion"}
+      responses:
+        "200":
+          description: External account connected.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [connected, provider, subject]
+                properties:
+                  connected: {type: boolean, const: true}
+                  provider: {type: string}
+                  subject: {type: string}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
   /account/passkeys/options:
     post:
       tags: [Passkeys]
@@ -468,9 +677,15 @@ paths:
             schema: {$ref: "#/components/schemas/Web3Start"}
       responses:
         "200":
-          description: Provider-specific message to sign and bound ceremony cookies.
+          description: >-
+            Bound ceremony configuration. Ethereum and direct Farcaster starts
+            include `message`; relay/AuthKit Farcaster starts return nonce,
+            domain, URI, chain and resource-prefix fields instead.
           headers:
             Set-Cookie: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Web3Challenge"}
         "400": {$ref: "#/components/responses/Error"}
   /auth/web3/complete:
     post:
@@ -480,13 +695,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [message, signature]
-              properties:
-                message: {type: string, maxLength: 8192}
-                signature: {type: string, maxLength: 8192}
+            schema: {$ref: "#/components/schemas/Web3Completion"}
       responses:
         "200": {description: OpenProof session issued in a secure cookie.}
         "401": {$ref: "#/components/responses/Error"}
@@ -1199,6 +1408,10 @@ components:
       type: http
       scheme: bearer
       description: Dedicated operator-generated SCIM bearer; not a user OAuth token.
+    metricsBearer:
+      type: http
+      scheme: bearer
+      description: Dedicated private-scraper bearer; never a user OAuth token.
   parameters:
     IfMatch:
       name: If-Match
@@ -1317,6 +1530,13 @@ components:
       required: [email]
       properties:
         email: {type: string, format: email, maxLength: 320}
+    AccountConnection:
+      type: object
+      additionalProperties: false
+      required: [provider, subject]
+      properties:
+        provider: {type: string, minLength: 1, maxLength: 128}
+        subject: {type: string, minLength: 1, maxLength: 4096}
     ProfileUpdate:
       type: object
       additionalProperties: false
@@ -1352,11 +1572,45 @@ components:
     Web3Start:
       type: object
       additionalProperties: false
-      required: [provider, address]
+      required: [provider]
       properties:
-        provider: {type: string, enum: [ethereum, solana, farcaster]}
+        provider: {type: string, enum: [ethereum-wallet, farcaster]}
+        address: {type: string, maxLength: 64, description: Required for Ethereum; optional for direct SIWF.}
+        fid: {type: string, pattern: "^[1-9][0-9]{0,19}$", maxLength: 20, description: Paired with address for direct SIWF.}
+      oneOf:
+        - properties:
+            provider: {const: ethereum-wallet}
+          required: [address]
+        - properties:
+            provider: {const: farcaster}
+          dependentRequired:
+            address: [fid]
+            fid: [address]
+    Web3Completion:
+      type: object
+      additionalProperties: false
+      required: [message, signature]
+      properties:
+        message: {type: string, maxLength: 8192}
+        signature: {type: string, maxLength: 8192}
+    Web3Challenge:
+      type: object
+      additionalProperties: false
+      required: [provider, challenge_id, expires_at, chain_id]
+      properties:
+        provider: {type: string, enum: [ethereum-wallet, farcaster]}
+        challenge_id: {type: string}
+        expires_at: {type: string, format: date-time}
+        message: {type: string, maxLength: 8192}
         address: {type: string, maxLength: 64}
-        fid: {type: string, maxLength: 32, description: Required for Farcaster.}
+        fid: {type: string, maxLength: 20}
+        chain_id: {type: string}
+        nonce: {type: string, minLength: 8, maxLength: 64}
+        domain: {type: string}
+        uri: {type: string, format: uri}
+        statement: {type: string, const: Farcaster Auth}
+        resource_prefix: {type: string, const: "farcaster://fids/"}
+        signer_kind: {type: string, enum: [custody, auth_address]}
     LdapCompletion:
       type: object
       additionalProperties: false

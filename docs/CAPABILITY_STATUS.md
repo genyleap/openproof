@@ -17,12 +17,12 @@ fail-closed until that operator configuration is supplied.
 | 4 | Forgot-password self-service | **Implemented** | One-time password-reset challenge, authenticated delivery, expiry/replay handling and credential replacement. |
 | 5 | User-profile self-service | **Implemented** | Authenticated profile read/update plus separately verified email/phone ownership changes. |
 | 6 | Passkeys / WebAuthn | **Implemented** | Discoverable ES256/P-256 credentials, RP/origin/challenge/UP/UV validation, durable credential storage, assertion verification and atomic sign-counter advancement. |
-| 7 | Google / Apple login | **Implemented** | OIDC Authorization Code + PKCE, state/nonce, discovery/JWKS rotation and ID Token validation; Apple form-post callback is supported. |
+| 7 | Google / Apple / LinkedIn / Telegram login | **Implemented** | OIDC Authorization Code + PKCE, state/nonce, discovery/JWKS rotation and RS256 ID Token validation; Apple form-post callback and Telegram `client_secret_basic` token exchange are supported. |
 | 8 | Consent subsystem | **Implemented** | Durable remembered grants, consent UI with CSRF protection, approve/deny and revocation semantics. |
 | 9 | Resource / Audience Registry | **Implemented** | Tenant resource registry, resource scopes, audience propagation into token families and gateway audience enforcement. |
 | 10 | `client_credentials` | **Implemented** | Service-client authentication and access-token-only machine grant with registered scope/audience constraints. |
 | 11 | Service identities | **Implemented** | Canonical `Service` identities bound to service OAuth clients with durable lifecycle and management API. |
-| 12 | GitHub / Microsoft / Farcaster / Wallet providers | **Implemented** | GitHub OAuth+PKCE and immutable account subject; tenant-specific Microsoft OIDC; SIWE EOA/ERC-1271 wallet proof; Farcaster FID/custody verification against the configured on-chain IdRegistry. |
+| 12 | GitHub / Microsoft / Farcaster / Wallet providers | **Implemented** | GitHub OAuth+PKCE and immutable account subject; tenant-specific Microsoft OIDC; SIWE EOA/ERC-1271 wallet proof; FIP-11 Farcaster SIWF with AuthKit-compatible nonce start, direct-message mode, IdRegistry custody and KeyRegistry type-2 auth addresses. |
 | 13 | Admin Console | **Implemented** | Owner + IAL2-protected web/API management for members, applications, clients, resources, service identities, client secret rotation and JAR signing keys. |
 | 14 | SAML / LDAP / SCIM | **Implemented** | Pinned-certificate SAML 2.0 login with constrained XMLDSIG verification; LDAPS search-then-bind; bearer-protected SCIM 2.0 Users/Groups provisioning over canonical identities/memberships. |
 | 15 | DPoP / mTLS | **Implemented** | Sender binding persisted in token families, DPoP replay/`htu`/`htm`/`iat`/`jti`/`ath` verification, authenticated mTLS certificate forwarding, refresh/exchange binding preservation and gateway/UserInfo enforcement. |
@@ -30,11 +30,19 @@ fail-closed until that operator configuration is supplied.
 | 17 | Token Exchange | **Implemented** | Down-scope/down-audience token exchange that cannot mint authority absent from the subject token and client grants. |
 | 18 | PAR / JAR / JARM | **Implemented** | One-time pushed authorization requests, pinned registered JAR signing keys with replay protection, and signed JARM success/error responses. |
 | 19 | Real Trust / Evidence verifiers | **Implemented** | Durable one-time proof challenges plus pinned RS256 attestation-JWT verification and X.509 chain/SAN/proof-of-possession verification feeding the evidence repository and trust engine. |
+| 20 | Self-service account connections | **Implemented** | Authenticated redirect and Web3 connection ceremonies attach verified provider subjects to one canonical identity, prevent login/link ceremony substitution and cross-account transfer, expose connection listing, and refuse removal of the last sign-in method. Native clients use a two-minute one-time browser handoff with no session/bearer in its URL; delegated operations require the explicit `account` scope. |
 
 ## Other implemented platform surface
 
-- Canonical tenant-scoped identities, explicit external-identity linking and lifecycle.
+- Canonical tenant-scoped identities, explicit external-identity linking and lifecycle;
+  native OpenProof accounts remain first-class and can add or remove configured
+  provider login methods without email-based auto-linking.
 - Password + TOTP local authentication, recovery codes and session rotation/revocation.
+- Dedicated versioned TOTP envelope encryption with an offline atomic dry-run/
+  commit rotation command and durable rotation journal.
+- Dedicated password/recovery/audit/OAuth-client key material plus guarded
+  legacy materialization and atomic offline master-key retirement. Startup is
+  bound to the committed database version/fingerprint.
 - Organization membership and role administration.
 - Application and OAuth-client registries with exact redirect and lifecycle rules.
 - Authorization Code + mandatory S256 PKCE, opaque access/refresh tokens, refresh
@@ -43,6 +51,8 @@ fail-closed until that operator configuration is supplied.
 - PostgreSQL persistence with checksummed forward-only migrations.
 - API gateway role/IAL/scope/audience enforcement, rate limiting, circuit breaker
   and trusted upstream identity context.
+- Authenticated loopback/private Prometheus exposition with bounded series and
+  non-identifying HTTP method/status-class instrumentation.
 - C++/JavaScript/Swift/Kotlin SDK foundations.
 
 ## External dependencies that must be configured to activate integrations
@@ -52,10 +62,11 @@ external trust dependency is absent:
 
 - Email/SMS verification requires the authenticated HTTPS delivery webhook in
   `[account]` configuration.
-- Google, Apple, Microsoft and GitHub require registered upstream OAuth/OIDC
+- Google, Apple, Microsoft, GitHub, LinkedIn and Telegram require registered upstream OAuth/OIDC
   client credentials and the exact federation callback URI.
-- Wallet/Farcaster require HTTPS EVM RPC endpoints; Farcaster additionally
-  requires the configured IdRegistry contract address.
+- Wallet/Farcaster require HTTPS EVM RPC endpoints. Farcaster SIWF uses the
+  Optimism IdRegistry for custody and KeyRegistry type-2 entries for auth
+  addresses; canonical mainnet addresses are defaults and may be overridden.
 - LDAP requires LDAPS and directory configuration; SAML requires the IdP entity,
   SSO URL and pinned IdP signing certificate.
 - SCIM requires an operator-generated bearer token of at least 32 bytes.
@@ -69,7 +80,7 @@ external trust dependency is absent:
 
 The completed list above does not imply that every possible IAM feature belongs
 inside OpenProof. Dynamic Client Registration, pairwise OIDC subjects, RP-initiated
-logout, automated master-key rekeying, multi-region replication, scheduled
+logout, online zero-logout master rotation, multi-region replication, scheduled
 backup/restore orchestration beyond the included safe scripts, external SIEM
 integration, and a trusted public TLS edge remain
 separate protocol/deployment capabilities unless a relying deployment adds them.
@@ -81,6 +92,7 @@ from the 19 completed identity-platform capabilities above.
 The repository continues to require its qualified **GCC 16.1 + Ninja** C++26
 modules toolchain. Promotion to production still requires the release gates in
 `scripts/qualify-production.sh`: a clean qualified build, complete CTest run,
-PostgreSQL integration tests without skips, sanitizers/fuzzing where configured,
+PostgreSQL integration tests without skips, the opt-in coverage-guided
+GCC/ASan/UBSan boundary fuzzer,
 the repository TLS identity E2E, load/soak qualification and deployment
 key/backup exercises.

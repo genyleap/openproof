@@ -8,6 +8,94 @@ fail() {
     exit 1
 }
 
+command -v node >/dev/null 2>&1 || fail "Node.js is required for SDK and E2E release gates"
+node --check "${ROOT_DIR}/scripts/load-smoke.mjs"
+node --check "${ROOT_DIR}/scripts/e2e-identity-platform.mjs"
+python3 "${ROOT_DIR}/scripts/verify-openapi.py"
+
+# Credential key rotation must stay wired end to end: closed configuration,
+# deployment secret mount, atomic schema journal, operator CLI and real-process E2E.
+grep -q 'credential_encryption_key = "file:/run/openproof/secrets/credential-encryption.key"' \
+    "${ROOT_DIR}/deploy/openproof.toml.example" \
+    || fail "deployment template omits the dedicated credential-encryption key"
+grep -q 'CREATE TABLE openproof.credential_key_rotations' \
+    "${ROOT_DIR}/migrations/0014_credential_key_rotation.sql" \
+    || fail "credential key rotation journal migration is missing"
+grep -q 'rekey-totp' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "offline TOTP rekey command is missing"
+grep -q '"rekey-totp", "--config"' \
+    "${ROOT_DIR}/scripts/e2e-identity-platform.mjs" \
+    || fail "identity E2E does not exercise TOTP credential rekey"
+grep -q 'TotpCredentialRekeyIsAtomicVersionedAndDryRunnable' \
+    "${ROOT_DIR}/tests/storage/postgres_integration_test.cpp" \
+    || fail "atomic PostgreSQL credential rekey regression is missing"
+
+# Full master retirement is safe only when long-lived one-way credentials are
+# independently keyed and all master-derived transient state is atomically retired.
+for key in password_pepper recovery_code_pepper audit_chain_key oauth_client_secret_key; do
+    grep -q "${key} = \"file:/run/openproof/secrets/" \
+        "${ROOT_DIR}/deploy/openproof.toml.example" \
+        || fail "deployment template omits dedicated ${key}"
+done
+grep -q 'CREATE TABLE openproof.master_key_rotations' \
+    "${ROOT_DIR}/migrations/0015_master_key_rotation.sql" \
+    || fail "master key rotation journal migration is missing"
+grep -q 'ADD COLUMN passkey_registrations' \
+    "${ROOT_DIR}/migrations/0016_master_rotation_passkey_ceremonies.sql" \
+    || fail "master rotation does not journal passkey registration invalidation"
+grep -q 'DELETE FROM openproof.passkey_registration_ceremonies' \
+    "${ROOT_DIR}/src/storage/postgres/postgres.cpp" \
+    || fail "master rotation leaves durable passkey ceremonies live"
+grep -q 'rotate-master-key' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "offline master key rotation command is missing"
+grep -q 'materialize-persistent-keys' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "legacy persistent-key materialization command is missing"
+grep -q 'hexfile:' "${ROOT_DIR}/src/config/config.cpp" \
+    || fail "binary-safe derived-key secret references are missing"
+grep -q '"rotate-master-key", "--config"' \
+    "${ROOT_DIR}/scripts/e2e-identity-platform.mjs" \
+    || fail "identity E2E does not exercise master key retirement"
+grep -q 'MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState' \
+    "${ROOT_DIR}/tests/storage/postgres_integration_test.cpp" \
+    || fail "atomic PostgreSQL master key rotation regression is missing"
+grep -q 'OPENPROOF_BUILD_COVERAGE_FUZZER' "${ROOT_DIR}/CMakeLists.txt" \
+    || fail "coverage-guided fuzzer build option is missing"
+grep -q 'fsanitize-coverage=trace-pc' "${ROOT_DIR}/fuzz/CMakeLists.txt" \
+    || fail "boundary fuzzer lacks execution-coverage feedback"
+grep -q 'currentCoverage' "${ROOT_DIR}/fuzz/boundary_fuzzer.cpp" \
+    || fail "boundary fuzzer does not retain coverage-increasing inputs"
+test -x "${ROOT_DIR}/scripts/qualify-fuzzing.sh" \
+    || fail "fuzz qualification entrypoint is not executable"
+grep -q 'rate_limit_refill_per_second' "${ROOT_DIR}/deploy/openproof.toml.example" \
+    || fail "deployment template omits the tunable gateway rate-limit policy"
+grep -q 'platform.gateway().rateLimitCapacity()' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "server composition does not consume the configured rate-limit policy"
+
+# Operational metrics must remain a private, authenticated runtime capability,
+# not merely an unused registry or a publicly proxied endpoint.
+grep -q 'metrics_bearer_token = "file:/run/openproof/secrets/metrics-bearer.token"' \
+    "${ROOT_DIR}/deploy/openproof.toml.example" \
+    || fail "deployment template omits the dedicated metrics bearer"
+grep -q 'platform.operations().metricsEnabled()' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "server composition does not wire configured runtime metrics"
+grep -q 'security::constantTimeEquals' \
+    "${ROOT_DIR}/src/operations/http/http.cpp" \
+    || fail "metrics bearer is not compared in constant time"
+grep -q 'location = /metrics' "${ROOT_DIR}/deploy/nginx-openproof.conf" \
+    || fail "public Nginx template does not block the private metrics endpoint"
+grep -q 'deniedMetrics.*edgeRequest("/metrics")' \
+    "${ROOT_DIR}/scripts/e2e-identity-platform.mjs" \
+    || fail "identity E2E does not prove unauthenticated metrics are denied"
+grep -q 'openproof_http_requests_total' \
+    "${ROOT_DIR}/scripts/e2e-identity-platform.mjs" \
+    || fail "identity E2E does not prove runtime HTTP metrics are emitted"
+
+# Keep the built-in operator console aligned with the administration API's
+# mandatory local-member identity identifier.
+grep -q "identity_id:v.identity_id,subject:v.subject" \
+    "${ROOT_DIR}/src/application/http/http.cpp" \
+    || fail "admin console local-member form omits identity_id"
+
 # Production source remains modules-only.
 if find "${ROOT_DIR}/src" "${ROOT_DIR}/sdk/cpp" -type f \( -name '*.h' -o -name '*.hpp' \) -print -quit | grep -q .; then
     fail "classic C/C++ header found in project-owned source"
@@ -817,13 +905,12 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     (cd "${ROOT_DIR}/sdk/javascript" && npm test)
 fi
 
-if command -v kotlinc >/dev/null 2>&1; then
-    KOTLIN_OUT="$(mktemp -d)/openproof-sdk.jar"
-    kotlinc "${ROOT_DIR}/sdk/kotlin/src/main/kotlin/org/openproof/identity/OpenProof.kt" -d "${KOTLIN_OUT}"
+if [[ -x "${ROOT_DIR}/sdk/kotlin/gradlew" ]]; then
+    (cd "${ROOT_DIR}/sdk/kotlin" && ./gradlew --no-daemon build)
 fi
 
 if [[ "$(uname -s)" == "Darwin" ]] && command -v swift >/dev/null 2>&1; then
-    swift build --package-path "${ROOT_DIR}/sdk/swift"
+    swift test --package-path "${ROOT_DIR}/sdk/swift"
 fi
 
 printf 'OpenProof release gate passed.\n'
