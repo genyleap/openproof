@@ -61,7 +61,8 @@ In **API Explorer & code**, choose a workflow preset or open any operation from
 the complete reference. **Guided form** labels each supported field and omits
 empty optional values. **JSON / Form raw** is the universal escape hatch for
 the complete OpenAPI contract. `GET /account/profile` sends no body, while
-`PATCH /account/profile` sends only the profile fields you supplied. The
+`PATCH /account/profile` sends only the profile fields you supplied. Send `null`
+or an empty string to clear any optional self-service profile field. The
 response panel is the real status/body returned by the local OpenProof process;
 the code panel generates the equivalent cURL, JavaScript, PHP, C++/STL,
 C++/Qt, C++/Boost or Web3 request. The C++ tabs are intentionally separate:

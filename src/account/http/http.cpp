@@ -89,6 +89,24 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
     return std::optional<std::string>{std::move(text).value()};
 }
 
+[[nodiscard]] foundation::Result<std::optional<std::string>> optionalProfileString(
+    const json::object& object, std::string_view name, std::size_t maximum)
+{
+    const auto* value = object.if_contains(name);
+    if (value == nullptr || value->is_null()) return std::optional<std::string>{};
+    if (!value->is_string()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The request was not valid.");
+    }
+    std::string text{value->as_string()};
+    if (text.empty()) return std::optional<std::string>{};
+    if (!safeText(text, maximum)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The request was not valid.");
+    }
+    return std::optional<std::string>{std::move(text)};
+}
+
 [[nodiscard]] bool onlyFields(const json::object& object,
                               std::initializer_list<std::string_view> allowed)
 {
@@ -324,10 +342,10 @@ gateway::HttpResponse AccountHttpApi::updateProfile(gateway::HttpRequest request
     auto actor = authorize(request); if (!actor) return error(actor.error(), request);
     auto body = objectBody(request);
     if (!body || !onlyFields(body.value(), {"display_name", "preferred_username", "locale", "picture"})) return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
-    auto display = optionalString(body.value(), "display_name", 256U);
-    auto username = optionalString(body.value(), "preferred_username", 128U);
-    auto locale = optionalString(body.value(), "locale", 64U);
-    auto picture = optionalString(body.value(), "picture", 2048U);
+    auto display = optionalProfileString(body.value(), "display_name", 256U);
+    auto username = optionalProfileString(body.value(), "preferred_username", 128U);
+    auto locale = optionalProfileString(body.value(), "locale", 64U);
+    auto picture = optionalProfileString(body.value(), "picture", 2048U);
     if (!display || !username || !locale || !picture) return error(!display ? display.error() : (!username ? username.error() : (!locale ? locale.error() : picture.error())), request);
     auto status = m_accounts->updateProfile(actor.value(), std::move(display).value(),
                                             std::move(username).value(), std::move(locale).value(),

@@ -239,10 +239,10 @@ paths:
               type: object
               additionalProperties: false
               properties:
-                display_name: {type: string, maxLength: 256}
-                preferred_username: {type: string, maxLength: 128}
-                locale: {type: string, maxLength: 64}
-                picture: {type: string, format: uri, maxLength: 2048}
+                display_name: {type: [string, "null"], maxLength: 256, description: Null or an empty string clears the field.}
+                preferred_username: {type: [string, "null"], maxLength: 128, description: Null or an empty string clears the field.}
+                locale: {type: [string, "null"], maxLength: 64, description: Null or an empty string clears the field.}
+                picture: {type: [string, "null"], format: uri, maxLength: 2048, description: Null or an empty string clears the field.}
       responses:
         "200":
           description: Updated profile.
@@ -1550,10 +1550,10 @@ components:
       type: object
       additionalProperties: false
       properties:
-        display_name: {type: string, maxLength: 256}
-        preferred_username: {type: string, maxLength: 128}
-        locale: {type: string, maxLength: 64}
-        picture: {type: string, format: uri, maxLength: 2048}
+        display_name: {type: [string, "null"], maxLength: 256, description: Null or an empty string clears the field.}
+        preferred_username: {type: [string, "null"], maxLength: 128, description: Null or an empty string clears the field.}
+        locale: {type: [string, "null"], maxLength: 64, description: Null or an empty string clears the field.}
+        picture: {type: [string, "null"], format: uri, maxLength: 2048, description: Null or an empty string clears the field.}
     WebAuthnOptions:
       type: object
       description: PublicKeyCredential options. Pass directly to the platform WebAuthn API after base64url decoding fields as required by that API.
