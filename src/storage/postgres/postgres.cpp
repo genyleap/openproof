@@ -4247,12 +4247,16 @@ namespace openproof::storage::postgres {
         std::string_view credentialId, std::uint32_t expected,
         std::uint32_t replacement, foundation::Instant usedAt)
     {
-        if (replacement <= expected) return foundation::fail(foundation::ErrorCode::Conflict);
+        const bool counterUnsupported = expected == 0U && replacement == 0U;
+        if (!counterUnsupported && replacement <= expected) {
+            return foundation::fail(foundation::ErrorCode::Conflict);
+        }
         auto lease = m_pool->m_implementation->acquire();
         if (!lease) return foundation::fail(lease.error());
         ResultPointer result = execParams(
             lease->get(),
-            "UPDATE openproof.passkey_credentials SET sign_count=$3,last_used_at_ms=$4 "
+            "UPDATE openproof.passkey_credentials "
+            "SET sign_count=$3,last_used_at_ms=GREATEST(last_used_at_ms,$4) "
             "WHERE credential_id=$1 AND sign_count=$2",
             {std::string{credentialId}, integer(static_cast<std::int64_t>(expected)),
              integer(static_cast<std::int64_t>(replacement)), instant(usedAt)});
@@ -4261,6 +4265,62 @@ namespace openproof::storage::postgres {
         }
         return std::string_view{PQcmdTuples(result.get())} == "1"
             ? foundation::ok() : foundation::fail(foundation::ErrorCode::Conflict);
+    }
+
+    foundation::Status PostgresPasskeyRepository::removeCredentialIfAnotherExists(
+        const identity::core::IdentityId& identityId,
+        std::string_view credentialId)
+    {
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        PGconn* connection = lease->get();
+        auto begun = beginTransaction(connection);
+        if (!begun) return begun;
+        const auto failTransaction = [&](foundation::Error error) -> foundation::Status {
+            rollback(connection);
+            return foundation::fail(std::move(error));
+        };
+
+        ResultPointer locked = execParams(
+            connection,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+            {std::string{identityId.value()}});
+        if (!tuplesOk(locked.get())) {
+            return failTransaction(databaseError(locked.get(), "lock passkey credentials"));
+        }
+
+        ResultPointer counts = execParams(
+            connection,
+            "SELECT count(*), count(*) FILTER (WHERE credential_id=$2) "
+            "FROM openproof.passkey_credentials WHERE identity_id=$1",
+            {std::string{identityId.value()}, std::string{credentialId}});
+        if (!tuplesOk(counts.get()) || PQntuples(counts.get()) != 1) {
+            return failTransaction(databaseError(counts.get(), "count passkey credentials"));
+        }
+        auto total = parseInteger<std::size_t>(field(counts.get(), 0, 0));
+        auto matching = parseInteger<std::size_t>(field(counts.get(), 0, 1));
+        if (!total || !matching) {
+            return failTransaction(foundation::Error{foundation::ErrorCode::Internal});
+        }
+        if (matching.value() != 1U) {
+            return failTransaction(foundation::Error{foundation::ErrorCode::NotFound});
+        }
+        if (total.value() <= 1U) {
+            return failTransaction(foundation::Error{
+                foundation::ErrorCode::FailedPrecondition,
+                "The final passkey credential cannot be removed while passkey sign-in is connected."});
+        }
+
+        ResultPointer removed = execParams(
+            connection,
+            "DELETE FROM openproof.passkey_credentials WHERE credential_id=$1 AND identity_id=$2",
+            {std::string{credentialId}, std::string{identityId.value()}});
+        if (!commandOk(removed.get()) || std::string_view{PQcmdTuples(removed.get())} != "1") {
+            return failTransaction(databaseError(removed.get(), "remove passkey credential"));
+        }
+        auto committed = commit(connection);
+        if (!committed) return foundation::fail(committed.error());
+        return foundation::ok();
     }
 
     foundation::Status PostgresPasskeyRepository::removeCredential(

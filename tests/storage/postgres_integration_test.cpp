@@ -26,6 +26,7 @@ import openproof.oauth;
 import openproof.organization;
 import openproof.policy;
 import openproof.provider.local;
+import openproof.provider.passkey;
 import openproof.security;
 import openproof.session;
 import openproof.token;
@@ -47,6 +48,7 @@ namespace pg = openproof::storage::postgres;
 namespace pol = openproof::policy;
 namespace org = openproof::organization;
 namespace local = openproof::provider::local;
+namespace passkey = openproof::provider::passkey;
 namespace sec = openproof::security;
 namespace sess = openproof::session;
 namespace tok = openproof::token;
@@ -133,6 +135,37 @@ TEST_F(PostgresIntegrationTest, MigrationIsIdempotentAndPoolIsHealthy)
     EXPECT_EQ(result->applied, 0U);
     EXPECT_GE(result->alreadyApplied, 1U);
     EXPECT_EQ(pool->size(), 4U);
+}
+
+TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)
+{
+    pg::PostgresPasskeyRepository repository{*pool};
+    const core::IdentityId identity{"identity-1"};
+    const auto value = [&](std::string id) {
+        return passkey::PasskeyCredential{
+            std::move(id), identity, "x", "y", 0U, kNow, kNow};
+    };
+    ASSERT_TRUE(repository.addCredential(value("passkey-a")));
+    ASSERT_TRUE(repository.addCredential(value("passkey-b")));
+
+    std::atomic<int> removed{0};
+    std::thread first([&] {
+        if (repository.removeCredentialIfAnotherExists(identity, "passkey-a")) {
+            removed.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    std::thread second([&] {
+        if (repository.removeCredentialIfAnotherExists(identity, "passkey-b")) {
+            removed.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    first.join();
+    second.join();
+
+    EXPECT_EQ(removed.load(std::memory_order_relaxed), 1);
+    auto remaining = repository.listCredentials(identity);
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->size(), 1U);
 }
 
 TEST_F(PostgresIntegrationTest, SessionUseRotationAndRevocationAreImmediate)
@@ -1098,6 +1131,33 @@ TEST_F(PostgresIntegrationTest, IdentityPlatformPersistenceAndOneTimeOAuthStateA
     auto revokedReplacement = store.findRefresh(nextRefreshDigest);
     ASSERT_TRUE(revokedReplacement);
     EXPECT_EQ(revokedReplacement->state(), tok::RefreshTokenState::Revoked);
+}
+
+
+TEST_F(PostgresIntegrationTest, PasskeyZeroCounterUseUpdatesLastUsedAt)
+{
+    pg::PostgresPasskeyRepository repository{*pool};
+    const auto usedAt = kNow + std::chrono::minutes{5};
+
+    ASSERT_TRUE(repository.addCredential(passkey::PasskeyCredential{
+        "zero-counter-credential", core::IdentityId{"identity-1"},
+        "public-x", "public-y", 0U, kNow, kNow}));
+
+    ASSERT_TRUE(repository.advanceCounter(
+        "zero-counter-credential", 0U, 0U, usedAt));
+
+    auto stored = repository.findCredential("zero-counter-credential");
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().signCount, 0U);
+    EXPECT_EQ(stored->value().lastUsedAt, usedAt);
+
+    ASSERT_TRUE(repository.advanceCounter(
+        "zero-counter-credential", 0U, 0U, kNow));
+    stored = repository.findCredential("zero-counter-credential");
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().lastUsedAt, usedAt);
 }
 
 }

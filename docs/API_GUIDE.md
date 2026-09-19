@@ -342,6 +342,12 @@ Passkey registration requires an authenticated OpenProof session:
 4. list with `GET /account/passkeys`; remove with
    `DELETE /account/passkeys/{credential-id}`.
 
+When removing the final passkey credential, first disconnect the `passkey`
+sign-in connection through `POST /account/connections/disconnect`. That
+disconnect is accepted only when another sign-in method remains. This keeps
+credential deletion and last-sign-in protection fail-closed under concurrent
+requests.
+
 Passkey login is:
 
 1. `POST /auth/passkey/options`;

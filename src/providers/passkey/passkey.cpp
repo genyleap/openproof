@@ -479,11 +479,12 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
     if ((previous != 0U || next != 0U) && next <= previous) {
         return foundation::fail(failure("WebAuthn signature counter did not advance."));
     }
-    if (next != previous) {
-        auto advanced = repository.advanceCounter(response.credentialId, previous, next, now);
-        if (!advanced) return foundation::fail(advanced.error());
-        stored->value().signCount = next;
-    }
+    // Persist every successful use, including authenticators that do not support a
+    // signature counter and therefore report 0 on every assertion. The repository
+    // keeps the compare-and-update atomic for counters that are supported.
+    auto advanced = repository.advanceCounter(response.credentialId, previous, next, now);
+    if (!advanced) return foundation::fail(advanced.error());
+    stored->value().signCount = next;
     stored->value().lastUsedAt = now;
     return std::move(stored).value().value();
 }
@@ -545,8 +546,36 @@ foundation::Status InMemoryPasskeyRepository::advanceCounter(
 {
     std::lock_guard guard{m_mutex}; const auto found = m_credentials.find(credentialId);
     if (found == m_credentials.end()) return foundation::fail(foundation::ErrorCode::NotFound);
-    if (found->second.signCount != expected || replacement <= expected) return foundation::fail(foundation::ErrorCode::Conflict);
-    found->second.signCount = replacement; found->second.lastUsedAt = usedAt; return foundation::ok();
+    const bool counterUnsupported = expected == 0U && replacement == 0U;
+    if (found->second.signCount != expected
+        || (!counterUnsupported && replacement <= expected)) {
+        return foundation::fail(foundation::ErrorCode::Conflict);
+    }
+    found->second.signCount = replacement;
+    if (usedAt > found->second.lastUsedAt) {
+        found->second.lastUsedAt = usedAt;
+    }
+    return foundation::ok();
+}
+
+foundation::Status InMemoryPasskeyRepository::removeCredentialIfAnotherExists(
+    const identity::core::IdentityId& identity, std::string_view credentialId)
+{
+    std::lock_guard guard{m_mutex};
+    const auto found = m_credentials.find(credentialId);
+    if (found == m_credentials.end() || found->second.identity != identity) {
+        return foundation::fail(foundation::ErrorCode::NotFound);
+    }
+    const auto count = std::ranges::count_if(m_credentials, [&](const auto& entry) {
+        return entry.second.identity == identity;
+    });
+    if (count <= 1) {
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The final passkey credential cannot be removed while passkey sign-in is connected.");
+    }
+    m_credentials.erase(found);
+    return foundation::ok();
 }
 
 foundation::Status InMemoryPasskeyRepository::removeCredential(
@@ -649,7 +678,28 @@ foundation::Status PasskeyService::completeRegistration(
 foundation::Result<std::vector<PasskeyCredential>> PasskeyService::list(
     const identity::core::IdentityId& identity) const { return m_repository->listCredentials(identity); }
 foundation::Status PasskeyService::remove(const identity::core::IdentityId& identity,
-    std::string_view credentialId) { return m_repository->removeCredential(identity, credentialId); }
+    std::string_view credentialId)
+{
+    auto preserved = m_repository->removeCredentialIfAnotherExists(identity, credentialId);
+    if (preserved) return preserved;
+    if (preserved.error().code() != foundation::ErrorCode::FailedPrecondition) {
+        return preserved;
+    }
+
+    const identity::core::ExternalIdentityRef external{
+        idp::ProviderId{"passkey"}, idp::ExternalSubject{std::string{identity.value()}}};
+    auto owner = m_externalIdentities->ownerOf(external);
+    if (!owner) return foundation::fail(owner.error());
+    if (owner->has_value()) {
+        if (owner->value() != identity) {
+            return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        }
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "Disconnect passkey sign-in before removing the final passkey credential.");
+    }
+    return m_repository->removeCredential(identity, credentialId);
+}
 
 PasskeyAuthenticationProvider::PasskeyAuthenticationProvider(PasskeyRepository& repository,
     const foundation::ClockSource& clock, const PasskeyConfig& config)

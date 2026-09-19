@@ -52,9 +52,25 @@ public:
         std::string_view credentialId) const = 0;
     [[nodiscard]] virtual foundation::Result<std::vector<PasskeyCredential>> listCredentials(
         const identity::core::IdentityId& identity) const = 0;
+    /**
+     * @brief Atomically records a successful credential use and advances a supported signature counter.
+     *
+     * Authenticators that do not implement a signature counter report zero on every use. For those
+     * credentials, a 0 -> 0 update is valid and still persists @p usedAt. Non-zero counters must
+     * advance strictly.
+     */
     [[nodiscard]] virtual foundation::Status advanceCounter(
         std::string_view credentialId, std::uint32_t expected,
         std::uint32_t replacement, foundation::Instant usedAt) = 0;
+    /**
+     * @brief Removes @p credentialId only when another passkey credential remains.
+     *
+     * Implementations must make the count-and-delete decision atomically per
+     * identity. This prevents concurrent removals from deleting every passkey
+     * while the passkey authentication connection is still attached.
+     */
+    [[nodiscard]] virtual foundation::Status removeCredentialIfAnotherExists(
+        const identity::core::IdentityId& identity, std::string_view credentialId) = 0;
     [[nodiscard]] virtual foundation::Status removeCredential(
         const identity::core::IdentityId& identity, std::string_view credentialId) = 0;
 
@@ -78,6 +94,8 @@ public:
     [[nodiscard]] foundation::Status advanceCounter(
         std::string_view credentialId, std::uint32_t expected,
         std::uint32_t replacement, foundation::Instant usedAt) override;
+    [[nodiscard]] foundation::Status removeCredentialIfAnotherExists(
+        const identity::core::IdentityId& identity, std::string_view credentialId) override;
     [[nodiscard]] foundation::Status removeCredential(
         const identity::core::IdentityId& identity, std::string_view credentialId) override;
 

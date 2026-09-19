@@ -499,6 +499,15 @@ paths:
       responses:
         "200": {description: Passkey removed.}
         "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "412":
+          description: >-
+            The final passkey credential cannot be removed while passkey sign-in
+            is still connected. Disconnect the passkey account connection first;
+            that operation itself requires another sign-in method to remain.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
   /auth/login:
     post:
       tags: [Authentication]

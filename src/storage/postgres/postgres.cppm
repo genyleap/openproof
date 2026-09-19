@@ -511,6 +511,9 @@ public:
     [[nodiscard]] foundation::Status advanceCounter(
         std::string_view credentialId, std::uint32_t expected,
         std::uint32_t replacement, foundation::Instant usedAt) override;
+    [[nodiscard]] foundation::Status removeCredentialIfAnotherExists(
+        const identity::core::IdentityId& identity,
+        std::string_view credentialId) override;
     [[nodiscard]] foundation::Status removeCredential(
         const identity::core::IdentityId& identity,
         std::string_view credentialId) override;
