@@ -65,7 +65,8 @@ foundation::Status InMemoryAccountRepository::replace(VerificationChallenge chal
 
 foundation::Result<VerificationChallenge> InMemoryAccountRepository::consume(
     const VerificationId& id, const VerificationDigest& presented,
-    foundation::Instant now, std::uint32_t maximumAttempts)
+    foundation::Instant now, std::uint32_t maximumAttempts,
+    const identity::core::IdentityId* expectedIdentity)
 {
     if (maximumAttempts == 0U) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -75,6 +76,11 @@ foundation::Result<VerificationChallenge> InMemoryAccountRepository::consume(
     const auto found = m_impl->challenges.find(id);
     if (found == m_impl->challenges.end()) {
         return foundation::fail(invalidVerification("Verification challenge is unknown or consumed."));
+    }
+    if (expectedIdentity != nullptr
+        && found->second.challenge.identity() != *expectedIdentity) {
+        return foundation::fail(invalidVerification(
+            "Verification challenge does not belong to the authenticated identity."));
     }
     if (found->second.challenge.expiredAt(now) || found->second.attempts >= maximumAttempts) {
         m_impl->challenges.erase(found);

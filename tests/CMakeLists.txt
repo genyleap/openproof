@@ -23,6 +23,7 @@ add_executable(openproof_tests
     identity/transaction_test.cpp
     authentication/service_test.cpp
     authentication/http_test.cpp
+    account/account_test.cpp
     administration/administration_test.cpp
     administration/http_test.cpp
     session/session_test.cpp
@@ -74,6 +75,7 @@ target_link_libraries(openproof_tests
         openproof_identity_provider
         openproof_authentication
         openproof_authentication_http
+        openproof_account
         openproof_session
         openproof_credentials
         openproof_provider_local

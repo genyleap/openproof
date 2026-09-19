@@ -335,8 +335,8 @@ curl --fail-with-body -X PATCH -b openproof.cookies \
 
 Email and phone ownership are separate verified ceremonies:
 
-- `POST /account/email/change` → `{"email":"new@example.com"}`
-- `POST /account/email/change/verify` → verification identifier and secret
+- `POST /account/email/change` → `{"email":"new@example.com"}`. This sends a fresh OpenProof-owned verification link even for identities originally created through federated/Web3 providers.
+- `POST /account/email/change/verify` → verification identifier and secret. If a local password sign-in already exists, its subject is rebound to the verified email. If no local method exists, clients may include `"password":"a new long unique password"` in this same verification request to create email/password sign-in only after OpenProof has proven control of the mailbox.
 - `POST /account/phone` → `{"phone_number":"+989121234567"}`
 - `POST /account/phone/verify` → verification identifier and secret
 
