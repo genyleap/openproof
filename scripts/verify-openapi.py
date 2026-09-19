@@ -22,6 +22,8 @@ EXPECTED: dict[str, set[str]] = {
     "/account/password/forgot": {"post"},
     "/account/password/reset": {"post"},
     "/account/profile": {"get", "patch", "put"},
+    "/account/sessions": {"get"},
+    "/account/sessions/revoke": {"post"},
     "/account/connections": {"get"},
     "/account/connections/complete": {"get"},
     "/account/connections/start": {"get"},
