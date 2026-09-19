@@ -2,6 +2,7 @@ module;
 
 #include <compare>
 #include <optional>
+#include <string>
 #include <string_view>
 
 export module openproof.session:model;

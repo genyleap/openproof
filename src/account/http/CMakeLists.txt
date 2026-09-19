@@ -6,10 +6,12 @@ openproof_add_module(openproof_account_http
         boost_json.cpp
     LINK_PUBLIC
         openproof_account
+        openproof_authentication
         openproof_foundation
         openproof_gateway
         openproof_identity_core
         openproof_identity_profile
+        openproof_identity_provider
         openproof_session
     LINK_PRIVATE
         Boost::headers
