@@ -625,6 +625,105 @@ TEST(AuthenticationServiceTest, SelfProvisioningPersistsVerifiedProfileClaims)
     EXPECT_TRUE(stored->value().emailVerified());
 }
 
+TEST(AuthenticationServiceTest, ExistingLoginRefreshesProviderPictureWithoutReplacingCanonicalContactData)
+{
+    Fixture fixture;
+    fixture.implementation->claims.set(idp::ClaimName::DisplayName, "Provider Name");
+    fixture.implementation->claims.set(idp::ClaimName::PreferredUsername, "provider-name");
+    fixture.implementation->claims.set(idp::ClaimName::Email, "provider@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+    fixture.implementation->claims.set(idp::ClaimName::PictureUrl, "https://cdn.example.test/new.png");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    auto canonical = core::Identity::create(
+        core::IdentityId{"identity-1"}, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+
+    auto current = profile::IdentityProfile::create(core::IdentityId{"identity-1"}, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->updateSelfService(
+        std::optional<std::string>{"My Chosen Name"},
+        std::optional<std::string>{"chosen"},
+        std::optional<std::string>{"en"},
+        std::optional<std::string>{"https://cdn.example.test/old.png"}, kNow));
+    ASSERT_TRUE(current->setEmail("owner@example.test", true, kNow));
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("existing-profile-browser");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-profile-refresh"});
+    ASSERT_TRUE(started);
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+
+    auto stored = profiles.find(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().displayName(), "My Chosen Name");
+    EXPECT_EQ(stored->value().preferredUsername(), "chosen");
+    EXPECT_EQ(stored->value().email(), "owner@example.test");
+    EXPECT_TRUE(stored->value().emailVerified());
+    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/new.png");
+}
+
+TEST(AuthenticationServiceTest, ConnectionFillsMissingPresentationClaimsWithoutImportingEmail)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "subject-2";
+    fixture.implementation->claims.set(idp::ClaimName::DisplayName, "Connected Name");
+    fixture.implementation->claims.set(idp::ClaimName::PreferredUsername, "connected");
+    fixture.implementation->claims.set(idp::ClaimName::Email, "other@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+    fixture.implementation->claims.set(idp::ClaimName::PictureUrl, "https://cdn.example.test/connected.png");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    auto canonical = core::Identity::create(
+        core::IdentityId{"identity-1"}, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+    auto current = profile::IdentityProfile::create(core::IdentityId{"identity-1"}, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("connection-profile-browser");
+    auto started = service.beginConnection(
+        fixture.request(), binding, fnd::CorrelationId{"corr-connection-profile"},
+        core::IdentityId{"identity-1"});
+    ASSERT_TRUE(started);
+    auto connected = service.completeConnection(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(connected) << connected.error().internalDetail();
+
+    auto stored = profiles.find(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().displayName(), "Connected Name");
+    EXPECT_EQ(stored->value().preferredUsername(), "connected");
+    EXPECT_FALSE(stored->value().email().has_value());
+    EXPECT_FALSE(stored->value().emailVerified());
+    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/connected.png");
+}
+
 TEST(AuthenticationServiceTest, BrowserConnectionHandoffIsBoundAndSingleUse)
 {
     Fixture fixture;

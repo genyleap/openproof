@@ -707,7 +707,7 @@ gateway::HttpResponse OAuthHttpApi::loginSubmit(gateway::HttpRequest request)
         foundation::SecretString{std::string{started->continuationToken().expose()}},
         binding.value(), authResponse);
     if (!verified) return error(verified.error(), request);
-    auto sessionGrant = m_sessions->issue(verified.value());
+    auto sessionGrant = m_sessions->issue(verified.value(), clientContext(request));
     if (!sessionGrant) return error(sessionGrant.error(), request);
     auto response = redirect(returnTarget.value(), 303);
     response.addHeader("set-cookie", cookie(kSessionCookie, sessionGrant->token().expose(), "/", 8 * 60 * 60));

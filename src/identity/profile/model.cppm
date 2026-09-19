@@ -53,6 +53,16 @@ public:
     [[nodiscard]] foundation::Status applyVerifiedClaims(
         const provider::VerifiedClaims& claims, foundation::Instant now);
 
+    /**
+     * @brief Refreshes non-security presentation data from an authenticated provider.
+     *
+     * Existing user-chosen display name, username and locale win. A verified provider
+     * picture may refresh so the account can follow the connected profile avatar.
+     * Email and phone claims are deliberately ignored by this path.
+     */
+    [[nodiscard]] foundation::Status refreshPresentationClaims(
+        const provider::VerifiedClaims& claims, foundation::Instant now);
+
     /** @brief Updates subject-controlled non-verified presentation fields. */
     [[nodiscard]] foundation::Status updateSelfService(
         std::optional<std::string> displayName,

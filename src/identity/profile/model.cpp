@@ -191,6 +191,47 @@ foundation::Status IdentityProfile::applyVerifiedClaims(
     return foundation::ok();
 }
 
+foundation::Status IdentityProfile::refreshPresentationClaims(
+    const provider::VerifiedClaims& claims, foundation::Instant now)
+{
+    if (now < m_updatedAt) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Profile claims cannot move time backwards.");
+    }
+    bool changed = false;
+    if (!m_displayName) {
+        if (const auto value = claims.get(provider::ClaimName::DisplayName); value) {
+            m_displayName = std::string{*value};
+            changed = true;
+        }
+    }
+    if (!m_preferredUsername) {
+        if (const auto value = claims.get(provider::ClaimName::PreferredUsername); value) {
+            m_preferredUsername = std::string{*value};
+            changed = true;
+        }
+    }
+    if (!m_locale) {
+        if (const auto value = claims.get(provider::ClaimName::Locale); value) {
+            m_locale = std::string{*value};
+            changed = true;
+        }
+    }
+    if (const auto value = claims.get(provider::ClaimName::PictureUrl); value) {
+        if (!m_pictureUrl || *m_pictureUrl != *value) {
+            m_pictureUrl = std::string{*value};
+            changed = true;
+        }
+    }
+    if (!validText(m_displayName, 256U) || !validText(m_preferredUsername, 128U)
+        || !validText(m_locale, 64U) || !validText(m_pictureUrl, 2048U)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Provider presentation claims exceeded platform limits.");
+    }
+    if (changed) m_updatedAt = now;
+    return foundation::ok();
+}
+
 foundation::Status IdentityProfile::updateSelfService(
     std::optional<std::string> displayName,
     std::optional<std::string> preferredUsername,

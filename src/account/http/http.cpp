@@ -199,6 +199,13 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Get && request.path() == "/account/profile") return getProfile(std::move(request));
     if ((request.method() == HttpMethod::Patch || request.method() == HttpMethod::Put)
         && request.path() == "/account/profile") return updateProfile(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/sessions") {
+        return sessions(std::move(request));
+    }
+    if (request.method() == HttpMethod::Post
+        && request.path() == "/account/sessions/revoke") {
+        return revokeSession(std::move(request));
+    }
     if (request.method() == HttpMethod::Get && request.path() == "/account/connections") {
         return connections(std::move(request));
     }
@@ -355,6 +362,65 @@ gateway::HttpResponse AccountHttpApi::updateProfile(gateway::HttpRequest request
     return profile ? jsonResponse(200, profileJson(profile.value())) : error(profile.error(), request);
 }
 
+gateway::HttpResponse AccountHttpApi::sessions(gateway::HttpRequest request)
+{
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) return error(credential.error(), request);
+    if (!credential->has_value()) {
+        return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    }
+    auto authenticated = m_sessions->authenticate(credential->value());
+    if (!authenticated) return error(authenticated.error(), request);
+    const auto& current = authenticated->session();
+    auto values = m_sessions->list(current.identity());
+    if (!values) return error(values.error(), request);
+
+    json::array sessions;
+    for (const auto& value : values.value()) {
+        json::object item;
+        item["session_id"] = value.id().value();
+        item["provider"] = value.provider().value();
+        item["assurance"] = identity::provider::assuranceLevelName(value.assurance());
+        item["phishing_resistant"] = value.strength().isPhishingResistant();
+        item["issued_at_ms"] = value.issuedAt().time_since_epoch().count();
+        item["last_seen_at_ms"] = value.lastSeenAt().time_since_epoch().count();
+        item["absolute_expires_at_ms"] = value.absoluteExpiresAt().time_since_epoch().count();
+        item["idle_expires_at_ms"] = value.idleExpiresAt().time_since_epoch().count();
+        item["current"] = value.id() == current.id();
+        if (value.userAgent()) item["user_agent"] = *value.userAgent();
+        sessions.emplace_back(std::move(item));
+    }
+    return jsonResponse(200, json::object{{"sessions", std::move(sessions)}});
+}
+
+gateway::HttpResponse AccountHttpApi::revokeSession(gateway::HttpRequest request)
+{
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) return error(credential.error(), request);
+    if (!credential->has_value()) {
+        return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    }
+    auto authenticated = m_sessions->authenticate(credential->value());
+    if (!authenticated) return error(authenticated.error(), request);
+
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"session_id"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
+    }
+    auto idText = requiredString(body.value(), "session_id", 200U);
+    if (!idText) return error(idText.error(), request);
+    const session::SessionId target{std::move(idText).value()};
+    if (target == authenticated->session().id()) {
+        return error(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "Use logout to end the current session."}, request);
+    }
+    auto revoked = m_sessions->revokeOwned(authenticated->session().identity(), target);
+    return revoked
+        ? jsonResponse(200, json::object{{"revoked", true}})
+        : error(revoked.error(), request);
+}
+
 gateway::HttpResponse AccountHttpApi::connections(gateway::HttpRequest request)
 {
     auto actor = authorize(request);
@@ -363,9 +429,21 @@ gateway::HttpResponse AccountHttpApi::connections(gateway::HttpRequest request)
     if (!values) return error(values.error(), request);
     json::array connectionsJson;
     for (const auto& external : values.value()) {
-        connectionsJson.emplace_back(json::object{
+        json::object item{
             {"provider", external.providerId().value()},
-            {"subject", external.subject().value()}});
+            {"subject", external.subject().value()}};
+        if (external.providerId().value() == "farcaster") {
+            const std::string fid{external.subject().value()};
+            const bool numeric = !fid.empty()
+                && std::ranges::all_of(fid, [](char symbol) {
+                       return symbol >= '0' && symbol <= '9';
+                   });
+            if (numeric) {
+                item["fid"] = fid;
+                item["profile_url"] = "https://farcaster.xyz/~/profiles/" + fid;
+            }
+        }
+        connectionsJson.emplace_back(std::move(item));
     }
     return jsonResponse(200, json::object{{"connections", std::move(connectionsJson)}});
 }

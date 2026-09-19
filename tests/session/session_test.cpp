@@ -276,6 +276,42 @@ TEST(SessionServiceTest, RevokeAllInvalidatesEverySessionForOnlyThatIdentity)
     EXPECT_FALSE(fixture.service.authenticate(second.token()).has_value());
 }
 
+TEST(SessionServiceTest, StoresClientMetadataAndListsActiveSessions)
+{
+    Fixture fixture;
+    idp::ClientContext client;
+    client.setUserAgent("Mozilla/5.0 Test Browser");
+    client.setRemoteAddress("203.0.113.42");
+
+    auto grant = fixture.service.issue(verifiedAuthentication(), client);
+    ASSERT_TRUE(grant);
+    auto listed = fixture.service.list(core::IdentityId{"identity-1"});
+
+    ASSERT_TRUE(listed);
+    ASSERT_EQ(listed->size(), 1U);
+    EXPECT_EQ(listed->front().id(), grant->id());
+    ASSERT_TRUE(listed->front().userAgent().has_value());
+    ASSERT_TRUE(listed->front().remoteAddress().has_value());
+    EXPECT_EQ(*listed->front().userAgent(), "Mozilla/5.0 Test Browser");
+    EXPECT_EQ(*listed->front().remoteAddress(), "203.0.113.42");
+}
+
+TEST(SessionServiceTest, RevokeOwnedChecksTheCanonicalIdentity)
+{
+    Fixture fixture;
+    auto grant = fixture.service.issue(verifiedAuthentication()).value();
+
+    const auto refused = fixture.service.revokeOwned(
+        core::IdentityId{"identity-2"}, grant.id());
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), fnd::ErrorCode::NotFound);
+    EXPECT_TRUE(fixture.service.authenticate(grant.token()).has_value());
+
+    EXPECT_TRUE(fixture.service.revokeOwned(
+        core::IdentityId{"identity-1"}, grant.id()).has_value());
+    EXPECT_FALSE(fixture.service.authenticate(grant.token()).has_value());
+}
+
 TEST(SessionServiceTest, AbsoluteExpiryIsInclusive)
 {
     sess::InMemorySessionRepository sessions;

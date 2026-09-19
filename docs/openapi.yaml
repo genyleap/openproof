@@ -266,6 +266,55 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Profile"}
         "401": {$ref: "#/components/responses/Error"}
+  /account/sessions:
+    get:
+      tags: [Account]
+      operationId: listSessions
+      summary: List active first-party sessions for the current identity.
+      security: [{sessionCookie: []}]
+      responses:
+        "200":
+          description: Active sessions, including whether each is the current session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: {$ref: "#/components/schemas/AccountSession"}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/sessions/revoke:
+    post:
+      tags: [Account]
+      operationId: revokeSession
+      summary: Revoke one other active session owned by the current identity.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_id]
+              properties:
+                session_id: {type: string, minLength: 1, maxLength: 200}
+      responses:
+        "200":
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: {type: boolean}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
   /account/connections:
     get:
       tags: [Account, Federation]
@@ -1539,6 +1588,21 @@ components:
       required: [email]
       properties:
         email: {type: string, format: email, maxLength: 320}
+    AccountSession:
+      type: object
+      additionalProperties: false
+      required: [session_id, provider, assurance, phishing_resistant, issued_at_ms, last_seen_at_ms, absolute_expires_at_ms, idle_expires_at_ms, current]
+      properties:
+        session_id: {type: string, minLength: 1, maxLength: 200, description: Opaque action identifier. Do not display it as a user-facing device name.}
+        provider: {type: string, minLength: 1, maxLength: 200}
+        assurance: {type: string}
+        phishing_resistant: {type: boolean}
+        issued_at_ms: {type: integer, format: int64}
+        last_seen_at_ms: {type: integer, format: int64}
+        absolute_expires_at_ms: {type: integer, format: int64}
+        idle_expires_at_ms: {type: integer, format: int64}
+        current: {type: boolean}
+        user_agent: {type: string, maxLength: 1024, description: Client metadata captured when the session was issued. May be absent for older sessions.}
     AccountConnection:
       type: object
       additionalProperties: false
@@ -1546,6 +1610,14 @@ components:
       properties:
         provider: {type: string, minLength: 1, maxLength: 128}
         subject: {type: string, minLength: 1, maxLength: 4096}
+        fid:
+          type: string
+          pattern: "^[0-9]+$"
+          description: Stable Farcaster ID when the connection provider is farcaster.
+        profile_url:
+          type: string
+          format: uri
+          description: Stable public profile URL for providers that expose one.
     ProfileUpdate:
       type: object
       additionalProperties: false

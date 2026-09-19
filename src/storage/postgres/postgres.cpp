@@ -370,11 +370,12 @@ struct LockedMember final {
 constexpr std::string_view kSessionColumns =
     "id, identity_id, provider, assurance, factors, phishing_resistant, state, "
     "encode(token_digest, 'hex'), authenticated_at_ms, issued_at_ms, "
-    "last_seen_at_ms, absolute_expires_at_ms, idle_timeout_ms, revoked_at_ms";
+    "last_seen_at_ms, absolute_expires_at_ms, idle_timeout_ms, revoked_at_ms, "
+    "user_agent, remote_address";
 
 [[nodiscard]] foundation::Result<session::Session> sessionFromRow(PGresult* result, int row)
 {
-    if (PQnfields(result) != 14) {
+    if (PQnfields(result) != 16) {
         return foundation::fail(foundation::ErrorCode::Internal,
                                 "PostgreSQL returned an invalid session shape.");
     }
@@ -399,6 +400,10 @@ constexpr std::string_view kSessionColumns =
         if (!revoked) return foundation::fail(revoked.error());
         revokedAt = foundation::Instant{foundation::Duration{revoked.value()}};
     }
+    std::optional<std::string> userAgent;
+    if (PQgetisnull(result, row, 14) == 0) userAgent = field(result, row, 14);
+    std::optional<std::string> remoteAddress;
+    if (PQgetisnull(result, row, 15) == 0) remoteAddress = field(result, row, 15);
     return session::Session::restore(
         session::SessionId{field(result, row, 0)},
         identity::core::IdentityId{field(result, row, 1)},
@@ -413,7 +418,8 @@ constexpr std::string_view kSessionColumns =
         foundation::Instant{foundation::Duration{issued.value()}},
         foundation::Instant{foundation::Duration{lastSeen.value()}},
         foundation::Instant{foundation::Duration{absolute.value()}},
-        foundation::Duration{idle.value()}, revokedAt);
+        foundation::Duration{idle.value()}, revokedAt,
+        std::move(userAgent), std::move(remoteAddress));
 }
 
 constexpr std::string_view kTransactionColumns =
@@ -1034,8 +1040,10 @@ foundation::Status PostgresSessionRepository::add(session::Session value)
     ResultPointer result = execParams(lease->get(),
         "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,"
         "phishing_resistant,state,token_digest,authenticated_at_ms,issued_at_ms,"
-        "last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,revoked_at_ms) "
-        "VALUES($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,$10,$11,$12,$13,NULL)",
+        "last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,revoked_at_ms,"
+        "user_agent,remote_address) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,$10,$11,$12,$13,NULL,"
+        "NULLIF($14,''),NULLIF($15,''))",
         {std::string{value.id().value()}, std::string{value.identity().value()},
          std::string{value.provider().value()},
          std::to_string(static_cast<unsigned int>(value.assurance())),
@@ -1043,7 +1051,8 @@ foundation::Status PostgresSessionRepository::add(session::Session value)
          std::to_string(static_cast<unsigned int>(value.state())),
          foundation::toHex(value.tokenDigest().bytes()), instant(value.authenticatedAt()),
          instant(value.issuedAt()), instant(value.lastSeenAt()), instant(value.absoluteExpiresAt()),
-         integer(value.idleTimeout().count())});
+         integer(value.idleTimeout().count()),
+         value.userAgent().value_or(""), value.remoteAddress().value_or("")});
     if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "insert session"));
     return foundation::ok();
 }
@@ -1133,6 +1142,28 @@ foundation::Result<std::optional<session::Session>> PostgresSessionRepository::f
     auto value = sessionFromRow(result.get(), 0);
     if (!value) return foundation::fail(value.error());
     return std::optional<session::Session>{std::move(value).value()};
+}
+
+foundation::Result<std::vector<session::Session>>
+PostgresSessionRepository::list(const identity::core::IdentityId& identity) const
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT " + std::string{kSessionColumns}
+        + " FROM openproof.sessions WHERE identity_id=$1 ORDER BY last_seen_at_ms DESC",
+        {std::string{identity.value()}});
+    if (!tuplesOk(result.get())) {
+        return foundation::fail(databaseError(result.get(), "list identity sessions"));
+    }
+    std::vector<session::Session> values;
+    values.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+    for (int row = 0; row < PQntuples(result.get()); ++row) {
+        auto value = sessionFromRow(result.get(), row);
+        if (!value) return foundation::fail(value.error());
+        values.emplace_back(std::move(value).value());
+    }
+    return values;
 }
 
 std::size_t PostgresSessionRepository::purgeExpired(foundation::Instant now)

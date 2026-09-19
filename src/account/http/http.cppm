@@ -43,6 +43,8 @@ private:
     [[nodiscard]] gateway::HttpResponse updateProfile(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse connections(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse disconnect(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse sessions(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse revokeSession(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse error(const foundation::Error& failure,
                                                const gateway::HttpRequest& request) const;
 

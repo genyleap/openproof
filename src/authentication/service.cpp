@@ -518,6 +518,12 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
             if (!applied) return foundation::fail(applied.error());
             auto saved = m_profileRepository->save(profile.value());
             if (!saved) return foundation::fail(saved.error());
+        } else {
+            auto profile = stored->value();
+            auto refreshed = profile.refreshPresentationClaims(outcome.claims(), completedAt);
+            if (!refreshed) return foundation::fail(refreshed.error());
+            auto saved = m_profileRepository->save(profile);
+            if (!saved) return foundation::fail(saved.error());
         }
     }
     return VerifiedAuthentication{std::move(outcome), std::move(identity)};
@@ -541,14 +547,36 @@ AuthenticationService::completeConnection(
     const std::lock_guard guard{m_connectionMutex};
     auto owner = m_identities.ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
-    if (owner->has_value()) {
-        if (owner->value() == target) return external;
+    if (owner->has_value() && owner->value() != target) {
         return foundation::fail(
             foundation::ErrorCode::Conflict,
             "That external account is already connected to another OpenProof identity.");
     }
-    auto attached = attachVerified(target, external, exchange->completedAt);
-    if (!attached) return foundation::fail(attached.error());
+    if (!owner->has_value()) {
+        auto attached = attachVerified(target, external, exchange->completedAt);
+        if (!attached) return foundation::fail(attached.error());
+    }
+    if (m_profileRepository != nullptr) {
+        auto stored = m_profileRepository->find(target);
+        if (!stored) return foundation::fail(stored.error());
+        if (stored->has_value()) {
+            auto profile = stored->value();
+            auto refreshed = profile.refreshPresentationClaims(
+                exchange->outcome.claims(), exchange->completedAt);
+            if (!refreshed) return foundation::fail(refreshed.error());
+            auto saved = m_profileRepository->save(profile);
+            if (!saved) return foundation::fail(saved.error());
+        } else {
+            auto profile = identity::profile::IdentityProfile::create(
+                target, exchange->completedAt);
+            if (!profile) return foundation::fail(profile.error());
+            auto refreshed = profile->refreshPresentationClaims(
+                exchange->outcome.claims(), exchange->completedAt);
+            if (!refreshed) return foundation::fail(refreshed.error());
+            auto saved = m_profileRepository->save(profile.value());
+            if (!saved) return foundation::fail(saved.error());
+        }
+    }
     return external;
 }
 

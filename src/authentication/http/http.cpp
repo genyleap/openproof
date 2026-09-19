@@ -302,7 +302,7 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
         foundation::SecretString{continuation.value()}, binding.value(),
         authenticationResponse);
     if (!verified.has_value()) return error(verified.error(), request, true);
-    auto grant = m_sessions->issue(verified.value());
+    auto grant = m_sessions->issue(verified.value(), clientContext(request));
     if (!grant.has_value()) return error(grant.error(), request, true);
     json::object payload;
     payload["session_id"] = grant->id().value();

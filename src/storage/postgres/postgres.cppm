@@ -189,6 +189,8 @@ public:
         foundation::Instant now) override;
     [[nodiscard]] foundation::Result<std::optional<session::Session>>
     find(const session::SessionId& id) const override;
+    [[nodiscard]] foundation::Result<std::vector<session::Session>>
+    list(const identity::core::IdentityId& identity) const override;
     [[nodiscard]] std::size_t purgeExpired(foundation::Instant now) override;
     [[nodiscard]] std::size_t size() const override;
 private:
