@@ -371,7 +371,7 @@ Other challenge/response providers also use a cookie-bound start/complete pair:
 
 Never allow a wallet or LDAP client to substitute its own nonce, transaction
 identifier or username binding. Farcaster messages must use statement
-`Farcaster Auth`, Optimism chain 10 and resource `farcaster://fids/<fid>`.
+`Farcaster Auth`, Optimism chain 10 and resource `farcaster://fid/<fid>`.
 
 ## 7. Service-to-service authentication
 

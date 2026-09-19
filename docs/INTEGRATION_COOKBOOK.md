@@ -417,7 +417,7 @@ const siwf = await fetch(`${issuer}/auth/web3/start`, {
 // The signed message must contain:
 //   Farcaster Auth
 //   Chain ID: 10
-//   Resources:\n- farcaster://fids/<fid>
+//   Resources:\n- farcaster://fid/<fid>
 const completed = await fetch(`${issuer}/auth/web3/complete`, {
   method: "POST",
   credentials: "include",

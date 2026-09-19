@@ -1618,7 +1618,7 @@ components:
         domain: {type: string}
         uri: {type: string, format: uri}
         statement: {type: string, const: Farcaster Auth}
-        resource_prefix: {type: string, const: "farcaster://fids/"}
+        resource_prefix: {type: string, const: "farcaster://fid/"}
         signer_kind: {type: string, enum: [custody, auth_address]}
     LdapCompletion:
       type: object

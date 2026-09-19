@@ -132,7 +132,7 @@ TEST(FarcasterProviderTest, RelayStartPublishesAuthKitConfigurationWithoutRequir
               "https://login.openproof.test/auth/farcaster");
     EXPECT_EQ(parameter(*challenge, "statement"), "Farcaster Auth");
     EXPECT_EQ(parameter(*challenge, "chain_id"), "10");
-    EXPECT_EQ(parameter(*challenge, "resource_prefix"), "farcaster://fids/");
+    EXPECT_EQ(parameter(*challenge, "resource_prefix"), "farcaster://fid/");
     EXPECT_EQ(parameter(*challenge, "nonce").size(), 32U);
     EXPECT_FALSE(challenge->parameters().contains("message"));
 }
@@ -150,7 +150,7 @@ TEST(FarcasterProviderTest, DirectCustodyFlowUsesCanonicalFip11Message)
     const std::string message = parameter(*challenge, "message");
     EXPECT_NE(message.find("\n\nFarcaster Auth\n\n"), std::string::npos);
     EXPECT_NE(message.find("\nChain ID: 10\n"), std::string::npos);
-    EXPECT_NE(message.find("\nResources:\n- farcaster://fids/6841"), std::string::npos);
+    EXPECT_NE(message.find("\nResources:\n- farcaster://fid/6841"), std::string::npos);
     EXPECT_EQ(message.find("Request ID:"), std::string::npos);
     EXPECT_EQ(parameter(*challenge, "signer_kind"), "custody");
 
@@ -162,6 +162,27 @@ TEST(FarcasterProviderTest, DirectCustodyFlowUsesCanonicalFip11Message)
     EXPECT_EQ(observed->signatureChecks, 1);
     EXPECT_EQ(observed->authorizationChecks, 2);
     EXPECT_EQ(observed->lastFid, kFid);
+}
+
+TEST(FarcasterProviderTest, AcceptsLegacyPluralFidResourceDuringMigration)
+{
+    fnd::ManualClockSource clock{kNow};
+    auto chain = std::make_unique<FakeFarcasterChain>();
+    web3::FarcasterAuthenticationProvider provider{
+        configuration(), clock, std::move(chain)};
+    auto challenge = provider.beginAuthentication(request(true));
+    ASSERT_TRUE(challenge);
+    std::string message = parameter(*challenge, "message");
+    const auto current = message.find("farcaster://fid/");
+    ASSERT_NE(current, std::string::npos);
+    message.replace(current, std::string_view{"farcaster://fid/"}.size(),
+                    "farcaster://fids/");
+
+    auto outcome = provider.completeAuthentication(
+        response(*challenge, std::move(message)));
+
+    ASSERT_TRUE(outcome);
+    EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
 }
 
 TEST(FarcasterProviderTest, AuthAddressIsAcceptedAndRecordedDistinctly)

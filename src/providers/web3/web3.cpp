@@ -633,7 +633,7 @@ struct RpcResponse final { json::value result; };
     std::string output = buildSiweMessage(
         domain, address, kFarcasterStatement, uri, kOptimismMainnetChainId,
         nonce, issuedAt, expiresAt);
-    output.append("\nResources:\n- farcaster://fids/");
+    output.append("\nResources:\n- farcaster://fid/");
     output.append(std::to_string(fid));
     return output;
 }
@@ -753,11 +753,17 @@ struct ParsedFarcasterSiwe final {
             "The SIWF message is not a Farcaster FIP-11 message for this relying party."));
     }
     auto address = normalizeAddress(lines[1]);
-    constexpr std::string_view resourcePrefix{"- farcaster://fids/"};
-    if (!address || !lines[12].starts_with(resourcePrefix)) {
+    constexpr std::string_view resourcePrefix{"- farcaster://fid/"};
+    constexpr std::string_view legacyResourcePrefix{"- farcaster://fids/"};
+    const auto resource = lines[12];
+    const auto prefix = resource.starts_with(resourcePrefix)
+        ? resourcePrefix
+        : (resource.starts_with(legacyResourcePrefix) ? legacyResourcePrefix
+                                                      : std::string_view{});
+    if (!address || prefix.empty()) {
         return foundation::fail(authenticationFailure("The SIWF signer or FID resource is invalid."));
     }
-    auto fid = parseDecimal(lines[12].substr(resourcePrefix.size()));
+    auto fid = parseDecimal(resource.substr(prefix.size()));
     if (!fid || fid.value() == 0U) {
         return foundation::fail(authenticationFailure("The SIWF Farcaster FID is invalid."));
     }
@@ -1057,7 +1063,7 @@ FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRe
     challenge.setParameter("domain", std::string{m_implementation->config.domain()});
     challenge.setParameter("uri", std::string{m_implementation->config.uri()});
     challenge.setParameter("statement", std::string{kFarcasterStatement});
-    challenge.setParameter("resource_prefix", "farcaster://fids/");
+    challenge.setParameter("resource_prefix", "farcaster://fid/");
     challenge.setParameter("chain_id", std::to_string(m_implementation->config.chainId()));
     if (address && fid && signerKind) {
         challenge.setParameter("message", buildFarcasterMessage(

@@ -647,7 +647,7 @@ bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS `OPENPROOF_WEB3_URI`;
   chain ID `10`; the default registries are the canonical Farcaster IdRegistry
   (`0x00000000fc6c5f01fc30151999387bb99a9f489b`) and KeyRegistry
   (`0x00000000fc1237824fb747abde0ff18990e59b7e`). The signed FIP-11 proof binds
-  statement `Farcaster Auth` and resource `farcaster://fids/<fid>`. OpenProof
+  statement `Farcaster Auth` and resource `farcaster://fid/<fid>`. OpenProof
   independently rechecks custody or an active type-2 auth address after
   signature verification. Setting `OPENPROOF_FARCASTER_CHAIN_ID` to a value
   other than `10` is rejected.
