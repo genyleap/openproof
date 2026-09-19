@@ -130,6 +130,34 @@ struct BrowserConnectionTarget final {
 };
 
 /**
+ * @brief Two-secret bridge for wallet authentication across mobile browsers.
+ *
+ * The publisher ticket may be exposed to the wallet app. The redeem ticket stays
+ * in the originating browser and is the only credential that can mint its session.
+ */
+class BrowserAuthenticationHandoff final {
+public:
+    BrowserAuthenticationHandoff(const BrowserAuthenticationHandoff&) = delete;
+    BrowserAuthenticationHandoff& operator=(const BrowserAuthenticationHandoff&) = delete;
+    BrowserAuthenticationHandoff(BrowserAuthenticationHandoff&&) noexcept = default;
+    BrowserAuthenticationHandoff& operator=(BrowserAuthenticationHandoff&&) noexcept = default;
+
+    [[nodiscard]] const foundation::SecretString& publisherTicket() const noexcept;
+    [[nodiscard]] const foundation::SecretString& redeemTicket() const noexcept;
+    [[nodiscard]] foundation::Instant expiresAt() const noexcept;
+
+private:
+    friend class AuthenticationService;
+    BrowserAuthenticationHandoff(foundation::SecretString publisherTicket,
+                                 foundation::SecretString redeemTicket,
+                                 foundation::Instant expiresAt);
+
+    foundation::SecretString m_publisherTicket;
+    foundation::SecretString m_redeemTicket;
+    foundation::Instant m_expiresAt{};
+};
+
+/**
  * @brief Trusted coordinator for every authentication exchange.
  *
  * The service enforces transaction redemption, cross-session binding, challenge
@@ -237,6 +265,27 @@ public:
     /** @brief Atomically consumes a native-to-browser connection ticket. */
     [[nodiscard]] foundation::Result<BrowserConnectionTarget>
     consumeBrowserConnectionHandoff(const foundation::SecretString& ticket);
+
+    /**
+     * @brief Issues separated publisher/redeemer credentials for mobile wallet login.
+     *
+     * Only the publisher ticket is sent through a wallet deep link. The redeem
+     * ticket remains in the original browser.
+     */
+    [[nodiscard]] foundation::Result<BrowserAuthenticationHandoff>
+    issueBrowserAuthenticationHandoff(
+        const provider::ProviderId& providerId,
+        foundation::CorrelationId correlation);
+
+    /** @brief Publishes a verified wallet result to the originating browser ticket. */
+    [[nodiscard]] foundation::Status publishBrowserAuthenticationHandoff(
+        const foundation::SecretString& publisherTicket,
+        const VerifiedAuthentication& authentication);
+
+    /** @brief Redeems a completed mobile-wallet authentication exactly once. */
+    [[nodiscard]] foundation::Result<VerifiedAuthentication>
+    redeemBrowserAuthenticationHandoff(
+        const foundation::SecretString& redeemTicket);
 
 private:
     struct CompletedExchange final {

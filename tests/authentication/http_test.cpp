@@ -13,6 +13,7 @@
 import openproof.authentication;
 import openproof.authentication.federated.http;
 import openproof.authentication.http;
+import openproof.authentication.web3.http;
 import openproof.credentials;
 import openproof.foundation;
 import openproof.gateway;
@@ -109,6 +110,39 @@ public:
     {
         return idp::AuthenticationChallenge{
             idp::ChallengeId{"challenge-id"}, kNow + std::chrono::minutes{5}};
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse&) override
+    {
+        return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+    }
+};
+
+class WalletChallengeProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override
+    {
+        return idp::ProviderId{"ethereum-wallet"};
+    }
+
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
+    {
+        return idp::InteractionModel::ChallengeResponse;
+    }
+
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
+    {
+        return idp::AssuranceLevel::Ial1;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override
+    {
+        idp::AuthenticationChallenge challenge{
+            idp::ChallengeId{"wallet-challenge"}, kNow + std::chrono::minutes{5}};
+        challenge.setParameter("message", "test");
+        return challenge;
     }
 
     [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
@@ -331,6 +365,53 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
     const auto rejected = fixture.api->handle(std::move(ambiguous).value());
     EXPECT_EQ(rejected.status(), 401);
     EXPECT_TRUE(setCookies(rejected).empty());
+}
+
+TEST(Web3AuthenticationHttpApiTest, MobileWalletHandoffSeparatesBrowserRedeemCredential)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<WalletChallengeProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"ethereum-wallet"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::Web3AuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto issued = api.handle(request(
+        "/auth/web3/handoff", R"({"provider":"ethereum-wallet"})"));
+    ASSERT_EQ(issued.status(), 201) << issued.body();
+    const auto body = json::parse(issued.body()).as_object();
+    const std::string publisher{body.at("publisher_ticket").as_string()};
+    const std::string redeemer{body.at("redeem_ticket").as_string()};
+    EXPECT_FALSE(publisher.empty());
+    EXPECT_FALSE(redeemer.empty());
+    EXPECT_NE(publisher, redeemer);
+    EXPECT_TRUE(setCookies(issued).empty());
+
+    json::object redemption;
+    redemption["redeem_ticket"] = redeemer;
+    const auto pending = api.handle(request(
+        "/auth/web3/handoff/redeem", json::serialize(redemption)));
+    ASSERT_EQ(pending.status(), 202) << pending.body();
+    EXPECT_TRUE(json::parse(pending.body()).as_object().at("pending").as_bool());
+    EXPECT_TRUE(cookieValue(pending, "__Host-openproof-session").empty());
 }
 
 TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndChallengeProviders)

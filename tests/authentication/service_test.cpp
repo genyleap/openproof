@@ -47,7 +47,7 @@ public:
 
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
     {
-        return idp::InteractionModel::Redirect;
+        return model;
     }
 
     [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
@@ -97,6 +97,7 @@ public:
             idp::ProviderEvidence{}, verifiedAt);
     }
 
+    idp::InteractionModel model{idp::InteractionModel::Redirect};
     idp::AssuranceLevel declaredMaximum{idp::AssuranceLevel::Ial3};
     idp::AssuranceLevel outcomeAssurance{idp::AssuranceLevel::Ial2};
     fnd::Instant verifiedAt{kNow};
@@ -727,6 +728,44 @@ TEST(AuthenticationServiceTest, ConnectionFillsMissingPresentationClaimsWithoutI
     EXPECT_FALSE(stored->value().email().has_value());
     EXPECT_FALSE(stored->value().emailVerified());
     EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/connected.png");
+}
+
+TEST(AuthenticationServiceTest, MobileWalletAuthenticationHandoffSeparatesPublishAndRedeemSecrets)
+{
+    Fixture fixture;
+    fixture.implementation->model = idp::InteractionModel::ChallengeResponse;
+    auto service = fixture.service();
+
+    auto handoff = service.issueBrowserAuthenticationHandoff(
+        idp::ProviderId{"provider-a"}, fnd::CorrelationId{"corr-mobile-wallet"});
+    ASSERT_TRUE(handoff) << handoff.error().internalDetail();
+    EXPECT_EQ(handoff->expiresAt(), kNow + std::chrono::minutes{2});
+    EXPECT_NE(handoff->publisherTicket().expose(), handoff->redeemTicket().expose());
+
+    const auto binding = bindingOf("mobile-wallet-browser");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-wallet-proof"});
+    ASSERT_TRUE(started);
+    auto verified = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(verified) << verified.error().internalDetail();
+
+    auto published = service.publishBrowserAuthenticationHandoff(
+        handoff->publisherTicket(), verified.value());
+    ASSERT_TRUE(published) << published.error().internalDetail();
+
+    auto redeemed = service.redeemBrowserAuthenticationHandoff(
+        handoff->redeemTicket());
+    ASSERT_TRUE(redeemed) << redeemed.error().internalDetail();
+    EXPECT_EQ(redeemed->identity(), core::IdentityId{"identity-1"});
+    EXPECT_EQ(redeemed->outcome().provider(), idp::ProviderId{"provider-a"});
+    EXPECT_EQ(redeemed->outcome().subject(), idp::ExternalSubject{"subject-1"});
+    EXPECT_TRUE(redeemed->outcome().strength().isPhishingResistant());
+
+    auto replay = service.redeemBrowserAuthenticationHandoff(
+        handoff->redeemTicket());
+    ASSERT_FALSE(replay);
 }
 
 TEST(AuthenticationServiceTest, BrowserConnectionHandoffIsBoundAndSingleUse)

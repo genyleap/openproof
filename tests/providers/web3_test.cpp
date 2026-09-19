@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -56,6 +57,25 @@ public:
     std::string lastSignature;
 };
 
+[[nodiscard]] web3::WalletProviderConfig walletConfiguration()
+{
+    auto config = web3::WalletProviderConfig::create(
+        "login.openproof.test", "https://login.openproof.test/auth/wallet",
+        std::map<std::uint64_t, std::string>{},
+        fnd::SecretString{std::string(48U, 'w')}, std::chrono::minutes{5});
+    EXPECT_TRUE(config);
+    return std::move(config).value();
+}
+
+[[nodiscard]] idp::AuthenticationRequest walletRequest(std::uint64_t chainId)
+{
+    idp::AuthenticationRequest value{
+        idp::ProviderId{"ethereum-wallet"}, idp::ClientContext{}};
+    value.setParameter("address", std::string{kAddress});
+    value.setParameter("chain_id", std::to_string(chainId));
+    return value;
+}
+
 [[nodiscard]] web3::FarcasterProviderConfig configuration(
     std::uint64_t chainId = 10U, std::string keyRegistry =
         "0x00000000fc1237824fb747abde0ff18990e59b7e")
@@ -95,6 +115,82 @@ public:
     const auto found = challenge.parameters().find(name);
     EXPECT_NE(found, challenge.parameters().end());
     return found == challenge.parameters().end() ? std::string{} : found->second;
+}
+
+TEST(WalletProviderTest, ChallengeUsesRequestedEvmChainWithoutRpcDependency)
+{
+    fnd::ManualClockSource clock{kNow};
+    auto config = web3::WalletProviderConfig::create(
+        "login.openproof.test", "https://login.openproof.test/auth/wallet",
+        std::map<std::uint64_t, std::string>{},
+        fnd::SecretString{std::string(48U, 'w')}, std::chrono::minutes{5});
+    ASSERT_TRUE(config);
+    web3::WalletAuthenticationProvider provider{std::move(config).value(), clock};
+
+    idp::AuthenticationRequest baseRequest{
+        idp::ProviderId{"ethereum-wallet"}, idp::ClientContext{}};
+    baseRequest.setParameter("address", std::string{kAddress});
+    baseRequest.setParameter("chain_id", "8453");
+
+    auto baseChallenge = provider.beginAuthentication(baseRequest);
+    ASSERT_TRUE(baseChallenge);
+    EXPECT_EQ(parameter(*baseChallenge, "chain_id"), "8453");
+    EXPECT_NE(parameter(*baseChallenge, "message").find("\nChain ID: 8453\n"),
+              std::string::npos);
+
+    idp::AuthenticationRequest arbitrumRequest{
+        idp::ProviderId{"ethereum-wallet"}, idp::ClientContext{}};
+    arbitrumRequest.setParameter("address", std::string{kAddress});
+    arbitrumRequest.setParameter("chain_id", "42161");
+
+    auto arbitrumChallenge = provider.beginAuthentication(arbitrumRequest);
+    ASSERT_TRUE(arbitrumChallenge);
+    EXPECT_EQ(parameter(*arbitrumChallenge, "chain_id"), "42161");
+    EXPECT_NE(parameter(*arbitrumChallenge, "message").find("\nChain ID: 42161\n"),
+              std::string::npos);
+}
+
+TEST(WalletProviderTest, SmartWalletRpcMappingsAreChainSpecific)
+{
+    auto config = web3::WalletProviderConfig::create(
+        "login.openproof.test", "https://login.openproof.test/auth/wallet",
+        std::map<std::uint64_t, std::string>{
+            {1U, "https://ethereum-rpc.openproof.test"},
+            {8453U, "https://base-rpc.openproof.test"}},
+        fnd::SecretString{std::string(48U, 'w')}, std::chrono::minutes{5});
+    ASSERT_TRUE(config);
+    ASSERT_TRUE(config->rpcEndpoint(1U));
+    ASSERT_TRUE(config->rpcEndpoint(8453U));
+    EXPECT_EQ(*config->rpcEndpoint(1U), "https://ethereum-rpc.openproof.test");
+    EXPECT_EQ(*config->rpcEndpoint(8453U), "https://base-rpc.openproof.test");
+    EXPECT_FALSE(config->rpcEndpoint(42161U));
+}
+
+TEST(WalletProviderTest, ChallengeUsesTheWalletsRequestedEvmChain)
+{
+    fnd::ManualClockSource clock{kNow};
+    web3::WalletAuthenticationProvider provider{walletConfiguration(), clock};
+
+    for (const std::uint64_t chainId : {1U, 8453U, 42161U, 10U, 5042U, 4663U}) {
+        auto challenge = provider.beginAuthentication(walletRequest(chainId));
+        ASSERT_TRUE(challenge);
+        EXPECT_EQ(parameter(*challenge, "chain_id"), std::to_string(chainId));
+        EXPECT_NE(parameter(*challenge, "message").find(
+                      "\nChain ID: " + std::to_string(chainId) + "\n"),
+                  std::string::npos);
+        EXPECT_NE(challenge->id().value().find(
+                      "siwe_" + std::to_string(kNow.time_since_epoch().count())
+                      + "_" + std::to_string(chainId) + "_"),
+                  std::string::npos);
+    }
+}
+
+TEST(WalletProviderTest, ConfigurationCanEnableEoaLoginWithoutAnyRpcDependency)
+{
+    auto config = walletConfiguration();
+    EXPECT_FALSE(config.rpcEndpoint(1U).has_value());
+    EXPECT_FALSE(config.rpcEndpoint(8453U).has_value());
+    EXPECT_FALSE(config.rpcEndpoint(42161U).has_value());
 }
 
 TEST(FarcasterProviderTest, ConfigurationRequiresFip11OptimismMainnet)

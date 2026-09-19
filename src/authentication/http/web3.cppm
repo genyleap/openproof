@@ -24,6 +24,9 @@ public:
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] gateway::HttpResponse issueAuthenticationHandoff(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse redeemAuthenticationHandoff(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse issueConnectionHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse start(gateway::HttpRequest request, bool connection);
     [[nodiscard]] gateway::HttpResponse complete(gateway::HttpRequest request, bool connection);
     [[nodiscard]] gateway::HttpResponse error(const foundation::Error& failure,

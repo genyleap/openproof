@@ -227,7 +227,8 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
         return m_fallback->handle(std::move(request));
     }
     if (request.method() == HttpMethod::Post
-        && (request.path() == "/account/connections/web3/start"
+        && (request.path() == "/account/connections/web3/handoff"
+            || request.path() == "/account/connections/web3/start"
             || request.path() == "/account/connections/web3/complete")) {
         return m_fallback->handle(std::move(request));
     }

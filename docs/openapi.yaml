@@ -341,18 +341,13 @@ paths:
   /account/connections/complete:
     get:
       tags: [Account, Federation]
-      operationId: showAccountConnectionComplete
+      operationId: completeAccountConnectionCompatibility
       description: >-
-        Browser landing page shown after a redirect provider has been attached
-        to the existing canonical identity. It contains no account data and is
-        safe to open after the connection ceremony state has been cleared.
+        Legacy empty completion endpoint retained for compatibility. User-facing
+        completion UX belongs to the relying frontend, not the authentication API.
       security: []
       responses:
-        "200":
-          description: Bilingual account-connected confirmation page.
-          content:
-            text/html:
-              schema: {type: string}
+        "204": {description: Connection completion acknowledged with no response body.}
   /account/connections/start:
     get:
       tags: [Account, Federation]
@@ -451,6 +446,41 @@ paths:
         "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "412": {$ref: "#/components/responses/Error"}
+  /account/connections/web3/handoff:
+    post:
+      tags: [Account, Federation]
+      operationId: issueWeb3AccountConnectionHandoff
+      description: >-
+        Issues a short-lived one-time wallet publisher ticket for connecting an
+        EVM wallet from a separate mobile wallet browser. The authenticated
+        browser session remains in the originating browser; no session credential
+        is placed in the deep link.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider]
+              properties:
+                provider: {type: string, const: ethereum-wallet}
+      responses:
+        "201":
+          description: One-time wallet connection handoff issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [handoff_ticket, expires_at]
+                properties:
+                  handoff_ticket: {type: string, maxLength: 256}
+                  expires_at: {type: string, format: date-time}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
   /account/connections/web3/start:
     post:
       tags: [Account, Federation]
@@ -730,6 +760,66 @@ paths:
             schema: {$ref: "#/components/schemas/WebAuthnAssertion"}
       responses:
         "200": {description: IAL2 OpenProof session issued in a secure cookie.}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/web3/handoff:
+    post:
+      tags: [Federation]
+      operationId: issueWeb3AuthenticationHandoff
+      description: >-
+        Issues separated publisher and redeemer tickets for mobile EVM wallet
+        login. Only the publisher ticket may leave the originating browser; the
+        redeemer ticket is the credential that can mint the browser session after
+        a verified wallet result has been published.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider]
+              properties:
+                provider: {type: string, const: ethereum-wallet}
+      responses:
+        "201":
+          description: Short-lived mobile wallet login handoff issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [publisher_ticket, redeem_ticket, expires_at]
+                properties:
+                  publisher_ticket: {type: string, maxLength: 256}
+                  redeem_ticket: {type: string, maxLength: 256}
+                  expires_at: {type: string, format: date-time}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+  /auth/web3/handoff/redeem:
+    post:
+      tags: [Federation]
+      operationId: redeemWeb3AuthenticationHandoff
+      description: >-
+        Polls and atomically redeems a completed mobile-wallet authentication.
+        Before the wallet publishes a result this endpoint returns 202 without
+        issuing a session; successful redemption is single-use.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [redeem_ticket]
+              properties:
+                redeem_ticket: {type: string, maxLength: 256}
+      responses:
+        "200":
+          description: Verified handoff redeemed and OpenProof session issued.
+          headers:
+            Set-Cookie: {schema: {type: string}}
+        "202": {description: Wallet result is not available yet.}
+        "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
   /auth/web3/start:
     post:
@@ -1663,14 +1753,20 @@ components:
       required: [provider]
       properties:
         provider: {type: string, enum: [ethereum-wallet, farcaster]}
-        address: {type: string, maxLength: 64, description: Required for Ethereum; optional for direct SIWF.}
+        address: {type: string, maxLength: 64, description: Required for EVM wallet login; optional for direct SIWF.}
+        chain_id: {type: string, pattern: "^[1-9][0-9]{0,19}$", maxLength: 20, description: Current positive decimal EVM chain ID; required for ethereum-wallet and not accepted for Farcaster.}
         fid: {type: string, pattern: "^[1-9][0-9]{0,19}$", maxLength: 20, description: Paired with address for direct SIWF.}
+        handoff_ticket: {type: string, maxLength: 256, description: Optional one-time mobile wallet publisher ticket; accepted only for ethereum-wallet.}
       oneOf:
         - properties:
             provider: {const: ethereum-wallet}
-          required: [address]
+          required: [address, chain_id]
         - properties:
             provider: {const: farcaster}
+          not:
+            anyOf:
+              - required: [chain_id]
+              - required: [handoff_ticket]
           dependentRequired:
             address: [fid]
             fid: [address]
