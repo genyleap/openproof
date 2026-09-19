@@ -8,7 +8,10 @@ These files are reviewed starting points for a single-node identity deployment:
 - `openproof.toml.example` composes account, OAuth/OIDC and protected API
   surfaces;
 - `openproof.env.example` lists optional environment-only feature credentials
-  without containing usable ones.
+  without containing usable ones;
+- `verification-delivery-postfix.php`, `openproof-delivery.service` and
+  `openproof-delivery.env.example` provide an optional loopback-only email adapter
+  for deployments that operate a local Postfix MTA.
 
 Install the release binary as `/opt/openproof/bin/opp`, copy `migrations/` to
 `/opt/openproof/migrations`, configuration to `/etc/openproof/openproof.toml`
@@ -39,6 +42,26 @@ configuration with `nginx -t`, execute `opp check-config --config
 The unit intentionally grants no writable filesystem path. OpenProof state is
 in PostgreSQL and logs go to journald. If a deployment adds local state, grant
 only its exact directory with a reviewed `ReadWritePaths=` override.
+
+### Optional local Postfix delivery adapter
+
+When direct transactional email is appropriate for the deployment, install a local
+Postfix instance that accepts SMTP only from loopback, then copy
+`verification-delivery-postfix.php` to `/opt/openproof/delivery/`, copy the delivery
+unit to `/etc/systemd/system/openproof-delivery.service`, and create
+`/etc/openproof/delivery.env` from `openproof-delivery.env.example`.
+
+Point `[account].delivery_host` at `127.0.0.1`, port `18444`, with TLS disabled only
+for this same-host loopback hop. Keep `delivery_authorization` backed by the same
+secret file referenced through `OPENPROOF_DELIVERY_TOKEN_FILE`. The adapter validates
+the bearer, accepts only email verification purposes, and submits the message to the
+loopback SMTP listener. It does not require setuid/setgid helpers, so the systemd unit
+retains `NoNewPrivileges=true`.
+
+Before sending public mail, configure forward-confirmed reverse DNS, SPF, DKIM and
+DMARC for the envelope/header domain. If the host has IPv6 but no IPv6 PTR, do not let
+the MTA prefer IPv6 until reverse DNS is provisioned. See
+[`docs/DELIVERY_WEBHOOK.md`](../docs/DELIVERY_WEBHOOK.md) for the complete checklist.
 
 Do not enable `trust_proxy_client_ip` unless the listener remains loopback-only
 and every connection is forced through the proxy template (or an equivalent
