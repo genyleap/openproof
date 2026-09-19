@@ -67,6 +67,45 @@ void clearState(gateway::HttpResponse& response)
     response.addHeader("set-cookie", cookie(kModeCookie, "", 0));
 }
 
+[[nodiscard]] std::string encodeQueryComponent(std::string_view value)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(value.size());
+    for (const char symbol : value) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool unreserved = (byte >= 'A' && byte <= 'Z')
+            || (byte >= 'a' && byte <= 'z')
+            || (byte >= '0' && byte <= '9')
+            || byte == '-' || byte == '_' || byte == '.' || byte == '~';
+        if (unreserved) {
+            output.push_back(static_cast<char>(byte));
+        } else {
+            output.push_back('%');
+            output.push_back(hex[(byte >> 4U) & 0x0fU]);
+            output.push_back(hex[byte & 0x0fU]);
+        }
+    }
+    return output;
+}
+
+[[nodiscard]] std::string appendQueryParameter(
+    std::string target, std::string_view name, std::string_view value)
+{
+    const auto fragment = target.find('#');
+    std::string suffix;
+    if (fragment != std::string::npos) {
+        suffix = target.substr(fragment);
+        target.resize(fragment);
+    }
+    target.push_back(target.contains('?') ? '&' : '?');
+    target.append(name);
+    target.push_back('=');
+    target.append(encodeQueryComponent(value));
+    target.append(suffix);
+    return target;
+}
+
 [[nodiscard]] bool validLocalReturn(std::string_view value) noexcept
 {
     return !value.empty() && value.size() <= 2048U && value.front() == '/'
@@ -474,9 +513,34 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     const auto challengeCookie = cookieValue(request, kChallengeCookie, 512U);
     const auto returnCookie = cookieValue(request, kReturnCookie, 16U * 1024U);
     const auto modeCookie = cookieValue(request, kModeCookie, 16U);
+    const auto redirectConnectionFailure =
+        [&](const foundation::Error& failure)
+            -> std::optional<gateway::HttpResponse> {
+        if (!modeCookie || *modeCookie != "link" || !returnCookie) {
+            return std::nullopt;
+        }
+        auto target = decodeBase64UrlText(*returnCookie);
+        if (!target || !validLocalReturn(target.value())) {
+            return std::nullopt;
+        }
+        std::string location = appendQueryParameter(
+            std::move(target).value(), "op_error",
+            foundation::errorCodeName(failure.code()));
+        location = appendQueryParameter(
+            std::move(location), "op_request", request.correlation().value());
+        gateway::HttpResponse response{
+            302, gateway::Headers{{"location", std::move(location)}}, {}};
+        secure(response);
+        clearState(response);
+        return response;
+    };
     if (!parameters || !continuation || !bindingToken || !transactionCookie
         || !challengeCookie || !returnCookie || parameters->contains("error")) {
-        return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+        const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+        if (auto redirected = redirectConnectionFailure(failure)) {
+            return std::move(*redirected);
+        }
+        return error(failure, request, true);
     }
     const bool samlCallback = parameters->contains("SAMLResponse") || parameters->contains("RelayState");
     const auto code = parameters->find("code");
@@ -487,12 +551,20 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         if (samlResponse == parameters->end() || relayState == parameters->end()
             || samlResponse->second.empty() || samlResponse->second.size() > 900U * 1024U
             || relayState->second.empty() || relayState->second.size() > 512U) {
-            return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+            const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+            if (auto redirected = redirectConnectionFailure(failure)) {
+                return std::move(*redirected);
+            }
+            return error(failure, request, true);
         }
     } else if (code == parameters->end() || state == parameters->end()
         || code->second.empty() || code->second.size() > 4096U
         || state->second.empty() || state->second.size() > 512U) {
-        return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+        const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+        if (auto redirected = redirectConnectionFailure(failure)) {
+            return std::move(*redirected);
+        }
+        return error(failure, request, true);
     }
     auto transactionText = decodeBase64UrlText(*transactionCookie);
     auto challengeText = decodeBase64UrlText(*challengeCookie);
@@ -519,7 +591,12 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         auto connected = m_authentication->completeConnection(
             idp::TransactionId{std::move(transactionText).value()},
             foundation::SecretString{*continuation}, binding.value(), authenticationResponse);
-        if (!connected) return error(connected.error(), request, true);
+        if (!connected) {
+            if (auto redirected = redirectConnectionFailure(connected.error())) {
+                return std::move(*redirected);
+            }
+            return error(connected.error(), request, true);
+        }
         gateway::HttpResponse response{
             302, gateway::Headers{{"location", std::move(returnTarget).value()}}, {}};
         secure(response);

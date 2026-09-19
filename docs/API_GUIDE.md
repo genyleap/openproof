@@ -369,8 +369,11 @@ Other challenge/response providers also use a cookie-bound start/complete pair:
 
 - Web3: `POST /auth/web3/start` with
   `{"provider":"ethereum-wallet","address":"0x...","chain_id":"8453"}`,
-  where `chain_id` is the wallet's current positive decimal EVM chain ID. The
-  server signs the ceremony to that chain but does not force a network switch;
+  where `chain_id` is the wallet's current positive decimal EVM chain ID. Use either
+  an injected EIP-1193 provider or a WalletConnect v2 provider. The recommended hybrid
+  client integration, Reown Project ID/domain allowlisting and mobile/QR flow are
+  documented in [WALLETCONNECT.md](WALLETCONNECT.md). OpenProof signs the ceremony to
+  that chain but does not force a network switch;
   EOAs can authenticate without an RPC. When the wallet is a separate mobile
   app, the originating browser first calls `POST /auth/web3/handoff`. It keeps
   the returned `redeem_ticket` locally and sends only `publisher_ticket` to
