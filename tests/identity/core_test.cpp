@@ -330,6 +330,32 @@ TEST(ExternalIdentityDirectoryTest, ListsExternalIdentitiesOfAnOwner)
     EXPECT_TRUE(none.value().empty());
 }
 
+TEST(ExternalIdentityDirectoryTest, StoresPresentationMetadataWithoutChangingOwnership)
+{
+    core::InMemoryExternalIdentityDirectory directory;
+    const auto bare = externalRef("farcaster", "12345");
+    ASSERT_TRUE(directory.attach(linkedRequest("id-1", bare)).has_value());
+
+    const core::ExternalIdentityRef presentation{
+        idp::ProviderId{"farcaster"}, idp::ExternalSubject{"12345"},
+        std::string{"Alice"}, std::string{"alice"},
+        std::string{"https://example.test/alice.png"}};
+    ASSERT_TRUE(directory.updatePresentation(presentation).has_value());
+
+    const auto owner = directory.ownerOf(presentation);
+    ASSERT_TRUE(owner.has_value());
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value().value(), "id-1");
+
+    const auto owned = directory.externalIdentitiesOf(core::IdentityId{"id-1"});
+    ASSERT_TRUE(owned.has_value());
+    ASSERT_EQ(owned->size(), 1U);
+    EXPECT_EQ(owned->front().displayName(), std::optional<std::string>{"Alice"});
+    EXPECT_EQ(owned->front().preferredUsername(), std::optional<std::string>{"alice"});
+    EXPECT_EQ(owned->front().pictureUrl(),
+              std::optional<std::string>{"https://example.test/alice.png"});
+}
+
 TEST(ExternalIdentityDirectoryTest, ConcurrentProtectedDetachAlwaysLeavesOneSignInMethod)
 {
     core::InMemoryExternalIdentityDirectory directory;

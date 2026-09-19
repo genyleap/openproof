@@ -548,14 +548,36 @@ foundation::Status AccountService::updateProfile(
     std::optional<std::string> displayName,
     std::optional<std::string> preferredUsername,
     std::optional<std::string> locale,
-    std::optional<std::string> pictureUrl)
+    std::optional<std::string> pictureUrl,
+    std::optional<std::string> avatarSource)
 {
     auto profile = requireProfile(identity);
     if (!profile.has_value()) return foundation::fail(profile.error());
+    const auto now = m_clock->now();
     auto updated = profile->updateSelfService(
         std::move(displayName), std::move(preferredUsername),
-        std::move(locale), std::move(pictureUrl), m_clock->now());
+        std::move(locale), std::move(pictureUrl), now);
     if (!updated.has_value()) return updated;
+
+    if (avatarSource.has_value()) {
+        bool allowed = *avatarSource == "auto";
+        if (*avatarSource == "profile") {
+            allowed = profile->pictureUrl().has_value();
+        } else if (!allowed) {
+            auto connections = m_externalIdentities->externalIdentitiesOf(identity);
+            if (!connections) return foundation::fail(connections.error());
+            allowed = std::ranges::any_of(connections.value(), [&](const auto& external) {
+                return external.providerId().value() == *avatarSource
+                    && external.pictureUrl().has_value();
+            });
+        }
+        if (!allowed) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The selected avatar source is not available.");
+        }
+        auto sourceUpdated = profile->setAvatarSource(std::move(*avatarSource), now);
+        if (!sourceUpdated) return sourceUpdated;
+    }
     return m_profiles->save(profile.value());
 }
 foundation::Result<identity::profile::IdentityProfile> AccountService::profile(

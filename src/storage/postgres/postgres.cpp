@@ -1559,13 +1559,22 @@ foundation::Status PostgresExternalIdentityDirectory::attach(
     }
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
+    const auto optionalText = [](const std::optional<std::string>& value) {
+        return value.value_or(std::string{});
+    };
     ResultPointer result = execParams(lease->get(),
-        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
-        "VALUES($1,$2,$3,$4) ON CONFLICT(provider,external_subject) DO UPDATE SET "
-        "identity_id=EXCLUDED.identity_id WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id",
+        "INSERT INTO openproof.external_identities("
+        "provider,external_subject,identity_id,linked_at_ms,display_name,preferred_username,picture_url) "
+        "VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,'')) "
+        "ON CONFLICT(provider,external_subject) DO UPDATE SET "
+        "identity_id=EXCLUDED.identity_id,display_name=COALESCE(EXCLUDED.display_name,openproof.external_identities.display_name),"
+        "preferred_username=COALESCE(EXCLUDED.preferred_username,openproof.external_identities.preferred_username),"
+        "picture_url=COALESCE(EXCLUDED.picture_url,openproof.external_identities.picture_url) "
+        "WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id",
         {std::string{link.external().providerId().value()},
          std::string{link.external().subject().value()}, std::string{link.owner().value()},
-         instant(link.requestedAt())});
+         instant(link.requestedAt()), optionalText(link.external().displayName()),
+         optionalText(link.external().preferredUsername()), optionalText(link.external().pictureUrl())});
     if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "attach external identity"));
     return std::string_view{PQcmdTuples(result.get())} == "1" ? foundation::ok()
         : foundation::fail(foundation::ErrorCode::Conflict,
@@ -1710,6 +1719,32 @@ foundation::Status PostgresExternalIdentityDirectory::reassign(
         : foundation::fail(foundation::ErrorCode::NotFound);
 }
 
+foundation::Status
+PostgresExternalIdentityDirectory::updatePresentation(
+    const identity::core::ExternalIdentityRef& external)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    const auto optionalText = [](const std::optional<std::string>& value) {
+        return value.value_or(std::string{});
+    };
+    ResultPointer result = execParams(lease->get(),
+        "UPDATE openproof.external_identities SET "
+        "display_name=COALESCE(NULLIF($3,''),display_name),"
+        "preferred_username=COALESCE(NULLIF($4,''),preferred_username),"
+        "picture_url=COALESCE(NULLIF($5,''),picture_url) "
+        "WHERE provider=$1 AND external_subject=$2 RETURNING identity_id",
+        {std::string{external.providerId().value()}, std::string{external.subject().value()},
+         optionalText(external.displayName()), optionalText(external.preferredUsername()),
+         optionalText(external.pictureUrl())});
+    if (!tuplesOk(result.get())) {
+        return foundation::fail(databaseError(result.get(), "update external identity presentation"));
+    }
+    return PQntuples(result.get()) == 1
+        ? foundation::ok()
+        : foundation::fail(foundation::ErrorCode::NotFound);
+}
+
 foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
 PostgresExternalIdentityDirectory::externalIdentitiesOf(
     const identity::core::IdentityId& owner) const
@@ -1717,13 +1752,20 @@ PostgresExternalIdentityDirectory::externalIdentitiesOf(
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     ResultPointer result = execParams(lease->get(),
-        "SELECT provider,external_subject FROM openproof.external_identities "
+        "SELECT provider,external_subject,display_name,preferred_username,picture_url "
+        "FROM openproof.external_identities "
         "WHERE identity_id=$1 ORDER BY provider,external_subject", {std::string{owner.value()}});
     if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list external identities"));
     std::vector<identity::core::ExternalIdentityRef> output;
+    const auto nullable = [&](int row, int column) -> std::optional<std::string> {
+        return PQgetisnull(result.get(), row, column)
+            ? std::nullopt
+            : std::optional<std::string>{field(result.get(), row, column)};
+    };
     for (int row = 0; row < PQntuples(result.get()); ++row) {
         output.emplace_back(identity::provider::ProviderId{field(result.get(), row, 0)},
-                            identity::provider::ExternalSubject{field(result.get(), row, 1)});
+                            identity::provider::ExternalSubject{field(result.get(), row, 1)},
+                            nullable(row, 2), nullable(row, 3), nullable(row, 4));
     }
     return output;
 }
@@ -4916,14 +4958,15 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
             return optionalValue.value_or(std::string{});
         };
         return runCommand(lease->get(),
-        "INSERT INTO openproof.identity_profiles(identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,created_at_ms,updated_at_ms) "
-        "VALUES($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11) "
-        "ON CONFLICT(identity_id) DO UPDATE SET display_name=EXCLUDED.display_name,preferred_username=EXCLUDED.preferred_username,email=EXCLUDED.email,email_verified=EXCLUDED.email_verified,phone_number=EXCLUDED.phone_number,phone_number_verified=EXCLUDED.phone_number_verified,locale=EXCLUDED.locale,picture_url=EXCLUDED.picture_url,updated_at_ms=EXCLUDED.updated_at_ms",
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,avatar_source,created_at_ms,updated_at_ms) "
+        "VALUES($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12) "
+        "ON CONFLICT(identity_id) DO UPDATE SET display_name=EXCLUDED.display_name,preferred_username=EXCLUDED.preferred_username,email=EXCLUDED.email,email_verified=EXCLUDED.email_verified,phone_number=EXCLUDED.phone_number,phone_number_verified=EXCLUDED.phone_number_verified,locale=EXCLUDED.locale,picture_url=EXCLUDED.picture_url,avatar_source=EXCLUDED.avatar_source,updated_at_ms=EXCLUDED.updated_at_ms",
         {std::string{value.identity().value()}, optionalText(value.displayName()),
             optionalText(value.preferredUsername()), optionalText(value.email()),
             value.emailVerified() ? "true" : "false", optionalText(value.phoneNumber()),
             value.phoneNumberVerified() ? "true" : "false", optionalText(value.locale()),
-            optionalText(value.pictureUrl()), instant(value.createdAt()), instant(value.updatedAt())},
+            optionalText(value.pictureUrl()), std::string{value.avatarSource()},
+            instant(value.createdAt()), instant(value.updatedAt())},
         "save identity profile");
     }
 
@@ -4932,7 +4975,7 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
     {
         auto lease=m_pool->m_implementation->acquire();
         if(!lease)return foundation::fail(lease.error());
-        ResultPointer result=execParams(lease->get(),"SELECT identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,created_at_ms,updated_at_ms FROM openproof.identity_profiles WHERE identity_id=$1",{std::string{identityId.value()}});
+        ResultPointer result=execParams(lease->get(),"SELECT identity_id,display_name,preferred_username,email,email_verified,phone_number,phone_number_verified,locale,picture_url,avatar_source,created_at_ms,updated_at_ms FROM openproof.identity_profiles WHERE identity_id=$1",{std::string{identityId.value()}});
         if (!tuplesOk(result.get())) {
             return foundation::fail(databaseError(result.get(), "find identity profile"));
         }
@@ -4941,10 +4984,10 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
         }
         const auto nullable=[&](int column)->std::optional<std::string>{return PQgetisnull(result.get(),0,column)?std::nullopt:std::optional<std::string>{field(result.get(),0,column)};
         };
-        auto created=parseInteger<std::int64_t>(field(result.get(),0,9));
-        auto updated=parseInteger<std::int64_t>(field(result.get(),0,10));
+        auto created=parseInteger<std::int64_t>(field(result.get(),0,10));
+        auto updated=parseInteger<std::int64_t>(field(result.get(),0,11));
         if(!created||!updated)return foundation::fail(foundation::ErrorCode::Internal);
-        auto profile=identity::profile::IdentityProfile::restore(identity::core::IdentityId{field(result.get(),0,0)},nullable(1),nullable(2),nullable(3),field(result.get(),0,4)=="t",nullable(5),field(result.get(),0,6)=="t",nullable(7),nullable(8),storedInstant(created.value()),storedInstant(updated.value()));
+        auto profile=identity::profile::IdentityProfile::restore(identity::core::IdentityId{field(result.get(),0,0)},nullable(1),nullable(2),nullable(3),field(result.get(),0,4)=="t",nullable(5),field(result.get(),0,6)=="t",nullable(7),nullable(8),storedInstant(created.value()),storedInstant(updated.value()),field(result.get(),0,9));
         if(!profile)return foundation::fail(profile.error());
         return std::optional<identity::profile::IdentityProfile>{std::move(profile).value()};
     }

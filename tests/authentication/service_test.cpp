@@ -625,7 +625,7 @@ TEST(AuthenticationServiceTest, SelfProvisioningPersistsVerifiedProfileClaims)
     EXPECT_TRUE(stored->value().emailVerified());
 }
 
-TEST(AuthenticationServiceTest, ExistingLoginRefreshesProviderPictureWithoutReplacingCanonicalContactData)
+TEST(AuthenticationServiceTest, ExistingLoginPreservesCanonicalPictureAndRefreshesConnectionPresentation)
 {
     Fixture fixture;
     fixture.implementation->claims.set(idp::ClaimName::DisplayName, "Provider Name");
@@ -674,7 +674,12 @@ TEST(AuthenticationServiceTest, ExistingLoginRefreshesProviderPictureWithoutRepl
     EXPECT_EQ(stored->value().preferredUsername(), "chosen");
     EXPECT_EQ(stored->value().email(), "owner@example.test");
     EXPECT_TRUE(stored->value().emailVerified());
-    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/new.png");
+    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/old.png");
+
+    auto connections = service.connections(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(connections);
+    ASSERT_EQ(connections->size(), 1U);
+    EXPECT_EQ(connections->front().pictureUrl(), "https://cdn.example.test/new.png");
 }
 
 TEST(AuthenticationServiceTest, ConnectionFillsMissingPresentationClaimsWithoutImportingEmail)

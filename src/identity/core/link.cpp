@@ -15,9 +15,15 @@ module openproof.identity.core;
 namespace openproof::identity::core {
 
 ExternalIdentityRef::ExternalIdentityRef(provider::ProviderId providerId,
-                                         provider::ExternalSubject subject)
+                                         provider::ExternalSubject subject,
+                                         std::optional<std::string> displayName,
+                                         std::optional<std::string> preferredUsername,
+                                         std::optional<std::string> pictureUrl)
     : m_providerId(std::move(providerId))
     , m_subject(std::move(subject))
+    , m_displayName(std::move(displayName))
+    , m_preferredUsername(std::move(preferredUsername))
+    , m_pictureUrl(std::move(pictureUrl))
 {
 }
 
@@ -29,6 +35,36 @@ const provider::ProviderId& ExternalIdentityRef::providerId() const noexcept
 const provider::ExternalSubject& ExternalIdentityRef::subject() const noexcept
 {
     return m_subject;
+}
+
+const std::optional<std::string>& ExternalIdentityRef::displayName() const noexcept
+{
+    return m_displayName;
+}
+
+const std::optional<std::string>& ExternalIdentityRef::preferredUsername() const noexcept
+{
+    return m_preferredUsername;
+}
+
+const std::optional<std::string>& ExternalIdentityRef::pictureUrl() const noexcept
+{
+    return m_pictureUrl;
+}
+
+bool operator==(const ExternalIdentityRef& left, const ExternalIdentityRef& right) noexcept
+{
+    return left.m_providerId == right.m_providerId && left.m_subject == right.m_subject;
+}
+
+std::strong_ordering operator<=>(const ExternalIdentityRef& left,
+                                 const ExternalIdentityRef& right) noexcept
+{
+    if (const auto providerOrder = left.m_providerId <=> right.m_providerId;
+        providerOrder != 0) {
+        return providerOrder;
+    }
+    return left.m_subject <=> right.m_subject;
 }
 
 std::string_view linkStateName(LinkState state) noexcept
@@ -250,6 +286,7 @@ foundation::Status InMemoryExternalIdentityDirectory::attach(const IdentityLink&
     }
 
     m_owners.emplace(link.external(), link.owner());
+    m_presentations.insert_or_assign(link.external(), link.external());
     return foundation::ok();
 }
 
@@ -284,6 +321,7 @@ InMemoryExternalIdentityDirectory::detach(const ExternalIdentityRef& external,
             "identity.");
     }
 
+    m_presentations.erase(external);
     m_owners.erase(position);
     return foundation::ok();
 }
@@ -316,6 +354,7 @@ InMemoryExternalIdentityDirectory::detachIfAnotherAuthenticationMethod(
             foundation::ErrorCode::FailedPrecondition,
             "The last available sign-in method cannot be disconnected.");
     }
+    m_presentations.erase(external);
     m_owners.erase(position);
     return foundation::ok();
 }
@@ -348,6 +387,28 @@ InMemoryExternalIdentityDirectory::reassign(const ExternalIdentityRef& external,
     return foundation::ok();
 }
 
+foundation::Status
+InMemoryExternalIdentityDirectory::updatePresentation(const ExternalIdentityRef& external)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    if (m_owners.find(external) == m_owners.end()) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That connected account was not found.");
+    }
+    const auto current = m_presentations.find(external);
+    if (current == m_presentations.end()) {
+        m_presentations.emplace(external, external);
+    } else {
+        const auto& previous = current->second;
+        m_presentations.insert_or_assign(external, ExternalIdentityRef{
+            external.providerId(), external.subject(),
+            external.displayName().has_value() ? external.displayName() : previous.displayName(),
+            external.preferredUsername().has_value() ? external.preferredUsername() : previous.preferredUsername(),
+            external.pictureUrl().has_value() ? external.pictureUrl() : previous.pictureUrl()});
+    }
+    return foundation::ok();
+}
+
 foundation::Result<std::vector<ExternalIdentityRef>>
 InMemoryExternalIdentityDirectory::externalIdentitiesOf(const IdentityId& owner) const
 {
@@ -356,7 +417,10 @@ InMemoryExternalIdentityDirectory::externalIdentitiesOf(const IdentityId& owner)
     std::vector<ExternalIdentityRef> out;
     for (const auto& entry : m_owners) {
         if (entry.second == owner) {
-            out.push_back(entry.first);
+            const auto presentation = m_presentations.find(entry.first);
+            out.push_back(presentation == m_presentations.end()
+                              ? entry.first
+                              : presentation->second);
         }
     }
     return out;

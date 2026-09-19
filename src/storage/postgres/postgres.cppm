@@ -274,6 +274,8 @@ public:
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedCurrentOwner,
         const identity::core::IdentityId& newOwner) override;
+    [[nodiscard]] foundation::Status
+    updatePresentation(const identity::core::ExternalIdentityRef& external) override;
     [[nodiscard]] foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
     externalIdentitiesOf(const identity::core::IdentityId& owner) const override;
     [[nodiscard]] std::size_t size() const override;
