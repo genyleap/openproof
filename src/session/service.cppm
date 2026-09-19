@@ -147,6 +147,9 @@ public:
 
     [[nodiscard]] foundation::Result<SessionGrant>
     issue(const authentication::VerifiedAuthentication& authentication);
+    [[nodiscard]] foundation::Result<SessionGrant>
+    issue(const authentication::VerifiedAuthentication& authentication,
+          const identity::provider::ClientContext& client);
     [[nodiscard]] foundation::Result<AuthenticatedSession>
     authenticate(const foundation::SecretString& token);
     /**
@@ -165,6 +168,10 @@ public:
     [[nodiscard]] foundation::Status revoke(const SessionId& id);
     [[nodiscard]] foundation::Result<std::size_t>
     revokeAll(const identity::core::IdentityId& identity);
+    [[nodiscard]] foundation::Result<std::vector<Session>>
+    list(const identity::core::IdentityId& identity) const;
+    [[nodiscard]] foundation::Status
+    revokeOwned(const identity::core::IdentityId& identity, const SessionId& id);
 
 private:
     [[nodiscard]] foundation::Result<TokenDigest>

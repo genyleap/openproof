@@ -207,7 +207,7 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(gateway::Htt
     auto verified = m_authentication->complete(idp::TransactionId{transaction.value()},
         foundation::SecretString{*continuation}, binding.value(), authenticationResponse);
     if (!verified) return error(verified.error(), request, true);
-    auto grant = m_sessions->issue(verified.value());
+    auto grant = m_sessions->issue(verified.value(), clientContext(request));
     if (!grant) return error(grant.error(), request, true);
     json::object output;
     output["session_id"] = grant->id().value();

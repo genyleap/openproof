@@ -5,6 +5,7 @@ module;
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 module openproof.session;
 
@@ -121,6 +122,18 @@ InMemorySessionRepository::find(const SessionId& id) const
         return std::optional<Session>{};
     }
     return std::optional<Session>{position->second};
+}
+
+foundation::Result<std::vector<Session>>
+InMemorySessionRepository::list(const identity::core::IdentityId& identity) const
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    std::vector<Session> values;
+    for (const auto& [id, value] : m_sessions) {
+        static_cast<void>(id);
+        if (value.identity() == identity) values.emplace_back(value);
+    }
+    return values;
 }
 
 std::size_t InMemorySessionRepository::purgeExpired(foundation::Instant now)

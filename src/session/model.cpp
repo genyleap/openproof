@@ -93,7 +93,9 @@ Session::Session(SessionId id, identity::core::IdentityId identity,
                  identity::provider::AuthenticationStrength strength,
                  foundation::Instant authenticatedAt, TokenDigest tokenDigest,
                  foundation::Instant issuedAt, foundation::Instant absoluteExpiresAt,
-                 foundation::Duration idleTimeout)
+                 foundation::Duration idleTimeout,
+                 std::optional<std::string> userAgent,
+                 std::optional<std::string> remoteAddress)
     : m_id(std::move(id))
     , m_identity(std::move(identity))
     , m_provider(std::move(provider))
@@ -105,6 +107,8 @@ Session::Session(SessionId id, identity::core::IdentityId identity,
     , m_lastSeenAt(issuedAt)
     , m_absoluteExpiresAt(absoluteExpiresAt)
     , m_idleTimeout(idleTimeout)
+    , m_userAgent(std::move(userAgent))
+    , m_remoteAddress(std::move(remoteAddress))
 {
 }
 
@@ -115,7 +119,9 @@ foundation::Result<Session> Session::create(
     identity::provider::AuthenticationStrength strength,
     foundation::Instant authenticatedAt, TokenDigest tokenDigest,
     foundation::Instant issuedAt, foundation::Duration absoluteLifetime,
-    foundation::Duration idleTimeout)
+    foundation::Duration idleTimeout,
+    std::optional<std::string> userAgent,
+    std::optional<std::string> remoteAddress)
 {
     if (id.empty() || identity.empty() || provider.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -130,9 +136,15 @@ foundation::Result<Session> Session::create(
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "A session cannot predate its authentication.");
     }
+    if ((userAgent && userAgent->size() > 1024U)
+        || (remoteAddress && remoteAddress->size() > 128U)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Session client metadata is too large.");
+    }
     return Session{std::move(id), std::move(identity), std::move(provider), assurance,
                    strength, authenticatedAt, std::move(tokenDigest), issuedAt,
-                   issuedAt + absoluteLifetime, idleTimeout};
+                   issuedAt + absoluteLifetime, idleTimeout,
+                   std::move(userAgent), std::move(remoteAddress)};
 }
 
 foundation::Result<Session> Session::restore(
@@ -143,19 +155,24 @@ foundation::Result<Session> Session::restore(
     foundation::Instant authenticatedAt, TokenDigest tokenDigest,
     foundation::Instant issuedAt, foundation::Instant lastSeenAt,
     foundation::Instant absoluteExpiresAt, foundation::Duration idleTimeout,
-    std::optional<foundation::Instant> revokedAt)
+    std::optional<foundation::Instant> revokedAt,
+    std::optional<std::string> userAgent,
+    std::optional<std::string> remoteAddress)
 {
     if (id.empty() || identity.empty() || provider.empty()
         || authenticatedAt > issuedAt || lastSeenAt < issuedAt
         || lastSeenAt >= absoluteExpiresAt
         || idleTimeout <= foundation::Duration::zero()
-        || (state == SessionState::Revoked) != revokedAt.has_value()) {
+        || (state == SessionState::Revoked) != revokedAt.has_value()
+        || (userAgent && userAgent->size() > 1024U)
+        || (remoteAddress && remoteAddress->size() > 128U)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The persisted session is invalid.");
     }
     Session restored{std::move(id), std::move(identity), std::move(provider), assurance,
                      strength, authenticatedAt, std::move(tokenDigest), issuedAt,
-                     absoluteExpiresAt, idleTimeout};
+                     absoluteExpiresAt, idleTimeout,
+                     std::move(userAgent), std::move(remoteAddress)};
     restored.m_state = state;
     restored.m_lastSeenAt = lastSeenAt;
     restored.m_revokedAt = revokedAt;
@@ -179,6 +196,8 @@ foundation::Instant Session::idleExpiresAt() const noexcept { return m_lastSeenA
 foundation::Duration Session::idleTimeout() const noexcept { return m_idleTimeout; }
 const TokenDigest& Session::tokenDigest() const noexcept { return m_tokenDigest; }
 const std::optional<foundation::Instant>& Session::revokedAt() const noexcept { return m_revokedAt; }
+const std::optional<std::string>& Session::userAgent() const noexcept { return m_userAgent; }
+const std::optional<std::string>& Session::remoteAddress() const noexcept { return m_remoteAddress; }
 
 bool Session::isExpiredAt(foundation::Instant now) const noexcept
 {

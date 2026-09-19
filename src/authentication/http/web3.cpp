@@ -319,7 +319,7 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
         idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
         binding.value(), authenticationResponse);
     if (!verified) return error(verified.error(), request, true);
-    auto issued = m_sessions->issue(verified.value());
+    auto issued = m_sessions->issue(verified.value(), clientContext(request));
     if (!issued) return error(issued.error(), request, true);
     json::object payload;
     payload["authenticated"] = true;

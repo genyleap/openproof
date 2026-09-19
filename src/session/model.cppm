@@ -63,7 +63,9 @@ public:
            identity::provider::AuthenticationStrength strength,
            foundation::Instant authenticatedAt, TokenDigest tokenDigest,
            foundation::Instant issuedAt, foundation::Duration absoluteLifetime,
-           foundation::Duration idleTimeout);
+           foundation::Duration idleTimeout,
+           std::optional<std::string> userAgent = std::nullopt,
+           std::optional<std::string> remoteAddress = std::nullopt);
 
     [[nodiscard]] static foundation::Result<Session>
     restore(SessionId id, identity::core::IdentityId identity,
@@ -75,7 +77,9 @@ public:
             foundation::Instant lastSeenAt,
             foundation::Instant absoluteExpiresAt,
             foundation::Duration idleTimeout,
-            std::optional<foundation::Instant> revokedAt);
+            std::optional<foundation::Instant> revokedAt,
+            std::optional<std::string> userAgent = std::nullopt,
+            std::optional<std::string> remoteAddress = std::nullopt);
 
     [[nodiscard]] const SessionId& id() const noexcept;
     [[nodiscard]] const identity::core::IdentityId& identity() const noexcept;
@@ -91,6 +95,8 @@ public:
     [[nodiscard]] foundation::Duration idleTimeout() const noexcept;
     [[nodiscard]] const TokenDigest& tokenDigest() const noexcept;
     [[nodiscard]] const std::optional<foundation::Instant>& revokedAt() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& userAgent() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& remoteAddress() const noexcept;
 
     [[nodiscard]] bool isExpiredAt(foundation::Instant now) const noexcept;
     [[nodiscard]] foundation::Status use(const TokenDigest& presented, foundation::Instant now);
@@ -105,7 +111,9 @@ private:
             identity::provider::AuthenticationStrength strength,
             foundation::Instant authenticatedAt, TokenDigest tokenDigest,
             foundation::Instant issuedAt, foundation::Instant absoluteExpiresAt,
-            foundation::Duration idleTimeout);
+            foundation::Duration idleTimeout,
+            std::optional<std::string> userAgent,
+            std::optional<std::string> remoteAddress);
 
     SessionId m_id;
     identity::core::IdentityId m_identity;
@@ -120,6 +128,8 @@ private:
     foundation::Instant m_absoluteExpiresAt{};
     foundation::Duration m_idleTimeout{};
     std::optional<foundation::Instant> m_revokedAt;
+    std::optional<std::string> m_userAgent;
+    std::optional<std::string> m_remoteAddress;
 };
 
 }

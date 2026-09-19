@@ -539,7 +539,7 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         idp::TransactionId{std::move(transactionText).value()},
         foundation::SecretString{*continuation}, binding.value(), authenticationResponse);
     if (!verified) return error(verified.error(), request, true);
-    auto session = m_sessions->issue(verified.value());
+    auto session = m_sessions->issue(verified.value(), clientContext(request));
     if (!session) return error(session.error(), request, true);
     gateway::HttpResponse response{302, gateway::Headers{{"location", std::move(returnTarget).value()}}, {}};
     secure(response);

@@ -493,7 +493,7 @@ gateway::HttpResponse PasskeyAuthenticationHttpApi::verifyAssertion(
         return errorResponse(verified.error(), request);
     }
 
-    auto session = m_sessions->issue(verified.value());
+    auto session = m_sessions->issue(verified.value(), clientContext(request));
     if (!session) {
         return errorResponse(session.error(), request);
     }

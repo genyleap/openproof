@@ -211,6 +211,13 @@ SessionService::digest(const foundation::SecretString& token) const
 foundation::Result<SessionGrant> SessionService::issue(
     const authentication::VerifiedAuthentication& authentication)
 {
+    return issue(authentication, identity::provider::ClientContext{});
+}
+
+foundation::Result<SessionGrant> SessionService::issue(
+    const authentication::VerifiedAuthentication& authentication,
+    const identity::provider::ClientContext& client)
+{
     foundation::Result<std::string> generatedId =
         security::randomTokenBase64Url(kIdentifierEntropyBytes);
     if (!generatedId.has_value()) {
@@ -233,7 +240,11 @@ foundation::Result<SessionGrant> SessionService::issue(
     foundation::Result<Session> session = Session::create(
         id, authentication.identity(), outcome.provider(), outcome.claimedAssurance(),
         outcome.strength(), outcome.verifiedAt(), fingerprint.value(), now,
-        m_policy.absoluteLifetime(), m_policy.idleTimeout());
+        m_policy.absoluteLifetime(), m_policy.idleTimeout(),
+        client.userAgent().empty()
+            ? std::nullopt : std::optional<std::string>{std::string{client.userAgent()}},
+        client.remoteAddress().empty()
+            ? std::nullopt : std::optional<std::string>{std::string{client.remoteAddress()}});
     if (!session.has_value()) {
         return foundation::fail(session.error());
     }
@@ -320,6 +331,33 @@ foundation::Result<std::size_t>
 SessionService::revokeAll(const identity::core::IdentityId& identity)
 {
     return m_sessions.revokeAll(identity, m_clock.now());
+}
+
+foundation::Result<std::vector<Session>>
+SessionService::list(const identity::core::IdentityId& identity) const
+{
+    auto values = m_sessions.list(identity);
+    if (!values) return foundation::fail(values.error());
+    const auto now = m_clock.now();
+    std::erase_if(values.value(), [now](const Session& value) {
+        return value.state() != SessionState::Active || value.isExpiredAt(now);
+    });
+    std::ranges::sort(values.value(), [](const Session& left, const Session& right) {
+        return left.lastSeenAt() > right.lastSeenAt();
+    });
+    return values;
+}
+
+foundation::Status SessionService::revokeOwned(
+    const identity::core::IdentityId& identity, const SessionId& id)
+{
+    auto found = m_sessions.find(id);
+    if (!found) return foundation::fail(found.error());
+    if (!found->has_value() || found->value().identity() != identity) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That session was not found.");
+    }
+    return m_sessions.revoke(id, m_clock.now());
 }
 
 }

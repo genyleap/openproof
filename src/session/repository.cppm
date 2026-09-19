@@ -4,6 +4,7 @@ module;
 #include <map>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 export module openproof.session:repository;
 
@@ -37,6 +38,8 @@ public:
     [[nodiscard]] virtual foundation::Result<std::size_t>
     revokeAll(const identity::core::IdentityId& identity, foundation::Instant now) = 0;
     [[nodiscard]] virtual foundation::Result<std::optional<Session>> find(const SessionId& id) const = 0;
+    [[nodiscard]] virtual foundation::Result<std::vector<Session>>
+    list(const identity::core::IdentityId& identity) const = 0;
     [[nodiscard]] virtual std::size_t purgeExpired(foundation::Instant now) = 0;
     [[nodiscard]] virtual std::size_t size() const = 0;
 
@@ -56,6 +59,8 @@ public:
     revokeAll(const identity::core::IdentityId& identity, foundation::Instant now) override;
     [[nodiscard]] foundation::Result<std::optional<Session>>
     find(const SessionId& id) const override;
+    [[nodiscard]] foundation::Result<std::vector<Session>>
+    list(const identity::core::IdentityId& identity) const override;
     [[nodiscard]] std::size_t purgeExpired(foundation::Instant now) override;
     [[nodiscard]] std::size_t size() const override;
 
