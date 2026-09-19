@@ -142,10 +142,16 @@ After signing in with any existing method, list connections with
 /account/connections/start?provider=google&return_to=%2F
 ```
 
-For Farcaster or a wallet use `/account/connections/web3/start` and
-`/account/connections/web3/complete` with the same bodies as the login ceremony.
-Completion attaches the verified FID/address to the existing identity and does
-not issue or switch to another session. Disconnect with:
+For Farcaster or an in-browser wallet use
+`/account/connections/web3/start` and `/account/connections/web3/complete`
+with the same bodies as the login ceremony. For a wallet installed as a separate
+mobile app, first call `POST /account/connections/web3/handoff` with
+`{"provider":"ethereum-wallet"}`, keep the existing OpenProof session in the
+originating browser, and send only the returned one-time `handoff_ticket` to
+the wallet browser. The wallet then supplies its address and active `chain_id`
+to the normal start endpoint together with that ticket. Completion attaches the
+verified address to the existing identity and does not issue or switch to
+another session. Disconnect with:
 
 Native/mobile/desktop clients must not copy their session or OAuth bearer into
 the system browser. They instead call `POST /account/connections/handoff` with
@@ -362,10 +368,20 @@ the platform WebAuthn API and preserve the returned challenge exactly.
 Other challenge/response providers also use a cookie-bound start/complete pair:
 
 - Web3: `POST /auth/web3/start` with
-  `{"provider":"ethereum-wallet","address":"0x..."}`. For Farcaster,
-  `{"provider":"farcaster"}` returns the nonce/domain/URI used by AuthKit;
-  optionally include both `address` and `fid` to receive a complete direct-sign
-  FIP-11 message. Sign the exact resulting SIWE message, then call
+  `{"provider":"ethereum-wallet","address":"0x...","chain_id":"8453"}`,
+  where `chain_id` is the wallet's current positive decimal EVM chain ID. The
+  server signs the ceremony to that chain but does not force a network switch;
+  EOAs can authenticate without an RPC. When the wallet is a separate mobile
+  app, the originating browser first calls `POST /auth/web3/handoff`. It keeps
+  the returned `redeem_ticket` locally and sends only `publisher_ticket` to
+  the wallet browser. The wallet includes that publisher ticket as
+  `handoff_ticket` in `/auth/web3/start`, signs the returned SIWE message, and
+  completes normally. The originating browser polls
+  `POST /auth/web3/handoff/redeem`; it returns `202` until the wallet publishes
+  the verified result and then atomically issues the browser session. For
+  Farcaster, `{"provider":"farcaster"}` returns the nonce/domain/URI used by
+  AuthKit; optionally include both `address` and `fid` to receive a complete
+  direct-sign FIP-11 message. Sign the exact resulting SIWE message, then call
   `POST /auth/web3/complete` with `{"message":"...","signature":"..."}`.
 - LDAP: `POST /auth/ldap/start` with `{"username":"..."}`, then preserve its
   cookies and send the returned `transaction_id`, `challenge_id`, `username`

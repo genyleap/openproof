@@ -1,6 +1,7 @@
 module;
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,6 +18,15 @@ export namespace openproof::provider::web3 {
 class WalletProviderConfig final {
 public:
     [[nodiscard]] static foundation::Result<WalletProviderConfig> create(
+        std::string domain, std::string uri,
+        std::map<std::uint64_t, std::string> rpcEndpoints,
+        foundation::SecretString derivationKey,
+        foundation::Duration challengeLifetime, std::string caFile = {},
+        foundation::SecretString authorizationHeader = {});
+
+    // Backward-compatible single-chain configuration. The configured RPC is
+    // used only when an ERC-1271/ERC-6492 smart account needs chain state.
+    [[nodiscard]] static foundation::Result<WalletProviderConfig> create(
         std::string domain, std::string uri, std::uint64_t chainId,
         std::string rpcEndpoint, foundation::SecretString derivationKey,
         foundation::Duration challengeLifetime, std::string caFile = {},
@@ -29,23 +39,22 @@ public:
 
     [[nodiscard]] std::string_view domain() const noexcept;
     [[nodiscard]] std::string_view uri() const noexcept;
-    [[nodiscard]] std::uint64_t chainId() const noexcept;
-    [[nodiscard]] std::string_view rpcEndpoint() const noexcept;
+    [[nodiscard]] std::optional<std::string_view> rpcEndpoint(std::uint64_t chainId) const noexcept;
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
     [[nodiscard]] std::string_view caFile() const noexcept;
     [[nodiscard]] const foundation::SecretString& authorizationHeader() const noexcept;
 
 private:
-    WalletProviderConfig(std::string domain, std::string uri, std::uint64_t chainId,
-                         std::string rpcEndpoint, foundation::SecretString derivationKey,
+    WalletProviderConfig(std::string domain, std::string uri,
+                         std::map<std::uint64_t, std::string> rpcEndpoints,
+                         foundation::SecretString derivationKey,
                          foundation::Duration challengeLifetime, std::string caFile,
                          foundation::SecretString authorizationHeader);
 
     std::string m_domain;
     std::string m_uri;
-    std::uint64_t m_chainId{};
-    std::string m_rpcEndpoint;
+    std::map<std::uint64_t, std::string> m_rpcEndpoints;
     foundation::SecretString m_derivationKey;
     foundation::Duration m_challengeLifetime{};
     std::string m_caFile;

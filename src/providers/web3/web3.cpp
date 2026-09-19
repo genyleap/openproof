@@ -8,6 +8,7 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -774,6 +775,35 @@ struct RpcResponse final { json::value result; };
     return milliseconds;
 }
 
+[[nodiscard]] foundation::Result<std::uint64_t> walletChallengeChainId(
+    const idp::ChallengeId& challenge)
+{
+    constexpr std::string_view prefix{"siwe_"};
+    std::string_view value = challenge.value();
+    if (!value.starts_with(prefix)) {
+        return foundation::fail(authenticationFailure("The SIWE challenge identifier is invalid."));
+    }
+    value.remove_prefix(prefix.size());
+    const auto timestampSeparator = value.find('_');
+    if (timestampSeparator == std::string_view::npos) {
+        return foundation::fail(authenticationFailure("The SIWE challenge identifier is invalid."));
+    }
+    value.remove_prefix(timestampSeparator + 1U);
+    const auto chainSeparator = value.find('_');
+    if (chainSeparator == std::string_view::npos) {
+        return foundation::fail(authenticationFailure("The SIWE challenge identifier is invalid."));
+    }
+    std::uint64_t chainId{};
+    const auto chainText = value.substr(0U, chainSeparator);
+    const auto parsed = std::from_chars(
+        chainText.data(), chainText.data() + chainText.size(), chainId, 10);
+    if (parsed.ec != std::errc{} || parsed.ptr != chainText.data() + chainText.size()
+        || chainId == 0U) {
+        return foundation::fail(authenticationFailure("The SIWE challenge chain id is invalid."));
+    }
+    return chainId;
+}
+
 [[nodiscard]] foundation::Result<std::string> challengeNonce(
     const foundation::SecretString& key, const idp::ChallengeId& challenge)
 {
@@ -789,6 +819,17 @@ struct RpcResponse final { json::value result; };
     if (!random) return foundation::fail(random.error());
     const auto milliseconds = now.time_since_epoch().count();
     return idp::ChallengeId{std::string{prefix} + std::to_string(milliseconds) + "_" + std::move(random).value()};
+}
+
+[[nodiscard]] foundation::Result<idp::ChallengeId> makeWalletChallengeId(
+    foundation::Instant now, std::uint64_t chainId)
+{
+    auto random = security::randomTokenBase64Url(18U);
+    if (!random) return foundation::fail(random.error());
+    const auto milliseconds = now.time_since_epoch().count();
+    return idp::ChallengeId{
+        "siwe_" + std::to_string(milliseconds) + "_" + std::to_string(chainId)
+        + "_" + std::move(random).value()};
 }
 
 [[nodiscard]] std::string buildSiweMessage(
@@ -831,13 +872,14 @@ struct RpcResponse final { json::value result; };
 
 struct ParsedSiwe final {
     std::string address;
+    std::uint64_t chainId{};
 };
 
 [[nodiscard]] foundation::Result<ParsedSiwe> validateSiweMessage(
     std::string_view message, const idp::ChallengeId& challenge,
     std::string_view challengePrefix, std::string_view domain, std::string_view uri,
-    std::uint64_t chainId, std::string_view statement,
-    const foundation::SecretString& derivationKey, foundation::Duration lifetime)
+    std::string_view statement, const foundation::SecretString& derivationKey,
+    foundation::Duration lifetime)
 {
     if (message.empty() || message.size() > 8192U || message.contains('\r')) {
         return foundation::fail(authenticationFailure("The SIWE message encoding is invalid."));
@@ -850,13 +892,25 @@ struct ParsedSiwe final {
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
+    constexpr std::string_view chainLabel{"Chain ID: "};
     if (lines.size() != 11U
         || lines[0] != std::string{domain} + " wants you to sign in with your Ethereum account:"
         || lines[2] != "" || lines[3] != statement || lines[4] != ""
         || lines[5] != std::string{"URI: "} + std::string{uri}
-        || lines[6] != "Version: 1"
-        || lines[7] != std::string{"Chain ID: "} + std::to_string(chainId)) {
+        || lines[6] != "Version: 1" || !lines[7].starts_with(chainLabel)) {
         return foundation::fail(authenticationFailure("The SIWE message is not bound to this relying party."));
+    }
+    std::uint64_t chainId{};
+    const auto chainText = lines[7].substr(chainLabel.size());
+    const auto chainParsed = std::from_chars(
+        chainText.data(), chainText.data() + chainText.size(), chainId, 10);
+    if (chainParsed.ec != std::errc{} || chainParsed.ptr != chainText.data() + chainText.size()
+        || chainId == 0U) {
+        return foundation::fail(authenticationFailure("The SIWE chain id is invalid."));
+    }
+    auto boundChain = walletChallengeChainId(challenge);
+    if (!boundChain || boundChain.value() != chainId) {
+        return foundation::fail(authenticationFailure("The SIWE chain id is not bound to this challenge."));
     }
     auto address = normalizeAddress(lines[1]);
     if (!address) return foundation::fail(authenticationFailure("The SIWE address is invalid."));
@@ -870,7 +924,7 @@ struct ParsedSiwe final {
         || lines[10] != std::string{"Expiration Time: "} + foundation::toIso8601(expiresAt)) {
         return foundation::fail(authenticationFailure("The SIWE challenge binding is invalid."));
     }
-    return ParsedSiwe{std::move(*address)};
+    return ParsedSiwe{std::move(*address), chainId};
 }
 
 [[nodiscard]] std::optional<unsigned int> fixedDecimal(
@@ -1073,14 +1127,40 @@ private:
 } // namespace
 
 WalletProviderConfig::WalletProviderConfig(
-    std::string domain, std::string uri, std::uint64_t chainId,
-    std::string rpcEndpoint, foundation::SecretString derivationKey,
+    std::string domain, std::string uri,
+    std::map<std::uint64_t, std::string> rpcEndpoints,
+    foundation::SecretString derivationKey,
     foundation::Duration challengeLifetime, std::string caFile,
     foundation::SecretString authorizationHeader)
-    : m_domain(std::move(domain)), m_uri(std::move(uri)), m_chainId(chainId),
-      m_rpcEndpoint(std::move(rpcEndpoint)), m_derivationKey(std::move(derivationKey)),
+    : m_domain(std::move(domain)), m_uri(std::move(uri)),
+      m_rpcEndpoints(std::move(rpcEndpoints)), m_derivationKey(std::move(derivationKey)),
       m_challengeLifetime(challengeLifetime), m_caFile(std::move(caFile)),
       m_authorizationHeader(std::move(authorizationHeader)) {}
+
+foundation::Result<WalletProviderConfig> WalletProviderConfig::create(
+    std::string domain, std::string uri,
+    std::map<std::uint64_t, std::string> rpcEndpoints,
+    foundation::SecretString derivationKey,
+    foundation::Duration challengeLifetime, std::string caFile,
+    foundation::SecretString authorizationHeader)
+{
+    if (!validDomain(domain) || !parseHttpsUrl(uri)
+        || derivationKey.expose().size() < 32U
+        || challengeLifetime < std::chrono::seconds{30}
+        || challengeLifetime > std::chrono::minutes{15}) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The Ethereum wallet provider configuration is invalid.");
+    }
+    for (const auto& [chainId, endpoint] : rpcEndpoints) {
+        if (chainId == 0U || !parseHttpsUrl(endpoint)) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "An Ethereum smart-wallet RPC mapping is invalid.");
+        }
+    }
+    return WalletProviderConfig{std::move(domain), std::move(uri),
+        std::move(rpcEndpoints), std::move(derivationKey), challengeLifetime,
+        std::move(caFile), std::move(authorizationHeader)};
+}
 
 foundation::Result<WalletProviderConfig> WalletProviderConfig::create(
     std::string domain, std::string uri, std::uint64_t chainId,
@@ -1088,22 +1168,26 @@ foundation::Result<WalletProviderConfig> WalletProviderConfig::create(
     foundation::Duration challengeLifetime, std::string caFile,
     foundation::SecretString authorizationHeader)
 {
-    if (!validDomain(domain) || !parseHttpsUrl(uri) || !parseHttpsUrl(rpcEndpoint)
-        || chainId == 0U || derivationKey.expose().size() < 32U
-        || challengeLifetime < std::chrono::seconds{30}
-        || challengeLifetime > std::chrono::minutes{15}) {
+    if (chainId == 0U || rpcEndpoint.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "The Ethereum wallet provider configuration is invalid.");
+                                "The Ethereum wallet RPC configuration is invalid.");
     }
-    return WalletProviderConfig{std::move(domain), std::move(uri), chainId,
-        std::move(rpcEndpoint), std::move(derivationKey), challengeLifetime,
-        std::move(caFile), std::move(authorizationHeader)};
+    std::map<std::uint64_t, std::string> endpoints;
+    endpoints.emplace(chainId, std::move(rpcEndpoint));
+    return create(std::move(domain), std::move(uri), std::move(endpoints),
+                  std::move(derivationKey), challengeLifetime,
+                  std::move(caFile), std::move(authorizationHeader));
 }
 
 std::string_view WalletProviderConfig::domain() const noexcept { return m_domain; }
 std::string_view WalletProviderConfig::uri() const noexcept { return m_uri; }
-std::uint64_t WalletProviderConfig::chainId() const noexcept { return m_chainId; }
-std::string_view WalletProviderConfig::rpcEndpoint() const noexcept { return m_rpcEndpoint; }
+std::optional<std::string_view> WalletProviderConfig::rpcEndpoint(
+    std::uint64_t chainId) const noexcept
+{
+    const auto found = m_rpcEndpoints.find(chainId);
+    if (found == m_rpcEndpoints.end()) return std::nullopt;
+    return found->second;
+}
 const foundation::SecretString& WalletProviderConfig::derivationKey() const noexcept { return m_derivationKey; }
 foundation::Duration WalletProviderConfig::challengeLifetime() const noexcept { return m_challengeLifetime; }
 std::string_view WalletProviderConfig::caFile() const noexcept { return m_caFile; }
@@ -1130,25 +1214,29 @@ WalletAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
 {
     if (request.provider() != id()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
     const auto addressValue = publicParameter(request.parameters(), "address");
+    const auto chainValue = publicParameter(request.parameters(), "chain_id");
     auto address = addressValue ? normalizeAddress(*addressValue) : std::nullopt;
-    if (!address) return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                          "Wallet authentication requires a valid Ethereum address.");
-    auto chain = rpcChainMatches(m_implementation->config.rpcEndpoint(), m_implementation->config.chainId(),
-                              m_implementation->config.caFile(), m_implementation->config.authorizationHeader());
-    if (!chain || !chain.value()) return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
-                                                            : chain.error());
+    if (!address || !chainValue) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Wallet authentication requires a valid Ethereum address and chain id.");
+    }
+    auto chainId = parseDecimal(*chainValue);
+    if (!chainId || chainId.value() == 0U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Wallet authentication requires a valid Ethereum address and chain id.");
+    }
     const auto now = m_implementation->clock->now();
-    auto challengeId = makeChallengeId("siwe_", now);
+    auto challengeId = makeWalletChallengeId(now, chainId.value());
     if (!challengeId) return foundation::fail(challengeId.error());
     auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
     if (!nonce) return foundation::fail(nonce.error());
     idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
     challenge.setParameter("message", buildSiweMessage(
         m_implementation->config.domain(), *address, kWalletStatement,
-        m_implementation->config.uri(), m_implementation->config.chainId(), nonce.value(),
+        m_implementation->config.uri(), chainId.value(), nonce.value(),
         now, now + m_implementation->config.challengeLifetime()));
     challenge.setParameter("address", *address);
-    challenge.setParameter("chain_id", std::to_string(m_implementation->config.chainId()));
+    challenge.setParameter("chain_id", std::to_string(chainId.value()));
     return challenge;
 }
 
@@ -1162,23 +1250,43 @@ WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     }
     auto parsed = validateSiweMessage(*message, response.challengeId(), "siwe_",
         m_implementation->config.domain(), m_implementation->config.uri(),
-        m_implementation->config.chainId(), kWalletStatement,
-        m_implementation->config.derivationKey(), m_implementation->config.challengeLifetime());
+        kWalletStatement, m_implementation->config.derivationKey(),
+        m_implementation->config.challengeLifetime());
     if (!parsed) return foundation::fail(parsed.error());
     auto digest = ethereumMessageHash(*message);
     if (!digest) return foundation::fail(digest.error());
-    auto valid = contractWalletValid(m_implementation->config.rpcEndpoint(), parsed->address,
-        digest.value(), *signature, m_implementation->config.caFile(),
-        m_implementation->config.authorizationHeader());
-    if (!valid || !valid.value()) {
-        return foundation::fail(valid ? authenticationFailure("The SIWE signature is invalid.") : valid.error());
+
+    bool verified = false;
+    auto recovered = recoverAddress(digest.value(), *signature);
+    if (recovered && security::constantTimeEquals(*recovered, parsed->address)) {
+        verified = true;
+    } else if (const auto endpoint = m_implementation->config.rpcEndpoint(parsed->chainId)) {
+        auto matchingChain = rpcChainMatches(
+            *endpoint, parsed->chainId, m_implementation->config.caFile(),
+            m_implementation->config.authorizationHeader());
+        if (!matchingChain) return foundation::fail(matchingChain.error());
+        if (!matchingChain.value()) {
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "The configured smart-wallet RPC reports the wrong chain.");
+        }
+        auto valid = contractWalletValid(
+            *endpoint, parsed->address, digest.value(), *signature,
+            m_implementation->config.caFile(),
+            m_implementation->config.authorizationHeader());
+        if (!valid) return foundation::fail(valid.error());
+        verified = valid.value();
     }
+    if (!verified) {
+        return foundation::fail(authenticationFailure(
+            "The SIWE signature is invalid, or this smart-account chain has no configured RPC."));
+    }
+
     idp::VerifiedClaims claims;
     claims.setExtension("wallet_address", parsed->address);
-    claims.setExtension("chain_id", std::to_string(m_implementation->config.chainId()));
+    claims.setExtension("chain_id", std::to_string(parsed->chainId));
     idp::ProviderEvidence evidence;
     evidence.add("protocol", "erc4361_siwe");
-    evidence.add("chain_id", std::to_string(m_implementation->config.chainId()));
+    evidence.add("chain_id", std::to_string(parsed->chainId));
     evidence.add("wallet_address", parsed->address);
     return idp::AuthenticationOutcome::create(
         id(), idp::ExternalSubject{parsed->address}, std::move(claims), idp::AssuranceLevel::Ial1,

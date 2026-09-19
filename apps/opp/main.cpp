@@ -21,6 +21,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1596,23 +1597,82 @@ addProtectedRoutes(gateway::Router& router,
     const auto web3Domain = environment.get("OPENPROOF_WEB3_DOMAIN");
     const auto web3Uri = environment.get("OPENPROOF_WEB3_URI");
     const auto web3CaFile = environment.get("OPENPROOF_WEB3_CA_FILE").value_or(std::string{});
-    if (const auto ethereumRpc = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINT");
-        ethereumRpc && !ethereumRpc->empty()) {
+    const auto ethereumEnabledValue = environment.get("OPENPROOF_ETHEREUM_WALLET_ENABLED");
+    const auto ethereumLegacyRpc = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINT");
+    const auto ethereumRpcMapValue = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINTS");
+    bool ethereumEnabled = (ethereumLegacyRpc && !ethereumLegacyRpc->empty())
+        || (ethereumRpcMapValue && !ethereumRpcMapValue->empty());
+    if (ethereumEnabledValue && !ethereumEnabledValue->empty()) {
+        std::string lowered = *ethereumEnabledValue;
+        std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
+            return static_cast<char>(std::tolower(symbol));
+        });
+        if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+            ethereumEnabled = true;
+        } else if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+            ethereumEnabled = false;
+        } else {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_ETHEREUM_WALLET_ENABLED must be a boolean value."});
+            return ExitCode::ConfigurationError;
+        }
+    }
+    if (ethereumEnabled) {
         if (!web3Domain || web3Domain->empty() || !web3Uri || web3Uri->empty()) {
             reportStartupFailure(fnd::Error{
                 fnd::ErrorCode::FailedPrecondition,
                 "OPENPROOF_WEB3_DOMAIN and OPENPROOF_WEB3_URI are required for Web3 login."});
             return ExitCode::ConfigurationError;
         }
-        auto chainId = parseChainId("OPENPROOF_ETHEREUM_CHAIN_ID", 1U);
+
+        std::map<std::uint64_t, std::string> walletRpcEndpoints;
+        if (ethereumRpcMapValue && !ethereumRpcMapValue->empty()) {
+            std::string_view remaining{*ethereumRpcMapValue};
+            while (!remaining.empty()) {
+                const auto separator = remaining.find(';');
+                const auto entry = remaining.substr(
+                    0U, separator == std::string_view::npos ? remaining.size() : separator);
+                const auto equals = entry.find('=');
+                if (equals == std::string_view::npos || equals == 0U || equals + 1U >= entry.size()) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::InvalidArgument,
+                        "OPENPROOF_ETHEREUM_RPC_ENDPOINTS must use chain_id=https://rpc;... syntax."});
+                    return ExitCode::ConfigurationError;
+                }
+                std::uint64_t chainId{};
+                const auto chainText = entry.substr(0U, equals);
+                const auto parsed = std::from_chars(
+                    chainText.data(), chainText.data() + chainText.size(), chainId, 10);
+                if (parsed.ec != std::errc{} || parsed.ptr != chainText.data() + chainText.size()
+                    || chainId == 0U
+                    || !walletRpcEndpoints.emplace(chainId, std::string{entry.substr(equals + 1U)}).second) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::InvalidArgument,
+                        "OPENPROOF_ETHEREUM_RPC_ENDPOINTS contains an invalid or duplicate chain id."});
+                    return ExitCode::ConfigurationError;
+                }
+                if (separator == std::string_view::npos) break;
+                remaining.remove_prefix(separator + 1U);
+            }
+        }
+        if (ethereumLegacyRpc && !ethereumLegacyRpc->empty()) {
+            auto chainId = parseChainId("OPENPROOF_ETHEREUM_CHAIN_ID", 1U);
+            if (!chainId) {
+                reportStartupFailure(chainId.error());
+                return ExitCode::ConfigurationError;
+            }
+            walletRpcEndpoints.insert_or_assign(chainId.value(), *ethereumLegacyRpc);
+        }
+
         auto derivationKey = deriveSecret(
             platform.security().tokenSigningKey(), "openproof/federation/ethereum-wallet/v1");
-        if (!chainId || !derivationKey) {
-            reportStartupFailure(chainId ? derivationKey.error() : chainId.error());
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
             return ExitCode::ConfigurationError;
         }
         auto walletConfig = web3::WalletProviderConfig::create(
-            *web3Domain, *web3Uri, chainId.value(), *ethereumRpc,
+            *web3Domain, *web3Uri, std::move(walletRpcEndpoints),
             std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
             fnd::SecretString{environment.get("OPENPROOF_ETHEREUM_RPC_AUTHORIZATION").value_or(std::string{})});
         if (!walletConfig) {

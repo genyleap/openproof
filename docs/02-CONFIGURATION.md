@@ -632,14 +632,21 @@ server-side inherence claim.
 
 ### Wallet and Farcaster login
 
-Web3 login is enabled only when its RPC configuration is present. Common browser
-bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS `OPENPROOF_WEB3_URI`;
-`OPENPROOF_WEB3_CA_FILE` optionally supplies an additional CA bundle.
+Web3 browser bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS
+`OPENPROOF_WEB3_URI`; `OPENPROOF_WEB3_CA_FILE` optionally supplies an
+additional CA bundle.
 
-- Wallet/SIWE: `OPENPROOF_ETHEREUM_RPC_ENDPOINT`; optional
-  `OPENPROOF_ETHEREUM_CHAIN_ID` (default `1`) and
-  `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION`. EOA signatures are recovered on
-  secp256k1 and contract wallets are verified through ERC-1271.
+- Wallet/SIWE: enable with `OPENPROOF_ETHEREUM_WALLET_ENABLED=true`. The wallet
+  supplies its active positive EVM chain ID for each ceremony; EOA signatures
+  are recovered locally on secp256k1 and therefore do not require an RPC or a
+  fixed chain. Smart-account verification (ERC-1271/ERC-6492) uses the optional
+  server-side map `OPENPROOF_ETHEREUM_RPC_ENDPOINTS`, formatted as
+  `1=https://...;8453=https://...;42161=https://...;5042=https://rpc.mainnet.arc.io;4663=https://rpc.mainnet.chain.robinhood.com`. Only the matching
+  chain-specific endpoint is consulted. The legacy
+  `OPENPROOF_ETHEREUM_RPC_ENDPOINT` plus `OPENPROOF_ETHEREUM_CHAIN_ID`
+  pair remains supported as one smart-wallet RPC mapping.
+  `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION` is applied to configured wallet RPC
+  calls when required.
 - Farcaster: `OPENPROOF_FARCASTER_RPC_ENDPOINT`,
   optional `OPENPROOF_FARCASTER_ID_REGISTRY` and
   `OPENPROOF_FARCASTER_KEY_REGISTRY` overrides, and optional

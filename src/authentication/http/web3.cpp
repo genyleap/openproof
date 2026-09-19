@@ -27,6 +27,8 @@ constexpr std::string_view kBindingCookie{"__Host-openproof-web3-binding"};
 constexpr std::string_view kTransactionCookie{"__Host-openproof-web3-transaction"};
 constexpr std::string_view kChallengeCookie{"__Host-openproof-web3-challenge"};
 constexpr std::string_view kModeCookie{"__Host-openproof-web3-mode"};
+constexpr std::string_view kAuthenticationHandoffCookie{
+    "__Host-openproof-web3-auth-handoff"};
 constexpr std::size_t kMaximumBody = 16U * 1024U;
 
 [[nodiscard]] std::string cookie(std::string_view name, std::string_view value,
@@ -60,6 +62,7 @@ void clearState(gateway::HttpResponse& response)
     response.addHeader("set-cookie", cookie(kTransactionCookie, "", 0));
     response.addHeader("set-cookie", cookie(kChallengeCookie, "", 0));
     response.addHeader("set-cookie", cookie(kModeCookie, "", 0));
+    response.addHeader("set-cookie", cookie(kAuthenticationHandoffCookie, "", 0));
 }
 
 [[nodiscard]] std::optional<std::string> cookieValue(
@@ -124,6 +127,23 @@ void clearState(gateway::HttpResponse& response)
     return text;
 }
 
+[[nodiscard]] bool validTicket(std::string_view value) noexcept
+{
+    if (value.empty() || value.size() > 256U) return false;
+    const auto separator = value.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= value.size()
+        || value.find('.', separator + 1U) != std::string_view::npos) {
+        return false;
+    }
+    return std::ranges::all_of(value, [](char symbol) {
+        return (symbol >= 'A' && symbol <= 'Z')
+            || (symbol >= 'a' && symbol <= 'z')
+            || (symbol >= '0' && symbol <= '9')
+            || symbol == '-' || symbol == '_' || symbol == '.';
+    });
+}
+
 [[nodiscard]] idp::ClientContext clientContext(const gateway::HttpRequest& request)
 {
     idp::ClientContext client;
@@ -171,11 +191,23 @@ gateway::HttpResponse Web3AuthenticationHttpApi::error(
 
 gateway::HttpResponse Web3AuthenticationHttpApi::handle(gateway::HttpRequest request)
 {
+    if (request.path() == "/auth/web3/handoff"
+        && request.method() == gateway::HttpMethod::Post) {
+        return issueAuthenticationHandoff(std::move(request));
+    }
+    if (request.path() == "/auth/web3/handoff/redeem"
+        && request.method() == gateway::HttpMethod::Post) {
+        return redeemAuthenticationHandoff(std::move(request));
+    }
     if (request.path() == "/auth/web3/start" && request.method() == gateway::HttpMethod::Post) {
         return start(std::move(request), false);
     }
     if (request.path() == "/auth/web3/complete" && request.method() == gateway::HttpMethod::Post) {
         return complete(std::move(request), false);
+    }
+    if (request.path() == "/account/connections/web3/handoff"
+        && request.method() == gateway::HttpMethod::Post) {
+        return issueConnectionHandoff(std::move(request));
     }
     if (request.path() == "/account/connections/web3/start"
         && request.method() == gateway::HttpMethod::Post) {
@@ -188,6 +220,124 @@ gateway::HttpResponse Web3AuthenticationHttpApi::handle(gateway::HttpRequest req
     return m_fallback->handle(std::move(request));
 }
 
+gateway::HttpResponse Web3AuthenticationHttpApi::issueAuthenticationHandoff(
+    gateway::HttpRequest request)
+{
+    if (!m_rateLimiter->allow("web3-auth-handoff-ip:" + std::string{request.remoteAddress()})) {
+        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"provider"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request);
+    }
+    auto providerName = stringField(body.value(), "provider", 64U);
+    if (!providerName || *providerName != "ethereum-wallet") {
+        return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    auto issued = m_authentication->issueBrowserAuthenticationHandoff(
+        idp::ProviderId{*providerName}, request.correlation());
+    if (!issued) return error(issued.error(), request);
+
+    json::object payload;
+    payload["publisher_ticket"] = issued->publisherTicket().expose();
+    payload["redeem_ticket"] = issued->redeemTicket().expose();
+    payload["expires_at"] = foundation::toIso8601(issued->expiresAt());
+    gateway::HttpResponse response{
+        201, gateway::Headers{{"content-type", "application/json"}},
+        json::serialize(payload)};
+    secure(response);
+    return response;
+}
+
+gateway::HttpResponse Web3AuthenticationHttpApi::redeemAuthenticationHandoff(
+    gateway::HttpRequest request)
+{
+    if (!m_rateLimiter->allow("web3-auth-redeem-ip:" + std::string{request.remoteAddress()})) {
+        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"redeem_ticket"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request);
+    }
+    auto redeemTicket = stringField(body.value(), "redeem_ticket", 256U);
+    if (!redeemTicket || !validTicket(*redeemTicket)) {
+        return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    auto verified = m_authentication->redeemBrowserAuthenticationHandoff(
+        foundation::SecretString{*redeemTicket});
+    if (!verified) {
+        if (verified.error().code() == foundation::ErrorCode::AuthenticationFailed
+            || verified.error().code() == foundation::ErrorCode::NotFound) {
+            json::object payload;
+            payload["pending"] = true;
+            gateway::HttpResponse response{
+                202, gateway::Headers{{"content-type", "application/json"}},
+                json::serialize(payload)};
+            secure(response);
+            return response;
+        }
+        return error(verified.error(), request);
+    }
+    auto issued = m_sessions->issue(verified.value(), clientContext(request));
+    if (!issued) return error(issued.error(), request);
+
+    json::object payload;
+    payload["authenticated"] = true;
+    payload["identity_id"] = verified->identity().value();
+    gateway::HttpResponse response{
+        200, gateway::Headers{{"content-type", "application/json"}},
+        json::serialize(payload)};
+    secure(response);
+    response.addHeader("set-cookie", sessionCookie(issued->token().expose(), 8 * 60 * 60));
+    return response;
+}
+
+gateway::HttpResponse Web3AuthenticationHttpApi::issueConnectionHandoff(
+    gateway::HttpRequest request)
+{
+    if (!m_rateLimiter->allow("web3-handoff-ip:" + std::string{request.remoteAddress()})) {
+        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"provider"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request);
+    }
+    auto providerName = stringField(body.value(), "provider", 64U);
+    if (!providerName || *providerName != "ethereum-wallet") {
+        return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    const idp::ProviderId providerId{*providerName};
+    auto* implementation = m_providers->find(providerId);
+    if (implementation == nullptr
+        || implementation->interactionModel() != idp::InteractionModel::ChallengeResponse) {
+        return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
+    }
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential || !credential->has_value()) {
+        return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    }
+    auto authenticated = m_sessions->authenticate(
+        credential->value(), m_delegated, "account");
+    if (!authenticated) return error(authenticated.error(), request);
+
+    auto handoff = m_authentication->issueBrowserConnectionHandoff(
+        authenticated->session().identity(), providerId, "/account",
+        request.correlation());
+    if (!handoff) return error(handoff.error(), request);
+
+    json::object payload;
+    payload["handoff_ticket"] = handoff->ticket().expose();
+    payload["expires_at"] = foundation::toIso8601(handoff->expiresAt());
+    gateway::HttpResponse response{
+        201, gateway::Headers{{"content-type", "application/json"}},
+        json::serialize(payload)};
+    secure(response);
+    return response;
+}
+
 gateway::HttpResponse Web3AuthenticationHttpApi::start(
     gateway::HttpRequest request, bool connection)
 {
@@ -195,16 +345,21 @@ gateway::HttpResponse Web3AuthenticationHttpApi::start(
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
     auto body = parseObject(request);
-    if (!body || !onlyFields(body.value(), {"provider", "address", "fid"})) {
+    if (!body || !onlyFields(body.value(),
+                             {"provider", "address", "chain_id", "fid", "handoff_ticket"})) {
         return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
                      request, true);
     }
     auto providerName = stringField(body.value(), "provider", 64U);
     auto address = stringField(body.value(), "address", 64U);
+    auto chainId = stringField(body.value(), "chain_id", 32U);
     auto fid = stringField(body.value(), "fid", 32U);
+    auto handoffTicket = stringField(body.value(), "handoff_ticket", 256U);
     if (!providerName || !web3Provider(*providerName)
-        || (*providerName == "ethereum-wallet" && !address)
-        || (*providerName == "farcaster" && address.has_value() != fid.has_value())) {
+        || (*providerName == "ethereum-wallet" && (!address || !chainId))
+        || (*providerName == "farcaster" && (address.has_value() != fid.has_value() || chainId))
+        || (handoffTicket && (*providerName != "ethereum-wallet"
+                              || !validTicket(*handoffTicket)))) {
         return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request, true);
     }
     idp::ProviderId providerId{*providerName};
@@ -215,15 +370,26 @@ gateway::HttpResponse Web3AuthenticationHttpApi::start(
     }
     std::optional<identity::core::IdentityId> connectionTarget;
     if (connection) {
-        auto credential = gateway::takeSessionCredential(request);
-        if (!credential || !credential->has_value()) {
-            return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},
-                         request, true);
+        if (handoffTicket) {
+            auto target = m_authentication->consumeBrowserConnectionHandoff(
+                foundation::SecretString{*handoffTicket});
+            if (!target || target->providerId != providerId || target->returnTarget != "/account") {
+                return error(target
+                    ? foundation::Error{foundation::ErrorCode::AuthenticationFailed}
+                    : target.error(), request, true);
+            }
+            connectionTarget.emplace(std::move(target->identity));
+        } else {
+            auto credential = gateway::takeSessionCredential(request);
+            if (!credential || !credential->has_value()) {
+                return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},
+                             request, true);
+            }
+            auto authenticated = m_sessions->authenticate(
+                credential->value(), m_delegated, "account");
+            if (!authenticated) return error(authenticated.error(), request, true);
+            connectionTarget.emplace(authenticated->session().identity());
         }
-        auto authenticated = m_sessions->authenticate(
-            credential->value(), m_delegated, "account");
-        if (!authenticated) return error(authenticated.error(), request, true);
-        connectionTarget.emplace(authenticated->session().identity());
     }
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken) return error(bindingToken.error(), request, true);
@@ -233,6 +399,7 @@ gateway::HttpResponse Web3AuthenticationHttpApi::start(
     idp::AuthenticationRequest authenticationRequest{providerId, clientContext(request)};
     authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
     if (address) authenticationRequest.setParameter("address", *address);
+    if (chainId) authenticationRequest.setParameter("chain_id", *chainId);
     if (fid) {
         authenticationRequest.setParameter("fid", *fid);
     }
@@ -268,7 +435,12 @@ gateway::HttpResponse Web3AuthenticationHttpApi::start(
     response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
     response.addHeader("set-cookie", cookie(kTransactionCookie, started->transactionId().value(), 600));
     response.addHeader("set-cookie", cookie(kChallengeCookie, started->challenge().id().value(), 600));
-    if (connection) response.addHeader("set-cookie", cookie(kModeCookie, "link", 600));
+    if (connection) {
+        response.addHeader("set-cookie", cookie(kModeCookie, "link", 600));
+    } else if (handoffTicket) {
+        response.addHeader("set-cookie",
+                           cookie(kAuthenticationHandoffCookie, *handoffTicket, 180));
+    }
     return response;
 }
 
@@ -295,6 +467,8 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
     const auto transaction = cookieValue(request, kTransactionCookie, 256U);
     const auto challenge = cookieValue(request, kChallengeCookie, 512U);
     const auto mode = cookieValue(request, kModeCookie, 16U);
+    const auto authenticationHandoff =
+        cookieValue(request, kAuthenticationHandoffCookie, 256U);
     if (!message || !signature || !continuation || !bindingToken || !transaction || !challenge
         || (connection && (!mode || *mode != "link")) || (!connection && mode.has_value())) {
         return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
@@ -330,6 +504,20 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
         identity::core::ExternalIdentityRef{
             verified->outcome().provider(), verified->outcome().subject()},
         displayName, preferredUsername, pictureUrl));
+    if (authenticationHandoff) {
+        auto published = m_authentication->publishBrowserAuthenticationHandoff(
+            foundation::SecretString{*authenticationHandoff}, verified.value());
+        if (!published) return error(published.error(), request, true);
+        json::object payload;
+        payload["published"] = true;
+        payload["provider"] = verified->outcome().provider().value();
+        gateway::HttpResponse response{
+            200, gateway::Headers{{"content-type", "application/json"}},
+            json::serialize(payload)};
+        secure(response);
+        clearState(response);
+        return response;
+    }
     auto issued = m_sessions->issue(verified.value(), clientContext(request));
     if (!issued) return error(issued.error(), request, true);
     json::object payload;
