@@ -37,8 +37,30 @@ if(NOT DEFINED OPENPROOF_GCC_ROOT)
 endif()
 
 if(NOT DEFINED OPENPROOF_GCC_ROOT)
+    # Prefer an actually installed, version-qualified GCC across all conventional
+    # prefixes. Merely finding a bin/ directory is not sufficient: on Linux,
+    # /usr/local/bin commonly exists even when the qualified compiler lives in
+    # /usr/bin, and stopping at /usr/local would make discovery spuriously fail.
+    foreach(version 20 19 18 17 16)
+        foreach(candidate /opt/homebrew /usr/local /usr)
+            if(EXISTS "${candidate}/bin/g++-${version}"
+               AND EXISTS "${candidate}/bin/gcc-${version}")
+                set(OPENPROOF_GCC_ROOT "${candidate}")
+                break()
+            endif()
+        endforeach()
+        if(DEFINED OPENPROOF_GCC_ROOT)
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NOT DEFINED OPENPROOF_GCC_ROOT)
+    # Unsuffixed drivers are a final fallback for distributions or custom
+    # toolchains that expose only gcc/g++. OpenProofToolchainGuard still checks
+    # the observed compiler family/version and rejects unsupported compilers.
     foreach(candidate /opt/homebrew /usr/local /usr)
-        if(EXISTS "${candidate}/bin")
+        if(EXISTS "${candidate}/bin/g++" AND EXISTS "${candidate}/bin/gcc")
             set(OPENPROOF_GCC_ROOT "${candidate}")
             break()
         endif()

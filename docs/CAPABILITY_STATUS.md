@@ -89,10 +89,12 @@ from the 19 completed identity-platform capabilities above.
 
 ## Production qualification
 
-The repository continues to require its qualified **GCC 16.1 + Ninja** C++26
-modules toolchain. Promotion to production still requires the release gates in
+The repository continues to require its qualified **GCC 16 + Ninja** C++26
+modules toolchain. CI performs an independent clean GCC 16 build and CTest run
+on Ubuntu Linux in addition to the full macOS qualification job; Swift remains
+an Apple-platform-only SDK gate and is not a prerequisite for compiling the C++
+platform on Linux. Promotion to production still requires the release gates in
 `scripts/qualify-production.sh`: a clean qualified build, complete CTest run,
 PostgreSQL integration tests without skips, the opt-in coverage-guided
-GCC/ASan/UBSan boundary fuzzer,
-the repository TLS identity E2E, load/soak qualification and deployment
-key/backup exercises.
+GCC/ASan/UBSan boundary fuzzer, the repository TLS identity E2E, load/soak
+qualification and deployment key/backup exercises.

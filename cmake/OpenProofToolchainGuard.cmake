@@ -21,12 +21,13 @@ set(OPENPROOF_MINIMUM_GNU_VERSION "16.0")
 # BLD-012 forbids inferring support from version numbers alone, so anything
 # outside this list configures with an explicit "unverified" notice.
 #
-# GCC 16.1 is the qualified production toolchain for the current module graph.
-# Experimental C++26 Contracts and Reflection are deliberately disabled in the
-# production stability profile because their interaction with project-owned
-# modules has not completed qualification. See docs/03-CXX26.md.
+# GCC 16 is the qualified production compiler family for the current module
+# graph. Recorded combinations below have completed configure, clean build and
+# test on the named operating system. Experimental C++26 Contracts and Reflection
+# remain disabled in the production stability profile. See docs/03-CXX26.md.
 set(OPENPROOF_VERIFIED_TOOLCHAINS
     "GNU-16.1.0-Ninja-Darwin"
+    "GNU-16.2.0-Ninja-Linux"
 )
 
 # Renders the observed toolchain facts that every diagnostic must quote.

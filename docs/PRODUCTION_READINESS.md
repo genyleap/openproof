@@ -83,7 +83,11 @@ class:
 
 ## Toolchain note
 
-GCC 16.1/Darwin is the qualified modules toolchain for this project. Production
-builds explicitly disable the experimental Contracts front-end and Reflection;
-internal invariants use `foundation::requireInvariant`. Clean CMI/BMI state is
-mandatory for release qualification.
+The qualified modules compiler family is GCC 16. Recorded combinations include
+GCC 16.1 on Darwin and GCC 16.2 on x86_64 Linux; CI performs a clean Ubuntu
+GCC 16 build/CTest run in addition to the Darwin production-qualification job.
+The Swift SDK remains an Apple-platform-only gate and does not constrain the C++
+server build to macOS. Production builds explicitly disable the experimental
+Contracts front-end and Reflection; internal invariants use
+`foundation::requireInvariant`. Clean CMI/BMI state is mandatory for release
+qualification.
