@@ -185,6 +185,33 @@ TEST(FarcasterProviderTest, AcceptsLegacyPluralFidResourceDuringMigration)
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
 }
 
+TEST(FarcasterProviderTest, AcceptsCurrentSdkCompatibilityVariants)
+{
+    fnd::ManualClockSource clock{kNow};
+    auto chain = std::make_unique<FakeFarcasterChain>();
+    web3::FarcasterAuthenticationProvider provider{
+        configuration(), clock, std::move(chain)};
+    auto challenge = provider.beginAuthentication(request(true));
+    ASSERT_TRUE(challenge);
+    std::string message = parameter(*challenge, "message");
+
+    const auto statement = message.find("Farcaster Auth");
+    ASSERT_NE(statement, std::string::npos);
+    message.replace(statement, std::string_view{"Farcaster Auth"}.size(),
+                    "Farcaster Connect");
+
+    const auto resource = message.find("farcaster://fid/6841");
+    ASSERT_NE(resource, std::string::npos);
+    message.insert(resource + std::string_view{"farcaster://fid/6841"}.size(), "/");
+    message.append("\n- https://example.com/resource");
+
+    auto outcome = provider.completeAuthentication(
+        response(*challenge, std::move(message)));
+
+    ASSERT_TRUE(outcome);
+    EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
+}
+
 TEST(FarcasterProviderTest, AuthAddressIsAcceptedAndRecordedDistinctly)
 {
     fnd::ManualClockSource clock{kNow};

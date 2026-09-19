@@ -743,9 +743,11 @@ struct ParsedFarcasterSiwe final {
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
-    if (lines.size() != 13U
+    const bool acceptedStatement = lines.size() > 3U
+        && (lines[3] == kFarcasterStatement || lines[3] == "Farcaster Connect");
+    if (lines.size() < 13U
         || lines[0] != std::string{domain} + " wants you to sign in with your Ethereum account:"
-        || lines[2] != "" || lines[3] != kFarcasterStatement || lines[4] != ""
+        || lines[2] != "" || !acceptedStatement || lines[4] != ""
         || lines[5] != std::string{"URI: "} + std::string{uri}
         || lines[6] != "Version: 1" || lines[7] != "Chain ID: 10"
         || lines[11] != "Resources:") {
@@ -755,17 +757,24 @@ struct ParsedFarcasterSiwe final {
     auto address = normalizeAddress(lines[1]);
     constexpr std::string_view resourcePrefix{"- farcaster://fid/"};
     constexpr std::string_view legacyResourcePrefix{"- farcaster://fids/"};
-    const auto resource = lines[12];
-    const auto prefix = resource.starts_with(resourcePrefix)
-        ? resourcePrefix
-        : (resource.starts_with(legacyResourcePrefix) ? legacyResourcePrefix
-                                                      : std::string_view{});
-    if (!address || prefix.empty()) {
-        return foundation::fail(authenticationFailure("The SIWF signer or FID resource is invalid."));
+    std::optional<std::uint64_t> fid;
+    for (std::size_t index = 12U; index < lines.size(); ++index) {
+        const auto resource = lines[index];
+        const auto prefix = resource.starts_with(resourcePrefix)
+            ? resourcePrefix
+            : (resource.starts_with(legacyResourcePrefix) ? legacyResourcePrefix
+                                                          : std::string_view{});
+        if (prefix.empty()) continue;
+        std::string_view text = resource.substr(prefix.size());
+        if (text.ends_with('/')) text.remove_suffix(1U);
+        auto parsedFid = parseDecimal(text);
+        if (!parsedFid || parsedFid.value() == 0U || fid.has_value()) {
+            return foundation::fail(authenticationFailure("The SIWF Farcaster FID is invalid."));
+        }
+        fid = parsedFid.value();
     }
-    auto fid = parseDecimal(resource.substr(prefix.size()));
-    if (!fid || fid.value() == 0U) {
-        return foundation::fail(authenticationFailure("The SIWF Farcaster FID is invalid."));
+    if (!address || !fid.has_value()) {
+        return foundation::fail(authenticationFailure("The SIWF signer or FID resource is invalid."));
     }
     auto nonce = challengeNonce(derivationKey, challenge);
     auto timestamp = challengeTimestamp(challenge, "fcsiwf_");
@@ -788,7 +797,7 @@ struct ParsedFarcasterSiwe final {
         || *expiresAt <= *issuedAt || now >= challengeEnd) {
         return foundation::fail(authenticationFailure("The SIWF time window is invalid."));
     }
-    return ParsedFarcasterSiwe{std::move(*address), fid.value()};
+    return ParsedFarcasterSiwe{std::move(*address), *fid};
 }
 
 class RpcFarcasterChainVerifier final : public FarcasterChainVerifier {
