@@ -55,6 +55,8 @@ required_audience = "https://api.example.com"
 [account]
 enabled = true
 phone_provider_id = "phone"
+# For an external adapter use its private HTTPS endpoint. For the optional same-host
+# Postfix adapter in this directory use 127.0.0.1:18444 with delivery_tls = false.
 delivery_host = "notifications.internal.example"
 delivery_port = 443
 delivery_tls = true

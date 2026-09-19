@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenProof verification email delivery adapter
+After=network-online.target postfix.service
+Wants=network-online.target
+Requires=postfix.service
+
+[Service]
+Type=simple
+User=openproof
+Group=openproof
+EnvironmentFile=/etc/openproof/delivery.env
+Environment=PHP_CLI_SERVER_WORKERS=4
+ExecStart=/usr/bin/php -d expose_php=0 -S 127.0.0.1:18444 /opt/openproof/delivery/verification-delivery-postfix.php
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

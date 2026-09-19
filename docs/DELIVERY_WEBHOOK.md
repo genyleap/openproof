@@ -88,6 +88,38 @@ success. Never log the bearer credential or one-time secret, use a private
 network where possible, validate TLS with the configured CA, enforce request
 size/time limits, and redact provider error output.
 
+## Optional same-host Postfix adapter
+
+`deploy/verification-delivery-postfix.php` is a small reference adapter for operators
+that deliver transactional email through a Postfix MTA on the same host. It binds only
+on loopback through `deploy/openproof-delivery.service`, validates the OpenProof bearer,
+accepts only the email purposes, builds application action URLs, and submits mail to a
+loopback-only SMTP listener. The adapter uses SMTP rather than the local `sendmail`
+queue helper so the hardened unit can keep `NoNewPrivileges=true`.
+
+Configure the three public action URLs and sender in `/etc/openproof/delivery.env` from
+`deploy/openproof-delivery.env.example`. For this topology, OpenProof itself points
+`delivery_host` to `127.0.0.1`, `delivery_port` to `18444` and `delivery_tls` to `false`;
+the absence of TLS is acceptable only because the entire hop is same-host loopback.
+The adapter returns `204` only after Postfix replies that it accepted the message into
+its local queue. Final delivery to the recipient MX is asynchronous, so operators must
+monitor the Postfix queue and bounce stream rather than interpreting queue acceptance
+as proof that the recipient inbox accepted the message.
+
+Direct-to-MX delivery needs DNS hygiene before production traffic. The sending IP should
+have PTR/rDNS to the SMTP hostname and that hostname must resolve forward to the same
+address. Publish an SPF record authorizing the sending address, publish the DKIM public
+key for the selector used by the signer, and publish DMARC for the From domain. If the
+host has both address families, either provision valid PTR/forward DNS for IPv6 too or
+keep outbound SMTP on IPv4 until that work is complete. Test the exact public records
+from multiple recursive resolvers because negative DNS caching can make a newly added
+PTR appear inconsistently for several hours.
+
+A direct-sending MTA should identify itself with the same hostname used by PTR, sign
+mail after submission, accept submission only from trusted local callers, and never be
+an open relay. Keep the OpenProof delivery adapter private even when the MTA itself must
+reach public MX hosts over TCP/25.
+
 Delivery purposes currently include signup email, password reset, email change
 and phone verification. Password-reset deliveries must lead to
 `POST /account/password/reset`; they cannot be consumed by the signup-email
