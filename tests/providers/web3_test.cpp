@@ -212,6 +212,29 @@ TEST(FarcasterProviderTest, AcceptsCurrentSdkCompatibilityVariants)
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
 }
 
+TEST(FarcasterProviderTest, AcceptsOptionalSiweFieldsBeforeResources)
+{
+    fnd::ManualClockSource clock{kNow};
+    auto chain = std::make_unique<FakeFarcasterChain>();
+    web3::FarcasterAuthenticationProvider provider{
+        configuration(), clock, std::move(chain)};
+    auto challenge = provider.beginAuthentication(request(true));
+    ASSERT_TRUE(challenge);
+    std::string message = parameter(*challenge, "message");
+
+    const auto resources = message.find("\nResources:");
+    ASSERT_NE(resources, std::string::npos);
+    message.insert(resources,
+        "\nNot Before: 2025-01-15T12:00:00.000Z"
+        "\nRequest ID: openproof-test");
+
+    auto outcome = provider.completeAuthentication(
+        response(*challenge, std::move(message)));
+
+    ASSERT_TRUE(outcome);
+    EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
+}
+
 TEST(FarcasterProviderTest, AuthAddressIsAcceptedAndRecordedDistinctly)
 {
     fnd::ManualClockSource clock{kNow};

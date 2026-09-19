@@ -51,6 +51,40 @@ constexpr std::string_view kErc1271Magic{"0x1626ba7e"};
 constexpr std::uint64_t kOptimismMainnetChainId = 10U;
 constexpr std::uint64_t kFarcasterAuthAddressKeyType = 2U;
 
+constexpr std::string_view kUniversalSignatureValidatorByteCode{
+    "0x608060405234801561001057600080fd5b5060405161069438038061069483398101604081905261002f9161051e565b600061003c8484"
+    "84610048565b9050806000526001601ff35b60007f6492649264926492649264926492649264926492649264926492649264926492610074"
+    "8361040c565b036101e7576000606080848060200190518101906100929190610577565b60405192955090935091506000906001600160a0"
+    "1b038516906100b69085906105dd565b6000604051808303816000865af19150503d80600081146100f3576040519150601f19603f3d0116"
+    "82016040523d82523d6000602084013e6100f8565b606091505b50509050876001600160a01b03163b600003610160578061016057604051"
+    "62461bcd60e51b815260206004820152601e60248201527f5369676e617475726556616c696461746f723a206465706c6f796d656e740000"
+    "60448201526064015b60405180910390fd5b604051630b135d3f60e11b808252906001600160a01b038a1690631626ba7e90610190908b90"
+    "87906004016105f9565b602060405180830381865afa1580156101ad573d6000803e3d6000fd5b505050506040513d601f19601f82011682"
+    "0180604052508101906101d19190610633565b6001600160e01b03191614945050505050610405565b6001600160a01b0384163b1561027a"
+    "57604051630b135d3f60e11b808252906001600160a01b03861690631626ba7e9061022790879087906004016105f9565b60206040518083"
+    "0381865afa158015610244573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906102689190610633"
+    "565b6001600160e01b031916149050610405565b81516041146102df5760405162461bcd60e51b815260206004820152603a602482015260"
+    "008051602061067483398151915260448201527f3a20696e76616c6964207369676e6174757265206c656e67746800000000000060648201"
+    "52608401610157565b6102e7610425565b5060208201516040808401518451859392600091859190811061030c5761030c61065d565b0160"
+    "20015160f81c9050601b811480159061032b57508060ff16601c14155b1561038c5760405162461bcd60e51b815260206004820152603b60"
+    "2482015260008051602061067483398151915260448201527f3a20696e76616c6964207369676e617475726520762076616c756500000000"
+    "006064820152608401610157565b60408051600081526020810180835289905260ff83169181019190915260608101849052608081018390"
+    "526001600160a01b0389169060019060a0016020604051602081039080840390855afa1580156103ea573d6000803e3d6000fd5b50505060"
+    "2060405103516001600160a01b0316149450505050505b9392505050565b600060208251101561041d57600080fd5b508051015190565b60"
+    "405180606001604052806003906020820280368337509192915050565b6001600160a01b038116811461045857600080fd5b50565b634e48"
+    "7b7160e01b600052604160045260246000fd5b60005b8381101561048c578181015183820152602001610474565b50506000910152565b60"
+    "0082601f8301126104a657600080fd5b81516001600160401b038111156104bf576104bf61045b565b604051601f8201601f19908116603f"
+    "011681016001600160401b03811182821017156104ed576104ed61045b565b60405281815283820160200185101561050557600080fd5b61"
+    "0516826020830160208701610471565b949350505050565b60008060006060848603121561053357600080fd5b835161053e81610443565b"
+    "6020850151604086015191945092506001600160401b0381111561056157600080fd5b61056d86828701610495565b915050925092509256"
+    "5b60008060006060848603121561058c57600080fd5b835161059781610443565b60208501519093506001600160401b038111156105b357"
+    "600080fd5b6105bf86828701610495565b604086015190935090506001600160401b0381111561056157600080fd5b600082516105ef8184"
+    "60208701610471565b9190910192915050565b828152604060208201526000825180604084015261061e816060850160208701610471565b"
+    "601f01601f1916919091016060019392505050565b60006020828403121561064557600080fd5b81516001600160e01b0319811681146104"
+    "0557600080fd5b634e487b7160e01b600052603260045260246000fdfe5369676e617475726556616c696461746f72237265636f76657253"
+    "69676e6572"
+};
+
 struct HttpsUrl final {
     std::string host;
     std::string port{"443"};
@@ -419,11 +453,56 @@ struct RpcResponse final { json::value result; };
     return parsed == expected;
 }
 
+
+[[nodiscard]] foundation::Result<bool> universalSignatureValid(
+    std::string_view endpoint, std::string_view address,
+    std::span<const std::byte, 32> digest, std::string_view signature,
+    std::string_view caFile, const foundation::SecretString& authorization)
+{
+    auto signatureBytes = decodeHex(signature);
+    if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 8192U) {
+        return foundation::fail(authenticationFailure(
+            "The universal signature encoding is invalid."));
+    }
+    std::string data{kUniversalSignatureValidatorByteCode};
+    data.append(24U, '0');
+    data.append(address.substr(2U));
+    data.append(encodeHex(digest, false));
+    data.append(uint256Hex(96U));
+    data.append(uint256Hex(signatureBytes->size()));
+    data.append(encodeHex(*signatureBytes, false));
+    const std::size_t remainder = signatureBytes->size() % 32U;
+    if (remainder != 0U) data.append((32U - remainder) * 2U, '0');
+
+    json::object call;
+    call["data"] = std::move(data);
+    auto result = rpcString(endpoint, "eth_call",
+        json::array{std::move(call), "latest"}, caFile, authorization);
+    if (!result) return foundation::fail(result.error());
+    if (!result->starts_with("0x") || result->size() > 66U) {
+        return foundation::fail(foundation::ErrorCode::Unavailable,
+                                "The universal signature verifier returned malformed data.");
+    }
+    std::string_view value{*result};
+    value.remove_prefix(2U);
+    while (value.size() > 1U && value.front() == '0') value.remove_prefix(1U);
+    return value == "1";
+}
+
 [[nodiscard]] foundation::Result<bool> contractWalletValid(
     std::string_view endpoint, std::string_view address,
     std::span<const std::byte, 32> digest, std::string_view signature,
     std::string_view caFile, const foundation::SecretString& authorization)
 {
+    // Match the verifier used by Farcaster AuthKit/viem. The deployless
+    // ERC-6492 validator handles EOAs, deployed ERC-1271 wallets, and
+    // counterfactual smart accounts without persisting any deployment.
+    auto universal = universalSignatureValid(
+        endpoint, address, digest, signature, caFile, authorization);
+    if (universal) return universal.value();
+
+    // Preserve the previous direct paths as a compatibility fallback for RPC
+    // providers that do not permit contract-creation eth_call simulations.
     auto code = rpcString(endpoint, "eth_getCode", json::array{address, "latest"}, caFile, authorization);
     if (!code) return foundation::fail(code.error());
     const bool contract = *code != "0x" && *code != "0x0" && *code != "0x00";
@@ -749,16 +828,29 @@ struct ParsedFarcasterSiwe final {
         || lines[0] != std::string{domain} + " wants you to sign in with your Ethereum account:"
         || lines[2] != "" || !acceptedStatement || lines[4] != ""
         || lines[5] != std::string{"URI: "} + std::string{uri}
-        || lines[6] != "Version: 1" || lines[7] != "Chain ID: 10"
-        || lines[11] != "Resources:") {
+        || lines[6] != "Version: 1" || lines[7] != "Chain ID: 10") {
         return foundation::fail(authenticationFailure(
             "The SIWF message is not a Farcaster FIP-11 message for this relying party."));
+    }
+    std::optional<std::size_t> resourcesIndex;
+    for (std::size_t index = 10U; index < lines.size(); ++index) {
+        if (lines[index] == "Resources:") {
+            if (resourcesIndex.has_value()) {
+                return foundation::fail(authenticationFailure(
+                    "The SIWF message contains duplicate resource sections."));
+            }
+            resourcesIndex = index;
+        }
+    }
+    if (!resourcesIndex || *resourcesIndex + 1U >= lines.size()) {
+        return foundation::fail(authenticationFailure(
+            "The SIWF message is missing Farcaster resources."));
     }
     auto address = normalizeAddress(lines[1]);
     constexpr std::string_view resourcePrefix{"- farcaster://fid/"};
     constexpr std::string_view legacyResourcePrefix{"- farcaster://fids/"};
     std::optional<std::uint64_t> fid;
-    for (std::size_t index = 12U; index < lines.size(); ++index) {
+    for (std::size_t index = *resourcesIndex + 1U; index < lines.size(); ++index) {
         const auto resource = lines[index];
         const auto prefix = resource.starts_with(resourcePrefix)
             ? resourcePrefix
@@ -781,14 +873,36 @@ struct ParsedFarcasterSiwe final {
     constexpr std::string_view nonceLabel{"Nonce: "};
     constexpr std::string_view issuedLabel{"Issued At: "};
     constexpr std::string_view expirationLabel{"Expiration Time: "};
+    constexpr std::string_view notBeforeLabel{"Not Before: "};
+    constexpr std::string_view requestIdLabel{"Request ID: "};
     if (!nonce || !timestamp || !lines[8].starts_with(nonceLabel)
         || lines[8].substr(nonceLabel.size()) != nonce.value()
-        || !lines[9].starts_with(issuedLabel)
-        || !lines[10].starts_with(expirationLabel)) {
+        || !lines[9].starts_with(issuedLabel)) {
         return foundation::fail(authenticationFailure("The SIWF challenge binding is invalid."));
     }
+    std::optional<std::string_view> expirationText;
+    for (std::size_t index = 10U; index < *resourcesIndex; ++index) {
+        if (lines[index].starts_with(expirationLabel)) {
+            if (expirationText.has_value()) {
+                return foundation::fail(authenticationFailure(
+                    "The SIWF message contains duplicate expiration fields."));
+            }
+            expirationText = lines[index].substr(expirationLabel.size());
+            continue;
+        }
+        if (lines[index].starts_with(notBeforeLabel)
+            || lines[index].starts_with(requestIdLabel)) {
+            continue;
+        }
+        return foundation::fail(authenticationFailure(
+            "The SIWF message contains an unsupported optional field."));
+    }
+    if (!expirationText.has_value()) {
+        return foundation::fail(authenticationFailure(
+            "The SIWF message is missing its expiration time."));
+    }
     const auto issuedAt = parseSiweInstant(lines[9].substr(issuedLabel.size()));
-    const auto expiresAt = parseSiweInstant(lines[10].substr(expirationLabel.size()));
+    const auto expiresAt = parseSiweInstant(*expirationText);
     const foundation::Instant challengeStart{foundation::Duration{timestamp.value()}};
     const foundation::Instant challengeEnd = challengeStart + lifetime;
     constexpr auto clockSkew = std::chrono::minutes{1};
