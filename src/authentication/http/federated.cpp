@@ -296,13 +296,15 @@ main{width:min(560px,100%);padding:34px;border:1px solid #e2e7ef;border-radius:2
 .mark{width:64px;height:64px;margin:0 auto 18px;border-radius:20px;display:grid;place-items:center;background:#e8f8f1;color:#0e7654;font-size:30px;font-weight:800}
 h1{margin:0 0 10px;font-size:25px}p{margin:0;color:#667085;line-height:1.9}.en{margin-top:18px;padding-top:18px;border-top:1px solid #e2e7ef;direction:ltr}
 .brand{margin-top:24px;color:#6957e8;font-weight:800;font-size:13px;letter-spacing:.4px}</style></head>
-<body><main><div class="mark">✓</div><h1>حساب با موفقیت متصل شد</h1><p>این provider به همان هویت OpenProof شما اضافه شد. می‌توانید این پنجره را ببندید و فهرست Connections را تازه کنید.</p><p class="en">The provider was added to your existing OpenProof identity. You can close this window and refresh Connections.</p><div class="brand">OPENPROOF / CANONICAL IDENTITY</div></main></body></html>)html";
+<body><main><div class="mark">✓</div><h1>حساب با موفقیت متصل شد</h1><p>این provider به همان هویت OpenProof شما اضافه شد. این پنجره خودکار بسته می‌شود.</p><p class="en">The provider was added to your existing OpenProof identity. This window will close automatically.</p><div class="brand">OPENPROOF / CANONICAL IDENTITY</div></main><script>
+(()=>{const message={type:"openproof:connection-complete"};try{const channel=new BroadcastChannel("openproof-account");channel.postMessage(message);channel.close()}catch{}try{if(window.opener&&!window.opener.closed)window.opener.postMessage(message,window.location.origin)}catch{}setTimeout(()=>{window.close();setTimeout(()=>window.location.replace("/account"),250)},120)})();
+</script></body></html>)html";
     gateway::HttpResponse response{200,
         gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
         std::string{body}};
     secure(response);
     response.setHeader("content-security-policy",
-        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-SNR1meg6e1waiiSYLeVEctBS0UexBT71ggT1pwXTMYU='; base-uri 'none'; frame-ancestors 'none'");
     return response;
 }
 
