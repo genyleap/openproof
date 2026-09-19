@@ -130,7 +130,7 @@ paths:
     post:
       tags: [Account]
       operationId: beginEmailChange
-      description: Starts verified email replacement for the authenticated identity.
+      description: Starts verified email addition or replacement for the authenticated identity.
       security: [{sessionCookie: []}, {bearerAuth: []}]
       requestBody:
         required: true
@@ -145,10 +145,25 @@ paths:
       tags: [Account]
       operationId: completeEmailChange
       security: [{sessionCookie: []}, {bearerAuth: []}]
-      requestBody: {$ref: "#/components/requestBodies/VerificationProof"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [verification_id, secret]
+              properties:
+                verification_id: {type: string, maxLength: 200}
+                secret: {type: string, maxLength: 512}
+                password:
+                  type: string
+                  format: password
+                  maxLength: 1024
+                  description: Optional. When the identity has no local sign-in method, verifies the email and enables email/password sign-in in the same ceremony.
       responses:
         "200":
-          description: Email replaced; returns the updated profile.
+          description: Email verified/updated; returns the updated profile.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Profile"}

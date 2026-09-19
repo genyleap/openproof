@@ -3628,7 +3628,8 @@ namespace openproof::storage::postgres {
 
     foundation::Result<account::VerificationChallenge> PostgresAccountRepository::consume(
         const account::VerificationId& id, const account::VerificationDigest& presented,
-        foundation::Instant now, std::uint32_t maximumAttempts)
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity)
     {
         if (maximumAttempts == 0U) {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -3658,6 +3659,12 @@ namespace openproof::storage::postgres {
             rollback(connection);
             return foundation::fail(authenticationFailure(
                 "Verification challenge is unknown or consumed."));
+        }
+        if (expectedIdentity != nullptr
+            && field(row.get(), 0, 0) != expectedIdentity->value()) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure(
+                "Verification challenge does not belong to the authenticated identity."));
         }
 
         auto purpose = parseInteger<unsigned int>(field(row.get(), 0, 1));

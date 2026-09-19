@@ -442,7 +442,8 @@ public:
     [[nodiscard]] foundation::Status replace(account::VerificationChallenge challenge) override;
     [[nodiscard]] foundation::Result<account::VerificationChallenge> consume(
         const account::VerificationId& id, const account::VerificationDigest& presented,
-        foundation::Instant now, std::uint32_t maximumAttempts) override;
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity = nullptr) override;
     [[nodiscard]] foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& identity,

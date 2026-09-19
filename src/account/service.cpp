@@ -206,12 +206,14 @@ foundation::Result<VerificationDispatch> AccountService::issue(
 
 foundation::Result<VerificationChallenge> AccountService::consume(
     const VerificationId& id, const foundation::SecretString& secret,
-    VerificationPurpose purpose)
+    VerificationPurpose purpose,
+    const identity::core::IdentityId* expectedIdentity)
 {
     auto fingerprint = digest(id, secret);
     if (!fingerprint.has_value()) return foundation::fail(fingerprint.error());
     auto challenge = m_repository->consume(
-        id, fingerprint.value(), m_clock->now(), m_policy.maximumAttempts());
+        id, fingerprint.value(), m_clock->now(), m_policy.maximumAttempts(),
+        expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     if (challenge->purpose() != purpose) {
         return foundation::fail(genericVerificationFailure(
@@ -383,8 +385,6 @@ foundation::Status AccountService::beginEmailChange(
     if (!normalized.has_value()) return foundation::fail(normalized.error());
     auto profile = requireProfile(identity);
     if (!profile.has_value()) return foundation::fail(profile.error());
-    if (profile->email().has_value() && profile->emailVerified()
-        && *profile->email() == normalized.value()) return foundation::ok();
     const identity::core::ExternalIdentityRef external{
         m_localProvider, identity::provider::ExternalSubject{normalized.value()}};
     auto owner = m_externalIdentities->ownerOf(external);
@@ -400,53 +400,169 @@ foundation::Status AccountService::beginEmailChange(
     auto dispatch = issue(identity, VerificationPurpose::ChangeEmail,
                           VerificationChannel::Email, normalized.value(),
                           m_policy.emailVerificationLifetime());
-    if (!dispatch.has_value()) return foundation::fail(dispatch.error());
-    return m_delivery->deliver(dispatch.value());
+    if (!dispatch.has_value()) {
+        static_cast<void>(m_repository->releaseSubject(external, identity));
+        return foundation::fail(dispatch.error());
+    }
+    auto delivered = m_delivery->deliver(dispatch.value());
+    if (!delivered.has_value()) {
+        static_cast<void>(m_repository->releaseSubject(external, identity));
+        return delivered;
+    }
+    return foundation::ok();
 }
 
 foundation::Status AccountService::completeEmailChange(
     const identity::core::IdentityId& expectedIdentity,
-    const VerificationId& id, const foundation::SecretString& secret)
+    const VerificationId& id, const foundation::SecretString& secret,
+    const foundation::SecretString* newPassword)
 {
-    auto challenge = consume(id, secret, VerificationPurpose::ChangeEmail);
+    if (newPassword != nullptr
+        && (newPassword->expose().size() < 8U || newPassword->expose().size() > 1024U)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The password length is outside the accepted range.");
+    }
+    auto challenge = consume(
+        id, secret, VerificationPurpose::ChangeEmail, &expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
-    if (challenge->identity() != expectedIdentity) {
-        return foundation::fail(genericVerificationFailure(
-            "Verification challenge does not belong to the authenticated identity."));
-    }
-    auto profile = requireProfile(challenge->identity());
-    if (!profile.has_value() || !profile->email().has_value() || !profile->emailVerified()) {
-        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                "A verified current email is required.");
-    }
-    const std::string previous = *profile->email();
+
     const std::string replacement{challenge->destination()};
-    const identity::core::ExternalIdentityRef oldExternal{
-        m_localProvider, identity::provider::ExternalSubject{previous}};
     const identity::core::ExternalIdentityRef newExternal{
         m_localProvider, identity::provider::ExternalSubject{replacement}};
+    const auto releaseReservation = [&]() {
+        static_cast<void>(m_repository->releaseSubject(
+            newExternal, challenge->identity()));
+    };
+    auto reservedOwner = m_repository->reservedOwner(newExternal, m_clock->now());
+    if (!reservedOwner.has_value()) {
+        return foundation::fail(reservedOwner.error());
+    }
+    if (!reservedOwner->has_value()
+        || reservedOwner->value() != challenge->identity()) {
+        return foundation::fail(genericVerificationFailure(
+            "Email subject reservation is absent or belongs to another identity."));
+    }
 
+    auto profile = requireProfile(challenge->identity());
+    if (!profile.has_value()) {
+        releaseReservation();
+        return foundation::fail(profile.error());
+    }
+
+    auto connections = m_externalIdentities->externalIdentitiesOf(challenge->identity());
+    if (!connections.has_value()) {
+        releaseReservation();
+        return foundation::fail(connections.error());
+    }
+    const auto local = std::ranges::find_if(connections.value(), [&](const auto& external) {
+        return external.providerId() == m_localProvider;
+    });
+
+    if (local == connections->end()) {
+        if (newPassword != nullptr) {
+            auto enrolled = m_localAccounts->enrollPending(
+                challenge->identity(), identity::provider::ExternalSubject{replacement},
+                *newPassword, std::nullopt);
+            if (!enrolled.has_value()) {
+                releaseReservation();
+                return enrolled;
+            }
+
+            auto attached = attachVerified(challenge->identity(), newExternal);
+            if (!attached.has_value()) {
+                static_cast<void>(m_localAccounts->removePending(
+                    challenge->identity(), identity::provider::ExternalSubject{replacement}));
+                releaseReservation();
+                return attached;
+            }
+
+            auto set = profile->setEmail(replacement, true, m_clock->now());
+            if (!set.has_value()) {
+                static_cast<void>(m_externalIdentities->detach(
+                    newExternal, challenge->identity()));
+                static_cast<void>(m_localAccounts->removePending(
+                    challenge->identity(), identity::provider::ExternalSubject{replacement}));
+                releaseReservation();
+                return set;
+            }
+            auto saved = m_profiles->save(profile.value());
+            if (!saved.has_value()) {
+                static_cast<void>(m_externalIdentities->detach(
+                    newExternal, challenge->identity()));
+                static_cast<void>(m_localAccounts->removePending(
+                    challenge->identity(), identity::provider::ExternalSubject{replacement}));
+                releaseReservation();
+                return saved;
+            }
+            return m_repository->releaseSubject(newExternal, challenge->identity());
+        }
+
+        auto set = profile->setEmail(replacement, true, m_clock->now());
+        if (!set.has_value()) {
+            releaseReservation();
+            return set;
+        }
+        auto saved = m_profiles->save(profile.value());
+        if (!saved.has_value()) {
+            releaseReservation();
+            return saved;
+        }
+        return m_repository->releaseSubject(newExternal, challenge->identity());
+    }
+
+    const std::string previous{local->subject().value()};
+    if (previous == replacement) {
+        auto set = profile->setEmail(replacement, true, m_clock->now());
+        if (!set.has_value()) {
+            releaseReservation();
+            return set;
+        }
+        auto saved = m_profiles->save(profile.value());
+        if (!saved.has_value()) {
+            releaseReservation();
+            return saved;
+        }
+        return m_repository->releaseSubject(newExternal, challenge->identity());
+    }
+
+    const identity::core::ExternalIdentityRef oldExternal{
+        m_localProvider, identity::provider::ExternalSubject{previous}};
     auto attached = attachVerified(challenge->identity(), newExternal);
-    if (!attached.has_value()) return attached;
+    if (!attached.has_value()) {
+        releaseReservation();
+        return attached;
+    }
     auto rebound = m_localAccounts->rebindSubject(
         challenge->identity(), identity::provider::ExternalSubject{previous},
         identity::provider::ExternalSubject{replacement});
     if (!rebound.has_value()) {
         static_cast<void>(m_externalIdentities->detach(newExternal, challenge->identity()));
+        releaseReservation();
         return rebound;
     }
     auto set = profile->setEmail(replacement, true, m_clock->now());
-    if (!set.has_value()) return set;
+    if (!set.has_value()) {
+        static_cast<void>(m_localAccounts->rebindSubject(
+            challenge->identity(), identity::provider::ExternalSubject{replacement},
+            identity::provider::ExternalSubject{previous}));
+        static_cast<void>(m_externalIdentities->detach(newExternal, challenge->identity()));
+        releaseReservation();
+        return set;
+    }
     auto saved = m_profiles->save(profile.value());
     if (!saved.has_value()) {
         static_cast<void>(m_localAccounts->rebindSubject(
             challenge->identity(), identity::provider::ExternalSubject{replacement},
             identity::provider::ExternalSubject{previous}));
         static_cast<void>(m_externalIdentities->detach(newExternal, challenge->identity()));
+        releaseReservation();
         return saved;
     }
     auto detached = m_externalIdentities->detach(oldExternal, challenge->identity());
-    if (!detached.has_value()) return detached;
+    if (!detached.has_value()) {
+        releaseReservation();
+        return detached;
+    }
     return m_repository->releaseSubject(newExternal, challenge->identity());
 }
 

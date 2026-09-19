@@ -102,7 +102,8 @@ public:
 
     [[nodiscard]] foundation::Status completeEmailChange(
         const identity::core::IdentityId& expectedIdentity,
-        const VerificationId& id, const foundation::SecretString& secret);
+        const VerificationId& id, const foundation::SecretString& secret,
+        const foundation::SecretString* newPassword = nullptr);
 
     [[nodiscard]] foundation::Status beginPhoneVerification(
         const identity::core::IdentityId& identity, std::string phoneNumber);
@@ -137,7 +138,8 @@ private:
         std::string destination, foundation::Duration lifetime);
     [[nodiscard]] foundation::Result<VerificationChallenge> consume(
         const VerificationId& id, const foundation::SecretString& secret,
-        VerificationPurpose purpose);
+        VerificationPurpose purpose,
+        const identity::core::IdentityId* expectedIdentity = nullptr);
     [[nodiscard]] foundation::Result<VerificationDigest> digest(
         const VerificationId& id, const foundation::SecretString& secret) const;
     [[nodiscard]] foundation::Result<identity::profile::IdentityProfile>

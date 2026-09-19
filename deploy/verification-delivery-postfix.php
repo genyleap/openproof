@@ -120,8 +120,15 @@ if (!isset($targets[$purpose])) {
 
 $urlVariable = $targets[$purpose];
 $actionUrl = configuredUrl($urlVariable);
+$queryParams = [
+    'id' => $payload['verification_id'],
+    'secret' => $payload['secret'],
+];
+if ($purpose === 'change_email') {
+    $queryParams['identity'] = $payload['identity_id'];
+}
 $query = http_build_query(
-    ['id' => $payload['verification_id'], 'secret' => $payload['secret']],
+    $queryParams,
     '',
     '&',
     PHP_QUERY_RFC3986

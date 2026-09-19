@@ -98,12 +98,16 @@ loopback-only SMTP listener. The adapter uses SMTP rather than the local `sendma
 queue helper so the hardened unit can keep `NoNewPrivileges=true`.
 
 Configure the three public action URLs and sender in `/etc/openproof/delivery.env` from
-`deploy/openproof-delivery.env.example`. For this topology, OpenProof itself points
-`delivery_host` to `127.0.0.1`, `delivery_port` to `18444` and `delivery_tls` to `false`;
-the absence of TLS is acceptable only because the entire hop is same-host loopback.
-The adapter returns `204` only after Postfix replies that it accepted the message into
-its local queue. Final delivery to the recipient MX is asynchronous, so operators must
-monitor the Postfix queue and bounce stream rather than interpreting queue acceptance
+`deploy/openproof-delivery.env.example`. Change-email links produced by the reference
+adapter also carry the server-issued `identity_id` as an `identity` query parameter so
+the product UI can detect a different signed-in identity before submitting the proof;
+OpenProof independently enforces the expected identity when consuming that challenge.
+For this topology, OpenProof itself points `delivery_host` to `127.0.0.1`,
+`delivery_port` to `18444` and `delivery_tls` to `false`; the absence of TLS is
+acceptable only because the entire hop is same-host loopback. The adapter returns `204`
+only after Postfix replies that it accepted the message into its local queue. Final
+delivery to the recipient MX is asynchronous, so operators must monitor the Postfix
+queue and bounce stream rather than interpreting queue acceptance
 as proof that the recipient inbox accepted the message.
 
 Direct-to-MX delivery needs DNS hygiene before production traffic. The sending IP should

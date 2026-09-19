@@ -28,7 +28,8 @@ public:
      */
     [[nodiscard]] virtual foundation::Result<VerificationChallenge> consume(
         const VerificationId& id, const VerificationDigest& presented,
-        foundation::Instant now, std::uint32_t maximumAttempts) = 0;
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity = nullptr) = 0;
 
     /** Reserves an unverified provider subject so two pending accounts cannot claim it. */
     [[nodiscard]] virtual foundation::Status reserveSubject(
@@ -56,7 +57,8 @@ public:
     [[nodiscard]] foundation::Status replace(VerificationChallenge challenge) override;
     [[nodiscard]] foundation::Result<VerificationChallenge> consume(
         const VerificationId& id, const VerificationDigest& presented,
-        foundation::Instant now, std::uint32_t maximumAttempts) override;
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity = nullptr) override;
     [[nodiscard]] foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& identity,

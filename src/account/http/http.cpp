@@ -287,12 +287,22 @@ gateway::HttpResponse AccountHttpApi::beginEmailChange(gateway::HttpRequest requ
 gateway::HttpResponse AccountHttpApi::completeEmailChange(gateway::HttpRequest request)
 {
     auto actor = authorize(request); if (!actor) return error(actor.error(), request);
-    auto body = objectBody(request); if (!body || !onlyFields(body.value(), {"verification_id", "secret"})) return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
-    auto id = requiredString(body.value(), "verification_id", 200U); auto secret = requiredString(body.value(), "secret", 512U);
-    if (!id || !secret) return error(id ? secret.error() : id.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"verification_id", "secret", "password"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
+    }
+    auto id = requiredString(body.value(), "verification_id", 200U);
+    auto secret = requiredString(body.value(), "secret", 512U);
+    auto password = optionalString(body.value(), "password", 1024U);
+    if (!id || !secret || !password) {
+        return error(!id ? id.error() : (!secret ? secret.error() : password.error()), request);
+    }
     foundation::SecretString proof{std::move(secret).value()};
+    std::optional<foundation::SecretString> newPassword;
+    if (password->has_value()) newPassword.emplace(std::move(password).value().value());
     auto status = m_accounts->completeEmailChange(
-        actor.value(), VerificationId{std::move(id).value()}, proof);
+        actor.value(), VerificationId{std::move(id).value()}, proof,
+        newPassword.has_value() ? &newPassword.value() : nullptr);
     if (!status) return error(status.error(), request);
     auto profile = m_accounts->profile(actor.value());
     return profile ? jsonResponse(200, profileJson(profile.value())) : error(profile.error(), request);
