@@ -2,6 +2,7 @@ module;
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cctype>
 #include <chrono>
@@ -26,7 +27,6 @@ module;
 #include <boost/json.hpp>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
-#include <openssl/evp.h>
 #include <openssl/obj_mac.h>
 #include <openssl/ssl.h>
 
@@ -198,26 +198,138 @@ struct HttpsUrl final {
     return output;
 }
 
+[[nodiscard]] constexpr std::uint64_t rotateLeft64(
+    std::uint64_t value, unsigned int shift) noexcept
+{
+    return shift == 0U ? value : std::rotl(value, static_cast<int>(shift));
+}
+
+void keccakF1600(std::array<std::uint64_t, 25>& state) noexcept
+{
+    constexpr std::array<std::uint64_t, 24> roundConstants{
+        0x0000000000000001ULL, 0x0000000000008082ULL,
+        0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL,
+        0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL,
+        0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL,
+        0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL,
+        0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL,
+        0x0000000080000001ULL, 0x8000000080008008ULL};
+    constexpr std::array<unsigned int, 25> rotation{
+         0U,  1U, 62U, 28U, 27U,
+        36U, 44U,  6U, 55U, 20U,
+         3U, 10U, 43U, 25U, 39U,
+        41U, 45U, 15U, 21U,  8U,
+        18U,  2U, 61U, 56U, 14U};
+
+    for (const std::uint64_t roundConstant : roundConstants) {
+        std::array<std::uint64_t, 5> columns{};
+        for (std::size_t x = 0U; x < 5U; ++x) {
+            columns[x] = state[x] ^ state[x + 5U] ^ state[x + 10U]
+                ^ state[x + 15U] ^ state[x + 20U];
+        }
+        std::array<std::uint64_t, 5> delta{};
+        for (std::size_t x = 0U; x < 5U; ++x) {
+            delta[x] = columns[(x + 4U) % 5U]
+                ^ rotateLeft64(columns[(x + 1U) % 5U], 1U);
+        }
+        for (std::size_t y = 0U; y < 5U; ++y) {
+            for (std::size_t x = 0U; x < 5U; ++x) {
+                state[x + 5U * y] ^= delta[x];
+            }
+        }
+
+        std::array<std::uint64_t, 25> permuted{};
+        for (std::size_t y = 0U; y < 5U; ++y) {
+            for (std::size_t x = 0U; x < 5U; ++x) {
+                const std::size_t targetX = y;
+                const std::size_t targetY = (2U * x + 3U * y) % 5U;
+                permuted[targetX + 5U * targetY]
+                    = rotateLeft64(state[x + 5U * y], rotation[x + 5U * y]);
+            }
+        }
+
+        for (std::size_t y = 0U; y < 5U; ++y) {
+            for (std::size_t x = 0U; x < 5U; ++x) {
+                state[x + 5U * y] = permuted[x + 5U * y]
+                    ^ ((~permuted[(x + 1U) % 5U + 5U * y])
+                        & permuted[(x + 2U) % 5U + 5U * y]);
+            }
+        }
+        state[0] ^= roundConstant;
+    }
+}
+
+[[nodiscard]] constexpr std::uint64_t loadLittleEndian64(
+    std::span<const std::byte, 8> input) noexcept
+{
+    std::uint64_t value{};
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        value |= static_cast<std::uint64_t>(
+            std::to_integer<unsigned int>(input[index])) << (index * 8U);
+    }
+    return value;
+}
+
+[[nodiscard]] std::array<std::byte, 32> keccak256Raw(
+    std::span<const std::byte> input)
+{
+    constexpr std::size_t rateBytes = 136U;
+    std::array<std::uint64_t, 25> state{};
+
+    auto absorb = [&state](std::span<const std::byte, rateBytes> block) {
+        for (std::size_t lane = 0U; lane < rateBytes / 8U; ++lane) {
+            const auto laneBytes = block.subspan(lane * 8U, 8U);
+            std::array<std::byte, 8> copy{};
+            std::ranges::copy(laneBytes, copy.begin());
+            state[lane] ^= loadLittleEndian64(copy);
+        }
+        keccakF1600(state);
+    };
+
+    while (input.size() >= rateBytes) {
+        std::array<std::byte, rateBytes> block{};
+        std::ranges::copy(input.first(rateBytes), block.begin());
+        absorb(block);
+        input = input.subspan(rateBytes);
+    }
+
+    std::array<std::byte, rateBytes> finalBlock{};
+    std::ranges::copy(input, finalBlock.begin());
+    finalBlock[input.size()] ^= std::byte{0x01};
+    finalBlock.back() ^= std::byte{0x80};
+    absorb(finalBlock);
+
+    std::array<std::byte, 32> digest{};
+    for (std::size_t index = 0U; index < digest.size(); ++index) {
+        digest[index] = static_cast<std::byte>(
+            (state[index / 8U] >> ((index % 8U) * 8U)) & 0xffU);
+    }
+    return digest;
+}
+
 [[nodiscard]] foundation::Result<std::array<std::byte, 32>> keccak256(
     std::span<const std::byte> input)
 {
-    std::array<std::byte, 32> digest{};
-    EVP_MD* algorithm = EVP_MD_fetch(nullptr, "KECCAK-256", nullptr);
-    if (algorithm == nullptr) {
+    static const bool selfTestPassed = [] {
+        const auto empty = keccak256Raw({});
+        constexpr std::string_view hello{"hello"};
+        const auto helloDigest = keccak256Raw(
+            std::as_bytes(std::span{hello.data(), hello.size()}));
+        return encodeHex(empty, false)
+                == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+            && encodeHex(helloDigest, false)
+                == "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8";
+    }();
+    if (!selfTestPassed) {
         return foundation::fail(foundation::ErrorCode::Internal,
-                                "OpenSSL does not provide KECCAK-256.");
+                                "The built-in Keccak-256 self-test failed.");
     }
-    EVP_MD_CTX* context = EVP_MD_CTX_new();
-    unsigned int length = 0U;
-    const bool ok = context != nullptr
-        && EVP_DigestInit_ex(context, algorithm, nullptr) == 1
-        && EVP_DigestUpdate(context, input.data(), input.size()) == 1
-        && EVP_DigestFinal_ex(context, reinterpret_cast<unsigned char*>(digest.data()), &length) == 1
-        && length == digest.size();
-    EVP_MD_CTX_free(context);
-    EVP_MD_free(algorithm);
-    if (!ok) return foundation::fail(foundation::ErrorCode::Internal);
-    return digest;
+    return keccak256Raw(input);
 }
 
 [[nodiscard]] foundation::Result<std::array<std::byte, 32>> keccak256(std::string_view input)
