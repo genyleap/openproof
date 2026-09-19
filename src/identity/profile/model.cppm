@@ -36,7 +36,8 @@ public:
             std::optional<std::string> phoneNumber, bool phoneNumberVerified,
             std::optional<std::string> locale,
             std::optional<std::string> pictureUrl,
-            foundation::Instant createdAt, foundation::Instant updatedAt);
+            foundation::Instant createdAt, foundation::Instant updatedAt,
+            std::string avatarSource = "auto");
 
     [[nodiscard]] const core::IdentityId& identity() const noexcept;
     [[nodiscard]] const std::optional<std::string>& displayName() const noexcept;
@@ -47,6 +48,7 @@ public:
     [[nodiscard]] bool phoneNumberVerified() const noexcept;
     [[nodiscard]] const std::optional<std::string>& locale() const noexcept;
     [[nodiscard]] const std::optional<std::string>& pictureUrl() const noexcept;
+    [[nodiscard]] std::string_view avatarSource() const noexcept;
     [[nodiscard]] foundation::Instant createdAt() const noexcept;
     [[nodiscard]] foundation::Instant updatedAt() const noexcept;
 
@@ -71,6 +73,10 @@ public:
         std::optional<std::string> pictureUrl,
         foundation::Instant now);
 
+    /** @brief Chooses which attached profile supplies the public account avatar. */
+    [[nodiscard]] foundation::Status setAvatarSource(
+        std::string avatarSource, foundation::Instant now);
+
     /** @brief Records an email claim; verified must come from a completed ceremony. */
     [[nodiscard]] foundation::Status setEmail(
         std::string email, bool verified, foundation::Instant now);
@@ -91,6 +97,7 @@ private:
     bool m_phoneNumberVerified{};
     std::optional<std::string> m_locale;
     std::optional<std::string> m_pictureUrl;
+    std::string m_avatarSource{"auto"};
     foundation::Instant m_createdAt{};
     foundation::Instant m_updatedAt{};
 };

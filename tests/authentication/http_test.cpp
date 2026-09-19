@@ -87,6 +87,37 @@ public:
     }
 };
 
+class ChallengeProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override
+    {
+        return idp::ProviderId{"challenge"};
+    }
+
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
+    {
+        return idp::InteractionModel::ChallengeResponse;
+    }
+
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
+    {
+        return idp::AssuranceLevel::Ial1;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override
+    {
+        return idp::AuthenticationChallenge{
+            idp::ChallengeId{"challenge-id"}, kNow + std::chrono::minutes{5}};
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse&) override
+    {
+        return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+    }
+};
+
 [[nodiscard]] gw::HttpRequest request(
     std::string path, std::string body = {}, std::string cookie = {})
 {
@@ -300,6 +331,45 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
     const auto rejected = fixture.api->handle(std::move(ambiguous).value());
     EXPECT_EQ(rejected.status(), 401);
     EXPECT_TRUE(setCookies(rejected).empty());
+}
+
+TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndChallengeProviders)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<RedirectProvider>()));
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<ChallengeProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"redirect"}, idp::AssuranceLevel::Ial1));
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"challenge"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto discovered = api.handle(getRequest("/auth/providers"));
+    ASSERT_EQ(discovered.status(), 200);
+    const auto body = json::parse(discovered.body()).as_object();
+    const auto& redirects = body.at("providers").as_array();
+    const auto& challenges = body.at("challenge_providers").as_array();
+    ASSERT_EQ(redirects.size(), 1U);
+    ASSERT_EQ(challenges.size(), 1U);
+    EXPECT_EQ(redirects.front().as_string(), "redirect");
+    EXPECT_EQ(challenges.front().as_string(), "challenge");
 }
 
 TEST(FederatedAuthenticationHttpApiTest, CallbackSessionSurvivesCrossSiteOAuthRedirect)

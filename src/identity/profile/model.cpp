@@ -37,6 +37,7 @@ IdentityProfile::IdentityProfile(const IdentityProfile& other)
     , m_phoneNumberVerified(other.m_phoneNumberVerified)
     , m_locale(other.m_locale)
     , m_pictureUrl(other.m_pictureUrl)
+    , m_avatarSource(other.m_avatarSource)
     , m_createdAt(other.m_createdAt)
     , m_updatedAt(other.m_updatedAt)
 {
@@ -51,6 +52,7 @@ IdentityProfile::IdentityProfile(IdentityProfile&& other)
     , m_phoneNumberVerified(other.m_phoneNumberVerified)
     , m_locale(std::move(other.m_locale))
     , m_pictureUrl(std::move(other.m_pictureUrl))
+    , m_avatarSource(std::move(other.m_avatarSource))
     , m_createdAt(other.m_createdAt)
     , m_updatedAt(other.m_updatedAt)
 {
@@ -67,6 +69,7 @@ IdentityProfile& IdentityProfile::operator=(const IdentityProfile& other)
         m_phoneNumberVerified = other.m_phoneNumberVerified;
         m_locale = other.m_locale;
         m_pictureUrl = other.m_pictureUrl;
+        m_avatarSource = other.m_avatarSource;
         m_createdAt = other.m_createdAt;
         m_updatedAt = other.m_updatedAt;
     }
@@ -84,6 +87,7 @@ IdentityProfile& IdentityProfile::operator=(IdentityProfile&& other)
         m_phoneNumberVerified = other.m_phoneNumberVerified;
         m_locale = std::move(other.m_locale);
         m_pictureUrl = std::move(other.m_pictureUrl);
+        m_avatarSource = std::move(other.m_avatarSource);
         m_createdAt = other.m_createdAt;
         m_updatedAt = other.m_updatedAt;
     }
@@ -113,11 +117,16 @@ foundation::Result<IdentityProfile> IdentityProfile::restore(
     bool emailVerified, std::optional<std::string> phoneNumber,
     bool phoneNumberVerified, std::optional<std::string> locale,
     std::optional<std::string> pictureUrl, foundation::Instant createdAt,
-    foundation::Instant updatedAt)
+    foundation::Instant updatedAt, std::string avatarSource)
 {
     if (!validText(displayName, 256U) || !validText(preferredUsername, 128U)
         || !validText(email, 320U) || !validText(phoneNumber, 32U)
         || !validText(locale, 64U) || !validText(pictureUrl, 2048U)
+        || avatarSource.empty() || avatarSource.size() > 128U
+        || std::ranges::any_of(avatarSource, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte < 0x20U || byte == 0x7FU;
+           })
         || updatedAt < createdAt || (emailVerified && !email.has_value())
         || (phoneNumberVerified && !phoneNumber.has_value())) {
         return foundation::fail(foundation::ErrorCode::Internal,
@@ -133,6 +142,7 @@ foundation::Result<IdentityProfile> IdentityProfile::restore(
     profile->m_phoneNumberVerified = phoneNumberVerified;
     profile->m_locale = std::move(locale);
     profile->m_pictureUrl = std::move(pictureUrl);
+    profile->m_avatarSource = std::move(avatarSource);
     profile->m_updatedAt = updatedAt;
     return profile;
 }
@@ -151,6 +161,7 @@ bool IdentityProfile::phoneNumberVerified() const noexcept
 const std::optional<std::string>& IdentityProfile::locale() const noexcept { return m_locale; }
 const std::optional<std::string>& IdentityProfile::pictureUrl() const noexcept
 { return m_pictureUrl; }
+std::string_view IdentityProfile::avatarSource() const noexcept { return m_avatarSource; }
 foundation::Instant IdentityProfile::createdAt() const noexcept { return m_createdAt; }
 foundation::Instant IdentityProfile::updatedAt() const noexcept { return m_updatedAt; }
 
@@ -217,8 +228,8 @@ foundation::Status IdentityProfile::refreshPresentationClaims(
             changed = true;
         }
     }
-    if (const auto value = claims.get(provider::ClaimName::PictureUrl); value) {
-        if (!m_pictureUrl || *m_pictureUrl != *value) {
+    if (!m_pictureUrl) {
+        if (const auto value = claims.get(provider::ClaimName::PictureUrl); value) {
             m_pictureUrl = std::string{*value};
             changed = true;
         }
@@ -252,6 +263,22 @@ foundation::Status IdentityProfile::updateSelfService(
     m_preferredUsername = std::move(preferredUsername);
     m_locale = std::move(locale);
     m_pictureUrl = std::move(pictureUrl);
+    m_updatedAt = now;
+    return foundation::ok();
+}
+
+foundation::Status IdentityProfile::setAvatarSource(
+    std::string avatarSource, foundation::Instant now)
+{
+    if (now < m_updatedAt || avatarSource.empty() || avatarSource.size() > 128U
+        || std::ranges::any_of(avatarSource, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte < 0x20U || byte == 0x7FU;
+           })) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Avatar source is invalid.");
+    }
+    m_avatarSource = std::move(avatarSource);
     m_updatedAt = now;
     return foundation::ok();
 }

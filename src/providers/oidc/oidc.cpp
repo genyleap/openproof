@@ -632,7 +632,9 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     const auto locale = stringValue(payload.value(), "locale");
     if (locale && safeText(*locale, 64U)) claims.set(idp::ClaimName::Locale, *locale);
     const auto picture = stringValue(payload.value(), "picture");
-    if (picture && picture->size() <= 2048U) claims.set(idp::ClaimName::PictureUrl, *picture);
+    if (picture && picture->size() <= 2048U && picture->starts_with("https://")) {
+        claims.set(idp::ClaimName::PictureUrl, *picture);
+    }
 
     idp::ProviderEvidence evidence;
     evidence.add("issuer", *issuer);

@@ -656,14 +656,21 @@ paths:
       operationId: listFederatedProviders
       responses:
         "200":
-          description: Enabled redirect-based identity providers.
+          description: Enabled redirect-based and challenge-response identity providers.
           content:
             application/json:
               schema:
                 type: object
-                required: [providers]
+                required: [providers, challenge_providers]
                 properties:
-                  providers: {type: array, items: {type: string}}
+                  providers:
+                    type: array
+                    description: Redirect-based providers usable with /auth/federated/start.
+                    items: {type: string}
+                  challenge_providers:
+                    type: array
+                    description: Challenge-response providers exposed by this deployment.
+                    items: {type: string}
   /auth/federated/start:
     get:
       tags: [Federation]

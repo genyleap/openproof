@@ -127,6 +127,7 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
     body["phone_number_verified"] = profile.phoneNumberVerified();
     if (profile.locale()) body["locale"] = *profile.locale();
     if (profile.pictureUrl()) body["picture"] = *profile.pictureUrl();
+    body["avatar_source"] = profile.avatarSource();
     return body;
 }
 
@@ -348,15 +349,16 @@ gateway::HttpResponse AccountHttpApi::updateProfile(gateway::HttpRequest request
 {
     auto actor = authorize(request); if (!actor) return error(actor.error(), request);
     auto body = objectBody(request);
-    if (!body || !onlyFields(body.value(), {"display_name", "preferred_username", "locale", "picture"})) return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
+    if (!body || !onlyFields(body.value(), {"display_name", "preferred_username", "locale", "picture", "avatar_source"})) return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
     auto display = optionalProfileString(body.value(), "display_name", 256U);
     auto username = optionalProfileString(body.value(), "preferred_username", 128U);
     auto locale = optionalProfileString(body.value(), "locale", 64U);
     auto picture = optionalProfileString(body.value(), "picture", 2048U);
-    if (!display || !username || !locale || !picture) return error(!display ? display.error() : (!username ? username.error() : (!locale ? locale.error() : picture.error())), request);
+    auto avatarSource = optionalProfileString(body.value(), "avatar_source", 128U);
+    if (!display || !username || !locale || !picture || !avatarSource) return error(!display ? display.error() : (!username ? username.error() : (!locale ? locale.error() : (!picture ? picture.error() : avatarSource.error()))), request);
     auto status = m_accounts->updateProfile(actor.value(), std::move(display).value(),
                                             std::move(username).value(), std::move(locale).value(),
-                                            std::move(picture).value());
+                                            std::move(picture).value(), std::move(avatarSource).value());
     if (!status) return error(status.error(), request);
     auto profile = m_accounts->profile(actor.value());
     return profile ? jsonResponse(200, profileJson(profile.value())) : error(profile.error(), request);
@@ -432,6 +434,9 @@ gateway::HttpResponse AccountHttpApi::connections(gateway::HttpRequest request)
         json::object item{
             {"provider", external.providerId().value()},
             {"subject", external.subject().value()}};
+        if (external.displayName()) item["display_name"] = *external.displayName();
+        if (external.preferredUsername()) item["preferred_username"] = *external.preferredUsername();
+        if (external.pictureUrl()) item["picture_url"] = *external.pictureUrl();
         if (external.providerId().value() == "farcaster") {
             const std::string fid{external.subject().value()};
             const bool numeric = !fid.empty()

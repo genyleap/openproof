@@ -117,7 +117,9 @@ Success sets the secure OpenProof session cookie. Supported session operations:
 | Generate recovery codes | `POST /auth/recovery-codes` | IAL2 required; codes returned once |
 
 For Google, Apple, Microsoft, GitHub, SAML and other configured providers, query
-`GET /auth/providers`, then navigate the browser to:
+`GET /auth/providers`. The `providers` array contains redirect-based providers and
+`challenge_providers` reports enabled challenge-response providers such as passkeys,
+Farcaster or Ethereum wallet authentication. For a redirect provider, navigate the browser to:
 
 ```text
 /auth/federated/start?provider=google&return_to=%2Foauth%2Fauthorize%3F...

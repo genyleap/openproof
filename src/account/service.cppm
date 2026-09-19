@@ -123,7 +123,8 @@ public:
         std::optional<std::string> displayName,
         std::optional<std::string> preferredUsername,
         std::optional<std::string> locale,
-        std::optional<std::string> pictureUrl);
+        std::optional<std::string> pictureUrl,
+        std::optional<std::string> avatarSource = std::nullopt);
 
     /** Returns the current self-service identity profile. */
     [[nodiscard]] foundation::Result<identity::profile::IdentityProfile> profile(

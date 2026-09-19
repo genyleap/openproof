@@ -8,6 +8,7 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 module openproof.authentication;
 
@@ -51,6 +52,25 @@ parseAssurance(std::string_view value) noexcept
         }
     }
     return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string> presentationClaim(
+    const provider::VerifiedClaims& claims, provider::ClaimName name,
+    std::size_t maximum)
+{
+    const auto value = claims.get(name);
+    if (!value || value->empty() || value->size() > maximum) return std::nullopt;
+    return std::string{*value};
+}
+
+[[nodiscard]] identity::core::ExternalIdentityRef externalFromOutcome(
+    const provider::AuthenticationOutcome& outcome)
+{
+    return identity::core::ExternalIdentityRef{
+        outcome.provider(), outcome.subject(),
+        presentationClaim(outcome.claims(), provider::ClaimName::DisplayName, 256U),
+        presentationClaim(outcome.claims(), provider::ClaimName::PreferredUsername, 128U),
+        presentationClaim(outcome.claims(), provider::ClaimName::PictureUrl, 2048U)};
 }
 
 }
@@ -454,7 +474,7 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     if (!exchange) return foundation::fail(exchange.error());
     auto outcome = std::move(exchange->outcome);
     const auto completedAt = exchange->completedAt;
-    const identity::core::ExternalIdentityRef external{outcome.provider(), outcome.subject()};
+    const auto external = externalFromOutcome(outcome);
     foundation::Result<std::optional<identity::core::IdentityId>> owner =
         m_identities.ownerOf(external);
     if (!owner.has_value()) {
@@ -508,6 +528,8 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     }
     auto active = requireActiveIdentity(identity);
     if (!active) return foundation::fail(active.error());
+    auto presentationSaved = m_identities.updatePresentation(external);
+    if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(identity);
         if (!stored) return foundation::fail(stored.error());
@@ -542,8 +564,7 @@ AuthenticationService::completeConnection(
     const auto& target = *exchange->connectionTarget;
     auto active = requireActiveIdentity(target);
     if (!active) return foundation::fail(active.error());
-    const identity::core::ExternalIdentityRef external{
-        exchange->outcome.provider(), exchange->outcome.subject()};
+    const auto external = externalFromOutcome(exchange->outcome);
     const std::lock_guard guard{m_connectionMutex};
     auto owner = m_identities.ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
@@ -556,6 +577,8 @@ AuthenticationService::completeConnection(
         auto attached = attachVerified(target, external, exchange->completedAt);
         if (!attached) return foundation::fail(attached.error());
     }
+    auto presentationSaved = m_identities.updatePresentation(external);
+    if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(target);
         if (!stored) return foundation::fail(stored.error());
@@ -578,6 +601,24 @@ AuthenticationService::completeConnection(
         }
     }
     return external;
+}
+
+foundation::Status AuthenticationService::updateConnectionPresentation(
+    const identity::core::ExternalIdentityRef& external,
+    std::optional<std::string> displayName,
+    std::optional<std::string> preferredUsername,
+    std::optional<std::string> pictureUrl)
+{
+    const std::lock_guard guard{m_connectionMutex};
+    auto owner = m_identities.ownerOf(external);
+    if (!owner) return foundation::fail(owner.error());
+    if (!owner->has_value()) {
+        return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That connected account was not found.");
+    }
+    return m_identities.updatePresentation(identity::core::ExternalIdentityRef{
+        external.providerId(), external.subject(), std::move(displayName),
+        std::move(preferredUsername), std::move(pictureUrl)});
 }
 
 foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
@@ -607,8 +648,23 @@ foundation::Status AuthenticationService::disconnect(
                                 "Only authentication connections can be disconnected here.");
     }
     const std::lock_guard guard{m_connectionMutex};
-    return m_identities.detachIfAnotherAuthenticationMethod(
+    auto detached = m_identities.detachIfAnotherAuthenticationMethod(
         external, identity, m_providers.ids());
+    if (!detached) return detached;
+
+    if (m_profileRepository != nullptr) {
+        auto stored = m_profileRepository->find(identity);
+        if (!stored) return foundation::fail(stored.error());
+        if (stored->has_value()
+            && stored->value().avatarSource() == external.providerId().value()) {
+            auto profile = stored->value();
+            auto reset = profile.setAvatarSource("auto", m_clock.now());
+            if (!reset) return reset;
+            auto saved = m_profileRepository->save(profile);
+            if (!saved) return saved;
+        }
+    }
+    return foundation::ok();
 }
 
 foundation::Result<BrowserConnectionHandoff>

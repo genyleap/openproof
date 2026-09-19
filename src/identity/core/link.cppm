@@ -27,17 +27,28 @@ export namespace openproof::identity::core {
  */
 class ExternalIdentityRef final {
 public:
-    ExternalIdentityRef(provider::ProviderId providerId, provider::ExternalSubject subject);
+    ExternalIdentityRef(provider::ProviderId providerId, provider::ExternalSubject subject,
+                        std::optional<std::string> displayName = std::nullopt,
+                        std::optional<std::string> preferredUsername = std::nullopt,
+                        std::optional<std::string> pictureUrl = std::nullopt);
 
     [[nodiscard]] const provider::ProviderId& providerId() const noexcept;
     [[nodiscard]] const provider::ExternalSubject& subject() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& displayName() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& preferredUsername() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& pictureUrl() const noexcept;
 
-    [[nodiscard]] friend bool operator==(const ExternalIdentityRef& left, const ExternalIdentityRef& right) = default;
-    [[nodiscard]] friend std::strong_ordering operator<=>(const ExternalIdentityRef& left, const ExternalIdentityRef& right) = default;
+    friend bool operator==(const ExternalIdentityRef& left,
+                           const ExternalIdentityRef& right) noexcept;
+    friend std::strong_ordering operator<=>(const ExternalIdentityRef& left,
+                                             const ExternalIdentityRef& right) noexcept;
 
 private:
     provider::ProviderId m_providerId;
     provider::ExternalSubject m_subject;
+    std::optional<std::string> m_displayName;
+    std::optional<std::string> m_preferredUsername;
+    std::optional<std::string> m_pictureUrl;
 };
 
 /**
@@ -212,6 +223,10 @@ public:
                                                       const IdentityId& expectedCurrentOwner,
                                                       const IdentityId& newOwner) = 0;
 
+    /** @brief Refreshes non-security presentation metadata for a verified external identity. */
+    [[nodiscard]] virtual foundation::Status
+    updatePresentation(const ExternalIdentityRef& external) = 0;
+
     /** @brief Returns every external identity owned by @p owner, in stable order. */
     [[nodiscard]] virtual foundation::Result<std::vector<ExternalIdentityRef>>
     externalIdentitiesOf(const IdentityId& owner) const = 0;
@@ -245,6 +260,9 @@ public:
                                               const IdentityId& expectedCurrentOwner,
                                               const IdentityId& newOwner) override;
 
+    [[nodiscard]] foundation::Status
+    updatePresentation(const ExternalIdentityRef& external) override;
+
     [[nodiscard]] foundation::Result<std::vector<ExternalIdentityRef>>
     externalIdentitiesOf(const IdentityId& owner) const override;
 
@@ -253,6 +271,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     std::map<ExternalIdentityRef, IdentityId> m_owners;
+    std::map<ExternalIdentityRef, ExternalIdentityRef> m_presentations;
 };
 
 }

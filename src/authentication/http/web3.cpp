@@ -279,12 +279,17 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
     auto body = parseObject(request);
-    if (!body || !onlyFields(body.value(), {"message", "signature"})) {
+    if (!body || !onlyFields(body.value(), {"message", "signature", "display_name",
+                                                  "preferred_username", "picture_url"})) {
         return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
                      request, true);
     }
     auto message = stringField(body.value(), "message", 8192U);
     auto signature = stringField(body.value(), "signature", 8192U);
+    auto displayName = stringField(body.value(), "display_name", 256U);
+    auto preferredUsername = stringField(body.value(), "preferred_username", 128U);
+    auto pictureUrl = stringField(body.value(), "picture_url", 2048U);
+    if (pictureUrl && !pictureUrl->starts_with("https://")) pictureUrl.reset();
     const auto continuation = cookieValue(request, kContinuationCookie, 256U);
     const auto bindingToken = cookieValue(request, kBindingCookie, 256U);
     const auto transaction = cookieValue(request, kTransactionCookie, 256U);
@@ -304,6 +309,8 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
             idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
             binding.value(), authenticationResponse);
         if (!connected) return error(connected.error(), request, true);
+        static_cast<void>(m_authentication->updateConnectionPresentation(
+            connected.value(), displayName, preferredUsername, pictureUrl));
         json::object payload;
         payload["connected"] = true;
         payload["provider"] = connected->providerId().value();
@@ -319,6 +326,10 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
         idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
         binding.value(), authenticationResponse);
     if (!verified) return error(verified.error(), request, true);
+    static_cast<void>(m_authentication->updateConnectionPresentation(
+        identity::core::ExternalIdentityRef{
+            verified->outcome().provider(), verified->outcome().subject()},
+        displayName, preferredUsername, pictureUrl));
     auto issued = m_sessions->issue(verified.value(), clientContext(request));
     if (!issued) return error(issued.error(), request, true);
     json::object payload;

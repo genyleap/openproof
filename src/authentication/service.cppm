@@ -200,6 +200,18 @@ public:
                        const provider::BindingDigest& binding,
                        const provider::AuthenticationResponse& response);
 
+    /**
+     * @brief Refreshes display-only metadata for an already verified connection.
+     *
+     * These values never participate in authentication, identity ownership or
+     * authorization decisions.
+     */
+    [[nodiscard]] foundation::Status updateConnectionPresentation(
+        const identity::core::ExternalIdentityRef& external,
+        std::optional<std::string> displayName,
+        std::optional<std::string> preferredUsername,
+        std::optional<std::string> pictureUrl);
+
     /** @brief Lists the authentication-capable external accounts attached to an identity. */
     [[nodiscard]] foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
     connections(const identity::core::IdentityId& identity) const;
