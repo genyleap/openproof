@@ -270,15 +270,20 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::handle(gateway::HttpReques
 
 gateway::HttpResponse FederatedAuthenticationHttpApi::providers()
 {
-    json::array values;
+    json::array redirectProviders;
+    json::array challengeProviders;
     for (const auto& providerId : m_providers->ids()) {
         auto* provider = m_providers->find(providerId);
-        if (provider != nullptr && provider->interactionModel() == idp::InteractionModel::Redirect) {
-            values.emplace_back(providerId.value());
+        if (provider == nullptr) continue;
+        if (provider->interactionModel() == idp::InteractionModel::Redirect) {
+            redirectProviders.emplace_back(providerId.value());
+        } else if (provider->interactionModel() == idp::InteractionModel::ChallengeResponse) {
+            challengeProviders.emplace_back(providerId.value());
         }
     }
     json::object body;
-    body["providers"] = std::move(values);
+    body["providers"] = std::move(redirectProviders);
+    body["challenge_providers"] = std::move(challengeProviders);
     gateway::HttpResponse response{200, gateway::Headers{{"content-type", "application/json"}},
                                    json::serialize(body)};
     secure(response);
