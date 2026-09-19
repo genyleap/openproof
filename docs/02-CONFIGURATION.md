@@ -662,6 +662,11 @@ additional CA bundle.
 Web3 authentication is classified as a possession factor but is not promoted to
 WebAuthn-style phishing resistance.
 
+WalletConnect/Reown is an optional client-side transport, not an OpenProof server
+credential or verification dependency. For the recommended hybrid browser setup,
+Project ID/domain allowlisting, EIP-6963 discovery and the WalletConnect-to-SIWE flow,
+see [WALLETCONNECT.md](WALLETCONNECT.md).
+
 ### LDAP and SAML federation
 
 LDAP is enabled by `OPENPROOF_LDAP_URI` and requires

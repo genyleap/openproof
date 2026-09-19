@@ -218,7 +218,10 @@ Configuration reference: [docs/02-CONFIGURATION.md](docs/02-CONFIGURATION.md).
 
 Product integration examples for registration, login/MFA, OAuth/OIDC, UserInfo,
 password recovery, profiles, passkeys, service identities, evidence and SCIM are
-in [docs/API_GUIDE.md](docs/API_GUIDE.md); the machine-readable core contract is
+in [docs/API_GUIDE.md](docs/API_GUIDE.md). The recommended hybrid EVM wallet
+integration—EIP-6963 for injected wallets, WalletConnect v2 for remote/mobile wallets,
+and OpenProof's native handoff as a compatibility fallback—is documented in
+[docs/WALLETCONNECT.md](docs/WALLETCONNECT.md). The machine-readable core contract is
 [docs/openapi.yaml](docs/openapi.yaml). Deployment probes, backup/restore and
 incident procedures are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
@@ -280,6 +283,7 @@ docs/
   01-ARCHITECTURE.md       layering, provider SPI, security properties
   02-CONFIGURATION.md      configuration reference
   03-CXX26.md              measured C++26 feature baseline
+  WALLETCONNECT.md         hybrid EVM wallet / WalletConnect integration guide
   SECURITY_INVARIANTS.md   invariants with enforcement, proof and failure mode
   THREAT_MODEL.md          assets, trust boundaries, threats and residual risks
 ```

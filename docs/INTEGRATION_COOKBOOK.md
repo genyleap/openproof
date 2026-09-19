@@ -374,17 +374,25 @@ not embed a confidential client secret.
 
 ## Web3 / SIWE login
 
-OpenProof supports Ethereum SIWE and Farcaster SIWF ceremonies when the operator
-configures their EVM RPC adapters. For Ethereum, request the message first and
-sign that exact message. Never submit a private key or seed phrase.
+OpenProof supports Ethereum SIWE and Farcaster SIWF ceremonies. EOA wallet login
+requires no EVM RPC; chain-specific RPC adapters are needed only for smart-account
+verification. For Ethereum, request the message first and sign that exact message.
+Never submit a private key or seed phrase.
+
+For browser products, the recommended wallet UX is hybrid: discover injected wallets
+with EIP-6963, use WalletConnect v2 for remote/mobile wallets and QR pairing, and keep
+the native OpenProof handoff as a compatibility fallback. The complete setup and
+reference implementation are in [WALLETCONNECT.md](WALLETCONNECT.md).
 
 ```javascript
 const address = await signer.getAddress();
+const network = await signer.provider.getNetwork();
+const chainId = network.chainId.toString();
 const start = await fetch(`${issuer}/auth/web3/start`, {
   method: "POST",
   credentials: "include",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ provider: "ethereum-wallet", address })
+  body: JSON.stringify({ provider: "ethereum-wallet", address, chain_id: chainId })
 }).then(response => response.json());
 
 const signature = await signer.signMessage(start.message);
