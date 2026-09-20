@@ -46,9 +46,11 @@ accountDirectory()
 }
 
 [[nodiscard]] idp::AuthenticationResponse responseFor(
-    const idp::ChallengeId& challenge, std::string password)
+    const idp::ChallengeId& challenge, std::string password,
+    std::string subject = "alice")
 {
     idp::AuthenticationResponse response{challenge, idp::ClientContext{}};
+    response.setParameter("subject", idp::CredentialValue{std::move(subject)});
     response.setParameter("password", idp::CredentialValue{std::move(password)});
     return response;
 }
@@ -245,7 +247,7 @@ TEST(LocalProviderTest, RecoveryCodeIsRejectedWhenTotpIsDisabled)
     EXPECT_EQ(remaining.value(), 1U);
 }
 
-TEST(LocalProviderTest, FailedAttemptBurnsChallengeAndDoesNotRevealAccountExistence)
+TEST(LocalProviderTest, WrongPasswordDoesNotRevealAccountExistence)
 {
     auto directory = accountDirectory();
     ASSERT_TRUE(directory);
@@ -260,20 +262,36 @@ TEST(LocalProviderTest, FailedAttemptBurnsChallengeAndDoesNotRevealAccountExiste
     ASSERT_TRUE(existingChallenge);
     ASSERT_TRUE(unknownChallenge);
     auto wrong = provider.completeAuthentication(
-        responseFor(existingChallenge->id(), "wrong-password"));
+        responseFor(existingChallenge->id(), "wrong-password", "alice"));
     auto unknown = provider.completeAuthentication(
-        responseFor(unknownChallenge->id(), "wrong-password"));
+        responseFor(unknownChallenge->id(), "wrong-password", "nobody"));
     ASSERT_FALSE(wrong);
     ASSERT_FALSE(unknown);
     EXPECT_EQ(wrong.error(), unknown.error());
-
-    auto replay = provider.completeAuthentication(
-        responseFor(existingChallenge->id(), "correct-password"));
-    ASSERT_FALSE(replay);
-    EXPECT_EQ(replay.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
-TEST(LocalProviderTest, ExpiryIsInclusive)
+TEST(LocalProviderTest, CompletionCanRunOnAnotherProviderInstance)
+{
+    auto directory = accountDirectory();
+    ASSERT_TRUE(directory);
+    ASSERT_TRUE(directory.value()->enroll(
+        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"}, std::nullopt));
+    fnd::ManualClockSource clock{kNow};
+    local::LocalAuthenticationProvider first{
+        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2}};
+    local::LocalAuthenticationProvider second{
+        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2}};
+
+    auto challenge = first.beginAuthentication(requestFor("alice"));
+    ASSERT_TRUE(challenge);
+    auto outcome = second.completeAuthentication(
+        responseFor(challenge->id(), "correct-password", "alice"));
+
+    ASSERT_TRUE(outcome);
+    EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"alice"});
+}
+
+TEST(LocalProviderTest, CompletionRequiresBoundSubject)
 {
     auto directory = accountDirectory();
     ASSERT_TRUE(directory);
@@ -284,37 +302,13 @@ TEST(LocalProviderTest, ExpiryIsInclusive)
         idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2}};
     auto challenge = provider.beginAuthentication(requestFor("alice"));
     ASSERT_TRUE(challenge);
-    clock.advance(std::chrono::minutes{2});
-    auto result = provider.completeAuthentication(
-        responseFor(challenge->id(), "correct-password"));
-    EXPECT_FALSE(result);
-}
+    idp::AuthenticationResponse response{challenge->id(), idp::ClientContext{}};
+    response.setParameter("password", idp::CredentialValue{"correct-password"});
 
-TEST(LocalProviderTest, ConcurrentCompletionHasExactlyOneWinner)
-{
-    auto directory = accountDirectory();
-    ASSERT_TRUE(directory);
-    ASSERT_TRUE(directory.value()->enroll(
-        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"}, std::nullopt));
-    fnd::ManualClockSource clock{kNow};
-    local::LocalAuthenticationProvider provider{
-        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2}};
-    auto challenge = provider.beginAuthentication(requestFor("alice"));
-    ASSERT_TRUE(challenge);
+    auto outcome = provider.completeAuthentication(response);
 
-    bool first = false;
-    bool second = false;
-    std::thread left{[&] {
-        first = provider.completeAuthentication(
-            responseFor(challenge->id(), "correct-password")).has_value();
-    }};
-    std::thread right{[&] {
-        second = provider.completeAuthentication(
-            responseFor(challenge->id(), "correct-password")).has_value();
-    }};
-    left.join();
-    right.join();
-    EXPECT_NE(first, second);
+    ASSERT_FALSE(outcome);
+    EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
 }

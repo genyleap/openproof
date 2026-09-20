@@ -380,15 +380,6 @@ LocalAuthenticationProvider::beginAuthentication(const idp::AuthenticationReques
     }
     idp::ChallengeId challengeId{std::move(identifier).value()};
     const foundation::Instant expiresAt = m_clock->now() + m_challengeLifetime;
-    {
-        const std::lock_guard<std::mutex> guard{m_mutex};
-        const auto inserted = m_pending.emplace(
-            challengeId, Pending{subject, expiresAt});
-        if (!inserted.second) {
-            return foundation::fail(foundation::ErrorCode::AlreadyExists,
-                                    "The authentication challenge could not be created.");
-        }
-    }
     idp::AuthenticationChallenge challenge{challengeId, expiresAt};
     challenge.setParameter("method", "password_totp");
     return challenge;
@@ -398,20 +389,15 @@ foundation::Result<idp::AuthenticationOutcome>
 LocalAuthenticationProvider::completeAuthentication(
     const idp::AuthenticationResponse& response)
 {
-    std::optional<Pending> pending;
-    {
-        const std::lock_guard<std::mutex> guard{m_mutex};
-        const auto found = m_pending.find(response.challengeId());
-        if (found == m_pending.end()) {
-            return foundation::fail(authenticationFailure("Local challenge is unknown."));
-        }
-        pending = std::move(found->second);
-        m_pending.erase(found);
+    const auto subjectValue = parameter(response.parameters(), "subject");
+    if (!subjectValue.has_value()) {
+        return foundation::fail(authenticationFailure("Local subject is missing."));
+    }
+    idp::ExternalSubject subject{std::string{subjectValue.value()}};
+    if (!LocalAccountDirectory::isValidSubject(subject)) {
+        return foundation::fail(authenticationFailure("Local subject is invalid."));
     }
     const foundation::Instant now = m_clock->now();
-    if (now >= pending->expiresAt) {
-        return foundation::fail(authenticationFailure("Local challenge expired."));
-    }
     const auto passwordValue = parameter(response.parameters(), "password");
     if (!passwordValue.has_value()) {
         return foundation::fail(authenticationFailure("Local password is missing."));
@@ -430,18 +416,18 @@ LocalAuthenticationProvider::completeAuthentication(
             return foundation::fail(authenticationFailure(
                 "Recovery-code authentication is not configured."));
         }
-        auto totpEnabled = m_accounts->hasTotp(pending->subject);
+        auto totpEnabled = m_accounts->hasTotp(subject);
         if (!totpEnabled.has_value() || !totpEnabled.value()) {
             return foundation::fail(authenticationFailure(
                 "Recovery code did not verify."));
         }
-        auto knowledgeVerified = m_accounts->verifyPassword(pending->subject, password);
+        auto knowledgeVerified = m_accounts->verifyPassword(subject, password);
         if (!knowledgeVerified.has_value()) {
             return foundation::fail(authenticationFailure(
                 std::string{"Local credential verification failed: "}
                 + std::string{knowledgeVerified.error().internalDetail()}));
         }
-        const identity::core::ExternalIdentityRef external{m_id, pending->subject};
+        const identity::core::ExternalIdentityRef external{m_id, subject};
         auto owner = m_identities->ownerOf(external);
         if (!owner.has_value() || !owner->has_value()) {
             return foundation::fail(authenticationFailure(
@@ -456,7 +442,7 @@ LocalAuthenticationProvider::completeAuthentication(
         verified = LocalVerification::PasswordAndRecoveryCode;
     } else {
         auto credentialVerified = m_accounts->verify(
-            pending->subject, password, totpValue, now);
+            subject, password, totpValue, now);
         if (!credentialVerified.has_value()) {
             return foundation::fail(authenticationFailure(
                 std::string{"Local credential verification failed: "}
@@ -478,7 +464,7 @@ LocalAuthenticationProvider::completeAuthentication(
         ? idp::AuthenticationFactor::Knowledge | idp::AuthenticationFactor::Possession
         : idp::AuthenticationFactor::Knowledge;
     return idp::AuthenticationOutcome::create(
-        m_id, std::move(pending->subject), std::move(claims),
+        m_id, std::move(subject), std::move(claims),
         multiFactor ? idp::AssuranceLevel::Ial2 : idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{factors, false}, std::move(evidence), now);
 }

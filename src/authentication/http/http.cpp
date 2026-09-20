@@ -6,6 +6,7 @@ module;
 #include <cstdint>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,6 +25,7 @@ namespace idp = identity::provider;
 constexpr std::size_t kMaximumAuthBody = 16U * 1024U;
 constexpr std::string_view kPreauthCookie = "__Host-openproof-preauth";
 constexpr std::string_view kBindingCookie = "__Host-openproof-preauth-binding";
+constexpr std::string_view kSubjectCookie = "__Host-openproof-preauth-subject";
 
 [[nodiscard]] gateway::HttpResponse response(int status, json::object body)
 {
@@ -54,10 +56,45 @@ constexpr std::string_view kBindingCookie = "__Host-openproof-preauth-binding";
         + "; Secure; HttpOnly; SameSite=Strict";
 }
 
+[[nodiscard]] foundation::Result<idp::BindingDigest> preauthBinding(
+    std::string_view bindingToken, std::string_view subject)
+{
+    if (bindingToken.empty() || subject.empty() || subject.size() > 320U) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    }
+    std::string material;
+    material.reserve(bindingToken.size() + 1U + subject.size());
+    material.append(bindingToken);
+    material.push_back('\0');
+    material.append(subject);
+    return security::sha256(material);
+}
+
+[[nodiscard]] foundation::Result<std::string> decodePreauthSubject(
+    std::string_view encoded)
+{
+    if (encoded.empty() || encoded.size() > 512U) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    }
+    auto decoded = foundation::fromBase64Url(encoded);
+    if (!decoded.has_value() || decoded->empty() || decoded->size() > 320U) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    }
+    std::string subject{reinterpret_cast<const char*>(decoded->data()), decoded->size()};
+    if (std::ranges::any_of(subject, [](char symbol) {
+            const auto byte = static_cast<unsigned char>(symbol);
+            return byte < 0x20U || byte == 0x7FU;
+        })) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    }
+    return subject;
+}
+
 void clearPreauth(gateway::HttpResponse& output)
 {
     output.addHeader("set-cookie", cookie(kPreauthCookie, "", "/", 0));
     output.addHeader("set-cookie", cookie(kBindingCookie, "", "/", 0));
+    output.addHeader("set-cookie", cookie(kSubjectCookie, "", "/", 0));
 }
 
 void setSessionCookie(gateway::HttpResponse& output,
@@ -248,10 +285,13 @@ gateway::HttpResponse AuthenticationHttpApi::login(gateway::HttpRequest request)
     }
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken.has_value()) return error(bindingToken.error(), request);
-    auto binding = security::sha256(bindingToken.value());
+    const std::string subjectValue = subject.value();
+    auto binding = preauthBinding(bindingToken.value(), subjectValue);
     if (!binding.has_value()) return error(binding.error(), request);
+    const std::string encodedSubject = foundation::toBase64Url(
+        std::as_bytes(std::span{subjectValue.data(), subjectValue.size()}));
     idp::AuthenticationRequest authenticationRequest{m_provider, clientContext(request)};
-    authenticationRequest.setParameter("subject", std::move(subject).value());
+    authenticationRequest.setParameter("subject", subjectValue);
     authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
     auto started = m_authentication->begin(
         authenticationRequest, binding.value(), request.correlation());
@@ -266,6 +306,8 @@ gateway::HttpResponse AuthenticationHttpApi::login(gateway::HttpRequest request)
         kPreauthCookie, started->continuationToken().expose(), "/", 300));
     output.addHeader("set-cookie", cookie(
         kBindingCookie, bindingToken.value(), "/", 300));
+    output.addHeader("set-cookie", cookie(
+        kSubjectCookie, encodedSubject, "/", 300));
     return output;
 }
 
@@ -285,16 +327,22 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
     const auto continuation = cookieValue(request, kPreauthCookie);
     const auto bindingToken = cookieValue(request, kBindingCookie);
+    const auto encodedSubject = cookieValue(request, kSubjectCookie);
     if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
         || (totp->has_value() && recoveryCode->has_value())
-        || !continuation.has_value() || !bindingToken.has_value()) {
+        || !continuation.has_value() || !bindingToken.has_value()
+        || !encodedSubject.has_value()) {
         return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},
                      request, true);
     }
-    auto binding = security::sha256(bindingToken.value());
+    auto subject = decodePreauthSubject(encodedSubject.value());
+    if (!subject.has_value()) return error(subject.error(), request, true);
+    auto binding = preauthBinding(bindingToken.value(), subject.value());
     if (!binding.has_value()) return error(binding.error(), request, true);
     idp::AuthenticationResponse authenticationResponse{
         idp::ChallengeId{std::move(challenge).value()}, clientContext(request)};
+    authenticationResponse.setParameter(
+        "subject", idp::CredentialValue{subject.value()});
     authenticationResponse.setParameter(
         "password", idp::CredentialValue{std::move(knowledgeSecret).value()});
     if (totp->has_value()) {
