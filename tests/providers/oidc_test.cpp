@@ -66,6 +66,55 @@ TEST(OidcProfileClaimTest, IgnoresUnsafeNameComponents)
     EXPECT_FALSE(rejected);
 }
 
+TEST(OidcProfileClaimTest, EnforcesPlatformDisplayNameLimit)
+{
+    const std::string tooLongName(257U, 'n');
+    const std::string tooLongGiven(200U, 'g');
+    const std::string tooLongFamily(100U, 'f');
+
+    const auto recovered = openproof::provider::oidc::detail::displayName(
+        std::string_view{tooLongName}, std::string_view{"Ada"},
+        std::string_view{"Lovelace"});
+    const auto rejected = openproof::provider::oidc::detail::displayName(
+        std::nullopt, std::string_view{tooLongGiven},
+        std::string_view{tooLongFamily});
+
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(*recovered, "Ada Lovelace");
+    EXPECT_FALSE(rejected);
+}
+
+TEST(OidcProfileClaimTest, EnforcesPreferredUsernamePlatformLimit)
+{
+    using openproof::provider::oidc::detail::kPreferredUsernameMaximum;
+    using openproof::provider::oidc::detail::safeProfileText;
+
+    const std::string accepted(kPreferredUsernameMaximum, 'u');
+    const std::string rejected(kPreferredUsernameMaximum + 1U, 'u');
+    EXPECT_TRUE(safeProfileText(accepted, kPreferredUsernameMaximum));
+    EXPECT_FALSE(safeProfileText(rejected, kPreferredUsernameMaximum));
+}
+
+TEST(OidcProfileClaimTest, ValidatesHttpsPictureUrlStructure)
+{
+    using openproof::provider::oidc::detail::validHttpsProfileUrl;
+
+    EXPECT_TRUE(validHttpsProfileUrl(
+        "https://images.example.test:443/avatar/42?variant=large"));
+    for (const std::string value : {
+             "http://images.example.test/avatar.png",
+             "https:///avatar.png",
+             "https://user@images.example.test/avatar.png",
+             "https://images.example.test:0/avatar.png",
+             "https://images.example.test:70000/avatar.png",
+             "https://images.example.test:/avatar.png",
+             "https://images.example.test/avatar.png#fragment",
+             "https://images.example.test\\\\avatar.png",
+             "https://images.example.test/avatar image.png"}) {
+        EXPECT_FALSE(validHttpsProfileUrl(value)) << value;
+    }
+}
+
 TEST(OidcProviderConfigTest, PreservesExplicitBasicTokenAuthentication)
 {
     auto configured = configuration(

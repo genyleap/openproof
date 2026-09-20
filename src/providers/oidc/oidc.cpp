@@ -346,44 +346,29 @@ struct HttpResult final {
     return detail::displayName(view(name), view(given), view(family));
 }
 
-[[nodiscard]] foundation::Result<std::optional<std::string>> appleDisplayName(
+[[nodiscard]] std::optional<std::string> appleDisplayName(
     const idp::SecretAttributeMap& parameters)
 {
     const auto payload = credential(parameters, "user");
-    if (!payload) return std::optional<std::string>{};
-    if (payload->empty() || payload->size() > 16U * 1024U) {
-        return foundation::fail(authFailure("The Apple user payload is invalid."));
+    if (!payload || payload->empty() || payload->size() > 16U * 1024U) {
+        return std::nullopt;
     }
 
     boost::system::error_code parseError;
     auto parsed = json::parse(*payload, parseError);
-    if (parseError || !parsed.is_object()) {
-        return foundation::fail(authFailure("The Apple user payload is malformed."));
-    }
+    if (parseError || !parsed.is_object()) return std::nullopt;
     const auto* nameValue = parsed.as_object().if_contains("name");
-    if (nameValue == nullptr) return std::optional<std::string>{};
-    if (!nameValue->is_object()) {
-        return foundation::fail(authFailure("The Apple user name is malformed."));
-    }
+    if (nameValue == nullptr || !nameValue->is_object()) return std::nullopt;
 
     const auto& name = nameValue->as_object();
     const auto first = stringValue(name, "firstName");
     const auto last = stringValue(name, "lastName");
-    if ((first && !safeText(*first, 256U)) || (last && !safeText(*last, 256U))) {
-        return foundation::fail(authFailure("The Apple user name is invalid."));
-    }
-
-    std::string displayName;
-    if (first) displayName = *first;
-    if (last) {
-        if (!displayName.empty()) displayName.push_back(' ');
-        displayName.append(*last);
-    }
-    if (displayName.empty()) return std::optional<std::string>{};
-    if (!safeText(displayName, 512U)) {
-        return foundation::fail(authFailure("The Apple user name is invalid."));
-    }
-    return std::optional<std::string>{std::move(displayName)};
+    const auto view = [](const std::optional<std::string>& value)
+        -> std::optional<std::string_view> {
+        if (!value) return std::nullopt;
+        return std::string_view{*value};
+    };
+    return detail::displayName(std::nullopt, view(first), view(last));
 }
 
 } // namespace
@@ -751,18 +736,20 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     if (displayName) {
         claims.set(idp::ClaimName::DisplayName, *displayName);
     } else if (m_implementation->config.providerId().value() == "apple") {
-        auto appleName = appleDisplayName(response.parameters());
-        if (!appleName) return foundation::fail(appleName.error());
-        if (appleName->has_value()) {
-            claims.set(idp::ClaimName::DisplayName, appleName->value());
+        const auto appleName = appleDisplayName(response.parameters());
+        if (appleName) {
+            claims.set(idp::ClaimName::DisplayName, *appleName);
         }
     }
     const auto username = stringValue(payload.value(), "preferred_username");
-    if (username && safeText(*username, 320U)) claims.set(idp::ClaimName::PreferredUsername, *username);
+    if (username && detail::safeProfileText(
+            *username, detail::kPreferredUsernameMaximum)) {
+        claims.set(idp::ClaimName::PreferredUsername, *username);
+    }
     const auto locale = stringValue(payload.value(), "locale");
     if (locale && safeText(*locale, 64U)) claims.set(idp::ClaimName::Locale, *locale);
     const auto picture = stringValue(payload.value(), "picture");
-    if (picture && picture->size() <= 2048U && picture->starts_with("https://")) {
+    if (picture && detail::validHttpsProfileUrl(*picture)) {
         claims.set(idp::ClaimName::PictureUrl, *picture);
     }
 
