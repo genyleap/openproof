@@ -807,7 +807,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: generateRecoveryCodes
-      description: Requires an IAL2 session. The ten returned codes are shown once.
+      description: Requires an IAL2 session and an enabled local TOTP authenticator. The ten returned codes are shown once.
       security: [{sessionCookie: []}, {bearerAuth: []}]
       responses:
         "201":
@@ -825,6 +825,7 @@ paths:
                     items: {type: string}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
   /auth/providers:
     get:
       tags: [Federation]

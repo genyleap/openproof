@@ -25,6 +25,7 @@ openproof_add_module(openproof_authentication_http
         openproof_credentials
         openproof_organization
         openproof_provider_passkey
+        openproof_provider_local
         openproof_gateway
     LINK_PRIVATE
         Boost::headers

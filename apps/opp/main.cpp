@@ -2005,8 +2005,8 @@ addProtectedRoutes(gateway::Router& router,
             identity::OrganizationId{std::string{platform.auth().organizationId()}},
             providerId, clock, gatewayCore};
         authHttp::AuthenticationHttpApi authApi{
-            authentication, sessions, recoveryCodes.value(), limiter.value(),
-            providerId, administrationApi};
+            authentication, sessions, recoveryCodes.value(), *accounts.value(),
+            limiter.value(), providerId, administrationApi};
         authHttp::FederatedAuthenticationHttpApi federatedApi{
             authentication, providers, sessions, limiter.value(), authApi};
         return runWithAccount(federatedApi, nullptr);
@@ -2102,8 +2102,8 @@ addProtectedRoutes(gateway::Router& router,
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
         providerId, clock, gatewayCore};
     authHttp::AuthenticationHttpApi authApi{
-        authentication, sessions, recoveryCodes.value(), limiter.value(),
-        providerId, administrationApi};
+        authentication, sessions, recoveryCodes.value(), *accounts.value(),
+        limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
         authentication, providers, sessions, limiter.value(), authApi, &tokenService};
     oauthHttp::OAuthHttpApi oauthApi{

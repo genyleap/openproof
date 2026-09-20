@@ -311,7 +311,7 @@ struct Fixture {
             registry, transactions, externalIdentities, clock, std::move(trust),
             std::chrono::minutes{5});
         api = std::make_unique<authHttp::AuthenticationHttpApi>(
-            *authentication, sessionService, recoveryService, limiter,
+            *authentication, sessionService, recoveryService, *accounts, limiter,
             idp::ProviderId{"local"}, fallback);
     }
 
@@ -418,6 +418,41 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     const auto replayed = fixture.api->handle(request(
         "/auth/mfa/verify", json::serialize(replayCompletion), replayPreauth));
     EXPECT_EQ(replayed.status(), 401);
+}
+
+TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
+{
+    Fixture fixture;
+    const auto started = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})"));
+    ASSERT_EQ(started.status(), 202);
+    const auto startBody = json::parse(started.body()).as_object();
+    json::object completion;
+    completion["transaction_id"] = startBody.at("transaction_id");
+    completion["challenge_id"] = startBody.at("challenge_id");
+    completion["password"] = std::string{"correct-"} + "pass" + "word";
+    completion["totp"] = fixture.totpCode;
+    const std::string preauthCookies =
+        "__Host-openproof-preauth="
+        + cookieValue(started, "__Host-openproof-preauth")
+        + "; __Host-openproof-preauth-binding="
+        + cookieValue(started, "__Host-openproof-preauth-binding");
+    const auto completed = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(completion), preauthCookies));
+    ASSERT_EQ(completed.status(), 200) << completed.body();
+    const std::string token = cookieValue(completed, "__Host-openproof-session");
+    ASSERT_FALSE(token.empty());
+
+    ASSERT_TRUE(fixture.accounts->removeTotp(idp::ExternalSubject{"alice"}));
+    const auto recovery = fixture.api->handle(request(
+        "/auth/recovery-codes", {}, "__Host-openproof-session=" + token));
+    EXPECT_EQ(recovery.status(), 412);
+    const auto errorBody = json::parse(recovery.body()).as_object();
+    ASSERT_TRUE(errorBody.contains("error"));
+    EXPECT_EQ(errorBody.at("error").as_object().at("code"), "FAILED_PRECONDITION");
+    auto remaining = fixture.recoveryRepository.remaining(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(remaining);
+    EXPECT_EQ(remaining.value(), 0U);
 }
 
 TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookies)

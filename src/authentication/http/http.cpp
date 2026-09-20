@@ -184,11 +184,12 @@ cookieValue(const gateway::HttpRequest& request, std::string_view wanted)
 AuthenticationHttpApi::AuthenticationHttpApi(
     AuthenticationService& authentication, session::SessionService& sessions,
     credentials::RecoveryCodeService& recoveryCodes,
+    ::openproof::provider::local::LocalAccountDirectory& localAccounts,
     gateway::TokenBucketRateLimiter& rateLimiter, idp::ProviderId provider,
     gateway::HttpHandler& fallback)
     : m_authentication(&authentication), m_sessions(&sessions),
-      m_recoveryCodes(&recoveryCodes), m_rateLimiter(&rateLimiter),
-      m_provider(std::move(provider)), m_fallback(&fallback)
+      m_recoveryCodes(&recoveryCodes), m_localAccounts(&localAccounts),
+      m_rateLimiter(&rateLimiter), m_provider(std::move(provider)), m_fallback(&fallback)
 {
 }
 
@@ -381,8 +382,31 @@ gateway::HttpResponse AuthenticationHttpApi::issueRecoveryCodes(
                              idp::AssuranceLevel::Ial2)) {
         return error(foundation::Error{foundation::ErrorCode::AssuranceInsufficient}, request);
     }
+    auto connections = m_authentication->connections(authenticated->session().identity());
+    if (!connections.has_value()) return error(connections.error(), request);
+    const auto localConnection = std::ranges::find_if(
+        connections.value(), [&](const auto& external) {
+            return external.providerId() == m_provider;
+        });
+    if (localConnection == connections->end()) {
+        return error(foundation::Error{foundation::ErrorCode::FailedPrecondition}, request);
+    }
+    auto totpEnabled = m_localAccounts->hasTotp(localConnection->subject());
+    if (!totpEnabled.has_value()) return error(totpEnabled.error(), request);
+    if (!totpEnabled.value()) {
+        return error(foundation::Error{foundation::ErrorCode::FailedPrecondition}, request);
+    }
     auto batch = m_recoveryCodes->issue(authenticated->session().identity(), 10U);
     if (!batch.has_value()) return error(batch.error(), request);
+    auto stillEnabled = m_localAccounts->hasTotp(localConnection->subject());
+    if (!stillEnabled.has_value() || !stillEnabled.value()) {
+        auto revoked = m_recoveryCodes->revoke(authenticated->session().identity());
+        if (!revoked.has_value()) return error(revoked.error(), request);
+        return error(stillEnabled.has_value()
+                         ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
+                         : stillEnabled.error(),
+                     request);
+    }
     json::array codes;
     for (const auto& code : batch->codes()) codes.emplace_back(code.expose());
     json::object payload;
