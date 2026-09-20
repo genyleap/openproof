@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <cstddef>
 #include <optional>
 #include <ranges>
@@ -29,11 +30,22 @@ constexpr std::size_t kScopeMaximum = 4096U;
 
 [[nodiscard]] inline bool validBearerCredential(std::string_view value) noexcept
 {
-    return !value.empty() && value.size() <= kAccessTokenMaximum
-        && std::ranges::all_of(value, [](char symbol) {
-               const auto byte = static_cast<unsigned char>(symbol);
-               return byte >= 0x21U && byte <= 0x7EU;
-           });
+    if (value.empty() || value.size() > kAccessTokenMaximum) return false;
+
+    bool padding = false;
+    for (char symbol : value) {
+        if (symbol == '=') {
+            padding = true;
+            continue;
+        }
+        if (padding) return false;
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool allowed = std::isalnum(byte) != 0
+            || symbol == '-' || symbol == '.' || symbol == '_'
+            || symbol == '~' || symbol == '+' || symbol == '/';
+        if (!allowed) return false;
+    }
+    return true;
 }
 
 [[nodiscard]] inline bool validScopeResponse(std::string_view value) noexcept

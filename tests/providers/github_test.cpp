@@ -64,6 +64,9 @@ TEST(GitHubResponseValidationTest, BoundsCredentialsAndPresentationClaims)
     namespace detail = openproof::provider::github::detail;
 
     EXPECT_TRUE(detail::validBearerCredential("gho_token-value_123"));
+    EXPECT_TRUE(detail::validBearerCredential("opaque.token+/value=="));
+    EXPECT_FALSE(detail::validBearerCredential("opaque=token"));
+    EXPECT_FALSE(detail::validBearerCredential("token;parameter"));
     EXPECT_FALSE(detail::validBearerCredential("token with space"));
     EXPECT_FALSE(detail::validBearerCredential("token\nheader"));
     EXPECT_FALSE(detail::validBearerCredential(
