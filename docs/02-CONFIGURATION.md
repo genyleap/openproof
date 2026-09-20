@@ -654,6 +654,7 @@ phishing-resistant possession factor; biometric unlock is not promoted to a
 server-side inherence claim.
 
 ### Wallet and Farcaster login
+Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
 
 Web3 browser bindings are `OPENPROOF_WEB3_DOMAIN` and the exact HTTPS
 `OPENPROOF_WEB3_URI`; `OPENPROOF_WEB3_CA_FILE` optionally supplies an

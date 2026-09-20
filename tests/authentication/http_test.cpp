@@ -10,6 +10,8 @@
 
 #include <boost/json.hpp>
 
+#include "../../src/authentication/http/web3_presentation.hpp"
+
 import openproof.authentication;
 import openproof.authentication.federated.http;
 import openproof.authentication.http;
@@ -550,6 +552,41 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
     const auto rejected = fixture.api->handle(std::move(ambiguous).value());
     EXPECT_EQ(rejected.status(), 401);
     EXPECT_TRUE(setCookies(rejected).empty());
+}
+
+TEST(Web3PresentationMetadataTest, DiscardsUnsafeTextWithoutBlockingAuthentication)
+{
+    using openproof::authentication::http::detail::presentationText;
+
+    EXPECT_EQ(presentationText(std::optional<std::string>{"Ada Lovelace"}, 256U),
+              std::optional<std::string>{"Ada Lovelace"});
+    EXPECT_FALSE(presentationText(std::optional<std::string>{"Ada\nLovelace"}, 256U));
+    EXPECT_FALSE(presentationText(std::optional<std::string>{"Ada\x7fLovelace"}, 256U));
+    EXPECT_FALSE(presentationText(std::optional<std::string>{}, 256U));
+}
+
+TEST(Web3PresentationMetadataTest, KeepsOnlyStructurallyValidHttpsPictureUrls)
+{
+    using openproof::authentication::http::detail::presentationPictureUrl;
+
+    const auto valid = presentationPictureUrl(std::optional<std::string>{
+        "https://imagedelivery.example.test:443/avatar/42?variant=large"});
+    ASSERT_TRUE(valid);
+    EXPECT_EQ(*valid,
+              "https://imagedelivery.example.test:443/avatar/42?variant=large");
+
+    for (const std::string value : {
+             "http://images.example.test/avatar.png",
+             "https:///avatar.png",
+             "https://user@images.example.test/avatar.png",
+             "https://images.example.test:0/avatar.png",
+             "https://images.example.test:70000/avatar.png",
+             "https://images.example.test:/avatar.png",
+             "https://images.example.test/avatar.png#fragment",
+             "https://images.example.test\\avatar.png",
+             "https://images.example.test/avatar image.png"}) {
+        EXPECT_FALSE(presentationPictureUrl(std::optional<std::string>{value})) << value;
+    }
 }
 
 TEST(Web3AuthenticationHttpApiTest, MobileWalletHandoffSeparatesBrowserRedeemCredential)

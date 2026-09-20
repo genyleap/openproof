@@ -11,6 +11,8 @@ module;
 
 #include <boost/json.hpp>
 
+#include "web3_presentation.hpp"
+
 module openproof.authentication.web3.http;
 
 import openproof.foundation;
@@ -458,10 +460,12 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
     }
     auto message = stringField(body.value(), "message", 8192U);
     auto signature = stringField(body.value(), "signature", 8192U);
-    auto displayName = stringField(body.value(), "display_name", 256U);
-    auto preferredUsername = stringField(body.value(), "preferred_username", 128U);
-    auto pictureUrl = stringField(body.value(), "picture_url", 2048U);
-    if (pictureUrl && !pictureUrl->starts_with("https://")) pictureUrl.reset();
+    auto displayName = detail::presentationText(
+        stringField(body.value(), "display_name", 256U), 256U);
+    auto preferredUsername = detail::presentationText(
+        stringField(body.value(), "preferred_username", 128U), 128U);
+    auto pictureUrl = detail::presentationPictureUrl(
+        stringField(body.value(), "picture_url", 2048U));
     const auto continuation = cookieValue(request, kContinuationCookie, 256U);
     const auto bindingToken = cookieValue(request, kBindingCookie, 256U);
     const auto transaction = cookieValue(request, kTransactionCookie, 256U);
