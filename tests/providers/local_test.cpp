@@ -7,6 +7,7 @@
 
 import openproof.credentials;
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.provider.local;
 
@@ -14,6 +15,7 @@ namespace {
 
 namespace cred = openproof::credentials;
 namespace fnd = openproof::foundation;
+namespace core = openproof::identity::core;
 namespace idp = openproof::identity::provider;
 namespace local = openproof::provider::local;
 
@@ -106,6 +108,74 @@ TEST(LocalProviderTest, PasswordAndTotpProduceTwoFactorsAndIal2)
     auto rejected = provider.completeAuthentication(replay);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
+TEST(LocalProviderTest, RecoveryCodeIsSecondFactorAndWrongPasswordDoesNotConsumeIt)
+{
+    auto directory = accountDirectory();
+    ASSERT_TRUE(directory);
+    auto secret = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"});
+    ASSERT_TRUE(secret);
+    ASSERT_TRUE(directory.value()->enroll(
+        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
+        std::optional<cred::TotpSecret>{std::move(secret).value()}));
+
+    core::InMemoryExternalIdentityDirectory identities;
+    const core::IdentityId identity{"identity-1"};
+    auto link = core::IdentityLink::request(
+        identity,
+        core::ExternalIdentityRef{idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"alice"}},
+        kNow, std::chrono::minutes{5});
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(identities.attach(link.value()));
+
+    cred::InMemoryRecoveryCodeRepository recoveryRepository;
+    auto recovery = cred::RecoveryCodeService::create(
+        recoveryRepository,
+        fnd::SecretString{"abcdef0123456789abcdef0123456789"});
+    ASSERT_TRUE(recovery);
+    auto batch = recovery->issue(identity, 1U);
+    ASSERT_TRUE(batch);
+    ASSERT_EQ(batch->codes().size(), 1U);
+    const std::string code{batch->codes().front().expose()};
+
+    fnd::ManualClockSource clock{kNow};
+    local::LocalAuthenticationProvider provider{
+        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2},
+        &identities, &recovery.value()};
+
+    auto wrongChallenge = provider.beginAuthentication(requestFor("alice"));
+    ASSERT_TRUE(wrongChallenge);
+    auto wrong = responseFor(wrongChallenge->id(), "wrong-password");
+    wrong.setParameter("recovery_code", idp::CredentialValue{code});
+    auto wrongOutcome = provider.completeAuthentication(wrong);
+    ASSERT_FALSE(wrongOutcome);
+
+    auto challenge = provider.beginAuthentication(requestFor("alice"));
+    ASSERT_TRUE(challenge);
+    auto response = responseFor(challenge->id(), "correct-password");
+    response.setParameter("recovery_code", idp::CredentialValue{code});
+    auto outcome = provider.completeAuthentication(response);
+    ASSERT_TRUE(outcome) << outcome.error().internalDetail();
+    EXPECT_EQ(outcome->claimedAssurance(), idp::AssuranceLevel::Ial2);
+    EXPECT_TRUE(outcome->strength().isMultiFactor());
+    EXPECT_TRUE(idp::containsFactor(
+        outcome->strength().factors(), idp::AuthenticationFactor::Knowledge));
+    EXPECT_TRUE(idp::containsFactor(
+        outcome->strength().factors(), idp::AuthenticationFactor::Possession));
+
+    auto replayChallenge = provider.beginAuthentication(requestFor("alice"));
+    ASSERT_TRUE(replayChallenge);
+    auto replay = responseFor(replayChallenge->id(), "correct-password");
+    replay.setParameter("recovery_code", idp::CredentialValue{code});
+    auto replayed = provider.completeAuthentication(replay);
+    ASSERT_FALSE(replayed);
+    EXPECT_EQ(replayed.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
 TEST(LocalProviderTest, FailedAttemptBurnsChallengeAndDoesNotRevealAccountExistence)

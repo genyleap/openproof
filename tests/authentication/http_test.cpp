@@ -292,7 +292,8 @@ struct Fixture {
             idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
             std::optional<cred::TotpSecret>{std::move(totp)}));
         auto provider = std::make_unique<local::LocalAuthenticationProvider>(
-            idp::ProviderId{"local"}, *accounts, clock, std::chrono::minutes{5});
+            idp::ProviderId{"local"}, *accounts, clock, std::chrono::minutes{5},
+            &externalIdentities, &recoveryService);
         EXPECT_TRUE(registry.registerProvider(std::move(provider)));
 
         auto link = core::IdentityLink::request(
@@ -362,7 +363,10 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     const auto recovery = fixture.api->handle(request(
         "/auth/recovery-codes", {}, "__Host-openproof-session=" + firstToken));
     ASSERT_EQ(recovery.status(), 201);
-    EXPECT_EQ(json::parse(recovery.body()).as_object().at("codes").as_array().size(), 10U);
+    const auto recoveryBody = json::parse(recovery.body()).as_object();
+    const auto& recoveryCodes = recoveryBody.at("codes").as_array();
+    ASSERT_EQ(recoveryCodes.size(), 10U);
+    const std::string recoveryCode{recoveryCodes.front().as_string()};
 
     const auto rotated = fixture.api->handle(request(
         "/auth/session/rotate", {}, "__Host-openproof-session=" + firstToken));
@@ -377,6 +381,43 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
         "/auth/logout", {}, "__Host-openproof-session=" + replacement));
     EXPECT_EQ(loggedOut.status(), 204);
     EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{replacement}));
+
+    const auto recoveryStarted = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})"));
+    ASSERT_EQ(recoveryStarted.status(), 202);
+    const auto recoveryStartBody = json::parse(recoveryStarted.body()).as_object();
+    json::object recoveryCompletion;
+    recoveryCompletion["transaction_id"] = recoveryStartBody.at("transaction_id");
+    recoveryCompletion["challenge_id"] = recoveryStartBody.at("challenge_id");
+    recoveryCompletion["password"] = "correct-password";
+    recoveryCompletion["recovery_code"] = recoveryCode;
+    const std::string recoveryPreauth =
+        "__Host-openproof-preauth="
+        + cookieValue(recoveryStarted, "__Host-openproof-preauth")
+        + "; __Host-openproof-preauth-binding="
+        + cookieValue(recoveryStarted, "__Host-openproof-preauth-binding");
+    const auto recovered = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(recoveryCompletion), recoveryPreauth));
+    ASSERT_EQ(recovered.status(), 200) << recovered.body();
+    EXPECT_EQ(json::parse(recovered.body()).as_object().at("assurance"), "ial2");
+
+    const auto replayStarted = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})"));
+    ASSERT_EQ(replayStarted.status(), 202);
+    const auto replayStartBody = json::parse(replayStarted.body()).as_object();
+    json::object replayCompletion;
+    replayCompletion["transaction_id"] = replayStartBody.at("transaction_id");
+    replayCompletion["challenge_id"] = replayStartBody.at("challenge_id");
+    replayCompletion["password"] = "correct-password";
+    replayCompletion["recovery_code"] = recoveryCode;
+    const std::string replayPreauth =
+        "__Host-openproof-preauth="
+        + cookieValue(replayStarted, "__Host-openproof-preauth")
+        + "; __Host-openproof-preauth-binding="
+        + cookieValue(replayStarted, "__Host-openproof-preauth-binding");
+    const auto replayed = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(replayCompletion), replayPreauth));
+    EXPECT_EQ(replayed.status(), 401);
 }
 
 TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookies)

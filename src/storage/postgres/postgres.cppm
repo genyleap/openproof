@@ -343,6 +343,9 @@ public:
     [[nodiscard]] foundation::Status changePassword(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Status verifyPassword(
+        const identity::provider::ExternalSubject& subject,
+        const foundation::SecretString& password) override;
     [[nodiscard]] foundation::Result<provider::local::LocalVerification> verify(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password,

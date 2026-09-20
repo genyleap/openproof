@@ -647,7 +647,17 @@ paths:
                 transaction_id: {type: string}
                 challenge_id: {type: string}
                 password: {type: string, format: password}
-                totp: {type: string, pattern: "^[0-9]{6,8}$"}
+                totp:
+                  type: string
+                  pattern: "^[0-9]{6,8}$"
+                  description: TOTP second factor; mutually exclusive with recovery_code.
+                recovery_code:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  description: One-time recovery code used instead of TOTP; mutually exclusive with totp.
+              not:
+                required: [totp, recovery_code]
       responses:
         "200":
           description: Session issued in a secure cookie.
