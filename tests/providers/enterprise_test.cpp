@@ -40,6 +40,24 @@ TEST(EnterprisePresentationClaimTest, RejectsControlCharactersAndOversizedValues
     EXPECT_FALSE(safePresentationText(""));
 }
 
+TEST(EnterpriseSamlValidationTest, RequiresEveryAudienceRestrictionToPermitServiceProvider)
+{
+    using openproof::provider::enterprise::detail::samlAudienceRestrictionsPermit;
+
+    const std::string expected{"https://sp.example.test/metadata"};
+    EXPECT_TRUE(samlAudienceRestrictionsPermit(
+        {{"https://other.example.test", expected},
+         {expected, "https://partner.example.test"}},
+        expected));
+    EXPECT_FALSE(samlAudienceRestrictionsPermit(
+        {{expected}, {"https://other.example.test"}},
+        expected));
+    EXPECT_FALSE(samlAudienceRestrictionsPermit(
+        {{expected}, {}},
+        expected));
+    EXPECT_FALSE(samlAudienceRestrictionsPermit({}, expected));
+}
+
 TEST(EnterpriseLdapConfigTest, AcceptsCertificateVerifiedLdapsConfiguration)
 {
     auto configured = enterprise::LdapProviderConfig::create(

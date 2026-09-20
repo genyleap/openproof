@@ -1036,13 +1036,20 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     if (conditions == nullptr) return foundation::fail(authenticationFailure("The SAML assertion has no Conditions."));
     auto window = withinWindow(conditions, now, config.m_clockSkew);
     if (!window) return foundation::fail(window.error());
-    bool audienceAccepted = false;
-    for (xmlNodePtr restriction : children(conditions, "AudienceRestriction", kSamlAssertion)) {
+    std::vector<std::vector<std::string>> audienceRestrictions;
+    for (xmlNodePtr restriction : children(
+             conditions, "AudienceRestriction", kSamlAssertion)) {
+        std::vector<std::string> audiences;
         for (xmlNodePtr audience : children(restriction, "Audience", kSamlAssertion)) {
-            if (content(audience) == config.m_spEntityId) audienceAccepted = true;
+            audiences.push_back(content(audience));
         }
+        audienceRestrictions.push_back(std::move(audiences));
     }
-    if (!audienceAccepted) return foundation::fail(authenticationFailure("The SAML assertion audience is invalid."));
+    if (!detail::samlAudienceRestrictionsPermit(
+            audienceRestrictions, config.m_spEntityId)) {
+        return foundation::fail(
+            authenticationFailure("The SAML assertion audience is invalid."));
+    }
     xmlNodePtr subject = uniqueChild(assertion, "Subject", kSamlAssertion);
     xmlNodePtr nameId = subject == nullptr ? nullptr : uniqueChild(subject, "NameID", kSamlAssertion);
     auto confirmations = subject == nullptr ? std::vector<xmlNodePtr>{} : children(subject, "SubjectConfirmation", kSamlAssertion);
