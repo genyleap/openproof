@@ -63,4 +63,27 @@ namespace openproof::provider::oidc::detail {
     return permitsVerification;
 }
 
+[[nodiscard]] inline bool discoveryAdvertisesRs256IdTokens(
+    const boost::json::object& metadata)
+{
+    const auto* algorithms = metadata.if_contains(
+        "id_token_signing_alg_values_supported");
+    if (algorithms == nullptr || !algorithms->is_array()
+        || algorithms->as_array().empty()) {
+        return false;
+    }
+
+    bool hasRs256 = false;
+    for (const auto& algorithm : algorithms->as_array()) {
+        if (!algorithm.is_string() || algorithm.as_string().empty()
+            || algorithm.as_string().size() > 128U) {
+            return false;
+        }
+        const std::string_view value{
+            algorithm.as_string().data(), algorithm.as_string().size()};
+        if (value == "RS256") hasRs256 = true;
+    }
+    return hasRs256;
+}
+
 } // namespace openproof::provider::oidc::detail

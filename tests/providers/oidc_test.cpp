@@ -177,6 +177,32 @@ TEST(OidcIdTokenValidationTest, HonorsJwkSignatureUseAndVerificationOperations)
     EXPECT_FALSE(jwkPermitsRs256Verification(key, "another-key"));
 }
 
+TEST(OidcDiscoveryValidationTest, RequiresAdvertisedRs256IdTokenSigning)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::discoveryAdvertisesRs256IdTokens;
+
+    json::object metadata{
+        {"id_token_signing_alg_values_supported", json::array{"RS256", "ES256"}}};
+    EXPECT_TRUE(discoveryAdvertisesRs256IdTokens(metadata));
+
+    metadata.erase("id_token_signing_alg_values_supported");
+    EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
+
+    metadata["id_token_signing_alg_values_supported"] = json::array{"ES256"};
+    EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
+
+    metadata["id_token_signing_alg_values_supported"] = json::array{};
+    EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
+
+    metadata["id_token_signing_alg_values_supported"] = "RS256";
+    EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
+
+    metadata["id_token_signing_alg_values_supported"] =
+        json::array{"RS256", 42};
+    EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
+}
+
 [[nodiscard]] std::string generatedP256PrivateKey()
 {
     EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
