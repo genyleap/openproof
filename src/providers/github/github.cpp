@@ -26,6 +26,8 @@ module;
 #include <boost/json.hpp>
 #include <openssl/ssl.h>
 
+#include "response_validation.hpp"
+
 module openproof.provider.github;
 
 import openproof.security;
@@ -235,12 +237,6 @@ struct HttpResponse final {
     return std::nullopt;
 }
 
-[[nodiscard]] bool booleanValue(const json::object& object, std::string_view name)
-{
-    const auto* value = object.if_contains(name);
-    return value != nullptr && value->is_bool() && value->as_bool();
-}
-
 [[nodiscard]] foundation::Result<std::string> derived(
     const foundation::SecretString& key, std::string_view label,
     const idp::ChallengeId& challenge)
@@ -420,8 +416,9 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     const auto accessToken = stringValue(tokenJson->as_object(), "access_token");
     const auto grantedScopes = stringValue(tokenJson->as_object(), "scope");
     const auto tokenType = stringValue(tokenJson->as_object(), "token_type");
-    if (!accessToken || accessToken->empty() || accessToken->size() > 4096U
-        || !grantedScopes || !hasEmailScope(*grantedScopes)
+    if (!accessToken || !detail::validBearerCredential(*accessToken)
+        || !grantedScopes || !detail::validScopeResponse(*grantedScopes)
+        || !hasEmailScope(*grantedScopes)
         || !tokenType || !bearerTokenType(*tokenType)) {
         return foundation::fail(authFailure("The GitHub token response did not grant the required identity scopes."));
     }
@@ -437,7 +434,8 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     }
     const auto accountId = unsignedValue(userJson->as_object(), "id");
     const auto login = stringValue(userJson->as_object(), "login");
-    if (!accountId || *accountId == 0U || !login || !safeText(*login, 256U)) {
+    if (!accountId || *accountId == 0U || !login
+        || !detail::safeProfileText(*login, detail::kPreferredUsernameMaximum)) {
         return foundation::fail(authFailure("The GitHub user identity is incomplete."));
     }
 
@@ -450,16 +448,8 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     if (!emailJson || !emailJson->is_array()) {
         return foundation::fail(authFailure("The GitHub email response is malformed."));
     }
-    std::optional<std::string> verifiedPrimaryEmail;
-    for (const auto& item : emailJson->as_array()) {
-        if (!item.is_object()) continue;
-        const auto email = stringValue(item.as_object(), "email");
-        if (email && safeText(*email, 320U) && booleanValue(item.as_object(), "verified")
-            && booleanValue(item.as_object(), "primary")) {
-            verifiedPrimaryEmail = std::move(email);
-            break;
-        }
-    }
+    const auto verifiedPrimaryEmail =
+        detail::uniqueVerifiedPrimaryEmail(emailJson->as_array());
 
     idp::VerifiedClaims claims;
     claims.set(idp::ClaimName::PreferredUsername, *login);
@@ -467,11 +457,13 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
         claims.set(idp::ClaimName::Email, *verifiedPrimaryEmail);
         claims.set(idp::ClaimName::EmailVerified, "true");
     }
-    if (const auto name = stringValue(userJson->as_object(), "name"); name && safeText(*name, 512U)) {
+    if (const auto name = stringValue(userJson->as_object(), "name");
+        name && detail::safeProfileText(*name, detail::kDisplayNameMaximum)) {
         claims.set(idp::ClaimName::DisplayName, *name);
     }
     if (const auto avatar = stringValue(userJson->as_object(), "avatar_url");
-        avatar && validHttpsUrl(*avatar)) {
+        avatar && avatar->size() <= detail::kPictureUrlMaximum
+        && validHttpsUrl(*avatar)) {
         claims.set(idp::ClaimName::PictureUrl, *avatar);
     }
     idp::ProviderEvidence evidence;
