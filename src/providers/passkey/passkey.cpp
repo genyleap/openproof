@@ -2,6 +2,7 @@ module;
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +58,68 @@ constexpr std::size_t kMaximumCredentialIdBytes = 1023U;
                const auto byte = static_cast<unsigned char>(symbol);
                return byte < 0x20U || byte == 0x7FU;
            });
+}
+
+[[nodiscard]] bool validDnsName(std::string_view value) noexcept
+{
+    if (!safeText(value, 253U) || value.starts_with('.') || value.ends_with('.')
+        || value.contains("..")) {
+        return false;
+    }
+    std::size_t begin = 0U;
+    while (begin < value.size()) {
+        const auto end = value.find('.', begin);
+        const auto label = value.substr(
+            begin, end == std::string_view::npos ? value.size() - begin : end - begin);
+        if (label.empty() || label.size() > 63U || label.starts_with('-') || label.ends_with('-')
+            || !std::ranges::all_of(label, [](char symbol) {
+                   return (symbol >= 'a' && symbol <= 'z')
+                       || (symbol >= '0' && symbol <= '9') || symbol == '-';
+               })) {
+            return false;
+        }
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    return true;
+}
+
+[[nodiscard]] std::optional<std::string_view> originHost(std::string_view origin) noexcept
+{
+    constexpr std::string_view prefix{"https://"};
+    if (!origin.starts_with(prefix) || origin.size() > 2048U) return std::nullopt;
+    origin.remove_prefix(prefix.size());
+    if (origin.empty() || origin.contains('/') || origin.contains('?') || origin.contains('#')
+        || origin.contains('@') || origin.contains('\\') || origin.contains('[')
+        || origin.contains(']')) {
+        return std::nullopt;
+    }
+
+    std::string_view host = origin;
+    if (const auto colon = origin.rfind(':'); colon != std::string_view::npos) {
+        if (origin.find(':') != colon) return std::nullopt;
+        host = origin.substr(0U, colon);
+        const auto portText = origin.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return std::nullopt;
+        }
+    }
+    if (!validDnsName(host)) return std::nullopt;
+    return host;
+}
+
+[[nodiscard]] bool rpIdMatchesOrigin(
+    std::string_view relyingPartyId, std::string_view host) noexcept
+{
+    if (host == relyingPartyId) return true;
+    return host.size() > relyingPartyId.size()
+        && host.ends_with(relyingPartyId)
+        && host[host.size() - relyingPartyId.size() - 1U] == '.';
 }
 
 [[nodiscard]] foundation::Result<std::string> challengeFor(
@@ -597,12 +660,16 @@ foundation::Result<PasskeyConfig> PasskeyConfig::create(
     std::string relyingPartyId, std::string relyingPartyName, std::string origin,
     foundation::SecretString derivationKey, foundation::Duration ceremonyLifetime)
 {
-    const bool validOrigin = origin.starts_with("https://") && !origin.ends_with('/')
-        && !origin.contains('#') && !origin.contains('?');
-    if (!safeText(relyingPartyId, 253U) || relyingPartyId.contains('/') || relyingPartyId.contains(':')
-        || !safeText(relyingPartyName, 128U) || !validOrigin || derivationKey.size() < 32U
-        || ceremonyLifetime <= foundation::Duration::zero() || ceremonyLifetime > std::chrono::minutes{10}) {
+    const auto host = originHost(origin);
+    if (!validDnsName(relyingPartyId) || !safeText(relyingPartyName, 128U)
+        || !host || !rpIdMatchesOrigin(relyingPartyId, *host)
+        || derivationKey.size() < 32U
+        || ceremonyLifetime <= foundation::Duration::zero()
+        || ceremonyLifetime > std::chrono::minutes{10}) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument, "The WebAuthn RP configuration is invalid.");
+    }
+    if (origin.ends_with(":443")) {
+        origin.resize(origin.size() - 4U);
     }
     return PasskeyConfig{std::move(relyingPartyId), std::move(relyingPartyName), std::move(origin),
                          std::move(derivationKey), ceremonyLifetime};

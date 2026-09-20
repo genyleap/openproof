@@ -52,6 +52,45 @@ void attachPasskey(core::InMemoryExternalIdentityDirectory& identities,
         std::chrono::minutes{5}).value();
 }
 
+TEST(PasskeyConfigTest, AcceptsOriginHostAndRpIdDomainSuffix)
+{
+    auto direct = passkey::PasskeyConfig::create(
+        "identity.example.test", "OpenProof Test",
+        "https://identity.example.test",
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5});
+    auto subdomain = passkey::PasskeyConfig::create(
+        "example.test", "OpenProof Test",
+        "https://login.example.test:8443",
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5});
+
+    auto canonicalDefaultPort = passkey::PasskeyConfig::create(
+        "example.test", "OpenProof Test",
+        "https://login.example.test:443",
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5});
+
+    EXPECT_TRUE(direct);
+    EXPECT_TRUE(subdomain);
+    ASSERT_TRUE(canonicalDefaultPort);
+    EXPECT_EQ(canonicalDefaultPort->origin(), "https://login.example.test");
+}
+
+TEST(PasskeyConfigTest, RejectsOriginOutsideRpIdAndMalformedOrigins)
+{
+    const auto create = [](std::string rpId, std::string origin) {
+        return passkey::PasskeyConfig::create(
+            std::move(rpId), "OpenProof Test", std::move(origin),
+            fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5});
+    };
+
+    EXPECT_FALSE(create("example.test", "https://login.other.test"));
+    EXPECT_FALSE(create("example.test", "https://notexample.test"));
+    EXPECT_FALSE(create("example.test", "https://login.example.test/path"));
+    EXPECT_FALSE(create("example.test", "https://user@login.example.test"));
+    EXPECT_FALSE(create("example.test", "https://login.example.test:70000"));
+    EXPECT_FALSE(create("example.test", "https:///login"));
+    EXPECT_FALSE(create("Example.test", "https://example.test"));
+}
+
 TEST(PasskeyRepositoryTest, ConcurrentRemovalPreservesOneCredential)
 {
     passkey::InMemoryPasskeyRepository repository;

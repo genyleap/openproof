@@ -637,7 +637,10 @@ protected from removal.
 ### WebAuthn / passkeys
 
 Passkeys are enabled by setting `OPENPROOF_WEBAUTHN_RP_ID` and the exact HTTPS
-`OPENPROOF_WEBAUTHN_ORIGIN`. `OPENPROOF_WEBAUTHN_RP_NAME` is optional and
+`OPENPROOF_WEBAUTHN_ORIGIN`. The RP ID must equal the origin host or be a domain-label
+suffix of it; malformed origins and unrelated RP IDs are rejected at startup. An
+explicit default HTTPS port (`:443`) is canonicalized away so server-side origin
+comparison matches browser origin serialization. `OPENPROOF_WEBAUTHN_RP_NAME` is optional and
 defaults to `OpenProof`. Registration is authenticated self-service under
 `/account/passkeys`; assertion login is exposed under `/auth/passkey/*`.
 
