@@ -204,6 +204,20 @@ namespace openproof::provider::oidc::detail {
     return supported;
 }
 
+[[nodiscard]] inline bool accessTokenHashClaimMatches(
+    const boost::json::object& payload, std::string_view expected) noexcept
+{
+    const auto* value = payload.if_contains("at_hash");
+    if (value == nullptr) return true;
+    if (!value->is_string() || value->as_string().empty()
+        || value->as_string().size() > 128U) {
+        return false;
+    }
+    const std::string_view claimed{
+        value->as_string().data(), value->as_string().size()};
+    return claimed == expected;
+}
+
 [[nodiscard]] inline bool joseHeaderUsesSupportedExtensions(
     const boost::json::object& header) noexcept
 {

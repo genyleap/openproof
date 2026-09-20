@@ -180,6 +180,24 @@ TEST(OidcUserInfoValidationTest, RequiresExactSubjectBinding)
     EXPECT_FALSE(userInfoSubjectMatches(userInfo, "stable-subject"));
 }
 
+TEST(OidcIdTokenValidationTest, ValidatesOptionalAccessTokenHashClaim)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::accessTokenHashClaimMatches;
+
+    json::object payload;
+    EXPECT_TRUE(accessTokenHashClaimMatches(payload, "expected-hash"));
+
+    payload["at_hash"] = "expected-hash";
+    EXPECT_TRUE(accessTokenHashClaimMatches(payload, "expected-hash"));
+    EXPECT_FALSE(accessTokenHashClaimMatches(payload, "another-hash"));
+
+    payload["at_hash"] = "";
+    EXPECT_FALSE(accessTokenHashClaimMatches(payload, "expected-hash"));
+    payload["at_hash"] = 42;
+    EXPECT_FALSE(accessTokenHashClaimMatches(payload, "expected-hash"));
+}
+
 TEST(OidcIdTokenValidationTest, RejectsMismatchedAuthorizedPartyEvenForSingleAudience)
 {
     using openproof::provider::oidc::detail::authorizedPartyMatches;

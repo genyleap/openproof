@@ -334,6 +334,18 @@ struct HttpResult final {
     return detail::displayName(view(name), view(given), view(family));
 }
 
+[[nodiscard]] foundation::Result<bool> accessTokenHashMatches(
+    const json::object& payload, std::string_view accessToken)
+{
+    if (!payload.contains("at_hash")) return true;
+
+    auto digest = security::sha256(accessToken);
+    if (!digest) return foundation::fail(digest.error());
+    const std::string expected = foundation::toBase64Url(
+        std::span<const std::byte>{digest->data(), digest->size() / 2U});
+    return detail::accessTokenHashClaimMatches(payload, expected);
+}
+
 void applyStandardProfileClaims(
     const json::object& source, idp::VerifiedClaims& claims)
 {
@@ -736,7 +748,14 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     }
     auto tokenObject = parseJsonObject(tokenResponse->body);
     if (!tokenObject) return foundation::fail(tokenObject.error());
+    const auto accessToken = stringValue(tokenObject.value(), "access_token");
+    const auto tokenType = stringValue(tokenObject.value(), "token_type");
     const auto idToken = stringValue(tokenObject.value(), "id_token");
+    if (!accessToken || !detail::validBearerAccessToken(*accessToken)
+        || !tokenType || !detail::bearerTokenType(*tokenType)) {
+        return foundation::fail(authFailure(
+            "The OIDC token response did not contain a valid Bearer access token."));
+    }
     if (!idToken || idToken->size() > 32U * 1024U) {
         return foundation::fail(authFailure("The OIDC token response did not contain an ID Token."));
     }
@@ -788,11 +807,14 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     const bool audienceValid = detail::audienceMatchesClientExclusively(
         payload.value(), m_implementation->config.clientId());
     const auto authorizedParty = stringValue(payload.value(), "azp");
+    auto accessHashMatches = accessTokenHashMatches(payload.value(), *accessToken);
+    if (!accessHashMatches) return foundation::fail(accessHashMatches.error());
     const auto now = m_implementation->clock->now();
     if (!issuer || *issuer != m_implementation->config.issuer()
         || !subject || !detail::validSubjectIdentifier(*subject) || !tokenNonce
         || !security::constantTimeEquals(*tokenNonce, nonce.value())
         || !issuedAt || !expiresAt || !audienceValid
+        || !accessHashMatches.value()
         || !detail::authorizedPartyMatches(
             authorizedParty ? std::optional<std::string_view>{*authorizedParty} : std::nullopt,
             m_implementation->config.clientId())
@@ -805,25 +827,20 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
 
     std::optional<json::object> userInfo;
     if (metadata->userInfoEndpoint) {
-        const auto accessToken = stringValue(tokenObject.value(), "access_token");
-        const auto tokenType = stringValue(tokenObject.value(), "token_type");
-        if (accessToken && detail::validBearerAccessToken(*accessToken)
-            && tokenType && detail::bearerTokenType(*tokenType)) {
-            auto userInfoEndpoint = parseHttpsUrl(*metadata->userInfoEndpoint);
-            if (userInfoEndpoint) {
-                std::string bearerAuthorization{"Bearer "};
-                bearerAuthorization.append(*accessToken);
-                auto userInfoResponse = httpsRequest(
-                    userInfoEndpoint.value(), http::verb::get, {}, {},
-                    m_implementation->caFile, bearerAuthorization);
-                std::ranges::fill(bearerAuthorization, '\0');
-                if (userInfoResponse && userInfoResponse->status == 200U) {
-                    auto parsedUserInfo = parseJsonObject(userInfoResponse->body);
-                    if (parsedUserInfo
-                        && detail::userInfoSubjectMatches(
-                            parsedUserInfo.value(), *subject)) {
-                        userInfo = std::move(parsedUserInfo).value();
-                    }
+        auto userInfoEndpoint = parseHttpsUrl(*metadata->userInfoEndpoint);
+        if (userInfoEndpoint) {
+            std::string bearerAuthorization{"Bearer "};
+            bearerAuthorization.append(*accessToken);
+            auto userInfoResponse = httpsRequest(
+                userInfoEndpoint.value(), http::verb::get, {}, {},
+                m_implementation->caFile, bearerAuthorization);
+            std::ranges::fill(bearerAuthorization, '\0');
+            if (userInfoResponse && userInfoResponse->status == 200U) {
+                auto parsedUserInfo = parseJsonObject(userInfoResponse->body);
+                if (parsedUserInfo
+                    && detail::userInfoSubjectMatches(
+                        parsedUserInfo.value(), *subject)) {
+                    userInfo = std::move(parsedUserInfo).value();
                 }
             }
         }
