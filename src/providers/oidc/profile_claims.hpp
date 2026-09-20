@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <optional>
 #include <ranges>
@@ -8,6 +9,10 @@
 #include <string_view>
 
 namespace openproof::provider::oidc::detail {
+
+inline constexpr std::size_t kDisplayNameMaximum = 256U;
+inline constexpr std::size_t kPreferredUsernameMaximum = 128U;
+inline constexpr std::size_t kPictureUrlMaximum = 2048U;
 
 [[nodiscard]] inline bool safeProfileText(
     std::string_view value, std::size_t maximum) noexcept
@@ -24,12 +29,12 @@ namespace openproof::provider::oidc::detail {
     std::optional<std::string_view> givenName,
     std::optional<std::string_view> familyName)
 {
-    if (name && safeProfileText(*name, 512U)) {
+    if (name && safeProfileText(*name, kDisplayNameMaximum)) {
         return std::string{*name};
     }
 
-    const bool givenSafe = givenName && safeProfileText(*givenName, 256U);
-    const bool familySafe = familyName && safeProfileText(*familyName, 256U);
+    const bool givenSafe = givenName && safeProfileText(*givenName, kDisplayNameMaximum);
+    const bool familySafe = familyName && safeProfileText(*familyName, kDisplayNameMaximum);
     if (!givenSafe && !familySafe) return std::nullopt;
 
     std::string combined;
@@ -38,8 +43,51 @@ namespace openproof::provider::oidc::detail {
         if (!combined.empty()) combined.push_back(' ');
         combined.append(*familyName);
     }
-    if (!safeProfileText(combined, 512U)) return std::nullopt;
+    if (!safeProfileText(combined, kDisplayNameMaximum)) return std::nullopt;
     return combined;
+}
+
+[[nodiscard]] inline bool validHttpsProfileUrl(std::string_view value) noexcept
+{
+    constexpr std::string_view scheme{"https://"};
+    if (!value.starts_with(scheme) || value.size() > kPictureUrlMaximum
+        || value.contains('#') || value.contains('\\')
+        || std::ranges::any_of(value, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte <= 0x20U || byte == 0x7FU;
+           })) {
+        return false;
+    }
+
+    value.remove_prefix(scheme.size());
+    const auto slash = value.find('/');
+    const auto query = value.find('?');
+    const auto authorityEnd = std::min(
+        slash == std::string_view::npos ? value.size() : slash,
+        query == std::string_view::npos ? value.size() : query);
+    const auto authority = value.substr(0U, authorityEnd);
+    if (authority.empty() || authority.contains('@')
+        || authority.contains('[') || authority.contains(']')) {
+        return false;
+    }
+
+    std::string_view host = authority;
+    if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+        host = authority.substr(0U, colon);
+        const auto portText = authority.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return false;
+        }
+    }
+
+    if (!safeProfileText(host, 253U) || host.contains(':')) return false;
+    return authorityEnd == value.size()
+        || value[authorityEnd] == '/' || value[authorityEnd] == '?';
 }
 
 } // namespace openproof::provider::oidc::detail

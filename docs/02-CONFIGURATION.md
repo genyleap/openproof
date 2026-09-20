@@ -619,8 +619,11 @@ flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
 accepted only after signature, issuer, audience, expiry, issued-at and nonce
 validation. For presentation metadata, a validated ID Token `name` claim takes
 precedence; when it is absent or unusable, OpenProof composes a display name from
-validated `given_name` and `family_name` claims. Apple's one-time callback name is
-used only as the final Apple-specific fallback. A previously unseen verified
+validated `given_name` and `family_name` claims. Presentation claims are normalized
+to OpenProof profile limits (`display_name` 256 characters and `preferred_username`
+128 characters), and picture claims are accepted only as structurally valid HTTPS
+URLs. Apple's one-time callback name is used only as the final Apple-specific fallback;
+malformed callback presentation metadata is ignored rather than failing authentication. A previously unseen verified
 upstream subject may create a new canonical identity only for explicitly trusted
 federation providers; email claims are never used to silently link an existing
 account.
