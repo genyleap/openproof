@@ -80,6 +80,45 @@ constexpr std::string_view kSamlSuccess{"urn:oasis:names:tc:SAML:2.0:status:Succ
     });
 }
 
+[[nodiscard]] bool validHttpsEndpoint(std::string_view value) noexcept
+{
+    constexpr std::string_view scheme{"https://"};
+    if (!value.starts_with(scheme) || !safeToken(value, 2048U)
+        || value.contains('#') || value.contains('\\')) {
+        return false;
+    }
+
+    value.remove_prefix(scheme.size());
+    const auto slash = value.find('/');
+    const auto query = value.find('?');
+    const auto authorityEnd = std::min(
+        slash == std::string_view::npos ? value.size() : slash,
+        query == std::string_view::npos ? value.size() : query);
+    const auto authority = value.substr(0U, authorityEnd);
+    if (authority.empty() || authority.contains('@')
+        || authority.contains('[') || authority.contains(']')) {
+        return false;
+    }
+
+    std::string_view host = authority;
+    if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+        host = authority.substr(0U, colon);
+        const auto portText = authority.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return false;
+        }
+    }
+
+    if (!safeToken(host, 253U) || host.contains(':')) return false;
+    if (authorityEnd == value.size()) return true;
+    return value[authorityEnd] == '/' || value[authorityEnd] == '?';
+}
+
 [[nodiscard]] std::string escapeLdapFilter(std::string_view value)
 {
     constexpr char hex[] = "0123456789abcdef";
@@ -784,8 +823,9 @@ foundation::Result<SamlProviderConfig> SamlProviderConfig::create(
     foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
     foundation::Duration clockSkew)
 {
-    if (!safeToken(spEntityId, 2048U) || !assertionConsumerServiceUri.starts_with("https://")
-        || !idpSsoUrl.starts_with("https://") || !safeToken(idpEntityId, 2048U)
+    if (!safeToken(spEntityId, 2048U)
+        || !validHttpsEndpoint(assertionConsumerServiceUri)
+        || !validHttpsEndpoint(idpSsoUrl) || !safeToken(idpEntityId, 2048U)
         || idpCertificatePem.size() < 64U || derivationKey.size() < 32U
         || challengeLifetime < 30s || challengeLifetime > 10min || clockSkew < 0ms || clockSkew > 5min) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument, "The SAML service-provider configuration is invalid.");
