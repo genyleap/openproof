@@ -49,6 +49,7 @@ target_link_libraries(opp
         openproof_authentication_http
         openproof_credentials
         openproof_provider_github
+        openproof_provider_x
         openproof_provider_local
         openproof_provider_oidc
         openproof_provider_passkey

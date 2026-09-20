@@ -77,6 +77,7 @@ import openproof.gateway;
 import openproof.gateway.http;
 import openproof.policy;
 import openproof.provider.github;
+import openproof.provider.x;
 import openproof.provider.local;
 import openproof.provider.oidc;
 import openproof.provider.passkey;
@@ -122,6 +123,7 @@ namespace gateway = openproof::gateway;
 namespace gatewayHttp = openproof::gateway::http;
 namespace policy = openproof::policy;
 namespace github = openproof::provider::github;
+namespace xProvider = openproof::provider::x;
 namespace local = openproof::provider::local;
 namespace externalOidc = openproof::provider::oidc;
 namespace passkey = openproof::provider::passkey;
@@ -1658,6 +1660,41 @@ addProtectedRoutes(gateway::Router& router,
         auto status = providers.registerProvider(std::move(githubProvider));
         if (status) {
             status = trust.trust(idp::ProviderId{"github"}, idp::AssuranceLevel::Ial1, true);
+        }
+        if (!status) {
+            reportStartupFailure(status.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+    if (const auto xClientId = environment.get("OPENPROOF_X_CLIENT_ID");
+        xClientId && !xClientId->empty()) {
+        const auto xClientSecret = environment.get("OPENPROOF_X_CLIENT_SECRET");
+        if (!xClientSecret || xClientSecret->empty()
+            || !federationCallback || federationCallback->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "X federation requires a client secret and callback URI."});
+            return ExitCode::ConfigurationError;
+        }
+        auto derivationKey = deriveSecret(
+            platform.security().tokenSigningKey(), "openproof/federation/x/v1");
+        if (!derivationKey) {
+            reportStartupFailure(derivationKey.error());
+            return ExitCode::InternalError;
+        }
+        auto xConfig = xProvider::XProviderConfig::create(
+            *xClientId, fnd::SecretString{*xClientSecret}, *federationCallback,
+            std::move(derivationKey).value(), std::chrono::minutes{5});
+        if (!xConfig) {
+            reportStartupFailure(xConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto xAuthenticationProvider = std::make_unique<xProvider::XAuthenticationProvider>(
+            std::move(xConfig).value(), clock,
+            federationCaFile.value_or(std::string{}));
+        auto status = providers.registerProvider(std::move(xAuthenticationProvider));
+        if (status) {
+            status = trust.trust(idp::ProviderId{"x"}, idp::AssuranceLevel::Ial1, true);
         }
         if (!status) {
             reportStartupFailure(status.error());
