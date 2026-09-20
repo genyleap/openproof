@@ -1499,15 +1499,80 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
     {
-        const auto appleIssuer = environment.get("OPENPROOF_APPLE_ISSUER");
-        auto status = registerOidcProvider(
-            "apple", appleIssuer.value_or("https://appleid.apple.com"),
-            {"name", "email"}, "openproof/federation/apple/v1",
-            externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
-            externalOidc::OidcAuthorizationResponseMode::FormPost);
-        if (!status) {
-            reportStartupFailure(status.error());
-            return ExitCode::ConfigurationError;
+        const auto appleClientId = environment.get("OPENPROOF_APPLE_CLIENT_ID");
+        if (appleClientId && !appleClientId->empty()) {
+            const auto appleIssuer = environment.get("OPENPROOF_APPLE_ISSUER");
+            const auto staticAppleSecret = environment.get("OPENPROOF_APPLE_CLIENT_SECRET");
+            auto status = fnd::ok();
+            if (staticAppleSecret && !staticAppleSecret->empty()) {
+                status = registerOidcProvider(
+                    "apple", appleIssuer.value_or("https://appleid.apple.com"),
+                    {"name", "email"}, "openproof/federation/apple/v1",
+                    externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
+                    externalOidc::OidcAuthorizationResponseMode::FormPost);
+            } else {
+                const auto teamId = environment.get("OPENPROOF_APPLE_TEAM_ID");
+                const auto keyId = environment.get("OPENPROOF_APPLE_KEY_ID");
+                const auto keyFile = environment.get("OPENPROOF_APPLE_PRIVATE_KEY_FILE");
+                if (!teamId || teamId->empty() || !keyId || keyId->empty()
+                    || !keyFile || keyFile->empty() || !federationCallback
+                    || federationCallback->empty()) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::FailedPrecondition,
+                        "Apple federation requires either OPENPROOF_APPLE_CLIENT_SECRET "
+                        "or TEAM_ID, KEY_ID and PRIVATE_KEY_FILE, plus the callback URI."});
+                    return ExitCode::ConfigurationError;
+                }
+                std::error_code fileError;
+                const std::filesystem::path path{*keyFile};
+                const auto fileStatus = std::filesystem::symlink_status(path, fileError);
+                const auto size = fileError ? 0U : std::filesystem::file_size(path, fileError);
+                if (fileError || std::filesystem::is_symlink(fileStatus)
+                    || !std::filesystem::is_regular_file(fileStatus) || size == 0U
+                    || size > 16U * 1024U) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::InvalidArgument,
+                        "OPENPROOF_APPLE_PRIVATE_KEY_FILE is invalid."});
+                    return ExitCode::ConfigurationError;
+                }
+                std::ifstream input{path, std::ios::binary};
+                std::string pem(static_cast<std::size_t>(size), '\0');
+                input.read(pem.data(), static_cast<std::streamsize>(pem.size()));
+                if (!input || input.gcount() != static_cast<std::streamsize>(pem.size())) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::InvalidArgument,
+                        "OPENPROOF_APPLE_PRIVATE_KEY_FILE could not be read."});
+                    return ExitCode::ConfigurationError;
+                }
+                auto derivationKey = deriveSecret(
+                    platform.security().tokenSigningKey(), "openproof/federation/apple/v1");
+                if (!derivationKey) {
+                    reportStartupFailure(derivationKey.error());
+                    return ExitCode::InternalError;
+                }
+                auto config = externalOidc::OidcProviderConfig::createApple(
+                    idp::ProviderId{"apple"},
+                    appleIssuer.value_or("https://appleid.apple.com"), *appleClientId,
+                    *teamId, *keyId, fnd::SecretString{std::move(pem)},
+                    *federationCallback, {"name", "email"},
+                    std::move(derivationKey).value(), std::chrono::minutes{5});
+                if (!config) {
+                    reportStartupFailure(config.error());
+                    return ExitCode::ConfigurationError;
+                }
+                auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
+                    std::move(config).value(), clock,
+                    federationCaFile.value_or(std::string{}));
+                status = providers.registerProvider(std::move(implementation));
+                if (status) {
+                    status = trust.trust(
+                        idp::ProviderId{"apple"}, idp::AssuranceLevel::Ial1, true);
+                }
+            }
+            if (!status) {
+                reportStartupFailure(status.error());
+                return ExitCode::ConfigurationError;
+            }
         }
     }
     {

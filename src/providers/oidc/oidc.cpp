@@ -2,6 +2,7 @@ module;
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -486,6 +487,42 @@ public:
     std::optional<Discovery> cached;
 };
 
+foundation::Result<foundation::SecretString> makeAppleClientSecret(
+    std::string teamId, std::string clientId, std::string keyId,
+    foundation::SecretString privateKeyPem, foundation::Instant now,
+    foundation::Duration lifetime)
+{
+    constexpr auto appleMaximumLifetime = std::chrono::seconds{15'777'000};
+    const auto appleIdentifier = [](std::string_view value) noexcept {
+        return value.size() == 10U
+            && std::ranges::all_of(value, [](char symbol) {
+                   return std::isalnum(static_cast<unsigned char>(symbol)) != 0;
+               });
+    };
+    if (!appleIdentifier(teamId) || !safeText(clientId, 512U)
+        || !appleIdentifier(keyId) || lifetime <= foundation::Duration::zero()
+        || lifetime > appleMaximumLifetime) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The Apple client-secret configuration is invalid.");
+    }
+    auto signer = security::Es256Signer::create(
+        std::move(privateKeyPem), std::move(keyId));
+    if (!signer) return foundation::fail(signer.error());
+    const auto seconds = [](foundation::Instant value) {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            value.time_since_epoch()).count();
+    };
+    foundation::JsonObjectWriter payload;
+    payload.add("iss", teamId)
+        .add("iat", static_cast<std::int64_t>(seconds(now)))
+        .add("exp", static_cast<std::int64_t>(seconds(now + lifetime)))
+        .add("aud", "https://appleid.apple.com")
+        .add("sub", clientId);
+    auto token = signer->signJwt(payload.build());
+    if (!token) return foundation::fail(token.error());
+    return foundation::SecretString{std::move(token).value()};
+}
+
 OidcProviderConfig::OidcProviderConfig(
     idp::ProviderId providerId, std::string issuer, std::string clientId,
     foundation::SecretString clientSecret, std::string callbackUri,
@@ -505,6 +542,13 @@ const idp::ProviderId& OidcProviderConfig::providerId() const noexcept { return 
 std::string_view OidcProviderConfig::issuer() const noexcept { return m_issuer; }
 std::string_view OidcProviderConfig::clientId() const noexcept { return m_clientId; }
 const foundation::SecretString& OidcProviderConfig::clientSecret() const noexcept { return m_clientSecret; }
+foundation::Result<foundation::SecretString>
+OidcProviderConfig::clientSecretAt(foundation::Instant now) const
+{
+    if (!m_dynamicAppleClientSecret) return m_clientSecret.clone();
+    return makeAppleClientSecret(
+        m_appleTeamId, m_clientId, m_appleKeyId, m_applePrivateKey.clone(), now);
+}
 std::string_view OidcProviderConfig::callbackUri() const noexcept { return m_callbackUri; }
 const std::vector<std::string>& OidcProviderConfig::scopes() const noexcept { return m_scopes; }
 const foundation::SecretString& OidcProviderConfig::derivationKey() const noexcept { return m_derivationKey; }
@@ -539,6 +583,34 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
         std::move(clientId), std::move(clientSecret), std::move(callbackUri),
         std::move(scopes), std::move(derivationKey), challengeLifetime,
         clientAuthentication, authorizationResponseMode};
+}
+
+foundation::Result<OidcProviderConfig> OidcProviderConfig::createApple(
+    idp::ProviderId providerId, std::string issuer, std::string clientId,
+    std::string teamId, std::string keyId, foundation::SecretString privateKeyPem,
+    std::string callbackUri, std::vector<std::string> scopes,
+    foundation::SecretString derivationKey, foundation::Duration challengeLifetime)
+{
+    if (providerId.value() != "apple") {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The Apple OIDC provider identifier is invalid.");
+    }
+    auto initialSecret = makeAppleClientSecret(
+        teamId, clientId, keyId, privateKeyPem.clone(), foundation::Instant{},
+        std::chrono::hours{1});
+    if (!initialSecret) return foundation::fail(initialSecret.error());
+    auto configured = create(
+        std::move(providerId), std::move(issuer), std::move(clientId),
+        std::move(initialSecret).value(), std::move(callbackUri), std::move(scopes),
+        std::move(derivationKey), challengeLifetime,
+        OidcClientAuthenticationMethod::ClientSecretPost,
+        OidcAuthorizationResponseMode::FormPost);
+    if (!configured) return foundation::fail(configured.error());
+    configured->m_dynamicAppleClientSecret = true;
+    configured->m_appleTeamId = std::move(teamId);
+    configured->m_appleKeyId = std::move(keyId);
+    configured->m_applePrivateKey = std::move(privateKeyPem);
+    return configured;
 }
 
 OidcAuthenticationProvider::OidcAuthenticationProvider(
@@ -634,14 +706,20 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     append("code", *code);
     append("redirect_uri", m_implementation->config.callbackUri());
     append("client_id", m_implementation->config.clientId());
+    auto clientSecret = m_implementation->config.clientSecretAt(
+        m_implementation->clock->now());
+    if (!clientSecret) {
+        return foundation::fail(authFailure(
+            "The OIDC client authentication material is unavailable."));
+    }
     std::string authorization;
     if (m_implementation->config.clientAuthentication()
         == OidcClientAuthenticationMethod::ClientSecretPost) {
-        append("client_secret", m_implementation->config.clientSecret().expose());
+        append("client_secret", clientSecret->expose());
     } else {
         std::string credentials = formEncode(m_implementation->config.clientId());
         credentials.push_back(':');
-        credentials.append(formEncode(m_implementation->config.clientSecret().expose()));
+        credentials.append(formEncode(clientSecret->expose()));
         authorization = "Basic " + standardBase64(credentials);
         std::ranges::fill(credentials, '\0');
     }

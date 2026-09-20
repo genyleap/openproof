@@ -14,6 +14,8 @@ module;
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
 #include <openssl/pem.h>
 #include <openssl/param_build.h>
 #include <openssl/params.h>
@@ -274,6 +276,100 @@ foundation::Result<std::string> RsaSha256Signer::publicJwkJson() const
 }
 
 std::string_view RsaSha256Signer::keyId() const noexcept
+{ return m_implementation->m_keyId; }
+
+
+class Es256Signer::Implementation final {
+public:
+    Implementation(PkeyPointer key, std::string keyId)
+        : m_key(std::move(key)), m_keyId(std::move(keyId)) {}
+
+    PkeyPointer m_key;
+    std::string m_keyId;
+};
+
+Es256Signer::Es256Signer(std::unique_ptr<Implementation> implementation)
+    : m_implementation(std::move(implementation)) {}
+Es256Signer::Es256Signer(Es256Signer&&) noexcept = default;
+Es256Signer& Es256Signer::operator=(Es256Signer&&) noexcept = default;
+Es256Signer::~Es256Signer() = default;
+
+foundation::Result<Es256Signer> Es256Signer::create(
+    foundation::SecretString privateKeyPem, std::string keyId)
+{
+    if (privateKeyPem.empty() || keyId.empty() || keyId.size() > 128U
+        || privateKeyPem.expose().size()
+            > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The ES256 signing key configuration is invalid.");
+    }
+    BioPointer input{BIO_new_mem_buf(privateKeyPem.expose().data(),
+                                     static_cast<int>(privateKeyPem.expose().size()))};
+    PkeyPointer key{input ? PEM_read_bio_PrivateKey(input.get(), nullptr, nullptr, nullptr)
+                          : nullptr};
+    char group[80]{};
+    std::size_t groupLength = 0U;
+    if (!key || EVP_PKEY_is_a(key.get(), "EC") != 1
+        || EVP_PKEY_get_utf8_string_param(key.get(), OSSL_PKEY_PARAM_GROUP_NAME,
+                                          group, sizeof(group), &groupLength) != 1
+        || (std::string_view{group} != "prime256v1"
+            && std::string_view{group} != "P-256")) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "ES256 requires a P-256 private key.");
+    }
+    return Es256Signer{std::make_unique<Implementation>(
+        std::move(key), std::move(keyId))};
+}
+
+foundation::Result<std::string> Es256Signer::signJwt(
+    std::string_view payloadJson) const
+{
+    foundation::JsonObjectWriter header;
+    header.add("alg", "ES256").add("typ", "JWT").add("kid", m_implementation->m_keyId);
+    const std::string encodedHeader = foundation::toBase64Url(bytes(header.build()));
+    const std::string encodedPayload = foundation::toBase64Url(bytes(payloadJson));
+    const std::string signingInput = encodedHeader + "." + encodedPayload;
+
+    ContextPointer context{EVP_MD_CTX_new()};
+    if (!context
+        || EVP_DigestSignInit(context.get(), nullptr, EVP_sha256(), nullptr,
+                              m_implementation->m_key.get()) != 1
+        || EVP_DigestSignUpdate(context.get(), signingInput.data(), signingInput.size()) != 1) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The ES256 signature could not be initialized.");
+    }
+    std::size_t derSize = 0U;
+    if (EVP_DigestSignFinal(context.get(), nullptr, &derSize) != 1 || derSize == 0U) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The ES256 signature size could not be determined.");
+    }
+    std::vector<unsigned char> der(derSize);
+    if (EVP_DigestSignFinal(context.get(), der.data(), &derSize) != 1) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The ES256 payload could not be signed.");
+    }
+    der.resize(derSize);
+    const unsigned char* cursor = der.data();
+    std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> signature{
+        d2i_ECDSA_SIG(nullptr, &cursor, static_cast<long>(der.size())), &ECDSA_SIG_free};
+    const BIGNUM* r = nullptr;
+    const BIGNUM* s = nullptr;
+    if (!signature || cursor != der.data() + der.size()) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The ES256 signature encoding is invalid.");
+    }
+    ECDSA_SIG_get0(signature.get(), &r, &s);
+    std::vector<std::byte> raw(64U);
+    if (r == nullptr || s == nullptr
+        || BN_bn2binpad(r, reinterpret_cast<unsigned char*>(raw.data()), 32) != 32
+        || BN_bn2binpad(s, reinterpret_cast<unsigned char*>(raw.data()) + 32, 32) != 32) {
+        return foundation::fail(foundation::ErrorCode::Internal,
+                                "The ES256 signature components are invalid.");
+    }
+    return signingInput + "." + foundation::toBase64Url(raw);
+}
+
+std::string_view Es256Signer::keyId() const noexcept
 { return m_implementation->m_keyId; }
 
 VerifiedCompactJws::VerifiedCompactJws(std::string headerJson, std::string payloadJson)

@@ -4,6 +4,13 @@
 #include <string>
 #include <vector>
 
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/params.h>
+
 #include "../../src/providers/oidc/profile_claims.hpp"
 
 import openproof.foundation;
@@ -113,6 +120,100 @@ TEST(OidcProfileClaimTest, ValidatesHttpsPictureUrlStructure)
              "https://images.example.test/avatar image.png"}) {
         EXPECT_FALSE(validHttpsProfileUrl(value)) << value;
     }
+}
+
+[[nodiscard]] std::string generatedP256PrivateKey()
+{
+    EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+    if (context == nullptr || EVP_PKEY_keygen_init(context) != 1) {
+        if (context != nullptr) EVP_PKEY_CTX_free(context);
+        return {};
+    }
+    std::string curve{"prime256v1"};
+    OSSL_PARAM parameters[] = {
+        OSSL_PARAM_construct_utf8_string(
+            const_cast<char*>(OSSL_PKEY_PARAM_GROUP_NAME), curve.data(), 0U),
+        OSSL_PARAM_construct_end()};
+    EVP_PKEY* key = nullptr;
+    if (EVP_PKEY_CTX_set_params(context, parameters) != 1
+        || EVP_PKEY_generate(context, &key) != 1) {
+        EVP_PKEY_CTX_free(context);
+        if (key != nullptr) EVP_PKEY_free(key);
+        return {};
+    }
+    EVP_PKEY_CTX_free(context);
+    BIO* output = BIO_new(BIO_s_mem());
+    if (output == nullptr
+        || PEM_write_bio_PrivateKey(output, key, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+        if (output != nullptr) BIO_free(output);
+        EVP_PKEY_free(key);
+        return {};
+    }
+    BUF_MEM* buffer = nullptr;
+    BIO_get_mem_ptr(output, &buffer);
+    std::string pem;
+    if (buffer != nullptr && buffer->data != nullptr && buffer->length != 0U) {
+        pem.assign(buffer->data, buffer->length);
+    }
+    BIO_free(output);
+    EVP_PKEY_free(key);
+    return pem;
+}
+
+TEST(OidcProviderConfigTest, BuildsAppleEs256ClientSecretWithExpectedClaims)
+{
+    const fnd::Instant now{std::chrono::milliseconds{1'790'000'000'000LL}};
+    const std::string pem = generatedP256PrivateKey();
+    ASSERT_FALSE(pem.empty());
+    auto configured = oidc::OidcProviderConfig::createApple(
+        idp::ProviderId{"apple"}, "https://appleid.apple.com",
+        "com.example.web", "TEAM123ABC", "KEY123ABCD", fnd::SecretString{pem},
+        "https://identity.example.test/auth/federated/callback",
+        std::vector<std::string>{"name", "email"},
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5});
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    auto secret = configured->clientSecretAt(now);
+    ASSERT_TRUE(secret) << secret.error().internalDetail();
+    auto laterSecret = configured->clientSecretAt(now + std::chrono::hours{1});
+    ASSERT_TRUE(laterSecret) << laterSecret.error().internalDetail();
+    const std::string_view jwt = secret->expose();
+    const auto firstDot = jwt.find('.');
+    const auto secondDot = jwt.find('.', firstDot + 1U);
+    ASSERT_NE(firstDot, std::string_view::npos);
+    ASSERT_NE(secondDot, std::string_view::npos);
+    auto headerBytes = fnd::fromBase64Url(jwt.substr(0U, firstDot));
+    auto payloadBytes = fnd::fromBase64Url(
+        jwt.substr(firstDot + 1U, secondDot - firstDot - 1U));
+    ASSERT_TRUE(headerBytes);
+    ASSERT_TRUE(payloadBytes);
+    const std::string header{
+        reinterpret_cast<const char*>(headerBytes->data()), headerBytes->size()};
+    const std::string payload{
+        reinterpret_cast<const char*>(payloadBytes->data()), payloadBytes->size()};
+    EXPECT_NE(header.find(R"("alg":"ES256")"), std::string::npos);
+    EXPECT_NE(header.find(R"("kid":"KEY123ABCD")"), std::string::npos);
+    EXPECT_NE(payload.find(R"("iss":"TEAM123ABC")"), std::string::npos);
+    EXPECT_NE(payload.find(R"("sub":"com.example.web")"), std::string::npos);
+    EXPECT_NE(payload.find(R"("aud":"https://appleid.apple.com")"), std::string::npos);
+    auto signature = fnd::fromBase64Url(jwt.substr(secondDot + 1U));
+    ASSERT_TRUE(signature);
+    EXPECT_EQ(signature->size(), 64U);
+    EXPECT_NE(secret->expose(), laterSecret->expose());
+}
+
+
+TEST(OidcProviderConfigTest, RejectsInvalidAppleIdentifiersAndOverlongSecretLifetime)
+{
+    const std::string pem = generatedP256PrivateKey();
+    ASSERT_FALSE(pem.empty());
+    const fnd::Instant now{std::chrono::milliseconds{1'790'000'000'000LL}};
+    EXPECT_FALSE(oidc::makeAppleClientSecret(
+        "SHORT", "com.example.web", "KEY123ABCD", fnd::SecretString{pem}, now));
+    EXPECT_FALSE(oidc::makeAppleClientSecret(
+        "TEAM123ABC", "com.example.web", "SHORT", fnd::SecretString{pem}, now));
+    EXPECT_FALSE(oidc::makeAppleClientSecret(
+        "TEAM123ABC", "com.example.web", "KEY123ABCD", fnd::SecretString{pem}, now,
+        std::chrono::seconds{15'777'001}));
 }
 
 TEST(OidcProviderConfigTest, PreservesExplicitBasicTokenAuthentication)

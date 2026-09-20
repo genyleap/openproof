@@ -574,10 +574,13 @@ and JWKS HTTPS requests.
 
 - Google: `OPENPROOF_GOOGLE_CLIENT_ID`, `OPENPROOF_GOOGLE_CLIENT_SECRET`; optional
   `OPENPROOF_GOOGLE_ISSUER` (default `https://accounts.google.com`).
-- Apple: `OPENPROOF_APPLE_CLIENT_ID`, `OPENPROOF_APPLE_CLIENT_SECRET`; optional
-  `OPENPROOF_APPLE_ISSUER` (default `https://appleid.apple.com`). The configured
-  Apple client secret may be the signed client-secret JWT managed by the operator.
-  OpenProof requests `response_mode=form_post` for Apple because Apple requires
+- Apple: `OPENPROOF_APPLE_CLIENT_ID`; optional `OPENPROOF_APPLE_ISSUER` (default
+  `https://appleid.apple.com`). Configure either a pre-generated
+  `OPENPROOF_APPLE_CLIENT_SECRET` JWT, or let OpenProof generate a fresh Apple
+  client-secret JWT for every token exchange with `OPENPROOF_APPLE_TEAM_ID`,
+  `OPENPROOF_APPLE_KEY_ID`, and `OPENPROOF_APPLE_PRIVATE_KEY_FILE` pointing to the
+  Apple P-256 `.p8` private key. The private-key file must be a regular, non-symlink
+  file no larger than 16 KiB. OpenProof requests `response_mode=form_post` for Apple because Apple requires
   form-post authorization responses whenever the `name` or `email` scopes are
   requested; the shared federation callback accepts URL-encoded POST responses.
   On the first authorization, OpenProof relays Apple's one-time `user` payload

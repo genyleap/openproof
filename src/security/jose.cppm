@@ -39,6 +39,34 @@ private:
     std::unique_ptr<Implementation> m_implementation;
 };
 
+
+/**
+ * @brief OpenSSL-backed P-256 ECDSA SHA-256 signer for ES256 compact JWTs.
+ *
+ * The signer validates that the private key uses the NIST P-256 curve and
+ * converts OpenSSL's DER ECDSA signature into the 64-byte JOSE r||s encoding.
+ */
+class Es256Signer final {
+public:
+    [[nodiscard]] static foundation::Result<Es256Signer>
+    create(foundation::SecretString privateKeyPem, std::string keyId);
+
+    Es256Signer(const Es256Signer&) = delete;
+    Es256Signer& operator=(const Es256Signer&) = delete;
+    Es256Signer(Es256Signer&&) noexcept;
+    Es256Signer& operator=(Es256Signer&&) noexcept;
+    ~Es256Signer();
+
+    [[nodiscard]] foundation::Result<std::string>
+    signJwt(std::string_view payloadJson) const;
+    [[nodiscard]] std::string_view keyId() const noexcept;
+
+private:
+    class Implementation;
+    explicit Es256Signer(std::unique_ptr<Implementation> implementation);
+    std::unique_ptr<Implementation> m_implementation;
+};
+
 /** @brief Decoded components of a compact JWS after a successful RS256 verification. */
 class VerifiedCompactJws final {
 public:

@@ -7,6 +7,13 @@
 #include <string_view>
 #include <vector>
 
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/params.h>
+
 import openproof.foundation;
 import openproof.security;
 
@@ -25,6 +32,60 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
 2wIDAQAB
 -----END PUBLIC KEY-----
 )PEM";
+
+[[nodiscard]] std::string generatedEcPrivateKey(std::string_view curve)
+{
+    EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+    if (context == nullptr || EVP_PKEY_keygen_init(context) != 1) {
+        if (context != nullptr) EVP_PKEY_CTX_free(context);
+        return {};
+    }
+    std::string curveValue{curve};
+    OSSL_PARAM parameters[] = {
+        OSSL_PARAM_construct_utf8_string(
+            const_cast<char*>(OSSL_PKEY_PARAM_GROUP_NAME), curveValue.data(), 0U),
+        OSSL_PARAM_construct_end()};
+    EVP_PKEY* key = nullptr;
+    if (EVP_PKEY_CTX_set_params(context, parameters) != 1
+        || EVP_PKEY_generate(context, &key) != 1) {
+        EVP_PKEY_CTX_free(context);
+        if (key != nullptr) EVP_PKEY_free(key);
+        return {};
+    }
+    EVP_PKEY_CTX_free(context);
+    BIO* output = BIO_new(BIO_s_mem());
+    if (output == nullptr || PEM_write_bio_PrivateKey(output, key, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+        if (output != nullptr) BIO_free(output);
+        EVP_PKEY_free(key);
+        return {};
+    }
+    BUF_MEM* buffer = nullptr;
+    BIO_get_mem_ptr(output, &buffer);
+    std::string pem{buffer->data, buffer->length};
+    BIO_free(output);
+    EVP_PKEY_free(key);
+    return pem;
+}
+
+TEST(JoseTest, Es256SignerProducesJoseSizedSignatureAndRejectsWrongCurve)
+{
+    const std::string p256 = generatedEcPrivateKey("prime256v1");
+    const std::string p384 = generatedEcPrivateKey("secp384r1");
+    ASSERT_FALSE(p256.empty());
+    ASSERT_FALSE(p384.empty());
+
+    auto signer = sec::Es256Signer::create(fnd::SecretString{p256}, "apple-key");
+    ASSERT_TRUE(signer) << signer.error().internalDetail();
+    auto jwt = signer->signJwt(R"({"sub":"client"})");
+    ASSERT_TRUE(jwt);
+    const auto secondDot = jwt->rfind('.');
+    ASSERT_NE(secondDot, std::string::npos);
+    auto signature = fnd::fromBase64Url(std::string_view{*jwt}.substr(secondDot + 1U));
+    ASSERT_TRUE(signature);
+    EXPECT_EQ(signature->size(), 64U);
+    EXPECT_FALSE(sec::Es256Signer::create(
+        fnd::SecretString{p384}, "wrong-curve"));
+}
 
 TEST(JoseTest, ExportsPreviousPublicKeyAsPublishableJwk)
 {

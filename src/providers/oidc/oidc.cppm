@@ -1,5 +1,6 @@
 module;
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -24,6 +25,16 @@ enum class OidcAuthorizationResponseMode {
     FormPost,
 };
 
+/**
+ * Builds a Sign in with Apple OAuth client secret using the required ES256 JWT.
+ * The default lifetime is one hour because a fresh credential is generated for
+ * every token exchange; callers may request a longer value within Apple's limit.
+ */
+[[nodiscard]] foundation::Result<foundation::SecretString> makeAppleClientSecret(
+    std::string teamId, std::string clientId, std::string keyId,
+    foundation::SecretString privateKeyPem, foundation::Instant now,
+    foundation::Duration lifetime = std::chrono::hours{1});
+
 /** @brief Validated configuration for an external OpenID Connect authentication provider. */
 class OidcProviderConfig final {
 public:
@@ -38,6 +49,13 @@ public:
         OidcAuthorizationResponseMode authorizationResponseMode =
             OidcAuthorizationResponseMode::Query);
 
+    [[nodiscard]] static foundation::Result<OidcProviderConfig> createApple(
+        identity::provider::ProviderId providerId, std::string issuer,
+        std::string clientId, std::string teamId, std::string keyId,
+        foundation::SecretString privateKeyPem, std::string callbackUri,
+        std::vector<std::string> scopes, foundation::SecretString derivationKey,
+        foundation::Duration challengeLifetime);
+
     OidcProviderConfig(const OidcProviderConfig&) = delete;
     OidcProviderConfig& operator=(const OidcProviderConfig&) = delete;
     OidcProviderConfig(OidcProviderConfig&&) noexcept = default;
@@ -47,6 +65,8 @@ public:
     [[nodiscard]] std::string_view issuer() const noexcept;
     [[nodiscard]] std::string_view clientId() const noexcept;
     [[nodiscard]] const foundation::SecretString& clientSecret() const noexcept;
+    [[nodiscard]] foundation::Result<foundation::SecretString>
+    clientSecretAt(foundation::Instant now) const;
     [[nodiscard]] std::string_view callbackUri() const noexcept;
     [[nodiscard]] const std::vector<std::string>& scopes() const noexcept;
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
@@ -68,6 +88,10 @@ private:
     std::string m_issuer;
     std::string m_clientId;
     foundation::SecretString m_clientSecret;
+    bool m_dynamicAppleClientSecret{false};
+    std::string m_appleTeamId;
+    std::string m_appleKeyId;
+    foundation::SecretString m_applePrivateKey;
     std::string m_callbackUri;
     std::vector<std::string> m_scopes;
     foundation::SecretString m_derivationKey;
