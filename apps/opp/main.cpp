@@ -1457,7 +1457,9 @@ addProtectedRoutes(gateway::Router& router,
                                           externalOidc::OidcAuthorizationResponseMode
                                               authorizationResponseMode = externalOidc::
                                                   OidcAuthorizationResponseMode::
-                                                      Query) -> fnd::Status {
+                                                      Query,
+                                          externalOidc::OidcPkceMode pkceMode =
+                                              externalOidc::OidcPkceMode::S256) -> fnd::Status {
         const std::string upperName = [&] {
             std::string output{name};
             std::ranges::transform(output, output.begin(), [](unsigned char symbol) {
@@ -1479,7 +1481,7 @@ addProtectedRoutes(gateway::Router& router,
             idp::ProviderId{std::string{name}}, std::move(issuer), *clientId,
             fnd::SecretString{*clientSecret}, *federationCallback, std::move(scopes),
             std::move(derivationKey).value(), std::chrono::minutes{5},
-            clientAuthentication, authorizationResponseMode);
+            clientAuthentication, authorizationResponseMode, pkceMode);
         if (!config) return fnd::fail(config.error());
         auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
             std::move(config).value(), clock, federationCaFile.value_or(std::string{}));
@@ -1579,7 +1581,10 @@ addProtectedRoutes(gateway::Router& router,
         const auto linkedinIssuer = environment.get("OPENPROOF_LINKEDIN_ISSUER");
         auto status = registerOidcProvider(
             "linkedin", linkedinIssuer.value_or("https://www.linkedin.com/oauth"),
-            {"openid", "profile", "email"}, "openproof/federation/linkedin/v1");
+            {"openid", "profile", "email"}, "openproof/federation/linkedin/v1",
+            externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
+            externalOidc::OidcAuthorizationResponseMode::Query,
+            externalOidc::OidcPkceMode::Disabled);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;

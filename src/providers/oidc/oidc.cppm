@@ -25,6 +25,12 @@ enum class OidcAuthorizationResponseMode {
     FormPost,
 };
 
+/** @brief Proof Key for Code Exchange policy for the upstream authorization code flow. */
+enum class OidcPkceMode {
+    S256,
+    Disabled,
+};
+
 /**
  * Builds a Sign in with Apple OAuth client secret using the required ES256 JWT.
  * The default lifetime is one hour because a fresh credential is generated for
@@ -47,7 +53,8 @@ public:
         OidcClientAuthenticationMethod clientAuthentication =
             OidcClientAuthenticationMethod::ClientSecretPost,
         OidcAuthorizationResponseMode authorizationResponseMode =
-            OidcAuthorizationResponseMode::Query);
+            OidcAuthorizationResponseMode::Query,
+        OidcPkceMode pkceMode = OidcPkceMode::S256);
 
     [[nodiscard]] static foundation::Result<OidcProviderConfig> createApple(
         identity::provider::ProviderId providerId, std::string issuer,
@@ -73,6 +80,7 @@ public:
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
     [[nodiscard]] OidcClientAuthenticationMethod clientAuthentication() const noexcept;
     [[nodiscard]] OidcAuthorizationResponseMode authorizationResponseMode() const noexcept;
+    [[nodiscard]] OidcPkceMode pkceMode() const noexcept;
 
 private:
     friend class OidcAuthenticationProvider;
@@ -82,7 +90,8 @@ private:
                        foundation::SecretString derivationKey,
                        foundation::Duration challengeLifetime,
                        OidcClientAuthenticationMethod clientAuthentication,
-                       OidcAuthorizationResponseMode authorizationResponseMode);
+                       OidcAuthorizationResponseMode authorizationResponseMode,
+                       OidcPkceMode pkceMode);
 
     identity::provider::ProviderId m_providerId;
     std::string m_issuer;
@@ -100,10 +109,11 @@ private:
         OidcClientAuthenticationMethod::ClientSecretPost};
     OidcAuthorizationResponseMode m_authorizationResponseMode{
         OidcAuthorizationResponseMode::Query};
+    OidcPkceMode m_pkceMode{OidcPkceMode::S256};
 };
 
 /**
- * @brief Discovery-driven OIDC Authorization Code provider with PKCE and nonce validation.
+ * @brief Discovery-driven OIDC Authorization Code provider with nonce validation and configurable PKCE.
  *
  * Discovery metadata, token responses and JWKS are fetched over verified TLS. ID Tokens are
  * accepted only after RS256 signature, issuer, audience, expiry, issued-at and nonce checks.
