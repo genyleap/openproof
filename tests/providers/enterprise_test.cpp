@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 
 import openproof.foundation;
 import openproof.provider.enterprise;
@@ -60,6 +61,28 @@ TEST(EnterpriseSamlConfigTest, RejectsInsecureEndpointsBeforeTrustMaterialIsUsed
         placeholderCertificate, derivationKey(), std::chrono::minutes{5},
         std::chrono::minutes{2});
     EXPECT_FALSE(insecureSso);
+}
+
+TEST(EnterpriseSamlConfigTest, RejectsMalformedHttpsAuthoritiesAndTargets)
+{
+    const std::string placeholderCertificate(128U, 'x');
+    const auto rejects = [&](std::string acs, std::string sso) {
+        auto configured = enterprise::SamlProviderConfig::create(
+            "https://sp.example.test/metadata", std::move(acs),
+            "https://idp.example.test/entity", std::move(sso),
+            placeholderCertificate, derivationKey(), std::chrono::minutes{5},
+            std::chrono::minutes{2});
+        EXPECT_FALSE(configured);
+    };
+
+    rejects("https:///saml/acs", "https://idp.example.test/sso");
+    rejects("https://user@sp.example.test/saml/acs", "https://idp.example.test/sso");
+    rejects("https://sp.example.test:70000/saml/acs", "https://idp.example.test/sso");
+    rejects("https://sp.example.test/saml/acs#fragment", "https://idp.example.test/sso");
+    rejects("https://sp.example.test/saml/acs with-space", "https://idp.example.test/sso");
+    rejects("https://sp.example.test/saml/acs\nnext", "https://idp.example.test/sso");
+    rejects("https://sp.example.test\\saml/acs", "https://idp.example.test/sso");
+    rejects("https://sp.example.test/saml/acs", "https:///sso");
 }
 
 } // namespace

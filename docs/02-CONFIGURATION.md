@@ -697,11 +697,14 @@ one directory entry and then performs an LDAP bind as that user.
 SAML is enabled by `OPENPROOF_SAML_IDP_SSO_URL` and additionally requires
 `OPENPROOF_SAML_SP_ENTITY_ID`, `OPENPROOF_SAML_IDP_ENTITY_ID`,
 `OPENPROOF_SAML_IDP_CERTIFICATE_PEM`, and the exact
-`OPENPROOF_FEDERATION_CALLBACK_URI` used as ACS. The adapter emits a SAML 2.0
-AuthnRequest and validates destination, `InResponseTo`, issuer, status, audience,
-conditions, bearer subject confirmation and NameID. XML signatures are pinned to
-the configured IdP certificate and constrained to the supported RSA-SHA256 /
-SHA-256 / exclusive-canonicalization profile.
+`OPENPROOF_FEDERATION_CALLBACK_URI` used as ACS. The IdP SSO and ACS endpoints
+must be well-formed HTTPS URLs with a non-empty authority and valid optional port;
+userinfo, fragments, backslashes, spaces/control characters, and ambiguous
+authorities are rejected before any trust material is used. The adapter emits a
+SAML 2.0 AuthnRequest and validates destination, `InResponseTo`, issuer, status,
+audience, conditions, bearer subject confirmation and NameID. XML signatures are
+pinned to the configured IdP certificate and constrained to the supported
+RSA-SHA256 / SHA-256 / exclusive-canonicalization profile.
 
 ### SCIM provisioning
 
