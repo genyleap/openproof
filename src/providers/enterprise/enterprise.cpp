@@ -164,8 +164,10 @@ struct LdapResolvedEntry final {
     int version = LDAP_VERSION3;
     int requireCertificate = LDAP_OPT_X_TLS_DEMAND;
     timeval networkTimeout{5, 0};
+    timeval operationTimeout{5, 0};
     if (ldap_set_option(handle.get(), LDAP_OPT_PROTOCOL_VERSION, &version) != LDAP_OPT_SUCCESS
         || ldap_set_option(handle.get(), LDAP_OPT_NETWORK_TIMEOUT, &networkTimeout) != LDAP_OPT_SUCCESS
+        || ldap_set_option(handle.get(), LDAP_OPT_TIMEOUT, &operationTimeout) != LDAP_OPT_SUCCESS
         || ldap_set_option(handle.get(), LDAP_OPT_X_TLS_REQUIRE_CERT, &requireCertificate) != LDAP_OPT_SUCCESS) {
         return foundation::fail(foundation::ErrorCode::Internal,
                                 "Unable to configure the LDAP TLS policy.");
