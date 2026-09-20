@@ -547,6 +547,7 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     const auto state = parameters->find("state");
     const auto samlResponse = parameters->find("SAMLResponse");
     const auto relayState = parameters->find("RelayState");
+    const auto user = parameters->find("user");
     if (samlCallback) {
         if (samlResponse == parameters->end() || relayState == parameters->end()
             || samlResponse->second.empty() || samlResponse->second.size() > 900U * 1024U
@@ -559,7 +560,9 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         }
     } else if (code == parameters->end() || state == parameters->end()
         || code->second.empty() || code->second.size() > 4096U
-        || state->second.empty() || state->second.size() > 512U) {
+        || state->second.empty() || state->second.size() > 512U
+        || (user != parameters->end()
+            && (user->second.empty() || user->second.size() > 16U * 1024U))) {
         const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
         if (auto redirected = redirectConnectionFailure(failure)) {
             return std::move(*redirected);
@@ -582,6 +585,9 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     } else {
         authenticationResponse.setParameter("code", idp::CredentialValue{code->second});
         authenticationResponse.setParameter("state", idp::CredentialValue{state->second});
+        if (user != parameters->end()) {
+            authenticationResponse.setParameter("user", idp::CredentialValue{user->second});
+        }
     }
     const bool connection = modeCookie.has_value();
     if (connection && *modeCookie != "link") {
