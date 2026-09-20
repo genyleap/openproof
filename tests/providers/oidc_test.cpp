@@ -126,6 +126,26 @@ TEST(OidcProfileClaimTest, ValidatesHttpsPictureUrlStructure)
     }
 }
 
+TEST(OidcProfileClaimTest, RejectsKnownCredentialedPictureEndpoints)
+{
+    using openproof::provider::oidc::detail::knownCredentialedProfilePictureUrl;
+    using openproof::provider::oidc::detail::validPresentationPictureUrl;
+
+    EXPECT_TRUE(knownCredentialedProfilePictureUrl(
+        "https://graph.microsoft.com/v1.0/me/photo/$value"));
+    EXPECT_TRUE(knownCredentialedProfilePictureUrl(
+        "https://GRAPH.MICROSOFT.COM/v1.0/me/photo/$value"));
+    EXPECT_TRUE(knownCredentialedProfilePictureUrl(
+        "https://graph.microsoft.com:443/v1.0/me/photo/$value"));
+    EXPECT_FALSE(knownCredentialedProfilePictureUrl(
+        "https://images.example.test/avatar.png"));
+
+    EXPECT_FALSE(validPresentationPictureUrl(
+        "https://graph.microsoft.com/v1.0/me/photo/$value"));
+    EXPECT_TRUE(validPresentationPictureUrl(
+        "https://lh3.googleusercontent.com/a/example"));
+}
+
 TEST(OidcUserInfoValidationTest, ValidatesBearerCredentialsAndTokenType)
 {
     using openproof::provider::oidc::detail::bearerTokenType;

@@ -93,6 +93,38 @@ inline constexpr std::size_t kPictureUrlMaximum = 2048U;
         || value[authorityEnd] == '/' || value[authorityEnd] == '?';
 }
 
+[[nodiscard]] inline bool knownCredentialedProfilePictureUrl(
+    std::string_view value) noexcept
+{
+    constexpr std::string_view scheme{"https://"};
+    if (!value.starts_with(scheme)) return false;
+    value.remove_prefix(scheme.size());
+
+    const auto authorityEnd = value.find_first_of("/?");
+    auto authority = value.substr(
+        0U, authorityEnd == std::string_view::npos ? value.size() : authorityEnd);
+    if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+        authority = authority.substr(0U, colon);
+    }
+    constexpr std::string_view graphHost{"graph.microsoft.com"};
+    if (authority.size() != graphHost.size()) return false;
+    for (std::size_t index = 0U; index < authority.size(); ++index) {
+        if (static_cast<char>(
+                std::tolower(static_cast<unsigned char>(authority[index])))
+            != graphHost[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool validPresentationPictureUrl(
+    std::string_view value) noexcept
+{
+    return validHttpsProfileUrl(value)
+        && !knownCredentialedProfilePictureUrl(value);
+}
+
 [[nodiscard]] inline bool validBearerAccessToken(std::string_view value) noexcept
 {
     if (value.empty() || value.size() > 4096U) return false;

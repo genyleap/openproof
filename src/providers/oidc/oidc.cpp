@@ -356,7 +356,7 @@ void applyStandardProfileClaims(
         claims.set(idp::ClaimName::Locale, *locale);
     }
     const auto picture = stringValue(source, "picture");
-    if (picture && detail::validHttpsProfileUrl(*picture)) {
+    if (picture && detail::validPresentationPictureUrl(*picture)) {
         claims.set(idp::ClaimName::PictureUrl, *picture);
     }
 }
