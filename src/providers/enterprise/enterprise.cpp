@@ -36,6 +36,8 @@ module;
 #include <openssl/x509.h>
 #include <zlib.h>
 
+#include "presentation.hpp"
+
 module openproof.provider.enterprise;
 
 import openproof.security;
@@ -788,7 +790,7 @@ foundation::Result<idp::AuthenticationOutcome> LdapAuthenticationProvider::compl
 
     idp::VerifiedClaims claims;
     if (!config.m_displayNameAttribute.empty()) {
-        if (auto value = ldapValue(directory->get(), entry, config.m_displayNameAttribute); value && safeToken(*value, 512U)) {
+        if (auto value = ldapValue(directory->get(), entry, config.m_displayNameAttribute); value && detail::safePresentationText(*value)) {
             claims.set(idp::ClaimName::DisplayName, *value);
         }
     }
@@ -976,7 +978,7 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     if (auto email = samlAttribute(assertion, "email"); email && safeToken(*email, 320U)) {
         claims.set(idp::ClaimName::Email, *email);
     }
-    if (auto display = samlAttribute(assertion, "displayName"); display && safeToken(*display, 512U)) {
+    if (auto display = samlAttribute(assertion, "displayName"); display && detail::safePresentationText(*display)) {
         claims.set(idp::ClaimName::DisplayName, *display);
     }
     idp::ProviderEvidence evidence;

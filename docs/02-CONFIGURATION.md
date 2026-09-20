@@ -708,7 +708,7 @@ mandatory. Optional settings are `OPENPROOF_LDAP_CA_FILE`, service-bind
 `OPENPROOF_LDAP_SUBJECT_ATTRIBUTE` (`entryUUID`),
 `OPENPROOF_LDAP_DISPLAY_NAME_ATTRIBUTE` (`cn`) and
 `OPENPROOF_LDAP_EMAIL_ATTRIBUTE` (`mail`). Authentication searches for exactly
-one directory entry and then performs an LDAP bind as that user.
+one directory entry and then performs an LDAP bind as that user. LDAP and SAML display-name attributes are presentation-only, may contain spaces/UTF-8, and are normalized to the 256-character OpenProof profile limit.
 
 SAML is enabled by `OPENPROOF_SAML_IDP_SSO_URL` and additionally requires
 `OPENPROOF_SAML_SP_ENTITY_ID`, `OPENPROOF_SAML_IDP_ENTITY_ID`,
