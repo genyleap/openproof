@@ -214,6 +214,27 @@ TEST(WalletProviderTest, ChallengeUsesTheWalletsRequestedEvmChain)
     }
 }
 
+TEST(WalletProviderTest, ExpiredSiweChallengeFailsBeforeSignatureVerification)
+{
+    fnd::ManualClockSource clock{kNow};
+    web3::WalletAuthenticationProvider provider{walletConfiguration(), clock};
+    auto challenge = provider.beginAuthentication(walletRequest(1U));
+    ASSERT_TRUE(challenge);
+
+    clock.advance(std::chrono::minutes{5});
+    idp::AuthenticationResponse completion{challenge->id(), idp::ClientContext{}};
+    completion.setParameter(
+        "message", idp::CredentialValue{parameter(*challenge, "message")});
+    completion.setParameter("signature", idp::CredentialValue{"0x0102"});
+
+    auto outcome = provider.completeAuthentication(completion);
+
+    ASSERT_FALSE(outcome);
+    EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_NE(outcome.error().internalDetail().find("time window is expired"),
+              std::string::npos);
+}
+
 TEST(WalletProviderTest, ConfigurationCanEnableEoaLoginWithoutAnyRpcDependency)
 {
     auto config = walletConfiguration();
