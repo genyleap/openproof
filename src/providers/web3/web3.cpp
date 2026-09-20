@@ -121,31 +121,78 @@ struct HttpsUrl final {
     });
 }
 
+[[nodiscard]] bool validHttpsHost(std::string_view value) noexcept
+{
+    if (!safeText(value, 253U) || value.starts_with('.') || value.ends_with('.')
+        || value.contains("..") || value.contains(':')) {
+        return false;
+    }
+    return std::ranges::all_of(value, [](char symbol) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        return std::isalnum(byte) != 0 || symbol == '.' || symbol == '-';
+    });
+}
+
 [[nodiscard]] foundation::Result<HttpsUrl> parseHttpsUrl(std::string_view raw)
 {
     constexpr std::string_view prefix{"https://"};
     if (!raw.starts_with(prefix) || raw.size() > 4096U || raw.contains('#')
-        || raw.contains('\\') || raw.find('@', prefix.size()) != std::string_view::npos) {
+        || raw.contains('\\')
+        || std::ranges::any_of(raw, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte <= 0x20U || byte == 0x7FU;
+           })) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A Web3 RPC endpoint must be an HTTPS URL.");
+                                "A Web3 endpoint must be a structurally valid HTTPS URL.");
     }
+
     raw.remove_prefix(prefix.size());
     const auto slash = raw.find('/');
-    std::string_view authority = raw.substr(0U, slash);
-    if (authority.empty()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const auto query = raw.find('?');
+    const auto authorityEnd = std::min(
+        slash == std::string_view::npos ? raw.size() : slash,
+        query == std::string_view::npos ? raw.size() : query);
+    const auto authority = raw.substr(0U, authorityEnd);
+    if (authority.empty() || authority.contains('@')
+        || authority.contains('[') || authority.contains(']')) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A Web3 endpoint has an invalid HTTPS authority.");
+    }
+
     HttpsUrl output;
-    const auto colon = authority.rfind(':');
-    if (colon != std::string_view::npos) {
-        output.host = std::string{authority.substr(0U, colon)};
-        output.port = std::string{authority.substr(colon + 1U)};
-    } else {
-        output.host = std::string{authority};
+    std::string_view host = authority;
+    if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+        if (authority.find(':') != colon) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A Web3 endpoint has an invalid HTTPS authority.");
+        }
+        host = authority.substr(0U, colon);
+        const auto portText = authority.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A Web3 endpoint has an invalid HTTPS port.");
+        }
+        output.port = std::string{portText};
     }
-    if (output.host.empty() || output.port.empty()
-        || !std::ranges::all_of(output.port, [](char value) { return value >= '0' && value <= '9'; })) {
-        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    if (!validHttpsHost(host)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A Web3 endpoint has an invalid HTTPS host.");
     }
-    if (slash != std::string_view::npos) output.target = std::string{raw.substr(slash)};
+    output.host = std::string{host};
+
+    if (authorityEnd < raw.size()) {
+        if (raw[authorityEnd] == '/') {
+            output.target = std::string{raw.substr(authorityEnd)};
+        } else {
+            output.target = "/";
+            output.target.append(raw.substr(authorityEnd));
+        }
+    }
     return output;
 }
 
@@ -475,7 +522,12 @@ struct RpcResponse final { json::value result; };
         beast::get_lowest_layer(stream).connect(endpoints);
         stream.handshake(asio::ssl::stream_base::client);
         http::request<http::string_body> request{http::verb::post, parsed->target, 11};
-        request.set(http::field::host, parsed->host);
+        std::string hostHeader{parsed->host};
+        if (parsed->port != "443") {
+            hostHeader.push_back(':');
+            hostHeader.append(parsed->port);
+        }
+        request.set(http::field::host, hostHeader);
         request.set(http::field::user_agent, "OpenProof/1");
         request.set(http::field::accept, "application/json");
         request.set(http::field::content_type, "application/json");

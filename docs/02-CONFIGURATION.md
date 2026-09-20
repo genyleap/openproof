@@ -667,7 +667,10 @@ additional CA bundle.
   `1=https://...;8453=https://...;42161=https://...;5042=https://rpc.mainnet.arc.io;4663=https://rpc.mainnet.chain.robinhood.com`. Only the matching
   chain-specific endpoint is consulted. The legacy
   `OPENPROOF_ETHEREUM_RPC_ENDPOINT` plus `OPENPROOF_ETHEREUM_CHAIN_ID`
-  pair remains supported as one smart-wallet RPC mapping.
+  pair remains supported as one smart-wallet RPC mapping. RPC endpoints must be
+  structurally valid HTTPS URLs; invalid authorities and ports are rejected at
+  startup. Query-only RPC URLs are sent with a canonical `/?...` request target,
+  and non-default HTTPS ports are preserved in the HTTP `Host` header.
   `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION` is applied to configured wallet RPC
   calls when required.
 - Farcaster: `OPENPROOF_FARCASTER_RPC_ENDPOINT`,
@@ -680,7 +683,8 @@ additional CA bundle.
   statement `Farcaster Auth` and resource `farcaster://fid/<fid>`. OpenProof
   independently rechecks custody or an active type-2 auth address after
   signature verification. Setting `OPENPROOF_FARCASTER_CHAIN_ID` to a value
-  other than `10` is rejected.
+  other than `10` is rejected. The Optimism RPC endpoint is subject to the same
+  strict HTTPS authority and port validation as wallet smart-account RPCs.
 
 Web3 authentication is classified as a possession factor but is not promoted to
 WebAuthn-style phishing resistance.
