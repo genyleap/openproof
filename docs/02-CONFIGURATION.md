@@ -603,9 +603,11 @@ and JWKS HTTPS requests.
   `OPENPROOF_TELEGRAM_CLIENT_SECRET`; optional `OPENPROOF_TELEGRAM_ISSUER`
   (default `https://oauth.telegram.org`). Obtain both values and register the
   exact callback through BotFather. Telegram token exchange uses
-  `client_secret_basic`; keep the bot's ID-token algorithm at the OpenProof-
-  supported default `RS256`. The default scopes are `openid profile`; phone and
-  bot messaging permission are deliberately not requested.
+  `client_secret_basic`; OpenProof applies the RFC 6749 form encoding to the
+  client ID and secret before constructing the HTTP Basic credential. Keep the
+  bot's ID-token algorithm at the OpenProof-supported default `RS256`. The
+  default scopes are `openid profile`; phone and bot messaging permission are
+  deliberately not requested.
 
 OIDC discovery metadata and JWKS are fetched over certificate-verified TLS. When
 the upstream metadata explicitly advertises token-authentication methods, response
