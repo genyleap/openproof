@@ -55,6 +55,8 @@ constexpr auto kClockSkew = std::chrono::seconds{60};
         std::move(detail)};
 }
 
+enum class ChallengeConsumption : std::uint8_t { Accepted, Unknown, Expired };
+
 [[nodiscard]] bool safeText(std::string_view value, std::size_t maximum) noexcept
 {
     return !value.empty() && value.size() <= maximum
@@ -479,11 +481,36 @@ public:
         return value;
     }
 
+    [[nodiscard]] bool rememberChallenge(
+        const idp::ChallengeId& challenge, foundation::Instant expiresAt,
+        foundation::Instant now)
+    {
+        const std::lock_guard guard{mutex};
+        for (auto pending = pendingChallenges.begin(); pending != pendingChallenges.end();) {
+            if (now >= pending->second) pending = pendingChallenges.erase(pending);
+            else ++pending;
+        }
+        return pendingChallenges.emplace(challenge, expiresAt).second;
+    }
+
+    [[nodiscard]] ChallengeConsumption consumeChallenge(
+        const idp::ChallengeId& challenge, foundation::Instant now)
+    {
+        const std::lock_guard guard{mutex};
+        const auto found = pendingChallenges.find(challenge);
+        if (found == pendingChallenges.end()) return ChallengeConsumption::Unknown;
+        const auto expiresAt = found->second;
+        pendingChallenges.erase(found);
+        return now >= expiresAt ? ChallengeConsumption::Expired
+                                : ChallengeConsumption::Accepted;
+    }
+
     OidcProviderConfig config;
     const foundation::ClockSource* clock;
     std::string caFile;
     std::mutex mutex;
     std::optional<Discovery> cached;
+    std::map<idp::ChallengeId, foundation::Instant> pendingChallenges;
 };
 
 OidcProviderConfig::OidcProviderConfig(
@@ -597,8 +624,13 @@ OidcAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest
     url = queryAppend(std::move(url), "code_challenge",
                       foundation::toBase64Url(verifierDigest.value()));
     url = queryAppend(std::move(url), "code_challenge_method", "S256");
-    idp::AuthenticationChallenge challenge{
-        challengeId, m_implementation->clock->now() + m_implementation->config.challengeLifetime()};
+    const auto now = m_implementation->clock->now();
+    const auto expiresAt = now + m_implementation->config.challengeLifetime();
+    if (!m_implementation->rememberChallenge(challengeId, expiresAt, now)) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "The OIDC authentication challenge could not be created.");
+    }
+    idp::AuthenticationChallenge challenge{challengeId, expiresAt};
     challenge.setParameter("authorization_url", std::move(url));
     return challenge;
 }
@@ -606,6 +638,17 @@ OidcAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest
 foundation::Result<idp::AuthenticationOutcome>
 OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
 {
+    const auto challengeNow = m_implementation->clock->now();
+    switch (m_implementation->consumeChallenge(response.challengeId(), challengeNow)) {
+    case ChallengeConsumption::Unknown:
+        return foundation::fail(authFailure(
+            "The OIDC authentication challenge is unknown or already used."));
+    case ChallengeConsumption::Expired:
+        return foundation::fail(authFailure(
+            "The OIDC authentication challenge expired."));
+    case ChallengeConsumption::Accepted:
+        break;
+    }
     const auto code = credential(response.parameters(), "code");
     const auto state = credential(response.parameters(), "state");
     if (!code || !state || code->size() > 4096U || state->size() > 512U) {
