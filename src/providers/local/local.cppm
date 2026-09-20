@@ -161,18 +161,12 @@ public:
     completeAuthentication(const idp::AuthenticationResponse& response) override;
 
 private:
-    struct Pending final {
-        idp::ExternalSubject subject;
-        foundation::Instant expiresAt;
-    };
     idp::ProviderId m_id;
     LocalAccountDirectory* m_accounts;
     identity::core::ExternalIdentityDirectory* m_identities;
     credentials::RecoveryCodeService* m_recoveryCodes;
     const foundation::ClockSource* m_clock;
     foundation::Duration m_challengeLifetime;
-    std::mutex m_mutex;
-    std::map<idp::ChallengeId, Pending> m_pending;
 };
 
 }
