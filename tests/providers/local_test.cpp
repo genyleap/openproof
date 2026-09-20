@@ -53,6 +53,28 @@ accountDirectory()
     return response;
 }
 
+TEST(LocalProviderTest, SubjectInvariantMatchesEnrollmentAndLogin)
+{
+    auto directory = accountDirectory();
+    ASSERT_TRUE(directory);
+    fnd::ManualClockSource clock{kNow};
+    local::LocalAuthenticationProvider provider{
+        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2}};
+
+    const std::string maximum(320U, 'a');
+    const std::string oversized(321U, 'a');
+    ASSERT_TRUE(directory.value()->enroll(
+        idp::ExternalSubject{maximum}, fnd::SecretString{"correct-password"}, std::nullopt));
+    EXPECT_FALSE(directory.value()->enroll(
+        idp::ExternalSubject{oversized}, fnd::SecretString{"correct-password"}, std::nullopt));
+    EXPECT_FALSE(directory.value()->enroll(
+        idp::ExternalSubject{"bad\nsubject"}, fnd::SecretString{"correct-password"}, std::nullopt));
+
+    EXPECT_TRUE(provider.beginAuthentication(requestFor(maximum)));
+    EXPECT_FALSE(provider.beginAuthentication(requestFor(oversized)));
+    EXPECT_FALSE(provider.beginAuthentication(requestFor("bad\rsubject")));
+}
+
 TEST(LocalProviderTest, PasswordOnlyProducesKnowledgeFactorAtIal1)
 {
     auto directory = accountDirectory();
