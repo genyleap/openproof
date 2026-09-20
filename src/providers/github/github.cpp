@@ -14,7 +14,6 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -257,29 +256,6 @@ struct HttpResponse final {
     return found->second.expose();
 }
 
-[[nodiscard]] std::vector<std::string> scopes(std::string_view value)
-{
-    std::vector<std::string> output;
-    std::size_t begin = 0U;
-    while (begin <= value.size()) {
-        const auto end = value.find_first_of(", ", begin);
-        auto scope = value.substr(begin, end == std::string_view::npos ? value.size() - begin : end - begin);
-        if (!scope.empty()) output.emplace_back(scope);
-        if (end == std::string_view::npos) break;
-        begin = end + 1U;
-    }
-    return output;
-}
-
-[[nodiscard]] bool hasEmailScope(std::string_view granted)
-{
-    const auto values = scopes(granted);
-    return std::ranges::any_of(values, [](const std::string& value) {
-        const std::string_view scope{value};
-        return scope == "user:email" || scope == "user";
-    });
-}
-
 [[nodiscard]] bool bearerTokenType(std::string_view value) noexcept
 {
     constexpr std::string_view expected{"bearer"};
@@ -367,7 +343,7 @@ GitHubAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
     std::string url{kAuthorizationEndpoint};
     url = appendQuery(std::move(url), "client_id", m_implementation->config.clientId());
     url = appendQuery(std::move(url), "redirect_uri", m_implementation->config.callbackUri());
-    url = appendQuery(std::move(url), "scope", "read:user user:email");
+    url = appendQuery(std::move(url), "scope", "user:email");
     url = appendQuery(std::move(url), "state", state.value());
     url = appendQuery(std::move(url), "code_challenge", foundation::toBase64Url(digest.value()));
     url = appendQuery(std::move(url), "code_challenge_method", "S256");
@@ -418,9 +394,8 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     const auto tokenType = stringValue(tokenJson->as_object(), "token_type");
     if (!accessToken || !detail::validBearerCredential(*accessToken)
         || !grantedScopes || !detail::validScopeResponse(*grantedScopes)
-        || !hasEmailScope(*grantedScopes)
         || !tokenType || !bearerTokenType(*tokenType)) {
-        return foundation::fail(authFailure("The GitHub token response did not grant the required identity scopes."));
+        return foundation::fail(authFailure("The GitHub token response is invalid."));
     }
 
     auto userResponse = httpsRequest(kApiHost, "/user", http::verb::get, {}, {},
@@ -439,17 +414,19 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
         return foundation::fail(authFailure("The GitHub user identity is incomplete."));
     }
 
-    auto emailResponse = httpsRequest(kApiHost, "/user/emails?per_page=100", http::verb::get, {}, {},
-                                      *accessToken, m_implementation->caFile);
-    if (!emailResponse || emailResponse->status != 200U) {
-        return foundation::fail(authFailure("The GitHub verified-email endpoint failed."));
+    std::optional<std::string> verifiedPrimaryEmail;
+    if (detail::hasEmailScope(*grantedScopes)) {
+        auto emailResponse = httpsRequest(
+            kApiHost, "/user/emails?per_page=100", http::verb::get, {}, {},
+            *accessToken, m_implementation->caFile);
+        if (emailResponse && emailResponse->status == 200U) {
+            auto emailJson = parseJson(emailResponse->body);
+            if (emailJson && emailJson->is_array()) {
+                verifiedPrimaryEmail =
+                    detail::uniqueVerifiedPrimaryEmail(emailJson->as_array());
+            }
+        }
     }
-    auto emailJson = parseJson(emailResponse->body);
-    if (!emailJson || !emailJson->is_array()) {
-        return foundation::fail(authFailure("The GitHub email response is malformed."));
-    }
-    const auto verifiedPrimaryEmail =
-        detail::uniqueVerifiedPrimaryEmail(emailJson->as_array());
 
     idp::VerifiedClaims claims;
     claims.set(idp::ClaimName::PreferredUsername, *login);

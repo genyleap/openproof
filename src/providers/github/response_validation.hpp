@@ -38,11 +38,25 @@ constexpr std::size_t kScopeMaximum = 4096U;
 
 [[nodiscard]] inline bool validScopeResponse(std::string_view value) noexcept
 {
-    return !value.empty() && value.size() <= kScopeMaximum
+    return value.size() <= kScopeMaximum
         && std::ranges::all_of(value, [](char symbol) {
                const auto byte = static_cast<unsigned char>(symbol);
                return byte >= 0x20U && byte <= 0x7EU;
            });
+}
+
+[[nodiscard]] inline bool hasEmailScope(std::string_view granted) noexcept
+{
+    std::size_t begin = 0U;
+    while (begin <= granted.size()) {
+        const auto end = granted.find_first_of(", ", begin);
+        const auto scope = granted.substr(
+            begin, end == std::string_view::npos ? granted.size() - begin : end - begin);
+        if (scope == "user:email" || scope == "user") return true;
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    return false;
 }
 
 [[nodiscard]] inline bool plausibleEmail(std::string_view value) noexcept

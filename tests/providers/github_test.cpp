@@ -69,9 +69,16 @@ TEST(GitHubResponseValidationTest, BoundsCredentialsAndPresentationClaims)
     EXPECT_FALSE(detail::validBearerCredential(
         std::string(detail::kAccessTokenMaximum + 1U, 'a')));
 
+    EXPECT_TRUE(detail::validScopeResponse(""));
     EXPECT_TRUE(detail::validScopeResponse("read:user,user:email"));
     EXPECT_TRUE(detail::validScopeResponse("read:user user:email"));
     EXPECT_FALSE(detail::validScopeResponse("user:email\nrepo"));
+    EXPECT_TRUE(detail::hasEmailScope("user:email"));
+    EXPECT_TRUE(detail::hasEmailScope("read:user,user"));
+    EXPECT_TRUE(detail::hasEmailScope("repo user:email"));
+    EXPECT_FALSE(detail::hasEmailScope(""));
+    EXPECT_FALSE(detail::hasEmailScope("read:user"));
+    EXPECT_FALSE(detail::hasEmailScope("repo,gist"));
 
     EXPECT_TRUE(detail::safeProfileText(
         std::string(detail::kPreferredUsernameMaximum, 'u'),
