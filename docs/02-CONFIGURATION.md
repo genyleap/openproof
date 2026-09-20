@@ -591,9 +591,10 @@ and JWKS HTTPS requests.
   `response_mode=form_post` for Microsoft web sign-in and accepts the callback on
   the shared URL-encoded POST federation endpoint.
 - GitHub: `OPENPROOF_GITHUB_CLIENT_ID`, `OPENPROOF_GITHUB_CLIENT_SECRET`. The
-  provider uses Authorization Code with PKCE, revalidates the authenticated user
-  through the GitHub REST API after every sign-in, and accepts an email claim only
-  when GitHub reports the primary address as verified.
+  provider uses Authorization Code with PKCE, requires a structurally valid HTTPS
+  callback URI, revalidates the authenticated user through the GitHub REST API
+  after every sign-in, and accepts an email claim only when GitHub reports the
+  primary address as verified.
 - LinkedIn: `OPENPROOF_LINKEDIN_CLIENT_ID`, `OPENPROOF_LINKEDIN_CLIENT_SECRET`;
   optional `OPENPROOF_LINKEDIN_ISSUER` (default
   `https://www.linkedin.com/oauth`). Enable the **Sign in with LinkedIn using

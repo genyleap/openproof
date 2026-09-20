@@ -31,6 +31,7 @@ add_executable(openproof_tests
     providers/local_test.cpp
     providers/oidc_test.cpp
     providers/enterprise_test.cpp
+    providers/github_test.cpp
     providers/passkey_test.cpp
     providers/web3_test.cpp
     gateway/gateway_test.cpp
@@ -82,6 +83,7 @@ target_link_libraries(openproof_tests
         openproof_provider_local
         openproof_provider_oidc
         openproof_provider_enterprise
+        openproof_provider_github
         openproof_provider_passkey
         openproof_provider_web3
         openproof_gateway
