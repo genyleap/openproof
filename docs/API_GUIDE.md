@@ -119,7 +119,7 @@ Success sets the secure OpenProof session cookie. Supported session operations:
 | Rotate | `POST /auth/session/rotate` | Replaces the session bearer |
 | Logout current | `POST /auth/logout` | Revokes current session, `204` |
 | Logout all | `POST /auth/logout-all` | Revokes all identity sessions, `204` |
-| Generate recovery codes | `POST /auth/recovery-codes` | IAL2 required; codes returned once |
+| Generate recovery codes | `POST /auth/recovery-codes` | IAL2 + enabled local TOTP required; codes returned once |
 
 For Google, Apple, Microsoft, GitHub, SAML and other configured providers, query
 `GET /auth/providers`. The `providers` array contains redirect-based providers and
@@ -355,7 +355,8 @@ seed requires the current session to satisfy IAL2 in addition to password
 reauthentication. The pending seed is not installed until the confirmation code
 verifies, and failed confirmation attempts are bounded. After authenticating at
 IAL2, generate a fresh one-time recovery-code batch with `POST /auth/recovery-codes`.
-Disabling TOTP uses
+Recovery-code issuance is refused when local TOTP is not enabled, even if the
+current session still carries IAL2 from an earlier authentication. Disabling TOTP uses
 `POST /account/totp/disable`, also requires IAL2 plus the current password, and
 invalidates every outstanding recovery code and pending TOTP enrollment for the
 identity before removing the authenticator.

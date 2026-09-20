@@ -9,6 +9,7 @@ import openproof.credentials;
 import openproof.foundation;
 import openproof.gateway;
 import openproof.identity.provider;
+import openproof.provider.local;
 import openproof.session;
 
 export namespace openproof::authentication::http {
@@ -19,6 +20,7 @@ public:
     AuthenticationHttpApi(AuthenticationService& authentication,
                           session::SessionService& sessions,
                           credentials::RecoveryCodeService& recoveryCodes,
+                          ::openproof::provider::local::LocalAccountDirectory& localAccounts,
                           gateway::TokenBucketRateLimiter& rateLimiter,
                           identity::provider::ProviderId provider,
                           gateway::HttpHandler& fallback);
@@ -38,6 +40,7 @@ private:
     AuthenticationService* m_authentication;
     session::SessionService* m_sessions;
     credentials::RecoveryCodeService* m_recoveryCodes;
+    ::openproof::provider::local::LocalAccountDirectory* m_localAccounts;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     identity::provider::ProviderId m_provider;
     gateway::HttpHandler* m_fallback;
