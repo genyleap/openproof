@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "../../src/providers/oidc/profile_claims.hpp"
+
 import openproof.foundation;
 import openproof.identity.provider;
 import openproof.provider.oidc;
@@ -25,6 +27,43 @@ namespace oidc = openproof::provider::oidc;
         std::vector<std::string>{"openid", "profile"},
         fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
         authentication);
+}
+
+TEST(OidcProfileClaimTest, PrefersStandardNameOverComponents)
+{
+    const auto value = openproof::provider::oidc::detail::displayName(
+        std::string_view{"Ada Byron"}, std::string_view{"Ignored"},
+        std::string_view{"Name"});
+
+    ASSERT_TRUE(value);
+    EXPECT_EQ(*value, "Ada Byron");
+}
+
+TEST(OidcProfileClaimTest, JoinsGivenAndFamilyNameWhenNameIsUnavailable)
+{
+    const auto both = openproof::provider::oidc::detail::displayName(
+        std::nullopt, std::string_view{"Ada"}, std::string_view{"Lovelace"});
+    const auto familyOnly = openproof::provider::oidc::detail::displayName(
+        std::nullopt, std::nullopt, std::string_view{"Lovelace"});
+
+    ASSERT_TRUE(both);
+    EXPECT_EQ(*both, "Ada Lovelace");
+    ASSERT_TRUE(familyOnly);
+    EXPECT_EQ(*familyOnly, "Lovelace");
+}
+
+TEST(OidcProfileClaimTest, IgnoresUnsafeNameComponents)
+{
+    const auto recovered = openproof::provider::oidc::detail::displayName(
+        std::string_view{"Unsafe\nName"}, std::string_view{"Ada"},
+        std::string_view{"Lovelace"});
+    const auto rejected = openproof::provider::oidc::detail::displayName(
+        std::nullopt, std::string_view{"Unsafe\rGiven"},
+        std::string_view{"Unsafe\nFamily"});
+
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(*recovered, "Ada Lovelace");
+    EXPECT_FALSE(rejected);
 }
 
 TEST(OidcProviderConfigTest, PreservesExplicitBasicTokenAuthentication)

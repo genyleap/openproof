@@ -28,6 +28,8 @@ module;
 #include <boost/json.hpp>
 #include <openssl/ssl.h>
 
+#include "profile_claims.hpp"
+
 module openproof.provider.oidc;
 
 import openproof.security;
@@ -328,6 +330,20 @@ struct HttpResult final {
     if (value == nullptr) return false;
     if (value->is_bool()) return value->as_bool();
     return value->is_string() && value->as_string() == "true";
+}
+
+[[nodiscard]] std::optional<std::string> standardDisplayName(
+    const json::object& payload)
+{
+    const auto name = stringValue(payload, "name");
+    const auto given = stringValue(payload, "given_name");
+    const auto family = stringValue(payload, "family_name");
+    const auto view = [](const std::optional<std::string>& value)
+        -> std::optional<std::string_view> {
+        if (!value) return std::nullopt;
+        return std::string_view{*value};
+    };
+    return detail::displayName(view(name), view(given), view(family));
 }
 
 [[nodiscard]] foundation::Result<std::optional<std::string>> appleDisplayName(
@@ -731,9 +747,9 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
         claims.set(idp::ClaimName::Email, *email);
         claims.set(idp::ClaimName::EmailVerified, "true");
     }
-    const auto name = stringValue(payload.value(), "name");
-    if (name && safeText(*name, 512U)) {
-        claims.set(idp::ClaimName::DisplayName, *name);
+    const auto displayName = standardDisplayName(payload.value());
+    if (displayName) {
+        claims.set(idp::ClaimName::DisplayName, *displayName);
     } else if (m_implementation->config.providerId().value() == "apple") {
         auto appleName = appleDisplayName(response.parameters());
         if (!appleName) return foundation::fail(appleName.error());

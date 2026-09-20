@@ -616,9 +616,13 @@ authentication method, configured response mode, or required `S256`. Providers t
 legitimately omit those optional discovery fields remain compatible. The browser
 flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
 accepted only after signature, issuer, audience, expiry, issued-at and nonce
-validation. A previously unseen verified upstream subject may create a new
-canonical identity only for explicitly trusted federation providers; email
-claims are never used to silently link an existing account.
+validation. For presentation metadata, a validated ID Token `name` claim takes
+precedence; when it is absent or unusable, OpenProof composes a display name from
+validated `given_name` and `family_name` claims. Apple's one-time callback name is
+used only as the final Apple-specific fallback. A previously unseen verified
+upstream subject may create a new canonical identity only for explicitly trusted
+federation providers; email claims are never used to silently link an existing
+account.
 
 An authenticated user may explicitly attach any enabled redirect provider with
 `GET /account/connections/start`. This uses the same registered federation
