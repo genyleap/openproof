@@ -21,6 +21,7 @@ namespace idp = identity::provider;
 enum class LocalVerification {
     Password,
     PasswordAndTotp,
+    PasswordAndRecoveryCode,
 };
 
 /** Credential-specific domain boundary used by the local provider. */
@@ -60,6 +61,10 @@ public:
     [[nodiscard]] virtual foundation::Status changePassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) = 0;
+    /** @brief Verifies only the knowledge factor without enforcing an enrolled second factor. */
+    [[nodiscard]] virtual foundation::Status verifyPassword(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) = 0;
     [[nodiscard]] virtual foundation::Result<LocalVerification> verify(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password,
@@ -95,6 +100,9 @@ public:
     [[nodiscard]] foundation::Status changePassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Status verifyPassword(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) override;
     [[nodiscard]] foundation::Result<LocalVerification> verify(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password,
@@ -120,10 +128,11 @@ private:
  */
 class LocalAuthenticationProvider final : public idp::AuthenticationProvider {
 public:
-    LocalAuthenticationProvider(idp::ProviderId id,
-                                LocalAccountDirectory& accounts,
-                                const foundation::ClockSource& clock,
-                                foundation::Duration challengeLifetime);
+    LocalAuthenticationProvider(
+        idp::ProviderId id, LocalAccountDirectory& accounts,
+        const foundation::ClockSource& clock, foundation::Duration challengeLifetime,
+        identity::core::ExternalIdentityDirectory* identities = nullptr,
+        credentials::RecoveryCodeService* recoveryCodes = nullptr);
 
     [[nodiscard]] idp::ProviderId id() const override;
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override;
@@ -140,6 +149,8 @@ private:
     };
     idp::ProviderId m_id;
     LocalAccountDirectory* m_accounts;
+    identity::core::ExternalIdentityDirectory* m_identities;
+    credentials::RecoveryCodeService* m_recoveryCodes;
     const foundation::ClockSource* m_clock;
     foundation::Duration m_challengeLifetime;
     std::mutex m_mutex;

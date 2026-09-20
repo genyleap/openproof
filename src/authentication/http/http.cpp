@@ -272,7 +272,8 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
 {
     auto body = parseObject(request);
     if (!body.has_value()
-        || !onlyFields(body.value(), {"transaction_id", "challenge_id", "password", "totp"})) {
+        || !onlyFields(body.value(),
+                       {"transaction_id", "challenge_id", "password", "totp", "recovery_code"})) {
         return error(body.has_value() ? foundation::Error{foundation::ErrorCode::InvalidArgument}
                                       : body.error(), request, true);
     }
@@ -280,9 +281,11 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     auto challenge = requiredString(body.value(), "challenge_id", 128U);
     auto password = requiredString(body.value(), "password", 1024U);
     auto totp = optionalString(body.value(), "totp", 8U);
+    auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
     const auto continuation = cookieValue(request, kPreauthCookie);
     const auto bindingToken = cookieValue(request, kBindingCookie);
-    if (!transaction || !challenge || !password || !totp
+    if (!transaction || !challenge || !password || !totp || !recoveryCode
+        || (totp->has_value() && recoveryCode->has_value())
         || !continuation.has_value() || !bindingToken.has_value()) {
         return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},
                      request, true);
@@ -296,6 +299,11 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     if (totp->has_value()) {
         authenticationResponse.setParameter(
             "totp", idp::CredentialValue{std::move(totp).value().value()});
+    }
+    if (recoveryCode->has_value()) {
+        authenticationResponse.setParameter(
+            "recovery_code",
+            idp::CredentialValue{std::move(recoveryCode).value().value()});
     }
     auto verified = m_authentication->complete(
         idp::TransactionId{std::move(transaction).value()},

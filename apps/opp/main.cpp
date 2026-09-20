@@ -1397,7 +1397,8 @@ addProtectedRoutes(gateway::Router& router,
 
     idp::ProviderRegistry providers;
     auto provider = std::make_unique<local::LocalAuthenticationProvider>(
-        providerId, *accounts.value(), clock, std::chrono::minutes{5});
+        providerId, *accounts.value(), clock, std::chrono::minutes{5},
+        &externalIdentities, &recoveryCodes.value());
     const fnd::Status registered = providers.registerProvider(std::move(provider));
     auth::ProviderTrustPolicy trust;
     const fnd::Status trusted = trust.trust(providerId, idp::AssuranceLevel::Ial2);

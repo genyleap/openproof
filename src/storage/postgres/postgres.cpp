@@ -2203,6 +2203,52 @@ foundation::Status PostgresLocalAccountDirectory::changePassword(
         : foundation::fail(authenticationFailure("Local account is unknown."));
 }
 
+foundation::Status PostgresLocalAccountDirectory::verifyPassword(
+    const identity::provider::ExternalSubject& subject,
+    const foundation::SecretString& password)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT e.identity_id,p.password_hash FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(result.get())) {
+        return foundation::fail(databaseError(result.get(), "verify local password"));
+    }
+    if (PQntuples(result.get()) != 1) {
+        auto dummy = m_passwordHasher.verify(password, m_dummyHash);
+        if (!dummy) return foundation::fail(dummy.error());
+        return foundation::fail(authenticationFailure("Local account is unknown or inactive."));
+    }
+    const std::string identityId = field(result.get(), 0, 0);
+    const std::string encodedHash = field(result.get(), 0, 1);
+    auto parsedHash = credentials::PasswordHash::parse(encodedHash);
+    if (!parsedHash) return foundation::fail(parsedHash.error());
+    auto passwordMatches = m_passwordHasher.verify(password, parsedHash.value());
+    if (!passwordMatches) return foundation::fail(passwordMatches.error());
+    if (!passwordMatches.value()) {
+        return foundation::fail(authenticationFailure("Local credential verification failed."));
+    }
+    ResultPointer current = execParams(lease->get(),
+        "SELECT 1 FROM openproof.password_credentials p "
+        "JOIN openproof.identities i ON i.id=p.identity_id AND i.status=0 "
+        "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+        "WHERE p.identity_id=$1 AND p.password_hash=$2 AND e.provider=$3 "
+        "AND e.external_subject=$4",
+        {identityId, encodedHash, std::string{m_provider.value()},
+         std::string{subject.value()}});
+    if (!tuplesOk(current.get())) {
+        return foundation::fail(databaseError(current.get(), "confirm local password"));
+    }
+    return PQntuples(current.get()) == 1
+        ? foundation::ok()
+        : foundation::fail(authenticationFailure(
+            "Local credential changed during verification."));
+}
+
 foundation::Result<provider::local::LocalVerification>
 PostgresLocalAccountDirectory::verify(
     const identity::provider::ExternalSubject& subject,

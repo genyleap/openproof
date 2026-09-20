@@ -107,6 +107,11 @@ curl --fail-with-body -b openproof.cookies -c openproof.cookies \
   }'
 ```
 
+A one-time recovery code may replace TOTP while the password remains mandatory.
+Send `"recovery_code":"RECOVERY_CODE"` instead of `totp`; never send both.
+A valid password plus recovery code produces an IAL2 local session and consumes
+that recovery code exactly once.
+
 Success sets the secure OpenProof session cookie. Supported session operations:
 
 | Operation | Call | Result |

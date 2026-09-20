@@ -237,7 +237,7 @@ to the HMAC audit chain and security-event outbox.
 | Method and path | Purpose | Authentication |
 |---|---|---|
 | `POST /auth/login` | Begin a single-use, client-bound local login | none |
-| `POST /auth/mfa/verify` | Verify password and optional TOTP, then issue a session | pre-auth cookies |
+| `POST /auth/mfa/verify` | Verify password plus optional TOTP or one-time recovery code, then issue a session | pre-auth cookies |
 | `POST /auth/session/rotate` | Atomically replace the current session | session cookie or Bearer |
 | `POST /auth/logout` | Revoke the current session | session cookie or Bearer |
 | `POST /auth/logout-all` | Revoke every session for the identity | session cookie or Bearer |

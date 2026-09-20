@@ -191,6 +191,28 @@ foundation::Status InMemoryLocalAccountDirectory::changePassword(
     return foundation::ok();
 }
 
+foundation::Status InMemoryLocalAccountDirectory::verifyPassword(
+    const idp::ExternalSubject& subject, const foundation::SecretString& password)
+{
+    Account* account = nullptr;
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_accounts.find(subject);
+        if (found != m_accounts.end()) account = found->second.get();
+    }
+    if (account == nullptr) {
+        const auto dummyResult = m_passwordHasher.verify(password, m_dummyHash);
+        if (!dummyResult.has_value()) return foundation::fail(dummyResult.error());
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    const std::lock_guard<std::mutex> accountGuard{account->mutex};
+    auto passwordMatches = m_passwordHasher.verify(password, account->password);
+    if (!passwordMatches.has_value()) return foundation::fail(passwordMatches.error());
+    return passwordMatches.value()
+        ? foundation::ok()
+        : foundation::fail(authenticationFailure("Local password did not verify."));
+}
+
 foundation::Result<LocalVerification> InMemoryLocalAccountDirectory::verify(
     const idp::ExternalSubject& subject, const foundation::SecretString& password,
     std::optional<std::string_view> totp, foundation::Instant now)
@@ -236,11 +258,17 @@ foundation::Result<LocalVerification> InMemoryLocalAccountDirectory::verify(
 
 LocalAuthenticationProvider::LocalAuthenticationProvider(
     idp::ProviderId id, LocalAccountDirectory& accounts,
-    const foundation::ClockSource& clock,
-    foundation::Duration challengeLifetime)
-    : m_id(std::move(id)), m_accounts(&accounts), m_clock(&clock),
+    const foundation::ClockSource& clock, foundation::Duration challengeLifetime,
+    identity::core::ExternalIdentityDirectory* identities,
+    credentials::RecoveryCodeService* recoveryCodes)
+    : m_id(std::move(id)), m_accounts(&accounts), m_identities(identities),
+      m_recoveryCodes(recoveryCodes), m_clock(&clock),
       m_challengeLifetime(challengeLifetime)
 {
+    if ((m_identities == nullptr) != (m_recoveryCodes == nullptr)) {
+        m_identities = nullptr;
+        m_recoveryCodes = nullptr;
+    }
 }
 
 idp::ProviderId LocalAuthenticationProvider::id() const { return m_id; }
@@ -312,19 +340,58 @@ LocalAuthenticationProvider::completeAuthentication(
         return foundation::fail(authenticationFailure("Local password is missing."));
     }
     foundation::SecretString password{std::string{passwordValue.value()}};
-    const auto verified = m_accounts->verify(
-        pending->subject, password, parameter(response.parameters(), "totp"), now);
-    if (!verified.has_value()) {
+    const auto totpValue = parameter(response.parameters(), "totp");
+    const auto recoveryValue = parameter(response.parameters(), "recovery_code");
+    if (totpValue.has_value() && recoveryValue.has_value()) {
         return foundation::fail(authenticationFailure(
-            std::string{"Local credential verification failed: "}
-            + std::string{verified.error().internalDetail()}));
+            "TOTP and recovery code cannot be presented together."));
+    }
+
+    LocalVerification verified = LocalVerification::Password;
+    if (recoveryValue.has_value()) {
+        if (m_identities == nullptr || m_recoveryCodes == nullptr) {
+            return foundation::fail(authenticationFailure(
+                "Recovery-code authentication is not configured."));
+        }
+        auto passwordVerified = m_accounts->verifyPassword(pending->subject, password);
+        if (!passwordVerified.has_value()) {
+            return foundation::fail(authenticationFailure(
+                std::string{"Local credential verification failed: "}
+                + std::string{passwordVerified.error().internalDetail()}));
+        }
+        const identity::core::ExternalIdentityRef external{m_id, pending->subject};
+        auto owner = m_identities->ownerOf(external);
+        if (!owner.has_value() || !owner->has_value()) {
+            return foundation::fail(authenticationFailure(
+                "Recovery-code authentication could not resolve the local identity."));
+        }
+        foundation::SecretString recoveryCode{std::string{recoveryValue.value()}};
+        auto consumed = m_recoveryCodes->consume(owner->value(), recoveryCode);
+        if (!consumed.has_value()) {
+            return foundation::fail(authenticationFailure(
+                "Recovery code did not verify."));
+        }
+        verified = LocalVerification::PasswordAndRecoveryCode;
+    } else {
+        auto credentialVerified = m_accounts->verify(
+            pending->subject, password, totpValue, now);
+        if (!credentialVerified.has_value()) {
+            return foundation::fail(authenticationFailure(
+                std::string{"Local credential verification failed: "}
+                + std::string{credentialVerified.error().internalDetail()}));
+        }
+        verified = credentialVerified.value();
     }
 
     idp::VerifiedClaims claims;
     idp::ProviderEvidence evidence;
-    evidence.add("method", verified.value() == LocalVerification::Password
-                               ? "password" : "password_totp");
-    const bool multiFactor = verified.value() == LocalVerification::PasswordAndTotp;
+    const std::string_view method = verified == LocalVerification::Password
+        ? "password"
+        : verified == LocalVerification::PasswordAndTotp
+            ? "password_totp"
+            : "password_recovery_code";
+    evidence.add("method", std::string{method});
+    const bool multiFactor = verified != LocalVerification::Password;
     const idp::AuthenticationFactor factors = multiFactor
         ? idp::AuthenticationFactor::Knowledge | idp::AuthenticationFactor::Possession
         : idp::AuthenticationFactor::Knowledge;
