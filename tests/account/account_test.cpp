@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,25 @@ namespace local = openproof::provider::local;
 namespace sess = openproof::session;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'790'000'000'000}};
+
+[[nodiscard]] std::string decodeBase32(std::string_view value)
+{
+    constexpr std::string_view alphabet{"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"};
+    std::string output;
+    std::uint32_t buffer = 0U;
+    unsigned int bits = 0U;
+    for (const char symbol : value) {
+        const auto position = alphabet.find(symbol);
+        if (position == std::string_view::npos) return {};
+        buffer = (buffer << 5U) | static_cast<std::uint32_t>(position);
+        bits += 5U;
+        if (bits >= 8U) {
+            bits -= 8U;
+            output.push_back(static_cast<char>((buffer >> bits) & 0xffU));
+        }
+    }
+    return output;
+}
 
 class CapturingDelivery final : public account::VerificationDelivery {
 public:
@@ -77,6 +97,9 @@ struct Fixture {
     Fixture()
         : localAccounts(localDirectory())
         , sessions(sessionRepository, clock, sessionKey(), sessionPolicy())
+        , recoveryService(cred::RecoveryCodeService::create(
+              recoveryRepository,
+              fnd::SecretString{"abcdef0123456789abcdef0123456789"}).value())
     {
         auto key = account::VerificationKey::create(
             fnd::SecretString{"0123456789abcdef0123456789abcdef"});
@@ -88,7 +111,7 @@ struct Fixture {
         service = std::make_unique<account::AccountService>(
             organization, localProvider, phoneProvider,
             identities, externalIdentities, profiles, *localAccounts,
-            accountRepository, sessions, clock,
+            recoveryService, accountRepository, sessions, clock,
             std::move(key).value(), policy.value(), delivery);
     }
 
@@ -120,6 +143,8 @@ struct Fixture {
     account::InMemoryAccountRepository accountRepository;
     sess::InMemorySessionRepository sessionRepository;
     sess::SessionService sessions;
+    cred::InMemoryRecoveryCodeRepository recoveryRepository;
+    cred::RecoveryCodeService recoveryService;
     CapturingDelivery delivery;
     std::unique_ptr<account::AccountService> service;
 };
@@ -278,6 +303,116 @@ TEST(AccountEmailLinkingTest, ExistingPasswordSignInRebindsOnlyAfterVerifiedEmai
     EXPECT_FALSE(oldOwner->has_value());
     ASSERT_TRUE(newOwner->has_value());
     EXPECT_EQ(newOwner->value(), identity);
+}
+
+TEST(AccountTotpEnrollmentTest, FirstEnrollmentNeedsPasswordAndReplacementNeedsIal2)
+{
+    Fixture fixture;
+    const fnd::SecretString password{"correct-password"};
+    auto signup = fixture.service->signup(
+        "totp@example.com", password, std::string{"TOTP Example"});
+    ASSERT_TRUE(signup);
+    const auto identity = signup.value();
+
+    const fnd::SecretString signupProof{fixture.delivery.secret};
+    ASSERT_TRUE(fixture.service->verifyEmail(
+        account::VerificationId{fixture.delivery.id}, signupProof));
+
+    const fnd::SecretString wrongPassword{"wrong-password"};
+    auto wrong = fixture.service->beginTotpEnrollment(
+        identity, wrongPassword, idp::AssuranceLevel::Ial1);
+    ASSERT_FALSE(wrong);
+    EXPECT_EQ(wrong.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    auto started = fixture.service->beginTotpEnrollment(
+        identity, password, idp::AssuranceLevel::Ial1);
+    ASSERT_TRUE(started) << started.error().internalDetail();
+    EXPECT_FALSE(started->replacing());
+
+    const std::string raw = decodeBase32(started->secretBase32().expose());
+    ASSERT_EQ(raw.size(), 20U);
+    auto secret = cred::TotpSecret::create(fnd::SecretString{raw});
+    ASSERT_TRUE(secret);
+    auto code = cred::totpAt(secret.value(), cred::TotpPolicy::recommended(), kNow);
+    ASSERT_TRUE(code);
+
+    auto malformed = fixture.service->completeTotpEnrollment(
+        identity, started->id(), "12", idp::AssuranceLevel::Ial1);
+    ASSERT_FALSE(malformed);
+    EXPECT_EQ(malformed.error().code(), fnd::ErrorCode::InvalidArgument);
+
+    ASSERT_TRUE(fixture.service->completeTotpEnrollment(
+        identity, started->id(), code.value(), idp::AssuranceLevel::Ial1));
+
+    auto enabled = fixture.service->totpEnabled(identity);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(enabled->has_value());
+    EXPECT_TRUE(enabled->value());
+
+    auto weakReplacement = fixture.service->beginTotpEnrollment(
+        identity, password, idp::AssuranceLevel::Ial1);
+    ASSERT_FALSE(weakReplacement);
+    EXPECT_EQ(weakReplacement.error().code(), fnd::ErrorCode::AssuranceInsufficient);
+
+    auto strongReplacement = fixture.service->beginTotpEnrollment(
+        identity, password, idp::AssuranceLevel::Ial2);
+    ASSERT_TRUE(strongReplacement);
+    EXPECT_TRUE(strongReplacement->replacing());
+
+    const std::string replacementRaw =
+        decodeBase32(strongReplacement->secretBase32().expose());
+    auto replacementSecret =
+        cred::TotpSecret::create(fnd::SecretString{replacementRaw});
+    ASSERT_TRUE(replacementSecret);
+    auto replacementCode = cred::totpAt(
+        replacementSecret.value(), cred::TotpPolicy::recommended(), kNow);
+    ASSERT_TRUE(replacementCode);
+
+    auto weakCompletion = fixture.service->completeTotpEnrollment(
+        identity, strongReplacement->id(), replacementCode.value(),
+        idp::AssuranceLevel::Ial1);
+    ASSERT_FALSE(weakCompletion);
+    EXPECT_EQ(weakCompletion.error().code(), fnd::ErrorCode::AssuranceInsufficient);
+
+    ASSERT_TRUE(fixture.service->completeTotpEnrollment(
+        identity, strongReplacement->id(), replacementCode.value(),
+        idp::AssuranceLevel::Ial2));
+
+    auto recoveryBatch = fixture.recoveryService.issue(identity, 2U);
+    ASSERT_TRUE(recoveryBatch);
+    ASSERT_EQ(recoveryBatch->codes().size(), 2U);
+    const fnd::SecretString recoveryCode{
+        std::string{recoveryBatch->codes().front().expose()}};
+
+    auto weakDisable = fixture.service->disableTotp(
+        identity, password, idp::AssuranceLevel::Ial1);
+    ASSERT_FALSE(weakDisable);
+    EXPECT_EQ(weakDisable.error().code(), fnd::ErrorCode::AssuranceInsufficient);
+
+    auto wrongDisable = fixture.service->disableTotp(
+        identity, wrongPassword, idp::AssuranceLevel::Ial2);
+    ASSERT_FALSE(wrongDisable);
+    EXPECT_EQ(wrongDisable.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    auto pendingReplacement = fixture.service->beginTotpEnrollment(
+        identity, password, idp::AssuranceLevel::Ial2);
+    ASSERT_TRUE(pendingReplacement);
+
+    ASSERT_TRUE(fixture.service->disableTotp(
+        identity, password, idp::AssuranceLevel::Ial2));
+    enabled = fixture.service->totpEnabled(identity);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(enabled->has_value());
+    EXPECT_FALSE(enabled->value());
+    EXPECT_EQ(fixture.recoveryRepository.remaining(identity).value(), 0U);
+
+    auto staleRecovery = fixture.recoveryService.consume(identity, recoveryCode);
+    EXPECT_FALSE(staleRecovery);
+
+    auto staleEnrollment = fixture.service->completeTotpEnrollment(
+        identity, pendingReplacement->id(), "000000", idp::AssuranceLevel::Ial2);
+    EXPECT_FALSE(staleEnrollment);
+    EXPECT_EQ(staleEnrollment.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
 } // namespace

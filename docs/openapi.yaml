@@ -230,6 +230,126 @@ paths:
         "200":
           description: Password replaced and existing sessions revoked.
         "400": {$ref: "#/components/responses/Error"}
+  /account/totp:
+    get:
+      tags: [Account]
+      operationId: getTotpStatus
+      summary: Report whether local TOTP is available and enabled for the current identity.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: Current TOTP state and session assurance.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [available, enabled, assurance]
+                properties:
+                  available: {type: boolean}
+                  enabled: {type: boolean}
+                  assurance: {type: string, enum: [ial0, ial1, ial2, ial3, ial4]}
+        "401": {$ref: "#/components/responses/Error"}
+  /account/totp/start:
+    post:
+      tags: [Account]
+      operationId: beginTotpEnrollment
+      summary: Begin or replace local TOTP enrollment after password reauthentication.
+      description: Replacing an existing TOTP authenticator additionally requires the current session to satisfy IAL2.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: {type: string, format: password, maxLength: 1024}
+      responses:
+        "201":
+          description: Short-lived enrollment material. The Base32 secret is returned only for this pending enrollment.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [enrollment_id, secret_base32, expires_at_ms, replacing]
+                properties:
+                  enrollment_id: {type: string, maxLength: 200}
+                  secret_base32: {type: string}
+                  expires_at_ms: {type: integer, format: int64}
+                  replacing: {type: boolean}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
+  /account/totp/complete:
+    post:
+      tags: [Account]
+      operationId: completeTotpEnrollment
+      summary: Verify the authenticator code and atomically install the pending TOTP seed.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enrollment_id, code]
+              properties:
+                enrollment_id: {type: string, maxLength: 200}
+                code: {type: string, pattern: "^[0-9]{6}$", maxLength: 8}
+      responses:
+        "200":
+          description: TOTP authenticator enabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [enabled]
+                properties:
+                  enabled: {type: boolean, const: true}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
+  /account/totp/disable:
+    post:
+      tags: [Account]
+      operationId: disableTotp
+      summary: Disable local TOTP after strong-session and password reauthentication.
+      description: Requires IAL2. Outstanding recovery codes and pending TOTP enrollments are invalidated before the authenticator is removed.
+      security: [{sessionCookie: []}, {bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: {type: string, format: password, maxLength: 1024}
+      responses:
+        "200":
+          description: TOTP disabled and recovery codes revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [enabled, recovery_codes_revoked]
+                properties:
+                  enabled: {type: boolean, const: false}
+                  recovery_codes_revoked: {type: boolean, const: true}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "412": {$ref: "#/components/responses/Error"}
   /account/profile:
     get:
       tags: [Account]

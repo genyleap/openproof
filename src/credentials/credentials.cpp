@@ -431,12 +431,21 @@ foundation::Status InMemoryRecoveryCodeRepository::replace(
     const identity::core::IdentityId& identity,
     std::vector<RecoveryCodeDigest> digests)
 {
-    if (identity.empty() || digests.empty()) {
+    if (identity.empty() || digests.size() > 64U) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "Recovery codes require an identity and at least one digest.");
+                                "The recovery-code replacement is invalid.");
+    }
+    std::ranges::sort(digests);
+    if (std::ranges::adjacent_find(digests) != digests.end()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Recovery-code digests must be unique.");
     }
     const std::lock_guard<std::mutex> guard{m_mutex};
-    m_codes.insert_or_assign(identity, std::move(digests));
+    if (digests.empty()) {
+        m_codes.erase(identity);
+    } else {
+        m_codes.insert_or_assign(identity, std::move(digests));
+    }
     return foundation::ok();
 }
 
@@ -528,6 +537,16 @@ foundation::Status RecoveryCodeService::consume(
         return foundation::fail(fingerprint.error());
     }
     return m_repository->consume(identity, fingerprint.value());
+}
+
+foundation::Status RecoveryCodeService::revoke(
+    const identity::core::IdentityId& identity)
+{
+    if (identity.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Recovery-code revocation requires an identity.");
+    }
+    return m_repository->replace(identity, {});
 }
 
 }

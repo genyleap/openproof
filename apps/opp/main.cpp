@@ -1988,7 +1988,7 @@ addProtectedRoutes(gateway::Router& router,
             providerId,
             idp::ProviderId{std::string{platform.account().phoneProviderId()}},
             identities, externalIdentities, identityProviderStore,
-            *accounts.value(), accountRepository, sessions, clock,
+            *accounts.value(), recoveryCodes.value(), accountRepository, sessions, clock,
             std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
         accountHttp::AccountHttpApi accountApi{
             accountService, authentication, sessions, limiter.value(), fallback, delegated};

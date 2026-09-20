@@ -346,6 +346,15 @@ public:
     [[nodiscard]] foundation::Status verifyPassword(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Result<bool> hasTotp(
+        const identity::provider::ExternalSubject& subject) override;
+    [[nodiscard]] foundation::Status replaceTotp(
+        const identity::provider::ExternalSubject& subject,
+        credentials::TotpSecret& secret,
+        std::string_view verificationCode,
+        foundation::Instant now) override;
+    [[nodiscard]] foundation::Status removeTotp(
+        const identity::provider::ExternalSubject& subject) override;
     [[nodiscard]] foundation::Result<provider::local::LocalVerification> verify(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password,

@@ -178,6 +178,51 @@ TEST(LocalProviderTest, RecoveryCodeIsSecondFactorAndWrongPasswordDoesNotConsume
     EXPECT_EQ(replayed.error().code(), fnd::ErrorCode::AuthenticationFailed);
 }
 
+TEST(LocalProviderTest, RecoveryCodeIsRejectedWhenTotpIsDisabled)
+{
+    auto directory = accountDirectory();
+    ASSERT_TRUE(directory);
+    ASSERT_TRUE(directory.value()->enroll(
+        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"}, std::nullopt));
+
+    core::InMemoryExternalIdentityDirectory identities;
+    const core::IdentityId identity{"identity-no-totp"};
+    auto link = core::IdentityLink::request(
+        identity,
+        core::ExternalIdentityRef{idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"alice"}},
+        kNow, std::chrono::minutes{5});
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(identities.attach(link.value()));
+
+    cred::InMemoryRecoveryCodeRepository recoveryRepository;
+    auto recovery = cred::RecoveryCodeService::create(
+        recoveryRepository,
+        fnd::SecretString{"abcdef0123456789abcdef0123456789"});
+    ASSERT_TRUE(recovery);
+    auto batch = recovery->issue(identity, 1U);
+    ASSERT_TRUE(batch);
+    const std::string code{batch->codes().front().expose()};
+
+    fnd::ManualClockSource clock{kNow};
+    local::LocalAuthenticationProvider provider{
+        idp::ProviderId{"local"}, *directory.value(), clock, std::chrono::minutes{2},
+        &identities, &recovery.value()};
+    auto challenge = provider.beginAuthentication(requestFor("alice"));
+    ASSERT_TRUE(challenge);
+    auto response = responseFor(challenge->id(), "correct-password");
+    response.setParameter("recovery_code", idp::CredentialValue{code});
+    auto rejected = provider.completeAuthentication(response);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    auto remaining = recoveryRepository.remaining(identity);
+    ASSERT_TRUE(remaining);
+    EXPECT_EQ(remaining.value(), 1U);
+}
+
 TEST(LocalProviderTest, FailedAttemptBurnsChallengeAndDoesNotRevealAccountExistence)
 {
     auto directory = accountDirectory();

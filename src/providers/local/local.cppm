@@ -65,6 +65,14 @@ public:
     [[nodiscard]] virtual foundation::Status verifyPassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) = 0;
+    [[nodiscard]] virtual foundation::Result<bool> hasTotp(
+        const idp::ExternalSubject& subject) = 0;
+    /** Verifies the enrollment code, then installs/replaces the TOTP seed atomically. */
+    [[nodiscard]] virtual foundation::Status replaceTotp(
+        const idp::ExternalSubject& subject, credentials::TotpSecret& secret,
+        std::string_view verificationCode, foundation::Instant now) = 0;
+    [[nodiscard]] virtual foundation::Status removeTotp(
+        const idp::ExternalSubject& subject) = 0;
     [[nodiscard]] virtual foundation::Result<LocalVerification> verify(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password,
@@ -103,6 +111,13 @@ public:
     [[nodiscard]] foundation::Status verifyPassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Result<bool> hasTotp(
+        const idp::ExternalSubject& subject) override;
+    [[nodiscard]] foundation::Status replaceTotp(
+        const idp::ExternalSubject& subject, credentials::TotpSecret& secret,
+        std::string_view verificationCode, foundation::Instant now) override;
+    [[nodiscard]] foundation::Status removeTotp(
+        const idp::ExternalSubject& subject) override;
     [[nodiscard]] foundation::Result<LocalVerification> verify(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password,

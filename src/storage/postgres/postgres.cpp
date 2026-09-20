@@ -2249,6 +2249,93 @@ foundation::Status PostgresLocalAccountDirectory::verifyPassword(
             "Local credential changed during verification."));
 }
 
+foundation::Result<bool> PostgresLocalAccountDirectory::hasTotp(
+    const identity::provider::ExternalSubject& subject)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer result = execParams(lease->get(),
+        "SELECT EXISTS("
+        "SELECT 1 FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "JOIN openproof.totp_credentials t ON t.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2)",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+        return foundation::fail(databaseError(result.get(), "check local TOTP"));
+    }
+    return field(result.get(), 0, 0) == "t";
+}
+
+foundation::Status PostgresLocalAccountDirectory::replaceTotp(
+    const identity::provider::ExternalSubject& subject,
+    credentials::TotpSecret& secret,
+    std::string_view verificationCode,
+    foundation::Instant now)
+{
+    auto accepted = credentials::verifyTotp(
+        secret, m_totpPolicy, verificationCode, now, std::nullopt);
+    if (!accepted) return foundation::fail(accepted.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+    ResultPointer owner = execParams(connection,
+        "SELECT e.identity_id FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(owner.get())) {
+        return foundation::fail(databaseError(owner.get(), "resolve local TOTP owner"));
+    }
+    if (PQntuples(owner.get()) != 1) {
+        return foundation::fail(authenticationFailure("Local account is unknown or inactive."));
+    }
+    const std::string identityId = field(owner.get(), 0, 0);
+    auto encrypted = security::sealAes256Gcm(
+        m_totpKey, secret.bytes(), "openproof/totp/v1:" + identityId);
+    if (!encrypted) return foundation::fail(encrypted.error());
+
+    ResultPointer stored = execParams(connection,
+        "INSERT INTO openproof.totp_credentials("
+        "identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+        "VALUES($1,decode($2,'hex'),$3,$4,(extract(epoch FROM clock_timestamp())*1000)::bigint) "
+        "ON CONFLICT(identity_id) DO UPDATE SET "
+        "encrypted_seed=EXCLUDED.encrypted_seed,key_version=EXCLUDED.key_version,"
+        "last_accepted_step=EXCLUDED.last_accepted_step,enrolled_at_ms=EXCLUDED.enrolled_at_ms",
+        {identityId, foundation::toHex(encrypted.value()), std::to_string(m_keyVersion),
+         std::to_string(accepted.value())});
+    if (!commandOk(stored.get())) {
+        return foundation::fail(databaseError(stored.get(), "replace local TOTP"));
+    }
+    return foundation::ok();
+}
+
+foundation::Status PostgresLocalAccountDirectory::removeTotp(
+    const identity::provider::ExternalSubject& subject)
+{
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer removed = execParams(lease->get(),
+        "DELETE FROM openproof.totp_credentials t USING "
+        "openproof.external_identities e, openproof.identities i, "
+        "openproof.password_credentials p "
+        "WHERE t.identity_id=e.identity_id AND i.id=e.identity_id AND i.status=0 "
+        "AND p.identity_id=e.identity_id AND e.provider=$1 AND e.external_subject=$2 "
+        "RETURNING t.identity_id",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(removed.get())) {
+        return foundation::fail(databaseError(removed.get(), "remove local TOTP"));
+    }
+    if (PQntuples(removed.get()) != 1) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "TOTP is not enabled for this local account.");
+    }
+    return foundation::ok();
+}
+
 foundation::Result<provider::local::LocalVerification>
 PostgresLocalAccountDirectory::verify(
     const identity::provider::ExternalSubject& subject,

@@ -6,6 +6,7 @@ module;
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -23,6 +24,9 @@ namespace {
 constexpr std::size_t kIdentityEntropyBytes = 24U;
 constexpr std::size_t kVerificationIdEntropyBytes = 24U;
 constexpr std::size_t kEmailSecretEntropyBytes = 24U;
+constexpr std::size_t kTotpEnrollmentIdEntropyBytes = 24U;
+constexpr foundation::Duration kTotpEnrollmentLifetime = std::chrono::minutes{10};
+constexpr std::uint32_t kTotpEnrollmentMaximumAttempts = 5U;
 
 [[nodiscard]] bool validEmail(std::string_view value) noexcept
 {
@@ -149,6 +153,7 @@ AccountService::AccountService(
     identity::core::ExternalIdentityDirectory& externalIdentities,
     identity::profile::IdentityProfileRepository& profiles,
     provider::local::LocalAccountDirectory& localAccounts,
+    credentials::RecoveryCodeService& recoveryCodes,
     AccountRepository& repository,
     session::SessionService& sessions,
     const foundation::ClockSource& clock,
@@ -157,7 +162,8 @@ AccountService::AccountService(
     : m_organization(std::move(organization)), m_localProvider(std::move(localProvider)),
       m_phoneProvider(std::move(phoneProvider)), m_identities(&identities),
       m_externalIdentities(&externalIdentities), m_profiles(&profiles),
-      m_localAccounts(&localAccounts), m_repository(&repository),
+      m_localAccounts(&localAccounts), m_recoveryCodes(&recoveryCodes),
+      m_repository(&repository),
       m_sessions(&sessions), m_clock(&clock), m_key(std::move(key)),
       m_policy(policy), m_delivery(&delivery)
 {
@@ -702,5 +708,187 @@ foundation::Result<identity::profile::IdentityProfile> AccountService::profile(
     return requireProfile(identity);
 }
 
+foundation::Result<std::optional<identity::provider::ExternalSubject>>
+AccountService::localSubject(const identity::core::IdentityId& identity) const
+{
+    auto connections = m_externalIdentities->externalIdentitiesOf(identity);
+    if (!connections) return foundation::fail(connections.error());
+    const auto found = std::ranges::find_if(connections.value(), [&](const auto& external) {
+        return external.providerId() == m_localProvider;
+    });
+    if (found == connections->end()) {
+        return std::optional<identity::provider::ExternalSubject>{};
+    }
+    return std::optional<identity::provider::ExternalSubject>{found->subject()};
+}
+
+foundation::Result<std::optional<bool>> AccountService::totpEnabled(
+    const identity::core::IdentityId& identity) const
+{
+    auto subject = localSubject(identity);
+    if (!subject) return foundation::fail(subject.error());
+    if (!subject->has_value()) return std::optional<bool>{};
+    auto enabled = m_localAccounts->hasTotp(subject->value());
+    if (!enabled) return foundation::fail(enabled.error());
+    return std::optional<bool>{enabled.value()};
+}
+
+foundation::Result<TotpEnrollmentStart> AccountService::beginTotpEnrollment(
+    const identity::core::IdentityId& identity,
+    const foundation::SecretString& password,
+    identity::provider::AssuranceLevel currentAssurance)
+{
+    auto subject = localSubject(identity);
+    if (!subject) return foundation::fail(subject.error());
+    if (!subject->has_value()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "A local email/password sign-in method is required.");
+    }
+    auto passwordVerified = m_localAccounts->verifyPassword(subject->value(), password);
+    if (!passwordVerified) return foundation::fail(passwordVerified.error());
+
+    auto enabled = m_localAccounts->hasTotp(subject->value());
+    if (!enabled) return foundation::fail(enabled.error());
+    if (enabled.value()
+        && !identity::provider::meetsAssurance(
+            currentAssurance, identity::provider::AssuranceLevel::Ial2)) {
+        return foundation::fail(
+            foundation::ErrorCode::AssuranceInsufficient,
+            "Replacing an existing authenticator requires an IAL2 session.");
+    }
+
+    auto secret = credentials::TotpSecret::generate();
+    if (!secret) return foundation::fail(secret.error());
+    auto identifier = security::randomTokenBase64Url(kTotpEnrollmentIdEntropyBytes);
+    if (!identifier) return foundation::fail(identifier.error());
+    TotpEnrollmentId enrollmentId{"opt_" + std::move(identifier).value()};
+    foundation::SecretString base32 = secret->enrollmentBase32();
+    const auto expiresAt = m_clock->now() + kTotpEnrollmentLifetime;
+
+    {
+        const std::lock_guard<std::mutex> guard{m_totpMutex};
+        auto currentEnabled = m_localAccounts->hasTotp(subject->value());
+        if (!currentEnabled) return foundation::fail(currentEnabled.error());
+        if (currentEnabled.value() != enabled.value()) {
+            return foundation::fail(
+                foundation::ErrorCode::FailedPrecondition,
+                "The authenticator state changed while enrollment was starting.");
+        }
+        for (auto it = m_pendingTotp.begin(); it != m_pendingTotp.end();) {
+            if (it->second.identity == identity || it->second.expiresAt <= m_clock->now()) {
+                it = m_pendingTotp.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        m_pendingTotp.emplace(
+            enrollmentId,
+            PendingTotpEnrollment{
+                identity, subject->value(), std::move(secret).value(),
+                expiresAt, enabled.value(), 0U});
+    }
+    return TotpEnrollmentStart{
+        enrollmentId, std::move(base32), expiresAt, enabled.value()};
+}
+
+foundation::Status AccountService::completeTotpEnrollment(
+    const identity::core::IdentityId& identity,
+    const TotpEnrollmentId& enrollmentId,
+    std::string_view verificationCode,
+    identity::provider::AssuranceLevel currentAssurance)
+{
+    if (enrollmentId.empty() || verificationCode.size() != 6U
+        || !std::ranges::all_of(verificationCode, [](char value) {
+            return value >= '0' && value <= '9';
+        })) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The authenticator verification code is invalid.");
+    }
+
+    const std::lock_guard<std::mutex> guard{m_totpMutex};
+    const auto found = m_pendingTotp.find(enrollmentId);
+    if (found == m_pendingTotp.end()) {
+        return foundation::fail(genericVerificationFailure(
+            "The authenticator enrollment is unknown."));
+    }
+    if (found->second.identity != identity) {
+        return foundation::fail(genericVerificationFailure(
+            "The authenticator enrollment belongs to another identity."));
+    }
+    if (found->second.expiresAt <= m_clock->now()) {
+        m_pendingTotp.erase(found);
+        return foundation::fail(genericVerificationFailure(
+            "The authenticator enrollment expired."));
+    }
+    if (found->second.replacementAuthorized
+        && !identity::provider::meetsAssurance(
+            currentAssurance, identity::provider::AssuranceLevel::Ial2)) {
+        return foundation::fail(
+            foundation::ErrorCode::AssuranceInsufficient,
+            "Replacing an existing authenticator requires an IAL2 session.");
+    }
+
+    auto enabled = m_localAccounts->hasTotp(found->second.subject);
+    if (!enabled) return foundation::fail(enabled.error());
+    if (enabled.value() != found->second.replacementAuthorized) {
+        m_pendingTotp.erase(found);
+        return foundation::fail(
+            foundation::ErrorCode::FailedPrecondition,
+            "The authenticator state changed during enrollment.");
+    }
+
+    auto installed = m_localAccounts->replaceTotp(
+        found->second.subject, found->second.secret,
+        verificationCode, m_clock->now());
+    if (!installed) {
+        if (installed.error().code() == foundation::ErrorCode::AuthenticationFailed) {
+            ++found->second.attempts;
+            if (found->second.attempts >= kTotpEnrollmentMaximumAttempts) {
+                m_pendingTotp.erase(found);
+            }
+        }
+        return foundation::fail(installed.error());
+    }
+    m_pendingTotp.erase(found);
+    return foundation::ok();
+}
+
+foundation::Status AccountService::disableTotp(
+    const identity::core::IdentityId& identity,
+    const foundation::SecretString& password,
+    identity::provider::AssuranceLevel currentAssurance)
+{
+    if (!identity::provider::meetsAssurance(
+            currentAssurance, identity::provider::AssuranceLevel::Ial2)) {
+        return foundation::fail(
+            foundation::ErrorCode::AssuranceInsufficient,
+            "Disabling an authenticator requires an IAL2 session.");
+    }
+    auto subject = localSubject(identity);
+    if (!subject) return foundation::fail(subject.error());
+    if (!subject->has_value()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "A local email/password sign-in method is required.");
+    }
+    auto passwordVerified = m_localAccounts->verifyPassword(subject->value(), password);
+    if (!passwordVerified) return foundation::fail(passwordVerified.error());
+    const std::lock_guard<std::mutex> guard{m_totpMutex};
+    auto enabled = m_localAccounts->hasTotp(subject->value());
+    if (!enabled) return foundation::fail(enabled.error());
+    if (!enabled.value()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "TOTP is not enabled for this local account.");
+    }
+    for (auto it = m_pendingTotp.begin(); it != m_pendingTotp.end();) {
+        if (it->second.identity == identity) {
+            it = m_pendingTotp.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto revoked = m_recoveryCodes->revoke(identity);
+    if (!revoked) return foundation::fail(revoked.error());
+    return m_localAccounts->removeTotp(subject->value());
+}
 
 }

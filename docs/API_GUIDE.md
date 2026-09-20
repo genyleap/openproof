@@ -345,6 +345,21 @@ Email and phone ownership are separate verified ceremonies:
 - `POST /account/phone` → `{"phone_number":"+989121234567"}`
 - `POST /account/phone/verify` → verification identifier and secret
 
+TOTP self-service is also session-bound. `GET /account/totp` reports whether a
+local email/password method exists and whether TOTP is already enabled. Begin
+enrollment with `POST /account/totp/start` and the current local password. The
+response returns a short-lived Base32 seed exactly once; render it as an
+`otpauth://` QR URI or let the user copy it into an authenticator. Confirm a
+six-digit code with `POST /account/totp/complete`. Replacing an existing TOTP
+seed requires the current session to satisfy IAL2 in addition to password
+reauthentication. The pending seed is not installed until the confirmation code
+verifies, and failed confirmation attempts are bounded. After authenticating at
+IAL2, generate a fresh one-time recovery-code batch with `POST /auth/recovery-codes`.
+Disabling TOTP uses
+`POST /account/totp/disable`, also requires IAL2 plus the current password, and
+invalidates every outstanding recovery code and pending TOTP enrollment for the
+identity before removing the authenticator.
+
 ## 6. Passkeys
 
 Passkey registration requires an authenticated OpenProof session:
