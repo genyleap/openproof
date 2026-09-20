@@ -580,6 +580,10 @@ and JWKS HTTPS requests.
   OpenProof requests `response_mode=form_post` for Apple because Apple requires
   form-post authorization responses whenever the `name` or `email` scopes are
   requested; the shared federation callback accepts URL-encoded POST responses.
+  On the first authorization, OpenProof relays Apple's one-time `user` payload
+  only to recover the sanitized first/last name for connection presentation. The
+  canonical subject and verified email continue to come only from the validated
+  signed ID Token; the raw `user` email is never trusted for identity linking.
 - Microsoft: `OPENPROOF_MICROSOFT_CLIENT_ID`, `OPENPROOF_MICROSOFT_CLIENT_SECRET`,
   and a required tenant-specific `OPENPROOF_MICROSOFT_ISSUER`. Multi-tenant
   `common`, `organizations`, `consumers`, and issuer templates are rejected so an

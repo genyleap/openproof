@@ -302,6 +302,46 @@ struct HttpResult final {
     return value->is_string() && value->as_string() == "true";
 }
 
+[[nodiscard]] foundation::Result<std::optional<std::string>> appleDisplayName(
+    const idp::SecretAttributeMap& parameters)
+{
+    const auto payload = credential(parameters, "user");
+    if (!payload) return std::optional<std::string>{};
+    if (payload->empty() || payload->size() > 16U * 1024U) {
+        return foundation::fail(authFailure("The Apple user payload is invalid."));
+    }
+
+    boost::system::error_code parseError;
+    auto parsed = json::parse(*payload, parseError);
+    if (parseError || !parsed.is_object()) {
+        return foundation::fail(authFailure("The Apple user payload is malformed."));
+    }
+    const auto* nameValue = parsed.as_object().if_contains("name");
+    if (nameValue == nullptr) return std::optional<std::string>{};
+    if (!nameValue->is_object()) {
+        return foundation::fail(authFailure("The Apple user name is malformed."));
+    }
+
+    const auto& name = nameValue->as_object();
+    const auto first = stringValue(name, "firstName");
+    const auto last = stringValue(name, "lastName");
+    if ((first && !safeText(*first, 256U)) || (last && !safeText(*last, 256U))) {
+        return foundation::fail(authFailure("The Apple user name is invalid."));
+    }
+
+    std::string displayName;
+    if (first) displayName = *first;
+    if (last) {
+        if (!displayName.empty()) displayName.push_back(' ');
+        displayName.append(*last);
+    }
+    if (displayName.empty()) return std::optional<std::string>{};
+    if (!safeText(displayName, 512U)) {
+        return foundation::fail(authFailure("The Apple user name is invalid."));
+    }
+    return std::optional<std::string>{std::move(displayName)};
+}
+
 } // namespace
 
 class OidcAuthenticationProvider::Implementation final {
@@ -666,7 +706,15 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
         claims.set(idp::ClaimName::EmailVerified, "true");
     }
     const auto name = stringValue(payload.value(), "name");
-    if (name && safeText(*name, 512U)) claims.set(idp::ClaimName::DisplayName, *name);
+    if (name && safeText(*name, 512U)) {
+        claims.set(idp::ClaimName::DisplayName, *name);
+    } else if (m_implementation->config.providerId().value() == "apple") {
+        auto appleName = appleDisplayName(response.parameters());
+        if (!appleName) return foundation::fail(appleName.error());
+        if (appleName->has_value()) {
+            claims.set(idp::ClaimName::DisplayName, appleName->value());
+        }
+    }
     const auto username = stringValue(payload.value(), "preferred_username");
     if (username && safeText(*username, 320U)) claims.set(idp::ClaimName::PreferredUsername, *username);
     const auto locale = stringValue(payload.value(), "locale");

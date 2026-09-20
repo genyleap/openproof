@@ -88,6 +88,55 @@ public:
     }
 };
 
+class AppleFormPostRelayProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override
+    {
+        return idp::ProviderId{"apple-relay"};
+    }
+
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
+    {
+        return idp::InteractionModel::Redirect;
+    }
+
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
+    {
+        return idp::AssuranceLevel::Ial1;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override
+    {
+        idp::AuthenticationChallenge challenge{
+            idp::ChallengeId{"apple-relay-challenge"}, kNow + std::chrono::minutes{5}};
+        challenge.setParameter("authorization_url", "https://provider.example/apple-authorize");
+        return challenge;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse& response) override
+    {
+        const auto code = response.parameters().find("code");
+        const auto state = response.parameters().find("state");
+        const auto user = response.parameters().find("user");
+        constexpr std::string_view expectedUser{
+            R"({"name":{"firstName":"Ada","lastName":"Lovelace"},"email":"ignored@example.test"})"};
+        if (code == response.parameters().end() || code->second.expose() != "accepted"
+            || state == response.parameters().end() || state->second.expose() != "provider-state"
+            || user == response.parameters().end() || user->second.expose() != expectedUser) {
+            return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        }
+        idp::VerifiedClaims claims;
+        claims.set(idp::ClaimName::DisplayName, "Ada Lovelace");
+        return idp::AuthenticationOutcome::create(
+            idp::ProviderId{"apple-relay"}, idp::ExternalSubject{"apple-subject"},
+            std::move(claims), idp::AssuranceLevel::Ial1,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
+            idp::ProviderEvidence{}, kNow);
+    }
+};
+
 class SessionRedirectProvider final : public idp::AuthenticationProvider {
 public:
     [[nodiscard]] idp::ProviderId id() const override
@@ -206,6 +255,17 @@ public:
 {
     std::vector<std::pair<std::string, std::string>> headers;
     if (!body.empty()) headers.emplace_back("content-type", "application/json");
+    if (!cookie.empty()) headers.emplace_back("cookie", std::move(cookie));
+    return gw::HttpRequest::create(
+        gw::HttpMethod::Post, std::move(path), std::move(headers), std::move(body),
+        "127.0.0.1", fnd::CorrelationId{"request"}).value();
+}
+
+[[nodiscard]] gw::HttpRequest formPostRequest(
+    std::string path, std::string body, std::string cookie = {})
+{
+    std::vector<std::pair<std::string, std::string>> headers{
+        {"content-type", "application/x-www-form-urlencoded"}};
     if (!cookie.empty()) headers.emplace_back("cookie", std::move(cookie));
     return gw::HttpRequest::create(
         gw::HttpMethod::Post, std::move(path), std::move(headers), std::move(body),
@@ -576,6 +636,66 @@ TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndCh
     ASSERT_EQ(challenges.size(), 1U);
     EXPECT_EQ(redirects.front().as_string(), "redirect");
     EXPECT_EQ(challenges.front().as_string(), "challenge");
+}
+
+TEST(FederatedAuthenticationHttpApiTest, FormPostForwardsAppleUserPayloadToProvider)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(
+        std::make_unique<AppleFormPostRelayProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-apple"},
+        core::ExternalIdentityRef{idp::ProviderId{"apple-relay"},
+                                  idp::ExternalSubject{"apple-subject"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(externalIdentities.attach(link));
+
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"apple-relay"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto started = api.handle(getRequest(
+        "/auth/federated/start?provider=apple-relay&return_to=%2Faccount"));
+    ASSERT_EQ(started.status(), 302) << started.body();
+
+    std::string callbackCookies;
+    for (const auto& header : setCookies(started)) {
+        if (!callbackCookies.empty()) callbackCookies.append("; ");
+        callbackCookies.append(header.substr(0U, header.find(';')));
+    }
+    const std::string form =
+        "code=accepted&state=provider-state&user="
+        "%7B%22name%22%3A%7B%22firstName%22%3A%22Ada%22%2C"
+        "%22lastName%22%3A%22Lovelace%22%7D%2C"
+        "%22email%22%3A%22ignored%40example.test%22%7D";
+    const auto completed = api.handle(formPostRequest(
+        "/auth/federated/callback", form, std::move(callbackCookies)));
+
+    ASSERT_EQ(completed.status(), 302) << completed.body();
+    EXPECT_EQ(completed.headers().at("location"), "/account");
+    EXPECT_FALSE(cookieValue(completed, "__Host-openproof-session").empty());
 }
 
 TEST(FederatedAuthenticationHttpApiTest, ConnectionConflictRedirectsBackToUiInsteadOfRenderingJson)
