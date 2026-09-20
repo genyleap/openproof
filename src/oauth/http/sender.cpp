@@ -12,6 +12,8 @@ module;
 
 #include <boost/json.hpp>
 
+#include "protected_header_validation.hpp"
+
 module openproof.oauth.http.sender;
 
 import openproof.security;
@@ -77,6 +79,7 @@ namespace json = boost::json;
     const auto jwkFound = header.find("jwk");
     if (algorithm != std::optional<std::string>{"RS256"}
         || type != std::optional<std::string>{"dpop+jwt"}
+        || !detail::joseProtectedHeaderUsesSupportedExtensions(header)
         || jwkFound == header.end() || !jwkFound->value().is_object()) {
         return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                                 "The DPoP protected header is invalid.");

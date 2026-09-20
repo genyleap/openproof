@@ -9,6 +9,10 @@
 #include <thread>
 #include <vector>
 
+#include <boost/json.hpp>
+
+#include "../../src/oauth/http/protected_header_validation.hpp"
+
 import openproof.client;
 import openproof.credentials;
 import openproof.foundation;
@@ -56,6 +60,27 @@ TEST(HardeningTest, MalformedBoundaryCorpusNeverEscapesAsAnException)
             static_cast<void>(security::verifyRs256Jwk(input, input, input));
         });
     }
+}
+
+TEST(HardeningTest, DpopProtectedHeaderRejectsUnsupportedCriticalExtensions)
+{
+    namespace json = boost::json;
+    using openproof::oauth::http::detail::joseProtectedHeaderUsesSupportedExtensions;
+
+    json::object header{
+        {"alg", "RS256"},
+        {"typ", "dpop+jwt"},
+        {"jwk", json::object{{"kty", "RSA"}}}};
+    EXPECT_TRUE(joseProtectedHeaderUsesSupportedExtensions(header));
+
+    header["crit"] = json::array{"custom"};
+    header["custom"] = true;
+    EXPECT_FALSE(joseProtectedHeaderUsesSupportedExtensions(header));
+
+    header.erase("crit");
+    header.erase("custom");
+    header["b64"] = false;
+    EXPECT_FALSE(joseProtectedHeaderUsesSupportedExtensions(header));
 }
 
 TEST(HardeningTest, ConcurrentRateLimitCannotOverspendOneBucket)
