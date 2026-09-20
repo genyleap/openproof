@@ -7,8 +7,8 @@ These files are reviewed starting points for a single-node identity deployment:
   header rather than forwarding an attacker-controlled chain;
 - `openproof.toml.example` composes account, OAuth/OIDC and protected API
   surfaces;
-- `openproof.env.example` lists optional environment-only feature credentials
-  without containing usable ones;
+- `openproof.env.example` lists optional environment-only feature credentials,
+  including federated-login provider variables, without containing usable ones;
 - `verification-delivery-postfix.php`, `openproof-delivery.service` and
   `openproof-delivery.env.example` provide an optional loopback-only email adapter
   for deployments that operate a local Postfix MTA.
