@@ -38,17 +38,23 @@ TEST(OidcProviderConfigTest, PreservesExplicitBasicTokenAuthentication)
               oidc::OidcClientAuthenticationMethod::ClientSecretBasic);
 }
 
-TEST(OidcProviderConfigTest, BasicCredentialsRejectAmbiguousColonEncoding)
+TEST(OidcProviderConfigTest, BasicCredentialsAllowFormEncodableSeparators)
 {
-    auto colonInId = configuration(
-        "123:456", "secret",
-        oidc::OidcClientAuthenticationMethod::ClientSecretBasic);
-    auto colonInSecret = configuration(
-        "123456", "secret:value",
+    std::string clientSecret(16U, 's');
+    clientSecret.push_back(':');
+    clientSecret.append(16U, 'x');
+    clientSecret.push_back(' ');
+    clientSecret.push_back('+');
+    const std::string expectedSecret = clientSecret;
+    auto configured = configuration(
+        "123:456", std::move(clientSecret),
         oidc::OidcClientAuthenticationMethod::ClientSecretBasic);
 
-    EXPECT_FALSE(colonInId);
-    EXPECT_FALSE(colonInSecret);
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    EXPECT_EQ(configured->clientId(), "123:456");
+    EXPECT_EQ(configured->clientSecret().expose(), expectedSecret);
+    EXPECT_EQ(configured->clientAuthentication(),
+              oidc::OidcClientAuthenticationMethod::ClientSecretBasic);
 }
 
 TEST(OidcProviderConfigTest, PostAuthenticationRemainsTheCompatibilityDefault)

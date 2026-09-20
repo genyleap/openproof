@@ -142,6 +142,34 @@ struct HttpsUrl final {
     return output;
 }
 
+[[nodiscard]] std::string formEncode(std::string_view input)
+{
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(input.size() * 3U);
+    for (const char symbol : input) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool formSafe = (byte >= static_cast<unsigned char>('A')
+                && byte <= static_cast<unsigned char>('Z'))
+            || (byte >= static_cast<unsigned char>('a')
+                && byte <= static_cast<unsigned char>('z'))
+            || (byte >= static_cast<unsigned char>('0')
+                && byte <= static_cast<unsigned char>('9'))
+            || byte == static_cast<unsigned char>('-')
+            || byte == static_cast<unsigned char>('.')
+            || byte == static_cast<unsigned char>('_')
+            || byte == static_cast<unsigned char>('*');
+        if (formSafe) output.push_back(static_cast<char>(byte));
+        else if (byte == static_cast<unsigned char>(' ')) output.push_back('+');
+        else {
+            output.push_back('%');
+            output.push_back(hex[(byte >> 4U) & 0x0FU]);
+            output.push_back(hex[byte & 0x0FU]);
+        }
+    }
+    return output;
+}
+
 [[nodiscard]] std::string queryAppend(std::string base, std::string_view key,
                                       std::string_view value)
 {
@@ -499,8 +527,6 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
         || challengeLifetime <= foundation::Duration::zero()
         || challengeLifetime > std::chrono::minutes{15}
         || !parseHttpsUrl(issuer) || !parseHttpsUrl(callbackUri)
-        || (clientAuthentication == OidcClientAuthenticationMethod::ClientSecretBasic
-            && (clientId.contains(':') || clientSecret.expose().contains(':')))
         || scopes.empty() || scopes.size() > 32U
         || std::ranges::any_of(scopes, [](const std::string& scope) {
                return !safeText(scope, 128U) || scope.contains(' ');
@@ -599,9 +625,9 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     std::string form;
     const auto append = [&form](std::string_view key, std::string_view value) {
         if (!form.empty()) form.push_back('&');
-        form.append(percentEncode(key));
+        form.append(formEncode(key));
         form.push_back('=');
-        form.append(percentEncode(value));
+        form.append(formEncode(value));
     };
     append("grant_type", "authorization_code");
     append("code", *code);
@@ -612,9 +638,9 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
         == OidcClientAuthenticationMethod::ClientSecretPost) {
         append("client_secret", m_implementation->config.clientSecret().expose());
     } else {
-        std::string credentials{m_implementation->config.clientId()};
+        std::string credentials = formEncode(m_implementation->config.clientId());
         credentials.push_back(':');
-        credentials.append(m_implementation->config.clientSecret().expose());
+        credentials.append(formEncode(m_implementation->config.clientSecret().expose()));
         authorization = "Basic " + standardBase64(credentials);
         std::ranges::fill(credentials, '\0');
     }
