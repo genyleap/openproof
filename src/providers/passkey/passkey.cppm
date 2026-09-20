@@ -201,8 +201,6 @@ private:
     PasskeyRepository* m_repository;
     const foundation::ClockSource* m_clock;
     const PasskeyConfig* m_config;
-    std::mutex m_authenticationMutex;
-    std::map<identity::provider::ChallengeId, foundation::Instant> m_pendingAuthentication;
 };
 
 } // namespace openproof::provider::passkey

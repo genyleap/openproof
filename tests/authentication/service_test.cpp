@@ -169,6 +169,56 @@ struct Fixture {
     return response;
 }
 
+TEST(AuthenticationServiceTest, CompletionCanRunOnAnotherBrokerInstanceWithSharedTransactionStore)
+{
+    idp::ProviderRegistry firstRegistry;
+    idp::ProviderRegistry secondRegistry;
+    auto firstOwned = std::make_unique<ControlledProvider>("provider-a");
+    auto secondOwned = std::make_unique<ControlledProvider>("provider-a");
+    auto* firstProvider = firstOwned.get();
+    auto* secondProvider = secondOwned.get();
+    ASSERT_TRUE(firstRegistry.registerProvider(std::move(firstOwned)));
+    ASSERT_TRUE(secondRegistry.registerProvider(std::move(secondOwned)));
+
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    core::InMemoryExternalIdentityDirectory identities;
+    fnd::ManualClockSource clock{kNow};
+    core::IdentityLink link = core::IdentityLink::request(
+        core::IdentityId{"identity-1"},
+        core::ExternalIdentityRef{idp::ProviderId{"provider-a"},
+                                  idp::ExternalSubject{"subject-1"}},
+        kNow, kServiceLifetime).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(identities.attach(link));
+
+    auth::ProviderTrustPolicy firstPolicy;
+    auth::ProviderTrustPolicy secondPolicy;
+    ASSERT_TRUE(firstPolicy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    ASSERT_TRUE(secondPolicy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService firstService{
+        firstRegistry, transactions, identities, clock, std::move(firstPolicy), kServiceLifetime};
+    auth::AuthenticationService secondService{
+        secondRegistry, transactions, identities, clock, std::move(secondPolicy), kServiceLifetime};
+
+    idp::AuthenticationRequest request{idp::ProviderId{"provider-a"}, idp::ClientContext{}};
+    request.setRequestedAssurance(idp::AssuranceLevel::Ial2);
+    const auto binding = bindingOf("shared-pre-auth-cookie");
+    auto started = firstService.begin(request, binding, fnd::CorrelationId{"corr-cross-node"});
+    ASSERT_TRUE(started);
+
+    auto completed = secondService.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(firstProvider->beginCalls, 1);
+    EXPECT_EQ(firstProvider->completeCalls, 0);
+    EXPECT_EQ(secondProvider->beginCalls, 0);
+    EXPECT_EQ(secondProvider->completeCalls, 1);
+}
+
 TEST(AuthenticationServiceTest, CompletesOnlyThroughASingleUseBoundTransaction)
 {
     Fixture fixture;

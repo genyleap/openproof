@@ -197,7 +197,7 @@ TEST(OidcProviderConfigTest, MicrosoftCanUseFormPostWithPostClientAuthentication
               oidc::OidcAuthorizationResponseMode::FormPost);
 }
 
-TEST(OidcAuthenticationProviderTest, UnknownChallengeFailsBeforeCallbackOrNetworkWork)
+TEST(OidcAuthenticationProviderTest, WrongProviderFailsBeforeDiscovery)
 {
     auto config = configuration(
         "123456789", "telegram-client-secret",
@@ -206,15 +206,13 @@ TEST(OidcAuthenticationProviderTest, UnknownChallengeFailsBeforeCallbackOrNetwor
     fnd::ManualClockSource clock{
         fnd::Instant{std::chrono::milliseconds{1'790'000'000'000LL}}};
     oidc::OidcAuthenticationProvider provider{std::move(config).value(), clock};
-    idp::AuthenticationResponse completion{
-        idp::ChallengeId{"opc_unknown"}, idp::ClientContext{}};
+    idp::AuthenticationRequest request{
+        idp::ProviderId{"github"}, idp::ClientContext{}};
 
-    auto outcome = provider.completeAuthentication(completion);
+    auto challenge = provider.beginAuthentication(request);
 
-    ASSERT_FALSE(outcome);
-    EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(outcome.error().internalDetail().find("unknown or already used"),
-              std::string::npos);
+    ASSERT_FALSE(challenge);
+    EXPECT_EQ(challenge.error().code(), fnd::ErrorCode::InvalidArgument);
 }
 
 }

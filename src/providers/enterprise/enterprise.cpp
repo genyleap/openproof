@@ -10,9 +10,7 @@ module;
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -65,39 +63,6 @@ constexpr std::string_view kSamlSuccess{"urn:oasis:names:tc:SAML:2.0:status:Succ
         std::string{foundation::defaultErrorMessage(foundation::ErrorCode::AuthenticationFailed)},
         std::move(detail)};
 }
-
-enum class ChallengeConsumption : std::uint8_t { Accepted, Unknown, Expired };
-
-class OneTimeChallengeStore final {
-public:
-    [[nodiscard]] bool remember(
-        const idp::ChallengeId& challenge, foundation::Instant expiresAt,
-        foundation::Instant now)
-    {
-        const std::lock_guard<std::mutex> guard{m_mutex};
-        for (auto pending = m_pending.begin(); pending != m_pending.end();) {
-            if (now >= pending->second) pending = m_pending.erase(pending);
-            else ++pending;
-        }
-        return m_pending.emplace(challenge, expiresAt).second;
-    }
-
-    [[nodiscard]] ChallengeConsumption consume(
-        const idp::ChallengeId& challenge, foundation::Instant now)
-    {
-        const std::lock_guard<std::mutex> guard{m_mutex};
-        const auto found = m_pending.find(challenge);
-        if (found == m_pending.end()) return ChallengeConsumption::Unknown;
-        const auto expiresAt = found->second;
-        m_pending.erase(found);
-        return now >= expiresAt ? ChallengeConsumption::Expired
-                                : ChallengeConsumption::Accepted;
-    }
-
-private:
-    std::mutex m_mutex;
-    std::map<idp::ChallengeId, foundation::Instant> m_pending;
-};
 
 [[nodiscard]] bool safeToken(std::string_view value, std::size_t maximum) noexcept
 {
@@ -828,7 +793,6 @@ public:
         : config(std::move(providerConfig)), clock(&clockSource) {}
     LdapProviderConfig config;
     const foundation::ClockSource* clock;
-    OneTimeChallengeStore challenges;
 };
 
 LdapAuthenticationProvider::LdapAuthenticationProvider(LdapProviderConfig config,
@@ -852,14 +816,8 @@ foundation::Result<idp::AuthenticationChallenge> LdapAuthenticationProvider::beg
     }
     auto challengeId = security::randomTokenBase64Url(32U);
     if (!challengeId) return foundation::fail(challengeId.error());
-    const auto now = m_implementation->clock->now();
-    const idp::ChallengeId idValue{challengeId.value()};
-    const auto expiresAt = now + m_implementation->config.m_challengeLifetime;
-    if (!m_implementation->challenges.remember(idValue, expiresAt, now)) {
-        return foundation::fail(foundation::ErrorCode::AlreadyExists,
-                                "The LDAP authentication challenge could not be created.");
-    }
-    idp::AuthenticationChallenge challenge{idValue, expiresAt};
+    idp::AuthenticationChallenge challenge{idp::ChallengeId{challengeId.value()},
+        m_implementation->clock->now() + m_implementation->config.m_challengeLifetime};
     const auto binding = hmacToken(m_implementation->config.m_derivationKey,
         "ldap-username", challengeId.value(), username->second);
     if (binding.empty()) return foundation::fail(foundation::ErrorCode::Internal);
@@ -871,17 +829,6 @@ foundation::Result<idp::AuthenticationChallenge> LdapAuthenticationProvider::beg
 foundation::Result<idp::AuthenticationOutcome> LdapAuthenticationProvider::completeAuthentication(
     const idp::AuthenticationResponse& response)
 {
-    const auto now = m_implementation->clock->now();
-    switch (m_implementation->challenges.consume(response.challengeId(), now)) {
-    case ChallengeConsumption::Unknown:
-        return foundation::fail(authenticationFailure(
-            "The LDAP authentication challenge is unknown or already used."));
-    case ChallengeConsumption::Expired:
-        return foundation::fail(authenticationFailure(
-            "The LDAP authentication challenge expired."));
-    case ChallengeConsumption::Accepted:
-        break;
-    }
     const auto usernameIt = response.parameters().find("username");
     const auto passwordIt = response.parameters().find("password");
     const auto bindingIt = response.parameters().find("username_binding");
@@ -943,7 +890,7 @@ foundation::Result<idp::AuthenticationOutcome> LdapAuthenticationProvider::compl
     return idp::AuthenticationOutcome::create(id(), idp::ExternalSubject{*subject}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge, false},
-        std::move(evidence), now);
+        std::move(evidence), m_implementation->clock->now());
 }
 
 SamlProviderConfig::SamlProviderConfig(
@@ -983,7 +930,6 @@ public:
         : config(std::move(providerConfig)), clock(&clockSource) {}
     SamlProviderConfig config;
     const foundation::ClockSource* clock;
-    OneTimeChallengeStore challenges;
 };
 
 SamlAuthenticationProvider::SamlAuthenticationProvider(SamlProviderConfig config,
@@ -1020,16 +966,10 @@ foundation::Result<idp::AuthenticationChallenge> SamlAuthenticationProvider::beg
     if (!encoded) return foundation::fail(encoded.error());
     const std::string relayState = hmacToken(config.m_derivationKey, "saml-relay", challengeText);
     if (relayState.empty()) return foundation::fail(foundation::ErrorCode::Internal);
-    const idp::ChallengeId challengeId{challengeText};
-    const auto expiresAt = now + config.m_challengeLifetime;
-    if (!m_implementation->challenges.remember(challengeId, expiresAt, now)) {
-        return foundation::fail(foundation::ErrorCode::AlreadyExists,
-                                "The SAML authentication challenge could not be created.");
-    }
     std::string separator = config.m_idpSsoUrl.contains('?') ? "&" : "?";
     const std::string authorizationUrl = config.m_idpSsoUrl + separator + "SAMLRequest="
         + percentEncode(encoded.value()) + "&RelayState=" + percentEncode(relayState);
-    idp::AuthenticationChallenge challenge{challengeId, expiresAt};
+    idp::AuthenticationChallenge challenge{idp::ChallengeId{challengeText}, now + config.m_challengeLifetime};
     challenge.setParameter("authorization_url", authorizationUrl);
     return challenge;
 }
@@ -1037,17 +977,6 @@ foundation::Result<idp::AuthenticationChallenge> SamlAuthenticationProvider::beg
 foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::completeAuthentication(
     const idp::AuthenticationResponse& response)
 {
-    const auto now = m_implementation->clock->now();
-    switch (m_implementation->challenges.consume(response.challengeId(), now)) {
-    case ChallengeConsumption::Unknown:
-        return foundation::fail(authenticationFailure(
-            "The SAML authentication challenge is unknown or already used."));
-    case ChallengeConsumption::Expired:
-        return foundation::fail(authenticationFailure(
-            "The SAML authentication challenge expired."));
-    case ChallengeConsumption::Accepted:
-        break;
-    }
     const auto assertionIt = response.parameters().find("SAMLResponse");
     const auto relayIt = response.parameters().find("RelayState");
     if (assertionIt == response.parameters().end() || relayIt == response.parameters().end()
@@ -1091,6 +1020,7 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     auto assertions = children(root, "Assertion", kSamlAssertion);
     if (assertions.size() != 1U) return foundation::fail(authenticationFailure("The SAML response must contain exactly one assertion."));
     xmlNodePtr assertion = assertions.front();
+    const auto now = m_implementation->clock->now();
     const bool responseSigned = uniqueChild(root, "Signature", kXmlDsig) != nullptr;
     const bool assertionSigned = uniqueChild(assertion, "Signature", kXmlDsig) != nullptr;
     if (!responseSigned && !assertionSigned) return foundation::fail(authenticationFailure("The SAML response is unsigned."));

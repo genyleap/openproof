@@ -231,30 +231,7 @@ TEST(WalletProviderTest, ExpiredSiweChallengeFailsBeforeSignatureVerification)
 
     ASSERT_FALSE(outcome);
     EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(outcome.error().internalDetail().find("challenge expired"),
-              std::string::npos);
-}
-
-TEST(WalletProviderTest, AuthenticationChallengeIsSingleUseAfterFailedCompletion)
-{
-    fnd::ManualClockSource clock{kNow};
-    web3::WalletAuthenticationProvider provider{walletConfiguration(), clock};
-    auto challenge = provider.beginAuthentication(walletRequest(1U));
-    ASSERT_TRUE(challenge);
-
-    idp::AuthenticationResponse completion{challenge->id(), idp::ClientContext{}};
-    completion.setParameter(
-        "message", idp::CredentialValue{parameter(*challenge, "message")});
-    completion.setParameter("signature", idp::CredentialValue{"0x0102"});
-
-    auto first = provider.completeAuthentication(completion);
-    ASSERT_FALSE(first);
-    EXPECT_EQ(first.error().code(), fnd::ErrorCode::AuthenticationFailed);
-
-    auto replay = provider.completeAuthentication(completion);
-    ASSERT_FALSE(replay);
-    EXPECT_EQ(replay.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(replay.error().internalDetail().find("already used"),
+    EXPECT_NE(outcome.error().internalDetail().find("time window is expired"),
               std::string::npos);
 }
 
@@ -348,32 +325,6 @@ TEST(FarcasterProviderTest, DirectCustodyFlowUsesCanonicalFip11Message)
     EXPECT_EQ(observed->signatureChecks, 1);
     EXPECT_EQ(observed->authorizationChecks, 2);
     EXPECT_EQ(observed->lastFid, kFid);
-}
-
-TEST(FarcasterProviderTest, AuthenticationChallengeIsSingleUseAfterSuccess)
-{
-    fnd::ManualClockSource clock{kNow};
-    auto chain = std::make_unique<FakeFarcasterChain>();
-    auto* observed = chain.get();
-    web3::FarcasterAuthenticationProvider provider{
-        configuration(), clock, std::move(chain)};
-
-    auto challenge = provider.beginAuthentication(request(true));
-    ASSERT_TRUE(challenge);
-    auto completion = response(*challenge, parameter(*challenge, "message"));
-
-    auto first = provider.completeAuthentication(completion);
-    ASSERT_TRUE(first);
-    EXPECT_EQ(observed->signatureChecks, 1);
-    EXPECT_EQ(observed->authorizationChecks, 2);
-
-    auto replay = provider.completeAuthentication(completion);
-    ASSERT_FALSE(replay);
-    EXPECT_EQ(replay.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(replay.error().internalDetail().find("already used"),
-              std::string::npos);
-    EXPECT_EQ(observed->signatureChecks, 1);
-    EXPECT_EQ(observed->authorizationChecks, 2);
 }
 
 TEST(FarcasterProviderTest, AcceptsLegacyPluralFidResourceDuringMigration)
@@ -485,8 +436,7 @@ TEST(FarcasterProviderTest, RejectsDuplicateOptionalSiweFields)
 
     const auto resources = message.find("\nResources:");
     ASSERT_NE(resources, std::string::npos);
-    message.insert(resources,
-        "\nRequest ID: first\nRequest ID: second");
+    message.insert(resources, "\nRequest ID: first\nRequest ID: second");
 
     auto outcome = provider.completeAuthentication(
         response(*challenge, std::move(message)));
