@@ -4,6 +4,8 @@
 #include <string>
 #include <utility>
 
+#include "../../src/providers/enterprise/presentation.hpp"
+
 import openproof.foundation;
 import openproof.provider.enterprise;
 
@@ -15,6 +17,25 @@ namespace fnd = openproof::foundation;
 [[nodiscard]] fnd::SecretString derivationKey()
 {
     return fnd::SecretString{std::string(32U, 'k')};
+}
+
+TEST(EnterprisePresentationClaimTest, AllowsSpacesAndUtf8WithinProfileLimit)
+{
+    using openproof::provider::enterprise::detail::safePresentationText;
+
+    const std::string utf8Name = std::string{"Jos"} + "\xC3\xA9" + " Alvarez";
+    EXPECT_TRUE(safePresentationText("Ada Lovelace"));
+    EXPECT_TRUE(safePresentationText(utf8Name));
+    EXPECT_TRUE(safePresentationText(std::string(256U, 'a')));
+}
+
+TEST(EnterprisePresentationClaimTest, RejectsControlCharactersAndOversizedValues)
+{
+    using openproof::provider::enterprise::detail::safePresentationText;
+
+    EXPECT_FALSE(safePresentationText("Ada\nLovelace"));
+    EXPECT_FALSE(safePresentationText(std::string(257U, 'a')));
+    EXPECT_FALSE(safePresentationText(""));
 }
 
 TEST(EnterpriseLdapConfigTest, AcceptsCertificateVerifiedLdapsConfiguration)
