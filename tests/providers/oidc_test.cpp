@@ -273,6 +273,81 @@ TEST(OidcDiscoveryValidationTest, RequiresAuthorizationCodeFlowMetadata)
     EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
 }
 
+TEST(OidcDiscoveryValidationTest, RejectsEmptyCapabilitiesAndHonorsResponseModeDefaults)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::discoveryHasSupportedSubjectType;
+    using openproof::provider::oidc::detail::discoveryOptionalArraySupports;
+    using openproof::provider::oidc::detail::discoverySupportsResponseMode;
+
+    json::object metadata{{"subject_types_supported", json::array{"public"}}};
+    EXPECT_TRUE(discoveryHasSupportedSubjectType(metadata));
+    EXPECT_TRUE(discoveryOptionalArraySupports(
+        metadata, "code_challenge_methods_supported", "S256"));
+    EXPECT_TRUE(discoverySupportsResponseMode(metadata, "query"));
+    EXPECT_FALSE(discoverySupportsResponseMode(metadata, "form_post"));
+
+    metadata["code_challenge_methods_supported"] = json::array{};
+    EXPECT_FALSE(discoveryOptionalArraySupports(
+        metadata, "code_challenge_methods_supported", "S256"));
+
+    metadata["code_challenge_methods_supported"] = json::array{"plain", "S256"};
+    EXPECT_TRUE(discoveryOptionalArraySupports(
+        metadata, "code_challenge_methods_supported", "S256"));
+
+    metadata["response_modes_supported"] = json::array{};
+    EXPECT_FALSE(discoverySupportsResponseMode(metadata, "query"));
+
+    metadata["response_modes_supported"] = json::array{"query", "form_post"};
+    EXPECT_TRUE(discoverySupportsResponseMode(metadata, "form_post"));
+
+    metadata["subject_types_supported"] = json::array{"pairwise"};
+    EXPECT_TRUE(discoveryHasSupportedSubjectType(metadata));
+    metadata["subject_types_supported"] = json::array{};
+    EXPECT_FALSE(discoveryHasSupportedSubjectType(metadata));
+    metadata.erase("subject_types_supported");
+    EXPECT_FALSE(discoveryHasSupportedSubjectType(metadata));
+}
+
+TEST(OidcIdTokenValidationTest, RejectsUnsupportedJoseCriticalExtensions)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::joseHeaderUsesSupportedExtensions;
+
+    json::object header{{"alg", "RS256"}, {"kid", "key"}};
+    EXPECT_TRUE(joseHeaderUsesSupportedExtensions(header));
+
+    header["crit"] = json::array{"custom"};
+    header["custom"] = true;
+    EXPECT_FALSE(joseHeaderUsesSupportedExtensions(header));
+
+    header.erase("crit");
+    header.erase("custom");
+    header["b64"] = false;
+    EXPECT_FALSE(joseHeaderUsesSupportedExtensions(header));
+}
+
+TEST(OidcIdTokenValidationTest, RejectsAmbiguousMatchingJwksKeys)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::uniqueRs256VerificationKey;
+
+    json::array keys{
+        json::object{{"kid", "target"}, {"kty", "RSA"}, {"alg", "RS256"},
+                     {"n", "modulus-one"}, {"e", "AQAB"}},
+        json::object{{"kid", "other"}, {"kty", "RSA"}, {"alg", "RS256"},
+                     {"n", "modulus-other"}, {"e", "AQAB"}}};
+    auto selected = uniqueRs256VerificationKey(keys, "target");
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->modulus, "modulus-one");
+    EXPECT_EQ(selected->exponent, "AQAB");
+
+    keys.emplace_back(json::object{
+        {"kid", "target"}, {"kty", "RSA"}, {"alg", "RS256"},
+        {"n", "modulus-two"}, {"e", "AQAB"}});
+    EXPECT_FALSE(uniqueRs256VerificationKey(keys, "target"));
+}
+
 [[nodiscard]] std::string generatedP256PrivateKey()
 {
     EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);

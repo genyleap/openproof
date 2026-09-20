@@ -367,7 +367,6 @@ public:
         std::string authorizationEndpoint;
         std::string tokenEndpoint;
         std::string jwksUri;
-        std::vector<std::string> tokenAuthenticationMethods;
         foundation::Instant expiresAt{};
     };
 
@@ -409,64 +408,33 @@ public:
             || !parseHttpsUrl(*authorization) || !parseHttpsUrl(*token) || !parseHttpsUrl(*jwks)) {
             return foundation::fail(authFailure("OIDC discovery metadata failed validation."));
         }
-        const auto readStringArray = [&](std::string_view name, std::string_view detail)
-            -> foundation::Result<std::vector<std::string>> {
-            std::vector<std::string> values;
-            const auto* field = object->if_contains(name);
-            if (field == nullptr) return values;
-            if (!field->is_array()) {
-                return foundation::fail(authFailure(std::string{detail}));
-            }
-            for (const auto& value : field->as_array()) {
-                if (!value.is_string() || value.as_string().empty()
-                    || value.as_string().size() > 128U) {
-                    return foundation::fail(authFailure(std::string{detail}));
-                }
-                values.emplace_back(value.as_string());
-            }
-            return values;
-        };
-        auto tokenAuthenticationMethods = readStringArray(
-            "token_endpoint_auth_methods_supported",
-            "OIDC discovery token authentication metadata is malformed.");
-        if (!tokenAuthenticationMethods) {
-            return foundation::fail(tokenAuthenticationMethods.error());
+        if (!detail::discoveryHasSupportedSubjectType(object.value())) {
+            return foundation::fail(authFailure(
+                "OIDC discovery does not advertise a supported subject identifier type."));
         }
-        auto responseModes = readStringArray(
-            "response_modes_supported",
-            "OIDC discovery response-mode metadata is malformed.");
-        if (!responseModes) return foundation::fail(responseModes.error());
-        auto codeChallengeMethods = readStringArray(
-            "code_challenge_methods_supported",
-            "OIDC discovery PKCE metadata is malformed.");
-        if (!codeChallengeMethods) return foundation::fail(codeChallengeMethods.error());
         const std::string_view requiredMethod =
             config.clientAuthentication()
                     == OidcClientAuthenticationMethod::ClientSecretBasic
                 ? "client_secret_basic" : "client_secret_post";
-        if (!tokenAuthenticationMethods->empty()
-            && std::ranges::find(tokenAuthenticationMethods.value(), requiredMethod)
-                == tokenAuthenticationMethods->end()) {
+        if (!detail::discoveryOptionalArraySupports(
+                object.value(), "token_endpoint_auth_methods_supported", requiredMethod)) {
             return foundation::fail(authFailure(
                 "OIDC discovery does not support the configured client authentication method."));
         }
-        if (!codeChallengeMethods->empty()
-            && std::ranges::find(codeChallengeMethods.value(), std::string_view{"S256"})
-                == codeChallengeMethods->end()) {
+        if (!detail::discoveryOptionalArraySupports(
+                object.value(), "code_challenge_methods_supported", "S256")) {
             return foundation::fail(authFailure(
                 "OIDC discovery does not support the required S256 PKCE method."));
         }
         const std::string_view requiredResponseMode =
             config.authorizationResponseMode() == OidcAuthorizationResponseMode::FormPost
                 ? "form_post" : "query";
-        if (!responseModes->empty()
-            && std::ranges::find(responseModes.value(), requiredResponseMode)
-                == responseModes->end()) {
+        if (!detail::discoverySupportsResponseMode(
+                object.value(), requiredResponseMode)) {
             return foundation::fail(authFailure(
                 "OIDC discovery does not support the configured authorization response mode."));
         }
         Discovery value{*authorization, *token, *jwks,
-                        std::move(tokenAuthenticationMethods).value(),
                         now + std::chrono::hours{1}};
         {
             const std::lock_guard guard{mutex};
@@ -744,7 +712,8 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     auto header = parseJsonObject(headerJson);
     const auto kid = header ? stringValue(header.value(), "kid") : std::nullopt;
     const auto alg = header ? stringValue(header.value(), "alg") : std::nullopt;
-    if (!header || !kid || !alg || *alg != "RS256" || kid->empty() || kid->size() > 256U) {
+    if (!header || !kid || !alg || *alg != "RS256" || kid->empty() || kid->size() > 256U
+        || !detail::joseHeaderUsesSupportedExtensions(header.value())) {
         return foundation::fail(authFailure("The OIDC ID Token JOSE header is invalid."));
     }
 
@@ -759,20 +728,14 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     if (!jwks || keysValue == nullptr || !keysValue->is_array()) {
         return foundation::fail(authFailure("The OIDC JWKS is malformed."));
     }
-    std::optional<std::string> modulus;
-    std::optional<std::string> exponent;
-    for (const auto& value : keysValue->as_array()) {
-        if (!value.is_object()) continue;
-        const auto& key = value.as_object();
-        if (!detail::jwkPermitsRs256Verification(key, *kid)) continue;
-        modulus = stringValue(key, "n");
-        exponent = stringValue(key, "e");
-        if (modulus && exponent) break;
+    auto signingKey = detail::uniqueRs256VerificationKey(
+        keysValue->as_array(), *kid);
+    if (!signingKey) {
+        return foundation::fail(authFailure(
+            "The OIDC signing key was not found or was ambiguous."));
     }
-    if (!modulus || !exponent) {
-        return foundation::fail(authFailure("The OIDC signing key was not found."));
-    }
-    auto verified = security::verifyRs256Jwk(*modulus, *exponent, *idToken);
+    auto verified = security::verifyRs256Jwk(
+        signingKey->modulus, signingKey->exponent, *idToken);
     if (!verified) return foundation::fail(authFailure("The OIDC ID Token signature is invalid."));
     auto payload = parseJsonObject(verified->payloadJson());
     if (!payload) return foundation::fail(payload.error());

@@ -140,4 +140,110 @@ namespace openproof::provider::oidc::detail {
                     "authorization_code", true);
 }
 
+[[nodiscard]] inline bool discoveryOptionalArraySupports(
+    const boost::json::object& metadata, std::string_view fieldName,
+    std::string_view required)
+{
+    const auto* field = metadata.if_contains(fieldName);
+    if (field == nullptr) return true;
+    if (!field->is_array() || field->as_array().empty()) return false;
+
+    bool found = false;
+    for (const auto& item : field->as_array()) {
+        if (!item.is_string() || item.as_string().empty()
+            || item.as_string().size() > 128U) {
+            return false;
+        }
+        const std::string_view value{
+            item.as_string().data(), item.as_string().size()};
+        if (value == required) found = true;
+    }
+    return found;
+}
+
+[[nodiscard]] inline bool discoverySupportsResponseMode(
+    const boost::json::object& metadata, std::string_view required)
+{
+    const auto* field = metadata.if_contains("response_modes_supported");
+    if (field == nullptr) {
+        return required == "query" || required == "fragment";
+    }
+    if (!field->is_array() || field->as_array().empty()) return false;
+
+    bool found = false;
+    for (const auto& item : field->as_array()) {
+        if (!item.is_string() || item.as_string().empty()
+            || item.as_string().size() > 128U) {
+            return false;
+        }
+        const std::string_view value{
+            item.as_string().data(), item.as_string().size()};
+        if (value == required) found = true;
+    }
+    return found;
+}
+
+[[nodiscard]] inline bool discoveryHasSupportedSubjectType(
+    const boost::json::object& metadata)
+{
+    const auto* field = metadata.if_contains("subject_types_supported");
+    if (field == nullptr || !field->is_array() || field->as_array().empty()) {
+        return false;
+    }
+
+    bool supported = false;
+    for (const auto& item : field->as_array()) {
+        if (!item.is_string() || item.as_string().empty()
+            || item.as_string().size() > 128U) {
+            return false;
+        }
+        const std::string_view value{
+            item.as_string().data(), item.as_string().size()};
+        if (value == "public" || value == "pairwise") supported = true;
+    }
+    return supported;
+}
+
+[[nodiscard]] inline bool joseHeaderUsesSupportedExtensions(
+    const boost::json::object& header) noexcept
+{
+    return !header.contains("crit") && !header.contains("b64");
+}
+
+struct Rs256VerificationKey final {
+    std::string modulus;
+    std::string exponent;
+};
+
+[[nodiscard]] inline std::optional<Rs256VerificationKey>
+uniqueRs256VerificationKey(const boost::json::array& keys,
+                           std::string_view expectedKeyId)
+{
+    std::optional<Rs256VerificationKey> selected;
+    for (const auto& value : keys) {
+        if (!value.is_object()) continue;
+        const auto& key = value.as_object();
+        if (!jwkPermitsRs256Verification(key, expectedKeyId)) continue;
+
+        const auto* modulus = key.if_contains("n");
+        const auto* exponent = key.if_contains("e");
+        if (modulus == nullptr || exponent == nullptr
+            || !modulus->is_string() || !exponent->is_string()
+            || modulus->as_string().empty() || exponent->as_string().empty()
+            || modulus->as_string().size() > 2048U
+            || exponent->as_string().size() > 128U) {
+            return std::nullopt;
+        }
+
+        Rs256VerificationKey candidate{
+            std::string{modulus->as_string()},
+            std::string{exponent->as_string()}};
+        if (selected) {
+            return std::nullopt;
+        }
+        selected = std::move(candidate);
+    }
+    return selected;
+}
+
 } // namespace openproof::provider::oidc::detail
