@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstddef>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
+
+#include <boost/json.hpp>
 
 namespace openproof::provider::oidc::detail {
 
@@ -88,6 +91,50 @@ inline constexpr std::size_t kPictureUrlMaximum = 2048U;
     if (!safeProfileText(host, 253U) || host.contains(':')) return false;
     return authorityEnd == value.size()
         || value[authorityEnd] == '/' || value[authorityEnd] == '?';
+}
+
+[[nodiscard]] inline bool validBearerAccessToken(std::string_view value) noexcept
+{
+    if (value.empty() || value.size() > 4096U) return false;
+
+    bool padding = false;
+    for (char symbol : value) {
+        if (symbol == '=') {
+            padding = true;
+            continue;
+        }
+        if (padding) return false;
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool allowed = std::isalnum(byte) != 0
+            || symbol == '-' || symbol == '.' || symbol == '_'
+            || symbol == '~' || symbol == '+' || symbol == '/';
+        if (!allowed) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool bearerTokenType(std::string_view value) noexcept
+{
+    constexpr std::string_view expected{"bearer"};
+    if (value.size() != expected.size()) return false;
+    for (std::size_t index = 0U; index < value.size(); ++index) {
+        if (static_cast<char>(
+                std::tolower(static_cast<unsigned char>(value[index])))
+            != expected[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool userInfoSubjectMatches(
+    const boost::json::object& userInfo, std::string_view expectedSubject) noexcept
+{
+    const auto* value = userInfo.if_contains("sub");
+    if (value == nullptr || !value->is_string()) return false;
+    const std::string_view subject{
+        value->as_string().data(), value->as_string().size()};
+    return subject == expectedSubject;
 }
 
 } // namespace openproof::provider::oidc::detail

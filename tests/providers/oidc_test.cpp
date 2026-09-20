@@ -126,6 +126,40 @@ TEST(OidcProfileClaimTest, ValidatesHttpsPictureUrlStructure)
     }
 }
 
+TEST(OidcUserInfoValidationTest, ValidatesBearerCredentialsAndTokenType)
+{
+    using openproof::provider::oidc::detail::bearerTokenType;
+    using openproof::provider::oidc::detail::validBearerAccessToken;
+
+    EXPECT_TRUE(validBearerAccessToken("eyJhbGciOiJSUzI1NiJ9.payload.signature"));
+    EXPECT_TRUE(validBearerAccessToken("opaque-token_123~+/=="));
+    EXPECT_FALSE(validBearerAccessToken(""));
+    EXPECT_FALSE(validBearerAccessToken("token with space"));
+    EXPECT_FALSE(validBearerAccessToken("token\nheader"));
+    EXPECT_FALSE(validBearerAccessToken("token=middle"));
+    EXPECT_FALSE(validBearerAccessToken(std::string(4097U, 'a')));
+
+    EXPECT_TRUE(bearerTokenType("Bearer"));
+    EXPECT_TRUE(bearerTokenType("bearer"));
+    EXPECT_TRUE(bearerTokenType("BEARER"));
+    EXPECT_FALSE(bearerTokenType("DPoP"));
+}
+
+TEST(OidcUserInfoValidationTest, RequiresExactSubjectBinding)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::userInfoSubjectMatches;
+
+    json::object userInfo{{"sub", "stable-subject"}, {"name", "Ada"}};
+    EXPECT_TRUE(userInfoSubjectMatches(userInfo, "stable-subject"));
+    EXPECT_FALSE(userInfoSubjectMatches(userInfo, "another-subject"));
+
+    userInfo["sub"] = 42;
+    EXPECT_FALSE(userInfoSubjectMatches(userInfo, "stable-subject"));
+    userInfo.erase("sub");
+    EXPECT_FALSE(userInfoSubjectMatches(userInfo, "stable-subject"));
+}
+
 TEST(OidcIdTokenValidationTest, RejectsMismatchedAuthorizedPartyEvenForSingleAudience)
 {
     using openproof::provider::oidc::detail::authorizedPartyMatches;

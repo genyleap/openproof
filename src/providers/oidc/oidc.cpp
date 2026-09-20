@@ -334,6 +334,33 @@ struct HttpResult final {
     return detail::displayName(view(name), view(given), view(family));
 }
 
+void applyStandardProfileClaims(
+    const json::object& source, idp::VerifiedClaims& claims)
+{
+    const auto email = stringValue(source, "email");
+    if (email && safeText(*email, 320U) && jsonBoolean(source, "email_verified")) {
+        claims.set(idp::ClaimName::Email, *email);
+        claims.set(idp::ClaimName::EmailVerified, "true");
+    }
+
+    if (const auto displayName = standardDisplayName(source); displayName) {
+        claims.set(idp::ClaimName::DisplayName, *displayName);
+    }
+    const auto username = stringValue(source, "preferred_username");
+    if (username && detail::safeProfileText(
+            *username, detail::kPreferredUsernameMaximum)) {
+        claims.set(idp::ClaimName::PreferredUsername, *username);
+    }
+    const auto locale = stringValue(source, "locale");
+    if (locale && safeText(*locale, 64U)) {
+        claims.set(idp::ClaimName::Locale, *locale);
+    }
+    const auto picture = stringValue(source, "picture");
+    if (picture && detail::validHttpsProfileUrl(*picture)) {
+        claims.set(idp::ClaimName::PictureUrl, *picture);
+    }
+}
+
 [[nodiscard]] std::optional<std::string> appleDisplayName(
     const idp::SecretAttributeMap& parameters)
 {
@@ -367,6 +394,7 @@ public:
         std::string authorizationEndpoint;
         std::string tokenEndpoint;
         std::string jwksUri;
+        std::optional<std::string> userInfoEndpoint;
         foundation::Instant expiresAt{};
     };
 
@@ -404,6 +432,19 @@ public:
         const auto authorization = stringValue(object.value(), "authorization_endpoint");
         const auto token = stringValue(object.value(), "token_endpoint");
         const auto jwks = stringValue(object.value(), "jwks_uri");
+        std::optional<std::string> userInfo;
+        if (const auto* value = object->if_contains("userinfo_endpoint"); value != nullptr) {
+            if (!value->is_string() || value->as_string().empty()
+                || value->as_string().size() > 4096U) {
+                return foundation::fail(authFailure(
+                    "OIDC discovery UserInfo metadata is malformed."));
+            }
+            userInfo = std::string{value->as_string()};
+            if (!parseHttpsUrl(*userInfo)) {
+                return foundation::fail(authFailure(
+                    "OIDC discovery UserInfo metadata is malformed."));
+            }
+        }
         if (!issuer || *issuer != config.issuer() || !authorization || !token || !jwks
             || !parseHttpsUrl(*authorization) || !parseHttpsUrl(*token) || !parseHttpsUrl(*jwks)) {
             return foundation::fail(authFailure("OIDC discovery metadata failed validation."));
@@ -434,7 +475,7 @@ public:
             return foundation::fail(authFailure(
                 "OIDC discovery does not support the configured authorization response mode."));
         }
-        Discovery value{*authorization, *token, *jwks,
+        Discovery value{*authorization, *token, *jwks, std::move(userInfo),
                         now + std::chrono::hours{1}};
         {
             const std::lock_guard guard{mutex};
@@ -762,31 +803,43 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
         return foundation::fail(authFailure("The OIDC ID Token claims are invalid."));
     }
 
-    idp::VerifiedClaims claims;
-    const auto email = stringValue(payload.value(), "email");
-    if (email && safeText(*email, 320U) && jsonBoolean(payload.value(), "email_verified")) {
-        claims.set(idp::ClaimName::Email, *email);
-        claims.set(idp::ClaimName::EmailVerified, "true");
+    std::optional<json::object> userInfo;
+    if (metadata->userInfoEndpoint) {
+        const auto accessToken = stringValue(tokenObject.value(), "access_token");
+        const auto tokenType = stringValue(tokenObject.value(), "token_type");
+        if (accessToken && detail::validBearerAccessToken(*accessToken)
+            && tokenType && detail::bearerTokenType(*tokenType)) {
+            auto userInfoEndpoint = parseHttpsUrl(*metadata->userInfoEndpoint);
+            if (userInfoEndpoint) {
+                std::string bearerAuthorization{"Bearer "};
+                bearerAuthorization.append(*accessToken);
+                auto userInfoResponse = httpsRequest(
+                    userInfoEndpoint.value(), http::verb::get, {}, {},
+                    m_implementation->caFile, bearerAuthorization);
+                std::ranges::fill(bearerAuthorization, '\0');
+                if (userInfoResponse && userInfoResponse->status == 200U) {
+                    auto parsedUserInfo = parseJsonObject(userInfoResponse->body);
+                    if (parsedUserInfo
+                        && detail::userInfoSubjectMatches(
+                            parsedUserInfo.value(), *subject)) {
+                        userInfo = std::move(parsedUserInfo).value();
+                    }
+                }
+            }
+        }
     }
-    const auto displayName = standardDisplayName(payload.value());
-    if (displayName) {
-        claims.set(idp::ClaimName::DisplayName, *displayName);
-    } else if (m_implementation->config.providerId().value() == "apple") {
+
+    idp::VerifiedClaims claims;
+    applyStandardProfileClaims(payload.value(), claims);
+    if (userInfo) {
+        applyStandardProfileClaims(*userInfo, claims);
+    }
+    if (!claims.get(idp::ClaimName::DisplayName)
+        && m_implementation->config.providerId().value() == "apple") {
         const auto appleName = appleDisplayName(response.parameters());
         if (appleName) {
             claims.set(idp::ClaimName::DisplayName, *appleName);
         }
-    }
-    const auto username = stringValue(payload.value(), "preferred_username");
-    if (username && detail::safeProfileText(
-            *username, detail::kPreferredUsernameMaximum)) {
-        claims.set(idp::ClaimName::PreferredUsername, *username);
-    }
-    const auto locale = stringValue(payload.value(), "locale");
-    if (locale && safeText(*locale, 64U)) claims.set(idp::ClaimName::Locale, *locale);
-    const auto picture = stringValue(payload.value(), "picture");
-    if (picture && detail::validHttpsProfileUrl(*picture)) {
-        claims.set(idp::ClaimName::PictureUrl, *picture);
     }
 
     idp::ProviderEvidence evidence;
@@ -794,6 +847,7 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     evidence.add("kid", *kid);
     evidence.add("algorithm", "RS256");
     evidence.add("protocol", "oidc_authorization_code_pkce");
+    if (userInfo) evidence.add("userinfo", "subject_bound");
     return idp::AuthenticationOutcome::create(
         m_implementation->config.providerId(), idp::ExternalSubject{*subject},
         std::move(claims), idp::AssuranceLevel::Ial1,
