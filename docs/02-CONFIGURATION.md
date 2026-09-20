@@ -577,6 +577,9 @@ and JWKS HTTPS requests.
 - Apple: `OPENPROOF_APPLE_CLIENT_ID`, `OPENPROOF_APPLE_CLIENT_SECRET`; optional
   `OPENPROOF_APPLE_ISSUER` (default `https://appleid.apple.com`). The configured
   Apple client secret may be the signed client-secret JWT managed by the operator.
+  OpenProof requests `response_mode=form_post` for Apple because Apple requires
+  form-post authorization responses whenever the `name` or `email` scopes are
+  requested; the shared federation callback accepts URL-encoded POST responses.
 - Microsoft: `OPENPROOF_MICROSOFT_CLIENT_ID`, `OPENPROOF_MICROSOFT_CLIENT_SECRET`,
   and a required tenant-specific `OPENPROOF_MICROSOFT_ISSUER`. Multi-tenant
   `common`, `organizations`, `consumers`, and issuer templates are rejected so an

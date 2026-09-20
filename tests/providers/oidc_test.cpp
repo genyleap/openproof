@@ -63,6 +63,24 @@ TEST(OidcProviderConfigTest, PostAuthenticationRemainsTheCompatibilityDefault)
     ASSERT_TRUE(configured) << configured.error().internalDetail();
     EXPECT_EQ(configured->clientAuthentication(),
               oidc::OidcClientAuthenticationMethod::ClientSecretPost);
+    EXPECT_EQ(configured->authorizationResponseMode(),
+              oidc::OidcAuthorizationResponseMode::Query);
+}
+
+TEST(OidcProviderConfigTest, PreservesFormPostAuthorizationResponseMode)
+{
+    auto configured = oidc::OidcProviderConfig::create(
+        idp::ProviderId{"apple"}, "https://appleid.apple.com",
+        "com.example.web", fnd::SecretString{"signed-client-secret-jwt"},
+        "https://identity.example.test/auth/federated/callback",
+        std::vector<std::string>{"name", "email"},
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
+        oidc::OidcClientAuthenticationMethod::ClientSecretPost,
+        oidc::OidcAuthorizationResponseMode::FormPost);
+
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    EXPECT_EQ(configured->authorizationResponseMode(),
+              oidc::OidcAuthorizationResponseMode::FormPost);
 }
 
 }

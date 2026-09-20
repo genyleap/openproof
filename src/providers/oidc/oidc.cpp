@@ -391,12 +391,14 @@ OidcProviderConfig::OidcProviderConfig(
     foundation::SecretString clientSecret, std::string callbackUri,
     std::vector<std::string> scopes, foundation::SecretString derivationKey,
     foundation::Duration challengeLifetime,
-    OidcClientAuthenticationMethod clientAuthentication)
+    OidcClientAuthenticationMethod clientAuthentication,
+    OidcAuthorizationResponseMode authorizationResponseMode)
     : m_providerId(std::move(providerId)), m_issuer(std::move(issuer)),
       m_clientId(std::move(clientId)), m_clientSecret(std::move(clientSecret)),
       m_callbackUri(std::move(callbackUri)), m_scopes(std::move(scopes)),
       m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
-      m_clientAuthentication(clientAuthentication) {}
+      m_clientAuthentication(clientAuthentication),
+      m_authorizationResponseMode(authorizationResponseMode) {}
 
 
 const idp::ProviderId& OidcProviderConfig::providerId() const noexcept { return m_providerId; }
@@ -409,13 +411,16 @@ const foundation::SecretString& OidcProviderConfig::derivationKey() const noexce
 foundation::Duration OidcProviderConfig::challengeLifetime() const noexcept { return m_challengeLifetime; }
 OidcClientAuthenticationMethod OidcProviderConfig::clientAuthentication() const noexcept
 { return m_clientAuthentication; }
+OidcAuthorizationResponseMode OidcProviderConfig::authorizationResponseMode() const noexcept
+{ return m_authorizationResponseMode; }
 
 foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     idp::ProviderId providerId, std::string issuer, std::string clientId,
     foundation::SecretString clientSecret, std::string callbackUri,
     std::vector<std::string> scopes, foundation::SecretString derivationKey,
     foundation::Duration challengeLifetime,
-    OidcClientAuthenticationMethod clientAuthentication)
+    OidcClientAuthenticationMethod clientAuthentication,
+    OidcAuthorizationResponseMode authorizationResponseMode)
 {
     while (issuer.size() > 8U && issuer.ends_with('/')) issuer.pop_back();
     if (providerId.empty() || !safeText(clientId, 512U) || clientSecret.empty()
@@ -435,7 +440,7 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     return OidcProviderConfig{std::move(providerId), std::move(issuer),
         std::move(clientId), std::move(clientSecret), std::move(callbackUri),
         std::move(scopes), std::move(derivationKey), challengeLifetime,
-        clientAuthentication};
+        clientAuthentication, authorizationResponseMode};
 }
 
 OidcAuthenticationProvider::OidcAuthenticationProvider(
@@ -487,6 +492,10 @@ OidcAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest
     url = queryAppend(std::move(url), "scope", scope);
     url = queryAppend(std::move(url), "state", state.value());
     url = queryAppend(std::move(url), "nonce", nonce.value());
+    if (m_implementation->config.authorizationResponseMode()
+        == OidcAuthorizationResponseMode::FormPost) {
+        url = queryAppend(std::move(url), "response_mode", "form_post");
+    }
     url = queryAppend(std::move(url), "code_challenge",
                       foundation::toBase64Url(verifierDigest.value()));
     url = queryAppend(std::move(url), "code_challenge_method", "S256");
