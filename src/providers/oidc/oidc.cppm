@@ -18,6 +18,12 @@ enum class OidcClientAuthenticationMethod {
     ClientSecretBasic,
 };
 
+/** @brief Browser response transport expected from the upstream authorization endpoint. */
+enum class OidcAuthorizationResponseMode {
+    Query,
+    FormPost,
+};
+
 /** @brief Validated configuration for an external OpenID Connect authentication provider. */
 class OidcProviderConfig final {
 public:
@@ -28,7 +34,9 @@ public:
         foundation::SecretString derivationKey,
         foundation::Duration challengeLifetime,
         OidcClientAuthenticationMethod clientAuthentication =
-            OidcClientAuthenticationMethod::ClientSecretPost);
+            OidcClientAuthenticationMethod::ClientSecretPost,
+        OidcAuthorizationResponseMode authorizationResponseMode =
+            OidcAuthorizationResponseMode::Query);
 
     OidcProviderConfig(const OidcProviderConfig&) = delete;
     OidcProviderConfig& operator=(const OidcProviderConfig&) = delete;
@@ -44,6 +52,7 @@ public:
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
     [[nodiscard]] OidcClientAuthenticationMethod clientAuthentication() const noexcept;
+    [[nodiscard]] OidcAuthorizationResponseMode authorizationResponseMode() const noexcept;
 
 private:
     friend class OidcAuthenticationProvider;
@@ -52,7 +61,8 @@ private:
                        std::string callbackUri, std::vector<std::string> scopes,
                        foundation::SecretString derivationKey,
                        foundation::Duration challengeLifetime,
-                       OidcClientAuthenticationMethod clientAuthentication);
+                       OidcClientAuthenticationMethod clientAuthentication,
+                       OidcAuthorizationResponseMode authorizationResponseMode);
 
     identity::provider::ProviderId m_providerId;
     std::string m_issuer;
@@ -64,6 +74,8 @@ private:
     foundation::Duration m_challengeLifetime{};
     OidcClientAuthenticationMethod m_clientAuthentication{
         OidcClientAuthenticationMethod::ClientSecretPost};
+    OidcAuthorizationResponseMode m_authorizationResponseMode{
+        OidcAuthorizationResponseMode::Query};
 };
 
 /**

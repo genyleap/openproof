@@ -1452,7 +1452,11 @@ addProtectedRoutes(gateway::Router& router,
                                           externalOidc::OidcClientAuthenticationMethod
                                               clientAuthentication = externalOidc::
                                                   OidcClientAuthenticationMethod::
-                                                      ClientSecretPost) -> fnd::Status {
+                                                      ClientSecretPost,
+                                          externalOidc::OidcAuthorizationResponseMode
+                                              authorizationResponseMode = externalOidc::
+                                                  OidcAuthorizationResponseMode::
+                                                      Query) -> fnd::Status {
         const std::string upperName = [&] {
             std::string output{name};
             std::ranges::transform(output, output.begin(), [](unsigned char symbol) {
@@ -1474,7 +1478,7 @@ addProtectedRoutes(gateway::Router& router,
             idp::ProviderId{std::string{name}}, std::move(issuer), *clientId,
             fnd::SecretString{*clientSecret}, *federationCallback, std::move(scopes),
             std::move(derivationKey).value(), std::chrono::minutes{5},
-            clientAuthentication);
+            clientAuthentication, authorizationResponseMode);
         if (!config) return fnd::fail(config.error());
         auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
             std::move(config).value(), clock, federationCaFile.value_or(std::string{}));
@@ -1497,7 +1501,9 @@ addProtectedRoutes(gateway::Router& router,
         const auto appleIssuer = environment.get("OPENPROOF_APPLE_ISSUER");
         auto status = registerOidcProvider(
             "apple", appleIssuer.value_or("https://appleid.apple.com"),
-            {"name", "email"}, "openproof/federation/apple/v1");
+            {"name", "email"}, "openproof/federation/apple/v1",
+            externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
+            externalOidc::OidcAuthorizationResponseMode::FormPost);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;
