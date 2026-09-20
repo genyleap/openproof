@@ -82,6 +82,84 @@ constexpr std::string_view kSamlSuccess{"urn:oasis:names:tc:SAML:2.0:status:Succ
     });
 }
 
+[[nodiscard]] bool safeLdapText(std::string_view value, std::size_t maximum) noexcept
+{
+    return !value.empty() && value.size() <= maximum
+        && std::ranges::none_of(value, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte < 0x20U || byte == 0x7FU;
+           });
+}
+
+[[nodiscard]] bool validLdapHost(std::string_view value) noexcept
+{
+    if (!safeLdapText(value, 253U) || value.starts_with('.') || value.ends_with('.')
+        || value.contains("..")) {
+        return false;
+    }
+    std::size_t begin = 0U;
+    while (begin < value.size()) {
+        const auto end = value.find('.', begin);
+        const auto label = value.substr(
+            begin, end == std::string_view::npos ? value.size() - begin : end - begin);
+        if (label.empty() || label.size() > 63U || label.starts_with('-') || label.ends_with('-')
+            || !std::ranges::all_of(label, [](char symbol) {
+                   return (symbol >= 'A' && symbol <= 'Z')
+                       || (symbol >= 'a' && symbol <= 'z')
+                       || (symbol >= '0' && symbol <= '9') || symbol == '-';
+               })) {
+            return false;
+        }
+        if (end == std::string_view::npos) break;
+        begin = end + 1U;
+    }
+    return true;
+}
+
+[[nodiscard]] bool validLdapsUri(std::string_view value) noexcept
+{
+    constexpr std::string_view scheme{"ldaps://"};
+    if (!value.starts_with(scheme) || value.size() > 2048U
+        || std::ranges::any_of(value, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte <= 0x20U || byte == 0x7FU;
+           })) {
+        return false;
+    }
+    value.remove_prefix(scheme.size());
+    if (value.empty() || value.contains('/') || value.contains('?') || value.contains('#')
+        || value.contains('@') || value.contains('\\') || value.contains('[')
+        || value.contains(']')) {
+        return false;
+    }
+
+    std::string_view host = value;
+    if (const auto colon = value.rfind(':'); colon != std::string_view::npos) {
+        if (value.find(':') != colon) return false;
+        host = value.substr(0U, colon);
+        const auto portText = value.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return false;
+        }
+    }
+    return validLdapHost(host);
+}
+
+[[nodiscard]] bool validLdapDn(std::string_view value) noexcept
+{
+    if (!safeLdapText(value, 2048U)) return false;
+    std::string storage{value};
+    LDAPDN parsed = nullptr;
+    const int result = ldap_str2dn(storage.c_str(), &parsed, LDAP_DN_FORMAT_LDAPV3);
+    if (parsed != nullptr) ldap_dnfree(parsed);
+    return result == LDAP_SUCCESS;
+}
+
 [[nodiscard]] bool validHttpsEndpoint(std::string_view value) noexcept
 {
     constexpr std::string_view scheme{"https://"};
@@ -678,11 +756,13 @@ foundation::Result<LdapProviderConfig> LdapProviderConfig::create(
     foundation::SecretString serviceBindPassword, foundation::SecretString derivationKey,
     std::string caFile, foundation::Duration challengeLifetime)
 {
-    if (!uri.starts_with("ldaps://") || uri.size() > 2048U || !safeToken(baseDn, 2048U)
+    if (!validLdapsUri(uri) || !validLdapDn(baseDn)
         || !safeAttribute(usernameAttribute) || !safeAttribute(subjectAttribute)
         || (!displayNameAttribute.empty() && !safeAttribute(displayNameAttribute))
         || (!emailAttribute.empty() && !safeAttribute(emailAttribute))
-        || (serviceBindDn.empty() != serviceBindPassword.empty()) || derivationKey.size() < 32U
+        || (serviceBindDn.empty() != serviceBindPassword.empty())
+        || (!serviceBindDn.empty() && !safeLdapText(serviceBindDn, 2048U))
+        || derivationKey.size() < 32U
         || challengeLifetime < 30s || challengeLifetime > 10min) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The enterprise LDAP configuration is invalid.");
