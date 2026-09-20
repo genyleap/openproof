@@ -786,7 +786,7 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     const auto authorizedParty = stringValue(payload.value(), "azp");
     const auto now = m_implementation->clock->now();
     if (!issuer || *issuer != m_implementation->config.issuer()
-        || !subject || !safeText(*subject, 512U) || !tokenNonce
+        || !subject || !detail::validSubjectIdentifier(*subject) || !tokenNonce
         || !security::constantTimeEquals(*tokenNonce, nonce.value())
         || !issuedAt || !expiresAt || !audienceValid
         || !detail::authorizedPartyMatches(

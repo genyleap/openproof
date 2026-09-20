@@ -17,6 +17,15 @@ namespace openproof::provider::oidc::detail {
     return !authorizedParty || *authorizedParty == clientId;
 }
 
+[[nodiscard]] inline bool validSubjectIdentifier(std::string_view subject) noexcept
+{
+    return !subject.empty() && subject.size() <= 255U
+        && std::ranges::all_of(subject, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte >= 0x20U && byte <= 0x7EU;
+           });
+}
+
 [[nodiscard]] inline bool audienceMatchesClientExclusively(
     const boost::json::object& payload, std::string_view clientId)
 {

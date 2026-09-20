@@ -164,6 +164,18 @@ TEST(OidcIdTokenValidationTest, RejectsUntrustedOrMalformedAudienceSets)
     EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
 }
 
+TEST(OidcIdTokenValidationTest, EnforcesAsciiSubjectIdentifierLimit)
+{
+    using openproof::provider::oidc::detail::validSubjectIdentifier;
+
+    EXPECT_TRUE(validSubjectIdentifier("provider-subject-123"));
+    EXPECT_TRUE(validSubjectIdentifier(std::string(255U, 's')));
+    EXPECT_FALSE(validSubjectIdentifier({}));
+    EXPECT_FALSE(validSubjectIdentifier(std::string(256U, 's')));
+    EXPECT_FALSE(validSubjectIdentifier("subject\nwith-control"));
+    EXPECT_FALSE(validSubjectIdentifier("subject-\xC3\xA9"));
+}
+
 TEST(OidcIdTokenValidationTest, HonorsJwkSignatureUseAndVerificationOperations)
 {
     namespace json = boost::json;
