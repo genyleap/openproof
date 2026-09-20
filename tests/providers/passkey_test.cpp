@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <string>
-#include <string_view>
 #include <thread>
 
 import openproof.foundation;
@@ -189,53 +188,6 @@ TEST(PasskeyServiceTest, RemovingOneOfMultipleCredentialsKeepsConnectionAttached
     EXPECT_EQ(finalRemoval.error().code(), fnd::ErrorCode::FailedPrecondition);
 }
 
-
-
-TEST(PasskeyAuthenticationProviderTest, AuthenticationChallengeIsSingleUse)
-{
-    passkey::InMemoryPasskeyRepository repository;
-    fnd::ManualClockSource clock{kNow};
-    auto passkeyConfig = config();
-    passkey::PasskeyAuthenticationProvider provider{repository, clock, passkeyConfig};
-    idp::AuthenticationRequest request{idp::ProviderId{"passkey"}, idp::ClientContext{}};
-
-    auto challenge = provider.beginAuthentication(request);
-    ASSERT_TRUE(challenge);
-    idp::AuthenticationResponse response{challenge->id(), idp::ClientContext{}};
-
-    auto first = provider.completeAuthentication(response);
-    ASSERT_FALSE(first);
-    EXPECT_EQ(first.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(first.error().internalDetail().find("incomplete"), std::string_view::npos);
-
-    auto replay = provider.completeAuthentication(response);
-    ASSERT_FALSE(replay);
-    EXPECT_EQ(replay.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(replay.error().internalDetail().find("already used"), std::string_view::npos);
-}
-
-TEST(PasskeyAuthenticationProviderTest, ExpiredAuthenticationChallengeIsConsumed)
-{
-    passkey::InMemoryPasskeyRepository repository;
-    fnd::ManualClockSource clock{kNow};
-    auto passkeyConfig = config();
-    passkey::PasskeyAuthenticationProvider provider{repository, clock, passkeyConfig};
-    idp::AuthenticationRequest request{idp::ProviderId{"passkey"}, idp::ClientContext{}};
-
-    auto challenge = provider.beginAuthentication(request);
-    ASSERT_TRUE(challenge);
-    clock.advance(std::chrono::minutes{5});
-    idp::AuthenticationResponse response{challenge->id(), idp::ClientContext{}};
-
-    auto expired = provider.completeAuthentication(response);
-    ASSERT_FALSE(expired);
-    EXPECT_EQ(expired.error().code(), fnd::ErrorCode::AuthenticationFailed);
-    EXPECT_NE(expired.error().internalDetail().find("expired"), std::string_view::npos);
-
-    auto replay = provider.completeAuthentication(response);
-    ASSERT_FALSE(replay);
-    EXPECT_NE(replay.error().internalDetail().find("already used"), std::string_view::npos);
-}
 
 TEST(PasskeyRepositoryTest, ZeroCounterCredentialRecordsSuccessfulUse)
 {

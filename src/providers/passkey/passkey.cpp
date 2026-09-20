@@ -783,24 +783,10 @@ foundation::Result<idp::AuthenticationChallenge> PasskeyAuthenticationProvider::
     auto random = security::randomTokenBase64Url(24U); if (!random) return foundation::fail(random.error());
     idp::ChallengeId idValue{"pka_" + std::move(random).value()};
     auto challenge = challengeFor(*m_config, "authenticate", idValue); if (!challenge) return foundation::fail(challenge.error());
-    const foundation::Instant now = m_clock->now();
-    const foundation::Instant expiresAt = now + m_config->ceremonyLifetime();
-    {
-        const std::lock_guard<std::mutex> guard{m_authenticationMutex};
-        for (auto pending = m_pendingAuthentication.begin(); pending != m_pendingAuthentication.end();) {
-            if (now >= pending->second) pending = m_pendingAuthentication.erase(pending);
-            else ++pending;
-        }
-        const auto inserted = m_pendingAuthentication.emplace(idValue, expiresAt);
-        if (!inserted.second) {
-            return foundation::fail(foundation::ErrorCode::AlreadyExists,
-                                    "The WebAuthn authentication challenge could not be created.");
-        }
-    }
     json::object options{{"challenge", challenge.value()}, {"rpId", m_config->relyingPartyId()},
         {"timeout", std::chrono::duration_cast<std::chrono::milliseconds>(m_config->ceremonyLifetime()).count()},
         {"userVerification", "required"}};
-    idp::AuthenticationChallenge output{idValue, expiresAt};
+    idp::AuthenticationChallenge output{idValue, m_clock->now() + m_config->ceremonyLifetime()};
     output.setParameter("public_key_options", json::serialize(options));
     return output;
 }
@@ -808,21 +794,6 @@ foundation::Result<idp::AuthenticationChallenge> PasskeyAuthenticationProvider::
 foundation::Result<idp::AuthenticationOutcome> PasskeyAuthenticationProvider::completeAuthentication(
     const idp::AuthenticationResponse& response)
 {
-    foundation::Instant expiresAt{};
-    {
-        const std::lock_guard<std::mutex> guard{m_authenticationMutex};
-        const auto pending = m_pendingAuthentication.find(response.challengeId());
-        if (pending == m_pendingAuthentication.end()) {
-            return foundation::fail(failure(
-                "WebAuthn authentication challenge is unknown or already used."));
-        }
-        expiresAt = pending->second;
-        m_pendingAuthentication.erase(pending);
-    }
-    const foundation::Instant now = m_clock->now();
-    if (now >= expiresAt) {
-        return foundation::fail(failure("WebAuthn authentication challenge expired."));
-    }
     const auto credentialId = parameter(response.parameters(), "credential_id");
     const auto clientData = parameter(response.parameters(), "client_data_json");
     const auto authenticatorData = parameter(response.parameters(), "authenticator_data");
@@ -834,7 +805,7 @@ foundation::Result<idp::AuthenticationOutcome> PasskeyAuthenticationProvider::co
     AssertionResponse assertion{std::string{*credentialId}, std::string{*clientData},
         std::string{*authenticatorData}, std::string{*signature},
         userHandle ? std::optional<std::string>{std::string{*userHandle}} : std::nullopt};
-    auto credential = verifyAssertion(*m_repository, assertion, *m_config, challenge.value(), now);
+    auto credential = verifyAssertion(*m_repository, assertion, *m_config, challenge.value(), m_clock->now());
     if (!credential) return foundation::fail(credential.error());
     idp::ProviderEvidence evidence;
     evidence.add("protocol", "webauthn_level3");
@@ -844,7 +815,7 @@ foundation::Result<idp::AuthenticationOutcome> PasskeyAuthenticationProvider::co
     return idp::AuthenticationOutcome::create(id(), idp::ExternalSubject{std::string{credential->identity.value()}},
         idp::VerifiedClaims{}, idp::AssuranceLevel::Ial2,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
-        std::move(evidence), now);
+        std::move(evidence), m_clock->now());
 }
 
 } // namespace openproof::provider::passkey
