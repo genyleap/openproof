@@ -10,6 +10,7 @@ module;
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -99,6 +100,43 @@ struct HttpsUrl final {
         std::string{foundation::defaultErrorMessage(foundation::ErrorCode::AuthenticationFailed)},
         std::move(detail)};
 }
+
+enum class ChallengeConsumption : std::uint8_t {
+    Accepted,
+    Unknown,
+    Expired,
+};
+
+class OneTimeChallengeStore final {
+public:
+    [[nodiscard]] bool remember(
+        const idp::ChallengeId& challenge, foundation::Instant expiresAt,
+        foundation::Instant now)
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        for (auto pending = m_pending.begin(); pending != m_pending.end();) {
+            if (now >= pending->second) pending = m_pending.erase(pending);
+            else ++pending;
+        }
+        return m_pending.emplace(challenge, expiresAt).second;
+    }
+
+    [[nodiscard]] ChallengeConsumption consume(
+        const idp::ChallengeId& challenge, foundation::Instant now)
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_pending.find(challenge);
+        if (found == m_pending.end()) return ChallengeConsumption::Unknown;
+        const auto expiresAt = found->second;
+        m_pending.erase(found);
+        return now >= expiresAt ? ChallengeConsumption::Expired
+                                : ChallengeConsumption::Accepted;
+    }
+
+private:
+    std::mutex m_mutex;
+    std::map<idp::ChallengeId, foundation::Instant> m_pending;
+};
 
 [[nodiscard]] bool safeText(std::string_view value, std::size_t maximum) noexcept
 {
@@ -1102,6 +1140,8 @@ struct ParsedFarcasterSiwe final {
         return foundation::fail(authenticationFailure("The SIWF challenge binding is invalid."));
     }
     std::optional<std::string_view> expirationText;
+    std::optional<std::string_view> notBeforeText;
+    bool requestIdSeen = false;
     for (std::size_t index = 10U; index < *resourcesIndex; ++index) {
         if (lines[index].starts_with(expirationLabel)) {
             if (expirationText.has_value()) {
@@ -1111,8 +1151,20 @@ struct ParsedFarcasterSiwe final {
             expirationText = lines[index].substr(expirationLabel.size());
             continue;
         }
-        if (lines[index].starts_with(notBeforeLabel)
-            || lines[index].starts_with(requestIdLabel)) {
+        if (lines[index].starts_with(notBeforeLabel)) {
+            if (notBeforeText.has_value()) {
+                return foundation::fail(authenticationFailure(
+                    "The SIWF message contains duplicate not-before fields."));
+            }
+            notBeforeText = lines[index].substr(notBeforeLabel.size());
+            continue;
+        }
+        if (lines[index].starts_with(requestIdLabel)) {
+            if (requestIdSeen) {
+                return foundation::fail(authenticationFailure(
+                    "The SIWF message contains duplicate request-id fields."));
+            }
+            requestIdSeen = true;
             continue;
         }
         return foundation::fail(authenticationFailure(
@@ -1124,12 +1176,17 @@ struct ParsedFarcasterSiwe final {
     }
     const auto issuedAt = parseSiweInstant(lines[9].substr(issuedLabel.size()));
     const auto expiresAt = parseSiweInstant(*expirationText);
+    const auto notBefore = notBeforeText.has_value()
+        ? parseSiweInstant(*notBeforeText)
+        : std::optional<foundation::Instant>{};
     const foundation::Instant challengeStart{foundation::Duration{timestamp.value()}};
     const foundation::Instant challengeEnd = challengeStart + lifetime;
     constexpr auto clockSkew = std::chrono::minutes{1};
-    if (!issuedAt || !expiresAt || *issuedAt < challengeStart - clockSkew
+    if (!issuedAt || !expiresAt || (notBeforeText.has_value() && !notBefore.has_value())
+        || *issuedAt < challengeStart - clockSkew
         || *issuedAt > now + clockSkew || *expiresAt != challengeEnd
-        || *expiresAt <= *issuedAt || now >= challengeEnd) {
+        || *expiresAt <= *issuedAt || now >= challengeEnd
+        || (notBefore.has_value() && now < *notBefore)) {
         return foundation::fail(authenticationFailure("The SIWF time window is invalid."));
     }
     return ParsedFarcasterSiwe{std::move(*address), *fid};
@@ -1254,6 +1311,7 @@ public:
         : config(std::move(value)), clock(&source) {}
     WalletProviderConfig config;
     const foundation::ClockSource* clock;
+    OneTimeChallengeStore challenges;
 };
 
 WalletAuthenticationProvider::WalletAuthenticationProvider(
@@ -1285,11 +1343,17 @@ WalletAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
     if (!challengeId) return foundation::fail(challengeId.error());
     auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
     if (!nonce) return foundation::fail(nonce.error());
-    idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
+    const auto expiresAt = now + m_implementation->config.challengeLifetime();
+    if (!m_implementation->challenges.remember(challengeId.value(), expiresAt, now)) {
+        return foundation::fail(
+            foundation::ErrorCode::AlreadyExists,
+            "The SIWE authentication challenge could not be created.");
+    }
+    idp::AuthenticationChallenge challenge{challengeId.value(), expiresAt};
     challenge.setParameter("message", buildSiweMessage(
         m_implementation->config.domain(), *address, kWalletStatement,
         m_implementation->config.uri(), chainId.value(), nonce.value(),
-        now, now + m_implementation->config.challengeLifetime()));
+        now, expiresAt));
     challenge.setParameter("address", *address);
     challenge.setParameter("chain_id", std::to_string(chainId.value()));
     return challenge;
@@ -1298,6 +1362,17 @@ WalletAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
 foundation::Result<idp::AuthenticationOutcome>
 WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
 {
+    const auto now = m_implementation->clock->now();
+    switch (m_implementation->challenges.consume(response.challengeId(), now)) {
+    case ChallengeConsumption::Unknown:
+        return foundation::fail(authenticationFailure(
+            "The SIWE authentication challenge is unknown or already used."));
+    case ChallengeConsumption::Expired:
+        return foundation::fail(authenticationFailure(
+            "The SIWE authentication challenge expired."));
+    case ChallengeConsumption::Accepted:
+        break;
+    }
     const auto message = credential(response.parameters(), "message");
     const auto signature = credential(response.parameters(), "signature");
     if (!message || !signature || signature->size() > 8192U) {
@@ -1306,7 +1381,7 @@ WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     auto parsed = validateSiweMessage(*message, response.challengeId(), "siwe_",
         m_implementation->config.domain(), m_implementation->config.uri(),
         kWalletStatement, m_implementation->config.derivationKey(),
-        m_implementation->config.challengeLifetime(), m_implementation->clock->now());
+        m_implementation->config.challengeLifetime(), now);
     if (!parsed) return foundation::fail(parsed.error());
     auto digest = ethereumMessageHash(*message);
     if (!digest) return foundation::fail(digest.error());
@@ -1346,7 +1421,7 @@ WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     return idp::AuthenticationOutcome::create(
         id(), idp::ExternalSubject{parsed->address}, std::move(claims), idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-        std::move(evidence), m_implementation->clock->now());
+        std::move(evidence), now);
 }
 
 FarcasterProviderConfig::FarcasterProviderConfig(
@@ -1407,6 +1482,7 @@ public:
     FarcasterProviderConfig config;
     const foundation::ClockSource* clock;
     std::unique_ptr<FarcasterChainVerifier> verifier;
+    OneTimeChallengeStore challenges;
 };
 
 FarcasterAuthenticationProvider::FarcasterAuthenticationProvider(
@@ -1456,7 +1532,13 @@ FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRe
     if (!challengeId) return foundation::fail(challengeId.error());
     auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
     if (!nonce) return foundation::fail(nonce.error());
-    idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
+    const auto expiresAt = now + m_implementation->config.challengeLifetime();
+    if (!m_implementation->challenges.remember(challengeId.value(), expiresAt, now)) {
+        return foundation::fail(
+            foundation::ErrorCode::AlreadyExists,
+            "The Farcaster authentication challenge could not be created.");
+    }
+    idp::AuthenticationChallenge challenge{challengeId.value(), expiresAt};
     challenge.setParameter("nonce", nonce.value());
     challenge.setParameter("domain", std::string{m_implementation->config.domain()});
     challenge.setParameter("uri", std::string{m_implementation->config.uri()});
@@ -1466,7 +1548,7 @@ FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRe
     if (address && fid && signerKind) {
         challenge.setParameter("message", buildFarcasterMessage(
             m_implementation->config.domain(), *address, m_implementation->config.uri(),
-            nonce.value(), now, now + m_implementation->config.challengeLifetime(), *fid));
+            nonce.value(), now, expiresAt, *fid));
         challenge.setParameter("address", *address);
         challenge.setParameter("fid", std::to_string(*fid));
         challenge.setParameter("signer_kind",
@@ -1478,6 +1560,17 @@ FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRe
 foundation::Result<idp::AuthenticationOutcome>
 FarcasterAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
 {
+    const auto now = m_implementation->clock->now();
+    switch (m_implementation->challenges.consume(response.challengeId(), now)) {
+    case ChallengeConsumption::Unknown:
+        return foundation::fail(authenticationFailure(
+            "The Farcaster authentication challenge is unknown or already used."));
+    case ChallengeConsumption::Expired:
+        return foundation::fail(authenticationFailure(
+            "The Farcaster authentication challenge expired."));
+    case ChallengeConsumption::Accepted:
+        break;
+    }
     const auto message = credential(response.parameters(), "message");
     const auto signature = credential(response.parameters(), "signature");
     if (!message || !signature || signature->size() > 8192U) {
@@ -1486,7 +1579,7 @@ FarcasterAuthenticationProvider::completeAuthentication(const idp::Authenticatio
     auto parsed = validateFarcasterMessage(*message, response.challengeId(),
         m_implementation->config.domain(), m_implementation->config.uri(),
         m_implementation->config.derivationKey(), m_implementation->config.challengeLifetime(),
-        m_implementation->clock->now());
+        now);
     if (!parsed) return foundation::fail(parsed.error());
     auto signatureValid = m_implementation->verifier->verifySignature(
         parsed->address, *message, *signature);
@@ -1520,7 +1613,7 @@ FarcasterAuthenticationProvider::completeAuthentication(const idp::Authenticatio
         id(), idp::ExternalSubject{std::to_string(parsed->fid)}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-        std::move(evidence), m_implementation->clock->now());
+        std::move(evidence), now);
 }
 
 } // namespace openproof::provider::web3
