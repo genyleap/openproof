@@ -559,6 +559,8 @@ TEST(OidcProviderConfigTest, PostAuthenticationRemainsTheCompatibilityDefault)
     EXPECT_EQ(configured->authorizationResponseMode(),
               oidc::OidcAuthorizationResponseMode::Query);
     EXPECT_EQ(configured->pkceMode(), oidc::OidcPkceMode::S256);
+    EXPECT_EQ(configured->nonceMode(), oidc::OidcNonceMode::Required);
+    EXPECT_EQ(configured->idTokenIssuer(), "https://www.linkedin.com/oauth");
 }
 
 TEST(OidcProviderConfigTest, PreservesExplicitDisabledPkceForConfidentialWebProviders)
@@ -571,10 +573,32 @@ TEST(OidcProviderConfigTest, PreservesExplicitDisabledPkceForConfidentialWebProv
         fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
         oidc::OidcClientAuthenticationMethod::ClientSecretPost,
         oidc::OidcAuthorizationResponseMode::Query,
-        oidc::OidcPkceMode::Disabled);
+        oidc::OidcPkceMode::Disabled,
+        oidc::OidcNonceMode::Disabled);
 
     ASSERT_TRUE(configured) << configured.error().internalDetail();
     EXPECT_EQ(configured->pkceMode(), oidc::OidcPkceMode::Disabled);
+    EXPECT_EQ(configured->nonceMode(), oidc::OidcNonceMode::Disabled);
+    EXPECT_EQ(configured->idTokenIssuer(), "https://www.linkedin.com/oauth");
+}
+
+TEST(OidcProviderConfigTest, SupportsCustomIdTokenIssuer)
+{
+    auto configured = oidc::OidcProviderConfig::create(
+        idp::ProviderId{"custom"}, "https://discovery.example.test",
+        "client-id", fnd::SecretString{"client-secret"},
+        "https://identity.example.test/auth/federated/callback",
+        std::vector<std::string>{"openid", "profile", "email"},
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
+        oidc::OidcClientAuthenticationMethod::ClientSecretPost,
+        oidc::OidcAuthorizationResponseMode::Query,
+        oidc::OidcPkceMode::S256,
+        oidc::OidcNonceMode::Required,
+        "https://issuer.example.test");
+
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    EXPECT_EQ(configured->nonceMode(), oidc::OidcNonceMode::Required);
+    EXPECT_EQ(configured->idTokenIssuer(), "https://issuer.example.test");
 }
 
 TEST(OidcProviderConfigTest, PreservesFormPostAuthorizationResponseMode)

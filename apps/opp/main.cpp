@@ -1459,7 +1459,10 @@ addProtectedRoutes(gateway::Router& router,
                                                   OidcAuthorizationResponseMode::
                                                       Query,
                                           externalOidc::OidcPkceMode pkceMode =
-                                              externalOidc::OidcPkceMode::S256) -> fnd::Status {
+                                              externalOidc::OidcPkceMode::S256,
+                                          externalOidc::OidcNonceMode nonceMode =
+                                              externalOidc::OidcNonceMode::Required,
+                                          std::string idTokenIssuer = {}) -> fnd::Status {
         const std::string upperName = [&] {
             std::string output{name};
             std::ranges::transform(output, output.begin(), [](unsigned char symbol) {
@@ -1481,7 +1484,8 @@ addProtectedRoutes(gateway::Router& router,
             idp::ProviderId{std::string{name}}, std::move(issuer), *clientId,
             fnd::SecretString{*clientSecret}, *federationCallback, std::move(scopes),
             std::move(derivationKey).value(), std::chrono::minutes{5},
-            clientAuthentication, authorizationResponseMode, pkceMode);
+            clientAuthentication, authorizationResponseMode, pkceMode,
+            nonceMode, std::move(idTokenIssuer));
         if (!config) return fnd::fail(config.error());
         auto implementation = std::make_unique<externalOidc::OidcAuthenticationProvider>(
             std::move(config).value(), clock, federationCaFile.value_or(std::string{}));
@@ -1584,7 +1588,8 @@ addProtectedRoutes(gateway::Router& router,
             {"openid", "profile", "email"}, "openproof/federation/linkedin/v1",
             externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
             externalOidc::OidcAuthorizationResponseMode::Query,
-            externalOidc::OidcPkceMode::Disabled);
+            externalOidc::OidcPkceMode::Disabled,
+            externalOidc::OidcNonceMode::Disabled);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;

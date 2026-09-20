@@ -547,18 +547,21 @@ OidcProviderConfig::OidcProviderConfig(
     foundation::Duration challengeLifetime,
     OidcClientAuthenticationMethod clientAuthentication,
     OidcAuthorizationResponseMode authorizationResponseMode,
-    OidcPkceMode pkceMode)
+    OidcPkceMode pkceMode, OidcNonceMode nonceMode,
+    std::string idTokenIssuer)
     : m_providerId(std::move(providerId)), m_issuer(std::move(issuer)),
+      m_idTokenIssuer(std::move(idTokenIssuer)),
       m_clientId(std::move(clientId)), m_clientSecret(std::move(clientSecret)),
       m_callbackUri(std::move(callbackUri)), m_scopes(std::move(scopes)),
       m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
       m_clientAuthentication(clientAuthentication),
       m_authorizationResponseMode(authorizationResponseMode),
-      m_pkceMode(pkceMode) {}
+      m_pkceMode(pkceMode), m_nonceMode(nonceMode) {}
 
 
 const idp::ProviderId& OidcProviderConfig::providerId() const noexcept { return m_providerId; }
 std::string_view OidcProviderConfig::issuer() const noexcept { return m_issuer; }
+std::string_view OidcProviderConfig::idTokenIssuer() const noexcept { return m_idTokenIssuer; }
 std::string_view OidcProviderConfig::clientId() const noexcept { return m_clientId; }
 const foundation::SecretString& OidcProviderConfig::clientSecret() const noexcept { return m_clientSecret; }
 foundation::Result<foundation::SecretString>
@@ -578,6 +581,8 @@ OidcAuthorizationResponseMode OidcProviderConfig::authorizationResponseMode() co
 { return m_authorizationResponseMode; }
 OidcPkceMode OidcProviderConfig::pkceMode() const noexcept
 { return m_pkceMode; }
+OidcNonceMode OidcProviderConfig::nonceMode() const noexcept
+{ return m_nonceMode; }
 
 foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     idp::ProviderId providerId, std::string issuer, std::string clientId,
@@ -586,14 +591,18 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     foundation::Duration challengeLifetime,
     OidcClientAuthenticationMethod clientAuthentication,
     OidcAuthorizationResponseMode authorizationResponseMode,
-    OidcPkceMode pkceMode)
+    OidcPkceMode pkceMode, OidcNonceMode nonceMode,
+    std::string idTokenIssuer)
 {
     while (issuer.size() > 8U && issuer.ends_with('/')) issuer.pop_back();
+    if (idTokenIssuer.empty()) idTokenIssuer = issuer;
+    while (idTokenIssuer.size() > 8U && idTokenIssuer.ends_with('/')) idTokenIssuer.pop_back();
     if (providerId.empty() || !safeText(clientId, 512U) || clientSecret.empty()
         || clientSecret.size() > 4096U || derivationKey.size() < 32U
         || challengeLifetime <= foundation::Duration::zero()
         || challengeLifetime > std::chrono::minutes{15}
-        || !parseHttpsUrl(issuer) || !parseHttpsUrl(callbackUri)
+        || !parseHttpsUrl(issuer) || !parseHttpsUrl(idTokenIssuer)
+        || !parseHttpsUrl(callbackUri)
         || scopes.empty() || scopes.size() > 32U
         || std::ranges::any_of(scopes, [](const std::string& scope) {
                return !safeText(scope, 128U) || scope.contains(' ');
@@ -604,7 +613,8 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::create(
     return OidcProviderConfig{std::move(providerId), std::move(issuer),
         std::move(clientId), std::move(clientSecret), std::move(callbackUri),
         std::move(scopes), std::move(derivationKey), challengeLifetime,
-        clientAuthentication, authorizationResponseMode, pkceMode};
+        clientAuthentication, authorizationResponseMode, pkceMode, nonceMode,
+        std::move(idTokenIssuer)};
 }
 
 foundation::Result<OidcProviderConfig> OidcProviderConfig::createApple(
@@ -626,7 +636,8 @@ foundation::Result<OidcProviderConfig> OidcProviderConfig::createApple(
         std::move(initialSecret).value(), std::move(callbackUri), std::move(scopes),
         std::move(derivationKey), challengeLifetime,
         OidcClientAuthenticationMethod::ClientSecretPost,
-        OidcAuthorizationResponseMode::FormPost, OidcPkceMode::S256);
+        OidcAuthorizationResponseMode::FormPost, OidcPkceMode::S256,
+        OidcNonceMode::Required);
     if (!configured) return foundation::fail(configured.error());
     configured->m_dynamicAppleClientSecret = true;
     configured->m_appleTeamId = std::move(teamId);
@@ -664,10 +675,19 @@ OidcAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest
     if (!random) return foundation::fail(random.error());
     idp::ChallengeId challengeId{"opc_" + std::move(random).value()};
     auto state = derived(m_implementation->config.derivationKey(), "state", challengeId);
-    auto nonce = derived(m_implementation->config.derivationKey(), "nonce", challengeId);
-    if (!state || !nonce) {
+    if (!state) {
         return foundation::fail(foundation::ErrorCode::Internal,
                                 "OIDC challenge derivation failed.");
+    }
+    std::optional<std::string> nonce;
+    if (m_implementation->config.nonceMode() == OidcNonceMode::Required) {
+        auto derivedNonce = derived(
+            m_implementation->config.derivationKey(), "nonce", challengeId);
+        if (!derivedNonce) {
+            return foundation::fail(foundation::ErrorCode::Internal,
+                                    "OIDC nonce derivation failed.");
+        }
+        nonce = std::move(derivedNonce).value();
     }
     std::optional<std::string> verifier;
     if (m_implementation->config.pkceMode() == OidcPkceMode::S256) {
@@ -690,7 +710,7 @@ OidcAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest
     url = queryAppend(std::move(url), "redirect_uri", m_implementation->config.callbackUri());
     url = queryAppend(std::move(url), "scope", scope);
     url = queryAppend(std::move(url), "state", state.value());
-    url = queryAppend(std::move(url), "nonce", nonce.value());
+    if (nonce) url = queryAppend(std::move(url), "nonce", *nonce);
     if (m_implementation->config.authorizationResponseMode()
         == OidcAuthorizationResponseMode::FormPost) {
         url = queryAppend(std::move(url), "response_mode", "form_post");
@@ -718,10 +738,18 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     }
     auto expectedState = derived(
         m_implementation->config.derivationKey(), "state", response.challengeId());
-    auto nonce = derived(m_implementation->config.derivationKey(), "nonce", response.challengeId());
-    if (!expectedState || !nonce
+    if (!expectedState
         || !security::constantTimeEquals(*state, expectedState.value())) {
         return foundation::fail(authFailure("The OIDC state binding is invalid."));
+    }
+    std::optional<std::string> nonce;
+    if (m_implementation->config.nonceMode() == OidcNonceMode::Required) {
+        auto derivedNonce = derived(
+            m_implementation->config.derivationKey(), "nonce", response.challengeId());
+        if (!derivedNonce) {
+            return foundation::fail(authFailure("The OIDC nonce binding is unavailable."));
+        }
+        nonce = std::move(derivedNonce).value();
     }
     std::optional<std::string> verifier;
     if (m_implementation->config.pkceMode() == OidcPkceMode::S256) {
@@ -827,6 +855,9 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     const auto issuer = stringValue(payload.value(), "iss");
     const auto subject = stringValue(payload.value(), "sub");
     const auto tokenNonce = stringValue(payload.value(), "nonce");
+    const bool nonceValid = nonce
+        ? (tokenNonce && security::constantTimeEquals(*tokenNonce, *nonce))
+        : true;
     const auto issuedAt = integerValue(payload.value(), "iat");
     const auto expiresAt = integerValue(payload.value(), "exp");
     const bool audienceValid = detail::audienceMatchesClientExclusively(
@@ -835,9 +866,8 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     auto accessHashMatches = accessTokenHashMatches(payload.value(), *accessToken);
     if (!accessHashMatches) return foundation::fail(accessHashMatches.error());
     const auto now = m_implementation->clock->now();
-    if (!issuer || *issuer != m_implementation->config.issuer()
-        || !subject || !detail::validSubjectIdentifier(*subject) || !tokenNonce
-        || !security::constantTimeEquals(*tokenNonce, nonce.value())
+    if (!issuer || *issuer != m_implementation->config.idTokenIssuer()
+        || !subject || !detail::validSubjectIdentifier(*subject) || !nonceValid
         || !issuedAt || !expiresAt || !audienceValid
         || !accessHashMatches.value()
         || !detail::authorizedPartyMatches(
@@ -888,7 +918,10 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     evidence.add("issuer", *issuer);
     evidence.add("kid", *kid);
     evidence.add("algorithm", "RS256");
-    evidence.add("protocol", "oidc_authorization_code_pkce");
+    evidence.add("protocol",
+        m_implementation->config.pkceMode() == OidcPkceMode::S256
+            ? "oidc_authorization_code_pkce"
+            : "oidc_authorization_code");
     if (userInfo) evidence.add("userinfo", "subject_bound");
     return idp::AuthenticationOutcome::create(
         m_implementation->config.providerId(), idp::ExternalSubject{*subject},
