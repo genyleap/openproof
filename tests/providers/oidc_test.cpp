@@ -83,4 +83,24 @@ TEST(OidcProviderConfigTest, PreservesFormPostAuthorizationResponseMode)
               oidc::OidcAuthorizationResponseMode::FormPost);
 }
 
+TEST(OidcProviderConfigTest, MicrosoftCanUseFormPostWithPostClientAuthentication)
+{
+    auto configured = oidc::OidcProviderConfig::create(
+        idp::ProviderId{"microsoft"},
+        "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0",
+        "00000000-aaaa-bbbb-cccc-111111111111",
+        fnd::SecretString{std::string(32U, 's')},
+        "https://identity.example.test/auth/federated/callback",
+        std::vector<std::string>{"openid", "profile", "email"},
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
+        oidc::OidcClientAuthenticationMethod::ClientSecretPost,
+        oidc::OidcAuthorizationResponseMode::FormPost);
+
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    EXPECT_EQ(configured->clientAuthentication(),
+              oidc::OidcClientAuthenticationMethod::ClientSecretPost);
+    EXPECT_EQ(configured->authorizationResponseMode(),
+              oidc::OidcAuthorizationResponseMode::FormPost);
+}
+
 }

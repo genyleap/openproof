@@ -583,7 +583,9 @@ and JWKS HTTPS requests.
 - Microsoft: `OPENPROOF_MICROSOFT_CLIENT_ID`, `OPENPROOF_MICROSOFT_CLIENT_SECRET`,
   and a required tenant-specific `OPENPROOF_MICROSOFT_ISSUER`. Multi-tenant
   `common`, `organizations`, `consumers`, and issuer templates are rejected so an
-  ID Token is never accepted under an ambiguous issuer policy.
+  ID Token is never accepted under an ambiguous issuer policy. OpenProof requests
+  `response_mode=form_post` for Microsoft web sign-in and accepts the callback on
+  the shared URL-encoded POST federation endpoint.
 - GitHub: `OPENPROOF_GITHUB_CLIENT_ID`, `OPENPROOF_GITHUB_CLIENT_SECRET`. The
   provider uses Authorization Code with PKCE, revalidates the authenticated user
   through the GitHub REST API after every sign-in, and accepts an email claim only
@@ -601,8 +603,12 @@ and JWKS HTTPS requests.
   supported default `RS256`. The default scopes are `openid profile`; phone and
   bot messaging permission are deliberately not requested.
 
-OIDC discovery metadata and JWKS are fetched over certificate-verified TLS. The
-browser flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
+OIDC discovery metadata and JWKS are fetched over certificate-verified TLS. When
+the upstream metadata explicitly advertises token-authentication methods, response
+modes, or PKCE methods, OpenProof rejects metadata that omits the configured client
+authentication method, configured response mode, or required `S256`. Providers that
+legitimately omit those optional discovery fields remain compatible. The browser
+flow uses Authorization Code with PKCE, state and nonce. ID Tokens are
 accepted only after signature, issuer, audience, expiry, issued-at and nonce
 validation. A previously unseen verified upstream subject may create a new
 canonical identity only for explicitly trusted federation providers; email
