@@ -1,11 +1,16 @@
 module;
 
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 export module openproof.account:service;
 
+import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
@@ -72,6 +77,33 @@ protected:
     VerificationDelivery() = default;
 };
 
+struct TotpEnrollmentIdTag {};
+using TotpEnrollmentId = foundation::StrongId<TotpEnrollmentIdTag>;
+
+class TotpEnrollmentStart final {
+public:
+    TotpEnrollmentStart(const TotpEnrollmentStart&) = delete;
+    TotpEnrollmentStart& operator=(const TotpEnrollmentStart&) = delete;
+    TotpEnrollmentStart(TotpEnrollmentStart&&) noexcept = default;
+    TotpEnrollmentStart& operator=(TotpEnrollmentStart&&) noexcept = default;
+
+    [[nodiscard]] const TotpEnrollmentId& id() const noexcept { return m_id; }
+    [[nodiscard]] const foundation::SecretString& secretBase32() const noexcept { return m_secretBase32; }
+    [[nodiscard]] foundation::Instant expiresAt() const noexcept { return m_expiresAt; }
+    [[nodiscard]] bool replacing() const noexcept { return m_replacing; }
+
+private:
+    friend class AccountService;
+    TotpEnrollmentStart(TotpEnrollmentId id, foundation::SecretString secretBase32,
+                        foundation::Instant expiresAt, bool replacing)
+        : m_id(std::move(id)), m_secretBase32(std::move(secretBase32)),
+          m_expiresAt(expiresAt), m_replacing(replacing) {}
+    TotpEnrollmentId m_id;
+    foundation::SecretString m_secretBase32;
+    foundation::Instant m_expiresAt{};
+    bool m_replacing{};
+};
+
 /** @brief Public account lifecycle and self-service coordinator. */
 class AccountService final {
 public:
@@ -82,6 +114,7 @@ public:
                    identity::core::ExternalIdentityDirectory& externalIdentities,
                    identity::profile::IdentityProfileRepository& profiles,
                    provider::local::LocalAccountDirectory& localAccounts,
+                   credentials::RecoveryCodeService& recoveryCodes,
                    AccountRepository& repository,
                    session::SessionService& sessions,
                    const foundation::ClockSource& clock,
@@ -131,6 +164,23 @@ public:
     [[nodiscard]] foundation::Result<identity::profile::IdentityProfile> profile(
         const identity::core::IdentityId& identity) const;
 
+    /** nullopt means this identity has no local email/password method. */
+    [[nodiscard]] foundation::Result<std::optional<bool>> totpEnabled(
+        const identity::core::IdentityId& identity) const;
+    [[nodiscard]] foundation::Result<TotpEnrollmentStart> beginTotpEnrollment(
+        const identity::core::IdentityId& identity,
+        const foundation::SecretString& password,
+        identity::provider::AssuranceLevel currentAssurance);
+    [[nodiscard]] foundation::Status completeTotpEnrollment(
+        const identity::core::IdentityId& identity,
+        const TotpEnrollmentId& enrollmentId,
+        std::string_view verificationCode,
+        identity::provider::AssuranceLevel currentAssurance);
+    [[nodiscard]] foundation::Status disableTotp(
+        const identity::core::IdentityId& identity,
+        const foundation::SecretString& password,
+        identity::provider::AssuranceLevel currentAssurance);
+
 private:
     [[nodiscard]] foundation::Result<VerificationDispatch> issue(
         const identity::core::IdentityId& identity,
@@ -147,6 +197,17 @@ private:
     [[nodiscard]] foundation::Status attachVerified(
         const identity::core::IdentityId& identity,
         const identity::core::ExternalIdentityRef& external);
+    [[nodiscard]] foundation::Result<std::optional<identity::provider::ExternalSubject>>
+    localSubject(const identity::core::IdentityId& identity) const;
+
+    struct PendingTotpEnrollment {
+        identity::core::IdentityId identity;
+        identity::provider::ExternalSubject subject;
+        credentials::TotpSecret secret;
+        foundation::Instant expiresAt{};
+        bool replacementAuthorized{};
+        std::uint32_t attempts{};
+    };
 
     identity::core::OrganizationId m_organization;
     identity::provider::ProviderId m_localProvider;
@@ -155,12 +216,15 @@ private:
     identity::core::ExternalIdentityDirectory* m_externalIdentities;
     identity::profile::IdentityProfileRepository* m_profiles;
     provider::local::LocalAccountDirectory* m_localAccounts;
+    credentials::RecoveryCodeService* m_recoveryCodes;
     AccountRepository* m_repository;
     session::SessionService* m_sessions;
     const foundation::ClockSource* m_clock;
     VerificationKey m_key;
     AccountPolicy m_policy;
     VerificationDelivery* m_delivery;
+    mutable std::mutex m_totpMutex;
+    std::map<TotpEnrollmentId, PendingTotpEnrollment> m_pendingTotp;
 };
 
 }

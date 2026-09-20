@@ -28,6 +28,8 @@ public:
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] foundation::Result<session::AuthenticatedSession>
+    authenticate(gateway::HttpRequest& request) const;
     [[nodiscard]] foundation::Result<identity::core::IdentityId>
     authorize(gateway::HttpRequest& request) const;
     [[nodiscard]] gateway::HttpResponse signup(gateway::HttpRequest request);
@@ -39,6 +41,10 @@ private:
     [[nodiscard]] gateway::HttpResponse completePhone(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse forgotPassword(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse resetPassword(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse totpStatus(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse beginTotpEnrollment(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse completeTotpEnrollment(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse disableTotp(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse getProfile(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse updateProfile(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse connections(gateway::HttpRequest request);

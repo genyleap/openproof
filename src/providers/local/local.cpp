@@ -213,6 +213,66 @@ foundation::Status InMemoryLocalAccountDirectory::verifyPassword(
         : foundation::fail(authenticationFailure("Local password did not verify."));
 }
 
+foundation::Result<bool> InMemoryLocalAccountDirectory::hasTotp(
+    const idp::ExternalSubject& subject)
+{
+    Account* account = nullptr;
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_accounts.find(subject);
+        if (found != m_accounts.end()) account = found->second.get();
+    }
+    if (account == nullptr) {
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    const std::lock_guard<std::mutex> accountGuard{account->mutex};
+    return account->totp.has_value();
+}
+
+foundation::Status InMemoryLocalAccountDirectory::replaceTotp(
+    const idp::ExternalSubject& subject, credentials::TotpSecret& secret,
+    std::string_view verificationCode, foundation::Instant now)
+{
+    Account* account = nullptr;
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_accounts.find(subject);
+        if (found != m_accounts.end()) account = found->second.get();
+    }
+    if (account == nullptr) {
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    auto accepted = credentials::verifyTotp(
+        secret, m_totpPolicy, verificationCode, now, std::nullopt);
+    if (!accepted.has_value()) return foundation::fail(accepted.error());
+    const std::lock_guard<std::mutex> accountGuard{account->mutex};
+    account->totp = std::move(secret);
+    account->lastAcceptedTotpStep = accepted.value();
+    return foundation::ok();
+}
+
+foundation::Status InMemoryLocalAccountDirectory::removeTotp(
+    const idp::ExternalSubject& subject)
+{
+    Account* account = nullptr;
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_accounts.find(subject);
+        if (found != m_accounts.end()) account = found->second.get();
+    }
+    if (account == nullptr) {
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    const std::lock_guard<std::mutex> accountGuard{account->mutex};
+    if (!account->totp.has_value()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "TOTP is not enabled for this local account.");
+    }
+    account->totp.reset();
+    account->lastAcceptedTotpStep.reset();
+    return foundation::ok();
+}
+
 foundation::Result<LocalVerification> InMemoryLocalAccountDirectory::verify(
     const idp::ExternalSubject& subject, const foundation::SecretString& password,
     std::optional<std::string_view> totp, foundation::Instant now)
@@ -352,6 +412,11 @@ LocalAuthenticationProvider::completeAuthentication(
         if (m_identities == nullptr || m_recoveryCodes == nullptr) {
             return foundation::fail(authenticationFailure(
                 "Recovery-code authentication is not configured."));
+        }
+        auto totpEnabled = m_accounts->hasTotp(pending->subject);
+        if (!totpEnabled.has_value() || !totpEnabled.value()) {
+            return foundation::fail(authenticationFailure(
+                "Recovery code did not verify."));
         }
         auto knowledgeVerified = m_accounts->verifyPassword(pending->subject, password);
         if (!knowledgeVerified.has_value()) {

@@ -161,8 +161,8 @@ gateway::HttpResponse AccountHttpApi::error(
     return response;
 }
 
-foundation::Result<identity::core::IdentityId>
-AccountHttpApi::authorize(gateway::HttpRequest& request) const
+foundation::Result<session::AuthenticatedSession>
+AccountHttpApi::authenticate(gateway::HttpRequest& request) const
 {
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) return foundation::fail(credential.error());
@@ -170,8 +170,13 @@ AccountHttpApi::authorize(gateway::HttpRequest& request) const
         return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
                                 "Authentication is required.");
     }
-    auto authenticated = m_sessions->authenticate(
-        credential->value(), m_delegated, "account");
+    return m_sessions->authenticate(credential->value(), m_delegated, "account");
+}
+
+foundation::Result<identity::core::IdentityId>
+AccountHttpApi::authorize(gateway::HttpRequest& request) const
+{
+    auto authenticated = authenticate(request);
     if (!authenticated) return foundation::fail(authenticated.error());
     return authenticated->session().identity();
 }
@@ -197,6 +202,10 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Post && request.path() == "/account/phone/verify") return completePhone(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/forgot") return forgotPassword(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/reset") return resetPassword(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/totp") return totpStatus(std::move(request));
+    if (request.method() == HttpMethod::Post && request.path() == "/account/totp/start") return beginTotpEnrollment(std::move(request));
+    if (request.method() == HttpMethod::Post && request.path() == "/account/totp/complete") return completeTotpEnrollment(std::move(request));
+    if (request.method() == HttpMethod::Post && request.path() == "/account/totp/disable") return disableTotp(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/profile") return getProfile(std::move(request));
     if ((request.method() == HttpMethod::Patch || request.method() == HttpMethod::Put)
         && request.path() == "/account/profile") return updateProfile(std::move(request));
@@ -347,6 +356,87 @@ gateway::HttpResponse AccountHttpApi::resetPassword(gateway::HttpRequest request
     foundation::SecretString proof{std::move(secret).value()}; foundation::SecretString newPassword{std::move(password).value()};
     auto status = m_accounts->completePasswordReset(VerificationId{std::move(id).value()}, proof, newPassword);
     return status ? jsonResponse(200, json::object{{"password_reset", true}}) : error(status.error(), request);
+}
+
+gateway::HttpResponse AccountHttpApi::totpStatus(gateway::HttpRequest request)
+{
+    auto authenticated = authenticate(request);
+    if (!authenticated) return error(authenticated.error(), request);
+    auto enabled = m_accounts->totpEnabled(authenticated->session().identity());
+    if (!enabled) return error(enabled.error(), request);
+    json::object body;
+    body["available"] = enabled->has_value();
+    body["enabled"] = enabled->value_or(false);
+    body["assurance"] = identity::provider::assuranceLevelName(
+        authenticated->session().assurance());
+    return jsonResponse(200, std::move(body));
+}
+
+gateway::HttpResponse AccountHttpApi::beginTotpEnrollment(gateway::HttpRequest request)
+{
+    auto authenticated = authenticate(request);
+    if (!authenticated) return error(authenticated.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"password"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto password = requiredString(body.value(), "password", 1024U);
+    if (!password) return error(password.error(), request);
+    foundation::SecretString secret{std::move(password).value()};
+    auto started = m_accounts->beginTotpEnrollment(
+        authenticated->session().identity(), secret,
+        authenticated->session().assurance());
+    if (!started) return error(started.error(), request);
+
+    json::object responseBody;
+    responseBody["enrollment_id"] = started->id().value();
+    responseBody["secret_base32"] = started->secretBase32().expose();
+    responseBody["expires_at_ms"] = started->expiresAt().time_since_epoch().count();
+    responseBody["replacing"] = started->replacing();
+    return jsonResponse(201, std::move(responseBody));
+}
+
+gateway::HttpResponse AccountHttpApi::completeTotpEnrollment(gateway::HttpRequest request)
+{
+    auto authenticated = authenticate(request);
+    if (!authenticated) return error(authenticated.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"enrollment_id", "code"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto id = requiredString(body.value(), "enrollment_id", 200U);
+    auto code = requiredString(body.value(), "code", 8U);
+    if (!id || !code) return error(!id ? id.error() : code.error(), request);
+    auto status = m_accounts->completeTotpEnrollment(
+        authenticated->session().identity(),
+        TotpEnrollmentId{std::move(id).value()}, code.value(),
+        authenticated->session().assurance());
+    return status
+        ? jsonResponse(200, json::object{{"enabled", true}})
+        : error(status.error(), request);
+}
+
+gateway::HttpResponse AccountHttpApi::disableTotp(gateway::HttpRequest request)
+{
+    auto authenticated = authenticate(request);
+    if (!authenticated) return error(authenticated.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"password"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto password = requiredString(body.value(), "password", 1024U);
+    if (!password) return error(password.error(), request);
+    foundation::SecretString secret{std::move(password).value()};
+    auto status = m_accounts->disableTotp(
+        authenticated->session().identity(), secret,
+        authenticated->session().assurance());
+    return status
+        ? jsonResponse(200, json::object{
+              {"enabled", false}, {"recovery_codes_revoked", true}})
+        : error(status.error(), request);
 }
 
 gateway::HttpResponse AccountHttpApi::getProfile(gateway::HttpRequest request)

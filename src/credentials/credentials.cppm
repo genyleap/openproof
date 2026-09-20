@@ -160,7 +160,7 @@ public:
     RecoveryCodeRepository& operator=(RecoveryCodeRepository&&) = delete;
     virtual ~RecoveryCodeRepository() = default;
 
-    /** Replaces every previous code in one operation. */
+    /** Replaces every previous code in one operation; an empty set revokes all codes. */
     [[nodiscard]] virtual foundation::Status
     replace(const identity::core::IdentityId& identity,
             std::vector<RecoveryCodeDigest> digests) = 0;
@@ -207,6 +207,9 @@ public:
     [[nodiscard]] foundation::Status
     consume(const identity::core::IdentityId& identity,
             const foundation::SecretString& presented);
+    /** Invalidates every outstanding recovery code for the identity. */
+    [[nodiscard]] foundation::Status
+    revoke(const identity::core::IdentityId& identity);
 
 private:
     RecoveryCodeService(RecoveryCodeRepository& repository,

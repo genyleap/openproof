@@ -409,6 +409,23 @@ TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)
     first.join();
     second.join();
     EXPECT_EQ(winners.load(), 1U);
+
+    auto enabled = directory.value()->hasTotp(idp::ExternalSubject{"alice"});
+    ASSERT_TRUE(enabled);
+    EXPECT_TRUE(enabled.value());
+    ASSERT_TRUE(directory.value()->removeTotp(idp::ExternalSubject{"alice"}));
+    enabled = directory.value()->hasTotp(idp::ExternalSubject{"alice"});
+    ASSERT_TRUE(enabled);
+    EXPECT_FALSE(enabled.value());
+
+    auto passwordOnly = directory.value()->verify(
+        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
+        std::nullopt, kNow);
+    ASSERT_TRUE(passwordOnly);
+
+    auto removedAgain = directory.value()->removeTotp(idp::ExternalSubject{"alice"});
+    ASSERT_FALSE(removedAgain);
+    EXPECT_EQ(removedAgain.error().code(), fnd::ErrorCode::FailedPrecondition);
 }
 
 TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnable)
