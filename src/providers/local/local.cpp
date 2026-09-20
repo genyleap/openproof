@@ -353,11 +353,11 @@ LocalAuthenticationProvider::completeAuthentication(
             return foundation::fail(authenticationFailure(
                 "Recovery-code authentication is not configured."));
         }
-        auto passwordVerified = m_accounts->verifyPassword(pending->subject, password);
-        if (!passwordVerified.has_value()) {
+        auto knowledgeVerified = m_accounts->verifyPassword(pending->subject, password);
+        if (!knowledgeVerified.has_value()) {
             return foundation::fail(authenticationFailure(
                 std::string{"Local credential verification failed: "}
-                + std::string{passwordVerified.error().internalDetail()}));
+                + std::string{knowledgeVerified.error().internalDetail()}));
         }
         const identity::core::ExternalIdentityRef external{m_id, pending->subject};
         auto owner = m_identities->ownerOf(external);
