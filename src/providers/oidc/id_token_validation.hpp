@@ -17,6 +17,24 @@ namespace openproof::provider::oidc::detail {
     return !authorizedParty || *authorizedParty == clientId;
 }
 
+[[nodiscard]] inline bool audienceMatchesClientExclusively(
+    const boost::json::object& payload, std::string_view clientId)
+{
+    const auto* audience = payload.if_contains("aud");
+    if (audience == nullptr) return false;
+    if (audience->is_string()) {
+        const auto& value = audience->as_string();
+        return std::string_view{value.data(), value.size()} == clientId;
+    }
+    if (!audience->is_array() || audience->as_array().size() != 1U) {
+        return false;
+    }
+    const auto& value = audience->as_array().front();
+    if (!value.is_string()) return false;
+    const auto& text = value.as_string();
+    return std::string_view{text.data(), text.size()} == clientId;
+}
+
 [[nodiscard]] inline bool jwkPermitsRs256Verification(
     const boost::json::object& key, std::string_view expectedKeyId)
 {

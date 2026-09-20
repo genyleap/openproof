@@ -137,6 +137,33 @@ TEST(OidcIdTokenValidationTest, RejectsMismatchedAuthorizedPartyEvenForSingleAud
         std::optional<std::string_view>{"another-client"}, "client-id"));
 }
 
+TEST(OidcIdTokenValidationTest, RejectsUntrustedOrMalformedAudienceSets)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::audienceMatchesClientExclusively;
+
+    json::object payload{{"aud", "client-id"}};
+    EXPECT_TRUE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload["aud"] = json::array{"client-id"};
+    EXPECT_TRUE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload["aud"] = json::array{"client-id", "other-audience"};
+    EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload["aud"] = json::array{"client-id", 42};
+    EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload["aud"] = json::array{};
+    EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload["aud"] = "other-client";
+    EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
+
+    payload.erase("aud");
+    EXPECT_FALSE(audienceMatchesClientExclusively(payload, "client-id"));
+}
+
 TEST(OidcIdTokenValidationTest, HonorsJwkSignatureUseAndVerificationOperations)
 {
     namespace json = boost::json;

@@ -312,20 +312,6 @@ struct HttpResult final {
     return found->second.expose();
 }
 
-[[nodiscard]] bool audienceContains(const json::object& payload, std::string_view clientId,
-                                    bool& multiple)
-{
-    multiple = false;
-    const auto* audience = payload.if_contains("aud");
-    if (audience == nullptr) return false;
-    if (audience->is_string()) return audience->as_string() == clientId;
-    if (!audience->is_array()) return false;
-    multiple = audience->as_array().size() > 1U;
-    return std::ranges::any_of(audience->as_array(), [clientId](const json::value& value) {
-        return value.is_string() && value.as_string() == clientId;
-    });
-}
-
 [[nodiscard]] bool jsonBoolean(const json::object& object, std::string_view name)
 {
     const auto* value = object.if_contains(name);
@@ -795,16 +781,14 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     const auto tokenNonce = stringValue(payload.value(), "nonce");
     const auto issuedAt = integerValue(payload.value(), "iat");
     const auto expiresAt = integerValue(payload.value(), "exp");
-    bool multipleAudience = false;
-    const bool audienceValid = audienceContains(
-        payload.value(), m_implementation->config.clientId(), multipleAudience);
+    const bool audienceValid = detail::audienceMatchesClientExclusively(
+        payload.value(), m_implementation->config.clientId());
     const auto authorizedParty = stringValue(payload.value(), "azp");
     const auto now = m_implementation->clock->now();
     if (!issuer || *issuer != m_implementation->config.issuer()
         || !subject || !safeText(*subject, 512U) || !tokenNonce
         || !security::constantTimeEquals(*tokenNonce, nonce.value())
         || !issuedAt || !expiresAt || !audienceValid
-        || (multipleAudience && !authorizedParty)
         || !detail::authorizedPartyMatches(
             authorizedParty ? std::optional<std::string_view>{*authorizedParty} : std::nullopt,
             m_implementation->config.clientId())
