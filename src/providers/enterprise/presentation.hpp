@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -31,6 +32,17 @@ inline constexpr std::size_t kDisplayNameMaximum = 256U;
             return audience == expectedAudience;
         });
     });
+}
+
+[[nodiscard]] inline bool validSamlEntityIssuer(
+    std::string_view issuer,
+    const std::optional<std::string>& format,
+    std::string_view expectedIssuer) noexcept
+{
+    constexpr std::string_view kEntityFormat{
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:entity"};
+    return issuer == expectedIssuer
+        && (!format || *format == kEntityFormat);
 }
 
 } // namespace openproof::provider::enterprise::detail

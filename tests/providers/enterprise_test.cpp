@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -56,6 +57,26 @@ TEST(EnterpriseSamlValidationTest, RequiresEveryAudienceRestrictionToPermitServi
         {{expected}, {}},
         expected));
     EXPECT_FALSE(samlAudienceRestrictionsPermit({}, expected));
+}
+
+TEST(EnterpriseSamlValidationTest, ValidatesEntityIssuerIdentityAndFormat)
+{
+    using openproof::provider::enterprise::detail::validSamlEntityIssuer;
+
+    const std::string expected{"https://idp.example.test/entity"};
+    EXPECT_TRUE(validSamlEntityIssuer(expected, std::nullopt, expected));
+    EXPECT_TRUE(validSamlEntityIssuer(
+        expected,
+        std::optional<std::string>{
+            "urn:oasis:names:tc:SAML:2.0:nameid-format:entity"},
+        expected));
+    EXPECT_FALSE(validSamlEntityIssuer(
+        "https://other.example.test/entity", std::nullopt, expected));
+    EXPECT_FALSE(validSamlEntityIssuer(
+        expected,
+        std::optional<std::string>{
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"},
+        expected));
 }
 
 TEST(EnterpriseLdapConfigTest, AcceptsCertificateVerifiedLdapsConfiguration)

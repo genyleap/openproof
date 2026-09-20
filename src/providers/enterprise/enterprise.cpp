@@ -1008,10 +1008,6 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     if (attribute(root, "Destination") != config.m_acsUri || attribute(root, "InResponseTo") != expectedRequestId) {
         return foundation::fail(authenticationFailure("The SAML response is not bound to this service-provider request."));
     }
-    xmlNodePtr issuer = uniqueChild(root, "Issuer", kSamlAssertion);
-    if (issuer == nullptr || content(issuer) != config.m_idpEntityId) {
-        return foundation::fail(authenticationFailure("The SAML issuer is invalid."));
-    }
     xmlNodePtr status = uniqueChild(root, "Status", kSamlProtocol);
     xmlNodePtr statusCode = status == nullptr ? nullptr : uniqueChild(status, "StatusCode", kSamlProtocol);
     if (statusCode == nullptr || attribute(statusCode, "Value") != kSamlSuccess) {
@@ -1023,6 +1019,33 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     const auto now = m_implementation->clock->now();
     const bool responseSigned = uniqueChild(root, "Signature", kXmlDsig) != nullptr;
     const bool assertionSigned = uniqueChild(assertion, "Signature", kXmlDsig) != nullptr;
+
+    const auto responseIssuers = children(root, "Issuer", kSamlAssertion);
+    if (responseIssuers.size() > 1U
+        || (responseSigned && responseIssuers.empty())
+        || (!responseIssuers.empty()
+            && !detail::validSamlEntityIssuer(
+                content(responseIssuers.front()),
+                attribute(responseIssuers.front(), "Format"),
+                config.m_idpEntityId))) {
+        return foundation::fail(
+            authenticationFailure("The SAML response issuer is invalid."));
+    }
+
+    const auto assertionIssuers = children(assertion, "Issuer", kSamlAssertion);
+    if (assertionIssuers.size() != 1U
+        || !detail::validSamlEntityIssuer(
+            content(assertionIssuers.front()),
+            attribute(assertionIssuers.front(), "Format"),
+            config.m_idpEntityId)) {
+        return foundation::fail(
+            authenticationFailure("The SAML assertion issuer is invalid."));
+    }
+    if (children(assertion, "AuthnStatement", kSamlAssertion).empty()) {
+        return foundation::fail(
+            authenticationFailure("The SAML assertion contains no authentication statement."));
+    }
+
     if (!responseSigned && !assertionSigned) return foundation::fail(authenticationFailure("The SAML response is unsigned."));
     if (responseSigned) {
         auto verified = verifyXmlSignature(root, config.m_idpCertificatePem, now);
