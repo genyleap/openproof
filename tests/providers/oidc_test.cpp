@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <boost/json.hpp>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/core_names.h>
@@ -11,6 +14,7 @@
 #include <openssl/pem.h>
 #include <openssl/params.h>
 
+#include "../../src/providers/oidc/id_token_validation.hpp"
 #include "../../src/providers/oidc/profile_claims.hpp"
 
 import openproof.foundation;
@@ -120,6 +124,57 @@ TEST(OidcProfileClaimTest, ValidatesHttpsPictureUrlStructure)
              "https://images.example.test/avatar image.png"}) {
         EXPECT_FALSE(validHttpsProfileUrl(value)) << value;
     }
+}
+
+TEST(OidcIdTokenValidationTest, RejectsMismatchedAuthorizedPartyEvenForSingleAudience)
+{
+    using openproof::provider::oidc::detail::authorizedPartyMatches;
+
+    EXPECT_TRUE(authorizedPartyMatches(std::nullopt, "client-id"));
+    EXPECT_TRUE(authorizedPartyMatches(
+        std::optional<std::string_view>{"client-id"}, "client-id"));
+    EXPECT_FALSE(authorizedPartyMatches(
+        std::optional<std::string_view>{"another-client"}, "client-id"));
+}
+
+TEST(OidcIdTokenValidationTest, HonorsJwkSignatureUseAndVerificationOperations)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::jwkPermitsRs256Verification;
+
+    json::object key{
+        {"kid", "signing-key"},
+        {"kty", "RSA"},
+        {"alg", "RS256"},
+        {"n", "modulus"},
+        {"e", "AQAB"}};
+    EXPECT_TRUE(jwkPermitsRs256Verification(key, "signing-key"));
+
+    key["use"] = "sig";
+    key["key_ops"] = json::array{"verify"};
+    EXPECT_TRUE(jwkPermitsRs256Verification(key, "signing-key"));
+
+    auto encryptionKey = key;
+    encryptionKey["use"] = "enc";
+    EXPECT_FALSE(jwkPermitsRs256Verification(encryptionKey, "signing-key"));
+
+    auto nonVerifyingKey = key;
+    nonVerifyingKey["key_ops"] = json::array{"encrypt"};
+    EXPECT_FALSE(jwkPermitsRs256Verification(nonVerifyingKey, "signing-key"));
+
+    auto duplicateOperations = key;
+    duplicateOperations["key_ops"] = json::array{"verify", "verify"};
+    EXPECT_FALSE(jwkPermitsRs256Verification(duplicateOperations, "signing-key"));
+
+    auto malformedOperations = key;
+    malformedOperations["key_ops"] = "verify";
+    EXPECT_FALSE(jwkPermitsRs256Verification(malformedOperations, "signing-key"));
+
+    auto wrongAlgorithm = key;
+    wrongAlgorithm["alg"] = "RS512";
+    EXPECT_FALSE(jwkPermitsRs256Verification(wrongAlgorithm, "signing-key"));
+
+    EXPECT_FALSE(jwkPermitsRs256Verification(key, "another-key"));
 }
 
 [[nodiscard]] std::string generatedP256PrivateKey()

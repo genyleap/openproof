@@ -29,6 +29,7 @@ module;
 #include <boost/json.hpp>
 #include <openssl/ssl.h>
 
+#include "id_token_validation.hpp"
 #include "profile_claims.hpp"
 
 module openproof.provider.oidc;
@@ -769,8 +770,7 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     for (const auto& value : keysValue->as_array()) {
         if (!value.is_object()) continue;
         const auto& key = value.as_object();
-        if (stringValue(key, "kid") != kid || stringValue(key, "kty") != std::optional<std::string>{"RSA"}) continue;
-        if (const auto keyAlg = stringValue(key, "alg"); keyAlg && *keyAlg != "RS256") continue;
+        if (!detail::jwkPermitsRs256Verification(key, *kid)) continue;
         modulus = stringValue(key, "n");
         exponent = stringValue(key, "e");
         if (modulus && exponent) break;
@@ -796,7 +796,10 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
         || !subject || !safeText(*subject, 512U) || !tokenNonce
         || !security::constantTimeEquals(*tokenNonce, nonce.value())
         || !issuedAt || !expiresAt || !audienceValid
-        || (multipleAudience && (!authorizedParty || *authorizedParty != m_implementation->config.clientId()))
+        || (multipleAudience && !authorizedParty)
+        || !detail::authorizedPartyMatches(
+            authorizedParty ? std::optional<std::string_view>{*authorizedParty} : std::nullopt,
+            m_implementation->config.clientId())
         || fromUnixSeconds(*issuedAt) > now + kClockSkew
         || fromUnixSeconds(*issuedAt) < now - std::chrono::hours{24}
         || fromUnixSeconds(*expiresAt) <= now - kClockSkew
