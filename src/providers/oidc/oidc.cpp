@@ -411,6 +411,10 @@ public:
             return foundation::fail(authFailure(
                 "OIDC discovery does not advertise the required RS256 ID Token signing algorithm."));
         }
+        if (!detail::discoverySupportsAuthorizationCodeFlow(object.value())) {
+            return foundation::fail(authFailure(
+                "OIDC discovery does not support the required Authorization Code flow."));
+        }
         const auto issuer = stringValue(object.value(), "issuer");
         const auto authorization = stringValue(object.value(), "authorization_endpoint");
         const auto token = stringValue(object.value(), "token_endpoint");

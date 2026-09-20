@@ -203,6 +203,37 @@ TEST(OidcDiscoveryValidationTest, RequiresAdvertisedRs256IdTokenSigning)
     EXPECT_FALSE(discoveryAdvertisesRs256IdTokens(metadata));
 }
 
+TEST(OidcDiscoveryValidationTest, RequiresAuthorizationCodeFlowMetadata)
+{
+    namespace json = boost::json;
+    using openproof::provider::oidc::detail::discoverySupportsAuthorizationCodeFlow;
+
+    json::object metadata{
+        {"response_types_supported", json::array{"code"}},
+        {"grant_types_supported", json::array{"authorization_code", "refresh_token"}}};
+    EXPECT_TRUE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata.erase("grant_types_supported");
+    EXPECT_TRUE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata.erase("response_types_supported");
+    EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata["response_types_supported"] = json::array{"id_token"};
+    EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata["response_types_supported"] = json::array{"code"};
+    metadata["grant_types_supported"] = json::array{"refresh_token"};
+    EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata["grant_types_supported"] = "authorization_code";
+    EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
+
+    metadata["grant_types_supported"] =
+        json::array{"authorization_code", 42};
+    EXPECT_FALSE(discoverySupportsAuthorizationCodeFlow(metadata));
+}
+
 [[nodiscard]] std::string generatedP256PrivateKey()
 {
     EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);

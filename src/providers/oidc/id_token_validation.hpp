@@ -86,4 +86,31 @@ namespace openproof::provider::oidc::detail {
     return hasRs256;
 }
 
+[[nodiscard]] inline bool discoverySupportsAuthorizationCodeFlow(
+    const boost::json::object& metadata)
+{
+    const auto contains = [](const boost::json::value* field,
+                             std::string_view required,
+                             bool optional) {
+        if (field == nullptr) return optional;
+        if (!field->is_array() || field->as_array().empty()) return false;
+
+        bool found = false;
+        for (const auto& item : field->as_array()) {
+            if (!item.is_string() || item.as_string().empty()
+                || item.as_string().size() > 128U) {
+                return false;
+            }
+            const std::string_view value{
+                item.as_string().data(), item.as_string().size()};
+            if (value == required) found = true;
+        }
+        return found;
+    };
+
+    return contains(metadata.if_contains("response_types_supported"), "code", false)
+        && contains(metadata.if_contains("grant_types_supported"),
+                    "authorization_code", true);
+}
+
 } // namespace openproof::provider::oidc::detail
