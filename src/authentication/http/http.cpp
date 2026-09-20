@@ -279,12 +279,12 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     }
     auto transaction = requiredString(body.value(), "transaction_id", 128U);
     auto challenge = requiredString(body.value(), "challenge_id", 128U);
-    auto password = requiredString(body.value(), "password", 1024U);
+    auto knowledgeSecret = requiredString(body.value(), "password", 1024U);
     auto totp = optionalString(body.value(), "totp", 8U);
     auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
     const auto continuation = cookieValue(request, kPreauthCookie);
     const auto bindingToken = cookieValue(request, kBindingCookie);
-    if (!transaction || !challenge || !password || !totp || !recoveryCode
+    if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
         || (totp->has_value() && recoveryCode->has_value())
         || !continuation.has_value() || !bindingToken.has_value()) {
         return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},
@@ -295,7 +295,7 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     idp::AuthenticationResponse authenticationResponse{
         idp::ChallengeId{std::move(challenge).value()}, clientContext(request)};
     authenticationResponse.setParameter(
-        "password", idp::CredentialValue{std::move(password).value()});
+        "password", idp::CredentialValue{std::move(knowledgeSecret).value()});
     if (totp->has_value()) {
         authenticationResponse.setParameter(
             "totp", idp::CredentialValue{std::move(totp).value().value()});
