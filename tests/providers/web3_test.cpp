@@ -166,6 +166,35 @@ TEST(WalletProviderTest, SmartWalletRpcMappingsAreChainSpecific)
     EXPECT_FALSE(config->rpcEndpoint(42161U));
 }
 
+TEST(WalletProviderTest, RpcConfigurationValidatesHttpsAuthorityPortAndQueryTarget)
+{
+    auto valid = web3::WalletProviderConfig::create(
+        "login.openproof.test", "https://login.openproof.test/auth/wallet",
+        std::map<std::uint64_t, std::string>{{1U, "https://rpc.openproof.test:8443?api_key=a@b"}},
+        fnd::SecretString{std::string(48U, 'w')}, std::chrono::minutes{5});
+    ASSERT_TRUE(valid);
+    ASSERT_TRUE(valid->rpcEndpoint(1U));
+    EXPECT_EQ(*valid->rpcEndpoint(1U),
+              "https://rpc.openproof.test:8443?api_key=a@b");
+
+    for (const std::string endpoint : {
+             "http://rpc.openproof.test",
+             "https:///rpc",
+             "https://user@rpc.openproof.test",
+             "https://rpc.openproof.test:0",
+             "https://rpc.openproof.test:70000",
+             "https://rpc.openproof.test:",
+             "https://rpc.openproof.test\\path",
+             "https://rpc.openproof.test/path#fragment",
+             "https://rpc.openproof.test/path with-space"}) {
+        auto config = web3::WalletProviderConfig::create(
+            "login.openproof.test", "https://login.openproof.test/auth/wallet",
+            std::map<std::uint64_t, std::string>{{1U, endpoint}},
+            fnd::SecretString{std::string(48U, 'w')}, std::chrono::minutes{5});
+        EXPECT_FALSE(config) << endpoint;
+    }
+}
+
 TEST(WalletProviderTest, ChallengeUsesTheWalletsRequestedEvmChain)
 {
     fnd::ManualClockSource clock{kNow};
@@ -209,6 +238,23 @@ TEST(FarcasterProviderTest, ConfigurationRequiresFip11OptimismMainnet)
         fnd::SecretString{std::string(48U, 'f')}, std::chrono::minutes{5}, {}, {},
         "not-an-address");
     EXPECT_FALSE(invalidKeyRegistry);
+}
+
+TEST(FarcasterProviderTest, ConfigurationRejectsMalformedRpcHttpsAuthorities)
+{
+    for (const std::string endpoint : {
+             "https:///rpc",
+             "https://user@rpc.openproof.test",
+             "https://rpc.openproof.test:0",
+             "https://rpc.openproof.test:70000",
+             "https://rpc.openproof.test/path#fragment"}) {
+        auto config = web3::FarcasterProviderConfig::create(
+            "login.openproof.test", "https://login.openproof.test/auth/farcaster",
+            10U, endpoint,
+            "0x00000000fc6c5f01fc30151999387bb99a9f489b",
+            fnd::SecretString{std::string(48U, 'f')}, std::chrono::minutes{5});
+        EXPECT_FALSE(config) << endpoint;
+    }
 }
 
 TEST(FarcasterProviderTest, RelayStartPublishesAuthKitConfigurationWithoutRequiringAnAddress)
