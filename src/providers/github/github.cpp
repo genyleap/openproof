@@ -65,9 +65,51 @@ constexpr std::size_t kMaximumResponseBytes = 2U * 1024U * 1024U;
 
 [[nodiscard]] bool validHttpsUrl(std::string_view value) noexcept
 {
-    return value.starts_with("https://") && value.size() <= 4096U
-        && !value.contains('#') && !value.contains('\\')
-        && value.find('@', std::string_view{"https://"}.size()) == std::string_view::npos;
+    constexpr std::string_view scheme{"https://"};
+    const bool visibleAscii = std::ranges::all_of(value, [](char symbol) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        return byte >= 0x21U && byte <= 0x7EU;
+    });
+    if (!value.starts_with(scheme) || value.size() > 4096U || !visibleAscii
+        || value.contains('#') || value.contains('\\')) {
+        return false;
+    }
+
+    value.remove_prefix(scheme.size());
+    const auto slash = value.find('/');
+    const auto query = value.find('?');
+    const auto authorityEnd = std::min(
+        slash == std::string_view::npos ? value.size() : slash,
+        query == std::string_view::npos ? value.size() : query);
+    const auto authority = value.substr(0U, authorityEnd);
+    if (authority.empty() || authority.contains('@')
+        || authority.contains('[') || authority.contains(']')) {
+        return false;
+    }
+
+    std::string_view host = authority;
+    if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+        host = authority.substr(0U, colon);
+        const auto portText = authority.substr(colon + 1U);
+        unsigned int port{};
+        const auto parsed = std::from_chars(
+            portText.data(), portText.data() + portText.size(), port);
+        if (portText.empty() || parsed.ec != std::errc{}
+            || parsed.ptr != portText.data() + portText.size()
+            || port == 0U || port > 65535U) {
+            return false;
+        }
+    }
+
+    if (host.empty() || host.size() > 253U || host.contains(':')
+        || !std::ranges::all_of(host, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return std::isalnum(byte) != 0 || symbol == '.' || symbol == '-';
+           })) {
+        return false;
+    }
+    if (authorityEnd == value.size()) return true;
+    return value[authorityEnd] == '/' || value[authorityEnd] == '?';
 }
 
 [[nodiscard]] std::string percentEncode(std::string_view input)
