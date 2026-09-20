@@ -33,6 +33,9 @@ public:
     LocalAccountDirectory& operator=(LocalAccountDirectory&&) = delete;
     virtual ~LocalAccountDirectory() = default;
 
+    /** Local subjects are bounded opaque identifiers shared by enrollment and login. */
+    [[nodiscard]] static bool isValidSubject(const idp::ExternalSubject& subject) noexcept;
+
     [[nodiscard]] virtual foundation::Status enroll(
         idp::ExternalSubject subject, const foundation::SecretString& password,
         std::optional<credentials::TotpSecret> totp) = 0;

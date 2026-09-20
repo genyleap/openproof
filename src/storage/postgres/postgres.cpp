@@ -1991,9 +1991,9 @@ foundation::Status PostgresLocalAccountDirectory::enroll(
     const foundation::SecretString& password,
     std::optional<credentials::TotpSecret> totp)
 {
-    if (subject.empty()) {
+    if (!provider::local::LocalAccountDirectory::isValidSubject(subject)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A local account subject must not be empty.");
+                                "The local account subject is invalid.");
     }
     auto passwordHash = m_passwordHasher.hash(password);
     if (!passwordHash) return foundation::fail(passwordHash.error());
@@ -2047,9 +2047,10 @@ foundation::Status PostgresLocalAccountDirectory::enrollPending(
     const foundation::SecretString& password,
     std::optional<credentials::TotpSecret> totp)
 {
-    if (canonicalIdentity.empty() || subject.empty()) {
+    if (canonicalIdentity.empty()
+        || !provider::local::LocalAccountDirectory::isValidSubject(subject)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A pending local account requires identity and subject.");
+                                "A pending local account requires valid identity and subject values.");
     }
     auto passwordHash = m_passwordHasher.hash(password);
     if (!passwordHash) return foundation::fail(passwordHash.error());
@@ -2127,7 +2128,8 @@ foundation::Status PostgresLocalAccountDirectory::rebindSubject(
     const identity::provider::ExternalSubject& previous,
     identity::provider::ExternalSubject replacement)
 {
-    if (identity.empty() || previous.empty() || replacement.empty()) {
+    if (identity.empty() || previous.empty()
+        || !provider::local::LocalAccountDirectory::isValidSubject(replacement)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "A local account rebind requires valid identifiers.");
     }

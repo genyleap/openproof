@@ -1,9 +1,11 @@
 module;
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,6 +37,16 @@ constexpr std::size_t kIdentifierEntropyBytes = 32U;
                : std::optional<std::string_view>{found->second.expose()};
 }
 
+}
+
+bool LocalAccountDirectory::isValidSubject(const idp::ExternalSubject& subject) noexcept
+{
+    const auto value = subject.value();
+    return !value.empty() && value.size() <= 320U
+        && std::ranges::none_of(value, [](char symbol) {
+               const auto byte = static_cast<unsigned char>(symbol);
+               return byte < 0x20U || byte == 0x7FU;
+           });
 }
 
 struct InMemoryLocalAccountDirectory::Account final {
@@ -84,9 +96,9 @@ foundation::Status InMemoryLocalAccountDirectory::enroll(
     idp::ExternalSubject subject, const foundation::SecretString& password,
     std::optional<credentials::TotpSecret> totp)
 {
-    if (subject.empty()) {
+    if (!LocalAccountDirectory::isValidSubject(subject)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A local account subject must not be empty.");
+                                "The local account subject is invalid.");
     }
     auto passwordHash = m_passwordHasher.hash(password);
     if (!passwordHash.has_value()) {
@@ -108,9 +120,9 @@ foundation::Status InMemoryLocalAccountDirectory::enrollPending(
     const foundation::SecretString& password,
     std::optional<credentials::TotpSecret> totp)
 {
-    if (canonicalIdentity.empty() || subject.empty()) {
+    if (canonicalIdentity.empty() || !LocalAccountDirectory::isValidSubject(subject)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A pending local account requires identity and subject.");
+                                "A pending local account requires valid identity and subject values.");
     }
     auto passwordHash = m_passwordHasher.hash(password);
     if (!passwordHash.has_value()) return foundation::fail(passwordHash.error());
@@ -129,7 +141,8 @@ foundation::Status InMemoryLocalAccountDirectory::rebindSubject(
     const idp::ExternalSubject& previous,
     idp::ExternalSubject replacement)
 {
-    if (identity.empty() || previous.empty() || replacement.empty()) {
+    if (identity.empty() || previous.empty()
+        || !LocalAccountDirectory::isValidSubject(replacement)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "A local account rebind requires valid identifiers.");
     }
@@ -352,8 +365,12 @@ LocalAuthenticationProvider::beginAuthentication(const idp::AuthenticationReques
                                 "The local authentication request is invalid.");
     }
     const auto subjectParameter = request.parameters().find("subject");
-    if (subjectParameter == request.parameters().end() || subjectParameter->second.empty()
-        || subjectParameter->second.size() > 320U) {
+    if (subjectParameter == request.parameters().end()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The local authentication request is invalid.");
+    }
+    const idp::ExternalSubject subject{subjectParameter->second};
+    if (!LocalAccountDirectory::isValidSubject(subject)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The local authentication request is invalid.");
     }
@@ -366,7 +383,7 @@ LocalAuthenticationProvider::beginAuthentication(const idp::AuthenticationReques
     {
         const std::lock_guard<std::mutex> guard{m_mutex};
         const auto inserted = m_pending.emplace(
-            challengeId, Pending{idp::ExternalSubject{subjectParameter->second}, expiresAt});
+            challengeId, Pending{subject, expiresAt});
         if (!inserted.second) {
             return foundation::fail(foundation::ErrorCode::AlreadyExists,
                                     "The authentication challenge could not be created.");
