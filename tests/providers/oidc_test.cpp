@@ -558,6 +558,23 @@ TEST(OidcProviderConfigTest, PostAuthenticationRemainsTheCompatibilityDefault)
               oidc::OidcClientAuthenticationMethod::ClientSecretPost);
     EXPECT_EQ(configured->authorizationResponseMode(),
               oidc::OidcAuthorizationResponseMode::Query);
+    EXPECT_EQ(configured->pkceMode(), oidc::OidcPkceMode::S256);
+}
+
+TEST(OidcProviderConfigTest, PreservesExplicitDisabledPkceForConfidentialWebProviders)
+{
+    auto configured = oidc::OidcProviderConfig::create(
+        idp::ProviderId{"linkedin"}, "https://www.linkedin.com/oauth",
+        "client-id", fnd::SecretString{"client-secret"},
+        "https://identity.example.test/auth/federated/callback",
+        std::vector<std::string>{"openid", "profile", "email"},
+        fnd::SecretString{std::string(32U, 'k')}, std::chrono::minutes{5},
+        oidc::OidcClientAuthenticationMethod::ClientSecretPost,
+        oidc::OidcAuthorizationResponseMode::Query,
+        oidc::OidcPkceMode::Disabled);
+
+    ASSERT_TRUE(configured) << configured.error().internalDetail();
+    EXPECT_EQ(configured->pkceMode(), oidc::OidcPkceMode::Disabled);
 }
 
 TEST(OidcProviderConfigTest, PreservesFormPostAuthorizationResponseMode)
