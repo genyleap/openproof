@@ -344,33 +344,64 @@ public:
             || !parseHttpsUrl(*authorization) || !parseHttpsUrl(*token) || !parseHttpsUrl(*jwks)) {
             return foundation::fail(authFailure("OIDC discovery metadata failed validation."));
         }
-        std::vector<std::string> tokenAuthenticationMethods;
-        if (const auto* methods = object->if_contains(
-                "token_endpoint_auth_methods_supported"); methods != nullptr) {
-            if (!methods->is_array()) {
-                return foundation::fail(authFailure(
-                    "OIDC discovery token authentication metadata is malformed."));
+        const auto readStringArray = [&](std::string_view name, std::string_view detail)
+            -> foundation::Result<std::vector<std::string>> {
+            std::vector<std::string> values;
+            const auto* field = object->if_contains(name);
+            if (field == nullptr) return values;
+            if (!field->is_array()) {
+                return foundation::fail(authFailure(std::string{detail}));
             }
-            for (const auto& method : methods->as_array()) {
-                if (!method.is_string() || method.as_string().size() > 128U) {
-                    return foundation::fail(authFailure(
-                        "OIDC discovery token authentication metadata is malformed."));
+            for (const auto& value : field->as_array()) {
+                if (!value.is_string() || value.as_string().empty()
+                    || value.as_string().size() > 128U) {
+                    return foundation::fail(authFailure(std::string{detail}));
                 }
-                tokenAuthenticationMethods.emplace_back(method.as_string());
+                values.emplace_back(value.as_string());
             }
+            return values;
+        };
+        auto tokenAuthenticationMethods = readStringArray(
+            "token_endpoint_auth_methods_supported",
+            "OIDC discovery token authentication metadata is malformed.");
+        if (!tokenAuthenticationMethods) {
+            return foundation::fail(tokenAuthenticationMethods.error());
         }
+        auto responseModes = readStringArray(
+            "response_modes_supported",
+            "OIDC discovery response-mode metadata is malformed.");
+        if (!responseModes) return foundation::fail(responseModes.error());
+        auto codeChallengeMethods = readStringArray(
+            "code_challenge_methods_supported",
+            "OIDC discovery PKCE metadata is malformed.");
+        if (!codeChallengeMethods) return foundation::fail(codeChallengeMethods.error());
         const std::string_view requiredMethod =
             config.clientAuthentication()
                     == OidcClientAuthenticationMethod::ClientSecretBasic
                 ? "client_secret_basic" : "client_secret_post";
-        if (!tokenAuthenticationMethods.empty()
-            && std::ranges::find(tokenAuthenticationMethods, requiredMethod)
-                == tokenAuthenticationMethods.end()) {
+        if (!tokenAuthenticationMethods->empty()
+            && std::ranges::find(tokenAuthenticationMethods.value(), requiredMethod)
+                == tokenAuthenticationMethods->end()) {
             return foundation::fail(authFailure(
                 "OIDC discovery does not support the configured client authentication method."));
         }
+        if (!codeChallengeMethods->empty()
+            && std::ranges::find(codeChallengeMethods.value(), std::string_view{"S256"})
+                == codeChallengeMethods->end()) {
+            return foundation::fail(authFailure(
+                "OIDC discovery does not support the required S256 PKCE method."));
+        }
+        const std::string_view requiredResponseMode =
+            config.authorizationResponseMode() == OidcAuthorizationResponseMode::FormPost
+                ? "form_post" : "query";
+        if (!responseModes->empty()
+            && std::ranges::find(responseModes.value(), requiredResponseMode)
+                == responseModes->end()) {
+            return foundation::fail(authFailure(
+                "OIDC discovery does not support the configured authorization response mode."));
+        }
         Discovery value{*authorization, *token, *jwks,
-                        std::move(tokenAuthenticationMethods),
+                        std::move(tokenAuthenticationMethods).value(),
                         now + std::chrono::hours{1}};
         {
             const std::lock_guard guard{mutex};

@@ -1546,7 +1546,9 @@ addProtectedRoutes(gateway::Router& router,
         }
         auto status = registerOidcProvider(
             "microsoft", *microsoftIssuer, {"openid", "profile", "email"},
-            "openproof/federation/microsoft/v1");
+            "openproof/federation/microsoft/v1",
+            externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
+            externalOidc::OidcAuthorizationResponseMode::FormPost);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;
