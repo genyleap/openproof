@@ -931,7 +931,7 @@ struct ParsedSiwe final {
     std::string_view message, const idp::ChallengeId& challenge,
     std::string_view challengePrefix, std::string_view domain, std::string_view uri,
     std::string_view statement, const foundation::SecretString& derivationKey,
-    foundation::Duration lifetime)
+    foundation::Duration lifetime, foundation::Instant now)
 {
     if (message.empty() || message.size() > 8192U || message.contains('\r')) {
         return foundation::fail(authenticationFailure("The SIWE message encoding is invalid."));
@@ -975,6 +975,9 @@ struct ParsedSiwe final {
         || lines[9] != std::string{"Issued At: "} + foundation::toIso8601(issuedAt)
         || lines[10] != std::string{"Expiration Time: "} + foundation::toIso8601(expiresAt)) {
         return foundation::fail(authenticationFailure("The SIWE challenge binding is invalid."));
+    }
+    if (now >= expiresAt) {
+        return foundation::fail(authenticationFailure("The SIWE time window is expired."));
     }
     return ParsedSiwe{std::move(*address), chainId};
 }
@@ -1303,7 +1306,7 @@ WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     auto parsed = validateSiweMessage(*message, response.challengeId(), "siwe_",
         m_implementation->config.domain(), m_implementation->config.uri(),
         kWalletStatement, m_implementation->config.derivationKey(),
-        m_implementation->config.challengeLifetime());
+        m_implementation->config.challengeLifetime(), m_implementation->clock->now());
     if (!parsed) return foundation::fail(parsed.error());
     auto digest = ethereumMessageHash(*message);
     if (!digest) return foundation::fail(digest.error());
