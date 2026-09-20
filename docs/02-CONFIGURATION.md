@@ -701,7 +701,9 @@ see [WALLETCONNECT.md](WALLETCONNECT.md).
 ### LDAP and SAML federation
 
 LDAP is enabled by `OPENPROOF_LDAP_URI` and requires
-`OPENPROOF_LDAP_BASE_DN`. The URI must be `ldaps://`; certificate validation is
+`OPENPROOF_LDAP_BASE_DN`. The URI must be one structurally valid `ldaps://host[:port]`
+endpoint (URI lists, plaintext fallbacks, paths and malformed authorities are rejected),
+and the base DN must parse as an LDAPv3 distinguished name. Certificate validation is
 mandatory. Optional settings are `OPENPROOF_LDAP_CA_FILE`, service-bind
 `OPENPROOF_LDAP_BIND_DN` / `OPENPROOF_LDAP_BIND_PASSWORD`, and attribute names:
 `OPENPROOF_LDAP_USERNAME_ATTRIBUTE` (`uid`),

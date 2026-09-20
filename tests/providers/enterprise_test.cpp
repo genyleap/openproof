@@ -51,6 +51,27 @@ TEST(EnterpriseLdapConfigTest, AcceptsCertificateVerifiedLdapsConfiguration)
     EXPECT_EQ(configured->subjectAttribute(), "entryUUID");
 }
 
+TEST(EnterpriseLdapConfigTest, RejectsAmbiguousLdapsUrisAndMalformedBaseDns)
+{
+    const auto create = [](std::string uri, std::string baseDn) {
+        return enterprise::LdapProviderConfig::create(
+            std::move(uri), std::move(baseDn), "uid", "entryUUID", "cn", "mail",
+            {}, {}, derivationKey(), {}, std::chrono::minutes{5});
+    };
+
+    EXPECT_TRUE(create("ldaps://directory.example.test:636",
+                       "ou=people,dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps:///", "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://user@directory.example.test", "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://directory.example.test:0", "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://directory.example.test:70000", "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://directory.example.test/path", "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://directory.example.test ldap://fallback.example.test",
+                        "dc=example,dc=test"));
+    EXPECT_FALSE(create("ldaps://directory.example.test", "not-a-dn"));
+    EXPECT_FALSE(create("ldaps://directory.example.test", "dc=example,"));
+}
+
 TEST(EnterpriseLdapConfigTest, RejectsPlaintextLdapAndHalfConfiguredServiceBind)
 {
     auto plaintext = enterprise::LdapProviderConfig::create(
