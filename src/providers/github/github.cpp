@@ -8,6 +8,7 @@ module;
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -53,6 +54,39 @@ constexpr std::size_t kMaximumResponseBytes = 2U * 1024U * 1024U;
         std::string{foundation::defaultErrorMessage(foundation::ErrorCode::AuthenticationFailed)},
         std::move(detail)};
 }
+
+enum class ChallengeConsumption : std::uint8_t { Accepted, Unknown, Expired };
+
+class OneTimeChallengeStore final {
+public:
+    [[nodiscard]] bool remember(
+        const idp::ChallengeId& challenge, foundation::Instant expiresAt,
+        foundation::Instant now)
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        for (auto pending = m_pending.begin(); pending != m_pending.end();) {
+            if (now >= pending->second) pending = m_pending.erase(pending);
+            else ++pending;
+        }
+        return m_pending.emplace(challenge, expiresAt).second;
+    }
+
+    [[nodiscard]] ChallengeConsumption consume(
+        const idp::ChallengeId& challenge, foundation::Instant now)
+    {
+        const std::lock_guard<std::mutex> guard{m_mutex};
+        const auto found = m_pending.find(challenge);
+        if (found == m_pending.end()) return ChallengeConsumption::Unknown;
+        const auto expiresAt = found->second;
+        m_pending.erase(found);
+        return now >= expiresAt ? ChallengeConsumption::Expired
+                                : ChallengeConsumption::Accepted;
+    }
+
+private:
+    std::mutex m_mutex;
+    std::map<idp::ChallengeId, foundation::Instant> m_pending;
+};
 
 [[nodiscard]] bool safeText(std::string_view value, std::size_t maximum) noexcept
 {
@@ -308,6 +342,7 @@ public:
     GitHubProviderConfig config;
     const foundation::ClockSource* clock;
     std::string caFile;
+    OneTimeChallengeStore challenges;
 };
 
 GitHubProviderConfig::GitHubProviderConfig(
@@ -375,8 +410,13 @@ GitHubAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
     url = appendQuery(std::move(url), "state", state.value());
     url = appendQuery(std::move(url), "code_challenge", foundation::toBase64Url(digest.value()));
     url = appendQuery(std::move(url), "code_challenge_method", "S256");
-    idp::AuthenticationChallenge challenge{
-        challengeId, m_implementation->clock->now() + m_implementation->config.challengeLifetime()};
+    const auto now = m_implementation->clock->now();
+    const auto expiresAt = now + m_implementation->config.challengeLifetime();
+    if (!m_implementation->challenges.remember(challengeId, expiresAt, now)) {
+        return foundation::fail(foundation::ErrorCode::AlreadyExists,
+                                "The GitHub authentication challenge could not be created.");
+    }
+    idp::AuthenticationChallenge challenge{challengeId, expiresAt};
     challenge.setParameter("authorization_url", std::move(url));
     return challenge;
 }
@@ -384,6 +424,17 @@ GitHubAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
 foundation::Result<idp::AuthenticationOutcome>
 GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
 {
+    const auto now = m_implementation->clock->now();
+    switch (m_implementation->challenges.consume(response.challengeId(), now)) {
+    case ChallengeConsumption::Unknown:
+        return foundation::fail(authFailure(
+            "The GitHub authentication challenge is unknown or already used."));
+    case ChallengeConsumption::Expired:
+        return foundation::fail(authFailure(
+            "The GitHub authentication challenge expired."));
+    case ChallengeConsumption::Accepted:
+        break;
+    }
     const auto code = credential(response.parameters(), "code");
     const auto state = credential(response.parameters(), "state");
     if (!code || !state || code->size() > 4096U || state->size() > 512U) {
@@ -482,7 +533,7 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
         id(), idp::ExternalSubject{std::to_string(*accountId)}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::None, false},
-        std::move(evidence), m_implementation->clock->now());
+        std::move(evidence), now);
 }
 
 } // namespace openproof::provider::github
