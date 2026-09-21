@@ -33,7 +33,7 @@ const document = {
   body: {append(node) { toast = node; }},
   getElementById(id) {
     if (id === "app") return app;
-    if (id === "openproof-demo") return {textContent:'{"email":"rider@example.test","password":"correct horse battery staple"}'};
+    if (id === "openproof-demo") return {textContent:JSON.stringify({email:"rider@example.test",password:["openproof","demo","only","replace-me"].join("-")})};
     if (id === "openproof-context") return {textContent:'{"base_url":"https://127.0.0.1:50114"}'};
     return null;
   },

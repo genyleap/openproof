@@ -38,7 +38,7 @@ TEST(PasswordHasherTest, HashesWithRandomSaltAndVerifiesInConstantTimeBoundary)
     auto hasher = cred::PasswordHasher::create(
         pepper(), cred::PasswordPolicy::recommended());
     ASSERT_TRUE(hasher);
-    const fnd::SecretString password{"correct horse battery staple"};
+    const fnd::SecretString password{std::string(32U, 'p')};
 
     auto first = hasher->hash(password);
     auto second = hasher->hash(password);

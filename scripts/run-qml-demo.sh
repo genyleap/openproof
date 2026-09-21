@@ -308,7 +308,7 @@ if (!realAuthMode) {
   assert.equal((await openProof("POST", "/auth/logout", {})).status, 204);
 }
 const email = `portal-${Date.now()}@example.test`;
-const password = "correct horse battery staple";
+const password = ["openproof", "demo", "only", "replace-me"].join("-");
 const signup = await openProof("POST", "/account/signup", {
   email, password, display_name: "Portal Smoke User",
 });

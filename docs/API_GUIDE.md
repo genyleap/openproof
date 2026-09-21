@@ -63,7 +63,7 @@ curl --fail-with-body https://identity.example.com/account/signup \
   -H 'Content-Type: application/json' \
   -d '{
     "email":"rider@example.com",
-    "password":"correct horse battery staple",
+    "password":"REPLACE_WITH_STRONG_PASSWORD",
     "display_name":"Example Rider"
   }'
 ```
@@ -102,7 +102,7 @@ curl --fail-with-body -b openproof.cookies -c openproof.cookies \
   -d '{
     "transaction_id":"TRANSACTION_ID",
     "challenge_id":"CHALLENGE_ID",
-    "password":"correct horse battery staple",
+    "password":"REPLACE_WITH_STRONG_PASSWORD",
     "totp":"123456"
   }'
 ```

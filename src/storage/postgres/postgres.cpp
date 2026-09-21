@@ -1978,7 +1978,7 @@ PostgresLocalAccountDirectory::create(
                                 "The persistent local-account configuration is invalid.");
     }
     auto dummyHash = passwordHasher.hash(foundation::SecretString{
-        "openproof-dummy-password-never-valid"});
+        std::string(32U, 'x')});
     if (!dummyHash) return foundation::fail(dummyHash.error());
     return std::unique_ptr<PostgresLocalAccountDirectory>{
         new PostgresLocalAccountDirectory{

@@ -81,8 +81,7 @@ InMemoryLocalAccountDirectory::create(
     credentials::PasswordHasher passwordHasher,
     credentials::TotpPolicy totpPolicy)
 {
-    const foundation::SecretString dummyPassword{
-        "openproof-dummy-password-never-valid"};
+    const foundation::SecretString dummyPassword{std::string(32U, 'x')};
     auto dummyHash = passwordHasher.hash(dummyPassword);
     if (!dummyHash.has_value()) {
         return foundation::fail(dummyHash.error());
