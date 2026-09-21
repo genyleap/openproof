@@ -109,12 +109,14 @@ if command -v g++-16 >/dev/null 2>&1; then
   GCC_ROOT=$(dirname "$(dirname "$(command -v g++-16)")")
 else
   say "Looking for the qualified GCC 16 toolchain..."
-  if apt-get install -y gcc-16 g++-16; then
+  if apt-cache show gcc-16 >/dev/null 2>&1 && apt-cache show g++-16 >/dev/null 2>&1; then
+    apt-get install -y gcc-16 g++-16
     GCC_ROOT=/usr
   elif [[ "$VERSION_CODENAME" == "noble" ]]; then
     add-apt-repository -y ppa:ubuntu-toolchain-r/test
     apt-get update -qq
-    if apt-get install -y gcc-16 g++-16; then
+    if apt-cache show gcc-16 >/dev/null 2>&1 && apt-cache show g++-16 >/dev/null 2>&1; then
+      apt-get install -y gcc-16 g++-16
       GCC_ROOT=/usr
     else
       build_gcc16
