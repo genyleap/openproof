@@ -1,0 +1,146 @@
+#!/bin/sh
+set -eu
+
+REPO="genyleap/openproof"
+CHANNEL="auto"
+VERSION=""
+NON_INTERACTIVE=0
+NO_SETUP=0
+API="https://api.github.com/repos/$REPO"
+RELEASES="https://github.com/$REPO/releases/download"
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'OpenProof installer: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+OpenProof bootstrap installer
+
+Usage:
+  curl -fsSL https://genyleap.com/install/openproof | sudo sh
+  curl -fsSL https://genyleap.com/install/openproof | sudo sh -s -- [options]
+
+Options:
+  --version VERSION       Install an exact release, for example 1.1.0 or 1.1.0-rc1
+  --channel CHANNEL       auto (default), stable, or rc
+  --non-interactive       Do not prompt during setup
+  --no-setup              Install the package only
+  -h, --help              Show this help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) [ "$#" -ge 2 ] || die "--version requires a value"; VERSION="$2"; shift 2 ;;
+    --channel) [ "$#" -ge 2 ] || die "--channel requires a value"; CHANNEL="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --no-setup) NO_SETUP=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "run this installer as root (for example via sudo)"
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+command -v apt-get >/dev/null 2>&1 || die "this installer currently supports Debian/Ubuntu systems"
+
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+else
+  die "cannot determine the operating system"
+fi
+
+case "${ID:-}" in
+  ubuntu)
+    major=$(printf '%s' "${VERSION_ID:-0}" | cut -d. -f1)
+    [ "$major" -ge 24 ] || die "Ubuntu 24.04 or newer is required"
+    ;;
+  debian)
+    major=$(printf '%s' "${VERSION_ID:-0}" | cut -d. -f1)
+    [ "$major" -ge 13 ] || die "Debian 13 or newer is required"
+    ;;
+  *)
+    die "unsupported distribution: ${ID:-unknown}; supported: Ubuntu 24.04+ and Debian 13+"
+    ;;
+esac
+
+case "$(uname -m)" in
+  x86_64|amd64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *) die "unsupported architecture: $(uname -m)" ;;
+esac
+
+extract_tag() {
+  sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+resolve_version() {
+  if [ -n "$VERSION" ]; then
+    printf '%s\n' "$VERSION" | sed 's/^v//'
+    return
+  fi
+
+  case "$CHANNEL" in
+    stable)
+      tag=$(curl -fsSL "$API/releases/latest" | extract_tag) || true
+      [ -n "${tag:-}" ] || die "no stable OpenProof release is available"
+      ;;
+    rc)
+      tag=$(curl -fsSL "$API/releases?per_page=20" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
+      [ -n "${tag:-}" ] || die "no release-candidate build is available"
+      ;;
+    auto)
+      tag=$(curl -fsSL "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(curl -fsSL "$API/releases?per_page=1" | extract_tag) || true
+      fi
+      [ -n "${tag:-}" ] || die "no OpenProof release is available yet"
+      ;;
+    *) die "invalid channel '$CHANNEL'; use auto, stable, or rc" ;;
+  esac
+
+  printf '%s\n' "$tag" | sed 's/^v//'
+}
+
+VERSION=$(resolve_version)
+TAG="v$VERSION"
+ASSET="openproof_${VERSION}_${ARCH}.deb"
+BASE="$RELEASES/$TAG"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+say ""
+say "OpenProof"
+say "  release : $VERSION"
+say "  system  : ${PRETTY_NAME:-$ID}"
+say "  arch    : $ARCH"
+say ""
+
+say "Downloading release metadata..."
+curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"
+curl -fL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"
+
+expected=$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$TMP/SHA256SUMS" | head -n 1)
+[ -n "$expected" ] || die "$ASSET is not listed in SHA256SUMS"
+actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
+[ "$expected" = "$actual" ] || die "checksum verification failed for $ASSET"
+say "✓ Release checksum verified"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y "$TMP/$ASSET"
+
+say "✓ OpenProof package installed"
+
+if [ "$NO_SETUP" -eq 0 ]; then
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    /usr/sbin/openproof setup --non-interactive
+  else
+    /usr/sbin/openproof setup
+  fi
+else
+  say ""
+  say "Package installed without configuration."
+  say "Run: sudo openproof setup"
+fi

@@ -7,6 +7,8 @@
 [Developer Portal & API Sandbox](https://docs.genyleap.com/openproof/api/) ·
 [OpenAPI](docs/openapi.yaml)
 
+[![CI](https://github.com/genyleap/openproof/actions/workflows/ci.yml/badge.svg)](https://github.com/genyleap/openproof/actions/workflows/ci.yml)
+
 OpenProof provides one canonical identity layer while keeping authentication,
 proof, trust, sessions, and authorization as separate security boundaries. It is
 designed to run inside your own infrastructure and keep identity data under your
@@ -93,9 +95,22 @@ token issuance, assurance, policy, and durable identity state.
 For the internal C++ module graph and trust boundaries, see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Start here
+## Install
 
-### Build
+On a supported Ubuntu or Debian host:
+
+```bash
+curl -fsSL https://genyleap.com/install/openproof | sudo sh
+```
+
+The installer downloads the matching GitHub Release package, verifies its published SHA-256 checksum, and guides
+you through PostgreSQL, secrets, the initial owner, email delivery, authentication
+providers, Nginx and TLS.
+
+See [Installation](docs/INSTALLATION.md) for package-only, version-pinned and
+non-interactive deployments.
+
+## Build from source
 
 OpenProof currently targets **GCC 16** with C++26 modules.
 
@@ -172,6 +187,7 @@ The protocol remains HTTP + OAuth/OIDC, so using an OpenProof SDK is optional.
 
 | Topic | Repository reference |
 |---|---|
+| Installation | [docs/INSTALLATION.md](docs/INSTALLATION.md) |
 | Architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Configuration | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | API integration | [docs/API_GUIDE.md](docs/API_GUIDE.md) |
@@ -181,6 +197,7 @@ The protocol remains HTTP + OAuth/OIDC, so using an OpenProof SDK is optional.
 | WalletConnect / EVM wallets | [docs/WALLETCONNECT.md](docs/WALLETCONNECT.md) |
 | Threat model | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) |
 | Security invariants | [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md) |
+| Release process | [docs/RELEASING.md](docs/RELEASING.md) |
 | OpenAPI 3.1 | [docs/openapi.yaml](docs/openapi.yaml) |
 
 The hosted documentation is the best entry point for application developers:

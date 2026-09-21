@@ -31,6 +31,8 @@ Notable user-facing changes to OpenProof are recorded here.
   secret references.
 - Added authenticated metrics, health endpoints, backup/restore tooling and
   production qualification scripts.
+- Added signed-release packaging, a guided Debian/Ubuntu installer and GitHub
+  CI/release automation for AMD64 and ARM64.
 - Expanded the C++, JavaScript, Swift and Kotlin SDK foundations.
 - Added the OpenAPI 3.1 contract and interactive Developer Portal.
 

@@ -1,6 +1,14 @@
 # Deployment templates
 
-This directory contains generic Linux deployment examples for OpenProof.
+For supported Debian/Ubuntu hosts, prefer the packaged installer documented in
+[../docs/INSTALLATION.md](../docs/INSTALLATION.md):
+
+```bash
+curl -fsSL https://genyleap.com/install/openproof | sudo sh
+```
+
+This directory contains the generic Linux deployment templates used by that
+packaging flow and available to operators who need a custom deployment.
 
 - `openproof.service` — hardened systemd unit for the OpenProof server.
 - `nginx-openproof.conf` — TLS reverse-proxy example for a loopback-only OpenProof listener.

@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_DIR=/etc/openproof
+CONFIG_FILE=/etc/openproof/openproof.toml
+PROVIDERS_FILE=/etc/openproof/providers.env
+MARKER=/etc/openproof/.configured
+BOOTSTRAP_URL=https://genyleap.com/install/openproof
+
+die(){ printf 'openproof: %s\n' "$*" >&2; exit 1; }
+ok(){ printf '✓ %s\n' "$*"; }
+bad(){ printf '✗ %s\n' "$*" >&2; }
+warn(){ printf '! %s\n' "$*" >&2; }
+need_root(){ [[ $EUID -eq 0 ]] || die "this command requires root"; }
+
+usage(){
+cat <<'EOF'
+OpenProof management CLI
+
+Usage:
+  openproof setup [--non-interactive]
+  openproof status
+  openproof doctor
+  openproof config [providers]
+  openproof update [--version VERSION | --channel stable|rc]
+  openproof backup /absolute/path/openproof.dump
+  openproof restore /absolute/path/openproof.dump POSTGRES_URL
+  openproof uninstall [--purge-data]
+  openproof version
+EOF
+}
+
+domain(){ [[ -r $MARKER ]] && head -n1 "$MARKER" || true; }
+database_url(){ [[ -r /etc/openproof/credentials/database.url ]] && cat /etc/openproof/credentials/database.url || true; }
+
+cmd_status(){ systemctl --no-pager --full status openproof.service || true; }
+
+cmd_doctor(){
+  need_root
+  local failures=0 host
+  printf 'OpenProof Doctor\n\n'
+
+  if [[ -x /opt/openproof/bin/opp ]]; then ok "Binary             installed"; else bad "Binary             missing"; failures=$((failures+1)); fi
+
+  if [[ -r $CONFIG_FILE ]] && /opt/openproof/bin/opp check-config --config "$CONFIG_FILE" >/dev/null 2>&1; then
+    ok "Configuration      valid"
+  else
+    bad "Configuration      invalid or missing"
+    failures=$((failures+1))
+  fi
+
+  if systemctl is-active --quiet openproof.service; then ok "OpenProof service   running"; else bad "OpenProof service   not running"; failures=$((failures+1)); fi
+
+  if curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+    ok "Local readiness     HTTP 200"
+  else
+    bad "Local readiness     unavailable"
+    failures=$((failures+1))
+  fi
+
+  if command -v pg_isready >/dev/null 2>&1 && pg_isready -q; then ok "PostgreSQL          reachable"; else warn "PostgreSQL          local readiness not confirmed"; fi
+
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then ok "Nginx               configuration valid"; else bad "Nginx               configuration invalid"; failures=$((failures+1)); fi
+  else
+    warn "Nginx               not installed (external ingress may be intentional)"
+  fi
+
+  host=$(domain)
+  if [[ -n $host ]]; then
+    if curl -fsS --max-time 7 "https://$host/health/ready" >/dev/null 2>&1; then ok "Public readiness    https://$host"; else bad "Public readiness    failed for https://$host"; failures=$((failures+1)); fi
+    if curl -fsS --max-time 7 "https://$host/.well-known/openid-configuration" >/dev/null 2>&1; then ok "OIDC discovery      available"; else warn "OIDC discovery      not confirmed"; fi
+  fi
+
+  printf '\n'
+  if (( failures == 0 )); then ok "No critical problems found."; else bad "$failures critical check(s) failed."; exit 1; fi
+}
+
+cmd_config(){
+  need_root
+  local section=all editor
+  if (($#)); then section=$1; fi
+  case "$section" in
+    providers)
+      printf 'Federation callback: https://%s/auth/federated/callback\n' "$(domain)"
+      printf 'Provider credentials: %s\n' "$PROVIDERS_FILE"
+      editor=$(printenv EDITOR 2>/dev/null || true)
+      [[ -n $editor ]] || editor=vi
+      "$editor" "$PROVIDERS_FILE"
+      chmod 0640 "$PROVIDERS_FILE"
+      chown root:openproof "$PROVIDERS_FILE"
+      systemctl restart openproof.service
+      ;;
+    all|"")
+      printf 'Main configuration: %s\n' "$CONFIG_FILE"
+      printf 'Provider credentials: %s\n' "$PROVIDERS_FILE"
+      printf 'Secrets: %s\n' "$CONFIG_DIR/credentials"
+      ;;
+    *) die "unknown config section: $section" ;;
+  esac
+}
+
+cmd_update(){
+  need_root
+  local args="--no-setup" tmp
+  while (($#)); do
+    case "$1" in
+      --version) [[ $# -ge 2 ]] || die "--version requires a value"; args="$args --version $2"; shift 2 ;;
+      --channel) [[ $# -ge 2 ]] || die "--channel requires a value"; args="$args --channel $2"; shift 2 ;;
+      *) die "unknown update option: $1" ;;
+    esac
+  done
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL "$BOOTSTRAP_URL" -o "$tmp"
+  sh "$tmp" $args
+  systemctl restart openproof.service
+  cmd_doctor
+}
+
+cmd_backup(){
+  need_root
+  [[ $# -eq 1 ]] || die "usage: openproof backup /absolute/path/openproof.dump"
+  url=$(database_url)
+  [[ -n $url ]] || die "database credential file not found"
+  OPENPROOF_DATABASE_URL="$url" /usr/lib/openproof/backup-postgres.sh "$1"
+}
+
+cmd_restore(){
+  need_root
+  [[ $# -eq 2 ]] || die "usage: openproof restore /absolute/path/openproof.dump POSTGRES_URL"
+  OPENPROOF_RESTORE_DATABASE_URL="$2" OPENPROOF_RESTORE_ACK=YES_RESTORE_TO_EMPTY_DATABASE /usr/lib/openproof/restore-postgres.sh "$1"
+}
+
+cmd_uninstall(){
+  need_root
+  local purge=0
+  if (($#)) && [[ $1 == --purge-data ]]; then purge=1; fi
+  systemctl disable --now openproof.service >/dev/null 2>&1 || true
+  systemctl disable --now openproof-delivery.service >/dev/null 2>&1 || true
+  if command -v apt-get >/dev/null 2>&1; then apt-get remove -y openproof; fi
+  if (( purge )); then
+    rm -rf /etc/openproof /opt/openproof
+    warn "OpenProof configuration and local files were removed. PostgreSQL data was not dropped automatically."
+  fi
+}
+
+cmd_version(){
+  [[ -x /opt/openproof/bin/opp ]] || die "OpenProof is not installed"
+  /opt/openproof/bin/opp --version 2>/dev/null || /opt/openproof/bin/opp version 2>/dev/null || true
+}
+
+cmd=""
+if (($#)); then cmd=$1; shift; fi
+if [[ -z $cmd ]]; then usage; exit 0; fi
+
+case "$cmd" in
+  setup) need_root; exec /usr/lib/openproof/setup.sh "$@" ;;
+  status) cmd_status "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  config) cmd_config "$@" ;;
+  update) cmd_update "$@" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  version|--version|-v) cmd_version ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command: $cmd" ;;
+esac

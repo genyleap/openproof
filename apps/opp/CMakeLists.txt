@@ -11,7 +11,7 @@ set_target_properties(opp PROPERTIES
 # it. main.cpp immediately binds it to a constexpr constant; no other code sees
 # the macro.
 target_compile_definitions(opp PRIVATE
-    OPENPROOF_VERSION="${PROJECT_VERSION}"
+    OPENPROOF_VERSION="${OPENPROOF_RELEASE_VERSION}"
     OPENPROOF_CONTRACT_SEMANTIC="${OPENPROOF_CONTRACT_SEMANTIC}"
 )
 

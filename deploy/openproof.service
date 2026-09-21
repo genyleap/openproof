@@ -1,18 +1,17 @@
 [Unit]
 Description=OpenProof identity service
 Documentation=file:/opt/openproof/docs/OPERATIONS.md
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
-Requires=postgresql.service
 
 [Service]
 Type=simple
 User=openproof
 Group=openproof
-EnvironmentFile=/etc/openproof/openproof.env
+EnvironmentFile=-/etc/openproof/openproof.env
 EnvironmentFile=-/etc/openproof/providers.env
-ExecStartPre=/opt/openproof/bin/opp check-config --config /opt/openproof/openproof.toml
-ExecStart=/opt/openproof/bin/opp server --config /opt/openproof/openproof.toml
+ExecStartPre=/opt/openproof/bin/opp check-config --config /etc/openproof/openproof.toml
+ExecStart=/opt/openproof/bin/opp server --config /etc/openproof/openproof.toml
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=60
