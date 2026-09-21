@@ -28,85 +28,70 @@ control.
 - Evidence and trust primitives that remain separate from authorization policy.
 - C++, JavaScript, Swift and Kotlin SDK foundations.
 
-## Architecture
+## What OpenProof does
 
-OpenProof keeps identity, authentication, sessions, authorization, and trust as
-separate boundaries behind one public edge.
+OpenProof sits between **the ways a person can prove who they are** and **the
+applications that need to trust that identity**.
+
+Different sign-in methods converge into one canonical OpenProof identity.
+Applications receive OAuth/OIDC tokens; they do not need to own provider
+credentials, wallet proofs, passwords, or the OpenProof browser session.
 
 ```mermaid
 flowchart LR
-    Actors["Users · Wallets · Enterprise IdPs"]
-
-    subgraph OP["OpenProof"]
-        Edge["HTTP Edge / Gateway"]
-        Auth["Authentication"]
-        Identity["Canonical Identity"]
-        Sessions["Sessions"]
-        OAuth["OAuth 2.0 / OIDC"]
-        Policy["Policy & Access"]
-        Trust["Evidence & Trust"]
-        Storage[("PostgreSQL")]
-
-        Edge --> Auth
-        Edge --> OAuth
-        Edge --> Policy
-        Auth --> Identity
-        Auth --> Sessions
-        Identity --> OAuth
-        OAuth --> Policy
-        Trust --> Policy
-
-        Identity --> Storage
-        Sessions --> Storage
-        OAuth --> Storage
-        Policy --> Storage
-        Trust --> Storage
+    subgraph Methods["Ways to authenticate"]
+        direction TB
+        Password["Email / Password"]
+        Social["Google · GitHub · Apple · Microsoft · LinkedIn · Telegram · X"]
+        Passkey["Passkeys / MFA"]
+        Wallet["Ethereum / Farcaster"]
+        Enterprise["SAML / LDAP / SCIM"]
     end
 
-    Apps["Applications / APIs"]
+    OpenProof["OpenProof<br/><b>one canonical identity</b>"]
+    App["Your application"]
+    API["Your protected API"]
 
-    Actors --> Edge
-    OAuth -->|"scoped tokens"| Apps
-    Apps -->|"identity / token requests"| Edge
+    Password --> OpenProof
+    Social --> OpenProof
+    Passkey --> OpenProof
+    Wallet --> OpenProof
+    Enterprise --> OpenProof
+
+    OpenProof -->|"OAuth / OIDC tokens"| App
+    App -->|"access token"| API
+    API -.->|"validate / introspect when needed"| OpenProof
 ```
 
-The detailed module graph and trust boundaries live in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The important part is the convergence: the same person can sign in with several
+methods without becoming several unrelated product accounts.
 
-## How authentication works
+For example, a user can first sign in with GitHub and later attach an Ethereum
+wallet. Both proofs can resolve to the **same OpenProof subject**, so the
+application still sees one user.
 
-Applications authenticate users through OpenProof, then consume scoped
-OAuth/OIDC tokens. The OpenProof browser session remains inside the identity
-boundary.
+## Sign-in flow
+
+A normal application integration can be understood as six steps:
 
 ```mermaid
-sequenceDiagram
-    actor User
-    participant App as Application
-    participant OP as OpenProof
-    participant IdP as Provider / Wallet / Passkey
-    participant API as Protected API
+flowchart TB
+    S1["1 · User chooses Sign in"]
+    S2["2 · Application redirects to OpenProof"]
+    S3["3 · OpenProof verifies the chosen sign-in method"]
+    S4["4 · The proof resolves to one canonical identity"]
+    S5["5 · OpenProof returns OAuth/OIDC tokens to the application"]
+    S6["6 · The application calls its API with the access token"]
 
-    User->>App: Sign in
-    App->>OP: Authorization request + PKCE
-
-    opt External or device-backed authentication
-        OP->>IdP: Start authentication ceremony
-        IdP-->>OP: Verified proof / claims
-    end
-
-    OP->>OP: Resolve canonical identity
-    OP-->>App: Authorization code
-    App->>OP: Code + PKCE verifier
-    OP-->>App: Access token + ID token
-    App->>API: Bearer access token
-    API->>OP: Validate or introspect when required
-    OP-->>API: Subject · scopes · audience · assurance
-    API-->>App: Protected resource
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
 
-This separation lets an application trust one canonical subject without owning
-passwords, provider credentials, wallet proofs, or identity sessions.
+Behind those six steps, OpenProof owns the security-sensitive work: provider
+callbacks, authentication ceremonies, identity linking, session lifecycle,
+token issuance, assurance, policy, and durable identity state.
+
+For the internal C++ module graph and trust boundaries, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Start here
 
@@ -169,18 +154,10 @@ Before starting a real deployment, use the complete
 
 OpenProof should normally listen on loopback behind a trusted TLS reverse proxy.
 
-## Integration model
-
-Applications should consume **OAuth/OIDC access tokens** rather than copying an
-OpenProof browser session into another product domain. A relying product stores
-the canonical OpenProof subject it needs for business data; credentials,
-authentication ceremonies, wallet proofs, and identity sessions stay in
-OpenProof.
-
-A minimal C++ relying-party example is available in
-[examples/reference-client](examples/reference-client).
-
 ## SDKs
+
+A minimal C++ relying-party integration is available in
+[examples/reference-client](examples/reference-client).
 
 | SDK | Location |
 |---|---|
