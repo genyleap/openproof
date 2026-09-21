@@ -41,8 +41,25 @@ exec /opt/openproof/bin/opp.real "$@"
 EOF
 chmod 0755 "$PKG/opt/openproof/bin/opp"
 
+COMPILER=""
+if [[ -n "${OPENPROOF_GCC_ROOT:-}" ]]; then
+  for candidate in "$OPENPROOF_GCC_ROOT/bin/g++-16" "$OPENPROOF_GCC_ROOT/bin/g++"; do
+    if [[ -x $candidate ]]; then COMPILER=$candidate; break; fi
+  done
+fi
+if [[ -z $COMPILER ]]; then
+  COMPILER=$(command -v g++-16 || command -v g++ || true)
+fi
+
 for soname in libstdc++.so.6 libgcc_s.so.1; do
-  path=$(ldd "$BINARY" | awk -v name="$soname" '$1 == name {print $3; exit}')
+  path=""
+  if [[ -n $COMPILER ]]; then
+    path=$("$COMPILER" -print-file-name="$soname")
+    [[ $path = /* && -r $path ]] || path=""
+  fi
+  if [[ -z $path ]]; then
+    path=$(ldd "$BINARY" | awk -v name="$soname" '$1 == name {print $3; exit}')
+  fi
   if [[ -n $path && -r $path ]]; then cp -L "$path" "$PKG/opt/openproof/lib/$soname"; fi
 done
 

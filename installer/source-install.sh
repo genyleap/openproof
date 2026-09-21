@@ -58,16 +58,69 @@ say "Installing build and runtime dependencies..."
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl git software-properties-common ninja-build \
-  python3 python3-pip bzip2 xz-utils build-essential \
-  libssl-dev libpq-dev libtomlplusplus-dev libxml2-dev zlib1g-dev libldap2-dev \
-  postgresql-client
+  python3 python3-pip bzip2 xz-utils build-essential flex bison gawk texinfo wget \
+  libzstd-dev libssl-dev libpq-dev libtomlplusplus-dev libxml2-dev zlib1g-dev \
+  libldap2-dev postgresql-client
 
-if ! command -v g++-16 >/dev/null 2>&1; then
-  say "Installing the qualified GCC 16 toolchain..."
-  if ! apt-get install -y gcc-16 g++-16; then
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+GCC_ROOT=/usr
+
+build_gcc16() {
+  GCC_VERSION=16.2.0
+  GCC_PREFIX="$WORK/gcc-$GCC_VERSION-install"
+
+  say ""
+  say "GCC 16 is not available as an Ubuntu package on this release."
+  say "Building GCC $GCC_VERSION automatically. This can take a while on smaller ARM systems."
+  say ""
+
+  curl -fL --retry 3 --connect-timeout 15 \
+    -o "$WORK/gcc.tar.xz" \
+    "https://ftp.gnu.org/gnu/gcc/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.xz"
+  tar -xJf "$WORK/gcc.tar.xz" -C "$WORK"
+
+  (
+    cd "$WORK/gcc-$GCC_VERSION"
+    ./contrib/download_prerequisites
+  )
+
+  mkdir -p "$WORK/gcc-build"
+  (
+    cd "$WORK/gcc-build"
+    "$WORK/gcc-$GCC_VERSION/configure" \
+      --prefix="$GCC_PREFIX" \
+      --enable-languages=c,c++ \
+      --disable-multilib \
+      --disable-bootstrap \
+      --enable-checking=release \
+      --with-system-zlib \
+      --enable-default-pie \
+      --enable-default-ssp
+    make -j"$(nproc)"
+    make install
+  )
+
+  GCC_ROOT="$GCC_PREFIX"
+}
+
+if command -v g++-16 >/dev/null 2>&1; then
+  GCC_ROOT=$(dirname "$(dirname "$(command -v g++-16)")")
+else
+  say "Looking for the qualified GCC 16 toolchain..."
+  if apt-get install -y gcc-16 g++-16; then
+    GCC_ROOT=/usr
+  elif [[ "$VERSION_CODENAME" == "noble" ]]; then
     add-apt-repository -y ppa:ubuntu-toolchain-r/test
     apt-get update -qq
-    apt-get install -y gcc-16 g++-16
+    if apt-get install -y gcc-16 g++-16; then
+      GCC_ROOT=/usr
+    else
+      build_gcc16
+    fi
+  else
+    build_gcc16
   fi
 fi
 
@@ -85,9 +138,6 @@ if [[ "$cmake_ok" -ne 1 ]]; then
   say "Installing CMake 3.30+..."
   python3 -m pip install --break-system-packages --upgrade "cmake>=3.30,<4"
 fi
-
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT INT TERM
 
 SOURCE="$WORK/openproof"
 BUILD="$WORK/build"
@@ -112,7 +162,7 @@ tar -xjf "$WORK/boost.tar.bz2" -C "$WORK"
 )
 
 say "Configuring OpenProof $OPENPROOF_VERSION..."
-OPENPROOF_GCC_ROOT=/usr cmake -S "$SOURCE" -B "$BUILD" -G Ninja \
+OPENPROOF_GCC_ROOT="$GCC_ROOT" cmake -S "$SOURCE" -B "$BUILD" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$SOURCE/cmake/toolchains/gcc.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DOPENPROOF_BUILD_TESTS=OFF \
@@ -124,7 +174,7 @@ cmake --build "$BUILD" --target opp --parallel "$(nproc)"
 
 say "Building Debian package..."
 mkdir -p "$DIST"
-"$SOURCE/packaging/build-deb.sh" "$BUILD" "$DIST" "$ARCH"
+OPENPROOF_GCC_ROOT="$GCC_ROOT" "$SOURCE/packaging/build-deb.sh" "$BUILD" "$DIST" "$ARCH"
 PACKAGE=$(find "$DIST" -maxdepth 1 -name "openproof_*_"$ARCH".deb" -print -quit)
 [[ -n "$PACKAGE" ]] || die "build completed but no Debian package was produced"
 
