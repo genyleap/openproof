@@ -7,9 +7,10 @@ curl -fsSL https://genyleap.com/install/openproof | sudo sh
 \`\`\`
 
 The bootstrap script detects the supported Debian/Ubuntu release and CPU
-architecture, downloads the matching GitHub Release package, verifies it against
-the published SHA-256 manifest, installs it with the system package manager, and
-starts the interactive setup wizard.
+architecture and prefers the matching GitHub Release package, verified against
+the published SHA-256 manifest. If no prebuilt release exists yet, Ubuntu hosts
+automatically install the qualified build dependencies, compile OpenProof, package
+it locally as a .deb, and continue into the same setup wizard.
 
 ## Supported systems
 

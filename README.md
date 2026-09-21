@@ -103,8 +103,10 @@ On a supported Ubuntu or Debian host:
 curl -fsSL https://genyleap.com/install/openproof | sudo sh
 ```
 
-The installer downloads the matching GitHub Release package, verifies its published SHA-256 checksum, and guides
-you through PostgreSQL, secrets, the initial owner, email delivery, authentication
+The installer prefers a matching GitHub Release package and verifies its published
+SHA-256 checksum. Until a prebuilt package exists for the selected channel, Ubuntu
+hosts automatically fall back to a source build. The same wizard then guides you
+through PostgreSQL, secrets, the initial owner, email delivery, authentication
 providers, Nginx and TLS.
 
 See [Installation](docs/INSTALLATION.md) for package-only, version-pinned and

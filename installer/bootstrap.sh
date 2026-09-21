@@ -3,11 +3,13 @@ set -eu
 
 REPO="genyleap/openproof"
 CHANNEL="auto"
-VERSION=""
+REQUESTED_VERSION=""
 NON_INTERACTIVE=0
 NO_SETUP=0
+PLAN_ONLY=0
 API="https://api.github.com/repos/$REPO"
 RELEASES="https://github.com/$REPO/releases/download"
+SOURCE_INSTALLER="https://genyleap.com/install/openproof-source"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'OpenProof installer: %s\n' "$*" >&2; exit 1; }
@@ -25,16 +27,18 @@ Options:
   --channel CHANNEL       auto (default), stable, or rc
   --non-interactive       Do not prompt during setup
   --no-setup              Install the package only
+  --plan                  Print the detected installation plan and exit
   -h, --help              Show this help
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version) [ "$#" -ge 2 ] || die "--version requires a value"; VERSION="$2"; shift 2 ;;
+    --version) [ "$#" -ge 2 ] || die "--version requires a value"; REQUESTED_VERSION="$2"; shift 2 ;;
     --channel) [ "$#" -ge 2 ] || die "--channel requires a value"; CHANNEL="$2"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --no-setup) NO_SETUP=1; shift ;;
+    --plan) PLAN_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -71,31 +75,35 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 
+api_get() {
+  curl -fsSL     -H "Accept: application/vnd.github+json"     -H "User-Agent: OpenProof-Installer"     "$1"
+}
+
 extract_tag() {
   sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
 }
 
 resolve_version() {
-  if [ -n "$VERSION" ]; then
-    printf '%s\n' "$VERSION" | sed 's/^v//'
+  if [ -n "$REQUESTED_VERSION" ]; then
+    printf '%s\n' "$REQUESTED_VERSION" | sed 's/^v//'
     return
   fi
 
+  tag=""
   case "$CHANNEL" in
     stable)
-      tag=$(curl -fsSL "$API/releases/latest" | extract_tag) || true
+      tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
       [ -n "${tag:-}" ] || die "no stable OpenProof release is available"
       ;;
     rc)
-      tag=$(curl -fsSL "$API/releases?per_page=20" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
+      tag=$(api_get "$API/releases?per_page=20" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
       [ -n "${tag:-}" ] || die "no release-candidate build is available"
       ;;
     auto)
-      tag=$(curl -fsSL "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
       if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL "$API/releases?per_page=1" | extract_tag) || true
+        tag=$(api_get "$API/releases?per_page=1" 2>/dev/null | extract_tag) || true
       fi
-      [ -n "${tag:-}" ] || die "no OpenProof release is available yet"
       ;;
     *) die "invalid channel '$CHANNEL'; use auto, stable, or rc" ;;
   esac
@@ -103,16 +111,45 @@ resolve_version() {
   printf '%s\n' "$tag" | sed 's/^v//'
 }
 
-VERSION=$(resolve_version)
-TAG="v$VERSION"
-ASSET="openproof_${VERSION}_${ARCH}.deb"
-BASE="$RELEASES/$TAG"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
+OPENPROOF_VERSION=$(resolve_version)
+
+if [ "$PLAN_ONLY" -eq 1 ]; then
+  say "OpenProof installation plan"
+  say "  system : ${PRETTY_NAME:-$ID}"
+  say "  arch   : $ARCH"
+  if [ -n "$OPENPROOF_VERSION" ]; then
+    say "  mode   : prebuilt release"
+    say "  release: $OPENPROOF_VERSION"
+  else
+    say "  mode   : automatic source build"
+    say "  ref    : main"
+  fi
+  exit 0
+fi
+
+if [ -z "$OPENPROOF_VERSION" ]; then
+  say ""
+  say "No prebuilt GitHub release is available yet."
+  say "Using the automatic Ubuntu source installer instead."
+  say ""
+  SOURCE_ARGS=""
+  [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
+  [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
+  SOURCE_SCRIPT="$TMP/source-install.sh"
+  curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+  exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
+fi
+
+TAG="v$OPENPROOF_VERSION"
+ASSET="openproof_${OPENPROOF_VERSION}_${ARCH}.deb"
+BASE="$RELEASES/$TAG"
+
 say ""
 say "OpenProof"
-say "  release : $VERSION"
+say "  release : $OPENPROOF_VERSION"
 say "  system  : ${PRETTY_NAME:-$ID}"
 say "  arch    : $ARCH"
 say ""
