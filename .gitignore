@@ -4,6 +4,7 @@
 build/
 cmake-build-*/
 runtime/
+.deps/
 sdk/kotlin/.gradle/
 sdk/kotlin/build/
 sdk/swift/.build/
