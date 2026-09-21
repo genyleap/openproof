@@ -3,6 +3,7 @@
 .gradle/
 build/
 cmake-build-*/
+runtime/
 sdk/kotlin/.gradle/
 sdk/kotlin/build/
 sdk/swift/.build/
