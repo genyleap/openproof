@@ -28,6 +28,86 @@ control.
 - Evidence and trust primitives that remain separate from authorization policy.
 - C++, JavaScript, Swift and Kotlin SDK foundations.
 
+## Architecture
+
+OpenProof keeps identity, authentication, sessions, authorization, and trust as
+separate boundaries behind one public edge.
+
+```mermaid
+flowchart LR
+    Actors["Users · Wallets · Enterprise IdPs"]
+
+    subgraph OP["OpenProof"]
+        Edge["HTTP Edge / Gateway"]
+        Auth["Authentication"]
+        Identity["Canonical Identity"]
+        Sessions["Sessions"]
+        OAuth["OAuth 2.0 / OIDC"]
+        Policy["Policy & Access"]
+        Trust["Evidence & Trust"]
+        Storage[("PostgreSQL")]
+
+        Edge --> Auth
+        Edge --> OAuth
+        Edge --> Policy
+        Auth --> Identity
+        Auth --> Sessions
+        Identity --> OAuth
+        OAuth --> Policy
+        Trust --> Policy
+
+        Identity --> Storage
+        Sessions --> Storage
+        OAuth --> Storage
+        Policy --> Storage
+        Trust --> Storage
+    end
+
+    Apps["Applications / APIs"]
+
+    Actors --> Edge
+    OAuth -->|"scoped tokens"| Apps
+    Apps -->|"identity / token requests"| Edge
+```
+
+The detailed module graph and trust boundaries live in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## How authentication works
+
+Applications authenticate users through OpenProof, then consume scoped
+OAuth/OIDC tokens. The OpenProof browser session remains inside the identity
+boundary.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant App as Application
+    participant OP as OpenProof
+    participant IdP as Provider / Wallet / Passkey
+    participant API as Protected API
+
+    User->>App: Sign in
+    App->>OP: Authorization request + PKCE
+
+    opt External or device-backed authentication
+        OP->>IdP: Start authentication ceremony
+        IdP-->>OP: Verified proof / claims
+    end
+
+    OP->>OP: Resolve canonical identity
+    OP-->>App: Authorization code
+    App->>OP: Code + PKCE verifier
+    OP-->>App: Access token + ID token
+    App->>API: Bearer access token
+    API->>OP: Validate or introspect when required
+    OP-->>API: Subject · scopes · audience · assurance
+    API-->>App: Protected resource
+```
+
+This separation lets an application trust one canonical subject without owning
+passwords, provider credentials, wallet proofs, or identity sessions.
+
 ## Start here
 
 ### Build
@@ -91,24 +171,10 @@ OpenProof should normally listen on loopback behind a trusted TLS reverse proxy.
 
 ## Integration model
 
-Applications should use **OAuth/OIDC access tokens** rather than copying an
-OpenProof browser session into another product domain.
-
-```text
-User / Wallet / Enterprise IdP
-             │
-             ▼
-         OpenProof
-    identity + auth core
-             │
-      OAuth/OIDC tokens
-             │
-             ▼
-     Application / API
-```
-
-A relying product stores the canonical OpenProof subject it needs for business
-data. Credentials, authentication ceremonies and identity sessions stay in
+Applications should consume **OAuth/OIDC access tokens** rather than copying an
+OpenProof browser session into another product domain. A relying product stores
+the canonical OpenProof subject it needs for business data; credentials,
+authentication ceremonies, wallet proofs, and identity sessions stay in
 OpenProof.
 
 A minimal C++ relying-party example is available in
