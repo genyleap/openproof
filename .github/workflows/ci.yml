@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lint tools
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck python3
+      - name: Shellcheck
+        run: |
+          shellcheck --severity=error installer/bootstrap.sh installer/setup.sh installer/openproof \
+            packaging/build-deb.sh scripts/ci/install-build-deps.sh \
+            scripts/backup-postgres.sh scripts/restore-postgres.sh
+      - name: OpenAPI coverage
+        run: python3 scripts/verify-openapi.py
+      - name: Portal behavior
+        run: node scripts/test-local-demo-portal-ui.mjs
+      - name: JavaScript SDK
+        run: node sdk/javascript/test.mjs
+      - name: Commit whitespace
+        run: git show --check --oneline --no-renames HEAD
+
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Boost 1.88
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openproof/boost-1.88.0
+          key: boost-1.88.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install build dependencies
+        run: ./scripts/ci/install-build-deps.sh
+
+      - name: Configure
+        run: |
+          cmake --preset gcc-release \
+            -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
+
+      - name: Build
+        run: cmake --build --preset gcc-release --parallel 2
+
+      - name: Test
+        run: ctest --preset gcc-release --output-on-failure
+
+      - name: Build Debian package
+        run: |
+          mkdir -p dist
+          ./packaging/build-deb.sh cmake-build-gcc-release dist amd64
+          dpkg-deb --info dist/openproof_*_amd64.deb
