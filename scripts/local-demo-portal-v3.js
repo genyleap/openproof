@@ -12,7 +12,7 @@
   const pretty = body => { try { return JSON.stringify(typeof body === "string" ? JSON.parse(body) : body, null, 2); } catch { return String(body || ""); } };
 
   const state = {
-    locale: localStorage.getItem("openproof.portal.locale") === "en" ? "en" : "fa",
+    locale: "en",
     page: "guide",
     catalog: [],
     selectedOperation: null,
@@ -45,7 +45,7 @@
       password: "correct horse battery staple",
       displayName: "OpenProof Developer",
       preferredUsername: "openproof-dev",
-      locale: "fa-IR",
+      locale: "en-US",
       picture: "",
       totp: "",
       profile: null,
@@ -473,7 +473,7 @@ int main() {
   app.addEventListener("click", async event => {
     const target=event.target.closest("[data-action]");if(!target)return;if(target.closest("[data-stop]")&&target===target.closest(".endpoint-picker"))return;const action=target.dataset.action;
     if(action==="page"){state.page=target.dataset.page;if(state.page==="farcaster")state.farcaster.purpose="login";if(state.page==="inbox")await loadMessages(false);if(state.page==="connections"&&state.session.authenticated)await runBusy("connections",()=>loadConnections(false));else renderApp();window.scrollTo({top:0,behavior:"smooth"})}
-    else if(action==="language"){state.locale=isEn()?"fa":"en";localStorage.setItem("openproof.portal.locale",state.locale);renderApp()}
+    else if(action==="language"){state.locale=isEn()?"fa":"en";renderApp()}
     else if(action==="journey-mode"){state.journey.mode=target.dataset.mode;if(target.dataset.mode==="demo"){state.journey.email=demo.email||demo.subject||"";state.journey.password=demo.password||""}renderApp()}
     else if(action==="farcaster-mode"){state.farcaster.mode=target.dataset.mode;resetFarcaster()}
     else if(action==="farcaster-start")await startFarcaster()

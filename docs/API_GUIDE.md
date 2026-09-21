@@ -1,10 +1,10 @@
 # OpenProof API integration guide
 
-For language-specific cURL, JavaScript, PHP, C++/STL, C++/Qt, C++/Boost and
-Web3 examples, see the
-[integration cookbook](INTEGRATION_COOKBOOK.md). The local Developer Portal
-renders all OpenAPI operations, explains their authentication model and creates
-copyable code for the request currently open in its API Explorer.
+For runnable examples and the complete OpenAPI surface, use the hosted
+[OpenProof Developer Portal](https://docs.genyleap.com/openproof/api/). It
+includes the Identity Workbench, API Explorer and generated cURL, JavaScript,
+PHP, C++ and Web3 examples. The machine-readable contract remains
+[openapi.yaml](openapi.yaml).
 
 This guide is the product-facing Golden Path for using OpenProof as the shared
 identity core behind multiple applications. In production replace

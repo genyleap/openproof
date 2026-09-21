@@ -29,16 +29,6 @@ Recommended production boundary:
 - Confirm the provider appears in `GET /auth/providers` before exposing its UI
   button.
 
-For Genyleap production the canonical callback remains:
-
-```
-https://genyleap.com/openproof/auth/federated/callback
-```
-
-The optional `openproof.genyleap.com` hostname can expose the same service, but
-it should not silently replace the registered callback unless every provider
-console and `OPENPROOF_FEDERATION_CALLBACK_URI` are changed together.
-
 ## Google
 
 Create an OAuth 2.0 Web application in Google Cloud, configure the exact callback
@@ -212,7 +202,7 @@ OPENPROOF_LDAP_CA_FILE=/run/openproof/certs/ldap-ca.pem
 ```
 
 Optional service-bind and attribute variables are documented in
-`docs/02-CONFIGURATION.md`. Plain LDAP fallback is intentionally unsupported.
+`docs/CONFIGURATION.md`. Plain LDAP fallback is intentionally unsupported.
 
 ## SAML
 
@@ -247,4 +237,4 @@ After configuring a provider:
    errors to the browser.
 
 See `deploy/providers.env.example`, `deploy/openproof.env.example`, and
-`docs/02-CONFIGURATION.md` for the complete variable reference.
+`docs/CONFIGURATION.md` for the complete variable reference.

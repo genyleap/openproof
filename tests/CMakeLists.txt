@@ -1,6 +1,5 @@
-# One test executable covering every Phase 1 module. Tests consume the public
-# module interfaces (`import openproof.foundation;`) and never the implementation
-# units, so they exercise the same surface a downstream product would (TST-002).
+# One test executable covers the public module interfaces. Tests import the
+# same module surface used by downstream consumers rather than implementation units.
 add_executable(openproof_tests
     foundation/error_test.cpp
     foundation/result_test.cpp

@@ -28,8 +28,8 @@ const signIdToken = async claims => {
 };
 
 const issuer = 'https://identity.example';
-const clientId = 'tegra-web';
-const redirectUri = 'https://tegra.example/auth/callback';
+const clientId = 'example-web';
+const redirectUri = 'https://app.example.com/auth/callback';
 const client = new OpenProofIdentity({
   issuer, clientId, redirectUri, scopes: ['openid', 'profile'],
 });

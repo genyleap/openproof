@@ -1,11 +1,11 @@
-# C++26 Feature Baseline
-> **Production stability profile (v1.0.13):** GCC 16.1 implements P2900 Contracts experimentally, but OpenProof production builds compile with `-fno-contracts`. Repeated GCC 16.1/Darwin module ICEs were observed in exported value types while the Contracts front-end was enabled. Internal invariants now use `foundation::requireInvariant`; `OPENPROOF_ENABLE_EXPERIMENTAL_CONTRACTS=ON` is a compiler-qualification mode only. Reflection remains disabled for the previously recorded module-partition defect.
+# C++26 Toolchain Notes
 
+OpenProof uses C++26 modules with a qualified GCC 16 toolchain. Experimental
+Contracts and Reflection support remain disabled in production builds because
+of observed compiler/module stability issues. Internal invariants use
+`foundation::requireInvariant`.
 
-Every entry below was established by compiling and running code on this machine,
-not from documentation. Where a feature is unavailable, the measured reason is
-given, because "not supported" and "not supported *here, for this reason*" lead
-to different decisions.
+The notes below record measured compiler behavior that affects the project.
 
 Measured on the original feature-baseline host:
 
@@ -22,7 +22,7 @@ separate from the C++ server qualification.
 ---
 
 ## 1. Status
-[technology-capability-baseline.md](../../../technology-capability-baseline.md)
+
 | Feature | Available | Used | Notes |
 |---|---|---|---|
 | **Contracts** (P2900) | ✅ experimental `__cpp_contracts` 202502 | ⚠ qualification-only | Production uses `-fno-contracts` and `foundation::requireInvariant` |
@@ -35,9 +35,9 @@ separate from the C++ server qualification.
 | **Reflection** (P2996) | ✅ `__cpp_impl_reflection` 202603 | ❌ **blocked** | Works standalone; `-freflection` miscompiles module partitions — §3 |
 | **`std::simd`** | ❌ | ❌ | x86-only in this libstdc++ — §4 |
 | **`import std;`** | ❌ | ❌ | libstdc++ module source is a 1-byte stub — §5 |
-| **Coroutines / `std::generator`** | ✅ 202207 | ❌ | Deferred to Phase 5 (async I/O) — §6 |
+| **Coroutines / `std::generator`** | ✅ 202207 | ❌ | Not currently used; asynchronous I/O remains transport-specific — §6 |
 | **`std::mdspan`** | ✅ 202406 | ❌ | No multidimensional data in this domain |
-| **`std::indirect` / `std::polymorphic`** | ✅ 202502 | ❌ | No Phase 1 use — §6 |
+| **`std::indirect` / `std::polymorphic`** | ✅ 202502 | ❌ | No current requirement — §6 |
 
 ---
 
@@ -171,9 +171,8 @@ The `<simd>` header exists, but its contents are gated in `bits/version.h`:
 machine. `std::experimental::simd` does work (`native_simd<float>::size() == 4`),
 though `reduce()` hits a libstdc++ NEON bug.
 
-No SIMD is used in Phase 1. The candidate hot paths are hex and base64url
-encoding for tokens, and optimising them before the gateway exists and before any
-measurement would be speculative.
+No SIMD is used today. Candidate hot paths include token encodings, but
+optimizing them without measured evidence would be speculative.
 
 ---
 
@@ -201,15 +200,15 @@ appear in each module's global module fragment.
 
 Listing these so their absence reads as a decision rather than an oversight.
 
-- **`std::generator` / coroutines.** The natural use is async I/O in the OpenProof gateway
-  (Phase 5). The one Phase 1 candidate — streaming repository keys — would hold a
-  mutex across a suspension point, which is a deadlock waiting to happen.
+- **`std::generator` / coroutines.** The natural use is asynchronous I/O.
+  Repository and gateway paths currently avoid introducing suspension points
+  across shared synchronization boundaries.
 - **`std::indirect` / `std::polymorphic`.** These give *value* semantics to
   polymorphic or incomplete members. `ProviderRegistry` deliberately has
   *reference* semantics and owns providers via `unique_ptr`; using
   `std::polymorphic` there would deep-copy providers, which is wrong. The real
-  fit is the recursive ABAC policy expression tree in Phase 4, where
-  `std::indirect` is the natural way to hold a recursive value type.
+  fit would be a recursive policy-expression tree, where
+  `std::indirect` can provide value semantics for recursive ownership.
 - **`std::mdspan`.** No multidimensional data exists in an identity domain.
 
 ---
@@ -217,10 +216,8 @@ Listing these so their absence reads as a decision rather than an oversight.
 ## 7. Toolchain requirement
 
 **GCC 16 or newer is required.** Clang is rejected at configure time with a
-diagnostic naming the missing features. This is a change from Phase 1, which
-supported both: contracts and reflection are used through standard syntax, and
-wrapping them in portability macros to accommodate a compiler that lacks them
-would put a project-specific facade in front of standard language features —
-exactly what this project should not do.
+diagnostic naming the missing features. The project intentionally avoids a
+portability-macro facade around language features that are part of its qualified
+toolchain contract.
 
 Portability returns when Clang and MSVC implement P2900.

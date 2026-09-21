@@ -8,9 +8,9 @@
  * grants nothing by itself, and a policy that permits an action does not
  * establish who the subject is.
  *
- * This module owns only the contract in Phase 1: request, decision, and the
- * engine interface. RBAC, ABAC and entitlement evaluation are implementations
- * that arrive in M7, and they will satisfy this interface rather than replace it.
+ * This module owns the authorization contract: request, decision, and the
+ * engine interface. RBAC, ABAC and entitlement evaluation remain implementations
+ * of this interface rather than replacements for it.
  *
  * The dependency direction is:
  *

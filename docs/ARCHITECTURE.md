@@ -1,13 +1,8 @@
-# OpenProof Protocol — Architecture
+# OpenProof Architecture
 
-> v1.0.13 production note: fail-closed internal invariants are enforced by `foundation::requireInvariant`; GCC experimental Contracts are opt-in qualification-only because of module ICEs on the qualified GCC 16.1/Darwin toolchain.
-
-Status: **OpenProof 1.0 identity platform implemented in source: centralized authentication, application/client registry, OAuth/OIDC authorization server, opaque token service, delegated gateway access, SDKs, PostgreSQL persistence and provider-neutral evidence/trust foundation.**
-
-This document describes the architecture that exists in the repository today.
-Target-toolchain release verification status is tracked separately in
-`RELEASE_VERIFICATION.md`; unsupported or unexecuted checks are not described as
-passes.
+OpenProof is a self-hosted identity platform built as a modular C++26 service.
+This document describes the source architecture, trust boundaries and dependency
+direction implemented in the repository.
 
 ---
 
@@ -100,7 +95,7 @@ every other layer may assume.
 
 81 project module interface units (`.cppm`) and 65 project implementation/test-example integration units (`.cpp`) across the identity platform, SDK and reference consumer surfaces.
 Zero `.h` / `.hpp` files. Zero uses of `import std;` (unavailable — see
-[03-CXX26.md](03-CXX26.md) §5).
+[CXX26.md](CXX26.md) §5).
 
 ### Gateway request path
 
@@ -325,7 +320,7 @@ additionally sits below every version floor.
 
 The project uses C++26 contracts through standard syntax, with GCC's standard
 violation handler and no project-supplied facade. See
-[03-CXX26.md](03-CXX26.md) for the measured feature matrix, the contract
+[CXX26.md](CXX26.md) for the measured feature matrix, the contract
 placement rule forced by a GCC modules defect, and why reflection is available
 but not yet enabled.
 
@@ -365,7 +360,7 @@ its types reach a module implementation unit.
 | OpenID Connect Provider | Discovery, UserInfo, JWKS and RS256 ID Tokens implemented |
 | Gateway | Platform-session and delegated OAuth bearer access, required scope, trusted signed upstream context, rate limiting/LB/circuit breaker implemented |
 | SDKs | C++ module, JavaScript, Swift (Apple), and Kotlin SDK cores implemented |
-| Reference relying product | Tegra-style C++ consumer example implemented; the external Tegra repository was not part of the supplied source and therefore was not mutated |
+| Reference relying product | Minimal C++ reference client demonstrates Authorization Code + PKCE integration through the public SDK |
 | Evidence / Trust | Provider-neutral verifier SPI, durable evidence and derived weighted trust/risk assessment implemented |
 | External authentication providers | Local, Google/Apple/Microsoft OIDC, GitHub OAuth, WebAuthn/passkeys, SIWE wallet, Farcaster custody/SIWE, LDAPS and SAML providers are implemented behind the provider SPI |
 | Concrete evidence verifiers | Signed RS256 attestation JWT and X.509 chain/SAN/proof-of-possession verifiers are implemented with durable one-time challenges; additional provider-specific evidence adapters remain SPI extensions |

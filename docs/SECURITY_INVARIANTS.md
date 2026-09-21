@@ -1,8 +1,6 @@
-# OpenProof — Security Invariants
+# OpenProof Security Invariants
 
-> v1.0.13 production note: fail-closed internal invariants are enforced by `foundation::requireInvariant`; GCC experimental Contracts are opt-in qualification-only because of module ICEs on the qualified GCC 16.1/Darwin toolchain.
-
-Required by brief §59. Every invariant states four things:
+Each invariant states four things:
 
 1. **What must always be true.**
 2. **How the implementation enforces it** — the mechanism, not the intention.
@@ -13,11 +11,9 @@ Required by brief §59. Every invariant states four things:
 "Enforced by" is the load-bearing field. An invariant whose only enforcement is
 a sentence in this document is **not enforced**, and is marked as such.
 
-The pre-1.0 baseline was verified by the project owner at 317/317 discovered tests
-on GCC 16.1/macOS; the ten PostgreSQL integration cases were skipped in that run.
-OpenProof 1.0 adds identity-platform tests. Exact release verification status is
-recorded in `RELEASE_VERIFICATION.md`; this document does not inflate skipped or
-unavailable target-toolchain checks into passes.
+Security invariants are enforced by implementation boundaries and regression
+tests. Environment-dependent integration tests must be run with their required
+dependencies enabled before a deployment is promoted.
 
 ---
 
@@ -102,8 +98,7 @@ Listed so their weakness is visible rather than implied.
 
 - **#5 — provider protocol logic out of the core.** Enforced today by the module
   graph and review. A CI check asserting that `openproof_identity_core` links no
-  provider target would make it mechanical. Worth adding when the first concrete
-  provider lands in Phase 3.
+  provider target would make this rule mechanically visible in CI.
 - **#6 — gateway never owns identity.** Enforced by dependency direction and the
   fact that it consumes broker-issued `AuthenticatedSession`; a CI link-graph
   assertion would make this structural rule mechanically visible.
@@ -114,7 +109,7 @@ Listed so their weakness is visible rather than implied.
   A future provider must preserve that boundary.
 - **Contracts guard internals, `Result` guards the perimeter.** This is the rule
   that keeps a contract from becoming a remote shutdown under `enforce`. It is
-  documented in `03-CXX26.md` and enforced in review only.
+  documented in `CXX26.md` and enforced in review only.
 
 ---
 

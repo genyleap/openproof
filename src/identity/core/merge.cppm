@@ -185,8 +185,8 @@ private:
  *       direction is impossible: the source is disabled before nothing, and a
  *       partial run can only ever leave the source with fewer associations than
  *       it began with, never the target with authority it was not granted.
- *       A real transaction boundary arrives with the PostgreSQL adapter in
- *       Phase 8; until then this is documented rather than pretended.
+ *       Deployments that require atomic merge persistence must use a
+ *       transactional repository implementation.
  */
 [[nodiscard]] foundation::Result<MergeRecord> applyMerge(IdentityMerge& merge,
                                                          IdentityRepository& identities,

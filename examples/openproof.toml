@@ -1,0 +1,58 @@
+# OpenProof example configuration
+#
+# This file is safe to commit. Secret values are referenced from the environment
+# or from files mounted by the deployment secret manager.
+
+[server]
+bind_address = "127.0.0.1"
+port = 18443
+trust_proxy_client_ip = true
+
+[logging]
+level = "info"
+console = true
+
+[security]
+token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"
+
+[database]
+connection_string = "env:OPENPROOF_DATABASE_URL"
+pool_size = 8
+migration_directory = "migrations"
+
+[account]
+enabled = true
+phone_provider_id = "phone"
+delivery_host = "notifications.internal.example"
+delivery_port = 443
+delivery_tls = true
+delivery_path = "/v1/openproof/verification"
+delivery_authorization = "env:OPENPROOF_VERIFICATION_WEBHOOK_TOKEN"
+
+[oidc]
+enabled = true
+issuer = "https://identity.example.com"
+key_id = "openproof-rs256-1"
+signing_key = "file:/run/secrets/openproof-oidc-private.pem"
+
+[gateway]
+enabled = true
+route_prefix = "/"
+upstream_host = "127.0.0.1"
+upstream_port = 18080
+upstream_tls = false
+
+[auth]
+enabled = true
+provider_id = "local"
+organization_id = "example"
+protected_route_prefix = "/api"
+
+[[auth.route_policies]]
+path_prefix = "/api"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+required_roles = ["member", "owner"]
+role_match = "any"
+minimum_assurance = "ial1"
+required_scope = "api"
+required_audience = "https://api.example.com"

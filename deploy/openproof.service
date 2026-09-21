@@ -1,6 +1,6 @@
 [Unit]
-Description=OpenProof identity service for genyleap.com
-Documentation=file:/opt/genyleap/openproof/docs/OPERATIONS.md
+Description=OpenProof identity service
+Documentation=file:/opt/openproof/docs/OPERATIONS.md
 After=network-online.target postgresql.service
 Wants=network-online.target
 Requires=postgresql.service
@@ -11,9 +11,8 @@ User=openproof
 Group=openproof
 EnvironmentFile=/etc/openproof/openproof.env
 EnvironmentFile=-/etc/openproof/providers.env
-Environment=LD_LIBRARY_PATH=/opt/gcc-16.2.0/lib64
-ExecStartPre=/opt/genyleap/openproof/runtime/bin/opp check-config --config /opt/genyleap/openproof/runtime/openproof.toml
-ExecStart=/opt/genyleap/openproof/runtime/bin/opp server --config /opt/genyleap/openproof/runtime/openproof.toml
+ExecStartPre=/opt/openproof/bin/opp check-config --config /opt/openproof/openproof.toml
+ExecStart=/opt/openproof/bin/opp server --config /opt/openproof/openproof.toml
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=60

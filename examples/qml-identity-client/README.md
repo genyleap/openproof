@@ -74,7 +74,7 @@ process environment and is never placed in command-line arguments or output.
 Use the same pattern with `OPENPROOF_LINKEDIN_*`, `OPENPROOF_TELEGRAM_*`,
 `OPENPROOF_GITHUB_*`, `OPENPROOF_APPLE_*`, or `OPENPROOF_MICROSOFT_*`.
 Provider-specific issuer requirements are documented in
-[`docs/02-CONFIGURATION.md`](../../docs/02-CONFIGURATION.md#external-federated-login).
+[`docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md#external-federated-login).
 
 If the Google consent screen is in testing mode, add the account you will use as
 a test user. The system browser may ask you to accept the generated local TLS

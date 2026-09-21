@@ -1,13 +1,26 @@
 .DS_Store
 .idea/
+.qtcreator/
 .gradle/
 build/
 cmake-build-*/
 runtime/
 .deps/
-sdk/kotlin/.gradle/
-sdk/kotlin/build/
-sdk/swift/.build/
+
+# Local environment and secret material
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
 *.cookies
 *.dump
 *.dump.sha256
+
+# SDK build outputs
+sdk/kotlin/.gradle/
+sdk/kotlin/build/
+sdk/swift/.build/

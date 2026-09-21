@@ -70,10 +70,10 @@ struct ClientFixture final {
               std::move(client::ClientSecretKey::create(
                   foundation::SecretString{std::string(32U, 'c')}).value()))
         , product(std::move(registry.registerApplication(
-              identity::core::OrganizationId{"org-main"}, "tegra", "Tegra",
+              identity::core::OrganizationId{"org-main"}, "example-app", "Example App",
               application::Environment::Production).value()))
         , registration(std::move(manager.registerClient(
-              product.id(), "Tegra Native", client::ClientKind::Native,
+              product.id(), "Example Native", client::ClientKind::Native,
               {"http://127.0.0.1:49152/callback"},
               {"openid", "profile", "offline_access"}).value()))
     {
@@ -123,8 +123,8 @@ TEST(ClientManagementTest, PublicAndConfidentialClientsHaveDifferentCredentialRu
         "http://[::1]:49152/callback"));
 
     auto web = fixture.manager.registerClient(
-        fixture.product.id(), "Tegra Web", client::ClientKind::Web,
-        {"https://tegra.example/auth/callback"}, {"openid", "profile"});
+        fixture.product.id(), "Example Web", client::ClientKind::Web,
+        {"https://app.example.com/auth/callback"}, {"openid", "profile"});
     ASSERT_TRUE(web.has_value());
     ASSERT_TRUE(web->secret().has_value());
     EXPECT_TRUE(web->secret()->expose().starts_with("ops_"));
@@ -480,8 +480,8 @@ TEST(OidcIssuerTest, RejectsAuthorityConfusionAndAcceptsHttpsOrLoopbackDevelopme
 TEST(CppSdkTest, GeneratesPkceStateAndKeepsTokenMaterialSecretTyped)
 {
     auto config = sdk::ClientConfig::create(
-        "https://identity.example", "tegra-native",
-        "https://tegra.example/auth/callback",
+        "https://identity.example", "example-native",
+        "https://app.example.com/auth/callback",
         {"openid", "profile"});
     ASSERT_TRUE(config.has_value());
     sdk::IdentityClient client{std::move(config).value()};

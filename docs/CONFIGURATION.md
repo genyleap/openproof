@@ -323,7 +323,7 @@ It is an offline operator ceremony, not an HTTP registration endpoint:
 export OPENPROOF_BOOTSTRAP_PASSWORD="use-a-long-unique-password"
 
 opp bootstrap-admin \
-  --config examples/openproof.auth-gateway.toml \
+  --config examples/openproof.toml \
   --organization-name "Example Organization" \
   --identity-id "initial-owner" \
   --subject "owner@example.test"
@@ -783,4 +783,4 @@ The role/assurance checks remain authoritative for platform sessions. Delegated
 OAuth access additionally carries a verified client ID and scopes from the token
 service; caller-provided scope headers are removed at the gateway boundary.
 
-See `examples/openproof.identity-platform.toml` for a complete deployment sample.
+See `examples/openproof.toml` for a complete deployment sample.

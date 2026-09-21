@@ -238,7 +238,7 @@ target_compile_definitions(openproof_compile_options INTERFACE
 #
 # Revisit when the defect is fixed. Nothing in the source depends on reflection,
 # so enabling it later is a one-line change plus the enum-name rewrite described
-# in docs/03-CXX26.md.
+# in docs/CXX26.md.
 
 message(STATUS
     "OpenProof: C++26 reflection is available on this compiler but is NOT enabled; -freflection "

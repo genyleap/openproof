@@ -3,7 +3,7 @@
 # GCC 16 is the project's primary toolchain because it is the only compiler on
 # the supported platforms that implements the C++26 features this platform
 # targets the qualified GCC 16 module/C++26 profile; experimental Contracts and Reflection are disabled by default. Historical feature probes include #embed, std::indirect/std::polymorphic,
-# std::text_encoding and std::generator. See docs/03-CXX26.md.
+# std::text_encoding and std::generator. See docs/CXX26.md.
 #
 # The prefix is discovered rather than hard-coded, so no machine-specific path
 # is committed (SEC-001).

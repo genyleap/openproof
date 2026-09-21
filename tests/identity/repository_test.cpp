@@ -190,8 +190,8 @@ TEST_F(IdentityRepositoryTest, MissingIdentityCannotChangeStatus)
     EXPECT_EQ(result.error().code(), fnd::ErrorCode::NotFound);
 }
 
-// Domain code depends on the port, never the adapter. This is what makes the
-// PostgreSQL adapter in Phase 8 a substitution rather than a rewrite.
+// Domain code depends on the port, never the adapter, so persistent storage can
+// replace the in-memory implementation without changing domain consumers.
 TEST_F(IdentityRepositoryTest, IsUsableThroughTheAbstractPort)
 {
     const std::unique_ptr<core::IdentityRepository> repository =

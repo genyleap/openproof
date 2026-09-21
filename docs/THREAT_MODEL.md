@@ -103,7 +103,5 @@ proof, trust and authorization remain separate decisions.
   implementation units with execution-coverage feedback and runs its retained
   mutation corpus under ASan/UBSan.
 - JavaScript SDK smoke tests and Kotlin compile checks are separately runnable.
-- Target-toolchain release status is recorded in
-  [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md).
 - Security invariants and their proving tests are indexed in
   [SECURITY_INVARIANTS.md](SECURITY_INVARIANTS.md).

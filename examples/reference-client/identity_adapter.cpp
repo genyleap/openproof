@@ -5,9 +5,9 @@ module;
 #include <utility>
 #include <vector>
 
-module openproof.examples.tegra.identity;
+module openproof.examples.reference.identity;
 
-namespace openproof::examples::tegra {
+namespace openproof::examples::reference {
 
 IdentityAdapter::IdentityAdapter(sdk::IdentityClient client)
     : m_client(std::move(client))

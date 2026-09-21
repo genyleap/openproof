@@ -24,7 +24,7 @@ set(OPENPROOF_MINIMUM_GNU_VERSION "16.0")
 # GCC 16 is the qualified production compiler family for the current module
 # graph. Recorded combinations below have completed configure, clean build and
 # test on the named operating system. Experimental C++26 Contracts and Reflection
-# remain disabled in the production stability profile. See docs/03-CXX26.md.
+# remain disabled in the production stability profile. See docs/CXX26.md.
 set(OPENPROOF_VERIFIED_TOOLCHAINS
     "GNU-16.1.0-Ninja-Darwin"
     "GNU-16.2.0-Ninja-Linux"
@@ -117,7 +117,7 @@ function(openproof_require_supported_toolchain)
             "Remediation: build with GCC 16 or newer, for example "
             "-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/gcc.cmake. These features will not be "
             "wrapped in a portability macro to accommodate a compiler that lacks them; see "
-            "docs/03-CXX26.md.")
+            "docs/CXX26.md.")
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS OPENPROOF_MINIMUM_GNU_VERSION)
             message(FATAL_ERROR

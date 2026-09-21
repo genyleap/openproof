@@ -25,6 +25,7 @@ const listeners = {};
 const app = {
   innerHTML: "",
   addEventListener(type, handler) { (listeners[type] ??= []).push(handler); },
+  querySelector() { return {lastChild:{textContent:""}}; },
 };
 let toast;
 const document = {
