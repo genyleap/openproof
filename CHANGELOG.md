@@ -2,7 +2,7 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
-## 1.1.0-rc1 — 2026-08-21
+## 1.1.0-rc1 — 2026-09-21
 
 ### Identity and authentication
 
@@ -31,8 +31,8 @@ Notable user-facing changes to OpenProof are recorded here.
   secret references.
 - Added authenticated metrics, health endpoints, backup/restore tooling and
   production qualification scripts.
-- Added signed-release packaging, a guided Debian/Ubuntu installer and GitHub
-  CI/release automation for AMD64 and ARM64.
+- Added release packaging and a guided Debian/Ubuntu installer with verified
+  release downloads and source-build fallback.
 - Expanded the C++, JavaScript, Swift and Kotlin SDK foundations.
 - Added the OpenAPI 3.1 contract and interactive Developer Portal.
 

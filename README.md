@@ -5,6 +5,7 @@
 [Product](https://genyleap.com/products/openproof) ·
 [Documentation](https://docs.genyleap.com/openproof/) ·
 [Developer Portal & API Sandbox](https://docs.genyleap.com/openproof/api/) ·
+[Releases](https://github.com/genyleap/openproof/releases) ·
 [OpenAPI](docs/openapi.yaml)
 
 OpenProof provides one canonical identity layer while keeping authentication,

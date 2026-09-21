@@ -9,6 +9,7 @@ NO_SETUP=0
 PLAN_ONLY=0
 API="https://api.github.com/repos/$REPO"
 RELEASES="https://github.com/$REPO/releases/download"
+GENYLEAP_RELEASES="https://genyleap.com/releases/openproof"
 SOURCE_INSTALLER="https://genyleap.com/install/openproof-source"
 
 say() { printf '%s\n' "$*"; }
@@ -92,15 +93,27 @@ resolve_version() {
   tag=""
   case "$CHANNEL" in
     stable)
-      tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      tag=$(curl -fsSL "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      fi
       [ -n "${tag:-}" ] || die "no stable OpenProof release is available"
       ;;
     rc)
-      tag=$(api_get "$API/releases?per_page=20" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
+      tag=$(curl -fsSL "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(api_get "$API/releases?per_page=20" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
+      fi
       [ -n "${tag:-}" ] || die "no release-candidate build is available"
       ;;
     auto)
-      tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      tag=$(curl -fsSL "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(curl -fsSL "$GENYLEAP_RELEASES/latest" 2>/dev/null | head -n 1) || true
+      fi
+      if [ -z "${tag:-}" ]; then
+        tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
+      fi
       if [ -z "${tag:-}" ]; then
         tag=$(api_get "$API/releases?per_page=1" 2>/dev/null | extract_tag) || true
       fi
@@ -145,7 +158,8 @@ fi
 
 TAG="v$OPENPROOF_VERSION"
 ASSET="openproof_${OPENPROOF_VERSION}_${ARCH}.deb"
-BASE="$RELEASES/$TAG"
+BASE="$GENYLEAP_RELEASES/$TAG"
+GITHUB_BASE="$RELEASES/$TAG"
 
 say ""
 say "OpenProof"
@@ -156,6 +170,9 @@ say ""
 
 say "Downloading release metadata..."
 if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
+  curl -fL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS" 2>/dev/null || true
+fi
+if [ ! -s "$TMP/SHA256SUMS" ]; then
   if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
     say "! Prebuilt release metadata is unavailable; using the Ubuntu source installer."
     SOURCE_ARGS=""
@@ -169,6 +186,9 @@ if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256S
 fi
 
 if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
+  curl -fL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET" 2>/dev/null || true
+fi
+if [ ! -s "$TMP/$ASSET" ]; then
   if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
     say "! No prebuilt $ARCH package exists for $OPENPROOF_VERSION; using the Ubuntu source installer."
     SOURCE_ARGS=""
