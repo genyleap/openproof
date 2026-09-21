@@ -65,6 +65,23 @@ set_target_properties(openproof_tests PROPERTIES
     CXX_EXTENSIONS OFF
 )
 
+# GCC 16 + glibc fortify can emit a false-positive -Warray-bounds diagnostic
+# while inlining Boost.Asio resolver internals in this integration test. Keep
+# the warning visible, but do not promote this third-party-header diagnostic to
+# an error for this one translation unit.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    set_source_files_properties(gateway/http_integration_test.cpp PROPERTIES
+        COMPILE_OPTIONS "-Wno-error=array-bounds")
+endif()
+
+# CI uses a private GCC 16 runtime that is newer than Ubuntu 24.04's system
+# libstdc++. Link the test runner's C++ runtime statically so CTest does not
+# depend on the runner's older dynamic libstdc++ after compilation succeeds.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
 target_link_libraries(openproof_tests
     PRIVATE
         openproof_foundation
