@@ -26,6 +26,7 @@ module;
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <boost/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/ssl.h>
@@ -40,15 +41,16 @@ namespace {
 namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
+namespace json = boost::json;
 namespace idp = identity::provider;
 using Tcp = asio::ip::tcp;
 
-constexpr std::string_view kApiHost{"api.twitter.com"};
+constexpr std::string_view kApiHost{"api.x.com"};
 constexpr std::string_view kRequestTokenTarget{"/oauth/request_token"};
 constexpr std::string_view kAccessTokenTarget{"/oauth/access_token"};
-constexpr std::string_view kRequestTokenUrl{"https://api.twitter.com/oauth/request_token"};
-constexpr std::string_view kAccessTokenUrl{"https://api.twitter.com/oauth/access_token"};
-constexpr std::string_view kAuthorizationEndpoint{"https://api.twitter.com/oauth/authorize"};
+constexpr std::string_view kRequestTokenUrl{"https://api.x.com/oauth/request_token"};
+constexpr std::string_view kAccessTokenUrl{"https://api.x.com/oauth/access_token"};
+constexpr std::string_view kAuthorizationEndpoint{"https://api.x.com/oauth/authenticate"};
 constexpr std::string_view kChallengePrefix{"xo1_"};
 constexpr std::string_view kChallengeAad{"openproof/x/oauth1/challenge/v1"};
 constexpr std::size_t kMaximumResponseBytes = 512U * 1024U;
@@ -382,6 +384,9 @@ void logUpstreamFailure(std::string_view stage,
     }
 
     std::string oauthProblem{"-"};
+    std::string jsonCode{"-"};
+    std::string jsonMessage{"-"};
+
     auto form = parseForm(response->body);
     if (form) {
         if (const auto found = form->find("oauth_problem");
@@ -389,9 +394,33 @@ void logUpstreamFailure(std::string_view stage,
             oauthProblem = found->second;
         }
     }
+
+    boost::system::error_code parseError;
+    auto parsed = json::parse(response->body, parseError);
+    if (!parseError && parsed.is_object()) {
+        const auto& object = parsed.as_object();
+        if (const auto* errors = object.if_contains("errors");
+            errors != nullptr && errors->is_array()
+            && !errors->as_array().empty()
+            && errors->as_array().front().is_object()) {
+            const auto& first = errors->as_array().front().as_object();
+            if (const auto* code = first.if_contains("code"); code != nullptr) {
+                if (code->is_int64()) jsonCode = std::to_string(code->as_int64());
+                else if (code->is_uint64()) jsonCode = std::to_string(code->as_uint64());
+            }
+            if (const auto* message = first.if_contains("message");
+                message != nullptr && message->is_string()) {
+                std::string value{message->as_string()};
+                if (safeText(value, 512U)) jsonMessage = std::move(value);
+            }
+        }
+    }
+
     std::cerr << "openproof_x_oauth1_failure stage=" << stage
               << " status=" << response->status
-              << " oauth_problem=" << oauthProblem << '\n';
+              << " oauth_problem=" << oauthProblem
+              << " error_code=" << jsonCode
+              << " error_message=" << jsonMessage << '\n';
 }
 
 [[nodiscard]] std::string unixTimestamp(const foundation::ClockSource& clock)
