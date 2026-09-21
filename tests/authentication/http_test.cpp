@@ -90,6 +90,55 @@ public:
     }
 };
 
+class OAuth1RelayProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override
+    {
+        return idp::ProviderId{"oauth1-relay"};
+    }
+
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
+    {
+        return idp::InteractionModel::Redirect;
+    }
+
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
+    {
+        return idp::AssuranceLevel::Ial1;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override
+    {
+        idp::AuthenticationChallenge challenge{
+            idp::ChallengeId{"oauth1-relay-challenge"},
+            kNow + std::chrono::minutes{5}};
+        challenge.setParameter(
+            "authorization_url", "https://provider.example/oauth1-authorize");
+        return challenge;
+    }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse& response) override
+    {
+        const auto token = response.parameters().find("oauth_token");
+        const auto verifier = response.parameters().find("oauth_verifier");
+        if (token == response.parameters().end()
+            || token->second.expose() != "request-token"
+            || verifier == response.parameters().end()
+            || verifier->second.expose() != "accepted-verifier") {
+            return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        }
+        return idp::AuthenticationOutcome::create(
+            idp::ProviderId{"oauth1-relay"},
+            idp::ExternalSubject{"oauth1-subject"},
+            idp::VerifiedClaims{}, idp::AssuranceLevel::Ial1,
+            idp::AuthenticationStrength{
+                idp::AuthenticationFactor::Possession, true},
+            idp::ProviderEvidence{}, kNow);
+    }
+};
+
 class AppleFormPostRelayProvider final : public idp::AuthenticationProvider {
 public:
     [[nodiscard]] idp::ProviderId id() const override
@@ -697,6 +746,66 @@ TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndCh
     ASSERT_EQ(challenges.size(), 1U);
     EXPECT_EQ(redirects.front().as_string(), "redirect");
     EXPECT_EQ(challenges.front().as_string(), "challenge");
+}
+
+TEST(FederatedAuthenticationHttpApiTest, OAuth1CallbackForwardsTokenAndVerifier)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(
+        std::make_unique<OAuth1RelayProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-oauth1"},
+        core::ExternalIdentityRef{idp::ProviderId{"oauth1-relay"},
+                                  idp::ExternalSubject{"oauth1-subject"}},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(externalIdentities.attach(link));
+
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"oauth1-relay"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto started = api.handle(getRequest(
+        "/auth/federated/start?provider=oauth1-relay&return_to=%2Faccount"));
+    ASSERT_EQ(started.status(), 302) << started.body();
+    ASSERT_EQ(started.headers().at("location"),
+              "https://provider.example/oauth1-authorize");
+
+    std::string callbackCookies;
+    for (const auto& header : setCookies(started)) {
+        if (!callbackCookies.empty()) callbackCookies.append("; ");
+        callbackCookies.append(header.substr(0U, header.find(';')));
+    }
+    const auto completed = api.handle(getRequest(
+        "/auth/federated/callback?oauth_token=request-token&"
+        "oauth_verifier=accepted-verifier",
+        std::move(callbackCookies)));
+
+    ASSERT_EQ(completed.status(), 302) << completed.body();
+    EXPECT_EQ(completed.headers().at("location"), "/account");
+    EXPECT_FALSE(cookieValue(
+        completed, "__Host-openproof-session").empty());
 }
 
 TEST(FederatedAuthenticationHttpApiTest, FormPostForwardsAppleUserPayloadToProvider)

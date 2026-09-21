@@ -1666,24 +1666,25 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
     }
-    if (const auto xClientId = environment.get("OPENPROOF_X_CLIENT_ID");
-        xClientId && !xClientId->empty()) {
-        const auto xClientSecret = environment.get("OPENPROOF_X_CLIENT_SECRET");
-        if (!xClientSecret || xClientSecret->empty()
+    if (const auto xApiKey = environment.get("OPENPROOF_X_API_KEY");
+        xApiKey && !xApiKey->empty()) {
+        const auto xApiSecret = environment.get("OPENPROOF_X_API_SECRET");
+        if (!xApiSecret || xApiSecret->empty()
             || !federationCallback || federationCallback->empty()) {
             reportStartupFailure(fnd::Error{
                 fnd::ErrorCode::FailedPrecondition,
-                "X federation requires a client secret and callback URI."});
+                "X OAuth 1.0a federation requires an API key, API secret, and callback URI."});
             return ExitCode::ConfigurationError;
         }
         auto derivationKey = deriveSecret(
-            platform.security().tokenSigningKey(), "openproof/federation/x/v1");
+            platform.security().tokenSigningKey(),
+            "openproof/federation/x/oauth1/v1");
         if (!derivationKey) {
             reportStartupFailure(derivationKey.error());
             return ExitCode::InternalError;
         }
         auto xConfig = xProvider::XProviderConfig::create(
-            *xClientId, fnd::SecretString{*xClientSecret}, *federationCallback,
+            *xApiKey, fnd::SecretString{*xApiSecret}, *federationCallback,
             std::move(derivationKey).value(), std::chrono::minutes{5});
         if (!xConfig) {
             reportStartupFailure(xConfig.error());

@@ -535,7 +535,8 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         return response;
     };
     if (!parameters || !continuation || !bindingToken || !transactionCookie
-        || !challengeCookie || !returnCookie || parameters->contains("error")) {
+        || !challengeCookie || !returnCookie || parameters->contains("error")
+        || parameters->contains("denied")) {
         const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
         if (auto redirected = redirectConnectionFailure(failure)) {
             return std::move(*redirected);
@@ -543,8 +544,11 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         return error(failure, request, true);
     }
     const bool samlCallback = parameters->contains("SAMLResponse") || parameters->contains("RelayState");
+    const bool oauth1Callback = parameters->contains("oauth_token") || parameters->contains("oauth_verifier");
     const auto code = parameters->find("code");
     const auto state = parameters->find("state");
+    const auto oauthToken = parameters->find("oauth_token");
+    const auto oauthVerifier = parameters->find("oauth_verifier");
     const auto samlResponse = parameters->find("SAMLResponse");
     const auto relayState = parameters->find("RelayState");
     const auto user = parameters->find("user");
@@ -552,6 +556,16 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         if (samlResponse == parameters->end() || relayState == parameters->end()
             || samlResponse->second.empty() || samlResponse->second.size() > 900U * 1024U
             || relayState->second.empty() || relayState->second.size() > 512U) {
+            const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+            if (auto redirected = redirectConnectionFailure(failure)) {
+                return std::move(*redirected);
+            }
+            return error(failure, request, true);
+        }
+    } else if (oauth1Callback) {
+        if (oauthToken == parameters->end() || oauthVerifier == parameters->end()
+            || oauthToken->second.empty() || oauthToken->second.size() > 1024U
+            || oauthVerifier->second.empty() || oauthVerifier->second.size() > 1024U) {
             const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
             if (auto redirected = redirectConnectionFailure(failure)) {
                 return std::move(*redirected);
@@ -582,6 +596,11 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     if (samlCallback) {
         authenticationResponse.setParameter("SAMLResponse", idp::CredentialValue{samlResponse->second});
         authenticationResponse.setParameter("RelayState", idp::CredentialValue{relayState->second});
+    } else if (oauth1Callback) {
+        authenticationResponse.setParameter(
+            "oauth_token", idp::CredentialValue{oauthToken->second});
+        authenticationResponse.setParameter(
+            "oauth_verifier", idp::CredentialValue{oauthVerifier->second});
     } else {
         authenticationResponse.setParameter("code", idp::CredentialValue{code->second});
         authenticationResponse.setParameter("state", idp::CredentialValue{state->second});

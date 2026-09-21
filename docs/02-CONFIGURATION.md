@@ -598,11 +598,12 @@ and JWKS HTTPS requests.
   callback URI, revalidates the authenticated user through the GitHub REST API
   after every sign-in, and accepts an email claim only when GitHub reports the
   primary address as verified.
-- X (Twitter): `OPENPROOF_X_CLIENT_ID`, `OPENPROOF_X_CLIENT_SECRET`. The provider
-  uses OAuth 2.0 Authorization Code with `S256` PKCE, requests only identity/read
-  scopes (`users.read tweet.read`), exchanges confidential-client credentials with
-  HTTP Basic authentication, and resolves the canonical subject, username, display
-  name, and profile image through the authenticated `GET /2/users/me` endpoint.
+- X (Twitter): `OPENPROOF_X_API_KEY`, `OPENPROOF_X_API_SECRET`. The provider
+  uses the three-legged OAuth 1.0a request-token / authorization / access-token
+  ceremony. The successful access-token response supplies the stable X `user_id`
+  and `screen_name`, which OpenProof uses as the external subject and preferred
+  username. OpenProof deliberately does not call `/2/users/me` or another profile
+  lookup endpoint merely to establish identity.
 - LinkedIn: `OPENPROOF_LINKEDIN_CLIENT_ID`, `OPENPROOF_LINKEDIN_CLIENT_SECRET`;
   optional `OPENPROOF_LINKEDIN_ISSUER` (default
   `https://www.linkedin.com/oauth`). Enable the **Sign in with LinkedIn using
