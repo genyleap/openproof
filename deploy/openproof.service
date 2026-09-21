@@ -1,6 +1,6 @@
 [Unit]
 Description=OpenProof identity and authorization service
-Documentation=file:/opt/openproof/docs/OPERATIONS.md
+Documentation=file:/opt/genyleap/openproof/docs/OPERATIONS.md
 Wants=network-online.target
 After=network-online.target
 
@@ -8,11 +8,12 @@ After=network-online.target
 Type=simple
 User=openproof
 Group=openproof
-EnvironmentFile=-/etc/openproof/openproof.env
+EnvironmentFile=/etc/openproof/openproof.env
+EnvironmentFile=-/etc/openproof/providers.env
 ExecStartPre=/usr/bin/test -r /etc/openproof/openproof.toml
-ExecStartPre=/usr/bin/test -x /opt/openproof/bin/opp
-ExecStartPre=/opt/openproof/bin/opp check-config --config /etc/openproof/openproof.toml
-ExecStart=/opt/openproof/bin/opp server --config /etc/openproof/openproof.toml
+ExecStartPre=/usr/bin/test -x /opt/genyleap/openproof/runtime/bin/opp
+ExecStartPre=/opt/genyleap/openproof/runtime/bin/opp check-config --config /etc/openproof/openproof.toml
+ExecStart=/opt/genyleap/openproof/runtime/bin/opp server --config /etc/openproof/openproof.toml
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=60s

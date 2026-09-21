@@ -31,6 +31,8 @@ only as providers behind extension interfaces.
 > a second empty disposable database.
 
 > Exact implemented/partial/missing capability inventory: [docs/CAPABILITY_STATUS.md](docs/CAPABILITY_STATUS.md).
+>
+> Provider registration and production setup: [docs/PROVIDER_SETUP.md](docs/PROVIDER_SETUP.md).
 
 ---
 

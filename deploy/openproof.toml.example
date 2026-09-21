@@ -35,7 +35,7 @@ rate_limit_maximum_keys = 100000
 [database]
 connection_string = "file:/run/openproof/secrets/database.url"
 pool_size = 16
-migration_directory = "/opt/openproof/migrations"
+migration_directory = "/opt/genyleap/openproof/runtime/migrations"
 
 [auth]
 enabled = true

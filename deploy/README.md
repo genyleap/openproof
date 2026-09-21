@@ -5,16 +5,21 @@ These files are reviewed starting points for a single-node identity deployment:
 - `openproof.service` runs an unprivileged, filesystem-restricted `opp` process;
 - `nginx-openproof.conf` terminates TLS and overwrites the trusted client-IP
   header rather than forwarding an attacker-controlled chain;
+- `genyleap-openproof-subdomain.nginx.conf` is the production-specific dedicated
+  hostname template for `openproof.genyleap.com` (enable only after DNS and TLS exist);
 - `openproof.toml.example` composes account, OAuth/OIDC and protected API
   surfaces;
-- `openproof.env.example` lists optional environment-only feature credentials,
-  including federated-login provider variables, without containing usable ones;
+- `openproof.env.example` lists general optional environment-only feature credentials;
+- `providers.env.example` groups the provider-specific production variables loaded by
+  the optional `/etc/openproof/providers.env` service environment file;
 - `verification-delivery-postfix.php`, `openproof-delivery.service` and
   `openproof-delivery.env.example` provide an optional loopback-only email adapter
   for deployments that operate a local Postfix MTA.
 
-Install the release binary as `/opt/openproof/bin/opp`, copy `migrations/` to
-`/opt/openproof/migrations`, configuration to `/etc/openproof/openproof.toml`
+Keep the canonical checkout at `/opt/genyleap/openproof`. Install the built release
+binary as `/opt/genyleap/openproof/runtime/bin/opp`, copy `migrations/` to
+`/opt/genyleap/openproof/runtime/migrations`, and keep configuration in
+`/etc/openproof/openproof.toml`
 and have the target secret-store/KMS agent mount these exact read-only files:
 
 - `/run/openproof/secrets/master.key` — at least 32 random bytes;
@@ -47,7 +52,7 @@ only its exact directory with a reviewed `ReadWritePaths=` override.
 
 When direct transactional email is appropriate for the deployment, install a local
 Postfix instance that accepts SMTP only from loopback, then copy
-`verification-delivery-postfix.php` to `/opt/openproof/delivery/`, copy the delivery
+`verification-delivery-postfix.php` to `/opt/genyleap/openproof/runtime/delivery/`, copy the delivery
 unit to `/etc/systemd/system/openproof-delivery.service`, and create
 `/etc/openproof/delivery.env` from `openproof-delivery.env.example`.
 

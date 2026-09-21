@@ -10,7 +10,7 @@ User=openproof
 Group=openproof
 EnvironmentFile=/etc/openproof/delivery.env
 Environment=PHP_CLI_SERVER_WORKERS=4
-ExecStart=/usr/bin/php -d expose_php=0 -S 127.0.0.1:18444 /opt/openproof/delivery/verification-delivery-postfix.php
+ExecStart=/usr/bin/php -d expose_php=0 -S 127.0.0.1:18444 /opt/genyleap/openproof/runtime/delivery/verification-delivery-postfix.php
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
