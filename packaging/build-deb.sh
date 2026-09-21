@@ -64,6 +64,8 @@ for soname in libstdc++.so.6 libgcc_s.so.1; do
 done
 
 cp -a "$ROOT/migrations/." "$PKG/opt/openproof/migrations/"
+find "$PKG/opt/openproof/migrations" -type d -exec chmod 0755 {} +
+find "$PKG/opt/openproof/migrations" -type f -exec chmod 0644 {} +
 install -m 0644 "$ROOT/docs/OPERATIONS.md" "$PKG/opt/openproof/docs/OPERATIONS.md"
 install -m 0644 "$ROOT/docs/CONFIGURATION.md" "$PKG/opt/openproof/docs/CONFIGURATION.md"
 

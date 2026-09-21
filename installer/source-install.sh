@@ -174,7 +174,18 @@ DIST="$WORK/dist"
 BOOST_PREFIX="$WORK/boost-1.88"
 
 say "Downloading OpenProof source..."
-git clone --depth 1 --branch "$SOURCE_REF" https://github.com/genyleap/openproof.git "$SOURCE"
+if [[ "$SOURCE_REF" == v* ]]; then
+  SOURCE_VERSION="${SOURCE_REF#v}"
+  SOURCE_ARCHIVE="https://genyleap.com/releases/openproof/$SOURCE_REF/openproof-$SOURCE_VERSION-source.tar.gz"
+  if curl -fsSL --retry 3 --connect-timeout 15 -o "$WORK/openproof-source.tar.gz" "$SOURCE_ARCHIVE"; then
+    mkdir -p "$SOURCE"
+    tar -xzf "$WORK/openproof-source.tar.gz" -C "$SOURCE" --strip-components=1
+  else
+    git clone --depth 1 --branch "$SOURCE_REF" https://github.com/genyleap/openproof.git "$SOURCE"
+  fi
+else
+  git clone --depth 1 --branch "$SOURCE_REF" https://github.com/genyleap/openproof.git "$SOURCE"
+fi
 OPENPROOF_VERSION=$(tr -d '[:space:]' <"$SOURCE/VERSION")
 
 say "Preparing Boost 1.88..."
