@@ -7,8 +7,6 @@
 [Developer Portal & API Sandbox](https://docs.genyleap.com/openproof/api/) ·
 [OpenAPI](docs/openapi.yaml)
 
-[![CI](https://github.com/genyleap/openproof/actions/workflows/ci.yml/badge.svg)](https://github.com/genyleap/openproof/actions/workflows/ci.yml)
-
 OpenProof provides one canonical identity layer while keeping authentication,
 proof, trust, sessions, and authorization as separate security boundaries. It is
 designed to run inside your own infrastructure and keep identity data under your

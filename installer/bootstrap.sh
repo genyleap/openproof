@@ -155,8 +155,31 @@ say "  arch    : $ARCH"
 say ""
 
 say "Downloading release metadata..."
-curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"
-curl -fL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"
+if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
+  if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
+    say "! Prebuilt release metadata is unavailable; using the Ubuntu source installer."
+    SOURCE_ARGS=""
+    [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
+    [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
+    SOURCE_SCRIPT="$TMP/source-install.sh"
+    curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+    exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
+  fi
+  die "release metadata for $OPENPROOF_VERSION could not be downloaded"
+fi
+
+if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
+  if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
+    say "! No prebuilt $ARCH package exists for $OPENPROOF_VERSION; using the Ubuntu source installer."
+    SOURCE_ARGS=""
+    [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
+    [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
+    SOURCE_SCRIPT="$TMP/source-install.sh"
+    curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+    exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
+  fi
+  die "$ASSET could not be downloaded"
+fi
 
 expected=$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$TMP/SHA256SUMS" | head -n 1)
 [ -n "$expected" ] || die "$ASSET is not listed in SHA256SUMS"

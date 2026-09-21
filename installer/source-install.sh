@@ -6,6 +6,7 @@ NO_SETUP=0
 PLAN_ONLY=0
 
 say(){ printf '%s\n' "$*"; }
+warn(){ printf '! %s\n' "$*" >&2; }
 die(){ printf 'OpenProof installer: %s\n' "$*" >&2; exit 1; }
 
 while (($#)); do
@@ -47,6 +48,30 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+
+cleanup_broken_toolchain_ppa() {
+  [[ "${VERSION_CODENAME:-}" == "noble" ]] && return 0
+
+  local file disabled=0
+  for file in /etc/apt/sources.list.d/*toolchain*r*test*.list /etc/apt/sources.list.d/*toolchain*r*test*.sources; do
+    [[ -f "$file" ]] || continue
+    if grep -q 'ppa.launchpadcontent.net/ubuntu-toolchain-r/test' "$file"; then
+      mv "$file" "$file.openproof-disabled"
+      disabled=1
+    fi
+  done
+
+  if [[ -f /etc/apt/sources.list ]] && grep -q 'ppa.launchpadcontent.net/ubuntu-toolchain-r/test' /etc/apt/sources.list; then
+    sed -i '\|ppa.launchpadcontent.net/ubuntu-toolchain-r/test|s|^|# disabled by OpenProof installer: |' /etc/apt/sources.list
+    disabled=1
+  fi
+
+  if [[ "$disabled" -eq 1 ]]; then
+    warn "Disabled an unsupported ubuntu-toolchain-r/test PPA for ${VERSION_CODENAME:-this Ubuntu release}."
+  fi
+}
+
+cleanup_broken_toolchain_ppa
 
 say ""
 say "OpenProof Linux installer"
