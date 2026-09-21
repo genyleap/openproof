@@ -152,7 +152,7 @@ if [ -z "$OPENPROOF_VERSION" ]; then
   [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
   [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
   SOURCE_SCRIPT="$TMP/source-install.sh"
-  curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+  curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
   exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
 fi
 
@@ -169,8 +169,8 @@ say "  arch    : $ARCH"
 say ""
 
 say "Downloading release metadata..."
-if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
-  curl -fL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS" 2>/dev/null || true
+if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS" 2>/dev/null || true
 fi
 if [ ! -s "$TMP/SHA256SUMS" ]; then
   if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
@@ -178,15 +178,16 @@ if [ ! -s "$TMP/SHA256SUMS" ]; then
     SOURCE_ARGS=""
     [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
     [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
+    SOURCE_ARGS="$SOURCE_ARGS --ref $TAG"
     SOURCE_SCRIPT="$TMP/source-install.sh"
-    curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+    curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
     exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
   fi
   die "release metadata for $OPENPROOF_VERSION could not be downloaded"
 fi
 
-if ! curl -fL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
-  curl -fL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET" 2>/dev/null || true
+if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET" 2>/dev/null; then
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET" 2>/dev/null || true
 fi
 if [ ! -s "$TMP/$ASSET" ]; then
   if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
@@ -194,8 +195,9 @@ if [ ! -s "$TMP/$ASSET" ]; then
     SOURCE_ARGS=""
     [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
     [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
+    SOURCE_ARGS="$SOURCE_ARGS --ref $TAG"
     SOURCE_SCRIPT="$TMP/source-install.sh"
-    curl -fL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
+    curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
     exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
   fi
   die "$ASSET could not be downloaded"

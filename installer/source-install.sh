@@ -4,6 +4,7 @@ set -Eeuo pipefail
 NON_INTERACTIVE=0
 NO_SETUP=0
 PLAN_ONLY=0
+SOURCE_REF="main"
 
 say(){ printf '%s\n' "$*"; }
 warn(){ printf '! %s\n' "$*" >&2; }
@@ -14,6 +15,7 @@ while (($#)); do
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --no-setup) NO_SETUP=1; shift ;;
     --plan) PLAN_ONLY=1; shift ;;
+    --ref) [[ $# -ge 2 ]] || die "--ref requires a value"; SOURCE_REF="$2"; shift 2 ;;
     *) die "unknown source-install option: $1" ;;
   esac
 done
@@ -43,7 +45,7 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
   say "  arch   : $ARCH"
   say "  compiler: GCC 16"
   say "  boost  : 1.88"
-  say "  source : github.com/genyleap/openproof (main)"
+  say "  source : github.com/genyleap/openproof ($SOURCE_REF)"
   exit 0
 fi
 
@@ -101,7 +103,7 @@ build_gcc16() {
   say "Building GCC $GCC_VERSION automatically. This can take a while on smaller ARM systems."
   say ""
 
-  curl -fL --retry 3 --connect-timeout 15 \
+  curl -fsSL --retry 3 --connect-timeout 15 \
     -o "$WORK/gcc.tar.xz" \
     "https://ftp.gnu.org/gnu/gcc/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.xz"
   tar -xJf "$WORK/gcc.tar.xz" -C "$WORK"
@@ -172,11 +174,11 @@ DIST="$WORK/dist"
 BOOST_PREFIX="$WORK/boost-1.88"
 
 say "Downloading OpenProof source..."
-git clone --depth 1 https://github.com/genyleap/openproof.git "$SOURCE"
+git clone --depth 1 --branch "$SOURCE_REF" https://github.com/genyleap/openproof.git "$SOURCE"
 OPENPROOF_VERSION=$(tr -d '[:space:]' <"$SOURCE/VERSION")
 
 say "Preparing Boost 1.88..."
-curl -fL --retry 3 --connect-timeout 15 \
+curl -fsSL --retry 3 --connect-timeout 15 \
   -o "$WORK/boost.tar.bz2" \
   https://archives.boost.io/release/1.88.0/source/boost_1_88_0.tar.bz2
 tar -xjf "$WORK/boost.tar.bz2" -C "$WORK"
