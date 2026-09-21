@@ -32,8 +32,8 @@ jobs:
         run: node scripts/test-local-demo-portal-ui.mjs
       - name: JavaScript SDK
         run: node sdk/javascript/test.mjs
-      - name: Commit whitespace
-        run: git show --check --oneline --no-renames HEAD
+      - name: Whitespace
+        run: git diff --check
 
   build:
     name: Build and test
