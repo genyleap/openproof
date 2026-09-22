@@ -11,6 +11,8 @@ operations:
 
 | Document | Purpose |
 |---|---|
+| [HANDBOOK.md](HANDBOOK.md) | deployment + developer handbook, from install to language integration |
+| [AI_AND_MCP.md](AI_AND_MCP.md) | LLM/RAG guidance and the public documentation MCP boundary |
 | [INSTALLATION.md](INSTALLATION.md) | packaged installation and setup wizard |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | module boundaries and system architecture |
 | [CONFIGURATION.md](CONFIGURATION.md) | complete configuration reference |

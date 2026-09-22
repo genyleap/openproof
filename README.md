@@ -188,6 +188,8 @@ The protocol remains HTTP + OAuth/OIDC, so using an OpenProof SDK is optional.
 
 | Topic | Repository reference |
 |---|---|
+| Deployment & developer handbook | [docs/HANDBOOK.md](docs/HANDBOOK.md) |
+| AI / LLM / MCP integration | [docs/AI_AND_MCP.md](docs/AI_AND_MCP.md) |
 | Installation | [docs/INSTALLATION.md](docs/INSTALLATION.md) |
 | Architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Configuration | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
