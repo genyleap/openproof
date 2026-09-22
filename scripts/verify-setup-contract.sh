@@ -66,4 +66,17 @@ grep -Fq 'restart_openproof_or_rollback(){' "$CLI" || fail "management CLI lacks
 grep -Fq 'You can add, replace, or remove provider credentials here at any time.' "$CLI" \
   || fail "provider configuration is not documented as editable after setup"
 
+grep -Fq "X-Forwarded-For: 127.0.0.1" "$SETUP" \
+  || fail "setup local readiness probe omits the trusted-proxy client header"
+grep -Fq 'local_openproof_probe(){' "$CLI" \
+  || fail "management CLI lacks the trusted local health probe helper"
+grep -Fq "X-Forwarded-For: 127.0.0.1" "$CLI" \
+  || fail "management CLI local readiness probes omit the trusted-proxy client header"
+if grep -Fq 'curl -fsS --max-time 2 http://127.0.0.1:18443/health/ready' "$SETUP"; then
+  fail "setup contains a direct readiness probe that bypasses trusted-proxy request requirements"
+fi
+if grep -Fq 'curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready' "$CLI"; then
+  fail "management CLI contains a direct readiness probe that bypasses trusted-proxy request requirements"
+fi
+
 printf 'setup contract gate: ok\n'

@@ -68,6 +68,10 @@ Notable user-facing changes to OpenProof are recorded here.
 - Failed readiness stops the service to avoid an uncontrolled systemd restart
   loop, and a resumed setup proactively pauses an incomplete OpenProof service
   before changing configuration.
+- Local readiness probes now send the loopback `X-Forwarded-For` value required
+  by deployments with trusted-proxy client-IP handling enabled; setup, status,
+  doctor and configuration rollback no longer misclassify a healthy listener as
+  unavailable.
 - Collects and validates SMTP relay settings before installing optional mail
   runtime packages, and keeps successful package provisioning output concise.
 - Generated persistent security material is stored as hexadecimal and referenced

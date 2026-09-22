@@ -1004,13 +1004,34 @@ bootstrap_owner(){
   warn "The TOTP enrollment secret above is shown once. Store it securely now."
 }
 
+local_openproof_probe(){
+  local timeout=$1 path=$2
+  curl -fsS --max-time "$timeout" \
+    -H 'X-Forwarded-For: 127.0.0.1' \
+    "http://127.0.0.1:18443$path"
+}
+
 health_check(){
-  local i
+  local i live_status ready_status
   for i in $(seq 1 30); do
-    if curl -fsS --max-time 2 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then ok "OpenProof readiness check passed"; return; fi
+    if local_openproof_probe 2 /health/ready >/dev/null 2>&1; then
+      ok "OpenProof readiness check passed"
+      return
+    fi
     sleep 1
   done
-  journalctl -u openproof.service -n 30 --no-pager >&2 || true
+
+  live_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    -H 'X-Forwarded-For: 127.0.0.1' \
+    http://127.0.0.1:18443/health/live 2>/dev/null || true)
+  ready_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    -H 'X-Forwarded-For: 127.0.0.1' \
+    http://127.0.0.1:18443/health/ready 2>/dev/null || true)
+  [[ -n $live_status ]] || live_status=unreachable
+  [[ -n $ready_status ]] || ready_status=unreachable
+  warn "Local health diagnostics: live=$live_status ready=$ready_status"
+  systemctl --no-pager --full status openproof.service >&2 || true
+  journalctl -u openproof.service -n 40 --no-pager >&2 || true
   systemctl stop openproof.service >/dev/null 2>&1 || true
   die "OpenProof did not become ready; the service was stopped to avoid a restart loop"
 }

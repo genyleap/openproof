@@ -47,10 +47,17 @@ field(){
   printf '  %s%-15s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"
 }
 
+local_openproof_probe(){
+  local timeout=$1 path=$2
+  curl -fsS --max-time "$timeout" \
+    -H 'X-Forwarded-For: 127.0.0.1' \
+    "http://127.0.0.1:18443$path"
+}
+
 wait_openproof_ready(){
   local i
   for i in $(seq 1 15); do
-    if curl -fsS --max-time 2 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+    if local_openproof_probe 2 /health/ready >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -196,7 +203,7 @@ cmd_status(){
     info "Delivery adapter is inactive (may be intentional)"
   fi
 
-  if curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+  if local_openproof_probe 3 /health/ready >/dev/null 2>&1; then
     ok "Local readiness endpoint is healthy"
   else
     warn "Local readiness endpoint is unavailable"
@@ -232,7 +239,7 @@ cmd_doctor(){
 
   if systemctl is-active --quiet openproof.service; then ok "OpenProof service   running"; else bad "OpenProof service   not running"; failures=$((failures+1)); fi
 
-  if curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+  if local_openproof_probe 3 /health/ready >/dev/null 2>&1; then
     ok "Local readiness     HTTP 200"
   else
     bad "Local readiness     unavailable"

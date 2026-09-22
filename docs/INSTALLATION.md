@@ -150,6 +150,12 @@ The optional gateway upstream can be supplied non-interactively with
 `127.0.0.1:18080` without TLS; these values can later be changed with
 `sudo openproof config main`.
 
+Production setup enables trusted-proxy client-IP handling on the loopback
+listener. Nginx supplies `X-Forwarded-For` automatically. OpenProof's own local
+health probes therefore send `X-Forwarded-For: 127.0.0.1`; a manual request
+sent directly to `127.0.0.1:18443` without that header is intentionally
+rejected by the listener.
+
 ## Email delivery
 
 OpenProof deliberately separates verification issuance from message delivery.
