@@ -45,6 +45,10 @@ Notable user-facing changes to OpenProof are recorded here.
 - Added the `openproof` management CLI for info, status, diagnostics, logs,
   service lifecycle, configuration, update/upgrade, backup/restore and uninstall.
 - Made setup resilient when invoked through `curl | sudo sh`.
+- Interactive validation now stays on the current field instead of restarting the
+  wizard: invalid input gets red feedback, accepted input gets green feedback,
+  each field gets three attempts, then the operator can retry that same field or
+  exit setup while preserving completed system changes.
 - Collects and validates SMTP relay settings before installing optional mail
   runtime packages, and keeps successful package provisioning output concise.
 - Generated persistent security material is stored as hexadecimal and referenced

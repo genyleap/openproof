@@ -59,6 +59,13 @@ The setup wizard can provision the entire single-host deployment:
 8. Nginx and Let's Encrypt, an existing certificate, or an external TLS ingress;
 9. systemd services and final readiness checks.
 
+Interactive validation is local to the current field. Invalid values are shown
+with red feedback and accepted values with green feedback. A field is retried up
+to three times; after three unsuccessful attempts the operator can retry that
+same field from a fresh three-attempt cycle or exit setup. Exiting preserves the
+bundle and system changes already completed, but does not mark the host as fully
+configured.
+
 Provider credentials are requested only for providers selected during setup. The
 shared federation callback is derived from the configured identity domain:
 

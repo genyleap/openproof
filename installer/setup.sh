@@ -33,7 +33,9 @@ info(){ printf '%s›%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 warn(){ printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die(){ printf '%s✗%s OpenProof setup: %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 section(){ printf '\n%s%s%s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
-option(){ printf '  %s%s)%s %s\n' "$C_CYAN" "$1" "$C_RESET" "$2"; }
+option(){ printf '  %s%s)%s %s\n' "$C_CYAN" "$1" "$C_RESET" "$2" >"$TTY"; }
+input_ok(){ printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*" >"$TTY"; }
+input_error(){ printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >"$TTY"; }
 
 show_setup_header(){
   printf '\n%s%sOpenProof%s  %sconfiguration wizard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
@@ -101,22 +103,151 @@ prompt(){
   printf '%s' "$value"
 }
 
-prompt_secret(){
-  local label=$1 env_name=$2 value
-  value=$(env_value "$env_name")
-  if (( NON_INTERACTIVE )); then
-    [[ -n $value ]] || die "$env_name is required in non-interactive mode"
-    printf '%s' "$value"
-    return
-  fi
+prompt_hidden(){
+  local label=$1 value
   printf '%s%s%s: ' "$C_BOLD" "$label" "$C_RESET" >"$TTY"
   IFS= read -r -s value <"$TTY"
   printf '\n' >"$TTY"
   printf '%s' "$value"
 }
 
+operator_exit(){
+  printf '\n%s›%s Setup exited by operator. Installed files and completed system changes were preserved.\n' "$C_CYAN" "$C_RESET" >"$TTY"
+  exit 130
+}
+
+retry_or_exit(){
+  local context=$1 choice
+  printf '\n%s!%s Three unsuccessful attempts for %s.\n' "$C_YELLOW" "$C_RESET" "$context" >"$TTY"
+  option 1 "Try again"
+  option 2 "Exit setup"
+  while :; do
+    choice=$(prompt "Choose" "1")
+    case "$choice" in
+      1|r|R|retry|Retry) return 0 ;;
+      2|e|E|exit|Exit) operator_exit ;;
+      *) input_error "Choose 1 to try again or 2 to exit setup." ;;
+    esac
+  done
+}
+
+retry_failed(){
+  local context=$1
+  local -n attempts_ref=$2
+  attempts_ref=$((attempts_ref + 1))
+  if (( attempts_ref >= 3 )); then
+    retry_or_exit "$context"
+    attempts_ref=0
+  fi
+}
+
+validated_prompt(){
+  local label=$1 default=$2 validator=$3 error_message=$4
+  local context=${5:-$label} value attempts=0
+  while :; do
+    value=$(prompt "$label" "$default")
+    if "$validator" "$value"; then
+      input_ok "$label accepted"
+      printf '%s' "$value"
+      return
+    fi
+    input_error "$error_message"
+    retry_failed "$context" attempts
+  done
+}
+
+validated_value(){
+  local env_name=$1 label=$2 default=$3 validator=$4 error_message=$5
+  local context=${6:-$label} value
+
+  value=$(env_value "$env_name")
+  if [[ -n $value ]]; then
+    "$validator" "$value" || die "$env_name: $error_message"
+    printf '%s' "$value"
+    return
+  fi
+
+  if (( NON_INTERACTIVE )); then
+    value=$default
+    "$validator" "$value" || die "$env_name is required or invalid in non-interactive mode: $error_message"
+    printf '%s' "$value"
+    return
+  fi
+
+  validated_prompt "$label" "$default" "$validator" "$error_message" "$context"
+}
+
+validated_secret(){
+  local label=$1 env_name=$2 validator=$3 error_message=$4
+  local context=${5:-$label} value attempts=0
+
+  value=$(env_value "$env_name")
+  if [[ -n $value ]]; then
+    "$validator" "$value" || die "$env_name: $error_message"
+    printf '%s' "$value"
+    return
+  fi
+  (( NON_INTERACTIVE == 0 )) || die "$env_name is required in non-interactive mode"
+
+  while :; do
+    value=$(prompt_hidden "$label")
+    if "$validator" "$value"; then
+      input_ok "$label accepted"
+      printf '%s' "$value"
+      return
+    fi
+    input_error "$error_message"
+    retry_failed "$context" attempts
+  done
+}
+
+prompt_choice(){
+  local context=$1 default=$2 allowed=$3 value attempts=0 item valid
+  local -a _allowed_values=()
+  while :; do
+    value=$(prompt "Choose" "$default")
+    valid=0
+    IFS=',' read -r -a _allowed_values <<<"$allowed"
+    for item in "${_allowed_values[@]}"; do
+      if [[ $value == "$item" ]]; then
+        valid=1
+        break
+      fi
+    done
+    if (( valid )); then
+      input_ok "Selection accepted"
+      printf '%s' "$value"
+      return
+    fi
+    input_error "Invalid selection. Choose one of: $allowed."
+    retry_failed "$context" attempts
+  done
+}
+
 slugify(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g;s/^-+|-+$//g'; }
+validate_nonempty(){ [[ -n $1 ]]; }
 validate_domain(){ [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+validate_org_id(){ [[ $1 =~ ^[a-zA-Z0-9._-]+$ ]]; }
+validate_subject(){ [[ -n $1 && ${#1} -le 320 ]]; }
+validate_email(){ [[ $1 =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; }
+validate_port(){ [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+validate_database_url(){ [[ $1 == postgresql://* || $1 == postgres://* ]]; }
+validate_host(){ [[ -n $1 && $1 != *[[:space:]]* ]]; }
+validate_web_path(){ [[ $1 == /* && $1 != *[[:space:]]* ]]; }
+validate_readable_file(){ [[ -r $1 ]]; }
+validate_boolean(){ [[ $1 == true || $1 == false ]]; }
+validate_owner_password(){ [[ $(printf '%s' "$1" | wc -c) -ge 16 ]]; }
+validate_provider_list(){
+  local raw=$1 p
+  [[ -z $raw ]] && return 0
+  raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+  while IFS= read -r p; do
+    case "$p" in
+      google|github|microsoft|apple|linkedin|telegram|x|ethereum|farcaster) ;;
+      *) return 1 ;;
+    esac
+  done < <(printf '%s' "$raw" | tr ',' '\n')
+}
 
 apt_install(){
   local log_file
@@ -189,9 +320,14 @@ configure_local_database(){
 
 configure_external_database(){
   local url
-  url=$(env_value OPENPROOF_DATABASE_URL)
-  [[ -n $url ]] || url=$(prompt_secret "PostgreSQL connection URL" OPENPROOF_DATABASE_URL)
-  [[ $url == postgresql://* || $url == postgres://* ]] || die "database URL must use postgres:// or postgresql://"
+  url=$(
+    validated_secret \
+      "PostgreSQL connection URL" \
+      OPENPROOF_DATABASE_URL \
+      validate_database_url \
+      "Database URL must use postgres:// or postgresql://." \
+      "database connection URL"
+  )
   secret_file database.url "$url"
   ok "External PostgreSQL configured"
 }
@@ -199,19 +335,62 @@ configure_external_database(){
 configure_postfix_adapter(){
   local mode=$1 smtp_host smtp_port smtp_user smtp_password from brand
 
-  from=$(env_value OPENPROOF_DELIVERY_FROM); [[ -n $from ]] || from=$(prompt "From address" "no-reply@$DOMAIN")
-  brand=$(env_value OPENPROOF_DELIVERY_BRAND); [[ -n $brand ]] || brand=$(prompt "Email brand name" "$ORG_NAME")
-  [[ $from == *@* ]] || die "From address must be a valid email-like address"
-  [[ -n $brand ]] || die "Email brand name is required"
+  from=$(
+    validated_value \
+      OPENPROOF_DELIVERY_FROM \
+      "From address" \
+      "no-reply@$DOMAIN" \
+      validate_email \
+      "Enter a valid email address." \
+      "delivery From address"
+  )
+  brand=$(
+    validated_value \
+      OPENPROOF_DELIVERY_BRAND \
+      "Email brand name" \
+      "$ORG_NAME" \
+      validate_nonempty \
+      "Email brand name cannot be empty." \
+      "email brand name"
+  )
 
   if [[ $mode == smtp ]]; then
     section "SMTP relay"
-    smtp_host=$(env_value OPENPROOF_SMTP_HOST); [[ -n $smtp_host ]] || smtp_host=$(prompt "SMTP host" "")
-    smtp_port=$(env_value OPENPROOF_SMTP_PORT); [[ -n $smtp_port ]] || smtp_port=$(prompt "SMTP port" "587")
-    smtp_user=$(env_value OPENPROOF_SMTP_USERNAME); [[ -n $smtp_user ]] || smtp_user=$(prompt "SMTP username" "")
-    smtp_password=$(env_value OPENPROOF_SMTP_PASSWORD); [[ -n $smtp_password ]] || smtp_password=$(prompt_secret "SMTP password" OPENPROOF_SMTP_PASSWORD)
-    [[ -n $smtp_host && -n $smtp_user && -n $smtp_password ]] || die "SMTP host, username and password are required"
-    [[ $smtp_port =~ ^[0-9]+$ ]] && (( smtp_port >= 1 && smtp_port <= 65535 )) || die "SMTP port must be between 1 and 65535"
+    smtp_host=$(
+      validated_value \
+        OPENPROOF_SMTP_HOST \
+        "SMTP host" \
+        "" \
+        validate_host \
+        "SMTP host cannot be empty or contain whitespace." \
+        "SMTP host"
+    )
+    smtp_port=$(
+      validated_value \
+        OPENPROOF_SMTP_PORT \
+        "SMTP port" \
+        "587" \
+        validate_port \
+        "SMTP port must be a number between 1 and 65535." \
+        "SMTP port"
+    )
+    smtp_user=$(
+      validated_value \
+        OPENPROOF_SMTP_USERNAME \
+        "SMTP username" \
+        "" \
+        validate_nonempty \
+        "SMTP username is required." \
+        "SMTP username"
+    )
+    smtp_password=$(
+      validated_secret \
+        "SMTP password" \
+        OPENPROOF_SMTP_PASSWORD \
+        validate_nonempty \
+        "SMTP password cannot be empty." \
+        "SMTP password"
+    )
   else
     warn "Direct Postfix delivery requires correct PTR/rDNS, SPF, DKIM and DMARC."
   fi
@@ -260,8 +439,8 @@ configure_delivery(){
       option 3 "Existing HTTPS delivery webhook (no local mail packages)"
       option 4 "Configure later"
       printf '  %sNote:%s options 1-2 install Postfix, PHP CLI and SASL runtime packages.\n' "$C_DIM" "$C_RESET"
-      choice=$(prompt "Choose" "1")
-      case "$choice" in 1) EMAIL_MODE=smtp;; 2) EMAIL_MODE=postfix;; 3) EMAIL_MODE=webhook;; *) EMAIL_MODE=later;; esac
+      choice=$(prompt_choice "email delivery mode" "1" "1,2,3,4")
+      case "$choice" in 1) EMAIL_MODE=smtp;; 2) EMAIL_MODE=postfix;; 3) EMAIL_MODE=webhook;; 4) EMAIL_MODE=later;; esac
     fi
   fi
   case "$EMAIL_MODE" in
@@ -271,11 +450,42 @@ configure_delivery(){
       ;;
     webhook)
       ACCOUNT_ENABLED=true
-      DELIVERY_HOST=$(env_value OPENPROOF_DELIVERY_HOST); [[ -n $DELIVERY_HOST ]] || DELIVERY_HOST=$(prompt "Delivery webhook host" "")
-      DELIVERY_PORT=$(env_value OPENPROOF_DELIVERY_PORT); [[ -n $DELIVERY_PORT ]] || DELIVERY_PORT=$(prompt "Delivery webhook port" "443")
-      DELIVERY_TLS=$(env_value OPENPROOF_DELIVERY_TLS); [[ -n $DELIVERY_TLS ]] || DELIVERY_TLS=true
-      DELIVERY_PATH=$(env_value OPENPROOF_DELIVERY_PATH); [[ -n $DELIVERY_PATH ]] || DELIVERY_PATH=$(prompt "Delivery webhook path" "/v1/openproof/verification")
-      [[ -n $DELIVERY_HOST ]] || die "delivery webhook host is required"
+      DELIVERY_HOST=$(
+        validated_value \
+          OPENPROOF_DELIVERY_HOST \
+          "Delivery webhook host" \
+          "" \
+          validate_host \
+          "Delivery webhook host cannot be empty or contain whitespace." \
+          "delivery webhook host"
+      )
+      DELIVERY_PORT=$(
+        validated_value \
+          OPENPROOF_DELIVERY_PORT \
+          "Delivery webhook port" \
+          "443" \
+          validate_port \
+          "Delivery webhook port must be a number between 1 and 65535." \
+          "delivery webhook port"
+      )
+      DELIVERY_TLS=$(
+        validated_value \
+          OPENPROOF_DELIVERY_TLS \
+          "Delivery webhook TLS (true/false)" \
+          "true" \
+          validate_boolean \
+          "Enter true or false." \
+          "delivery webhook TLS setting"
+      )
+      DELIVERY_PATH=$(
+        validated_value \
+          OPENPROOF_DELIVERY_PATH \
+          "Delivery webhook path" \
+          "/v1/openproof/verification" \
+          validate_web_path \
+          "Delivery webhook path must begin with / and contain no whitespace." \
+          "delivery webhook path"
+      )
       ;;
     later)
       ACCOUNT_ENABLED=false; DELIVERY_HOST=127.0.0.1; DELIVERY_PORT=18444; DELIVERY_TLS=false; DELIVERY_PATH=/v1/openproof/verification
@@ -287,11 +497,25 @@ configure_delivery(){
 
 append_provider(){ printf '%s=%s\n' "$1" "$2" >>"$PROVIDERS_FILE"; }
 
+provider_value(){
+  local label=$1 env_name=$2
+  validated_value \
+    "$env_name" \
+    "$label" \
+    "" \
+    validate_nonempty \
+    "$label cannot be empty." \
+    "$label"
+}
+
 provider_secret(){
-  local label=$1 env_name=$2 value
-  value=$(env_value "$env_name")
-  [[ -n $value ]] || value=$(prompt_secret "$label" "$env_name")
-  printf '%s' "$value"
+  local label=$1 env_name=$2
+  validated_secret \
+    "$label" \
+    "$env_name" \
+    validate_nonempty \
+    "$label cannot be empty." \
+    "$label"
 }
 
 configure_providers(){
@@ -301,49 +525,56 @@ configure_providers(){
   append_provider OPENPROOF_WEBAUTHN_ORIGIN "https://$DOMAIN"
   append_provider OPENPROOF_WEBAUTHN_RP_NAME "$ORG_NAME"
 
-  selected=$(env_value OPENPROOF_PROVIDERS)
-  if [[ -z $selected && $NON_INTERACTIVE -eq 0 ]]; then
+  if (( NON_INTERACTIVE == 0 )); then
     section "External sign-in providers"
     printf '  %sAvailable:%s google, github, microsoft, apple, linkedin, telegram, x, ethereum, farcaster\n' "$C_DIM" "$C_RESET"
-    selected=$(prompt "Comma-separated providers (blank = later)" "")
   fi
+  selected=$(
+    validated_value \
+      OPENPROOF_PROVIDERS \
+      "Comma-separated providers (blank = later)" \
+      "" \
+      validate_provider_list \
+      "Use only: google, github, microsoft, apple, linkedin, telegram, x, ethereum, farcaster." \
+      "external provider selection"
+  )
   selected=$(printf '%s' "$selected" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 
   while IFS= read -r p; do
     [[ -n $p ]] || continue
     case "$p" in
       google)
-        v=$(env_value OPENPROOF_GOOGLE_CLIENT_ID); [[ -n $v ]] || v=$(prompt "Google Client ID" ""); append_provider OPENPROOF_GOOGLE_CLIENT_ID "$v"
+        v=$(provider_value "Google Client ID" OPENPROOF_GOOGLE_CLIENT_ID); append_provider OPENPROOF_GOOGLE_CLIENT_ID "$v"
         append_provider OPENPROOF_GOOGLE_CLIENT_SECRET "$(provider_secret "Google Client Secret" OPENPROOF_GOOGLE_CLIENT_SECRET)"
         append_provider OPENPROOF_GOOGLE_ISSUER https://accounts.google.com
         ;;
       github)
-        v=$(env_value OPENPROOF_GITHUB_CLIENT_ID); [[ -n $v ]] || v=$(prompt "GitHub Client ID" ""); append_provider OPENPROOF_GITHUB_CLIENT_ID "$v"
+        v=$(provider_value "GitHub Client ID" OPENPROOF_GITHUB_CLIENT_ID); append_provider OPENPROOF_GITHUB_CLIENT_ID "$v"
         append_provider OPENPROOF_GITHUB_CLIENT_SECRET "$(provider_secret "GitHub Client Secret" OPENPROOF_GITHUB_CLIENT_SECRET)"
         ;;
       microsoft)
-        tenant=$(env_value OPENPROOF_MICROSOFT_TENANT_ID); [[ -n $tenant ]] || tenant=$(prompt "Microsoft Tenant ID" "")
-        v=$(env_value OPENPROOF_MICROSOFT_CLIENT_ID); [[ -n $v ]] || v=$(prompt "Microsoft Client ID" ""); append_provider OPENPROOF_MICROSOFT_CLIENT_ID "$v"
+        tenant=$(provider_value "Microsoft Tenant ID" OPENPROOF_MICROSOFT_TENANT_ID)
+        v=$(provider_value "Microsoft Client ID" OPENPROOF_MICROSOFT_CLIENT_ID); append_provider OPENPROOF_MICROSOFT_CLIENT_ID "$v"
         append_provider OPENPROOF_MICROSOFT_CLIENT_SECRET "$(provider_secret "Microsoft Client Secret" OPENPROOF_MICROSOFT_CLIENT_SECRET)"
         append_provider OPENPROOF_MICROSOFT_ISSUER "https://login.microsoftonline.com/$tenant/v2.0"
         ;;
       apple)
-        v=$(env_value OPENPROOF_APPLE_CLIENT_ID); [[ -n $v ]] || v=$(prompt "Apple Services ID" ""); append_provider OPENPROOF_APPLE_CLIENT_ID "$v"
+        v=$(provider_value "Apple Services ID" OPENPROOF_APPLE_CLIENT_ID); append_provider OPENPROOF_APPLE_CLIENT_ID "$v"
         append_provider OPENPROOF_APPLE_CLIENT_SECRET "$(provider_secret "Apple client-secret JWT" OPENPROOF_APPLE_CLIENT_SECRET)"
         append_provider OPENPROOF_APPLE_ISSUER https://appleid.apple.com
         ;;
       linkedin)
-        v=$(env_value OPENPROOF_LINKEDIN_CLIENT_ID); [[ -n $v ]] || v=$(prompt "LinkedIn Client ID" ""); append_provider OPENPROOF_LINKEDIN_CLIENT_ID "$v"
+        v=$(provider_value "LinkedIn Client ID" OPENPROOF_LINKEDIN_CLIENT_ID); append_provider OPENPROOF_LINKEDIN_CLIENT_ID "$v"
         append_provider OPENPROOF_LINKEDIN_CLIENT_SECRET "$(provider_secret "LinkedIn Client Secret" OPENPROOF_LINKEDIN_CLIENT_SECRET)"
         append_provider OPENPROOF_LINKEDIN_ISSUER https://www.linkedin.com/oauth
         ;;
       telegram)
-        v=$(env_value OPENPROOF_TELEGRAM_CLIENT_ID); [[ -n $v ]] || v=$(prompt "Telegram Client ID" ""); append_provider OPENPROOF_TELEGRAM_CLIENT_ID "$v"
+        v=$(provider_value "Telegram Client ID" OPENPROOF_TELEGRAM_CLIENT_ID); append_provider OPENPROOF_TELEGRAM_CLIENT_ID "$v"
         append_provider OPENPROOF_TELEGRAM_CLIENT_SECRET "$(provider_secret "Telegram Client Secret" OPENPROOF_TELEGRAM_CLIENT_SECRET)"
         append_provider OPENPROOF_TELEGRAM_ISSUER https://oauth.telegram.org
         ;;
       x)
-        v=$(env_value OPENPROOF_X_API_KEY); [[ -n $v ]] || v=$(prompt "X API key" ""); append_provider OPENPROOF_X_API_KEY "$v"
+        v=$(provider_value "X API key" OPENPROOF_X_API_KEY); append_provider OPENPROOF_X_API_KEY "$v"
         append_provider OPENPROOF_X_API_SECRET "$(provider_secret "X API secret" OPENPROOF_X_API_SECRET)"
         ;;
       ethereum)
@@ -357,7 +588,7 @@ configure_providers(){
       farcaster)
         append_provider OPENPROOF_WEB3_DOMAIN "$DOMAIN"
         append_provider OPENPROOF_WEB3_URI "https://$DOMAIN/auth/web3"
-        rpc=$(env_value OPENPROOF_FARCASTER_RPC_ENDPOINT); [[ -n $rpc ]] || rpc=$(prompt "Farcaster / Optimism RPC endpoint" "")
+        rpc=$(provider_value "Farcaster / Optimism RPC endpoint" OPENPROOF_FARCASTER_RPC_ENDPOINT)
         append_provider OPENPROOF_FARCASTER_RPC_ENDPOINT "$rpc"
         append_provider OPENPROOF_FARCASTER_CHAIN_ID 10
         ;;
@@ -518,23 +749,45 @@ configure_tls(){
     option 1 "Let's Encrypt (recommended)"
     option 2 "Existing certificate"
     option 3 "TLS is terminated by an external ingress"
-    choice=$(prompt "Choose" "1")
+    choice=$(prompt_choice "TLS mode" "1" "1,2,3")
     case "$choice" in 1) TLS_MODE=letsencrypt;; 2) TLS_MODE=existing;; 3) TLS_MODE=external;; esac
   fi
   case "$TLS_MODE" in
     letsencrypt)
       apt_install nginx certbot
       write_nginx_http
-      email=$(env_value OPENPROOF_TLS_EMAIL); [[ -n $email ]] || email=$(prompt "Let's Encrypt email" "")
-      [[ -n $email ]] || die "an email address is required for Let's Encrypt"
+      email=$(
+        validated_value \
+          OPENPROOF_TLS_EMAIL \
+          "Let's Encrypt email" \
+          "" \
+          validate_email \
+          "Enter a valid email address for Let's Encrypt." \
+          "Let's Encrypt email"
+      )
       certbot certonly --webroot -w /var/www/openproof-acme -d "$DOMAIN" --non-interactive --agree-tos -m "$email"
       write_nginx_tls "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
       ;;
     existing)
       apt_install nginx
-      cert=$(env_value OPENPROOF_TLS_CERT_FILE); [[ -n $cert ]] || cert=$(prompt "Certificate fullchain path" "")
-      key=$(env_value OPENPROOF_TLS_KEY_FILE); [[ -n $key ]] || key=$(prompt "Certificate private-key path" "")
-      [[ -r $cert && -r $key ]] || die "existing certificate or key is not readable"
+      cert=$(
+        validated_value \
+          OPENPROOF_TLS_CERT_FILE \
+          "Certificate fullchain path" \
+          "" \
+          validate_readable_file \
+          "Certificate file is not readable. Enter an existing readable path." \
+          "TLS certificate path"
+      )
+      key=$(
+        validated_value \
+          OPENPROOF_TLS_KEY_FILE \
+          "Certificate private-key path" \
+          "" \
+          validate_readable_file \
+          "Private-key file is not readable. Enter an existing readable path." \
+          "TLS private-key path"
+      )
       write_nginx_tls "$cert" "$key"
       ;;
     external)
@@ -544,15 +797,41 @@ configure_tls(){
   esac
 }
 
-bootstrap_owner(){
-  local password again identity_id output
+prompt_owner_password(){
+  local password again attempts=0
   password=$(env_value OPENPROOF_ADMIN_PASSWORD)
-  [[ -n $password ]] || password=$(prompt_secret "Initial owner password (16+ characters)" OPENPROOF_ADMIN_PASSWORD)
-  if [[ $NON_INTERACTIVE -eq 0 ]]; then
-    again=$(prompt_secret "Confirm initial owner password" OPENPROOF_ADMIN_PASSWORD)
-    [[ $password == "$again" ]] || die "owner passwords do not match"
+
+  if [[ -n $password ]]; then
+    validate_owner_password "$password" || die "OPENPROOF_ADMIN_PASSWORD must contain at least 16 bytes"
+    printf '%s' "$password"
+    return
   fi
-  [[ $(printf '%s' "$password" | wc -c) -ge 16 ]] || die "owner password must contain at least 16 characters"
+  (( NON_INTERACTIVE == 0 )) || die "OPENPROOF_ADMIN_PASSWORD is required in non-interactive mode"
+
+  while :; do
+    password=$(prompt_hidden "Initial owner password (16+ characters)")
+    if ! validate_owner_password "$password"; then
+      input_error "Password must contain at least 16 characters."
+      retry_failed "initial owner password" attempts
+      continue
+    fi
+
+    again=$(prompt_hidden "Confirm initial owner password")
+    if [[ $password != "$again" ]]; then
+      input_error "Passwords do not match."
+      retry_failed "initial owner password" attempts
+      continue
+    fi
+
+    input_ok "Owner password accepted"
+    printf '%s' "$password"
+    return
+  done
+}
+
+bootstrap_owner(){
+  local password identity_id output
+  password=$(prompt_owner_password)
   identity_id="owner-$(openssl rand -hex 8)"
   section "Initial owner"
   log "Creating the initial owner..."
@@ -579,16 +858,45 @@ health_check(){
 
 show_setup_header
 
-DOMAIN=$(env_value OPENPROOF_DOMAIN); [[ -n $DOMAIN ]] || DOMAIN=$(prompt "Identity domain" "identity.example.com")
-validate_domain "$DOMAIN" || die "invalid domain: $DOMAIN"
+DOMAIN=$(
+  validated_value \
+    OPENPROOF_DOMAIN \
+    "Identity domain" \
+    "identity.example.com" \
+    validate_domain \
+    "Enter a valid DNS hostname such as identity.example.com." \
+    "identity domain"
+)
 
-ORG_NAME=$(env_value OPENPROOF_ORGANIZATION_NAME); [[ -n $ORG_NAME ]] || ORG_NAME=$(prompt "Organization name" "OpenProof")
+ORG_NAME=$(
+  validated_value \
+    OPENPROOF_ORGANIZATION_NAME \
+    "Organization name" \
+    "OpenProof" \
+    validate_nonempty \
+    "Organization name cannot be empty." \
+    "organization name"
+)
 default_org=$(slugify "$ORG_NAME")
-ORG_ID=$(env_value OPENPROOF_ORGANIZATION_ID); [[ -n $ORG_ID ]] || ORG_ID=$(prompt "Organization ID" "$default_org")
-[[ $ORG_ID =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid organization ID"
+ORG_ID=$(
+  validated_value \
+    OPENPROOF_ORGANIZATION_ID \
+    "Organization ID" \
+    "$default_org" \
+    validate_org_id \
+    "Organization ID may contain only letters, numbers, dots, underscores and hyphens." \
+    "organization ID"
+)
 
-OWNER_SUBJECT=$(env_value OPENPROOF_OWNER_SUBJECT); [[ -n $OWNER_SUBJECT ]] || OWNER_SUBJECT=$(prompt "Initial owner email / login subject" "")
-[[ -n $OWNER_SUBJECT ]] || die "initial owner subject is required"
+OWNER_SUBJECT=$(
+  validated_value \
+    OPENPROOF_OWNER_SUBJECT \
+    "Initial owner email / login subject" \
+    "" \
+    validate_subject \
+    "Initial owner subject is required and must not exceed 320 characters." \
+    "initial owner subject"
+)
 
 ensure_user
 command -v curl >/dev/null 2>&1 || die "curl is required by setup"
@@ -600,7 +908,8 @@ if [[ $NON_INTERACTIVE -eq 0 ]]; then
   section "Database"
   option 1 "Install local PostgreSQL"
   option 2 "Use existing PostgreSQL"
-  choice=$(prompt "Choose" "1"); [[ $choice == 2 ]] && DB_MODE=external || DB_MODE=local
+  choice=$(prompt_choice "database mode" "1" "1,2")
+  [[ $choice == 2 ]] && DB_MODE=external || DB_MODE=local
 fi
 case "$DB_MODE" in local) configure_local_database;; external) configure_external_database;; *) die "invalid database mode: $DB_MODE";; esac
 

@@ -16,6 +16,7 @@ BINARY="$BUILD_DIR/apps/opp/opp"
 
 [[ -x $BINARY ]] || { printf 'missing built binary: %s\n' "$BINARY" >&2; exit 1; }
 "$ROOT/scripts/verify-generated-secret-references.sh"
+"$ROOT/scripts/verify-setup-contract.sh"
 [[ $ARCH == amd64 || $ARCH == arm64 ]] || { printf 'unsupported Debian architecture: %s\n' "$ARCH" >&2; exit 1; }
 
 STAGE=$(mktemp -d)
