@@ -67,13 +67,21 @@ same field from a fresh three-attempt cycle or exit setup. Exiting preserves the
 bundle and system changes already completed, but does not mark the host as fully
 configured.
 
+If setup is rerun after PostgreSQL has already been initialized but before the
+host received its final configured marker, the wizard treats the database as the
+source of truth for the bootstrap organization and initial owner. It restores
+that Organization ID/name/owner subject into the generated configuration and
+does not ask for or recreate the initial owner's password. This prevents a
+partially completed rerun from pointing the service at a different tenant.
+
 Provider credentials are requested only for providers selected during setup. A
 blank provider selection means "configure later". Provider credentials are not
 immutable: after installation use `sudo openproof config providers` to add,
 replace, or remove them. OpenProof backs up the previous provider file and rolls
-back the edit if the service cannot become ready after the change. Placeholder
-credentials may satisfy local non-empty validation but do not prove that the
-external provider will accept them.
+back the edit if the service cannot become ready after the change. Common test
+placeholders such as `0`, `test`, `dummy`, `example` and `placeholder`
+are not activated as real provider credentials; the provider remains disabled
+until those values are replaced with real credentials.
 
 The shared federation callback is derived from the configured identity domain:
 

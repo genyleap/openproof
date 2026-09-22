@@ -57,8 +57,17 @@ Notable user-facing changes to OpenProof are recorded here.
 - Provider, main and delivery configuration remain editable after installation;
   management edits are backed up and rolled back automatically when they prevent
   the affected service from becoming healthy.
-- Setup reruns preserve an already-created initial owner, and failed readiness
-  stops the service to avoid an uncontrolled systemd restart loop.
+- Setup reruns now reconcile the initialized organization and owner directly
+  from PostgreSQL bootstrap state before regenerating configuration, so changing
+  an Organization ID during recovery cannot disconnect the service configuration
+  from the authoritative database tenant. Existing owner credentials are not
+  requested or recreated during resume.
+- Placeholder provider credentials such as `0`, `test`, `dummy` or
+  `example` are treated as deferred configuration and leave that provider
+  disabled instead of allowing a later runtime-startup failure.
+- Failed readiness stops the service to avoid an uncontrolled systemd restart
+  loop, and a resumed setup proactively pauses an incomplete OpenProof service
+  before changing configuration.
 - Collects and validates SMTP relay settings before installing optional mail
   runtime packages, and keeps successful package provisioning output concise.
 - Generated persistent security material is stored as hexadecimal and referenced

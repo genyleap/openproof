@@ -50,6 +50,16 @@ grep -Fq 'systemctl stop openproof.service' "$SETUP" \
   || fail "failed readiness does not stop the systemd restart loop"
 grep -Fq 'already been initialized' "$SETUP" \
   || fail "setup rerun does not preserve an already-created initial owner"
+grep -Fq 'reconcile_existing_bootstrap(){' "$SETUP" \
+  || fail "setup rerun cannot reconcile initialized database identity state"
+grep -Fq "action = 'bootstrap.initial-owner'" "$SETUP" \
+  || fail "setup rerun does not identify the authoritative bootstrap organization"
+grep -Fq 'DEPLOYMENT_ALREADY_INITIALIZED=1' "$SETUP" \
+  || fail "setup rerun does not mark initialized deployments"
+grep -Fq 'Existing initial owner preserved' "$SETUP" \
+  || fail "setup rerun can unnecessarily recreate owner credentials"
+grep -Fq 'This provider will remain disabled until you replace it' "$SETUP" \
+  || fail "placeholder provider credentials can activate broken providers"
 
 grep -Fq 'backup_config_file(){' "$CLI" || fail "management CLI does not back up editable configuration"
 grep -Fq 'restart_openproof_or_rollback(){' "$CLI" || fail "management CLI lacks rollback after bad config edits"

@@ -11,6 +11,7 @@ INSTALL_ROOT=/opt/openproof
 TEMPLATE_ROOT=/usr/share/openproof/templates
 MARKER=/etc/openproof/.configured
 NON_INTERACTIVE=0
+DEPLOYMENT_ALREADY_INITIALIZED=0
 TTY="${OPENPROOF_TTY:-${SUDO_TTY:-/dev/tty}}"
 export PATH="$INSTALL_ROOT/bin:$PATH"
 
@@ -332,7 +333,78 @@ configure_external_database(){
       "database connection URL"
   )
   secret_file database.url "$url"
+  command -v psql >/dev/null 2>&1 || apt_install postgresql-client
   ok "External PostgreSQL configured"
+}
+
+database_query(){
+  local sql=$1 url
+  case "$DB_MODE" in
+    local)
+      runuser -u postgres -- psql -X -qAt -v ON_ERROR_STOP=1 -d openproof -c "$sql"
+      ;;
+    external)
+      command -v psql >/dev/null 2>&1 || return 1
+      url=$(<"$CREDENTIAL_DIR/database.url")
+      PGDATABASE="$url" PGCONNECT_TIMEOUT=5 psql -X -qAt -v ON_ERROR_STOP=1 -c "$sql"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+reconcile_existing_bootstrap(){
+  local row existing_id existing_name existing_state existing_subject
+  row=$(
+    database_query "
+WITH bootstrap_owner AS (
+  SELECT organization_id, identity_id
+  FROM openproof.audit_events
+  WHERE action = 'bootstrap.initial-owner' AND outcome = 'success'
+  ORDER BY sequence ASC
+  LIMIT 1
+)
+SELECT o.id,
+       o.name,
+       o.state,
+       COALESCE(e.external_subject, '')
+FROM bootstrap_owner b
+JOIN openproof.organizations o ON o.id = b.organization_id
+LEFT JOIN openproof.external_identities e
+  ON e.identity_id = b.identity_id AND e.provider = 'local'
+LIMIT 1;
+" 2>/dev/null
+  ) || return 1
+
+  [[ -n $row ]] || return 1
+  IFS='|' read -r existing_id existing_name existing_state existing_subject <<<"$row"
+  [[ -n $existing_id && -n $existing_name ]] || return 1
+
+  if [[ $existing_state != 0 ]]; then
+    die "the existing bootstrap organization '$existing_id' is not active; reactivate it before resuming setup"
+  fi
+
+  DEPLOYMENT_ALREADY_INITIALIZED=1
+
+  if [[ $ORG_ID != "$existing_id" ]]; then
+    warn "Organization ID '$ORG_ID' cannot replace the initialized database organization '$existing_id'. Reusing '$existing_id'."
+  fi
+  if [[ $ORG_NAME != "$existing_name" ]]; then
+    warn "Organization name '$ORG_NAME' differs from the initialized database value '$existing_name'. Reusing '$existing_name'."
+  fi
+  if [[ -n $existing_subject && $OWNER_SUBJECT != "$existing_subject" ]]; then
+    warn "Initial owner subject '$OWNER_SUBJECT' differs from the existing owner '$existing_subject'. Reusing the existing owner."
+  fi
+
+  ORG_ID=$existing_id
+  ORG_NAME=$existing_name
+  [[ -z $existing_subject ]] || OWNER_SUBJECT=$existing_subject
+
+  section "Existing deployment detected"
+  input_ok "Initialized OpenProof identity state found"
+  printf '  %sOrganization%s  %s (%s)\n' "$C_DIM" "$C_RESET" "$ORG_NAME" "$ORG_ID"
+  [[ -z $existing_subject ]] || printf '  %sOwner subject%s  %s\n' "$C_DIM" "$C_RESET" "$existing_subject"
+  info "Setup will resume without recreating the organization or initial owner."
+  return 0
 }
 
 configure_postfix_adapter(){
@@ -519,7 +591,9 @@ provider_value(){
       "$label"
   )
   if looks_placeholder "$value"; then
-    warn "$label looks like a placeholder. You can replace it later with: sudo openproof config providers"
+    warn "$label looks like a placeholder. This provider will remain disabled until you replace it with: sudo openproof config providers"
+    printf '%s' ""
+    return
   fi
   printf '%s' "$value"
 }
@@ -535,7 +609,9 @@ provider_secret(){
       "$label"
   )
   if looks_placeholder "$value"; then
-    warn "$label looks like a placeholder. You can replace it later with: sudo openproof config providers"
+    warn "$label looks like a placeholder. This provider will remain disabled until you replace it with: sudo openproof config providers"
+    printf '%s' ""
+    return
   fi
   printf '%s' "$value"
 }
@@ -656,6 +732,11 @@ configure_gateway(){
       "Enter true or false." \
       "application upstream TLS setting"
   )
+
+  if looks_placeholder "$GATEWAY_HOST"; then
+    warn "Upstream host '$GATEWAY_HOST' looks like a placeholder. Using 127.0.0.1 until you update it with: sudo openproof config main"
+    GATEWAY_HOST=127.0.0.1
+  fi
 }
 
 write_base_config(){
@@ -894,14 +975,26 @@ prompt_owner_password(){
 
 bootstrap_owner(){
   local password identity_id output
+
+  section "Initial owner"
+  if (( DEPLOYMENT_ALREADY_INITIALIZED )); then
+    ok "Existing initial owner preserved"
+    info "Owner credentials were not recreated or changed."
+    return
+  fi
+
   password=$(prompt_owner_password)
   identity_id="owner-$(openssl rand -hex 8)"
-  section "Initial owner"
   log "Creating the initial owner..."
   if ! output=$(OPENPROOF_BOOTSTRAP_PASSWORD="$password" "$INSTALL_ROOT/bin/opp" bootstrap-admin --config "$CONFIG_FILE" --organization-name "$ORG_NAME" --identity-id "$identity_id" --subject "$OWNER_SUBJECT" 2>&1); then
     if [[ $output == *"[ALREADY_EXISTS]"* || $output == *"already been initialized"* ]]; then
-      warn "This database already has an initial OpenProof owner. Keeping the existing owner and continuing setup."
-      return
+      if reconcile_existing_bootstrap; then
+        write_base_config
+        "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE" >/dev/null
+        warn "This database already has an initial OpenProof owner. Existing identity state was restored into the generated configuration."
+        return
+      fi
+      die "the database is already initialized, but setup could not resolve its bootstrap organization; refusing to start with a mismatched organization"
     fi
     printf '%s\n' "$output" >&2
     die "initial owner bootstrap failed"
@@ -923,6 +1016,13 @@ health_check(){
 }
 
 [[ ! -f $MARKER ]] || die "this host is already configured; use 'openproof config main', 'openproof config providers', or 'openproof config delivery'"
+
+if systemctl list-unit-files openproof.service >/dev/null 2>&1; then
+  if systemctl is-active --quiet openproof.service || systemctl is-failed --quiet openproof.service; then
+    systemctl stop openproof.service >/dev/null 2>&1 || true
+    info "Paused the incomplete OpenProof service while setup resumes."
+  fi
+fi
 
 show_setup_header
 
@@ -980,6 +1080,8 @@ if [[ $NON_INTERACTIVE -eq 0 ]]; then
   [[ $choice == 2 ]] && DB_MODE=external || DB_MODE=local
 fi
 case "$DB_MODE" in local) configure_local_database;; external) configure_external_database;; *) die "invalid database mode: $DB_MODE";; esac
+
+reconcile_existing_bootstrap || true
 
 configure_delivery
 configure_providers
