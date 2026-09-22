@@ -135,6 +135,7 @@ trap cleanup EXIT INT TERM
 OPENPROOF_VERSION=$(resolve_version)
 TAG="v$OPENPROOF_VERSION"
 ASSET="openproof_${OPENPROOF_VERSION}_linux_${ARCH}.tar.gz"
+MIRROR_ASSET="openproof_${OPENPROOF_VERSION}_linux_${ARCH}.tgz"
 BASE="$GENYLEAP_RELEASES/$TAG"
 GITHUB_BASE="$GITHUB_RELEASES/$TAG"
 
@@ -159,13 +160,13 @@ say ""
 
 say "Downloading release metadata..."
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS"; then
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null || true
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS.txt" 2>/dev/null || true
 fi
 [ -s "$TMP/SHA256SUMS" ] || die "release metadata for $OPENPROOF_VERSION could not be downloaded; refusing to build from source"
 
 say "Downloading $ASSET..."
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET"; then
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET" 2>/dev/null || true
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$MIRROR_ASSET" 2>/dev/null || true
 fi
 [ -s "$TMP/$ASSET" ] || die "no prebuilt $ARCH bundle exists for OpenProof $OPENPROOF_VERSION; refusing to build from source"
 
