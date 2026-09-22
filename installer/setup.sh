@@ -130,7 +130,10 @@ ensure_user(){
 }
 
 secret_file(){
-  local name=$1 value=$2 path="$CREDENTIAL_DIR/$name"
+  local name value path
+  name=$1
+  value=$2
+  path="$CREDENTIAL_DIR/$name"
   printf '%s' "$value" >"$path"
   chown root:openproof "$path"
   chmod 0640 "$path"

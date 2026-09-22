@@ -2,6 +2,16 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc4 — 2026-09-22
+
+### Setup reliability
+
+- Fixed a Bash nounset failure while persisting generated database credentials
+  during local PostgreSQL setup.
+- Audited installer-local variable declarations for dependent initialization.
+- Added a release blocklist hook so a known-bad release can be skipped by the
+  bootstrap resolver even if GitHub has already published its artifacts.
+
 ## 1.1.0-rc3 — 2026-09-22
 
 ### Installer and operations UX
