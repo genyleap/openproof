@@ -248,11 +248,27 @@ OLD_ROOT=""
 say "✓ OpenProof prebuilt bundle installed"
 say "✓ No compiler or build dependency was installed"
 
+run_interactive_setup() {
+  setup_tty="${SUDO_TTY:-/dev/tty}"
+
+  if [ -n "${SUDO_TTY:-}" ] && [ -r "$setup_tty" ] && [ -w "$setup_tty" ]; then
+    if command -v script >/dev/null 2>&1; then
+      OPENPROOF_TTY="$setup_tty"
+      export OPENPROOF_TTY
+      script -q -e -c "/usr/sbin/openproof setup" /dev/null \
+        <"$setup_tty" >"$setup_tty" 2>&1
+      return
+    fi
+  fi
+
+  OPENPROOF_TTY="$setup_tty" /usr/sbin/openproof setup
+}
+
 if [ "$NO_SETUP" -eq 0 ] && [ "$ALREADY_CONFIGURED" -eq 0 ]; then
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     /usr/sbin/openproof setup --non-interactive
   else
-    /usr/sbin/openproof setup
+    run_interactive_setup
   fi
 else
   if [ "$WAS_DELIVERY_ACTIVE" -eq 1 ]; then

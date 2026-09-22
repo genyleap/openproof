@@ -11,7 +11,7 @@ INSTALL_ROOT=/opt/openproof
 TEMPLATE_ROOT=/usr/share/openproof/templates
 MARKER=/etc/openproof/.configured
 NON_INTERACTIVE=0
-TTY=/dev/tty
+TTY="${OPENPROOF_TTY:-${SUDO_TTY:-/dev/tty}}"
 export PATH="$INSTALL_ROOT/bin:$PATH"
 
 log(){ printf '%s\n' "$*"; }
