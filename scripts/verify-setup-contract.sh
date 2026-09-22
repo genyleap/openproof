@@ -78,5 +78,11 @@ fi
 if grep -Fq 'curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready' "$CLI"; then
   fail "management CLI contains a direct readiness probe that bypasses trusted-proxy request requirements"
 fi
+grep -Fq 'reserved_tls_domain(){' "$SETUP" \
+  || fail "setup does not recognize reserved/test domains before TLS provisioning"
+grep -Fq 'Automatic public Let'"'"'s Encrypt issuance is not available' "$SETUP" \
+  || fail "setup does not explain reserved-domain TLS fallback"
+grep -Fq 'default_tls_mode=external' "$SETUP" \
+  || fail "reserved/test domains do not default away from Let's Encrypt"
 
 printf 'setup contract gate: ok\n'

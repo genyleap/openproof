@@ -231,6 +231,16 @@ prompt_choice(){
 slugify(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g;s/^-+|-+$//g'; }
 validate_nonempty(){ [[ -n $1 ]]; }
 validate_domain(){ [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+reserved_tls_domain(){
+  local value
+  value=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$value" in
+    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|*.test|*.invalid|localhost|*.localhost)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
 validate_org_id(){ [[ $1 =~ ^[a-zA-Z0-9._-]+$ ]]; }
 validate_subject(){ [[ -n $1 && ${#1} -le 320 ]]; }
 validate_email(){ [[ $1 =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; }
@@ -887,14 +897,32 @@ EOF
 }
 
 configure_tls(){
-  TLS_MODE=$(env_value OPENPROOF_TLS_MODE); [[ -n $TLS_MODE ]] || TLS_MODE=letsencrypt
+  local default_tls_mode=letsencrypt default_tls_choice=1 choice
+  if reserved_tls_domain "$DOMAIN"; then
+    default_tls_mode=external
+    default_tls_choice=3
+    warn "$DOMAIN is a reserved/test domain. Automatic public Let's Encrypt issuance is not available for it."
+  fi
+
+  TLS_MODE=$(env_value OPENPROOF_TLS_MODE)
+  [[ -n $TLS_MODE ]] || TLS_MODE=$default_tls_mode
+
   if [[ $NON_INTERACTIVE -eq 0 ]]; then
     section "TLS"
-    option 1 "Let's Encrypt (recommended)"
+    option 1 "Let's Encrypt (recommended for public DNS)"
     option 2 "Existing certificate"
-    option 3 "TLS is terminated by an external ingress"
-    choice=$(prompt_choice "TLS mode" "1" "1,2,3")
-    case "$choice" in 1) TLS_MODE=letsencrypt;; 2) TLS_MODE=existing;; 3) TLS_MODE=external;; esac
+    option 3 "External ingress / configure TLS later"
+    while :; do
+      choice=$(prompt_choice "TLS mode" "$default_tls_choice" "1,2,3")
+      if [[ $choice == 1 ]] && reserved_tls_domain "$DOMAIN"; then
+        input_error "Let's Encrypt cannot issue a public certificate for reserved/test domain '$DOMAIN'. Choose 2 or 3."
+        continue
+      fi
+      case "$choice" in 1) TLS_MODE=letsencrypt;; 2) TLS_MODE=existing;; 3) TLS_MODE=external;; esac
+      break
+    done
+  elif [[ $TLS_MODE == letsencrypt ]] && reserved_tls_domain "$DOMAIN"; then
+    die "OPENPROOF_TLS_MODE=letsencrypt cannot be used with reserved/test domain '$DOMAIN'; use existing or external"
   fi
   case "$TLS_MODE" in
     letsencrypt)

@@ -156,6 +156,12 @@ health probes therefore send `X-Forwarded-For: 127.0.0.1`; a manual request
 sent directly to `127.0.0.1:18443` without that header is intentionally
 rejected by the listener.
 
+For reserved/test identity domains such as `*.example.com`, `*.example.net`,
+`*.example.org`, `*.test`, `*.invalid` and localhost, the interactive
+wizard defaults TLS to external ingress / configure later instead of attempting
+public Let's Encrypt issuance. Non-interactive setup rejects an explicit
+`OPENPROOF_TLS_MODE=letsencrypt` for those domains.
+
 ## Email delivery
 
 OpenProof deliberately separates verification issuance from message delivery.

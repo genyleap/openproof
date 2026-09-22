@@ -72,6 +72,9 @@ Notable user-facing changes to OpenProof are recorded here.
   by deployments with trusted-proxy client-IP handling enabled; setup, status,
   doctor and configuration rollback no longer misclassify a healthy listener as
   unavailable.
+- Reserved/test identity domains such as `*.example.com`, `*.test`,
+  `*.invalid` and localhost no longer default into a doomed public Let's
+  Encrypt flow; interactive setup defaults them to external/deferred TLS.
 - Collects and validates SMTP relay settings before installing optional mail
   runtime packages, and keeps successful package provisioning output concise.
 - Generated persistent security material is stored as hexadecimal and referenced
