@@ -56,8 +56,9 @@ The setup wizard can provision the entire single-host deployment:
 6. Google, GitHub, Microsoft, Apple, LinkedIn, Telegram, X, Ethereum and
    Farcaster credentials when selected;
 7. WebAuthn relying-party origin;
-8. Nginx and Let's Encrypt, an existing certificate, or an external TLS ingress;
-9. systemd services and final readiness checks.
+8. the protected application upstream used by the OpenProof gateway;
+9. Nginx and Let's Encrypt, an existing certificate, or an external TLS ingress;
+10. systemd services and final readiness checks.
 
 Interactive validation is local to the current field. Invalid values are shown
 with red feedback and accepted values with green feedback. A field is retried up
@@ -66,8 +67,15 @@ same field from a fresh three-attempt cycle or exit setup. Exiting preserves the
 bundle and system changes already completed, but does not mark the host as fully
 configured.
 
-Provider credentials are requested only for providers selected during setup. The
-shared federation callback is derived from the configured identity domain:
+Provider credentials are requested only for providers selected during setup. A
+blank provider selection means "configure later". Provider credentials are not
+immutable: after installation use `sudo openproof config providers` to add,
+replace, or remove them. OpenProof backs up the previous provider file and rolls
+back the edit if the service cannot become ready after the change. Placeholder
+credentials may satisfy local non-empty validation but do not prove that the
+external provider will accept them.
+
+The shared federation callback is derived from the configured identity domain:
 
 \`\`\`text
 https://identity.example.com/auth/federated/callback
@@ -127,6 +135,12 @@ OPENPROOF_PROVIDERS
 
 Provider-specific credentials use the same names documented in
 [PROVIDER_SETUP.md](PROVIDER_SETUP.md).
+
+The optional gateway upstream can be supplied non-interactively with
+`OPENPROOF_GATEWAY_UPSTREAM_HOST`, `OPENPROOF_GATEWAY_UPSTREAM_PORT` and
+`OPENPROOF_GATEWAY_UPSTREAM_TLS`. The interactive defaults are
+`127.0.0.1:18080` without TLS; these values can later be changed with
+`sudo openproof config main`.
 
 ## Email delivery
 

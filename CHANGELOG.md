@@ -49,6 +49,16 @@ Notable user-facing changes to OpenProof are recorded here.
   wizard: invalid input gets red feedback, accepted input gets green feedback,
   each field gets three attempts, then the operator can retry that same field or
   exit setup while preserving completed system changes.
+- Generates a runnable gateway configuration and collects the protected
+  application upstream host, port and TLS mode instead of leaving the production
+  gateway disabled.
+- Fixes comma-separated provider processing so the final selected provider is
+  validated and configured rather than being silently dropped.
+- Provider, main and delivery configuration remain editable after installation;
+  management edits are backed up and rolled back automatically when they prevent
+  the affected service from becoming healthy.
+- Setup reruns preserve an already-created initial owner, and failed readiness
+  stops the service to avoid an uncontrolled systemd restart loop.
 - Collects and validates SMTP relay settings before installing optional mail
   runtime packages, and keeps successful package provisioning output concise.
 - Generated persistent security material is stored as hexadecimal and referenced

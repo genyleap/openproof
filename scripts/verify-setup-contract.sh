@@ -3,9 +3,14 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SETUP="$ROOT/installer/setup.sh"
+CLI="$ROOT/installer/openproof"
 
 bash -n "$SETUP" || {
   printf 'setup contract gate: installer/setup.sh has invalid Bash syntax\n' >&2
+  exit 1
+}
+bash -n "$CLI" || {
+  printf 'setup contract gate: installer/openproof has invalid Bash syntax\n' >&2
   exit 1
 }
 
@@ -32,5 +37,23 @@ fi
 if grep -Fq 'die "owner password must contain at least 16 characters"' "$SETUP"; then
   fail "short owner password still aborts the entire setup"
 fi
+
+grep -Fq 'configure_gateway(){' "$SETUP" || fail "production gateway setup is missing"
+grep -Fq 'enabled = true' "$SETUP" || fail "generated production gateway is not enabled"
+grep -Fq 'upstream_host = "$GATEWAY_HOST"' "$SETUP" || fail "generated gateway upstream host is missing"
+grep -Fq 'upstream_port = $GATEWAY_PORT' "$SETUP" || fail "generated gateway upstream port is missing"
+grep -Fq 'done < <(printf '"'"'%s\n'"'"' "$selected" | tr '"'"','"'"' '"'"'\n'"'"')' "$SETUP" \
+  || fail "provider loop can drop the final selected provider"
+grep -Fq 'done < <(printf '"'"'%s\n'"'"' "$raw" | tr '"'"','"'"' '"'"'\n'"'"')' "$SETUP" \
+  || fail "provider-list validator can drop the final provider"
+grep -Fq 'systemctl stop openproof.service' "$SETUP" \
+  || fail "failed readiness does not stop the systemd restart loop"
+grep -Fq 'already been initialized' "$SETUP" \
+  || fail "setup rerun does not preserve an already-created initial owner"
+
+grep -Fq 'backup_config_file(){' "$CLI" || fail "management CLI does not back up editable configuration"
+grep -Fq 'restart_openproof_or_rollback(){' "$CLI" || fail "management CLI lacks rollback after bad config edits"
+grep -Fq 'You can add, replace, or remove provider credentials here at any time.' "$CLI" \
+  || fail "provider configuration is not documented as editable after setup"
 
 printf 'setup contract gate: ok\n'

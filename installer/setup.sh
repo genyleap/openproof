@@ -66,6 +66,9 @@ Non-interactive environment:
   OPENPROOF_ADMIN_PASSWORD
   OPENPROOF_DATABASE_MODE=local|external
   OPENPROOF_DATABASE_URL
+  OPENPROOF_GATEWAY_UPSTREAM_HOST
+  OPENPROOF_GATEWAY_UPSTREAM_PORT
+  OPENPROOF_GATEWAY_UPSTREAM_TLS=true|false
   OPENPROOF_EMAIL_MODE=smtp|postfix|webhook|later
   OPENPROOF_TLS_MODE=letsencrypt|existing|external
   OPENPROOF_TLS_EMAIL
@@ -246,7 +249,7 @@ validate_provider_list(){
       google|github|microsoft|apple|linkedin|telegram|x|ethereum|farcaster) ;;
       *) return 1 ;;
     esac
-  done < <(printf '%s' "$raw" | tr ',' '\n')
+  done < <(printf '%s\n' "$raw" | tr ',' '\n')
 }
 
 apt_install(){
@@ -497,25 +500,44 @@ configure_delivery(){
 
 append_provider(){ printf '%s=%s\n' "$1" "$2" >>"$PROVIDERS_FILE"; }
 
+looks_placeholder(){
+  case "$1" in
+    0|test|TEST|dummy|DUMMY|example|EXAMPLE|placeholder|PLACEHOLDER) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 provider_value(){
-  local label=$1 env_name=$2
-  validated_value \
-    "$env_name" \
-    "$label" \
-    "" \
-    validate_nonempty \
-    "$label cannot be empty." \
-    "$label"
+  local label=$1 env_name=$2 value
+  value=$(
+    validated_value \
+      "$env_name" \
+      "$label" \
+      "" \
+      validate_nonempty \
+      "$label cannot be empty." \
+      "$label"
+  )
+  if looks_placeholder "$value"; then
+    warn "$label looks like a placeholder. You can replace it later with: sudo openproof config providers"
+  fi
+  printf '%s' "$value"
 }
 
 provider_secret(){
-  local label=$1 env_name=$2
-  validated_secret \
-    "$label" \
-    "$env_name" \
-    validate_nonempty \
-    "$label cannot be empty." \
-    "$label"
+  local label=$1 env_name=$2 value
+  value=$(
+    validated_secret \
+      "$label" \
+      "$env_name" \
+      validate_nonempty \
+      "$label cannot be empty." \
+      "$label"
+  )
+  if looks_placeholder "$value"; then
+    warn "$label looks like a placeholder. You can replace it later with: sudo openproof config providers"
+  fi
+  printf '%s' "$value"
 }
 
 configure_providers(){
@@ -594,12 +616,46 @@ configure_providers(){
         ;;
       *) warn "Unknown provider '$p' skipped" ;;
     esac
-  done < <(printf '%s' "$selected" | tr ',' '\n')
+  done < <(printf '%s\n' "$selected" | tr ',' '\n')
 
   chown root:openproof "$PROVIDERS_FILE"
   chmod 0640 "$PROVIDERS_FILE"
   ok "Provider configuration written"
   log "  Callback URI: https://$DOMAIN/auth/federated/callback"
+}
+
+configure_gateway(){
+  section "Protected application upstream"
+  printf '  %sOpenProof protects and proxies configured application routes to this upstream.%s\n' "$C_DIM" "$C_RESET"
+  printf '  %sIf your application is not running yet, keep the defaults and update them later.%s\n' "$C_DIM" "$C_RESET"
+
+  GATEWAY_HOST=$(
+    validated_value \
+      OPENPROOF_GATEWAY_UPSTREAM_HOST \
+      "Upstream host" \
+      "127.0.0.1" \
+      validate_host \
+      "Upstream host cannot be empty or contain whitespace." \
+      "application upstream host"
+  )
+  GATEWAY_PORT=$(
+    validated_value \
+      OPENPROOF_GATEWAY_UPSTREAM_PORT \
+      "Upstream port" \
+      "18080" \
+      validate_port \
+      "Upstream port must be a number between 1 and 65535." \
+      "application upstream port"
+  )
+  GATEWAY_TLS=$(
+    validated_value \
+      OPENPROOF_GATEWAY_UPSTREAM_TLS \
+      "Upstream TLS (true/false)" \
+      "false" \
+      validate_boolean \
+      "Enter true or false." \
+      "application upstream TLS setting"
+  )
 }
 
 write_base_config(){
@@ -634,7 +690,14 @@ pool_size = 16
 migration_directory = "$INSTALL_ROOT/migrations"
 
 [gateway]
-enabled = false
+enabled = true
+route_prefix = "/"
+upstream_host = "$GATEWAY_HOST"
+upstream_port = $GATEWAY_PORT
+upstream_tls = $GATEWAY_TLS
+rate_limit_capacity = 1000
+rate_limit_refill_per_second = 100
+rate_limit_maximum_keys = 100000
 
 [auth]
 enabled = true
@@ -836,6 +899,10 @@ bootstrap_owner(){
   section "Initial owner"
   log "Creating the initial owner..."
   if ! output=$(OPENPROOF_BOOTSTRAP_PASSWORD="$password" "$INSTALL_ROOT/bin/opp" bootstrap-admin --config "$CONFIG_FILE" --organization-name "$ORG_NAME" --identity-id "$identity_id" --subject "$OWNER_SUBJECT" 2>&1); then
+    if [[ $output == *"[ALREADY_EXISTS]"* || $output == *"already been initialized"* ]]; then
+      warn "This database already has an initial OpenProof owner. Keeping the existing owner and continuing setup."
+      return
+    fi
     printf '%s\n' "$output" >&2
     die "initial owner bootstrap failed"
   fi
@@ -851,7 +918,8 @@ health_check(){
     sleep 1
   done
   journalctl -u openproof.service -n 30 --no-pager >&2 || true
-  die "OpenProof did not become ready"
+  systemctl stop openproof.service >/dev/null 2>&1 || true
+  die "OpenProof did not become ready; the service was stopped to avoid a restart loop"
 }
 
 [[ ! -f $MARKER ]] || die "this host is already configured; use 'openproof config main', 'openproof config providers', or 'openproof config delivery'"
@@ -915,6 +983,7 @@ case "$DB_MODE" in local) configure_local_database;; external) configure_externa
 
 configure_delivery
 configure_providers
+configure_gateway
 write_base_config
 
 "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE"

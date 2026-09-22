@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 CONFIG_DIR=/etc/openproof
 CONFIG_FILE=/etc/openproof/openproof.toml
@@ -44,6 +45,49 @@ section(){
 
 field(){
   printf '  %s%-15s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"
+}
+
+wait_openproof_ready(){
+  local i
+  for i in $(seq 1 15); do
+    if curl -fsS --max-time 2 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+backup_config_file(){
+  local source=$1 backup
+  backup=$(mktemp "$CONFIG_DIR/.openproof-config-backup.XXXXXX")
+  cp -p "$source" "$backup"
+  printf '%s' "$backup"
+}
+
+restore_config_file(){
+  local backup=$1 target=$2
+  cp -p "$backup" "$target"
+  rm -f "$backup"
+}
+
+restart_openproof_or_rollback(){
+  local backup=$1 target=$2 label=$3
+  if systemctl restart openproof.service && wait_openproof_ready; then
+    rm -f "$backup"
+    ok "$label saved; OpenProof is healthy"
+    return
+  fi
+
+  bad "$label prevented OpenProof from becoming ready; restoring the previous configuration"
+  restore_config_file "$backup" "$target"
+  systemctl restart openproof.service >/dev/null 2>&1 || true
+  if wait_openproof_ready; then
+    ok "Previous $label restored and OpenProof recovered"
+  else
+    warn "Previous $label was restored, but OpenProof is still not ready. Run: sudo openproof doctor"
+  fi
+  die "$label change was rolled back"
 }
 
 installed_version(){
@@ -215,7 +259,7 @@ cmd_doctor(){
 
 cmd_config(){
   need_root
-  local section_name=all editor
+  local section_name=all editor backup
   if (($#)); then section_name=$1; fi
   editor=$(printenv EDITOR 2>/dev/null || true)
   [[ -n $editor ]] || editor=vi
@@ -224,34 +268,56 @@ cmd_config(){
     main)
       [[ -f $CONFIG_FILE ]] || die "main configuration does not exist yet"
       section "Main configuration"
-      "$editor" "$CONFIG_FILE"
+      backup=$(backup_config_file "$CONFIG_FILE")
+      if ! "$editor" "$CONFIG_FILE"; then
+        rm -f "$backup"
+        die "editor exited without saving a valid main configuration"
+      fi
       chmod 0640 "$CONFIG_FILE"
       chown root:openproof "$CONFIG_FILE"
-      "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE"
-      systemctl restart openproof.service
-      ok "Main configuration validated and OpenProof restarted"
+      if ! "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE"; then
+        restore_config_file "$backup" "$CONFIG_FILE"
+        die "main configuration is invalid; previous configuration restored"
+      fi
+      restart_openproof_or_rollback "$backup" "$CONFIG_FILE" "Main configuration"
       ;;
     providers)
       [[ -f $PROVIDERS_FILE ]] || die "provider configuration does not exist yet"
       section "Provider configuration"
       printf 'Federation callback: https://%s/auth/federated/callback\n' "$(domain)"
       printf 'Provider credentials: %s\n' "$PROVIDERS_FILE"
-      "$editor" "$PROVIDERS_FILE"
+      info "You can add, replace, or remove provider credentials here at any time."
+      backup=$(backup_config_file "$PROVIDERS_FILE")
+      if ! "$editor" "$PROVIDERS_FILE"; then
+        rm -f "$backup"
+        die "editor exited without saving provider configuration"
+      fi
       chmod 0640 "$PROVIDERS_FILE"
       chown root:openproof "$PROVIDERS_FILE"
-      systemctl restart openproof.service
-      ok "Provider configuration saved and OpenProof restarted"
+      restart_openproof_or_rollback "$backup" "$PROVIDERS_FILE" "Provider configuration"
       ;;
     delivery|email)
       [[ -f $DELIVERY_FILE ]] || die "delivery configuration does not exist; configure email delivery during setup first"
       section "Delivery configuration"
-      "$editor" "$DELIVERY_FILE"
+      backup=$(backup_config_file "$DELIVERY_FILE")
+      if ! "$editor" "$DELIVERY_FILE"; then
+        rm -f "$backup"
+        die "editor exited without saving delivery configuration"
+      fi
       chmod 0640 "$DELIVERY_FILE"
       chown root:openproof "$DELIVERY_FILE"
       if systemctl is-enabled --quiet openproof-delivery.service 2>/dev/null; then
-        systemctl restart openproof-delivery.service
-        ok "Delivery configuration saved and adapter restarted"
+        if systemctl restart openproof-delivery.service && systemctl is-active --quiet openproof-delivery.service; then
+          rm -f "$backup"
+          ok "Delivery configuration saved and adapter restarted"
+        else
+          bad "Delivery configuration prevented the adapter from starting; restoring the previous configuration"
+          restore_config_file "$backup" "$DELIVERY_FILE"
+          systemctl restart openproof-delivery.service >/dev/null 2>&1 || true
+          die "delivery configuration change was rolled back"
+        fi
       else
+        rm -f "$backup"
         ok "Delivery configuration saved"
         info "The delivery adapter is not enabled on this host."
       fi
