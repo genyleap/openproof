@@ -39,14 +39,15 @@ metrics_maximum_series = 512
 master_key_version = 1
 # Optional dedicated 32-byte key for encrypted-at-rest credential envelopes.
 # When omitted, version 1 is derived from token_signing_key for compatibility.
-# credential_encryption_key = "file:/run/openproof/secrets/credential-encryption.key"
+# credential_encryption_key = "hexfile:/run/openproof/secrets/credential-encryption.key"
 credential_encryption_key_version = 1
 # These long-lived one-way keys default to domain-separated derivations from
-# token_signing_key for compatibility. Configure all four before master rotation.
-# password_pepper = "file:/run/openproof/secrets/password-pepper.key"
-# recovery_code_pepper = "file:/run/openproof/secrets/recovery-code-pepper.key"
-# audit_chain_key = "file:/run/openproof/secrets/audit-chain.key"
-# oauth_client_secret_key = "file:/run/openproof/secrets/oauth-client-secret.key"
+# token_signing_key for compatibility. Hex-encoded key files should use hexfile:.
+# Configure all four before master rotation.
+# password_pepper = "hexfile:/run/openproof/secrets/password-pepper.key"
+# recovery_code_pepper = "hexfile:/run/openproof/secrets/recovery-code-pepper.key"
+# audit_chain_key = "hexfile:/run/openproof/secrets/audit-chain.key"
+# oauth_client_secret_key = "hexfile:/run/openproof/secrets/oauth-client-secret.key"
 
 [gateway]
 # Disabled until an explicit upstream and a master signing key are configured.

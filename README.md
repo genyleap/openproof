@@ -13,7 +13,7 @@ proof, trust, sessions, and authorization as separate security boundaries. It is
 designed to run inside your own infrastructure and keep identity data under your
 control.
 
-> Current release: **1.1.0-rc5** · C++26 · PostgreSQL · self-hosted
+> Current release: **1.1.0-rc1** · C++26 · PostgreSQL · self-hosted
 
 ## What OpenProof includes
 

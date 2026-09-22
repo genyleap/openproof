@@ -15,12 +15,12 @@ metrics_maximum_series = 512
 [security]
 token_signing_key = "file:/run/openproof/secrets/master.key"
 master_key_version = 1
-credential_encryption_key = "file:/run/openproof/secrets/credential-encryption.key"
+credential_encryption_key = "hexfile:/run/openproof/secrets/credential-encryption.key"
 credential_encryption_key_version = 1
-password_pepper = "file:/run/openproof/secrets/password-pepper.key"
-recovery_code_pepper = "file:/run/openproof/secrets/recovery-code-pepper.key"
-audit_chain_key = "file:/run/openproof/secrets/audit-chain.key"
-oauth_client_secret_key = "file:/run/openproof/secrets/oauth-client-secret.key"
+password_pepper = "hexfile:/run/openproof/secrets/password-pepper.key"
+recovery_code_pepper = "hexfile:/run/openproof/secrets/recovery-code-pepper.key"
+audit_chain_key = "hexfile:/run/openproof/secrets/audit-chain.key"
+oauth_client_secret_key = "hexfile:/run/openproof/secrets/oauth-client-secret.key"
 
 [gateway]
 enabled = true

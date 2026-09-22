@@ -390,12 +390,12 @@ metrics_maximum_series = 512
 [security]
 token_signing_key = "file:$CREDENTIAL_DIR/master.key"
 master_key_version = 1
-credential_encryption_key = "file:$CREDENTIAL_DIR/credential-encryption.key"
+credential_encryption_key = "hexfile:$CREDENTIAL_DIR/credential-encryption.key"
 credential_encryption_key_version = 1
-password_pepper = "file:$CREDENTIAL_DIR/password-pepper.key"
-recovery_code_pepper = "file:$CREDENTIAL_DIR/recovery-code-pepper.key"
-audit_chain_key = "file:$CREDENTIAL_DIR/audit-chain.key"
-oauth_client_secret_key = "file:$CREDENTIAL_DIR/oauth-client-secret.key"
+password_pepper = "hexfile:$CREDENTIAL_DIR/password-pepper.key"
+recovery_code_pepper = "hexfile:$CREDENTIAL_DIR/recovery-code-pepper.key"
+audit_chain_key = "hexfile:$CREDENTIAL_DIR/audit-chain.key"
+oauth_client_secret_key = "hexfile:$CREDENTIAL_DIR/oauth-client-secret.key"
 
 [database]
 connection_string = "file:$CREDENTIAL_DIR/database.url"

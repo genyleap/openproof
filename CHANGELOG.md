@@ -2,53 +2,7 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
-## 1.1.0-rc5 — 2026-09-22
-
-### Setup UX and delivery provisioning
-
-- Collect and validate SMTP relay settings before installing local mail runtime
-  packages or mutating Postfix configuration.
-- Make local mail-adapter side effects explicit in the setup menu.
-- Suppress verbose apt/needrestart output during successful provisioning while
-  preserving full package-manager diagnostics on failure.
-- Clarify that Postfix, PHP CLI and SASL are runtime dependencies of the optional
-  same-host verification-delivery adapter, not OpenProof build dependencies.
-
-## 1.1.0-rc4 — 2026-09-22
-
-### Setup reliability
-
-- Fixed a Bash nounset failure while persisting generated database credentials
-  during local PostgreSQL setup.
-- Audited installer-local variable declarations for dependent initialization.
-- Added a release blocklist hook so a known-bad release can be skipped by the
-  bootstrap resolver even if GitHub has already published its artifacts.
-
-## 1.1.0-rc3 — 2026-09-22
-
-### Installer and operations UX
-
-- Added a polished color-aware terminal experience for installation and setup.
-- Added explicit self-hosted operation, data responsibility, privacy, terms, and
-  documentation notices to the installer and configuration wizard.
-- Fixed interactive setup when the bootstrap installer is piped through sudo.
-- Expanded the `openproof` management CLI with info, service lifecycle, logs,
-  update/upgrade, diagnostics, backup/restore, and safer uninstall workflows.
-- Kept production installation prebuilt-only with verified AMD64/ARM64 bundles.
-
-## 1.1.0-rc2 — 2026-09-22
-
-### Installation and release delivery
-
-- Replaced target-host source-build fallback with verified prebuilt Linux bundles.
-- Added self-contained AMD64 and ARM64 runtime bundles with required non-glibc
-  shared libraries and a bundled OpenSSL CLI.
-- The bootstrap installer no longer installs compilers, build toolchains, or
-  OpenProof runtime library packages on the target host.
-- Missing release artifacts now fail explicitly instead of compiling OpenProof
-  or GCC on the user's machine.
-
-## 1.1.0-rc1 — 2026-09-21
+## 1.1.0-rc1 — 2026-09-22
 
 ### Identity and authentication
 
@@ -73,14 +27,29 @@ Notable user-facing changes to OpenProof are recorded here.
 ### Platform and security
 
 - Added PostgreSQL-backed durable state and checksummed migrations.
-- Added versioned credential encryption, key-rotation workflows and hardened
-  secret references.
+- Added versioned credential encryption, dedicated persistent keys, key-rotation
+  workflows and hardened binary-safe secret references.
 - Added authenticated metrics, health endpoints, backup/restore tooling and
   production qualification scripts.
-- Added release packaging and a guided Debian/Ubuntu installer with verified
-  release downloads and source-build fallback.
-- Expanded the C++, JavaScript, Swift and Kotlin SDK foundations.
 - Added the OpenAPI 3.1 contract and interactive Developer Portal.
+- Expanded the C++, JavaScript, Swift and Kotlin SDK foundations.
+
+### Installation and operations
+
+- Added verified prebuilt AMD64 and ARM64 runtime bundles; the production
+  installer never compiles OpenProof or installs compiler/build dependencies on
+  the target host.
+- Added a color-aware guided installer and setup wizard with explicit self-hosted
+  operation, data-responsibility, privacy and terms notices.
+- Added PostgreSQL, optional local email delivery, provider, Nginx and TLS setup.
+- Added the `openproof` management CLI for info, status, diagnostics, logs,
+  service lifecycle, configuration, update/upgrade, backup/restore and uninstall.
+- Made setup resilient when invoked through `curl | sudo sh`.
+- Collects and validates SMTP relay settings before installing optional mail
+  runtime packages, and keeps successful package provisioning output concise.
+- Generated persistent security material is stored as hexadecimal and referenced
+  with `hexfile:` so OpenProof receives the exact binary key lengths expected by
+  the runtime.
 
 ## 1.0.0 — 2026-08-11
 

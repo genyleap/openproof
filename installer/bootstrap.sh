@@ -9,7 +9,6 @@ NO_SETUP=0
 PLAN_ONLY=0
 GENYLEAP_RELEASES="https://genyleap.com/releases/openproof"
 GITHUB_RELEASES="https://github.com/$REPO/releases/download"
-BLOCKED_RELEASES_URL="$GENYLEAP_RELEASES/blocked"
 DOCS_URL="https://docs.genyleap.com/openproof/"
 PRODUCT_URL="https://genyleap.com/products/openproof"
 PRIVACY_URL="https://genyleap.com/privacy"
@@ -135,17 +134,9 @@ github_release_tags() {
     sed -n 's#.*href="[^"]*/releases/tag/\([^"]*\)".*#\1#p'
 }
 
-release_blocked() {
-  candidate=$1
-  [ -n "$candidate" ] || return 1
-  curl -fsSL --retry 1 --connect-timeout 5 "$BLOCKED_RELEASES_URL" 2>/dev/null |
-    grep -Fxq "$candidate"
-}
-
 release_ready() {
   candidate=$1
   [ -n "$candidate" ] || return 1
-  release_blocked "$candidate" && return 1
   curl -fsSI --retry 1 --connect-timeout 5 "$GITHUB_RELEASES/$candidate/SHA256SUMS" >/dev/null 2>&1
 }
 

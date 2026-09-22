@@ -15,7 +15,7 @@ python3 "${ROOT_DIR}/scripts/verify-openapi.py"
 
 # Credential key rotation must stay wired end to end: closed configuration,
 # deployment secret mount, atomic schema journal, operator CLI and real-process E2E.
-grep -q 'credential_encryption_key = "file:/run/openproof/secrets/credential-encryption.key"' \
+grep -q 'credential_encryption_key = "hexfile:/run/openproof/secrets/credential-encryption.key"' \
     "${ROOT_DIR}/deploy/openproof.toml.example" \
     || fail "deployment template omits the dedicated credential-encryption key"
 grep -q 'CREATE TABLE openproof.credential_key_rotations' \
@@ -33,9 +33,17 @@ grep -q 'TotpCredentialRekeyIsAtomicVersionedAndDryRunnable' \
 # Full master retirement is safe only when long-lived one-way credentials are
 # independently keyed and all master-derived transient state is atomically retired.
 for key in password_pepper recovery_code_pepper audit_chain_key oauth_client_secret_key; do
-    grep -q "${key} = \"file:/run/openproof/secrets/" \
+    grep -q "${key} = \"hexfile:/run/openproof/secrets/" \
         "${ROOT_DIR}/deploy/openproof.toml.example" \
-        || fail "deployment template omits dedicated ${key}"
+        || fail "deployment template omits binary-safe dedicated ${key}"
+done
+grep -q 'credential_encryption_key = "hexfile:$CREDENTIAL_DIR/credential-encryption.key"' \
+    "${ROOT_DIR}/installer/setup.sh" \
+    || fail "setup wizard does not decode generated credential encryption key material"
+for key in password_pepper recovery_code_pepper audit_chain_key oauth_client_secret_key; do
+    grep -q "${key} = \"hexfile:\$CREDENTIAL_DIR/" \
+        "${ROOT_DIR}/installer/setup.sh" \
+        || fail "setup wizard does not decode generated ${key} material"
 done
 grep -q 'CREATE TABLE openproof.master_key_rotations' \
     "${ROOT_DIR}/migrations/0015_master_key_rotation.sql" \
