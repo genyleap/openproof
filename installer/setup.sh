@@ -29,6 +29,7 @@ fi
 
 log(){ printf '%s\n' "$*"; }
 ok(){ printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+info(){ printf '%s›%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 warn(){ printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die(){ printf '%s✗%s OpenProof setup: %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 section(){ printf '\n%s%s%s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
@@ -118,9 +119,23 @@ slugify(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/
 validate_domain(){ [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 
 apt_install(){
+  local log_file
+  log_file=$(mktemp)
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y --no-install-recommends "$@"
+
+  info "Installing system packages: $*"
+  if ! apt-get update -qq >"$log_file" 2>&1; then
+    cat "$log_file" >&2
+    rm -f "$log_file"
+    die "package index update failed"
+  fi
+  if ! apt-get install -y -qq --no-install-recommends "$@" >>"$log_file" 2>&1; then
+    cat "$log_file" >&2
+    rm -f "$log_file"
+    die "system package installation failed: $*"
+  fi
+  rm -f "$log_file"
+  ok "System packages ready: $*"
 }
 
 ensure_user(){
@@ -183,13 +198,27 @@ configure_external_database(){
 
 configure_postfix_adapter(){
   local mode=$1 smtp_host smtp_port smtp_user smtp_password from brand
-  apt_install postfix php-cli libsasl2-modules
+
+  from=$(env_value OPENPROOF_DELIVERY_FROM); [[ -n $from ]] || from=$(prompt "From address" "no-reply@$DOMAIN")
+  brand=$(env_value OPENPROOF_DELIVERY_BRAND); [[ -n $brand ]] || brand=$(prompt "Email brand name" "$ORG_NAME")
+  [[ $from == *@* ]] || die "From address must be a valid email-like address"
+  [[ -n $brand ]] || die "Email brand name is required"
+
   if [[ $mode == smtp ]]; then
+    section "SMTP relay"
     smtp_host=$(env_value OPENPROOF_SMTP_HOST); [[ -n $smtp_host ]] || smtp_host=$(prompt "SMTP host" "")
     smtp_port=$(env_value OPENPROOF_SMTP_PORT); [[ -n $smtp_port ]] || smtp_port=$(prompt "SMTP port" "587")
     smtp_user=$(env_value OPENPROOF_SMTP_USERNAME); [[ -n $smtp_user ]] || smtp_user=$(prompt "SMTP username" "")
     smtp_password=$(env_value OPENPROOF_SMTP_PASSWORD); [[ -n $smtp_password ]] || smtp_password=$(prompt_secret "SMTP password" OPENPROOF_SMTP_PASSWORD)
     [[ -n $smtp_host && -n $smtp_user && -n $smtp_password ]] || die "SMTP host, username and password are required"
+    [[ $smtp_port =~ ^[0-9]+$ ]] && (( smtp_port >= 1 && smtp_port <= 65535 )) || die "SMTP port must be between 1 and 65535"
+  else
+    warn "Direct Postfix delivery requires correct PTR/rDNS, SPF, DKIM and DMARC."
+  fi
+
+  apt_install postfix php-cli libsasl2-modules
+
+  if [[ $mode == smtp ]]; then
     postconf -e "relayhost = [$smtp_host]:$smtp_port"
     postconf -e "smtp_sasl_auth_enable = yes"
     postconf -e "smtp_sasl_security_options = noanonymous"
@@ -200,15 +229,11 @@ configure_postfix_adapter(){
     postmap /etc/postfix/sasl_passwd
     rm -f /etc/postfix/sasl_passwd
     ok "Postfix configured as authenticated SMTP relay"
-  else
-    warn "Direct Postfix delivery requires correct PTR/rDNS, SPF, DKIM and DMARC."
   fi
+
   systemctl enable --now postfix
   install -d -o root -g root -m 0755 "$INSTALL_ROOT/delivery"
   install -m 0644 "$TEMPLATE_ROOT/verification-delivery-postfix.php" "$INSTALL_ROOT/delivery/verification-delivery-postfix.php"
-
-  from=$(env_value OPENPROOF_DELIVERY_FROM); [[ -n $from ]] || from=$(prompt "From address" "no-reply@$DOMAIN")
-  brand=$(env_value OPENPROOF_DELIVERY_BRAND); [[ -n $brand ]] || brand=$(prompt "Email brand name" "$ORG_NAME")
   cat >"$DELIVERY_FILE" <<EOF
 OPENPROOF_DELIVERY_TOKEN_FILE=$CREDENTIAL_DIR/verification-webhook.token
 OPENPROOF_DELIVERY_FROM=$from
@@ -230,10 +255,11 @@ configure_delivery(){
       EMAIL_MODE=later
     else
       section "Email delivery"
-      option 1 "Authenticated SMTP relay"
-      option 2 "Local Postfix / direct MX"
-      option 3 "Existing HTTPS delivery webhook"
+      option 1 "Authenticated SMTP relay via local delivery adapter"
+      option 2 "Direct Postfix / MX via local delivery adapter"
+      option 3 "Existing HTTPS delivery webhook (no local mail packages)"
       option 4 "Configure later"
+      printf '  %sNote:%s options 1-2 install Postfix, PHP CLI and SASL runtime packages.\n' "$C_DIM" "$C_RESET"
       choice=$(prompt "Choose" "1")
       case "$choice" in 1) EMAIL_MODE=smtp;; 2) EMAIL_MODE=postfix;; 3) EMAIL_MODE=webhook;; *) EMAIL_MODE=later;; esac
     fi

@@ -2,6 +2,18 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc5 — 2026-09-22
+
+### Setup UX and delivery provisioning
+
+- Collect and validate SMTP relay settings before installing local mail runtime
+  packages or mutating Postfix configuration.
+- Make local mail-adapter side effects explicit in the setup menu.
+- Suppress verbose apt/needrestart output during successful provisioning while
+  preserving full package-manager diagnostics on failure.
+- Clarify that Postfix, PHP CLI and SASL are runtime dependencies of the optional
+  same-host verification-delivery adapter, not OpenProof build dependencies.
+
 ## 1.1.0-rc4 — 2026-09-22
 
 ### Setup reliability
