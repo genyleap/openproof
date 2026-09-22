@@ -134,6 +134,33 @@ github_release_tags() {
     sed -n 's#.*href="[^"]*/releases/tag/\([^"]*\)".*#\1#p'
 }
 
+release_ready() {
+  candidate=$1
+  [ -n "$candidate" ] || return 1
+  curl -fsSI --retry 1 --connect-timeout 5 "$GITHUB_RELEASES/$candidate/SHA256SUMS" >/dev/null 2>&1
+}
+
+first_ready_tag() {
+  pattern=$1
+  for candidate in $(github_release_tags | grep -E "$pattern"); do
+    if release_ready "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ready_marker() {
+  marker_path=$1
+  candidate=$(curl -fsSL --retry 2 --connect-timeout 5 "$GENYLEAP_RELEASES/$marker_path" 2>/dev/null | head -n 1) || true
+  if release_ready "${candidate:-}"; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
 resolve_version() {
   if [ -n "$REQUESTED_VERSION" ]; then
     printf '%s\n' "$REQUESTED_VERSION" | sed 's/^v//'
@@ -143,30 +170,20 @@ resolve_version() {
   tag=""
   case "$CHANNEL" in
     stable)
-      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1) || true
-      if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
-      fi
+      tag=$(first_ready_tag '^v[0-9]+\.[0-9]+\.[0-9]+$') || true
+      [ -n "${tag:-}" ] || tag=$(ready_marker stable) || true
       [ -n "${tag:-}" ] || die "no stable OpenProof prebuilt release is available"
       ;;
     rc)
-      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9A-Za-z.-]*$' | head -n 1) || true
-      if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
-      fi
+      tag=$(first_ready_tag '^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9A-Za-z.-]*$') || true
+      [ -n "${tag:-}" ] || tag=$(ready_marker rc) || true
       [ -n "${tag:-}" ] || die "no OpenProof release-candidate build is available"
       ;;
     auto)
-      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1) || true
-      if [ -z "${tag:-}" ]; then
-        tag=$(github_release_tags | head -n 1) || true
-      fi
-      if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
-      fi
-      if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/latest" 2>/dev/null | head -n 1) || true
-      fi
+      tag=$(first_ready_tag '^v[0-9]+\.[0-9]+\.[0-9]+$') || true
+      [ -n "${tag:-}" ] || tag=$(first_ready_tag '^v[0-9]') || true
+      [ -n "${tag:-}" ] || tag=$(ready_marker stable) || true
+      [ -n "${tag:-}" ] || tag=$(ready_marker latest) || true
       [ -n "${tag:-}" ] || die "no OpenProof prebuilt release is available"
       ;;
     *) die "invalid channel '$CHANNEL'; use auto, stable, or rc" ;;
