@@ -77,6 +77,11 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 
+github_release_tags() {
+  curl -fsSL --retry 3 --connect-timeout 10 "https://github.com/$REPO/releases.atom" 2>/dev/null |
+    sed -n 's#.*href="[^"]*/releases/tag/\([^"]*\)".*#\1#p'
+}
+
 resolve_version() {
   if [ -n "$REQUESTED_VERSION" ]; then
     printf '%s\n' "$REQUESTED_VERSION" | sed 's/^v//'
@@ -86,15 +91,27 @@ resolve_version() {
   tag=""
   case "$CHANNEL" in
     stable)
-      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      fi
       [ -n "${tag:-}" ] || die "no stable OpenProof prebuilt release is available"
       ;;
     rc)
-      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
+      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9A-Za-z.-]*$' | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
+      fi
       [ -n "${tag:-}" ] || die "no OpenProof release-candidate build is available"
       ;;
     auto)
-      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      tag=$(github_release_tags | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1) || true
+      if [ -z "${tag:-}" ]; then
+        tag=$(github_release_tags | head -n 1) || true
+      fi
+      if [ -z "${tag:-}" ]; then
+        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      fi
       if [ -z "${tag:-}" ]; then
         tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/latest" 2>/dev/null | head -n 1) || true
       fi
@@ -141,14 +158,14 @@ say "  mode    : prebuilt bundle"
 say ""
 
 say "Downloading release metadata..."
-if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS" 2>/dev/null || true
+if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS"; then
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null || true
 fi
 [ -s "$TMP/SHA256SUMS" ] || die "release metadata for $OPENPROOF_VERSION could not be downloaded; refusing to build from source"
 
 say "Downloading $ASSET..."
-if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET" 2>/dev/null || true
+if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET"; then
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET" 2>/dev/null || true
 fi
 [ -s "$TMP/$ASSET" ] || die "no prebuilt $ARCH bundle exists for OpenProof $OPENPROOF_VERSION; refusing to build from source"
 
