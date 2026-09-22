@@ -9,27 +9,77 @@ NO_SETUP=0
 PLAN_ONLY=0
 GENYLEAP_RELEASES="https://genyleap.com/releases/openproof"
 GITHUB_RELEASES="https://github.com/$REPO/releases/download"
+DOCS_URL="https://docs.genyleap.com/openproof/"
+PRODUCT_URL="https://genyleap.com/products/openproof"
+PRIVACY_URL="https://genyleap.com/privacy"
+TERMS_URL="https://genyleap.com/terms-of-use"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  ESC=$(printf '\033')
+  C_RESET="${ESC}[0m"
+  C_BOLD="${ESC}[1m"
+  C_DIM="${ESC}[2m"
+  C_CYAN="${ESC}[36m"
+  C_GREEN="${ESC}[32m"
+  C_YELLOW="${ESC}[33m"
+  C_RED="${ESC}[31m"
+  C_BLUE="${ESC}[34m"
+else
+  C_RESET="" C_BOLD="" C_DIM="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_BLUE=""
+fi
 
 say() { printf '%s\n' "$*"; }
-die() { printf 'OpenProof installer: %s\n' "$*" >&2; exit 1; }
+ok() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+info() { printf '%s›%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die() { printf '%s✗%s OpenProof installer: %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+brand() {
+  printf '\n%s%sOpenProof%s  %sself-hosted identity infrastructure%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+  printf '%sby Genyleap%s\n' "$C_DIM" "$C_RESET"
+}
+
+section() {
+  printf '\n%s%s%s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"
+}
+
+field() {
+  printf '  %s%-12s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"
+}
+
+show_notice() {
+  brand
+  section "Before installation"
+  printf '  OpenProof is self-hosted software. This instance runs on infrastructure\n'
+  printf '  you control; Genyleap does not operate or administer the installed service.\n\n'
+  printf '  Normal OpenProof runtime does not require a managed Genyleap backend for\n'
+  printf '  your identity database, credentials, sessions, or cryptographic keys.\n'
+  printf '  You are responsible for hosting, security, backups, upgrades, compliance,\n'
+  printf '  and any third-party providers or delivery services you configure.\n\n'
+  printf '  Installation and upgrades may contact Genyleap and GitHub only to resolve\n'
+  printf '  and download verified release artifacts.\n\n'
+  printf '  %sDocs:%s    %s\n' "$C_DIM" "$C_RESET" "$DOCS_URL"
+  printf '  %sPrivacy:%s %s\n' "$C_DIM" "$C_RESET" "$PRIVACY_URL"
+  printf '  %sTerms:%s   %s\n' "$C_DIM" "$C_RESET" "$TERMS_URL"
+}
 
 usage() {
+  brand
+  printf '%sUsage%s\n' "$C_BOLD" "$C_RESET"
   cat <<'EOF'
-OpenProof prebuilt installer
-
-Usage:
   curl -fsSL https://genyleap.com/install/openproof | sudo sh
   curl -fsSL https://genyleap.com/install/openproof | sudo sh -s -- [options]
 
-Options:
-  --version VERSION       Install an exact release, for example 1.1.0 or 1.1.0-rc2
+Options
+  --version VERSION       Install an exact release
   --channel CHANNEL       auto (default), stable, or rc
   --non-interactive       Do not prompt during setup
   --no-setup              Install/update OpenProof files only
   --plan                  Print the detected installation plan and exit
   -h, --help              Show this help
 
-This installer never builds OpenProof and never installs compiler/build dependencies.
+The production installer uses verified prebuilt bundles. It never compiles
+OpenProof or installs compiler/build dependencies on the target host.
 EOF
 }
 
@@ -76,6 +126,8 @@ case "$(uname -m)" in
   aarch64|arm64) ARCH="arm64" ;;
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
+
+show_notice
 
 github_release_tags() {
   curl -fsSL --retry 3 --connect-timeout 10 "https://github.com/$REPO/releases.atom" 2>/dev/null |
@@ -140,31 +192,30 @@ BASE="$GENYLEAP_RELEASES/$TAG"
 GITHUB_BASE="$GITHUB_RELEASES/$TAG"
 
 if [ "$PLAN_ONLY" -eq 1 ]; then
-  say "OpenProof installation plan"
-  say "  system : ${PRETTY_NAME:-$ID}"
-  say "  arch   : $ARCH"
-  say "  mode   : verified prebuilt bundle"
-  say "  release: $OPENPROOF_VERSION"
-  say "  asset  : $ASSET"
-  say "  build  : never on the target host"
+  section "Installation plan"
+  field "System" "${PRETTY_NAME:-$ID}"
+  field "Architecture" "$ARCH"
+  field "Release" "$OPENPROOF_VERSION"
+  field "Mode" "verified prebuilt bundle"
+  field "Asset" "$ASSET"
+  field "Build" "never on the target host"
   exit 0
 fi
 
-say ""
-say "OpenProof"
-say "  release : $OPENPROOF_VERSION"
-say "  system  : ${PRETTY_NAME:-$ID}"
-say "  arch    : $ARCH"
-say "  mode    : prebuilt bundle"
-say ""
+section "Release"
+field "Version" "$OPENPROOF_VERSION"
+field "System" "${PRETTY_NAME:-$ID}"
+field "Architecture" "$ARCH"
+field "Mode" "verified prebuilt bundle"
 
-say "Downloading release metadata..."
+section "Install"
+info "Downloading release metadata..."
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS"; then
   curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS.txt" 2>/dev/null || true
 fi
 [ -s "$TMP/SHA256SUMS" ] || die "release metadata for $OPENPROOF_VERSION could not be downloaded; refusing to build from source"
 
-say "Downloading $ASSET..."
+info "Downloading $ASSET..."
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET"; then
   curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$MIRROR_ASSET" 2>/dev/null || true
 fi
@@ -174,7 +225,7 @@ expected=$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$TMP/SHA256SUMS" | he
 [ -n "$expected" ] || die "$ASSET is not listed in SHA256SUMS"
 actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
 [ "$expected" = "$actual" ] || die "checksum verification failed for $ASSET"
-say "✓ Release checksum verified"
+ok "Release checksum verified"
 
 if tar -tzf "$TMP/$ASSET" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
   die "release archive contains an unsafe path"
@@ -245,8 +296,8 @@ systemctl daemon-reload
 rm -rf "$OLD_ROOT"
 OLD_ROOT=""
 
-say "✓ OpenProof prebuilt bundle installed"
-say "✓ No compiler or build dependency was installed"
+ok "OpenProof prebuilt bundle installed"
+ok "No compiler or build dependency was installed"
 
 run_interactive_setup() {
   setup_tty="${SUDO_TTY:-/dev/tty}"
@@ -273,17 +324,17 @@ if [ "$NO_SETUP" -eq 0 ] && [ "$ALREADY_CONFIGURED" -eq 0 ]; then
 else
   if [ "$WAS_DELIVERY_ACTIVE" -eq 1 ]; then
     systemctl restart openproof-delivery.service
-    say "✓ OpenProof delivery service restarted"
+    ok "OpenProof delivery service restarted"
   fi
   if [ "$WAS_ACTIVE" -eq 1 ]; then
     systemctl restart openproof.service
-    say "✓ OpenProof service restarted"
+    ok "OpenProof service restarted"
   fi
   if [ "$ALREADY_CONFIGURED" -eq 1 ]; then
-    say "✓ Existing OpenProof configuration preserved"
+    ok "Existing OpenProof configuration preserved"
   elif [ "$NO_SETUP" -eq 1 ]; then
-    say ""
-    say "OpenProof files installed without configuration."
-    say "Run: sudo openproof setup"
+    section "Next step"
+    info "OpenProof files installed without configuration."
+    printf '  Run: %ssudo openproof setup%s\n' "$C_CYAN" "$C_RESET"
   fi
 fi

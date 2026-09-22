@@ -14,10 +14,42 @@ NON_INTERACTIVE=0
 TTY="${OPENPROOF_TTY:-${SUDO_TTY:-/dev/tty}}"
 export PATH="$INSTALL_ROOT/bin:$PATH"
 
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_CYAN='' C_GREEN='' C_YELLOW='' C_RED='' C_BLUE=''
+fi
+
 log(){ printf '%s\n' "$*"; }
-ok(){ printf '✓ %s\n' "$*"; }
-warn(){ printf '! %s\n' "$*" >&2; }
-die(){ printf 'OpenProof setup: %s\n' "$*" >&2; exit 1; }
+ok(){ printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn(){ printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die(){ printf '%s✗%s OpenProof setup: %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+section(){ printf '\n%s%s%s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
+option(){ printf '  %s%s)%s %s\n' "$C_CYAN" "$1" "$C_RESET" "$2"; }
+
+show_setup_header(){
+  printf '\n%s%sOpenProof%s  %sconfiguration wizard%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+  printf '%sSelf-hosted identity infrastructure by Genyleap%s\n' "$C_DIM" "$C_RESET"
+
+  section "Self-hosted operation"
+  printf '  OpenProof runs on infrastructure you control. Genyleap does not operate\n'
+  printf '  this instance, and normal runtime does not require a managed Genyleap\n'
+  printf '  backend for your identity database, credentials, sessions, or keys.\n\n'
+  printf '  You are responsible for hosting, security, backups, upgrades, compliance,\n'
+  printf '  and any third-party providers or delivery services you configure.\n\n'
+  printf '  %sDocs:%s    https://docs.genyleap.com/openproof/\n' "$C_DIM" "$C_RESET"
+  printf '  %sPrivacy:%s https://genyleap.com/privacy\n' "$C_DIM" "$C_RESET"
+  printf '  %sTerms:%s   https://genyleap.com/terms-of-use\n' "$C_DIM" "$C_RESET"
+
+  section "Identity"
+}
 
 usage(){
 cat <<'EOF'
@@ -58,7 +90,11 @@ env_value(){ printenv "$1" 2>/dev/null || true; }
 prompt(){
   local label=$1 default=$2 value=""
   if (( NON_INTERACTIVE )); then printf '%s' "$default"; return; fi
-  if [[ -n $default ]]; then printf '%s [%s]: ' "$label" "$default" >"$TTY"; else printf '%s: ' "$label" >"$TTY"; fi
+  if [[ -n $default ]]; then
+    printf '%s%s%s %s[%s]%s: ' "$C_BOLD" "$label" "$C_RESET" "$C_DIM" "$default" "$C_RESET" >"$TTY"
+  else
+    printf '%s%s%s: ' "$C_BOLD" "$label" "$C_RESET" >"$TTY"
+  fi
   IFS= read -r value <"$TTY"
   [[ -n $value ]] || value=$default
   printf '%s' "$value"
@@ -72,7 +108,7 @@ prompt_secret(){
     printf '%s' "$value"
     return
   fi
-  printf '%s: ' "$label" >"$TTY"
+  printf '%s%s%s: ' "$C_BOLD" "$label" "$C_RESET" >"$TTY"
   IFS= read -r -s value <"$TTY"
   printf '\n' >"$TTY"
   printf '%s' "$value"
@@ -190,11 +226,11 @@ configure_delivery(){
     if (( NON_INTERACTIVE )); then
       EMAIL_MODE=later
     else
-      log ""; log "Email delivery"
-      log "  1) Authenticated SMTP relay"
-      log "  2) Local Postfix / direct MX"
-      log "  3) Existing HTTPS delivery webhook"
-      log "  4) Configure later"
+      section "Email delivery"
+      option 1 "Authenticated SMTP relay"
+      option 2 "Local Postfix / direct MX"
+      option 3 "Existing HTTPS delivery webhook"
+      option 4 "Configure later"
       choice=$(prompt "Choose" "1")
       case "$choice" in 1) EMAIL_MODE=smtp;; 2) EMAIL_MODE=postfix;; 3) EMAIL_MODE=webhook;; *) EMAIL_MODE=later;; esac
     fi
@@ -238,8 +274,8 @@ configure_providers(){
 
   selected=$(env_value OPENPROOF_PROVIDERS)
   if [[ -z $selected && $NON_INTERACTIVE -eq 0 ]]; then
-    log ""; log "External sign-in providers"
-    log "Available: google,github,microsoft,apple,linkedin,telegram,x,ethereum,farcaster"
+    section "External sign-in providers"
+    printf '  %sAvailable:%s google, github, microsoft, apple, linkedin, telegram, x, ethereum, farcaster\n' "$C_DIM" "$C_RESET"
     selected=$(prompt "Comma-separated providers (blank = later)" "")
   fi
   selected=$(printf '%s' "$selected" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
@@ -449,10 +485,10 @@ EOF
 configure_tls(){
   TLS_MODE=$(env_value OPENPROOF_TLS_MODE); [[ -n $TLS_MODE ]] || TLS_MODE=letsencrypt
   if [[ $NON_INTERACTIVE -eq 0 ]]; then
-    log ""; log "TLS"
-    log "  1) Let's Encrypt (recommended)"
-    log "  2) Existing certificate"
-    log "  3) TLS is terminated by an external ingress"
+    section "TLS"
+    option 1 "Let's Encrypt (recommended)"
+    option 2 "Existing certificate"
+    option 3 "TLS is terminated by an external ingress"
     choice=$(prompt "Choose" "1")
     case "$choice" in 1) TLS_MODE=letsencrypt;; 2) TLS_MODE=existing;; 3) TLS_MODE=external;; esac
   fi
@@ -489,7 +525,8 @@ bootstrap_owner(){
   fi
   [[ $(printf '%s' "$password" | wc -c) -ge 16 ]] || die "owner password must contain at least 16 characters"
   identity_id="owner-$(openssl rand -hex 8)"
-  log ""; log "Creating the initial owner..."
+  section "Initial owner"
+  log "Creating the initial owner..."
   if ! output=$(OPENPROOF_BOOTSTRAP_PASSWORD="$password" "$INSTALL_ROOT/bin/opp" bootstrap-admin --config "$CONFIG_FILE" --organization-name "$ORG_NAME" --identity-id "$identity_id" --subject "$OWNER_SUBJECT" 2>&1); then
     printf '%s\n' "$output" >&2
     die "initial owner bootstrap failed"
@@ -509,9 +546,9 @@ health_check(){
   die "OpenProof did not become ready"
 }
 
-[[ ! -f $MARKER ]] || die "this host is already configured; use 'openproof config providers' or 'openproof config email'"
+[[ ! -f $MARKER ]] || die "this host is already configured; use 'openproof config main', 'openproof config providers', or 'openproof config delivery'"
 
-log ""; log "OpenProof setup"; log "==============="; log ""
+show_setup_header
 
 DOMAIN=$(env_value OPENPROOF_DOMAIN); [[ -n $DOMAIN ]] || DOMAIN=$(prompt "Identity domain" "identity.example.com")
 validate_domain "$DOMAIN" || die "invalid domain: $DOMAIN"
@@ -531,7 +568,9 @@ generate_secrets
 
 DB_MODE=$(env_value OPENPROOF_DATABASE_MODE); [[ -n $DB_MODE ]] || DB_MODE=local
 if [[ $NON_INTERACTIVE -eq 0 ]]; then
-  log ""; log "Database"; log "  1) Install local PostgreSQL"; log "  2) Use existing PostgreSQL"
+  section "Database"
+  option 1 "Install local PostgreSQL"
+  option 2 "Use existing PostgreSQL"
   choice=$(prompt "Choose" "1"); [[ $choice == 2 ]] && DB_MODE=external || DB_MODE=local
 fi
 case "$DB_MODE" in local) configure_local_database;; external) configure_external_database;; *) die "invalid database mode: $DB_MODE";; esac
@@ -554,11 +593,13 @@ printf '%s\n' "$DOMAIN" >"$MARKER"
 chown root:openproof "$MARKER"
 chmod 0640 "$MARKER"
 
-log ""; log "OpenProof is ready"; log "=================="
-log "Identity URL : https://$DOMAIN"
-log "Callback URL : https://$DOMAIN/auth/federated/callback"
-log "Config       : $CONFIG_FILE"
-log ""; log "Next:"
-log "  sudo openproof doctor"
-log "  sudo openproof config providers"
-log "  https://docs.genyleap.com/openproof/"
+section "OpenProof is ready"
+printf '  %sIdentity URL%s  https://%s\n' "$C_DIM" "$C_RESET" "$DOMAIN"
+printf '  %sCallback URL%s  https://%s/auth/federated/callback\n' "$C_DIM" "$C_RESET" "$DOMAIN"
+printf '  %sConfig%s        %s\n' "$C_DIM" "$C_RESET" "$CONFIG_FILE"
+printf '\n%sNext commands%s\n' "$C_BOLD" "$C_RESET"
+printf '  %ssudo openproof status%s\n' "$C_CYAN" "$C_RESET"
+printf '  %ssudo openproof doctor%s\n' "$C_CYAN" "$C_RESET"
+printf '  %ssudo openproof info%s\n' "$C_CYAN" "$C_RESET"
+printf '  %ssudo openproof config providers%s\n' "$C_CYAN" "$C_RESET"
+printf '\n%sDocs:%s https://docs.genyleap.com/openproof/\n' "$C_DIM" "$C_RESET"

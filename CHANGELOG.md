@@ -2,6 +2,18 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc3 — 2026-09-22
+
+### Installer and operations UX
+
+- Added a polished color-aware terminal experience for installation and setup.
+- Added explicit self-hosted operation, data responsibility, privacy, terms, and
+  documentation notices to the installer and configuration wizard.
+- Fixed interactive setup when the bootstrap installer is piped through sudo.
+- Expanded the `openproof` management CLI with info, service lifecycle, logs,
+  update/upgrade, diagnostics, backup/restore, and safer uninstall workflows.
+- Kept production installation prebuilt-only with verified AMD64/ARM64 bundles.
+
 ## 1.1.0-rc2 — 2026-09-22
 
 ### Installation and release delivery

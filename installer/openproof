@@ -4,45 +4,182 @@ set -Eeuo pipefail
 CONFIG_DIR=/etc/openproof
 CONFIG_FILE=/etc/openproof/openproof.toml
 PROVIDERS_FILE=/etc/openproof/providers.env
+DELIVERY_FILE=/etc/openproof/delivery.env
 MARKER=/etc/openproof/.configured
+INSTALL_ROOT=/opt/openproof
 BOOTSTRAP_URL=https://genyleap.com/install/openproof
+DOCS_URL=https://docs.genyleap.com/openproof/
+PRODUCT_URL=https://genyleap.com/products/openproof
+PRIVACY_URL=https://genyleap.com/privacy
+TERMS_URL=https://genyleap.com/terms-of-use
 
-die(){ printf 'openproof: %s\n' "$*" >&2; exit 1; }
-ok(){ printf '✓ %s\n' "$*"; }
-bad(){ printf '✗ %s\n' "$*" >&2; }
-warn(){ printf '! %s\n' "$*" >&2; }
-need_root(){ [[ $EUID -eq 0 ]] || die "this command requires root"; }
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_CYAN='' C_GREEN='' C_YELLOW='' C_RED='' C_BLUE=''
+fi
+
+die(){ printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+ok(){ printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+bad(){ printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn(){ printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+info(){ printf '%s›%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+need_root(){ [[ $EUID -eq 0 ]] || die "this command requires root (use sudo)"; }
+
+brand(){
+  printf '\n%s%sOpenProof%s  %sself-hosted identity infrastructure%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+  printf '%sby Genyleap%s\n\n' "$C_DIM" "$C_RESET"
+}
+
+section(){
+  printf '\n%s%s%s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"
+}
+
+field(){
+  printf '  %s%-15s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"
+}
+
+installed_version(){
+  if [[ -r "$INSTALL_ROOT/VERSION" ]]; then
+    tr -d '[:space:]' <"$INSTALL_ROOT/VERSION"
+    return
+  fi
+  if [[ -x "$INSTALL_ROOT/bin/opp" ]]; then
+    "$INSTALL_ROOT/bin/opp" --version 2>/dev/null | head -n1 || true
+  fi
+}
 
 usage(){
-cat <<'EOF'
-OpenProof management CLI
+  brand
+  cat <<EOF
+$C_BOLD Usage $C_RESET
+  openproof <command> [options]
 
-Usage:
-  openproof setup [--non-interactive]
-  openproof status
-  openproof doctor
-  openproof config [providers]
-  openproof update [--version VERSION | --channel stable|rc]
-  openproof backup /absolute/path/openproof.dump
-  openproof restore /absolute/path/openproof.dump POSTGRES_URL
-  openproof uninstall [--purge-data]
-  openproof version
+$C_BOLD Inspect $C_RESET
+  info                         Show installation and ownership information
+  status [--full]              Show service and readiness status
+  doctor                       Run deployment diagnostics
+  version                      Show the installed OpenProof version
+  logs [-f|--follow] [--lines N]
+                               Read service logs
+
+$C_BOLD Operate $C_RESET
+  start                        Start OpenProof
+  stop                         Stop OpenProof
+  restart                      Restart OpenProof
+  setup [--non-interactive]    Configure a new installation
+  config [main|providers|delivery]
+                               Show or edit configuration
+
+$C_BOLD Maintain $C_RESET
+  update [options]             Install the newest selected release
+  upgrade [options]            Alias for update
+      --channel stable|rc
+      --version VERSION
+  backup /absolute/path.dump   Back up the configured PostgreSQL database
+  restore FILE POSTGRES_URL    Restore into an empty PostgreSQL database
+  uninstall [--purge-data] [--yes]
+                               Remove OpenProof; config is preserved by default
+
+$C_DIM Docs:    $DOCS_URL
+Product: $PRODUCT_URL $C_RESET
 EOF
 }
 
 domain(){ [[ -r $MARKER ]] && head -n1 "$MARKER" || true; }
-database_url(){ [[ -r /etc/openproof/credentials/database.url ]] && cat /etc/openproof/credentials/database.url || true; }
+database_url(){ [[ -r "$CONFIG_DIR/credentials/database.url" ]] && cat "$CONFIG_DIR/credentials/database.url" || true; }
 
-cmd_status(){ systemctl --no-pager --full status openproof.service || true; }
+cmd_info(){
+  local v host service delivery
+  v=$(installed_version); [[ -n $v ]] || v="unknown"
+  host=$(domain); [[ -n $host ]] || host="not configured"
+  service=$(systemctl is-active openproof.service 2>/dev/null || true); [[ -n $service ]] || service="unknown"
+  delivery=$(systemctl is-active openproof-delivery.service 2>/dev/null || true); [[ -n $delivery ]] || delivery="inactive"
+
+  brand
+  section "Installation"
+  field "Version" "$v"
+  field "Domain" "$host"
+  field "Service" "$service"
+  field "Delivery" "$delivery"
+  field "Config" "$CONFIG_DIR"
+  field "Runtime" "$INSTALL_ROOT"
+
+  section "Self-hosted data model"
+  printf '  OpenProof runs on infrastructure you control. Genyleap does not operate\n'
+  printf '  this instance, and normal OpenProof runtime does not require a managed\n'
+  printf '  Genyleap backend for your identity database, credentials, sessions, or keys.\n\n'
+  printf '  You are responsible for hosting, access control, backups, upgrades,\n'
+  printf '  compliance, and any third-party services or providers you configure.\n'
+  printf '  Release installation/update may contact Genyleap and GitHub to resolve\n'
+  printf '  and download verified OpenProof artifacts.\n'
+
+  section "References"
+  field "Docs" "$DOCS_URL"
+  field "Privacy" "$PRIVACY_URL"
+  field "Terms" "$TERMS_URL"
+}
+
+cmd_status(){
+  local full=0 host
+  if (($#)); then
+    [[ $1 == --full ]] || die "usage: openproof status [--full]"
+    full=1
+  fi
+
+  brand
+  section "Runtime status"
+
+  if [[ -x "$INSTALL_ROOT/bin/opp" ]]; then ok "Binary installed ($(installed_version))"; else bad "Binary missing"; fi
+  if [[ -r "$CONFIG_FILE" ]]; then ok "Configuration present"; else warn "Configuration not present"; fi
+
+  if systemctl is-active --quiet openproof.service 2>/dev/null; then
+    ok "OpenProof service is running"
+  else
+    bad "OpenProof service is not running"
+  fi
+
+  if systemctl is-active --quiet openproof-delivery.service 2>/dev/null; then
+    ok "Delivery adapter is running"
+  else
+    info "Delivery adapter is inactive (may be intentional)"
+  fi
+
+  if curl -fsS --max-time 3 http://127.0.0.1:18443/health/ready >/dev/null 2>&1; then
+    ok "Local readiness endpoint is healthy"
+  else
+    warn "Local readiness endpoint is unavailable"
+  fi
+
+  host=$(domain)
+  if [[ -n $host ]]; then
+    field "Identity URL" "https://$host"
+  fi
+
+  if (( full )); then
+    section "systemd"
+    systemctl --no-pager --full status openproof.service || true
+  else
+    printf '\n%sTip:%s use %sopenproof status --full%s for the complete systemd view.\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
+  fi
+}
 
 cmd_doctor(){
   need_root
   local failures=0 host
-  printf 'OpenProof Doctor\n\n'
+  brand
+  section "OpenProof Doctor"
 
-  if [[ -x /opt/openproof/bin/opp ]]; then ok "Binary             installed"; else bad "Binary             missing"; failures=$((failures+1)); fi
+  if [[ -x "$INSTALL_ROOT/bin/opp" ]]; then ok "Binary             installed"; else bad "Binary             missing"; failures=$((failures+1)); fi
 
-  if [[ -r $CONFIG_FILE ]] && /opt/openproof/bin/opp check-config --config "$CONFIG_FILE" >/dev/null 2>&1; then
+  if [[ -r $CONFIG_FILE ]] && "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE" >/dev/null 2>&1; then
     ok "Configuration      valid"
   else
     bad "Configuration      invalid or missing"
@@ -78,80 +215,180 @@ cmd_doctor(){
 
 cmd_config(){
   need_root
-  local section=all editor
-  if (($#)); then section=$1; fi
-  case "$section" in
+  local section_name=all editor
+  if (($#)); then section_name=$1; fi
+  editor=$(printenv EDITOR 2>/dev/null || true)
+  [[ -n $editor ]] || editor=vi
+
+  case "$section_name" in
+    main)
+      [[ -f $CONFIG_FILE ]] || die "main configuration does not exist yet"
+      section "Main configuration"
+      "$editor" "$CONFIG_FILE"
+      chmod 0640 "$CONFIG_FILE"
+      chown root:openproof "$CONFIG_FILE"
+      "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE"
+      systemctl restart openproof.service
+      ok "Main configuration validated and OpenProof restarted"
+      ;;
     providers)
+      [[ -f $PROVIDERS_FILE ]] || die "provider configuration does not exist yet"
+      section "Provider configuration"
       printf 'Federation callback: https://%s/auth/federated/callback\n' "$(domain)"
       printf 'Provider credentials: %s\n' "$PROVIDERS_FILE"
-      editor=$(printenv EDITOR 2>/dev/null || true)
-      [[ -n $editor ]] || editor=vi
       "$editor" "$PROVIDERS_FILE"
       chmod 0640 "$PROVIDERS_FILE"
       chown root:openproof "$PROVIDERS_FILE"
       systemctl restart openproof.service
+      ok "Provider configuration saved and OpenProof restarted"
+      ;;
+    delivery|email)
+      [[ -f $DELIVERY_FILE ]] || die "delivery configuration does not exist; configure email delivery during setup first"
+      section "Delivery configuration"
+      "$editor" "$DELIVERY_FILE"
+      chmod 0640 "$DELIVERY_FILE"
+      chown root:openproof "$DELIVERY_FILE"
+      if systemctl is-enabled --quiet openproof-delivery.service 2>/dev/null; then
+        systemctl restart openproof-delivery.service
+        ok "Delivery configuration saved and adapter restarted"
+      else
+        ok "Delivery configuration saved"
+        info "The delivery adapter is not enabled on this host."
+      fi
       ;;
     all|"")
-      printf 'Main configuration: %s\n' "$CONFIG_FILE"
-      printf 'Provider credentials: %s\n' "$PROVIDERS_FILE"
-      printf 'Secrets: %s\n' "$CONFIG_DIR/credentials"
+      brand
+      section "Configuration"
+      field "Main" "$CONFIG_FILE"
+      field "Providers" "$PROVIDERS_FILE"
+      field "Delivery" "$DELIVERY_FILE"
+      field "Secrets" "$CONFIG_DIR/credentials"
       ;;
-    *) die "unknown config section: $section" ;;
+    *) die "unknown config section: $section_name (use main, providers, or delivery)" ;;
   esac
 }
 
 cmd_update(){
   need_root
-  local args="--no-setup" tmp
+  local tmp
+  local args=(--no-setup)
   while (($#)); do
     case "$1" in
-      --version) [[ $# -ge 2 ]] || die "--version requires a value"; args="$args --version $2"; shift 2 ;;
-      --channel) [[ $# -ge 2 ]] || die "--channel requires a value"; args="$args --channel $2"; shift 2 ;;
+      --version) [[ $# -ge 2 ]] || die "--version requires a value"; args+=(--version "$2"); shift 2 ;;
+      --channel) [[ $# -ge 2 ]] || die "--channel requires a value"; args+=(--channel "$2"); shift 2 ;;
       *) die "unknown update option: $1" ;;
     esac
   done
+
+  brand
+  section "Upgrade"
+  field "Current" "$(installed_version)"
+  info "Resolving and verifying the requested OpenProof release..."
+
   tmp=$(mktemp)
   trap 'rm -f "$tmp"' EXIT
-  curl -fsSL "$BOOTSTRAP_URL" -o "$tmp"
-  sh "$tmp" $args
-  systemctl restart openproof.service
+  curl -fsSL --retry 3 --connect-timeout 10 "$BOOTSTRAP_URL" -o "$tmp"
+  sh "$tmp" "${args[@]}"
+  rm -f "$tmp"
+  trap - EXIT
+
+  ok "Upgrade completed"
   cmd_doctor
+}
+
+cmd_service(){
+  need_root
+  local action=$1
+  systemctl "$action" openproof.service
+  ok "OpenProof service: $action"
+  systemctl --no-pager --full is-active openproof.service || true
+}
+
+cmd_logs(){
+  local follow=0 lines=100
+  while (($#)); do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      --lines) [[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] || die "--lines requires a number"; lines=$2; shift 2 ;;
+      *) die "usage: openproof logs [-f|--follow] [--lines N]" ;;
+    esac
+  done
+
+  if (( follow )); then
+    exec journalctl -u openproof.service -n "$lines" -f
+  fi
+  journalctl -u openproof.service -n "$lines" --no-pager
 }
 
 cmd_backup(){
   need_root
   [[ $# -eq 1 ]] || die "usage: openproof backup /absolute/path/openproof.dump"
+  local url
   url=$(database_url)
   [[ -n $url ]] || die "database credential file not found"
   OPENPROOF_DATABASE_URL="$url" /usr/lib/openproof/backup-postgres.sh "$1"
+  ok "Backup written to $1"
 }
 
 cmd_restore(){
   need_root
   [[ $# -eq 2 ]] || die "usage: openproof restore /absolute/path/openproof.dump POSTGRES_URL"
   OPENPROOF_RESTORE_DATABASE_URL="$2" OPENPROOF_RESTORE_ACK=YES_RESTORE_TO_EMPTY_DATABASE /usr/lib/openproof/restore-postgres.sh "$1"
+  ok "Restore completed"
+}
+
+confirm_uninstall(){
+  local tty="${SUDO_TTY:-/dev/tty}" answer
+  [[ -r $tty && -w $tty ]] || die "interactive confirmation requires a terminal; use --yes for automation"
+  printf '%sRemove OpenProof from this host? [y/N]: %s' "$C_YELLOW" "$C_RESET" >"$tty"
+  IFS= read -r answer <"$tty"
+  [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
 }
 
 cmd_uninstall(){
   need_root
-  local purge=0
-  if (($#)) && [[ $1 == --purge-data ]]; then purge=1; fi
+  local purge=0 assume_yes=0
+  while (($#)); do
+    case "$1" in
+      --purge-data) purge=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      *) die "usage: openproof uninstall [--purge-data] [--yes]" ;;
+    esac
+  done
+
+  brand
+  section "Uninstall"
+  warn "OpenProof services and binaries will be removed."
+  if (( purge )); then
+    warn "Configuration and local OpenProof credentials under /etc/openproof will also be removed."
+  else
+    info "Configuration under /etc/openproof will be preserved."
+  fi
+  warn "PostgreSQL databases are never dropped automatically."
+
+  if (( ! assume_yes )); then
+    confirm_uninstall || { info "Uninstall cancelled."; return 0; }
+  fi
+
   systemctl disable --now openproof.service >/dev/null 2>&1 || true
   systemctl disable --now openproof-delivery.service >/dev/null 2>&1 || true
-  rm -rf /opt/openproof /usr/lib/openproof /usr/share/openproof/templates
+  rm -rf "$INSTALL_ROOT" /usr/lib/openproof /usr/share/openproof/templates
   rm -f /usr/sbin/openproof /lib/systemd/system/openproof.service /lib/systemd/system/openproof-delivery.service
   systemctl daemon-reload >/dev/null 2>&1 || true
+
   if (( purge )); then
-    rm -rf /etc/openproof
-    warn "OpenProof configuration and local files were removed. PostgreSQL data was not dropped automatically."
+    rm -rf "$CONFIG_DIR"
+    ok "OpenProof binaries and local configuration removed"
   else
-    warn "OpenProof binaries were removed; configuration under /etc/openproof was preserved."
+    ok "OpenProof binaries removed; configuration preserved in $CONFIG_DIR"
   fi
 }
 
 cmd_version(){
-  [[ -x /opt/openproof/bin/opp ]] || die "OpenProof is not installed"
-  /opt/openproof/bin/opp --version 2>/dev/null || /opt/openproof/bin/opp version 2>/dev/null || true
+  local v
+  v=$(installed_version)
+  [[ -n $v ]] || die "OpenProof is not installed"
+  printf 'OpenProof %s\n' "$v"
 }
 
 cmd=""
@@ -160,14 +397,19 @@ if [[ -z $cmd ]]; then usage; exit 0; fi
 
 case "$cmd" in
   setup) need_root; exec /usr/lib/openproof/setup.sh "$@" ;;
+  info|about) cmd_info "$@" ;;
   status) cmd_status "$@" ;;
-  doctor) cmd_doctor "$@" ;;
+  doctor|check) cmd_doctor "$@" ;;
   config) cmd_config "$@" ;;
-  update) cmd_update "$@" ;;
+  update|upgrade) cmd_update "$@" ;;
+  start) cmd_service start ;;
+  stop) cmd_service stop ;;
+  restart) cmd_service restart ;;
+  logs) cmd_logs "$@" ;;
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
-  uninstall) cmd_uninstall "$@" ;;
+  uninstall|remove) cmd_uninstall "$@" ;;
   version|--version|-v) cmd_version ;;
   -h|--help|help) usage ;;
-  *) die "unknown command: $cmd" ;;
+  *) die "unknown command: $cmd (try 'openproof help')" ;;
 esac

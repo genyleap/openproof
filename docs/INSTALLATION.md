@@ -25,6 +25,24 @@ The packaged installer currently targets:
 Source builds remain available as a separate, explicit developer workflow and
 are never selected automatically by the production bootstrap installer.
 
+## Self-hosted operation and data responsibility
+
+OpenProof is software you operate on infrastructure you control; installing it
+does not create a managed Genyleap identity service. Normal OpenProof runtime does
+not require a Genyleap-hosted backend for the identity database, credentials,
+sessions, or cryptographic keys.
+
+The operator remains responsible for server administration, access control,
+backups, upgrades, legal/regulatory obligations, and any third-party identity,
+mail, RPC, TLS, database, or delivery services it chooses to configure.
+
+The installer and upgrade command may contact Genyleap and GitHub to resolve and
+download verified OpenProof release artifacts.
+
+- Product: https://genyleap.com/products/openproof
+- Privacy: https://genyleap.com/privacy
+- Terms: https://genyleap.com/terms-of-use
+
 ## What the setup wizard configures
 
 The setup wizard can provision the entire single-host deployment:
@@ -125,20 +143,40 @@ See [DELIVERY_WEBHOOK.md](DELIVERY_WEBHOOK.md) for the delivery contract.
 
 ## Operations
 
-The package installs the \`openproof\` management command:
+The bundle installs the \`openproof\` management command:
 
 \`\`\`bash
-sudo openproof status
+openproof info
+openproof status
+openproof status --full
 sudo openproof doctor
+
+sudo openproof start
+sudo openproof stop
+sudo openproof restart
+openproof logs --lines 200
+openproof logs --follow
+
 sudo openproof config
 sudo openproof config providers
+
 sudo openproof update
+sudo openproof upgrade --channel rc
+sudo openproof upgrade --version 1.1.0
+
 sudo openproof backup /var/backups/openproof.dump
+sudo openproof restore /var/backups/openproof.dump POSTGRES_URL
+
 sudo openproof uninstall
+sudo openproof uninstall --purge-data
 \`\`\`
 
+\`openproof info\` summarizes the installed version, configured identity domain,
+service state, local paths, self-hosted data model, and operator responsibility.
 \`openproof doctor\` checks the binary, configuration, systemd service, local
-readiness, PostgreSQL, Nginx, public readiness and OIDC discovery.
+readiness, PostgreSQL, Nginx, public readiness and OIDC discovery. Uninstall keeps
+\`/etc/openproof\` by default; \`--purge-data\` also removes local OpenProof
+configuration and credentials, but never drops PostgreSQL databases automatically.
 
 ## Security
 

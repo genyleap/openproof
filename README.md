@@ -13,7 +13,7 @@ proof, trust, sessions, and authorization as separate security boundaries. It is
 designed to run inside your own infrastructure and keep identity data under your
 control.
 
-> Current release: **1.1.0-rc1** · C++26 · PostgreSQL · self-hosted
+> Current release: **1.1.0-rc3** · C++26 · PostgreSQL · self-hosted
 
 ## What OpenProof includes
 
@@ -102,11 +102,11 @@ On a supported Ubuntu or Debian host:
 curl -fsSL https://genyleap.com/install/openproof | sudo sh
 ```
 
-The installer prefers a matching GitHub Release package and verifies its published
-SHA-256 checksum. Until a prebuilt package exists for the selected channel, Ubuntu
-hosts automatically fall back to a source build. The same wizard then guides you
-through PostgreSQL, secrets, the initial owner, email delivery, authentication
-providers, Nginx and TLS.
+The production installer downloads a matching prebuilt runtime bundle and verifies
+its published SHA-256 checksum. It never compiles OpenProof or installs compiler
+toolchains on the target host; missing release artifacts fail explicitly. The
+wizard then guides you through PostgreSQL, secrets, the initial owner, email
+delivery, authentication providers, Nginx and TLS.
 
 See [Installation](docs/INSTALLATION.md) for package-only, version-pinned and
 non-interactive deployments.
