@@ -67,11 +67,14 @@ jobs:
         run: |
           mkdir -p dist
           ./packaging/build-deb.sh cmake-build-gcc-release dist "${{ matrix.arch }}"
+          ./packaging/build-bundle.sh cmake-build-gcc-release dist "${{ matrix.arch }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: openproof-${{ matrix.arch }}
-          path: dist/*.deb
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -88,19 +91,23 @@ jobs:
 
       - name: Create checksums
         working-directory: dist
-        run: sha256sum openproof_*.deb | sort -k2 > SHA256SUMS
+        run: |
+          sha256sum openproof_*.deb openproof_*_linux_*.tar.gz | sort -k2 > SHA256SUMS
 
       - name: Inspect release assets
         run: |
           cat dist/SHA256SUMS
           test -f "dist/openproof_${{ needs.validate.outputs.version }}_amd64.deb"
           test -f "dist/openproof_${{ needs.validate.outputs.version }}_arm64.deb"
+          test -f "dist/openproof_${{ needs.validate.outputs.version }}_linux_amd64.tar.gz"
+          test -f "dist/openproof_${{ needs.validate.outputs.version }}_linux_arm64.tar.gz"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/openproof_*.deb
+            dist/openproof_*_linux_*.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

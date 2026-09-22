@@ -54,6 +54,7 @@ if [[ ! -x "$GCC_ROOT/bin/g++" ]]; then
 fi
 
 export PATH="$GCC_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$GCC_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [[ ! -f "$BOOST_ROOT/include/boost/version.hpp" ]]; then
   echo "Boost 1.88 cache miss; preparing required libraries."
@@ -79,6 +80,11 @@ fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'OPENPROOF_GCC_ROOT=%s\n' "$GCC_ROOT" >> "$GITHUB_ENV"
+  printf 'LD_LIBRARY_PATH=%s/lib64\n' "$GCC_ROOT" >> "$GITHUB_ENV"
+fi
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  printf '%s/bin\n' "$GCC_ROOT" >> "$GITHUB_PATH"
 fi
 
 "$GCC_ROOT/bin/g++" --version | head -n 1

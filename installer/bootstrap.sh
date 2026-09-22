@@ -7,29 +7,29 @@ REQUESTED_VERSION=""
 NON_INTERACTIVE=0
 NO_SETUP=0
 PLAN_ONLY=0
-API="https://api.github.com/repos/$REPO"
-RELEASES="https://github.com/$REPO/releases/download"
 GENYLEAP_RELEASES="https://genyleap.com/releases/openproof"
-SOURCE_INSTALLER="https://genyleap.com/install/openproof-source"
+GITHUB_RELEASES="https://github.com/$REPO/releases/download"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'OpenProof installer: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-OpenProof bootstrap installer
+OpenProof prebuilt installer
 
 Usage:
   curl -fsSL https://genyleap.com/install/openproof | sudo sh
   curl -fsSL https://genyleap.com/install/openproof | sudo sh -s -- [options]
 
 Options:
-  --version VERSION       Install an exact release, for example 1.1.0 or 1.1.0-rc1
+  --version VERSION       Install an exact release, for example 1.1.0 or 1.1.0-rc2
   --channel CHANNEL       auto (default), stable, or rc
   --non-interactive       Do not prompt during setup
-  --no-setup              Install the package only
+  --no-setup              Install/update OpenProof files only
   --plan                  Print the detected installation plan and exit
   -h, --help              Show this help
+
+This installer never builds OpenProof and never installs compiler/build dependencies.
 EOF
 }
 
@@ -46,9 +46,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "run this installer as root (for example via sudo)"
-command -v curl >/dev/null 2>&1 || die "curl is required"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
-command -v apt-get >/dev/null 2>&1 || die "this installer currently supports Debian/Ubuntu systems"
+
+for command_name in curl sha256sum tar install cp mv rm mktemp uname systemctl getent addgroup adduser; do
+  command -v "$command_name" >/dev/null 2>&1 || die "required base-system command not found: $command_name"
+done
 
 if [ -r /etc/os-release ]; then
   . /etc/os-release
@@ -76,14 +77,6 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 
-api_get() {
-  curl -fsSL     -H "Accept: application/vnd.github+json"     -H "User-Agent: OpenProof-Installer"     "$1"
-}
-
-extract_tag() {
-  sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
-}
-
 resolve_version() {
   if [ -n "$REQUESTED_VERSION" ]; then
     printf '%s\n' "$REQUESTED_VERSION" | sed 's/^v//'
@@ -93,30 +86,19 @@ resolve_version() {
   tag=""
   case "$CHANNEL" in
     stable)
-      tag=$(curl -fsSL "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
-      if [ -z "${tag:-}" ]; then
-        tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
-      fi
-      [ -n "${tag:-}" ] || die "no stable OpenProof release is available"
+      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      [ -n "${tag:-}" ] || die "no stable OpenProof prebuilt release is available"
       ;;
     rc)
-      tag=$(curl -fsSL "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
-      if [ -z "${tag:-}" ]; then
-        tag=$(api_get "$API/releases?per_page=20" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*-rc[^"]*\)".*/\1/p' | head -n 1) || true
-      fi
-      [ -n "${tag:-}" ] || die "no release-candidate build is available"
+      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/rc" 2>/dev/null | head -n 1) || true
+      [ -n "${tag:-}" ] || die "no OpenProof release-candidate build is available"
       ;;
     auto)
-      tag=$(curl -fsSL "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
+      tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/stable" 2>/dev/null | head -n 1) || true
       if [ -z "${tag:-}" ]; then
-        tag=$(curl -fsSL "$GENYLEAP_RELEASES/latest" 2>/dev/null | head -n 1) || true
+        tag=$(curl -fsSL --retry 3 --connect-timeout 10 "$GENYLEAP_RELEASES/latest" 2>/dev/null | head -n 1) || true
       fi
-      if [ -z "${tag:-}" ]; then
-        tag=$(api_get "$API/releases/latest" 2>/dev/null | extract_tag) || true
-      fi
-      if [ -z "${tag:-}" ]; then
-        tag=$(api_get "$API/releases?per_page=1" 2>/dev/null | extract_tag) || true
-      fi
+      [ -n "${tag:-}" ] || die "no OpenProof prebuilt release is available"
       ;;
     *) die "invalid channel '$CHANNEL'; use auto, stable, or rc" ;;
   esac
@@ -125,83 +107,50 @@ resolve_version() {
 }
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT INT TERM
+NEW_ROOT=""
+OLD_ROOT=""
+cleanup() {
+  rm -rf "$TMP"
+  [ -z "$NEW_ROOT" ] || rm -rf "$NEW_ROOT"
+}
+trap cleanup EXIT INT TERM
 
 OPENPROOF_VERSION=$(resolve_version)
+TAG="v$OPENPROOF_VERSION"
+ASSET="openproof_${OPENPROOF_VERSION}_linux_${ARCH}.tar.gz"
+BASE="$GENYLEAP_RELEASES/$TAG"
+GITHUB_BASE="$GITHUB_RELEASES/$TAG"
 
 if [ "$PLAN_ONLY" -eq 1 ]; then
   say "OpenProof installation plan"
   say "  system : ${PRETTY_NAME:-$ID}"
   say "  arch   : $ARCH"
-  if [ -n "$OPENPROOF_VERSION" ]; then
-    say "  mode   : prebuilt release"
-    say "  release: $OPENPROOF_VERSION"
-  else
-    say "  mode   : automatic source build"
-    say "  ref    : main"
-  fi
+  say "  mode   : verified prebuilt bundle"
+  say "  release: $OPENPROOF_VERSION"
+  say "  asset  : $ASSET"
+  say "  build  : never on the target host"
   exit 0
 fi
-
-if [ -z "$OPENPROOF_VERSION" ]; then
-  say ""
-  say "No prebuilt GitHub release is available yet."
-  say "Using the automatic Ubuntu source installer instead."
-  say ""
-  SOURCE_ARGS=""
-  [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
-  [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
-  SOURCE_SCRIPT="$TMP/source-install.sh"
-  curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
-  exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
-fi
-
-TAG="v$OPENPROOF_VERSION"
-ASSET="openproof_${OPENPROOF_VERSION}_${ARCH}.deb"
-BASE="$GENYLEAP_RELEASES/$TAG"
-GITHUB_BASE="$RELEASES/$TAG"
 
 say ""
 say "OpenProof"
 say "  release : $OPENPROOF_VERSION"
 say "  system  : ${PRETTY_NAME:-$ID}"
 say "  arch    : $ARCH"
+say "  mode    : prebuilt bundle"
 say ""
 
 say "Downloading release metadata..."
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"; then
   curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/SHA256SUMS" "$GITHUB_BASE/SHA256SUMS" 2>/dev/null || true
 fi
-if [ ! -s "$TMP/SHA256SUMS" ]; then
-  if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
-    say "! Prebuilt release metadata is unavailable; using the Ubuntu source installer."
-    SOURCE_ARGS=""
-    [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
-    [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
-    SOURCE_ARGS="$SOURCE_ARGS --ref $TAG"
-    SOURCE_SCRIPT="$TMP/source-install.sh"
-    curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
-    exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
-  fi
-  die "release metadata for $OPENPROOF_VERSION could not be downloaded"
-fi
+[ -s "$TMP/SHA256SUMS" ] || die "release metadata for $OPENPROOF_VERSION could not be downloaded; refusing to build from source"
 
-if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET" 2>/dev/null; then
+say "Downloading $ASSET..."
+if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
   curl -fsSL --retry 2 --connect-timeout 10 -o "$TMP/$ASSET" "$GITHUB_BASE/$ASSET" 2>/dev/null || true
 fi
-if [ ! -s "$TMP/$ASSET" ]; then
-  if [ "$CHANNEL" = "auto" ] && [ -z "$REQUESTED_VERSION" ]; then
-    say "! No prebuilt $ARCH package exists for $OPENPROOF_VERSION; using the Ubuntu source installer."
-    SOURCE_ARGS=""
-    [ "$NON_INTERACTIVE" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --non-interactive"
-    [ "$NO_SETUP" -eq 0 ] || SOURCE_ARGS="$SOURCE_ARGS --no-setup"
-    SOURCE_ARGS="$SOURCE_ARGS --ref $TAG"
-    SOURCE_SCRIPT="$TMP/source-install.sh"
-    curl -fsSL --retry 3 --connect-timeout 10 -o "$SOURCE_SCRIPT" "$SOURCE_INSTALLER"
-    exec bash "$SOURCE_SCRIPT" $SOURCE_ARGS
-  fi
-  die "$ASSET could not be downloaded"
-fi
+[ -s "$TMP/$ASSET" ] || die "no prebuilt $ARCH bundle exists for OpenProof $OPENPROOF_VERSION; refusing to build from source"
 
 expected=$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$TMP/SHA256SUMS" | head -n 1)
 [ -n "$expected" ] || die "$ASSET is not listed in SHA256SUMS"
@@ -209,20 +158,98 @@ actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
 [ "$expected" = "$actual" ] || die "checksum verification failed for $ASSET"
 say "✓ Release checksum verified"
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y "$TMP/$ASSET"
+if tar -tzf "$TMP/$ASSET" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+  die "release archive contains an unsafe path"
+fi
 
-say "✓ OpenProof package installed"
+EXTRACT="$TMP/root"
+mkdir -p "$EXTRACT"
+tar -xzf "$TMP/$ASSET" -C "$EXTRACT"
 
-if [ "$NO_SETUP" -eq 0 ]; then
+for required in \
+  opt/openproof/bin/opp \
+  opt/openproof/bin/opp.real \
+  opt/openproof/migrations \
+  usr/sbin/openproof \
+  usr/lib/openproof/setup.sh \
+  lib/systemd/system/openproof.service
+ do
+  [ -e "$EXTRACT/$required" ] || die "release bundle is incomplete: missing $required"
+done
+
+if ! getent group openproof >/dev/null 2>&1; then
+  addgroup --system openproof >/dev/null
+fi
+if ! id openproof >/dev/null 2>&1; then
+  adduser --system --ingroup openproof --home /nonexistent --no-create-home --shell /usr/sbin/nologin openproof >/dev/null
+fi
+install -d -o root -g openproof -m 0750 /etc/openproof /etc/openproof/credentials
+
+NEW_ROOT="/opt/openproof.new.$$"
+OLD_ROOT="/opt/openproof.old.$$"
+rm -rf "$NEW_ROOT" "$OLD_ROOT"
+cp -a "$EXTRACT/opt/openproof" "$NEW_ROOT"
+
+ALREADY_CONFIGURED=0
+[ ! -f /etc/openproof/.configured ] || ALREADY_CONFIGURED=1
+
+WAS_ACTIVE=0
+WAS_DELIVERY_ACTIVE=0
+if systemctl is-active --quiet openproof.service 2>/dev/null; then
+  WAS_ACTIVE=1
+  systemctl stop openproof.service
+fi
+if systemctl is-active --quiet openproof-delivery.service 2>/dev/null; then
+  WAS_DELIVERY_ACTIVE=1
+  systemctl stop openproof-delivery.service
+fi
+
+if [ -d /opt/openproof ]; then
+  mv /opt/openproof "$OLD_ROOT"
+fi
+mv "$NEW_ROOT" /opt/openproof
+NEW_ROOT=""
+
+install -m 0755 "$EXTRACT/usr/sbin/openproof" /usr/sbin/openproof
+install -d -m 0755 /usr/lib/openproof
+install -m 0755 "$EXTRACT/usr/lib/openproof/setup.sh" /usr/lib/openproof/setup.sh
+install -m 0755 "$EXTRACT/usr/lib/openproof/backup-postgres.sh" /usr/lib/openproof/backup-postgres.sh
+install -m 0755 "$EXTRACT/usr/lib/openproof/restore-postgres.sh" /usr/lib/openproof/restore-postgres.sh
+
+rm -rf /usr/share/openproof/templates
+install -d -m 0755 /usr/share/openproof/templates
+cp -a "$EXTRACT/usr/share/openproof/templates/." /usr/share/openproof/templates/
+
+install -m 0644 "$EXTRACT/lib/systemd/system/openproof.service" /lib/systemd/system/openproof.service
+install -m 0644 "$EXTRACT/lib/systemd/system/openproof-delivery.service" /lib/systemd/system/openproof-delivery.service
+systemctl daemon-reload
+
+rm -rf "$OLD_ROOT"
+OLD_ROOT=""
+
+say "✓ OpenProof prebuilt bundle installed"
+say "✓ No compiler or build dependency was installed"
+
+if [ "$NO_SETUP" -eq 0 ] && [ "$ALREADY_CONFIGURED" -eq 0 ]; then
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     /usr/sbin/openproof setup --non-interactive
   else
     /usr/sbin/openproof setup
   fi
 else
-  say ""
-  say "Package installed without configuration."
-  say "Run: sudo openproof setup"
+  if [ "$WAS_DELIVERY_ACTIVE" -eq 1 ]; then
+    systemctl restart openproof-delivery.service
+    say "✓ OpenProof delivery service restarted"
+  fi
+  if [ "$WAS_ACTIVE" -eq 1 ]; then
+    systemctl restart openproof.service
+    say "✓ OpenProof service restarted"
+  fi
+  if [ "$ALREADY_CONFIGURED" -eq 1 ]; then
+    say "✓ Existing OpenProof configuration preserved"
+  elif [ "$NO_SETUP" -eq 1 ]; then
+    say ""
+    say "OpenProof files installed without configuration."
+    say "Run: sudo openproof setup"
+  fi
 fi

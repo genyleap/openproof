@@ -7,10 +7,11 @@ curl -fsSL https://genyleap.com/install/openproof | sudo sh
 \`\`\`
 
 The bootstrap script detects the supported Debian/Ubuntu release and CPU
-architecture and prefers the matching GitHub Release package, verified against
-the published SHA-256 manifest. If no prebuilt release exists yet, Ubuntu hosts
-automatically install the qualified build dependencies, compile OpenProof, package
-it locally as a .deb, and continue into the same setup wizard.
+architecture, downloads the matching prebuilt OpenProof runtime bundle, and
+verifies it against the published SHA-256 manifest. The installer never compiles
+OpenProof on the target host and never installs a compiler, CMake, Boost, or other
+build dependencies. If a matching prebuilt bundle is unavailable, installation
+fails explicitly instead of falling back to a source build.
 
 ## Supported systems
 
@@ -21,7 +22,8 @@ The packaged installer currently targets:
 - AMD64 and ARM64;
 - systemd-based hosts.
 
-Source builds remain available for development and unsupported distributions.
+Source builds remain available as a separate, explicit developer workflow and
+are never selected automatically by the production bootstrap installer.
 
 ## What the setup wizard configures
 
@@ -46,9 +48,9 @@ shared federation callback is derived from the configured identity domain:
 https://identity.example.com/auth/federated/callback
 \`\`\`
 
-## Package-only installation
+## Bundle-only installation
 
-To install a release without running the setup wizard:
+To install or update the verified prebuilt bundle without running the setup wizard:
 
 \`\`\`bash
 curl -fsSL https://genyleap.com/install/openproof | sudo sh -s -- --no-setup

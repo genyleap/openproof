@@ -12,6 +12,7 @@ TEMPLATE_ROOT=/usr/share/openproof/templates
 MARKER=/etc/openproof/.configured
 NON_INTERACTIVE=0
 TTY=/dev/tty
+export PATH="$INSTALL_ROOT/bin:$PATH"
 
 log(){ printf '%s\n' "$*"; }
 ok(){ printf '✓ %s\n' "$*"; }
@@ -138,7 +139,6 @@ configure_external_database(){
   [[ -n $url ]] || url=$(prompt_secret "PostgreSQL connection URL" OPENPROOF_DATABASE_URL)
   [[ $url == postgresql://* || $url == postgres://* ]] || die "database URL must use postgres:// or postgresql://"
   secret_file database.url "$url"
-  apt_install postgresql-client
   ok "External PostgreSQL configured"
 }
 
@@ -525,7 +525,8 @@ OWNER_SUBJECT=$(env_value OPENPROOF_OWNER_SUBJECT); [[ -n $OWNER_SUBJECT ]] || O
 [[ -n $OWNER_SUBJECT ]] || die "initial owner subject is required"
 
 ensure_user
-apt_install ca-certificates curl openssl
+command -v curl >/dev/null 2>&1 || die "curl is required by setup"
+command -v openssl >/dev/null 2>&1 || die "the bundled OpenSSL runtime is missing"
 generate_secrets
 
 DB_MODE=$(env_value OPENPROOF_DATABASE_MODE); [[ -n $DB_MODE ]] || DB_MODE=local

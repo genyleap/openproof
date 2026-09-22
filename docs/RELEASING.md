@@ -21,7 +21,8 @@ CI validates:
 - the JavaScript SDK;
 - the GCC 16 / C++26 release build;
 - the CTest suite;
-- Debian package generation.
+- Debian package generation;
+- standalone runtime bundle generation.
 
 ## 2. Tag
 
@@ -48,6 +49,8 @@ The tag workflow builds on native AMD64 and ARM64 GitHub runners and publishes:
 \`\`\`text
 openproof_<version>_amd64.deb
 openproof_<version>_arm64.deb
+openproof_<version>_linux_amd64.tar.gz
+openproof_<version>_linux_arm64.tar.gz
 SHA256SUMS
 \`\`\`
 
@@ -56,7 +59,7 @@ prereleases. Other matching tags are normal releases.
 
 The public bootstrap endpoint at
 \`https://genyleap.com/install/openproof\` resolves releases from GitHub and
-verifies the selected package against \`SHA256SUMS\` before installation.
+verifies the selected prebuilt runtime bundle against \`SHA256SUMS\` before installation.
 
 ## 4. Verify after publishing
 

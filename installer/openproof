@@ -138,10 +138,14 @@ cmd_uninstall(){
   if (($#)) && [[ $1 == --purge-data ]]; then purge=1; fi
   systemctl disable --now openproof.service >/dev/null 2>&1 || true
   systemctl disable --now openproof-delivery.service >/dev/null 2>&1 || true
-  if command -v apt-get >/dev/null 2>&1; then apt-get remove -y openproof; fi
+  rm -rf /opt/openproof /usr/lib/openproof /usr/share/openproof/templates
+  rm -f /usr/sbin/openproof /lib/systemd/system/openproof.service /lib/systemd/system/openproof-delivery.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
   if (( purge )); then
-    rm -rf /etc/openproof /opt/openproof
+    rm -rf /etc/openproof
     warn "OpenProof configuration and local files were removed. PostgreSQL data was not dropped automatically."
+  else
+    warn "OpenProof binaries were removed; configuration under /etc/openproof was preserved."
   fi
 }
 

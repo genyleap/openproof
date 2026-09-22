@@ -2,6 +2,18 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc2 — 2026-09-22
+
+### Installation and release delivery
+
+- Replaced target-host source-build fallback with verified prebuilt Linux bundles.
+- Added self-contained AMD64 and ARM64 runtime bundles with required non-glibc
+  shared libraries and a bundled OpenSSL CLI.
+- The bootstrap installer no longer installs compilers, build toolchains, or
+  OpenProof runtime library packages on the target host.
+- Missing release artifacts now fail explicitly instead of compiling OpenProof
+  or GCC on the user's machine.
+
 ## 1.1.0-rc1 — 2026-09-21
 
 ### Identity and authentication
