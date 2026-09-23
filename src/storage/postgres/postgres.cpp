@@ -1732,7 +1732,8 @@ PostgresExternalIdentityDirectory::updatePresentation(
         "UPDATE openproof.external_identities SET "
         "display_name=COALESCE(NULLIF($3,''),display_name),"
         "preferred_username=COALESCE(NULLIF($4,''),preferred_username),"
-        "picture_url=COALESCE(NULLIF($5,''),picture_url) "
+        "picture_url=CASE WHEN $1='telegram' THEN NULLIF($5,'') "
+        "ELSE COALESCE(NULLIF($5,''),picture_url) END "
         "WHERE provider=$1 AND external_subject=$2 RETURNING identity_id",
         {std::string{external.providerId().value()}, std::string{external.subject().value()},
          optionalText(external.displayName()), optionalText(external.preferredUsername()),

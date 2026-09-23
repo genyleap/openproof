@@ -178,6 +178,9 @@ foundation::Status IdentityProfile::applyVerifiedClaims(
     if (const auto value = claims.get(provider::ClaimName::PreferredUsername); value) {
         m_preferredUsername = std::string{*value};
     }
+    if (!m_displayName && m_preferredUsername) {
+        m_displayName = *m_preferredUsername;
+    }
     if (const auto value = claims.get(provider::ClaimName::Email); value) {
         m_email = std::string{*value};
         m_emailVerified = claims.isTrue(provider::ClaimName::EmailVerified);
@@ -221,6 +224,10 @@ foundation::Status IdentityProfile::refreshPresentationClaims(
             m_preferredUsername = std::string{*value};
             changed = true;
         }
+    }
+    if (!m_displayName && m_preferredUsername) {
+        m_displayName = *m_preferredUsername;
+        changed = true;
     }
     if (!m_locale) {
         if (const auto value = claims.get(provider::ClaimName::Locale); value) {

@@ -356,6 +356,31 @@ TEST(ExternalIdentityDirectoryTest, StoresPresentationMetadataWithoutChangingOwn
               std::optional<std::string>{"https://example.test/alice.png"});
 }
 
+TEST(ExternalIdentityDirectoryTest, TelegramRefreshClearsStalePictureAndPreservesTextPresentation)
+{
+    core::InMemoryExternalIdentityDirectory directory;
+    const auto bare = externalRef("telegram", "12345");
+    ASSERT_TRUE(directory.attach(linkedRequest("id-1", bare)).has_value());
+
+    const core::ExternalIdentityRef presentation{
+        idp::ProviderId{"telegram"}, idp::ExternalSubject{"12345"},
+        std::string{"Alice"}, std::string{"alice"},
+        std::string{"https://t.me/i/userpic/320/stale.jpg"}};
+    ASSERT_TRUE(directory.updatePresentation(presentation).has_value());
+
+    const core::ExternalIdentityRef withoutPicture{
+        idp::ProviderId{"telegram"}, idp::ExternalSubject{"12345"},
+        std::nullopt, std::nullopt, std::nullopt};
+    ASSERT_TRUE(directory.updatePresentation(withoutPicture).has_value());
+
+    const auto refreshed = directory.externalIdentitiesOf(core::IdentityId{"id-1"});
+    ASSERT_TRUE(refreshed.has_value());
+    ASSERT_EQ(refreshed->size(), 1U);
+    EXPECT_EQ(refreshed->front().displayName(), std::optional<std::string>{"Alice"});
+    EXPECT_EQ(refreshed->front().preferredUsername(), std::optional<std::string>{"alice"});
+    EXPECT_FALSE(refreshed->front().pictureUrl().has_value());
+}
+
 TEST(ExternalIdentityDirectoryTest, ConcurrentProtectedDetachAlwaysLeavesOneSignInMethod)
 {
     core::InMemoryExternalIdentityDirectory directory;

@@ -404,7 +404,9 @@ InMemoryExternalIdentityDirectory::updatePresentation(const ExternalIdentityRef&
             external.providerId(), external.subject(),
             external.displayName().has_value() ? external.displayName() : previous.displayName(),
             external.preferredUsername().has_value() ? external.preferredUsername() : previous.preferredUsername(),
-            external.pictureUrl().has_value() ? external.pictureUrl() : previous.pictureUrl()});
+            external.providerId().value() == "telegram"
+                ? external.pictureUrl()
+                : (external.pictureUrl().has_value() ? external.pictureUrl() : previous.pictureUrl())});
     }
     return foundation::ok();
 }

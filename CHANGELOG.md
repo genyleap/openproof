@@ -2,6 +2,30 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc3 — 2026-09-24
+
+### Identity presentation and federation
+
+- Federated identities that provide a preferred username but no display name now
+  use that username as the initial canonical display name, avoiding empty-name
+  profiles for providers that expose only a handle.
+- Telegram OIDC keeps the standard `name`, `preferred_username` and `picture`
+  claims authoritative while accepting Telegram-specific first/last-name and
+  username aliases only as text-presentation fallbacks.
+- Removed the legacy Telegram `photo_url` image fallback because those URLs can
+  become stale or return 404 after linking. A Telegram presentation refresh now
+  clears a stale stored picture when the provider no longer supplies a valid
+  standard OIDC picture claim, without discarding the saved display name or
+  username.
+
+### Release metadata and documentation
+
+- Synchronized the public release version across `VERSION`, OpenAPI, SDK
+  metadata, the handbook, installation examples and release documentation.
+- Release instructions and production qualification now derive the active
+  release version from `VERSION` instead of embedding an RC number that can
+  silently become stale.
+
 ## 1.1.0-rc2 — 2026-09-23
 
 ### Fixed

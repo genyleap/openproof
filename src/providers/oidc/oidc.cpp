@@ -373,6 +373,32 @@ void applyStandardProfileClaims(
     }
 }
 
+void applyTelegramProfileAliases(
+    const json::object& source, idp::VerifiedClaims& claims)
+{
+    if (!claims.get(idp::ClaimName::DisplayName)) {
+        const auto first = stringValue(source, "first_name");
+        const auto last = stringValue(source, "last_name");
+        const auto view = [](const std::optional<std::string>& value)
+            -> std::optional<std::string_view> {
+            return value ? std::optional<std::string_view>{*value} : std::nullopt;
+        };
+        if (const auto display = detail::displayName(
+                std::nullopt, view(first), view(last)); display) {
+            claims.set(idp::ClaimName::DisplayName, *display);
+        }
+    }
+
+    if (!claims.get(idp::ClaimName::PreferredUsername)) {
+        const auto username = stringValue(source, "username");
+        if (username && detail::safeProfileText(
+                *username, detail::kPreferredUsernameMaximum)) {
+            claims.set(idp::ClaimName::PreferredUsername, *username);
+        }
+    }
+
+}
+
 [[nodiscard]] std::optional<std::string> appleDisplayName(
     const idp::SecretAttributeMap& parameters)
 {
@@ -905,6 +931,10 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     applyStandardProfileClaims(payload.value(), claims);
     if (userInfo) {
         applyStandardProfileClaims(*userInfo, claims);
+    }
+    if (m_implementation->config.providerId().value() == "telegram") {
+        applyTelegramProfileAliases(payload.value(), claims);
+        if (userInfo) applyTelegramProfileAliases(*userInfo, claims);
     }
     if (!claims.get(idp::ClaimName::DisplayName)
         && m_implementation->config.providerId().value() == "apple") {

@@ -1,6 +1,6 @@
 # OpenProof Deployment & Developer Handbook
 
-> Version scope: OpenProof 1.1.0-rc2
+> Version scope: OpenProof 1.1.0-rc3
 > Audience: operators, backend engineers, web developers, mobile/desktop developers and security reviewers  
 > Canonical docs: https://docs.genyleap.com/openproof/
 
@@ -98,7 +98,7 @@ Pin a version:
 
 ```bash
 curl -fsSL https://genyleap.com/install/openproof | \
-  sudo sh -s -- --version 1.1.0-rc2
+  sudo sh -s -- --version 1.1.0-rc3
 ```
 
 Use the RC channel explicitly:

@@ -676,6 +676,37 @@ TEST(AuthenticationServiceTest, SelfProvisioningPersistsVerifiedProfileClaims)
     EXPECT_TRUE(stored->value().emailVerified());
 }
 
+TEST(AuthenticationServiceTest, SelfProvisioningUsesProviderUsernameAsInitialDisplayName)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "username-only-subject";
+    fixture.implementation->claims.set(idp::ClaimName::PreferredUsername, "provider-handle");
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(
+        idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+    const auto binding = bindingOf("username-fallback-browser");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-username-fallback"});
+    ASSERT_TRUE(started);
+
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+    auto stored = profiles.find(completed->identity());
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().preferredUsername(), "provider-handle");
+    EXPECT_EQ(stored->value().displayName(), "provider-handle");
+}
+
 TEST(AuthenticationServiceTest, SelfProvisioningConvergesOnSingleActiveVerifiedEmail)
 {
     Fixture fixture;
