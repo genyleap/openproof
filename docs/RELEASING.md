@@ -29,8 +29,8 @@ CI validates:
 For a release candidate:
 
 \`\`\`bash
-git tag -a v1.1.0-rc1 -m "OpenProof 1.1.0-rc1"
-git push origin v1.1.0-rc1
+git tag -a v1.1.0-rc2 -m "OpenProof 1.1.0-rc2"
+git push origin v1.1.0-rc2
 \`\`\`
 
 For a stable release:

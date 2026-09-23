@@ -19,7 +19,7 @@ fail() {
 
 # The PostgreSQL integration fixture truncates OpenProof tables. Never point this
 # script at production, staging, or a shared development database.
-printf 'OpenProof 1.1.0-rc1 production qualification\n'
+printf 'OpenProof 1.1.0-rc2 production qualification\n'
 printf 'PostgreSQL target: configured (value intentionally not printed)\n'
 
 OPENPROOF_STATIC_ONLY=1 "${ROOT_DIR}/scripts/verify-release.sh"

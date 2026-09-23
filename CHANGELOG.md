@@ -2,6 +2,29 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc2 — 2026-09-23
+
+### Fixed
+
+- Fixed duplicate canonical identities when a user first authenticated through a
+  trusted federated provider and later enrolled local email/password with the
+  same verified email. OpenProof now converges that enrollment onto the single
+  active canonical identity instead of creating a second account.
+- Verified-email convergence now fails closed when the same verified email is
+  associated with multiple active identities, or with a suspended/non-authenticating
+  identity, rather than guessing which identity should own the new sign-in method.
+- Completing signup email verification now establishes an IAL1 browser session,
+  so a user does not need to perform a second sign-in immediately after proving
+  control of the email address. The OpenAPI response now exposes `session_id`
+  and `assurance` consistently with that behavior.
+
+### Documentation and developer tooling
+
+- Added the end-to-end Deployment & Developer Handbook covering installation,
+  production setup, OAuth/OIDC integration, Node.js, PHP, C++ and generic HTTP.
+- Added machine-readable LLM documentation entry points plus the public,
+  read-only OpenProof documentation MCP server and its reproducible source.
+
 ## 1.1.0-rc1 — 2026-09-22
 
 ### Identity and authentication
