@@ -44,6 +44,12 @@ async function openapiText() {
   return readFile(OPENAPI, 'utf8');
 }
 
+async function currentOpenProofVersion() {
+  const yaml = await openapiText();
+  const match = /^  version:\s*([^\s#]+)\s*$/m.exec(yaml);
+  return match?.[1] ?? 'unknown';
+}
+
 function sectionFromMarkdown(markdown, title) {
   const lines = markdown.split(/\r?\n/);
   const wanted = normalize(title);
@@ -275,7 +281,10 @@ function buildMcp() {
     title: 'Get OpenProof sources',
     description: 'Return the canonical public OpenProof documentation, LLM and OpenAPI entry points.',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async () => result(JSON.stringify(URLS, null, 2)));
+  }, async () => {
+    const openproofRelease = await currentOpenProofVersion();
+    return result(JSON.stringify({ openproofRelease, docsMcpVersion: VERSION, ...URLS }, null, 2));
+  });
 
   return mcp;
 }
@@ -300,7 +309,13 @@ const httpServer = createServer(async (req, res) => {
         'content-type': 'application/json; charset=utf-8',
         'cache-control': 'no-store',
       });
-      res.end(JSON.stringify({ ok: true, service: 'openproof-docs-mcp', version: VERSION }));
+      const openproofRelease = await currentOpenProofVersion();
+      res.end(JSON.stringify({
+        ok: true,
+        service: 'openproof-docs-mcp',
+        version: VERSION,
+        openproofRelease,
+      }));
       return;
     }
     if (url.pathname !== '/mcp') {
