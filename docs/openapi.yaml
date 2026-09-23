@@ -106,9 +106,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [verified]
+                required: [verified, session_id, assurance]
                 properties:
                   verified: {type: boolean, const: true}
+                  session_id: {type: string}
+                  assurance: {type: string, enum: [ial1]}
         "400": {$ref: "#/components/responses/Error"}
   /account/email/resend:
     post:

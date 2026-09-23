@@ -2,6 +2,8 @@ module;
 
 #include <memory>
 #include <optional>
+#include <string_view>
+#include <vector>
 
 export module openproof.identity.profile:repository;
 
@@ -20,6 +22,8 @@ public:
     [[nodiscard]] virtual foundation::Status save(const IdentityProfile& profile) = 0;
     [[nodiscard]] virtual foundation::Result<std::optional<IdentityProfile>>
     find(const core::IdentityId& identity) const = 0;
+    [[nodiscard]] virtual foundation::Result<std::vector<core::IdentityId>>
+    findVerifiedByEmail(std::string_view email) const = 0;
 
 protected:
     IdentityProfileRepository() = default;
@@ -37,6 +41,8 @@ public:
     [[nodiscard]] foundation::Status save(const IdentityProfile& profile) override;
     [[nodiscard]] foundation::Result<std::optional<IdentityProfile>>
     find(const core::IdentityId& identity) const override;
+    [[nodiscard]] foundation::Result<std::vector<core::IdentityId>>
+    findVerifiedByEmail(std::string_view email) const override;
 
 private:
     struct Impl;

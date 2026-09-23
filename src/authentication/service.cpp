@@ -566,12 +566,67 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     }
     identity::core::IdentityId identity;
     if (!owner->has_value()) {
-        if (!m_trustPolicy.maySelfProvision(outcome.provider())
-            || m_lifecycleRepository == nullptr || m_organization.empty()) {
+        bool convergedByVerifiedEmail = false;
+        if (m_profileRepository != nullptr
+            && m_lifecycleRepository != nullptr
+            && !m_organization.empty()
+            && m_trustPolicy.maySelfProvision(outcome.provider())
+            && outcome.claims().isTrue(provider::ClaimName::EmailVerified)) {
+            const auto verifiedEmail = outcome.claims().get(provider::ClaimName::Email);
+            if (verifiedEmail.has_value() && !verifiedEmail->empty()) {
+                auto candidates = m_profileRepository->findVerifiedByEmail(*verifiedEmail);
+                if (!candidates) return foundation::fail(candidates.error());
+
+                std::vector<identity::core::IdentityId> activeCandidates;
+                activeCandidates.reserve(candidates->size());
+                std::size_t blockedCandidates = 0U;
+                for (const auto& candidate : candidates.value()) {
+                    auto canonical = m_lifecycleRepository->findById(m_organization, candidate);
+                    if (!canonical) return foundation::fail(canonical.error());
+                    if (!canonical->has_value()) continue;
+                    if (canonical->value().canAuthenticate()) {
+                        activeCandidates.push_back(candidate);
+                        continue;
+                    }
+                    const auto status = canonical->value().status();
+                    if (status != identity::core::IdentityStatus::Deleted
+                        && status != identity::core::IdentityStatus::Merged) {
+                        ++blockedCandidates;
+                    }
+                }
+
+                if (activeCandidates.size() > 1U
+                    || (blockedCandidates > 0U && !activeCandidates.empty())) {
+                    return foundation::fail(
+                        foundation::ErrorCode::Conflict,
+                        "That verified email is already associated with multiple identities.",
+                        "Federated sign-in refused to guess between canonical identities that "
+                        "share the same verified email. An explicit merge is required.");
+                }
+                if (activeCandidates.empty() && blockedCandidates > 0U) {
+                    return foundation::fail(authenticationFailure(
+                        "Federated sign-in refused to self-provision because the verified email "
+                        "belongs to an existing non-authenticating canonical identity."));
+                }
+                if (activeCandidates.size() == 1U) {
+                    identity = activeCandidates.front();
+                    auto attached = attachVerified(identity, external, completedAt);
+                    if (!attached) return foundation::fail(attached.error());
+                    convergedByVerifiedEmail = true;
+                }
+            }
+        }
+
+        if (!convergedByVerifiedEmail
+            && (!m_trustPolicy.maySelfProvision(outcome.provider())
+                || m_lifecycleRepository == nullptr || m_organization.empty())) {
             return foundation::fail(authenticationFailure(
                 "Authentication completion refused: the external identity has no explicit link to "
                 "a canonical identity."));
         }
+        if (convergedByVerifiedEmail) {
+            // Continue below so provider presentation claims refresh on the canonical identity.
+        } else {
         auto generated = security::randomTokenBase64Url(24U);
         if (!generated) return foundation::fail(generated.error());
         identity = identity::core::IdentityId{"opi_" + std::move(generated).value()};
@@ -606,6 +661,7 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
                 m_organization, identity, identity::core::IdentityStatus::Deleted));
             return foundation::fail(attached.error());
         }
+        }
     } else {
         identity = std::move(owner).value().value();
     }
@@ -632,6 +688,35 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
         }
     }
     return VerifiedAuthentication{std::move(outcome), std::move(identity)};
+}
+
+foundation::Result<VerifiedAuthentication>
+AuthenticationService::acceptVerifiedEmail(
+    const identity::core::ExternalIdentityRef& external)
+{
+    auto owner = m_identities.ownerOf(external);
+    if (!owner) return foundation::fail(owner.error());
+    if (!owner->has_value()) {
+        return foundation::fail(
+            foundation::ErrorCode::AuthenticationFailed,
+            "The verified email is not linked to an active identity.");
+    }
+    auto active = requireActiveIdentity(owner->value());
+    if (!active) return foundation::fail(active.error());
+
+    provider::VerifiedClaims claims;
+    claims.set(provider::ClaimName::Email, std::string{external.subject().value()});
+    claims.set(provider::ClaimName::EmailVerified, "true");
+    provider::ProviderEvidence evidence;
+    evidence.add("method", "email_verification_link");
+    auto outcome = provider::AuthenticationOutcome::create(
+        external.providerId(), external.subject(), std::move(claims),
+        provider::AssuranceLevel::Ial1,
+        provider::AuthenticationStrength{provider::AuthenticationFactor::Possession, false},
+        std::move(evidence), m_clock.now());
+    if (!outcome) return foundation::fail(outcome.error());
+    return VerifiedAuthentication{
+        std::move(outcome).value(), std::move(owner).value().value()};
 }
 
 foundation::Result<identity::core::ExternalIdentityRef>

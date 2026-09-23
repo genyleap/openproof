@@ -13,6 +13,10 @@ Notable user-facing changes to OpenProof are recorded here.
 - Added Google, GitHub, Microsoft, Apple, LinkedIn, Telegram and X federation.
 - Added Ethereum SIWE and Farcaster SIWF authentication.
 - Added SAML, LDAPS and SCIM enterprise integration.
+- Verified-email convergence now reuses one active canonical identity across
+  federated and local-email enrollment instead of creating a duplicate identity;
+  ambiguous or suspended matches fail closed, and successful signup-email
+  verification establishes an IAL1 browser session.
 
 ### OAuth, OIDC and access
 

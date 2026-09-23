@@ -5134,6 +5134,28 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
         return std::optional<identity::profile::IdentityProfile>{std::move(profile).value()};
     }
 
+    foundation::Result<std::vector<identity::core::IdentityId>>
+    PostgresIdentityProviderStore::findVerifiedByEmail(std::string_view email) const
+    {
+        auto lease=m_pool->m_implementation->acquire();
+        if(!lease)return foundation::fail(lease.error());
+        ResultPointer result=execParams(
+            lease->get(),
+            "SELECT identity_id FROM openproof.identity_profiles "
+            "WHERE email_verified=true AND email IS NOT NULL AND lower(email)=lower($1) "
+            "ORDER BY created_at_ms,identity_id",
+            {std::string{email}});
+        if(!tuplesOk(result.get())) {
+            return foundation::fail(databaseError(result.get(),"find verified identity by email"));
+        }
+        std::vector<identity::core::IdentityId> output;
+        output.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+        for(int row=0;row<PQntuples(result.get());++row) {
+            output.emplace_back(field(result.get(),row,0));
+        }
+        return output;
+    }
+
     foundation::Status PostgresIdentityProviderStore::add(evidence::Evidence value)
     {
         std::vector<evidence::Evidence> batch;

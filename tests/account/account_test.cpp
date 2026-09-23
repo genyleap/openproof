@@ -148,6 +148,54 @@ struct Fixture {
     CapturingDelivery delivery;
     std::unique_ptr<account::AccountService> service;
 };
+TEST(AccountEmailLinkingTest, SignupConvergesOnExistingActiveVerifiedEmail)
+{
+    Fixture fixture;
+    const auto identity = fixture.addActiveIdentity(
+        "id-social-first", std::string{"person@example.com"}, true);
+    const fnd::SecretString password{"correct-password"};
+
+    auto signup = fixture.service->signup(
+        "PERSON@example.com", password, std::string{"Person"});
+    ASSERT_TRUE(signup) << signup.error().internalDetail();
+    EXPECT_EQ(signup.value(), identity);
+    EXPECT_EQ(fixture.delivery.purpose, account::VerificationPurpose::SignupEmail);
+    EXPECT_EQ(fixture.delivery.destination, "person@example.com");
+
+    const fnd::SecretString proof{fixture.delivery.secret};
+    ASSERT_TRUE(fixture.service->verifyEmail(
+        account::VerificationId{fixture.delivery.id}, proof));
+
+    const core::ExternalIdentityRef localRef{
+        fixture.localProvider, idp::ExternalSubject{"person@example.com"}};
+    auto owner = fixture.externalIdentities.ownerOf(localRef);
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), identity);
+
+    auto verified = fixture.localAccounts->verify(
+        idp::ExternalSubject{"person@example.com"}, password, std::nullopt, kNow);
+    ASSERT_TRUE(verified);
+    EXPECT_EQ(verified.value(), local::LocalVerification::Password);
+}
+
+TEST(AccountEmailLinkingTest, SignupRefusesVerifiedEmailOnSuspendedIdentity)
+{
+    Fixture fixture;
+    const auto identity = fixture.addActiveIdentity(
+        "id-suspended", std::string{"suspended@example.com"}, true);
+    ASSERT_TRUE(fixture.identities.changeStatus(
+        fixture.organization, identity, core::IdentityStatus::Suspended));
+
+    const fnd::SecretString password{"correct-password"};
+    auto signup = fixture.service->signup(
+        "suspended@example.com", password, std::string{"Suspended"});
+
+    ASSERT_FALSE(signup);
+    EXPECT_EQ(signup.error().code(), fnd::ErrorCode::AlreadyExists);
+    EXPECT_TRUE(fixture.delivery.id.empty());
+}
+
 TEST(AccountEmailLinkingTest, SameVerifiedProfileEmailStillDispatchesFreshProof)
 {
     Fixture fixture;

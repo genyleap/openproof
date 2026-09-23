@@ -1,9 +1,14 @@
 module;
 
+#include <algorithm>
+#include <cctype>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 module openproof.identity.profile;
 
@@ -37,6 +42,26 @@ InMemoryIdentityProfileRepository::find(const core::IdentityId& identity) const
     const auto found = m_impl->profiles.find(identity);
     if (found == m_impl->profiles.end()) return std::optional<IdentityProfile>{};
     return std::optional<IdentityProfile>{*found->second};
+}
+
+foundation::Result<std::vector<core::IdentityId>>
+InMemoryIdentityProfileRepository::findVerifiedByEmail(std::string_view email) const
+{
+    std::string needle{email};
+    std::ranges::transform(needle, needle.begin(), [](char symbol) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(symbol)));
+    });
+    std::vector<core::IdentityId> matches;
+    std::scoped_lock lock{m_impl->mutex};
+    for (const auto& [identity, profile] : m_impl->profiles) {
+        if (!profile->emailVerified() || !profile->email().has_value()) continue;
+        std::string candidate{*profile->email()};
+        std::ranges::transform(candidate, candidate.begin(), [](char symbol) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(symbol)));
+        });
+        if (candidate == needle) matches.push_back(identity);
+    }
+    return matches;
 }
 
 }

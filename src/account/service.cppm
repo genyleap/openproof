@@ -130,6 +130,11 @@ public:
     [[nodiscard]] foundation::Status verifyEmail(
         const VerificationId& id, const foundation::SecretString& secret);
 
+    /** Verifies signup email and returns the now-linked local identity reference. */
+    [[nodiscard]] foundation::Result<identity::core::ExternalIdentityRef>
+    verifyEmailAndGetExternal(
+        const VerificationId& id, const foundation::SecretString& secret);
+
     [[nodiscard]] foundation::Status beginEmailChange(
         const identity::core::IdentityId& identity, std::string replacementEmail);
 

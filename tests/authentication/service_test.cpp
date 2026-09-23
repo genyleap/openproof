@@ -676,6 +676,140 @@ TEST(AuthenticationServiceTest, SelfProvisioningPersistsVerifiedProfileClaims)
     EXPECT_TRUE(stored->value().emailVerified());
 }
 
+TEST(AuthenticationServiceTest, SelfProvisioningConvergesOnSingleActiveVerifiedEmail)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "google-subject-new";
+    fixture.implementation->claims.set(idp::ClaimName::Email, "person@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId existingIdentity{"existing-local-identity"};
+
+    auto canonical = core::Identity::create(
+        existingIdentity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+
+    auto current = profile::IdentityProfile::create(existingIdentity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->setEmail("person@example.test", true, kNow));
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(
+        idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("verified-email-convergence");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-email-convergence"});
+    ASSERT_TRUE(started);
+
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+    EXPECT_EQ(completed->identity(), existingIdentity);
+
+    auto owner = fixture.identities.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"google-subject-new"}});
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(owner->has_value());
+    EXPECT_EQ(owner->value(), existingIdentity);
+}
+
+TEST(AuthenticationServiceTest, VerifiedEmailConvergenceRefusesSuspendedIdentity)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "suspended-social-subject";
+    fixture.implementation->claims.set(idp::ClaimName::Email, "suspended@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId existingIdentity{"identity-suspended"};
+
+    auto canonical = core::Identity::create(
+        existingIdentity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(canonical->changeStatus(core::IdentityStatus::Suspended));
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+
+    auto current = profile::IdentityProfile::create(existingIdentity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->setEmail("suspended@example.test", true, kNow));
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(
+        idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("suspended-email-convergence");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-email-suspended"});
+    ASSERT_TRUE(started);
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_FALSE(completed);
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::AuthenticationFailed);
+
+    auto owner = fixture.identities.ownerOf(core::ExternalIdentityRef{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"suspended-social-subject"}});
+    ASSERT_TRUE(owner);
+    EXPECT_FALSE(owner->has_value());
+}
+
+TEST(AuthenticationServiceTest, VerifiedEmailConvergenceRefusesAmbiguousActiveIdentities)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "ambiguous-social-subject";
+    fixture.implementation->claims.set(idp::ClaimName::Email, "duplicate@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    for (const char* raw : {"identity-a", "identity-b"}) {
+        const core::IdentityId identity{raw};
+        auto canonical = core::Identity::create(identity, core::SubjectKind::Human, kNow);
+        ASSERT_TRUE(canonical);
+        ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+        auto current = profile::IdentityProfile::create(identity, kNow);
+        ASSERT_TRUE(current);
+        ASSERT_TRUE(current->setEmail("duplicate@example.test", true, kNow));
+        ASSERT_TRUE(profiles.save(current.value()));
+    }
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(
+        idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("ambiguous-email-convergence");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-email-ambiguous"});
+    ASSERT_TRUE(started);
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+
+    ASSERT_FALSE(completed);
+    EXPECT_EQ(completed.error().code(), fnd::ErrorCode::Conflict);
+}
+
 TEST(AuthenticationServiceTest, ExistingLoginPreservesCanonicalPictureAndRefreshesConnectionPresentation)
 {
     Fixture fixture;

@@ -34,6 +34,24 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
     return jsonResponse(202, json::object{{"accepted", true}});
 }
 
+[[nodiscard]] std::string sessionCookie(std::string_view value)
+{
+    return "__Host-openproof-session=" + std::string{value}
+        + "; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Strict";
+}
+
+[[nodiscard]] identity::provider::ClientContext clientContext(
+    const gateway::HttpRequest& request)
+{
+    identity::provider::ClientContext client;
+    client.setRemoteAddress(std::string{request.remoteAddress()});
+    if (const auto userAgent = request.header("user-agent"); userAgent.has_value()) {
+        client.setUserAgent(std::string{userAgent->substr(
+            0U, std::min<std::size_t>(userAgent->size(), 1024U))});
+    }
+    return client;
+}
+
 [[nodiscard]] foundation::Result<json::object> objectBody(const gateway::HttpRequest& request)
 {
     if (request.body().empty() || request.body().size() > kMaximumBody) {
@@ -269,8 +287,23 @@ gateway::HttpResponse AccountHttpApi::verifyEmail(gateway::HttpRequest request)
     auto secret = requiredString(body.value(), "secret", 512U);
     if (!id || !secret) return error(id ? secret.error() : id.error(), request);
     foundation::SecretString proof{std::move(secret).value()};
-    auto status = m_accounts->verifyEmail(VerificationId{std::move(id).value()}, proof);
-    return status ? jsonResponse(200, json::object{{"verified", true}}) : error(status.error(), request);
+    auto external = m_accounts->verifyEmailAndGetExternal(
+        VerificationId{std::move(id).value()}, proof);
+    if (!external) return error(external.error(), request);
+
+    auto verified = m_authentication->acceptVerifiedEmail(external.value());
+    if (!verified) return error(verified.error(), request);
+    auto grant = m_sessions->issue(verified.value(), clientContext(request));
+    if (!grant) return error(grant.error(), request);
+
+    json::object payload{
+        {"verified", true},
+        {"session_id", grant->id().value()},
+        {"assurance", identity::provider::assuranceLevelName(
+            verified->outcome().claimedAssurance())}};
+    auto response = jsonResponse(200, std::move(payload));
+    response.addHeader("set-cookie", sessionCookie(grant->token().expose()));
+    return response;
 }
 
 gateway::HttpResponse AccountHttpApi::resendEmail(gateway::HttpRequest request)

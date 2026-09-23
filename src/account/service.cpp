@@ -274,6 +274,88 @@ foundation::Result<identity::core::IdentityId> AccountService::signup(
                                 "An account with that identifier is already pending verification.");
     }
 
+    auto verifiedMatches = m_profiles->findVerifiedByEmail(normalized.value());
+    if (!verifiedMatches.has_value()) return foundation::fail(verifiedMatches.error());
+
+    std::vector<identity::core::IdentityId> activeVerifiedMatches;
+    activeVerifiedMatches.reserve(verifiedMatches->size());
+    std::size_t blockedVerifiedMatches = 0U;
+    for (const auto& candidate : verifiedMatches.value()) {
+        auto canonical = m_identities->findById(m_organization, candidate);
+        if (!canonical.has_value()) return foundation::fail(canonical.error());
+        if (!canonical->has_value()) continue;
+        if (canonical->value().canAuthenticate()) {
+            activeVerifiedMatches.push_back(candidate);
+            continue;
+        }
+        const auto status = canonical->value().status();
+        if (status != identity::core::IdentityStatus::Deleted
+            && status != identity::core::IdentityStatus::Merged) {
+            ++blockedVerifiedMatches;
+        }
+    }
+
+    if (activeVerifiedMatches.size() > 1U
+        || (blockedVerifiedMatches > 0U && !activeVerifiedMatches.empty())) {
+        return foundation::fail(
+            foundation::ErrorCode::Conflict,
+            "That verified email is already associated with multiple identities.",
+            "Local signup refused to guess between canonical identities that share the same "
+            "verified email. An explicit merge is required.");
+    }
+    if (activeVerifiedMatches.empty() && blockedVerifiedMatches > 0U) {
+        return foundation::fail(
+            foundation::ErrorCode::AlreadyExists,
+            "An account with that verified email already exists.");
+    }
+
+    if (activeVerifiedMatches.size() == 1U) {
+        const auto& existingIdentity = activeVerifiedMatches.front();
+        auto connections = m_externalIdentities->externalIdentitiesOf(existingIdentity);
+        if (!connections.has_value()) return foundation::fail(connections.error());
+        const auto localConnection = std::ranges::find_if(
+            connections.value(), [&](const auto& connected) {
+                return connected.providerId() == m_localProvider;
+            });
+        if (localConnection != connections->end()) {
+            return foundation::fail(
+                foundation::ErrorCode::AlreadyExists,
+                "Email sign-in is already configured for this account.");
+        }
+
+        auto reservation = m_repository->reserveSubject(
+            external, existingIdentity, m_clock->now(),
+            m_clock->now() + m_policy.emailVerificationLifetime());
+        if (!reservation.has_value()) return foundation::fail(reservation.error());
+
+        auto enrolled = m_localAccounts->enrollPending(
+            existingIdentity, identity::provider::ExternalSubject{normalized.value()},
+            password, std::nullopt);
+        if (!enrolled.has_value()) {
+            static_cast<void>(m_repository->releaseSubject(external, existingIdentity));
+            return foundation::fail(enrolled.error());
+        }
+
+        auto dispatch = issue(
+            existingIdentity, VerificationPurpose::SignupEmail,
+            VerificationChannel::Email, normalized.value(),
+            m_policy.emailVerificationLifetime());
+        if (!dispatch.has_value()) {
+            static_cast<void>(m_localAccounts->removePending(
+                existingIdentity, identity::provider::ExternalSubject{normalized.value()}));
+            static_cast<void>(m_repository->releaseSubject(external, existingIdentity));
+            return foundation::fail(dispatch.error());
+        }
+        auto delivered = m_delivery->deliver(dispatch.value());
+        if (!delivered.has_value()) {
+            static_cast<void>(m_localAccounts->removePending(
+                existingIdentity, identity::provider::ExternalSubject{normalized.value()}));
+            static_cast<void>(m_repository->releaseSubject(external, existingIdentity));
+            return foundation::fail(delivered.error());
+        }
+        return existingIdentity;
+    }
+
     auto idRaw = security::randomTokenBase64Url(kIdentityEntropyBytes);
     if (!idRaw.has_value()) return foundation::fail(idRaw.error());
     identity::core::IdentityId identity{"opi_" + std::move(idRaw).value()};
@@ -350,6 +432,14 @@ foundation::Status AccountService::resendSignupVerification(std::string email)
 foundation::Status AccountService::verifyEmail(
     const VerificationId& id, const foundation::SecretString& secret)
 {
+    auto verified = verifyEmailAndGetExternal(id, secret);
+    return verified ? foundation::ok() : foundation::fail(verified.error());
+}
+
+foundation::Result<identity::core::ExternalIdentityRef>
+AccountService::verifyEmailAndGetExternal(
+    const VerificationId& id, const foundation::SecretString& secret)
+{
     auto challenge = consume(id, secret, VerificationPurpose::SignupEmail);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     const identity::core::ExternalIdentityRef external{
@@ -364,14 +454,14 @@ foundation::Status AccountService::verifyEmail(
     auto profile = requireProfile(challenge->identity());
     if (!profile.has_value()) return foundation::fail(profile.error());
     auto set = profile->setEmail(std::string{challenge->destination()}, true, m_clock->now());
-    if (!set.has_value()) return set;
+    if (!set.has_value()) return foundation::fail(set.error());
     auto saved = m_profiles->save(profile.value());
-    if (!saved.has_value()) return saved;
+    if (!saved.has_value()) return foundation::fail(saved.error());
     auto attached = attachVerified(challenge->identity(), external);
     if (!attached.has_value()) {
         static_cast<void>(profile->setEmail(std::string{challenge->destination()}, false, m_clock->now()));
         static_cast<void>(m_profiles->save(profile.value()));
-        return attached;
+        return foundation::fail(attached.error());
     }
     auto activated = m_identities->changeStatus(
         m_organization, challenge->identity(), identity::core::IdentityStatus::Active);
@@ -379,9 +469,11 @@ foundation::Status AccountService::verifyEmail(
         static_cast<void>(m_externalIdentities->detach(external, challenge->identity()));
         static_cast<void>(profile->setEmail(std::string{challenge->destination()}, false, m_clock->now()));
         static_cast<void>(m_profiles->save(profile.value()));
-        return activated;
+        return foundation::fail(activated.error());
     }
-    return m_repository->releaseSubject(external, challenge->identity());
+    auto released = m_repository->releaseSubject(external, challenge->identity());
+    if (!released.has_value()) return foundation::fail(released.error());
+    return external;
 }
 
 foundation::Status AccountService::beginEmailChange(

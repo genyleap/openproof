@@ -633,6 +633,8 @@ public:
     [[nodiscard]] foundation::Status save(const identity::profile::IdentityProfile& profile) override;
     [[nodiscard]] foundation::Result<std::optional<identity::profile::IdentityProfile>>
     find(const identity::core::IdentityId& identity) const override;
+    [[nodiscard]] foundation::Result<std::vector<identity::core::IdentityId>>
+    findVerifiedByEmail(std::string_view email) const override;
 
     [[nodiscard]] foundation::Status add(evidence::Evidence evidence) override;
     [[nodiscard]] foundation::Status addBatch(std::vector<evidence::Evidence> evidence) override;

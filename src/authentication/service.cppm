@@ -215,6 +215,13 @@ public:
              const provider::AuthenticationResponse& response);
 
     /**
+     * @brief Converts a completed first-party email-verification ceremony into
+     *        an IAL1 authentication after re-checking the canonical identity link.
+     */
+    [[nodiscard]] foundation::Result<VerifiedAuthentication>
+    acceptVerifiedEmail(const identity::core::ExternalIdentityRef& external);
+
+    /**
      * @brief Completes a server-bound connection ceremony without creating a session.
      *
      * The target identity is recovered exclusively from the consumed server-side
