@@ -945,6 +945,135 @@ TEST(AuthenticationServiceTest, ConnectionFillsMissingPresentationClaimsWithoutI
     EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/connected.png");
 }
 
+TEST(AuthenticationServiceTest, PresentationUpdateSeedsEmptyCanonicalProfile)
+{
+    Fixture fixture;
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId identity{"identity-1"};
+
+    auto canonical = core::Identity::create(identity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+    auto current = profile::IdentityProfile::create(identity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const core::ExternalIdentityRef external{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"subject-1"}};
+    auto updated = service.updateConnectionPresentation(
+        external, std::optional<std::string>{"Farcaster Rider"},
+        std::optional<std::string>{"rider"},
+        std::optional<std::string>{"https://cdn.example.test/rider.png"});
+    ASSERT_TRUE(updated) << updated.error().internalDetail();
+
+    auto stored = profiles.find(identity);
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().displayName(), "Farcaster Rider");
+    EXPECT_EQ(stored->value().preferredUsername(), "rider");
+    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/rider.png");
+    EXPECT_FALSE(stored->value().email().has_value());
+
+    auto connections = service.connections(identity);
+    ASSERT_TRUE(connections);
+    ASSERT_EQ(connections->size(), 1U);
+    EXPECT_EQ(connections->front().displayName(), "Farcaster Rider");
+    EXPECT_EQ(connections->front().preferredUsername(), "rider");
+    EXPECT_EQ(connections->front().pictureUrl(), "https://cdn.example.test/rider.png");
+}
+
+TEST(AuthenticationServiceTest, PresentationUpdatePreservesCanonicalUserChoices)
+{
+    Fixture fixture;
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId identity{"identity-1"};
+
+    auto canonical = core::Identity::create(identity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+    auto current = profile::IdentityProfile::create(identity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->updateSelfService(
+        std::optional<std::string>{"Chosen Name"},
+        std::optional<std::string>{"chosen"},
+        std::optional<std::string>{"fa-IR"},
+        std::optional<std::string>{"https://cdn.example.test/chosen.png"}, kNow));
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const core::ExternalIdentityRef external{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"subject-1"}};
+    auto updated = service.updateConnectionPresentation(
+        external, std::optional<std::string>{"Provider Name"},
+        std::optional<std::string>{"provider-handle"},
+        std::optional<std::string>{"https://cdn.example.test/provider.png"});
+    ASSERT_TRUE(updated) << updated.error().internalDetail();
+
+    auto stored = profiles.find(identity);
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().displayName(), "Chosen Name");
+    EXPECT_EQ(stored->value().preferredUsername(), "chosen");
+    EXPECT_EQ(stored->value().locale(), "fa-IR");
+    EXPECT_EQ(stored->value().pictureUrl(), "https://cdn.example.test/chosen.png");
+
+    auto connections = service.connections(identity);
+    ASSERT_TRUE(connections);
+    ASSERT_EQ(connections->size(), 1U);
+    EXPECT_EQ(connections->front().displayName(), "Provider Name");
+    EXPECT_EQ(connections->front().preferredUsername(), "provider-handle");
+    EXPECT_EQ(connections->front().pictureUrl(), "https://cdn.example.test/provider.png");
+}
+
+TEST(AuthenticationServiceTest, PresentationUpdateUsesUsernameAsCanonicalDisplayFallback)
+{
+    Fixture fixture;
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId identity{"identity-1"};
+
+    auto canonical = core::Identity::create(identity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+    auto current = profile::IdentityProfile::create(identity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const core::ExternalIdentityRef external{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"subject-1"}};
+    auto updated = service.updateConnectionPresentation(
+        external, std::nullopt, std::optional<std::string>{"handle-only"}, std::nullopt);
+    ASSERT_TRUE(updated) << updated.error().internalDetail();
+
+    auto stored = profiles.find(identity);
+    ASSERT_TRUE(stored);
+    ASSERT_TRUE(stored->has_value());
+    EXPECT_EQ(stored->value().preferredUsername(), "handle-only");
+    EXPECT_EQ(stored->value().displayName(), "handle-only");
+}
+
 TEST(AuthenticationServiceTest, MobileWalletAuthenticationHandoffSeparatesPublishAndRedeemSecrets)
 {
     Fixture fixture;

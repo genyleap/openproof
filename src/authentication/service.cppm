@@ -238,6 +238,8 @@ public:
     /**
      * @brief Refreshes display-only metadata for an already verified connection.
      *
+     * Missing canonical profile presentation fields are seeded from these values,
+     * but existing user-chosen display name, username and picture are preserved.
      * These values never participate in authentication, identity ownership or
      * authorization decisions.
      */

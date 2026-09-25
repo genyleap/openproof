@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "org.openproof"
-version = "1.1.0-rc3"
+version = "1.1.0-rc4"
 
 val gradleLib = requireNotNull(gradle.gradleHomeDir) {
     "The Gradle home directory is required to compile the Kotlin SDK"

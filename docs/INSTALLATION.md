@@ -102,7 +102,7 @@ Install an exact version:
 
 \`\`\`bash
 curl -fsSL https://genyleap.com/install/openproof | \
-  sudo sh -s -- --version 1.1.0-rc3
+  sudo sh -s -- --version 1.1.0-rc4
 \`\`\`
 
 Select the newest release candidate explicitly:
@@ -203,7 +203,7 @@ sudo openproof config providers
 
 sudo openproof update
 sudo openproof upgrade --channel rc
-sudo openproof upgrade --version 1.1.0-rc3
+sudo openproof upgrade --version 1.1.0-rc4
 
 sudo openproof backup /var/backups/openproof.dump
 sudo openproof restore /var/backups/openproof.dump POSTGRES_URL

@@ -784,9 +784,47 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
         return foundation::fail(foundation::ErrorCode::NotFound,
                                 "That connected account was not found.");
     }
-    return m_identities.updatePresentation(identity::core::ExternalIdentityRef{
+
+    identity::core::ExternalIdentityRef presented{
         external.providerId(), external.subject(), std::move(displayName),
-        std::move(preferredUsername), std::move(pictureUrl)});
+        std::move(preferredUsername), std::move(pictureUrl)};
+    auto connectionSaved = m_identities.updatePresentation(presented);
+    if (!connectionSaved) return connectionSaved;
+
+    if (m_profileRepository == nullptr) return foundation::ok();
+
+    provider::VerifiedClaims presentationClaims;
+    if (presented.displayName()) {
+        presentationClaims.set(
+            provider::ClaimName::DisplayName, std::string{*presented.displayName()});
+    }
+    if (presented.preferredUsername()) {
+        presentationClaims.set(
+            provider::ClaimName::PreferredUsername,
+            std::string{*presented.preferredUsername()});
+    }
+    if (presented.pictureUrl()) {
+        presentationClaims.set(
+            provider::ClaimName::PictureUrl, std::string{*presented.pictureUrl()});
+    }
+    if (presentationClaims.empty()) return foundation::ok();
+
+    const auto now = m_clock.now();
+    auto stored = m_profileRepository->find(owner->value());
+    if (!stored) return foundation::fail(stored.error());
+
+    if (stored->has_value()) {
+        auto profile = stored->value();
+        auto refreshed = profile.refreshPresentationClaims(presentationClaims, now);
+        if (!refreshed) return refreshed;
+        return m_profileRepository->save(profile);
+    }
+
+    auto profile = identity::profile::IdentityProfile::create(owner->value(), now);
+    if (!profile) return foundation::fail(profile.error());
+    auto refreshed = profile->refreshPresentationClaims(presentationClaims, now);
+    if (!refreshed) return refreshed;
+    return m_profileRepository->save(profile.value());
 }
 
 foundation::Result<std::vector<identity::core::ExternalIdentityRef>>

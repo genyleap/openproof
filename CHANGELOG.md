@@ -2,6 +2,21 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc4 — 2026-09-24
+
+### Farcaster profile bootstrap
+
+- Farcaster SIWF presentation metadata now seeds missing canonical profile fields
+  after the signed identity proof is verified, so first-time Farcaster users
+  receive their display name, preferred username and avatar without having to
+  edit the OpenProof profile manually.
+- Provider presentation refreshes remain display-only: they never import email
+  or phone ownership claims, and existing user-chosen canonical name, username
+  and picture values are preserved.
+- Added a data migration that backfills empty canonical profiles from already
+  stored Farcaster connection metadata while leaving populated profile fields
+  untouched.
+
 ## 1.1.0-rc3 — 2026-09-24
 
 ### Identity presentation and federation
