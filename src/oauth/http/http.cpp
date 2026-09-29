@@ -1138,7 +1138,7 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
                 "<title>OpenProof Device Authorization</title></head><body><main>"
-                "<h1>Authorize a device</h1><form method=\"get\" action=\"/oauth/device\">"
+                "<h1>Authorize a device</h1><form method=\"get\">"
                 "<label>Device code <input name=\"user_code\" autocomplete=\"one-time-code\" "
                 "required></label><button type=\"submit\">Continue</button></form></main></body></html>";
             gateway::HttpResponse response{
@@ -1179,7 +1179,7 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
             body += "<p>Resource: <code>" + htmlEscape(*authorization->resource()) + "</code></p>";
         }
         body +=
-            "<form method=\"post\" action=\"/oauth/device\"><input type=\"hidden\" name=\"user_code\" value=\""
+            "<form method=\"post\"><input type=\"hidden\" name=\"user_code\" value=\""
             + htmlEscape(*userCode) + "\"><input type=\"hidden\" name=\"csrf\" value=\""
             + htmlEscape(csrf.value())
             + "\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button>"
