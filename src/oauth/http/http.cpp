@@ -764,6 +764,7 @@ gateway::HttpResponse OAuthHttpApi::loginSubmit(gateway::HttpRequest request)
     auto started = m_authentication->begin(authRequest, binding.value(), request.correlation());
     if (!started) return error(started.error(), request);
     idp::AuthenticationResponse authResponse{started->challenge().id(), clientContext(request)};
+    authResponse.setParameter("subject", idp::CredentialValue{subject.value()});
     authResponse.setParameter("password", idp::CredentialValue{std::move(password).value()});
     if (totp.has_value()) authResponse.setParameter("totp", idp::CredentialValue{totp.value()});
     auto verified = m_authentication->complete(started->transactionId(),
