@@ -1239,7 +1239,7 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
                 "<h1>Connect a device</h1>"
                 "<p class=\"lead\">Enter the one-time code shown by the app that wants to use your Genyleap identity.</p>"
                 "<form method=\"get\" class=\"stack\">"
-                "<label class=\"section-label\" for=\"user_code\">Device code</label>"
+                "<label class=\"section-label\" for=\"user_code\">Sign-in code</label>"
                 "<input class=\"code-input\" id=\"user_code\" name=\"user_code\" autocomplete=\"one-time-code\" "
                 "autocapitalize=\"characters\" spellcheck=\"false\" placeholder=\"ABCD-EFGH\" required>"
                 "<button class=\"primary\" type=\"submit\">Continue securely</button></form>"
@@ -1286,8 +1286,7 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
             "Your password and browser session are never copied into the app.</p>"
             "<div class=\"detail-grid\"><div class=\"detail\"><span>Application</span><strong>"
             + htmlEscape(registered->displayName())
-            + "</strong></div><div class=\"detail\"><span>Device code</span><code>"
-            + htmlEscape(*userCode) + "</code></div>";
+            + "</strong></div>";
         if (authorization->resource()) {
             detail += "<div class=\"detail\"><span>Resource</span><code>"
                 + htmlEscape(*authorization->resource()) + "</code></div>";
