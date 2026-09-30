@@ -22,6 +22,17 @@ namespace {
 namespace json = boost::json;
 constexpr std::size_t kMaximumBody = 32U * 1024U;
 
+[[nodiscard]] gateway::HttpResponse redirect(std::string location)
+{
+    gateway::HttpResponse response{
+        303, gateway::Headers{{"location", std::move(location)}}, {}};
+    response.setHeader("cache-control", "no-store");
+    response.setHeader("pragma", "no-cache");
+    response.setHeader("x-content-type-options", "nosniff");
+    response.setHeader("referrer-policy", "no-referrer");
+    return response;
+}
+
 [[nodiscard]] gateway::HttpResponse jsonResponse(int status, json::value body)
 {
     gateway::HttpResponse response{
@@ -265,7 +276,20 @@ gateway::HttpResponse ApplicationManagementHttpApi::handle(gateway::HttpRequest 
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
     auto actor = authorize(request);
-    if (!actor) return error(actor.error(), request);
+    if (!actor) {
+        if (request.method() == gateway::HttpMethod::Get
+            && request.path() == "/admin/console") {
+            if (actor.error().code()
+                == foundation::ErrorCode::AuthenticationRequired) {
+                return redirect("/login?return_to=%2Fadmin%2Fconsole");
+            }
+            if (actor.error().code()
+                == foundation::ErrorCode::AssuranceInsufficient) {
+                return redirect("/account/security");
+            }
+        }
+        return error(actor.error(), request);
+    }
     if (!m_limiter->allow("idp-admin-identity:" + std::string{actor->value()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }

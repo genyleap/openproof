@@ -340,7 +340,8 @@ body{background:radial-gradient(circle at 18% 0%,rgba(113,118,255,.18),transpare
 [[nodiscard]] bool validReturnTarget(std::string_view target) noexcept
 {
     const bool permittedPath = target.starts_with("/oauth/authorize?")
-        || target == "/oauth/device" || target.starts_with("/oauth/device?");
+        || target == "/oauth/device" || target.starts_with("/oauth/device?")
+        || target == "/admin/console" || target == "/account/security";
     return permittedPath && !target.starts_with("//")
         && !target.contains('\r') && !target.contains('\n') && target.size() <= 8192U;
 }
@@ -725,12 +726,44 @@ gateway::HttpResponse OAuthHttpApi::loginPage(gateway::HttpRequest request)
     }
     auto csrf = security::randomTokenBase64Url(32U);
     if (!csrf) return error(csrf.error(), request);
-    std::string body = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenProof Sign In</title></head><body><main><h1>Sign in with OpenProof</h1><form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"return_to\" value=\""
-        + htmlEscape(returnTarget.value()) + "\"><input type=\"hidden\" name=\"csrf\" value=\""
-        + htmlEscape(csrf.value()) + "\"><label>Account <input name=\"subject\" autocomplete=\"username\" required></label><label>Password <input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label><label>Authenticator code <input name=\"totp\" inputmode=\"numeric\" autocomplete=\"one-time-code\"></label><button type=\"submit\">Sign in</button></form></main></body></html>";
-    gateway::HttpResponse response{200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}}, std::move(body)};
+    auto nonce = security::randomTokenBase64Url(24U);
+    if (!nonce) return error(nonce.error(), request);
+    const std::string pageNonce = nonce.value();
+
+    std::string body = R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><title>Sign in · OpenProof</title>
+<style nonce=")HTML" + pageNonce + R"HTML(">
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#090b10;color:#f7f7fb}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 15% 0%,rgba(105,92,255,.22),transparent 34rem),linear-gradient(180deg,#10131b,#080a0f);padding:24px}
+.shell{width:min(100%,560px)}.brand{display:flex;align-items:center;gap:13px;margin:0 4px 24px;color:#e5e6ff;font-weight:800;font-size:21px}.brand-mark{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#7478ff,#9c68ff);box-shadow:0 16px 38px rgba(102,92,255,.28)}.brand small{display:block;margin-top:2px;color:#8c91a4;font-size:11px;letter-spacing:.11em;text-transform:uppercase}
+.card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(26px,6vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}.lead{color:#aeb3c4;line-height:1.65;margin:0 0 25px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}.field small{font-weight:600;text-transform:none;letter-spacing:0;color:#71778a}
+input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}.code{font-variant-numeric:tabular-nums;letter-spacing:.14em}
+button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
+@media(max-width:560px){body{padding:16px}.card{border-radius:23px}}
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+<section class="card"><span class="kicker">Secure sign in</span><h1>Sign in with OpenProof</h1>
+<p class="lead">Use your OpenProof account credentials. If you already enabled an authenticator, enter its current 6-digit code for an IAL2 session.</p>
+<form method="post" action="/login"><input type="hidden" name="return_to" value=")HTML"
+        + htmlEscape(returnTarget.value()) + R"HTML("><input type="hidden" name="csrf" value=")HTML"
+        + htmlEscape(csrf.value()) + R"HTML(">
+<label class="field"><span>Account</span><input name="subject" autocomplete="username" required></label>
+<label class="field"><span>Password</span><input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label>
+<label class="field"><span>Authenticator code <small>only if enabled</small></span><input class="code" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000"></label>
+<button type="submit">Sign in securely</button>
+<p class="hint"><strong>No authenticator yet?</strong> Leave the code empty. For owner administration, OpenProof will take you to Account Security to set one up.</p>
+</form></section><p class="footer">OpenProof keeps your application sessions separate from your Genyleap credentials.</p></main></body></html>)HTML";
+
+    gateway::HttpResponse response{
+        200,
+        gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        std::move(body)};
     secure(response);
-    response.setHeader("content-security-policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    response.setHeader(
+        "content-security-policy",
+        "default-src 'none'; style-src 'nonce-" + pageNonce
+            + "'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     response.addHeader("set-cookie", cookie(kLoginCsrfCookie, csrf.value(), "/", 600));
     return response;
 }

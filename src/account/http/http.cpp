@@ -12,6 +12,8 @@ module;
 
 module openproof.account.http;
 
+import openproof.security;
+
 namespace openproof::account::http {
 namespace {
 
@@ -220,6 +222,7 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Post && request.path() == "/account/phone/verify") return completePhone(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/forgot") return forgotPassword(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/reset") return resetPassword(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/security") return securityPage(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/totp") return totpStatus(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/totp/start") return beginTotpEnrollment(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/totp/complete") return completeTotpEnrollment(std::move(request));
@@ -389,6 +392,175 @@ gateway::HttpResponse AccountHttpApi::resetPassword(gateway::HttpRequest request
     foundation::SecretString proof{std::move(secret).value()}; foundation::SecretString newPassword{std::move(password).value()};
     auto status = m_accounts->completePasswordReset(VerificationId{std::move(id).value()}, proof, newPassword);
     return status ? jsonResponse(200, json::object{{"password_reset", true}}) : error(status.error(), request);
+}
+
+gateway::HttpResponse AccountHttpApi::securityPage(gateway::HttpRequest request)
+{
+    auto authenticated = authenticate(request);
+    if (!authenticated) {
+        gateway::HttpResponse response{
+            303,
+            gateway::Headers{{"location", "/login?return_to=%2Faccount%2Fsecurity"}},
+            {}};
+        response.setHeader("cache-control", "no-store");
+        response.setHeader("pragma", "no-cache");
+        response.setHeader("x-content-type-options", "nosniff");
+        response.setHeader("referrer-policy", "no-referrer");
+        return response;
+    }
+
+    auto enabled = m_accounts->totpEnabled(authenticated->session().identity());
+    if (!enabled) return error(enabled.error(), request);
+
+    auto nonce = security::randomTokenBase64Url(24U);
+    if (!nonce) return error(nonce.error(), request);
+    const std::string pageNonce = nonce.value();
+    const bool available = enabled->has_value();
+    const bool totpEnabled = enabled->value_or(false);
+    const bool ial2 = identity::provider::meetsAssurance(
+        authenticated->session().assurance(),
+        identity::provider::AssuranceLevel::Ial2);
+
+    std::string body = R"HTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><title>Account Security · OpenProof</title>
+<style nonce=")HTML" + pageNonce + R"HTML(">
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#090b10;color:#f6f7fb}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0%,rgba(105,92,255,.22),transparent 34rem),linear-gradient(180deg,#10131b,#080a0f);padding:24px}
+.shell{width:min(100%,760px);margin:0 auto}.brand{display:flex;align-items:center;gap:13px;margin:12px 4px 24px;color:#e5e6ff;font-weight:800;font-size:21px}.brand-mark{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#7478ff,#9c68ff);box-shadow:0 16px 38px rgba(102,92,255,.28)}.brand small{display:block;margin-top:2px;color:#8c91a4;font-size:11px;letter-spacing:.11em;text-transform:uppercase}
+.card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(24px,5vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+h1{font-size:clamp(34px,7vw,52px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}h2{font-size:19px;margin:0 0 9px}.lead,.muted{color:#aeb3c4;line-height:1.65}.lead{font-size:16px;margin:0 0 26px}.muted{margin:0 0 17px}
+.status{display:flex;align-items:center;gap:13px;padding:16px 17px;border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#11141b}.status strong{font-size:15px}.status span{color:#9298ac;font-size:13px}.dot{width:11px;height:11px;border-radius:50%;background:#f59e0b;box-shadow:0 0 0 5px rgba(245,158,11,.09)}.dot.on{background:#4ade80;box-shadow:0 0 0 5px rgba(74,222,128,.09)}
+.panel{border-top:1px solid rgba(255,255,255,.08);padding-top:26px;margin-top:26px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}
+button,.button{appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:13px 17px;font:750 14px inherit;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.secondary{background:#171a23!important;border:1px solid rgba(255,255,255,.11)!important}.actions{display:flex;gap:10px;flex-wrap:wrap}
+.setup{display:none;margin-top:18px;padding:19px;border-radius:19px;background:#0f1218;border:1px solid rgba(255,255,255,.08)}.setup.show{display:block}.key{display:flex;gap:10px;align-items:center;padding:13px;border-radius:14px;background:#090b10;border:1px solid rgba(255,255,255,.08)}.key code{flex:1;word-break:break-all;font:650 14px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
+.notice{display:none;margin:18px 0 0;padding:13px 15px;border-radius:14px;font-size:13px;line-height:1.55}.notice.show{display:block}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.notice.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#bbf7d0}
+.code{font-size:25px;letter-spacing:.22em;text-align:center;font-variant-numeric:tabular-nums}.foot{color:#747b8f;font-size:12px;line-height:1.55;margin:15px 0 0}.codes{white-space:pre-wrap;font:650 14px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e7e8f2}.spaced{margin-top:12px}.stage2{margin-top:25px}.center{text-align:center}
+@media(max-width:560px){body{padding:16px}.card{border-radius:23px}.actions>*{width:100%}.key{align-items:stretch;flex-direction:column}.key button{width:100%}}
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+<section class="card"><span class="kicker">Account security</span><h1>Protect your OpenProof account</h1>
+<p class="lead">Set up an authenticator for IAL2 access. The setup key stays in this browser and is shown only for the active enrollment.</p>
+<div class="status"><span class="dot )HTML";
+    body += totpEnabled ? "on" : "";
+    body += R"HTML("></span><div><strong>)HTML";
+    body += totpEnabled ? "Authenticator enabled" : "Authenticator not set up";
+    body += R"HTML(</strong><br><span>Current session: )HTML";
+    body += std::string{identity::provider::assuranceLevelName(
+        authenticated->session().assurance())};
+    body += R"HTML(</span></div></div><div id="notice" class="notice" role="status" aria-live="polite"></div>)HTML";
+
+    if (!available) {
+        body += R"HTML(<div class="panel"><h2>Authenticator unavailable</h2>
+<p class="muted">This identity does not have a local password sign-in method, so a TOTP authenticator cannot be enrolled here.</p></div>)HTML";
+    } else if (!totpEnabled) {
+        body += R"HTML(<div class="panel"><h2>Set up an authenticator</h2>
+<p class="muted">Confirm your OpenProof password. Then add the generated setup key to Google Authenticator, Microsoft Authenticator, 1Password, Authy, or another TOTP app.</p>
+<form id="startForm"><label class="field"><span>OpenProof password</span>
+<input name="password" type="password" autocomplete="current-password" maxlength="1024" required></label>
+<button type="submit">Create setup key</button></form>
+<div id="setup" class="setup"><h2>1. Add this setup key</h2>
+<p class="muted">In your authenticator choose “Enter setup key” (time based). This long key is not the 6-digit login code.</p>
+<div class="key"><code id="secret"></code><button class="secondary" type="button" id="copy">Copy key</button></div>
+<div class="actions spaced"><a id="openAuthenticator" class="button secondary" href="#">Open authenticator app</a></div>
+<h2 class="stage2">2. Verify the 6-digit code</h2>
+<p class="muted">Your authenticator will now show a new 6-digit code about every 30 seconds.</p>
+<form id="verifyForm"><label class="field"><span>Authenticator code</span>
+<input class="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" placeholder="000000" required></label>
+<button type="submit">Enable authenticator</button></form>
+<p class="foot">Enrollment expires after 10 minutes. If it expires, create a new setup key and replace the unfinished entry in your authenticator.</p></div></div>)HTML";
+    } else if (!ial2) {
+        body += R"HTML(<div class="panel"><h2>Authenticator is ready</h2>
+<p class="muted">This browser session was created with password only. Sign in once more and enter the current 6-digit authenticator code to activate an IAL2 session.</p>
+<a class="button" href="/login?return_to=%2Fadmin%2Fconsole">Sign in with authenticator</a></div>)HTML";
+    } else {
+        body += R"HTML(<div class="panel"><h2>IAL2 session active</h2>
+<p class="muted">This browser session satisfies the assurance required for owner administration.</p>
+<div class="actions"><a class="button" href="/admin/console">Open Admin Console</a>
+<button id="recovery" class="secondary" type="button">Generate recovery codes</button></div>
+<div id="recoveryBox" class="setup"><h2>Recovery codes</h2><p class="muted">Store these somewhere safe. A new batch replaces the previous batch and the codes are shown only once.</p>
+<pre id="recoveryCodes" class="codes"></pre><button id="copyRecovery" class="secondary" type="button">Copy recovery codes</button></div></div>)HTML";
+    }
+
+    body += R"HTML(</section><p class="foot center">OpenProof keeps application sessions separate from your Genyleap credentials.</p></main>
+<script nonce=")HTML" + pageNonce + R"HTML(">
+const notice=document.querySelector('#notice');
+const show=(message,type='error')=>{notice.textContent=message;notice.className='notice show '+type};
+async function api(url,method='GET',body){
+  const response=await fetch(url,{method,credentials:'same-origin',headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
+  const text=await response.text();let data={};
+  try{data=text?JSON.parse(text):{}}catch{data={error:{message:text||'Unexpected response'}}}
+  if(!response.ok)throw new Error(data?.error?.message||'The request could not be completed.');
+  return data;
+}
+let enrollmentId=null;
+const startForm=document.querySelector('#startForm');
+if(startForm)startForm.addEventListener('submit',async event=>{
+  event.preventDefault();notice.className='notice';
+  const password=String(new FormData(startForm).get('password')||'');
+  if(!password){show('Enter your OpenProof password.');return}
+  try{
+    const enrollment=await api('/account/totp/start','POST',{password});
+    enrollmentId=enrollment.enrollment_id;
+    const secret=String(enrollment.secret_base32||'');
+    document.querySelector('#secret').textContent=secret;
+    document.querySelector('#openAuthenticator').href='otpauth://totp/Genyleap%20OpenProof?secret='+encodeURIComponent(secret)+'&issuer=OpenProof&algorithm=SHA1&digits=6&period=30';
+    document.querySelector('#setup').classList.add('show');
+    startForm.reset();
+    show('Setup key created. Add it to your authenticator, then enter the 6-digit code.','ok');
+    document.querySelector('#verifyForm input[name="code"]').focus();
+  }catch(error){show(error.message)}
+});
+const copy=document.querySelector('#copy');
+if(copy)copy.addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText(document.querySelector('#secret').textContent);show('Setup key copied. Keep it private.','ok')}
+  catch{show('Copy was blocked. Select the setup key manually.')}
+});
+const verifyForm=document.querySelector('#verifyForm');
+if(verifyForm)verifyForm.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(!enrollmentId){show('Create a setup key first.');return}
+  const code=String(new FormData(verifyForm).get('code')||'').replace(/\s+/g,'');
+  if(!/^\d{6}$/.test(code)){show('Enter exactly the 6 digits shown by your authenticator.');return}
+  try{
+    await api('/account/totp/complete','POST',{enrollment_id:enrollmentId,code});
+    show('Authenticator enabled. Sign in again with the current 6-digit code to activate IAL2.','ok');
+    setTimeout(()=>location.assign('/login?return_to=%2Fadmin%2Fconsole'),1000);
+  }catch(error){show(error.message)}
+});
+const recovery=document.querySelector('#recovery');
+if(recovery)recovery.addEventListener('click',async()=>{
+  try{
+    const data=await api('/auth/recovery-codes','POST');
+    const codes=Array.isArray(data.codes)?data.codes.map(String):[];
+    if(!codes.length)throw new Error('OpenProof did not return recovery codes.');
+    document.querySelector('#recoveryCodes').textContent=codes.join('\n');
+    document.querySelector('#recoveryBox').classList.add('show');
+    show('Recovery codes generated. Store them securely; this batch is shown only once.','ok');
+  }catch(error){show(error.message)}
+});
+const copyRecovery=document.querySelector('#copyRecovery');
+if(copyRecovery)copyRecovery.addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText(document.querySelector('#recoveryCodes').textContent);show('Recovery codes copied. Store them securely.','ok')}
+  catch{show('Copy was blocked. Select the recovery codes manually.')}
+});
+</script></body></html>)HTML";
+
+    gateway::HttpResponse response{
+        200,
+        gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        std::move(body)};
+    response.setHeader("cache-control", "no-store");
+    response.setHeader("pragma", "no-cache");
+    response.setHeader("x-content-type-options", "nosniff");
+    response.setHeader("referrer-policy", "no-referrer");
+    response.setHeader(
+        "content-security-policy",
+        "default-src 'none'; style-src 'nonce-" + pageNonce
+            + "'; script-src 'nonce-" + pageNonce
+            + "'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    return response;
 }
 
 gateway::HttpResponse AccountHttpApi::totpStatus(gateway::HttpRequest request)

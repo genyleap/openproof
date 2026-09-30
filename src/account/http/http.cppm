@@ -41,6 +41,7 @@ private:
     [[nodiscard]] gateway::HttpResponse completePhone(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse forgotPassword(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse resetPassword(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse securityPage(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse totpStatus(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse beginTotpEnrollment(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse completeTotpEnrollment(gateway::HttpRequest request);
