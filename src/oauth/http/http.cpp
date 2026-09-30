@@ -865,7 +865,7 @@ gateway::HttpResponse OAuthHttpApi::authorize(gateway::HttpRequest request)
             "<title>Authorize access</title></head><body><main><h1>Authorize "
             + htmlEscape(registered->displayName())
             + "</h1><p>Requested access: " + scopeList
-            + "</p><form method=\"post\" action=\"/oauth/consent\">"
+            + "</p><form method=\"post\" action=\"consent\">"
               "<input type=\"hidden\" name=\"return_to\" value=\""
             + htmlEscape(request.target())
             + "\"><input type=\"hidden\" name=\"csrf\" value=\""
@@ -1004,7 +1004,39 @@ gateway::HttpResponse OAuthHttpApi::consentSubmit(gateway::HttpRequest request)
         consentAudience(clientId, authorizationRequest->resource()),
         scopeStrings(authorizationRequest->scopes()));
     if (!granted) return error(granted.error(), request);
-    auto response = redirect(returnTarget.value(), 303);
+
+    AuthorizationRequest finalRequest = authorizationRequest.value();
+    if (pushedRequestUri) {
+        auto consumed = m_pushedAuthorization->consume(*pushedRequestUri, clientId);
+        if (!consumed) return error(consumed.error(), request);
+        finalRequest = std::move(consumed).value();
+    }
+
+    const auto requestedResponseMode = finalRequest.responseMode();
+    auto grant = m_authorization->authorize(
+        authenticated.value(), std::move(finalRequest));
+    if (!grant) return error(grant.error(), request);
+
+    if (requestedResponseMode == AuthorizationResponseMode::Jwt) {
+        auto responseJwt = m_oidc->issueAuthorizationResponse(
+            clientId, grant->code().expose(),
+            grant->state() ? std::optional<std::string_view>{*grant->state()} : std::nullopt);
+        if (!responseJwt) return error(responseJwt.error(), request);
+        auto response = redirect(appendRedirectParameter(
+            std::string{grant->redirectUri()}, "response", responseJwt.value()), 303);
+        response.addHeader("set-cookie", cookie(kConsentCsrfCookie, "", "/", 0));
+        return response;
+    }
+
+    std::string location = appendRedirectParameter(
+        std::string{grant->redirectUri()}, "code", grant->code().expose());
+    if (grant->state()) {
+        location = appendRedirectParameter(
+            std::move(location), "state", grant->state().value());
+    }
+    location = appendRedirectParameter(std::move(location), "iss", m_oidc->issuer());
+
+    auto response = redirect(std::move(location), 303);
     response.addHeader("set-cookie", cookie(kConsentCsrfCookie, "", "/", 0));
     return response;
 }
