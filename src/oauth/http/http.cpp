@@ -274,6 +274,69 @@ using Parameters = std::map<std::string, std::string, std::less<>>;
     return output;
 }
 
+constexpr std::string_view kDevicePageCss = R"css(
+:root{color-scheme:dark light;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f14;color:#f7f7f8}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% 0%,rgba(99,102,241,.24),transparent 34rem),linear-gradient(180deg,#11131a 0%,#090b0f 100%);display:grid;place-items:center;padding:28px}
+.shell{width:min(100%,620px)}
+.brand{display:flex;align-items:center;gap:12px;margin:0 0 18px 2px;color:#d9dcff;font-weight:700;letter-spacing:-.01em}
+.brand-mark{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,#7479ff,#a66cff);box-shadow:0 10px 30px rgba(92,89,255,.3);color:white;font-size:17px}
+.brand small{display:block;color:#8f94a6;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;margin-top:2px}
+.card{background:rgba(24,27,36,.9);border:1px solid rgba(255,255,255,.09);border-radius:28px;padding:34px;box-shadow:0 30px 90px rgba(0,0,0,.38);backdrop-filter:blur(20px)}
+.kicker{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:rgba(110,116,255,.12);color:#bfc2ff;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:18px}
+h1{font-size:clamp(28px,6vw,42px);line-height:1.05;letter-spacing:-.04em;margin:0 0 14px}
+.lead{color:#aeb3c4;font-size:16px;line-height:1.6;margin:0 0 26px}
+.detail-grid{display:grid;gap:10px;margin:22px 0}
+.detail{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:14px 16px;border:1px solid rgba(255,255,255,.07);border-radius:16px;background:rgba(255,255,255,.025)}
+.detail span{color:#8f94a6;font-size:13px}
+.detail strong,.detail code{font-size:14px;color:#f5f6ff;text-align:right;overflow-wrap:anywhere}
+.section-label{color:#8f94a6;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin:22px 0 10px}
+.scopes{display:flex;flex-wrap:wrap;gap:8px}
+.scope{padding:8px 10px;border-radius:10px;background:#11141c;border:1px solid rgba(255,255,255,.08);color:#d8dbeb;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.hint{margin:22px 0 0;color:#858b9f;font-size:13px;line-height:1.55}
+.actions{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:28px}
+button{appearance:none;border:0;border-radius:14px;padding:14px 18px;font:inherit;font-weight:750;cursor:pointer}
+.primary{background:linear-gradient(135deg,#7378ff,#9568ff);color:white;box-shadow:0 12px 30px rgba(105,101,255,.28)}
+.secondary{background:transparent;color:#aeb3c4;border:1px solid rgba(255,255,255,.1)}
+.code-input{width:100%;margin-top:8px;border:1px solid rgba(255,255,255,.12);background:#10131a;color:#fff;border-radius:14px;padding:15px 16px;font:600 16px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;outline:none}
+.code-input:focus{border-color:#7f84ff;box-shadow:0 0 0 3px rgba(127,132,255,.14)}
+.stack{display:grid;gap:12px}
+.status-icon{width:58px;height:58px;border-radius:18px;display:grid;place-items:center;background:rgba(64,201,133,.12);color:#69d7a0;font-size:30px;font-weight:800;margin-bottom:22px}
+.status-icon.denied{background:rgba(241,102,113,.12);color:#ff8b94}
+.footer{margin:16px 0 0;text-align:center;color:#62687a;font-size:12px}
+@media (prefers-color-scheme:light){
+:root{background:#f4f5f8;color:#161820}.card{background:rgba(255,255,255,.94);border-color:rgba(15,20,35,.08);box-shadow:0 28px 75px rgba(36,43,68,.13)}
+body{background:radial-gradient(circle at 18% 0%,rgba(113,118,255,.18),transparent 34rem),linear-gradient(180deg,#f8f9fc,#eef0f5)}
+.lead,.hint{color:#656c80}.detail{background:#f8f9fc;border-color:#e7e9f0}.detail span{color:#777e91}.detail strong,.detail code{color:#202431}.scope{background:#f5f6fa;border-color:#e2e5ee;color:#4d5365}.code-input{background:#f7f8fb;color:#171a23;border-color:#dfe2eb}.secondary{color:#555d72;border-color:#dfe2eb}.brand{color:#4b4f77}.brand small,.footer{color:#8a90a1}
+}
+@media (max-width:560px){body{padding:16px}.card{padding:24px;border-radius:22px}.actions{grid-template-columns:1fr}.secondary{order:2}.detail{align-items:flex-start;flex-direction:column;gap:6px}.detail strong,.detail code{text-align:left}}
+)css";
+
+[[nodiscard]] std::string devicePageCsp(std::string_view nonce)
+{
+    return "default-src 'none'; style-src 'nonce-" + std::string{nonce}
+        + "'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+}
+
+[[nodiscard]] std::string devicePage(
+    std::string_view nonce,
+    std::string_view title,
+    std::string_view content)
+{
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<meta name=\"color-scheme\" content=\"dark light\"><title>"
+        + htmlEscape(title)
+        + "</title><style nonce=\"" + htmlEscape(nonce) + "\">"
+        + std::string{kDevicePageCss}
+        + "</style></head><body><main class=\"shell\"><div class=\"brand\">"
+          "<div class=\"brand-mark\">G</div><div>Genyleap<small>Secured by OpenProof</small></div>"
+          "</div><section class=\"card\">"
+        + std::string{content}
+        + "</section><p class=\"footer\">OpenProof keeps your app session separate from your Genyleap credentials.</p>"
+          "</main></body></html>";
+}
+
 [[nodiscard]] bool validReturnTarget(std::string_view target) noexcept
 {
     const bool permittedPath = target.starts_with("/oauth/authorize?")
@@ -1133,23 +1196,29 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
         auto parameters = queryParameters(request);
         if (!parameters) return error(parameters.error(), request);
         const auto userCode = optional(parameters.value(), "user_code");
+
+        auto styleNonce = security::randomTokenBase64Url(18U);
+        if (!styleNonce) return error(styleNonce.error(), request);
+
         if (!userCode) {
-            std::string body =
-                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                "<title>OpenProof Device Authorization</title></head><body><main>"
-                "<h1>Authorize a device</h1><form method=\"get\">"
-                "<label>Device code <input name=\"user_code\" autocomplete=\"one-time-code\" "
-                "required></label><button type=\"submit\">Continue</button></form></main></body></html>";
+            const std::string content =
+                "<span class=\"kicker\">Device authorization</span>"
+                "<h1>Connect a device</h1>"
+                "<p class=\"lead\">Enter the one-time code shown by the app that wants to use your Genyleap identity.</p>"
+                "<form method=\"get\" class=\"stack\">"
+                "<label class=\"section-label\" for=\"user_code\">Device code</label>"
+                "<input class=\"code-input\" id=\"user_code\" name=\"user_code\" autocomplete=\"one-time-code\" "
+                "autocapitalize=\"characters\" spellcheck=\"false\" placeholder=\"ABCD-EFGH\" required>"
+                "<button class=\"primary\" type=\"submit\">Continue securely</button></form>"
+                "<p class=\"hint\">Only approve codes you initiated yourself. OpenProof never asks the app for your Genyleap password.</p>";
             gateway::HttpResponse response{
                 200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
-                std::move(body)};
+                devicePage(styleNonce.value(), "Connect a device", content)};
             secure(response);
-            response.setHeader(
-                "content-security-policy",
-                "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+            response.setHeader("content-security-policy", devicePageCsp(styleNonce.value()));
             return response;
         }
+
         auto authorization = m_devices->find(*userCode);
         if (!authorization) {
             return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
@@ -1165,32 +1234,46 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
         if (!authenticated) {
             return redirect(std::string{"/login?return_to="} + percentEncode(returnTarget));
         }
+
+        auto registered = m_clients->requireActive(authorization->clientId());
+        if (!registered) return error(registered.error(), request);
+
         auto csrf = security::randomTokenBase64Url(32U);
         if (!csrf) return error(csrf.error(), request);
-        const std::string requestedScopes = scopeString(scopeStrings(authorization->scopes()));
-        std::string body =
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>OpenProof Device Authorization</title></head><body><main>"
-            "<h1>Authorize this device?</h1><p>Client: <code>"
-            + htmlEscape(authorization->clientId().value()) + "</code></p><p>Scopes: <code>"
-            + htmlEscape(requestedScopes) + "</code></p>";
-        if (authorization->resource()) {
-            body += "<p>Resource: <code>" + htmlEscape(*authorization->resource()) + "</code></p>";
+
+        std::string scopeBadges;
+        for (const auto& scope : scopeStrings(authorization->scopes())) {
+            scopeBadges += "<span class=\"scope\">" + htmlEscape(scope) + "</span>";
         }
-        body +=
-            "<form method=\"post\"><input type=\"hidden\" name=\"user_code\" value=\""
+
+        std::string detail =
+            "<span class=\"kicker\">Genyleap sign-in</span>"
+            "<h1>Approve " + htmlEscape(registered->displayName()) + "</h1>"
+            "<p class=\"lead\">This device is asking OpenProof to use your Genyleap identity. "
+            "Your password and browser session are never copied into the app.</p>"
+            "<div class=\"detail-grid\"><div class=\"detail\"><span>Application</span><strong>"
+            + htmlEscape(registered->displayName())
+            + "</strong></div><div class=\"detail\"><span>Device code</span><code>"
+            + htmlEscape(*userCode) + "</code></div>";
+        if (authorization->resource()) {
+            detail += "<div class=\"detail\"><span>Resource</span><code>"
+                + htmlEscape(*authorization->resource()) + "</code></div>";
+        }
+        detail += "</div><div class=\"section-label\">Permissions requested</div><div class=\"scopes\">"
+            + scopeBadges
+            + "</div><p class=\"hint\">For Genycaster, OpenProof proves which Genyleap identity you own. "
+              "Farcaster is a separate linked connection; Genycaster checks that connection before enabling your Farcaster account.</p>"
+              "<form method=\"post\" class=\"actions\"><input type=\"hidden\" name=\"user_code\" value=\""
             + htmlEscape(*userCode) + "\"><input type=\"hidden\" name=\"csrf\" value=\""
             + htmlEscape(csrf.value())
-            + "\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button>"
-              "<button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form>"
-              "</main></body></html>";
+            + "\"><button class=\"primary\" name=\"decision\" value=\"approve\" type=\"submit\">Approve Genycaster</button>"
+              "<button class=\"secondary\" name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form>";
+
         gateway::HttpResponse response{
-            200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}}, std::move(body)};
+            200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+            devicePage(styleNonce.value(), "Approve device", detail)};
         secure(response);
-        response.setHeader(
-            "content-security-policy",
-            "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+        response.setHeader("content-security-policy", devicePageCsp(styleNonce.value()));
         response.addHeader("set-cookie", cookie(kDeviceCsrfCookie, csrf.value(), "/", 600));
         return response;
     }
@@ -1216,6 +1299,9 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
         foundation::SecretString{sessionCookie.value()});
     if (!authenticated) return error(authenticated.error(), request);
 
+    auto styleNonce = security::randomTokenBase64Url(18U);
+    if (!styleNonce) return error(styleNonce.error(), request);
+
     foundation::Status action = foundation::ok();
     std::optional<oauth::DeviceAuthorization> approvedAuthorization;
     if (decision.value() == "deny") {
@@ -1230,22 +1316,27 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
     if (approvedAuthorization) {
         const auto audience = consentAudience(
             approvedAuthorization->clientId(), approvedAuthorization->resource());
-        // The explicit device approval is the authorization decision. Recording
-        // it as remembered consent is useful but must not invalidate an already
-        // completed approval if the optional remembered-consent write fails.
         [[maybe_unused]] auto remembered = m_consents->grant(
             authenticated->session().identity(), approvedAuthorization->clientId(),
             audience, scopeStrings(approvedAuthorization->scopes()));
     }
-    std::string body = decision.value() == "approve"
-        ? "<!doctype html><html lang=\"en\"><body><main><h1>Device approved</h1><p>You may return to your device.</p></main></body></html>"
-        : "<!doctype html><html lang=\"en\"><body><main><h1>Device denied</h1><p>The device was not authorized.</p></main></body></html>";
+
+    const bool approved = decision.value() == "approve";
+    const std::string content = approved
+        ? "<div class=\"status-icon\">&#10003;</div><span class=\"kicker\">Approved</span>"
+          "<h1>Device approved</h1><p class=\"lead\">Genycaster can now finish sign-in securely. "
+          "You may close this tab and return to the app.</p>"
+          "<p class=\"hint\">If your Genyleap identity does not yet have a Farcaster connection, "
+          "Genycaster will ask you to link one as the next step.</p>"
+        : "<div class=\"status-icon denied\">×</div><span class=\"kicker\">Not approved</span>"
+          "<h1>Device denied</h1><p class=\"lead\">No access was granted to this device. "
+          "You can close this tab and return to Genycaster.</p>";
+
     gateway::HttpResponse response{
-        200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}}, std::move(body)};
+        200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        devicePage(styleNonce.value(), approved ? "Device approved" : "Device denied", content)};
     secure(response);
-    response.setHeader(
-        "content-security-policy",
-        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    response.setHeader("content-security-policy", devicePageCsp(styleNonce.value()));
     response.addHeader("set-cookie", cookie(kDeviceCsrfCookie, "", "/", 0));
     return response;
 }
