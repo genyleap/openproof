@@ -300,6 +300,13 @@ button{appearance:none;border:0;border-radius:14px;padding:14px 18px;font:inheri
 .secondary{background:transparent;color:#aeb3c4;border:1px solid rgba(255,255,255,.1)}
 .code-input{width:100%;margin-top:8px;border:1px solid rgba(255,255,255,.12);background:#10131a;color:#fff;border-radius:14px;padding:15px 16px;font:600 16px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;outline:none}
 .code-input:focus{border-color:#7f84ff;box-shadow:0 0 0 3px rgba(127,132,255,.14)}
+.form-stack{display:grid;gap:16px}
+.field{display:grid;gap:7px}
+.field span{color:#c9ccda;font-size:13px;font-weight:700}
+.field input{width:100%;border:1px solid rgba(255,255,255,.12);background:#10131a;color:#fff;border-radius:14px;padding:14px 15px;font:inherit;outline:none;transition:border-color .15s ease,box-shadow .15s ease}
+.field input:focus{border-color:#7f84ff;box-shadow:0 0 0 3px rgba(127,132,255,.14)}
+.field input::placeholder{color:#62697c}
+.form-stack .actions{margin-top:6px}
 .stack{display:grid;gap:12px}
 .status-icon{width:58px;height:58px;border-radius:18px;display:grid;place-items:center;background:rgba(64,201,133,.12);color:#69d7a0;font-size:30px;font-weight:800;margin-bottom:22px}
 .status-icon.denied{background:rgba(241,102,113,.12);color:#ff8b94}
@@ -307,7 +314,7 @@ button{appearance:none;border:0;border-radius:14px;padding:14px 18px;font:inheri
 @media (prefers-color-scheme:light){
 :root{background:#f4f5f8;color:#161820}.card{background:rgba(255,255,255,.94);border-color:rgba(15,20,35,.08);box-shadow:0 28px 75px rgba(36,43,68,.13)}
 body{background:radial-gradient(circle at 18% 0%,rgba(113,118,255,.18),transparent 34rem),linear-gradient(180deg,#f8f9fc,#eef0f5)}
-.lead,.hint{color:#656c80}.detail{background:#f8f9fc;border-color:#e7e9f0}.detail span{color:#777e91}.detail strong,.detail code{color:#202431}.scope{background:#f5f6fa;border-color:#e2e5ee;color:#4d5365}.code-input{background:#f7f8fb;color:#171a23;border-color:#dfe2eb}.secondary{color:#555d72;border-color:#dfe2eb}.brand{color:#4b4f77}.brand small,.footer{color:#8a90a1}
+.lead,.hint{color:#656c80}.detail{background:#f8f9fc;border-color:#e7e9f0}.detail span{color:#777e91}.detail strong,.detail code{color:#202431}.scope{background:#f5f6fa;border-color:#e2e5ee;color:#4d5365}.code-input,.field input{background:#f7f8fb;color:#171a23;border-color:#dfe2eb}.field span{color:#4d5365}.secondary{color:#555d72;border-color:#dfe2eb}.brand{color:#4b4f77}.brand small,.footer{color:#8a90a1}
 }
 @media (max-width:560px){body{padding:16px}.card{padding:24px;border-radius:22px}.actions{grid-template-columns:1fr}.secondary{order:2}.detail{align-items:flex-start;flex-direction:column;gap:6px}.detail strong,.detail code{text-align:left}}
 )css";
@@ -725,12 +732,39 @@ gateway::HttpResponse OAuthHttpApi::loginPage(gateway::HttpRequest request)
     }
     auto csrf = security::randomTokenBase64Url(32U);
     if (!csrf) return error(csrf.error(), request);
-    std::string body = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OpenProof Sign In</title></head><body><main><h1>Sign in with OpenProof</h1><form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"return_to\" value=\""
-        + htmlEscape(returnTarget.value()) + "\"><input type=\"hidden\" name=\"csrf\" value=\""
-        + htmlEscape(csrf.value()) + "\"><label>Account <input name=\"subject\" autocomplete=\"username\" required></label><label>Password <input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label><label>Authenticator code <input name=\"totp\" inputmode=\"numeric\" autocomplete=\"one-time-code\"></label><button type=\"submit\">Sign in</button></form></main></body></html>";
-    gateway::HttpResponse response{200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}}, std::move(body)};
+    auto styleNonce = security::randomTokenBase64Url(18U);
+    if (!styleNonce) return error(styleNonce.error(), request);
+
+    const std::string content =
+        "<div class=\"kicker\">OpenProof Identity</div>"
+        "<h1>Sign in</h1>"
+        "<p class=\"lead\">Authenticate with your Genyleap identity. "
+        "The requesting application never receives your password or authenticator code.</p>"
+        "<form class=\"form-stack\" method=\"post\" action=\"/login\">"
+        "<input type=\"hidden\" name=\"return_to\" value=\""
+        + htmlEscape(returnTarget.value())
+        + "\"><input type=\"hidden\" name=\"csrf\" value=\""
+        + htmlEscape(csrf.value())
+        + "\"><label class=\"field\"><span>Account</span>"
+          "<input name=\"subject\" autocomplete=\"username\" "
+          "placeholder=\"Email or account identifier\" required></label>"
+          "<label class=\"field\"><span>Password</span>"
+          "<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>"
+          "<label class=\"field\"><span>Authenticator code <small>(if enabled)</small></span>"
+          "<input name=\"totp\" inputmode=\"numeric\" autocomplete=\"one-time-code\" "
+          "placeholder=\"6-digit code\"></label>"
+          "<div class=\"actions\"><button class=\"primary\" type=\"submit\">Sign in</button></div>"
+          "</form>"
+          "<p class=\"hint\">OpenProof handles authentication here; the app receives only the OAuth/OIDC result you authorize.</p>";
+
+    std::string body = devicePage(styleNonce.value(), "OpenProof Sign In", content);
+    gateway::HttpResponse response{
+        200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        std::move(body)};
     secure(response);
-    response.setHeader("content-security-policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    response.setHeader(
+        "content-security-policy",
+        devicePageCsp(styleNonce.value()));
     response.addHeader("set-cookie", cookie(kLoginCsrfCookie, csrf.value(), "/", 600));
     return response;
 }
@@ -856,30 +890,40 @@ gateway::HttpResponse OAuthHttpApi::authorize(gateway::HttpRequest request)
         if (!csrf) return error(csrf.error(), request);
         std::string scopeList;
         for (const auto& scope : consentScopes) {
-            if (!scopeList.empty()) scopeList.append(", ");
+            scopeList.append("<span class=\"scope\">");
             scopeList.append(htmlEscape(scope));
+            scopeList.append("</span>");
         }
-        std::string body =
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>Authorize access</title></head><body><main><h1>Authorize "
+        auto styleNonce = security::randomTokenBase64Url(18U);
+        if (!styleNonce) return error(styleNonce.error(), request);
+
+        const std::string content =
+            "<div class=\"kicker\">Authorization</div><h1>Authorize "
             + htmlEscape(registered->displayName())
-            + "</h1><p>Requested access: " + scopeList
-            + "</p><form method=\"post\" action=\"consent\">"
+            + "</h1><p class=\"lead\">Review the access requested by this application. "
+              "Your OpenProof password and authenticator remain private.</p>"
+              "<div class=\"section-label\">Requested access</div><div class=\"scopes\">"
+            + scopeList
+            + "</div><form method=\"post\" action=\"consent\">"
               "<input type=\"hidden\" name=\"return_to\" value=\""
             + htmlEscape(request.target())
             + "\"><input type=\"hidden\" name=\"csrf\" value=\""
             + htmlEscape(csrf.value())
-            + "\"><button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>"
-              "<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>"
-              "</form></main></body></html>";
+            + "\"><div class=\"actions\">"
+              "<button class=\"primary\" type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>"
+              "<button class=\"secondary\" type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>"
+              "</div></form>"
+              "<p class=\"hint\">You can revoke application consent later from your OpenProof-backed account security settings.</p>";
+
+        std::string body = devicePage(
+            styleNonce.value(), "Authorize access", content);
         gateway::HttpResponse response{
             200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
             std::move(body)};
         secure(response);
         response.setHeader(
             "content-security-policy",
-            "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+            devicePageCsp(styleNonce.value()));
         response.addHeader(
             "set-cookie", cookie(kConsentCsrfCookie, csrf.value(), "/", 600));
         return response;
