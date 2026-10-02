@@ -724,6 +724,11 @@ gateway::HttpResponse OAuthHttpApi::loginPage(gateway::HttpRequest request)
     if (!returnTarget || !validReturnTarget(returnTarget.value())) {
         return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
     }
+    const auto notice = optional(parameters.value(), "notice");
+    const auto loginError = optional(parameters.value(), "error");
+    const bool totpEnrolled = notice.has_value() && *notice == "totp-enrolled";
+    const bool authenticationFailed =
+        loginError.has_value() && *loginError == "authentication";
     auto csrf = security::randomTokenBase64Url(32U);
     if (!csrf) return error(csrf.error(), request);
     auto nonce = security::randomTokenBase64Url(24U);
@@ -740,12 +745,18 @@ gateway::HttpResponse OAuthHttpApi::loginPage(gateway::HttpRequest request)
 .card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(26px,6vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
 h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}.lead{color:#aeb3c4;line-height:1.65;margin:0 0 25px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}.field small{font-weight:600;text-transform:none;letter-spacing:0;color:#71778a}
 input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}.code{font-variant-numeric:tabular-nums;letter-spacing:.14em}
-button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
+button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.notice{margin:0 0 18px;padding:13px 14px;border-radius:14px;font-size:13px;line-height:1.55}.notice.info{background:rgba(99,102,241,.11);border:1px solid rgba(129,140,248,.28);color:#d8dbff}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
 @media(max-width:560px){body{padding:16px}.card{border-radius:23px}}
 </style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
 <section class="card"><span class="kicker">Secure sign in</span><h1>Sign in with OpenProof</h1>
-<p class="lead">Use your OpenProof account credentials. If you already enabled an authenticator, enter its current 6-digit code for an IAL2 session.</p>
-<form method="post" action="/login"><input type="hidden" name="return_to" value=")HTML"
+<p class="lead">Use your OpenProof account credentials. If you already enabled an authenticator, enter its current 6-digit code for an IAL2 session.</p>)HTML";
+    if (totpEnrolled) {
+        body += R"HTML(<div class="notice info"><strong>Authenticator enabled.</strong> The 6-digit code used during setup has already been consumed. Wait until your authenticator shows a <strong>new</strong> code, then sign in with that new code.</div>)HTML";
+    }
+    if (authenticationFailed) {
+        body += R"HTML(<div class="notice error"><strong>Sign-in failed.</strong> Use the same account email you used for password recovery, your new password, and the current 6-digit authenticator code. If you just enabled the authenticator, wait for the code to change before trying again.</div>)HTML";
+    }
+    body += R"HTML(<form method="post" action="/login"><input type="hidden" name="return_to" value=")HTML"
         + htmlEscape(returnTarget.value()) + R"HTML("><input type="hidden" name="csrf" value=")HTML"
         + htmlEscape(csrf.value()) + R"HTML(">
 <label class="field"><span>Account</span><input name="subject" autocomplete="username" required></label>
@@ -804,7 +815,15 @@ gateway::HttpResponse OAuthHttpApi::loginSubmit(gateway::HttpRequest request)
     auto verified = m_authentication->complete(started->transactionId(),
         foundation::SecretString{std::string{started->continuationToken().expose()}},
         binding.value(), authResponse);
-    if (!verified) return error(verified.error(), request);
+    if (!verified) {
+        if (verified.error().code() == foundation::ErrorCode::AuthenticationFailed) {
+            return redirect(
+                "/login?return_to=" + percentEncode(returnTarget.value())
+                    + "&error=authentication",
+                303);
+        }
+        return error(verified.error(), request);
+    }
     auto sessionGrant = m_sessions->issue(verified.value(), clientContext(request));
     if (!sessionGrant) return error(sessionGrant.error(), request);
     auto response = redirect(returnTarget.value(), 303);

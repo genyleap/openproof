@@ -632,8 +632,8 @@ if(verifyForm)verifyForm.addEventListener('submit',async event=>{
   if(!/^\d{6}$/.test(code)){show('Enter exactly the 6 digits shown by your authenticator.');return}
   try{
     await api('/account/totp/complete','POST',{enrollment_id:enrollmentId,code});
-    show('Authenticator enabled. Sign in again with the current 6-digit code to activate IAL2.','ok');
-    setTimeout(()=>location.assign('/login?return_to=%2Fadmin%2Fconsole'),1000);
+    show('Authenticator enabled. The code you just used is consumed. Wait for your authenticator to show a NEW 6-digit code, then sign in with that new code.','ok');
+    setTimeout(()=>location.assign('/login?return_to=%2Fadmin%2Fconsole&notice=totp-enrolled'),1400);
   }catch(error){show(error.message)}
 });
 const recovery=document.querySelector('#recovery');
