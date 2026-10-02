@@ -280,8 +280,14 @@ gateway::HttpResponse ApplicationManagementHttpApi::handle(gateway::HttpRequest 
         if (request.method() == gateway::HttpMethod::Get
             && request.path() == "/admin/console") {
             if (actor.error().code()
-                == foundation::ErrorCode::AuthenticationRequired) {
-                return redirect("/login?return_to=%2Fadmin%2Fconsole");
+                    == foundation::ErrorCode::AuthenticationRequired
+                || actor.error().code()
+                    == foundation::ErrorCode::AuthenticationFailed) {
+                auto response = redirect("/login?return_to=%2Fadmin%2Fconsole");
+                response.addHeader(
+                    "set-cookie",
+                    "__Host-openproof-session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
+                return response;
             }
             if (actor.error().code()
                 == foundation::ErrorCode::AssuranceInsufficient) {
