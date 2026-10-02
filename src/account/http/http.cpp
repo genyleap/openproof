@@ -222,6 +222,7 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Post && request.path() == "/account/phone/verify") return completePhone(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/forgot") return forgotPassword(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/reset") return resetPassword(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/recover") return recoveryPage(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/security") return securityPage(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/totp") return totpStatus(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/totp/start") return beginTotpEnrollment(std::move(request));
@@ -394,6 +395,109 @@ gateway::HttpResponse AccountHttpApi::resetPassword(gateway::HttpRequest request
     return status ? jsonResponse(200, json::object{{"password_reset", true}}) : error(status.error(), request);
 }
 
+gateway::HttpResponse AccountHttpApi::recoveryPage(gateway::HttpRequest request)
+{
+    static_cast<void>(request);
+    auto nonce = security::randomTokenBase64Url(24U);
+    if (!nonce) {
+        return jsonResponse(500, json::object{{"error", "Unable to render recovery page."}});
+    }
+    const std::string pageNonce = nonce.value();
+
+    std::string body = R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><title>Recover account · OpenProof</title>
+<style nonce=")HTML" + pageNonce + R"HTML(">
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#090b10;color:#f7f7fb}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 15% 0%,rgba(105,92,255,.22),transparent 34rem),linear-gradient(180deg,#10131b,#080a0f);padding:24px}
+.shell{width:min(100%,620px)}.brand{display:flex;align-items:center;gap:13px;margin:0 4px 24px;color:#e5e6ff;font-weight:800;font-size:21px}.brand-mark{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#7478ff,#9c68ff);box-shadow:0 16px 38px rgba(102,92,255,.28)}.brand small{display:block;margin-top:2px;color:#8c91a4;font-size:11px;letter-spacing:.11em;text-transform:uppercase}
+.card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(26px,6vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}h2{font-size:21px;margin:0 0 9px}.lead,.muted{color:#aeb3c4;line-height:1.65}.lead{margin:0 0 25px}.muted{margin:0 0 17px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
+input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}
+button,.button{appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.button.secondary{background:#171a23;border:1px solid rgba(255,255,255,.11)}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+.notice{display:none;margin:18px 0 0;padding:13px 15px;border-radius:14px;font-size:13px;line-height:1.55}.notice.show{display:block}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.notice.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#bbf7d0}.panel{display:none}.panel.show{display:block}.foot{color:#747b8f;font-size:12px;line-height:1.55;margin:16px 0 0}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
+@media(max-width:560px){body{padding:16px}.card{border-radius:23px}.actions>*{width:100%}}
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+<section class="card"><span class="kicker">Account recovery</span><h1>Reset your OpenProof password</h1>
+<p class="lead">OpenProof never reveals your existing password. Recovery verifies control of your email, then lets you choose a new password.</p>
+<div id="requestPanel" class="panel"><h2>Send a reset link</h2><p class="muted">Enter the email address used by your OpenProof account.</p>
+<form id="requestForm"><label class="field"><span>Email address</span><input name="email" type="email" autocomplete="email" maxlength="320" required></label><button type="submit">Send reset link</button></form>
+<p class="foot">For privacy, OpenProof gives the same response whether or not an account exists for that address.</p></div>
+<div id="resetPanel" class="panel"><h2>Choose a new password</h2><p class="muted">Use at least 8 characters. Completing the reset revokes existing OpenProof sessions for this identity.</p>
+<form id="resetForm"><label class="field"><span>New password</span><input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
+<label class="field"><span>Confirm new password</span><input name="confirm" type="password" autocomplete="new-password" minlength="8" maxlength="1024" required></label>
+<button type="submit">Reset password</button></form></div>
+<div id="notice" class="notice" role="status" aria-live="polite"></div>
+<div class="actions"><a class="button secondary" href="/login?return_to=%2Faccount%2Fsecurity">Back to sign in</a></div>
+</section><p class="footer">Recovery links are single-use and time-limited.</p></main>
+<script nonce=")HTML" + pageNonce + R"HTML(">
+const notice=document.querySelector('#notice');
+const show=(message,type='error')=>{notice.textContent=message;notice.className='notice show '+type};
+async function api(url,body){
+  const response=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  const text=await response.text();let data={};
+  try{data=text?JSON.parse(text):{}}catch{data={error:{message:text||'Unexpected response'}}}
+  if(!response.ok)throw new Error(data?.error?.message||'The request could not be completed.');
+  return data;
+}
+const params=new URLSearchParams(location.search);
+const queryId=params.get('id');
+const querySecret=params.get('secret');
+if(queryId&&querySecret){
+  sessionStorage.setItem('openproof_reset_id',queryId);
+  sessionStorage.setItem('openproof_reset_secret',querySecret);
+  history.replaceState(null,'','/account/recover');
+}
+const resetId=sessionStorage.getItem('openproof_reset_id');
+const resetSecret=sessionStorage.getItem('openproof_reset_secret');
+const hasProof=Boolean(resetId&&resetSecret);
+document.querySelector(hasProof?'#resetPanel':'#requestPanel').classList.add('show');
+const requestForm=document.querySelector('#requestForm');
+requestForm.addEventListener('submit',async event=>{
+  event.preventDefault();notice.className='notice';
+  const email=String(new FormData(requestForm).get('email')||'').trim();
+  try{
+    await api('/account/password/forgot',{email});
+    requestForm.reset();
+    show('If that email belongs to an OpenProof account, a single-use reset link has been sent.','ok');
+  }catch(error){show(error.message)}
+});
+const resetForm=document.querySelector('#resetForm');
+resetForm.addEventListener('submit',async event=>{
+  event.preventDefault();notice.className='notice';
+  if(!resetId||!resetSecret){show('This reset link is missing or no longer available. Request a new one.');return}
+  const data=new FormData(resetForm);
+  const password=String(data.get('password')||'');
+  const confirm=String(data.get('confirm')||'');
+  if(password.length<8){show('Use a password with at least 8 characters.');return}
+  if(password!==confirm){show('The two password fields do not match.');return}
+  try{
+    await api('/account/password/reset',{verification_id:resetId,secret:resetSecret,new_password:password});
+    sessionStorage.removeItem('openproof_reset_id');
+    sessionStorage.removeItem('openproof_reset_secret');
+    resetForm.reset();
+    show('Password reset complete. Sign in with your new password.','ok');
+    setTimeout(()=>location.assign('/login?return_to=%2Faccount%2Fsecurity'),1200);
+  }catch(error){show(error.message)}
+});
+</script></body></html>)HTML";
+
+    gateway::HttpResponse response{
+        200,
+        gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        std::move(body)};
+    response.setHeader("cache-control", "no-store");
+    response.setHeader("pragma", "no-cache");
+    response.setHeader("x-content-type-options", "nosniff");
+    response.setHeader("referrer-policy", "no-referrer");
+    response.setHeader(
+        "content-security-policy",
+        "default-src 'none'; style-src 'nonce-" + pageNonce
+            + "'; script-src 'nonce-" + pageNonce
+            + "'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    return response;
+}
+
 gateway::HttpResponse AccountHttpApi::securityPage(gateway::HttpRequest request)
 {
     auto authenticated = authenticate(request);
@@ -437,7 +541,7 @@ input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;backg
 button,.button{appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:13px 17px;font:750 14px inherit;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.secondary{background:#171a23!important;border:1px solid rgba(255,255,255,.11)!important}.actions{display:flex;gap:10px;flex-wrap:wrap}
 .setup{display:none;margin-top:18px;padding:19px;border-radius:19px;background:#0f1218;border:1px solid rgba(255,255,255,.08)}.setup.show{display:block}.key{display:flex;gap:10px;align-items:center;padding:13px;border-radius:14px;background:#090b10;border:1px solid rgba(255,255,255,.08)}.key code{flex:1;word-break:break-all;font:650 14px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
 .notice{display:none;margin:18px 0 0;padding:13px 15px;border-radius:14px;font-size:13px;line-height:1.55}.notice.show{display:block}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.notice.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#bbf7d0}
-.code{font-size:25px;letter-spacing:.22em;text-align:center;font-variant-numeric:tabular-nums}.foot{color:#747b8f;font-size:12px;line-height:1.55;margin:15px 0 0}.codes{white-space:pre-wrap;font:650 14px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e7e8f2}.spaced{margin-top:12px}.stage2{margin-top:25px}.center{text-align:center}
+.code{font-size:25px;letter-spacing:.22em;text-align:center;font-variant-numeric:tabular-nums}.foot{color:#747b8f;font-size:12px;line-height:1.55;margin:15px 0 0}.codes{white-space:pre-wrap;font:650 14px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e7e8f2}.spaced{margin-top:12px}.stage2{margin-top:25px}.center{text-align:center}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}
 @media(max-width:560px){body{padding:16px}.card{border-radius:23px}.actions>*{width:100%}.key{align-items:stretch;flex-direction:column}.key button{width:100%}}
 </style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
 <section class="card"><span class="kicker">Account security</span><h1>Protect your OpenProof account</h1>
@@ -460,6 +564,7 @@ button,.button{appearance:none;border:0;border-radius:14px;background:linear-gra
 <form id="startForm"><label class="field"><span>OpenProof password</span>
 <input name="password" type="password" autocomplete="current-password" maxlength="1024" required></label>
 <button type="submit">Create setup key</button></form>
+<p class="foot">Forgot your password? <a class="text-link" href="/account/recover">Reset it securely</a>.</p>
 <div id="setup" class="setup"><h2>1. Add this setup key</h2>
 <p class="muted">In your authenticator choose “Enter setup key” (time based). This long key is not the 6-digit login code.</p>
 <div class="key"><code id="secret"></code><button class="secondary" type="button" id="copy">Copy key</button></div>

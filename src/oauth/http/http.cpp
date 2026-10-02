@@ -740,7 +740,7 @@ gateway::HttpResponse OAuthHttpApi::loginPage(gateway::HttpRequest request)
 .card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(26px,6vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
 h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}.lead{color:#aeb3c4;line-height:1.65;margin:0 0 25px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}.field small{font-weight:600;text-transform:none;letter-spacing:0;color:#71778a}
 input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}.code{font-variant-numeric:tabular-nums;letter-spacing:.14em}
-button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
+button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
 @media(max-width:560px){body{padding:16px}.card{border-radius:23px}}
 </style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
 <section class="card"><span class="kicker">Secure sign in</span><h1>Sign in with OpenProof</h1>
@@ -753,6 +753,7 @@ button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-
 <label class="field"><span>Authenticator code <small>only if enabled</small></span><input class="code" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000"></label>
 <button type="submit">Sign in securely</button>
 <p class="hint"><strong>No authenticator yet?</strong> Leave the code empty. For owner administration, OpenProof will take you to Account Security to set one up.</p>
+<p class="hint"><strong>Forgot your password?</strong> <a class="text-link" href="/account/recover">Reset it securely</a>.</p>
 </form></section><p class="footer">OpenProof keeps your application sessions separate from your Genyleap credentials.</p></main></body></html>)HTML";
 
     gateway::HttpResponse response{

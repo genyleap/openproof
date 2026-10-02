@@ -738,6 +738,10 @@ foundation::Status AccountService::completePasswordReset(
     const VerificationId& id, const foundation::SecretString& secret,
     const foundation::SecretString& newPassword)
 {
+    if (newPassword.expose().size() < 8U || newPassword.expose().size() > 1024U) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The password length is outside the accepted range.");
+    }
     auto challenge = consume(id, secret, VerificationPurpose::PasswordReset);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     const identity::core::ExternalIdentityRef external{
