@@ -391,6 +391,14 @@ public:
 
     [[nodiscard]] foundation::Status initialize(
         const administration::InitialAdministrator& administrator) override;
+    /**
+     * Repairs an incomplete bootstrap that has one active organization but no
+     * memberships or owners. Requires an active IAL2 session for @p identity.
+     */
+    [[nodiscard]] foundation::Status repairInitialOwnerMembership(
+        const identity::core::OrganizationId& organization,
+        const identity::core::IdentityId& identity,
+        foundation::Instant now);
     [[nodiscard]] foundation::Status provision(
         const identity::core::IdentityId& actor,
         const administration::LocalMemberEnrollment& enrollment) override;

@@ -208,6 +208,7 @@ public:
 
     [[nodiscard]] bool runServer() const noexcept { return m_runServer; }
     [[nodiscard]] bool bootstrapAdmin() const noexcept { return m_bootstrapAdmin; }
+    [[nodiscard]] bool repairInitialOwner() const noexcept { return m_repairInitialOwner; }
     [[nodiscard]] bool checkConfig() const noexcept { return m_checkConfig; }
     [[nodiscard]] bool rekeyTotp() const noexcept { return m_rekeyTotp; }
     [[nodiscard]] bool rotateMasterKey() const noexcept { return m_rotateMasterKey; }
@@ -244,6 +245,7 @@ private:
     bool m_printDefaultConfig{false};
     bool m_runServer{false};
     bool m_bootstrapAdmin{false};
+    bool m_repairInitialOwner{false};
     bool m_checkConfig{false};
     bool m_rekeyTotp{false};
     bool m_rotateMasterKey{false};
@@ -279,6 +281,13 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
                                  "The 'bootstrap-admin' subcommand was specified more than once.");
             }
             parsed.m_bootstrapAdmin = true;
+        } else if (argument == "repair-initial-owner") {
+            if (parsed.m_repairInitialOwner) {
+                return fnd::fail(
+                    fnd::ErrorCode::InvalidArgument,
+                    "The 'repair-initial-owner' subcommand was specified more than once.");
+            }
+            parsed.m_repairInitialOwner = true;
         } else if (argument == "check-config") {
             if (parsed.m_checkConfig) {
                 return fnd::fail(fnd::ErrorCode::InvalidArgument,
@@ -392,6 +401,7 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
     if (parsed.m_showHelp) return parsed;
     const unsigned subcommandCount = static_cast<unsigned>(parsed.m_runServer)
         + static_cast<unsigned>(parsed.m_bootstrapAdmin)
+        + static_cast<unsigned>(parsed.m_repairInitialOwner)
         + static_cast<unsigned>(parsed.m_checkConfig)
         + static_cast<unsigned>(parsed.m_rekeyTotp)
         + static_cast<unsigned>(parsed.m_rotateMasterKey)
@@ -400,8 +410,8 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
                          "Only one subcommand may be selected.");
     }
-    const bool hasBootstrapOption = parsed.m_organizationName.has_value()
-        || parsed.m_identityId.has_value() || parsed.m_externalSubject.has_value();
+    const bool hasBootstrapOnlyOption = parsed.m_organizationName.has_value()
+        || parsed.m_externalSubject.has_value();
     if (parsed.m_bootstrapAdmin
         && (!parsed.m_configPath.has_value() || !parsed.m_organizationName.has_value()
             || !parsed.m_identityId.has_value()
@@ -410,13 +420,25 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
             fnd::ErrorCode::InvalidArgument,
             "bootstrap-admin requires --config, --organization-name, --identity-id and --subject.");
     }
-    if (!parsed.m_bootstrapAdmin && hasBootstrapOption) {
+    if (!parsed.m_bootstrapAdmin && hasBootstrapOnlyOption) {
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
-                         "Bootstrap options require the bootstrap-admin subcommand.");
+                         "Bootstrap-only options require the bootstrap-admin subcommand.");
+    }
+    if (parsed.m_repairInitialOwner
+        && (!parsed.m_configPath.has_value() || !parsed.m_identityId.has_value()
+            || !parsed.m_acknowledgedOffline)) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "repair-initial-owner requires --config, --identity-id and --acknowledge-offline.");
+    }
+    if (parsed.m_identityId.has_value()
+        && !parsed.m_bootstrapAdmin && !parsed.m_repairInitialOwner) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "Option '--identity-id' requires bootstrap-admin or repair-initial-owner.");
     }
     const bool hasRekeyOption = parsed.m_newKeyReference.has_value()
-        || parsed.m_newKeyVersion.has_value() || parsed.m_dryRun
-        || parsed.m_acknowledgedOffline;
+        || parsed.m_newKeyVersion.has_value() || parsed.m_dryRun;
     if ((parsed.m_rekeyTotp || parsed.m_rotateMasterKey)
         && (!parsed.m_configPath.has_value() || !parsed.m_newKeyReference.has_value()
             || !parsed.m_newKeyVersion.has_value()
@@ -434,6 +456,13 @@ fnd::Result<CommandLine> CommandLine::parse(std::span<const std::string_view> ar
     if (!parsed.m_rekeyTotp && !parsed.m_rotateMasterKey && hasRekeyOption) {
         return fnd::fail(fnd::ErrorCode::InvalidArgument,
                          "Key rotation options require a key-rotation subcommand.");
+    }
+    if (parsed.m_acknowledgedOffline
+        && !parsed.m_rekeyTotp && !parsed.m_rotateMasterKey
+        && !parsed.m_repairInitialOwner) {
+        return fnd::fail(
+            fnd::ErrorCode::InvalidArgument,
+            "Option '--acknowledge-offline' requires an offline maintenance subcommand.");
     }
     const bool hasMaterializeOption = parsed.m_outputDirectory.has_value()
         || parsed.m_acknowledgedSecretExport;
@@ -471,6 +500,9 @@ void printUsage()
     std::println("  {} bootstrap-admin --config <path> --organization-name <name>",
                  kProgramName);
     std::println("      --identity-id <id> --subject <local-subject>");
+    std::println("  {} repair-initial-owner --config <path> --identity-id <id>",
+                 kProgramName);
+    std::println("      --acknowledge-offline");
     std::println("  {} [--help | --version | --print-default-config]", kProgramName);
     std::println("");
     std::println("Options:");
@@ -481,12 +513,13 @@ void printUsage()
     std::println("                       opening a listener or connecting to dependencies.");
     std::println("  rekey-totp           Offline atomic re-encryption of all persisted TOTP seeds.");
     std::println("  rotate-master-key    Offline atomic invalidation of master-derived state.");
+    std::println("  repair-initial-owner Recover an incomplete zero-membership bootstrap only.");
     std::println("  materialize-persistent-keys");
     std::println("                       Export legacy-derived persistent subkeys as hex files.");
     std::println("  --new-key-ref        env:, file: or hexfile: reference for replacement key material.");
     std::println("  --new-key-version    Monotonically increasing key version.");
     std::println("  --dry-run            Perform the locked ceremony, then roll back.");
-    std::println("  --acknowledge-offline Confirm the server is stopped for a committed rotation.");
+    std::println("  --acknowledge-offline Confirm the server is stopped for committed offline maintenance.");
     std::println("  --output-directory   Existing empty owner-only directory for derived subkeys.");
     std::println("  --acknowledge-secret-export Confirm protected secret material will be written.");
     std::println("  --print-default-config");
@@ -495,7 +528,7 @@ void printUsage()
     std::println("  -h, --help           Show this message and exit.");
     std::println("  -V, --version        Show the version and exit.");
     std::println("  --organization-name  Display name of the initial tenant.");
-    std::println("  --identity-id        Canonical id for the initial owner.");
+    std::println("  --identity-id        Canonical id for bootstrap or constrained owner repair.");
     std::println("  --subject            Local login subject; never reused as identity id.");
     std::println("");
     std::println("Environment overrides:");
@@ -1164,6 +1197,86 @@ addProtectedRoutes(gateway::Router& router,
                  platform.auth().organizationId());
     std::println("TOTP secret (Base32; shown once): {}", enrollment.expose());
     std::println("Store this secret in the owner's authenticator before starting the server.");
+    return ExitCode::Success;
+}
+
+[[nodiscard]] ExitCode runRepairInitialOwner(
+    const cfg::PlatformConfig& platform, const CommandLine& commandLine,
+    const fnd::ClockSource& clock)
+{
+    if (!platform.auth().enabled() || !platform.database().enabled()
+        || platform.security().tokenSigningKey().expose().size() < 32U) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "repair-initial-owner requires enabled auth, PostgreSQL and configured security keys."});
+        return ExitCode::ConfigurationError;
+    }
+
+    auto poolConfig = postgres::PoolConfig::create(
+        platform.database().connectionString().clone(), platform.database().poolSize(),
+        std::chrono::seconds{5});
+    if (!poolConfig) {
+        reportStartupFailure(poolConfig.error());
+        return ExitCode::ConfigurationError;
+    }
+    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+    if (!pool) {
+        reportStartupFailure(pool.error());
+        return ExitCode::ConfigurationError;
+    }
+    postgres::Migrator migrator{*pool.value()};
+    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
+    const fnd::Status activeMaster =
+        verifyActiveMasterKey(*pool.value(), platform.security());
+    if (!activeMaster) {
+        reportStartupFailure(activeMaster.error());
+        return ExitCode::ConfigurationError;
+    }
+
+    auto passwordSecret = passwordPepperMaterial(platform.security());
+    auto totpSecret = credentialEncryptionMaterial(platform.security());
+    auto auditSecret = auditChainMaterial(platform.security());
+    if (!passwordSecret || !totpSecret || !auditSecret) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+    auto passwordHasher = credentials::PasswordHasher::create(
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+    auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
+    auto auditKey = audit::AuditKey::create(std::move(auditSecret).value());
+    if (!passwordHasher || !totpKey || !auditKey) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+        return ExitCode::InternalError;
+    }
+
+    auto repository = postgres::PostgresAdministrationRepository::create(
+        *pool.value(), std::move(passwordHasher).value(),
+        std::move(totpKey).value(),
+        platform.security().credentialEncryptionKeyVersion(),
+        idp::ProviderId{std::string{platform.auth().providerId()}},
+        std::move(auditKey).value());
+    if (!repository) {
+        reportStartupFailure(repository.error());
+        return ExitCode::InternalError;
+    }
+
+    const fnd::Status repaired = repository.value()->repairInitialOwnerMembership(
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        identity::IdentityId{commandLine.identityId()}, clock.now());
+    if (!repaired) {
+        reportStartupFailure(repaired.error());
+        return repaired.error().code() == fnd::ErrorCode::FailedPrecondition
+            || repaired.error().code() == fnd::ErrorCode::AssuranceInsufficient
+            ? ExitCode::UsageError : ExitCode::InternalError;
+    }
+
+    std::println(
+        "Initial-owner membership repaired for identity '{}' in organization '{}'.",
+        commandLine.identityId(), platform.auth().organizationId());
     return ExitCode::Success;
 }
 
@@ -2340,6 +2453,7 @@ void reportStartupFailure(const fnd::Error& failure)
         }
     }
     if (!commandLine->runServer() && !commandLine->bootstrapAdmin()
+        && !commandLine->repairInitialOwner()
         && !commandLine->checkConfig() && !commandLine->rekeyTotp()
         && !commandLine->rotateMasterKey()
         && !commandLine->materializePersistentKeys()) {
@@ -2381,6 +2495,9 @@ void reportStartupFailure(const fnd::Error& failure)
 
     if (commandLine->bootstrapAdmin()) {
         return runBootstrapAdmin(platform, environment, commandLine.value(), *clock);
+    }
+    if (commandLine->repairInitialOwner()) {
+        return runRepairInitialOwner(platform, commandLine.value(), *clock);
     }
 
     std::vector<obs::LogField> startupFields{

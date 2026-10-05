@@ -2656,6 +2656,157 @@ foundation::Status PostgresAdministrationRepository::initialize(
     return commit(connection);
 }
 
+foundation::Status PostgresAdministrationRepository::repairInitialOwnerMembership(
+    const identity::core::OrganizationId& organizationId,
+    const identity::core::IdentityId& identityId,
+    foundation::Instant now)
+{
+    if (organizationId.empty() || identityId.empty()) {
+        return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The initial-owner repair target is invalid.");
+    }
+
+    auto event = administrationEvent(
+        "bootstrap.initial-owner.repair", organizationId, identityId, identityId, now,
+        audit::AuditFields{{"role", "owner"},
+                           {"recovery_mode", "empty-membership-bootstrap"}});
+    if (!event) return foundation::fail(event.error());
+
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    PGconn* connection = lease->get();
+
+    auto begun = beginTransaction(connection);
+    if (!begun) return foundation::fail(begun.error());
+    auto failTransaction = [&](const foundation::Error& failure) -> foundation::Status {
+        rollback(connection);
+        return foundation::fail(failure);
+    };
+
+    ResultPointer isolated = exec(
+        connection, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    if (!commandOk(isolated.get())) {
+        return failTransaction(
+            databaseError(isolated.get(), "set owner-repair isolation"));
+    }
+    ResultPointer locked = exec(
+        connection, "SELECT pg_advisory_xact_lock(7299730475761673313)");
+    if (!tuplesOk(locked.get())) {
+        return failTransaction(
+            databaseError(locked.get(), "lock owner-repair ceremony"));
+    }
+
+    auto scalarCount = [&](std::string_view sql,
+                           const std::vector<std::string>& parameters,
+                           std::string_view operation)
+        -> foundation::Result<std::size_t> {
+        ResultPointer result = parameters.empty()
+            ? exec(connection, sql)
+            : execParams(connection, sql, parameters);
+        if (!tuplesOk(result.get()) || PQntuples(result.get()) != 1) {
+            return foundation::fail(databaseError(result.get(), operation));
+        }
+        return parseInteger<std::size_t>(field(result.get(), 0, 0));
+    };
+
+    auto organizationCount = scalarCount(
+        "SELECT count(*) FROM openproof.organizations",
+        {}, "count organizations for owner repair");
+    if (!organizationCount) return failTransaction(organizationCount.error());
+    if (organizationCount.value() != 1U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "Initial-owner repair requires exactly one organization."});
+    }
+
+    auto targetOrganization = scalarCount(
+        "SELECT count(*) FROM openproof.organizations WHERE id=$1 AND state=0",
+        {std::string{organizationId.value()}},
+        "validate owner-repair organization");
+    if (!targetOrganization) return failTransaction(targetOrganization.error());
+    if (targetOrganization.value() != 1U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "The owner-repair organization is not active."});
+    }
+
+    auto membershipCount = scalarCount(
+        "SELECT count(*) FROM openproof.memberships",
+        {}, "count memberships for owner repair");
+    if (!membershipCount) return failTransaction(membershipCount.error());
+    auto ownerCount = scalarCount(
+        "SELECT count(*) FROM openproof.membership_roles WHERE role='owner'",
+        {}, "count owners for owner repair");
+    if (!ownerCount) return failTransaction(ownerCount.error());
+    auto priorBootstrap = scalarCount(
+        "SELECT count(*) FROM openproof.audit_events "
+        "WHERE action='bootstrap.initial-owner' AND outcome='success'",
+        {}, "check bootstrap audit for owner repair");
+    if (!priorBootstrap) return failTransaction(priorBootstrap.error());
+    if (membershipCount.value() != 0U || ownerCount.value() != 0U
+        || priorBootstrap.value() != 0U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "Initial-owner repair is permitted only for an unowned incomplete bootstrap."});
+    }
+
+    auto eligibleIdentity = scalarCount(
+        "SELECT count(*) FROM openproof.identities i "
+        "JOIN openproof.external_identities e "
+        "  ON e.identity_id=i.id AND e.provider=$3 "
+        "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+        "JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+        "WHERE i.organization_id=$1 AND i.id=$2 AND i.kind=0 AND i.status=0",
+        {std::string{organizationId.value()}, std::string{identityId.value()},
+         std::string{m_provider.value()}},
+        "validate owner-repair identity");
+    if (!eligibleIdentity) return failTransaction(eligibleIdentity.error());
+    if (eligibleIdentity.value() != 1U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::FailedPrecondition,
+            "Initial-owner repair requires one active local human identity with password and TOTP."});
+    }
+
+    const std::string nowText = instant(now);
+    auto ial2Sessions = scalarCount(
+        "SELECT count(*) FROM openproof.sessions "
+        "WHERE identity_id=$1 AND state=0 AND assurance>=2 "
+        "AND absolute_expires_at_ms>$2::bigint "
+        "AND last_seen_at_ms + idle_timeout_ms > $2::bigint",
+        {std::string{identityId.value()}, nowText},
+        "validate owner-repair IAL2 session");
+    if (!ial2Sessions) return failTransaction(ial2Sessions.error());
+    if (ial2Sessions.value() == 0U) {
+        return failTransaction(foundation::Error{
+            foundation::ErrorCode::AssuranceInsufficient,
+            "Initial-owner repair requires an active IAL2 session for the target identity."});
+    }
+
+    auto status = runCommand(
+        connection,
+        "INSERT INTO openproof.memberships"
+        "(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,1,$3)",
+        {std::string{organizationId.value()}, std::string{identityId.value()}, nowText},
+        "repair initial owner membership");
+    if (!status) return failTransaction(status.error());
+
+    status = runCommand(
+        connection,
+        "INSERT INTO openproof.membership_roles"
+        "(organization_id,identity_id,role) VALUES($1,$2,'owner')",
+        {std::string{organizationId.value()}, std::string{identityId.value()}},
+        "repair initial owner role");
+    if (!status) return failTransaction(status.error());
+
+    status = appendAdministrationRecords(
+        connection, event.value(), m_auditKey,
+        "bootstrap.initial-owner.repaired");
+    if (!status) return failTransaction(status.error());
+
+    return commit(connection);
+}
+
 foundation::Status PostgresAdministrationRepository::provision(
     const identity::core::IdentityId& actor,
     const administration::LocalMemberEnrollment& enrollment)
