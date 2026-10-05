@@ -2,6 +2,40 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc5 — 2026-10-05
+
+### Browser authentication and account security
+
+- Added the browser Account Security surface for TOTP enrollment, IAL2 status,
+  recovery-code generation and owner-administration handoff without relying on
+  developer-console flows.
+- Added a first-party browser password-recovery experience backed by the existing
+  enumeration-safe reset APIs, including one-time proof removal from the URL and
+  consistent password validation before challenge consumption.
+- Improved browser login and admin-console error handling so stale sessions are
+  cleared and redirected back through sign-in instead of surfacing raw JSON
+  authentication failures.
+- Clarified TOTP replay behavior after enrollment: the setup code is consumed and
+  the next authenticator timestep must be used for the following IAL2 sign-in.
+
+### OAuth and native client flows
+
+- Completed browser OAuth consent without unnecessary credential re-entry and
+  fixed local-login subject forwarding during authorization.
+- Refined Device Authorization presentation and approval routing, including
+  hiding device codes from the final approval surface.
+- Added the Genycaster native OAuth client and production-environment migrations.
+
+### Owner bootstrap recovery
+
+- Added the offline `repair-initial-owner` maintenance command for the narrowly
+  defined incomplete-bootstrap case where one active organization and one active
+  local Password+TOTP identity exist but no memberships, owner roles or prior
+  successful initial-owner bootstrap record exist.
+- The repair requires an active IAL2 session for the target identity, executes in
+  a serializable transaction under the bootstrap advisory lock, and appends the
+  administration audit/outbox records after creating the owner membership.
+
 ## 1.1.0-rc4 — 2026-09-24
 
 ### Farcaster profile bootstrap
