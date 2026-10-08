@@ -88,6 +88,16 @@ const accepted = await client.handleCallback(callback(valid.state));
 assert.equal(accepted.id_token_claims.sub, 'identity-42');
 assert.equal(storage.has(`openproof:${valid.state}`), false);
 
+const authorizedParty = await begin();
+tokenResponse = {
+  access_token: 'access-token',
+  id_token: await signIdToken(claims(authorizedParty.nonce, {
+    aud: [clientId, 'other-client'], azp: clientId,
+  })),
+};
+const acceptedAzp = await client.handleCallback(callback(authorizedParty.state));
+assert.equal(acceptedAzp.id_token_claims.azp, clientId);
+
 const issuerMismatch = await begin();
 await assert.rejects(
   client.handleCallback(
@@ -120,6 +130,9 @@ for (const override of [
   { iss: 'https://evil.example' },
   { aud: 'other-client' },
   { aud: [clientId, 'other-client'] },
+  { azp: 'other-client' },
+  { aud: [clientId], azp: 'other-client' },
+  { aud: [clientId, 'other-client'], azp: 'other-client' },
   { iat: Math.floor(Date.now() / 1000) + 600 },
   { at_hash: 'invalid-access-token-hash' },
 ]) {
