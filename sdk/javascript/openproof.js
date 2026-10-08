@@ -45,12 +45,14 @@ const assertConfig = ({ issuer, clientId, redirectUri, scopes }) => {
   } catch {
     throw new TypeError('Invalid OpenProof client configuration');
   }
+  const unsafeRedirectScheme = ['javascript:', 'data:', 'file:']
+    .includes(parsedRedirect.protocol);
   const loopbackHttp = parsedIssuer.protocol === 'http:'
     && ['127.0.0.1', '[::1]', 'localhost'].includes(parsedIssuer.hostname);
   if ((parsedIssuer.protocol !== 'https:' && !loopbackHttp)
       || parsedIssuer.username || parsedIssuer.password
       || parsedIssuer.search || parsedIssuer.hash || parsedRedirect.username
-      || parsedRedirect.password) {
+      || parsedRedirect.password || parsedRedirect.hash || unsafeRedirectScheme) {
     throw new TypeError('Invalid OpenProof client configuration');
   }
 };
@@ -86,6 +88,9 @@ export class OpenProofIdentity {
 
   async handleCallback(currentUrl = location.href) {
     const url = new URL(currentUrl);
+    if (['code', 'state', 'iss'].some(name => url.searchParams.getAll(name).length !== 1)) {
+      throw new Error('Invalid OpenProof callback');
+    }
     const code = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     const returnedIssuer = url.searchParams.get('iss');
