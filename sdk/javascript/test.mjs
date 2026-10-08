@@ -43,6 +43,20 @@ for (const invalidIssuer of [
     issuer: invalidIssuer, clientId, redirectUri, scopes: ['openid'],
   }), /Invalid OpenProof client configuration/);
 }
+for (const invalidRedirect of [
+  'javascript:alert(1)',
+  'data:text/html,callback',
+  'file:///tmp/callback',
+  'https://app.example.com/auth/callback#fragment',
+]) {
+  assert.throws(() => new OpenProofIdentity({
+    issuer, clientId, redirectUri: invalidRedirect, scopes: ['openid'],
+  }), /Invalid OpenProof client configuration/);
+}
+assert.ok(new OpenProofIdentity({
+  issuer, clientId, redirectUri: 'com.example.app:/oauth2redirect',
+}).redirectUri.endsWith('/oauth2redirect'));
+
 let tokenResponse;
 let jwks = [publicJwk];
 globalThis.fetch = async url => {
@@ -105,6 +119,20 @@ await assert.rejects(
   ),
   /Invalid OpenProof callback/,
 );
+
+for (const name of ['code', 'state', 'iss']) {
+  const ambiguous = await begin();
+  tokenResponse = {
+    access_token: 'access-token',
+    id_token: await signIdToken(claims(ambiguous.nonce)),
+  };
+  const duplicateUrl = new URL(callback(ambiguous.state));
+  duplicateUrl.searchParams.append(name, duplicateUrl.searchParams.get(name));
+  await assert.rejects(
+    client.handleCallback(duplicateUrl.toString()),
+    /Invalid OpenProof callback/,
+  );
+}
 
 const nonceMismatch = await begin();
 tokenResponse = {
