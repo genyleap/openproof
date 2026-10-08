@@ -21,6 +21,7 @@ const decodeJsonPart = value => {
   }
 };
 const audienceMatches = (claims, clientId) => {
+  if (claims.azp !== undefined && claims.azp !== clientId) return false;
   if (typeof claims.aud === 'string') return claims.aud === clientId;
   if (!Array.isArray(claims.aud) || !claims.aud.every(value => typeof value === 'string')
       || !claims.aud.includes(clientId)) return false;
