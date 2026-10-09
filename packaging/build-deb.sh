@@ -125,5 +125,7 @@ chmod 0755 "$PKG/DEBIAN/prerm"
 mkdir -p "$OUT_DIR"
 ASSET="$OUT_DIR/openproof_"$RAW_VERSION"_"$ARCH".deb"
 dpkg-deb --build --root-owner-group "$PKG" "$ASSET" >/dev/null
+python3 "$ROOT/scripts/verify-migration-artifacts.py" \
+  --source "$ROOT/migrations" --deb "$ASSET"
 sha256sum "$ASSET"
 printf 'Built %s\n' "$ASSET"
