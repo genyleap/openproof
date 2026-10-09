@@ -48,14 +48,31 @@ for (const invalidRedirect of [
   'data:text/html,callback',
   'file:///tmp/callback',
   'https://app.example.com/auth/callback#fragment',
+  'http://example.com/oauth/callback',
+  'http://localhost:3000/callback',
+  'http://127.0.0.1/callback',
+  'http://[::1]/callback',
+  'ftp://example.com/callback',
+  'HTTPS://app.example.com/callback',
+  'https://app.example.com/callback\\invalid',
+  'https://app.example.com/callback\\n',
+  'http://127.0.0.1:0/callback',
+  'http://127.0.0.1:65536/callback',
+  'com.example.app:/oauth2redirect',
 ]) {
   assert.throws(() => new OpenProofIdentity({
     issuer, clientId, redirectUri: invalidRedirect, scopes: ['openid'],
   }), /Invalid OpenProof client configuration/);
 }
-assert.ok(new OpenProofIdentity({
-  issuer, clientId, redirectUri: 'com.example.app:/oauth2redirect',
-}).redirectUri.endsWith('/oauth2redirect'));
+for (const safeRedirect of [
+  'https://app.example.com/auth/callback',
+  'http://127.0.0.1:49152/oauth/callback',
+  'http://[::1]:49152/oauth/callback',
+]) {
+  assert.equal(new OpenProofIdentity({
+    issuer, clientId, redirectUri: safeRedirect,
+  }).redirectUri, safeRedirect);
+}
 
 let tokenResponse;
 let jwks = [publicJwk];

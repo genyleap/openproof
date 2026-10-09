@@ -45,14 +45,20 @@ const assertConfig = ({ issuer, clientId, redirectUri, scopes }) => {
   } catch {
     throw new TypeError('Invalid OpenProof client configuration');
   }
-  const unsafeRedirectScheme = ['javascript:', 'data:', 'file:']
-    .includes(parsedRedirect.protocol);
+  // Match server-side redirect registration: HTTPS, or native IP-loopback HTTP with a port.
+  const nativeLoopback = /^http:\/\/(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})(?:[/?]|$)/
+    .exec(redirectUri);
+  const validNativeLoopback = parsedRedirect.protocol === 'http:' && nativeLoopback
+    && Number(nativeLoopback[1]) >= 1 && Number(nativeLoopback[1]) <= 65535;
+  const validRedirect = (parsedRedirect.protocol === 'https:'
+    && redirectUri.startsWith('https://')) || validNativeLoopback;
   const loopbackHttp = parsedIssuer.protocol === 'http:'
     && ['127.0.0.1', '[::1]', 'localhost'].includes(parsedIssuer.hostname);
   if ((parsedIssuer.protocol !== 'https:' && !loopbackHttp)
       || parsedIssuer.username || parsedIssuer.password
       || parsedIssuer.search || parsedIssuer.hash || parsedRedirect.username
-      || parsedRedirect.password || parsedRedirect.hash || unsafeRedirectScheme) {
+      || parsedRedirect.password || parsedRedirect.hash || !validRedirect
+      || redirectUri.length > 2048 || /[\\\s\x00-\x1f\x7f]/.test(redirectUri)) {
     throw new TypeError('Invalid OpenProof client configuration');
   }
 };
