@@ -344,12 +344,15 @@ const httpServer = createServer(async (req, res) => {
     res.once('close', () => void mcp.close().catch(() => undefined));
     await transport.handleRequest(req, res);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    console.error(JSON.stringify({
+      event: 'mcp_request_error',
+      errorType: error instanceof Error ? error.name : 'unknown',
+    }));
     if (!res.headersSent) {
       res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
     }
     if (!res.writableEnded) {
-      res.end(JSON.stringify({ error: 'internal_error', message }));
+      res.end(JSON.stringify({ error: 'internal_error' }));
     }
   }
 });
