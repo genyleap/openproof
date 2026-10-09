@@ -136,6 +136,8 @@ tar \
   -C "$ROOTFS" \
   -czf "$ASSET" .
 
+python3 "$ROOT/scripts/verify-migration-artifacts.py" \
+  --source "$ROOT/migrations" --bundle "$ASSET"
 sha256sum "$ASSET"
 printf 'Built %s\n' "$ASSET"
 printf 'Bundled runtime libraries:\n'
