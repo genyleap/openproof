@@ -68,6 +68,13 @@ public:
     [[nodiscard]] virtual foundation::Status verifyPassword(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) = 0;
+    /** Only prompts when Argon2id is the configured target policy. */
+    [[nodiscard]] virtual foundation::Result<bool> passwordUpgradeNeeded(
+        const idp::ExternalSubject& subject) = 0;
+    /** Verify current password and conditionally replace its hash, never the password. */
+    [[nodiscard]] virtual foundation::Result<bool> confirmPasswordUpgrade(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) = 0;
     [[nodiscard]] virtual foundation::Result<bool> hasTotp(
         const idp::ExternalSubject& subject) = 0;
     /** Verifies the enrollment code, then installs/replaces the TOTP seed atomically. */
@@ -112,6 +119,11 @@ public:
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) override;
     [[nodiscard]] foundation::Status verifyPassword(
+        const idp::ExternalSubject& subject,
+        const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Result<bool> passwordUpgradeNeeded(
+        const idp::ExternalSubject& subject) override;
+    [[nodiscard]] foundation::Result<bool> confirmPasswordUpgrade(
         const idp::ExternalSubject& subject,
         const foundation::SecretString& password) override;
     [[nodiscard]] foundation::Result<bool> hasTotp(

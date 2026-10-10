@@ -172,6 +172,12 @@ public:
     /** nullopt means this identity has no local email/password method. */
     [[nodiscard]] foundation::Result<std::optional<bool>> totpEnabled(
         const identity::core::IdentityId& identity) const;
+    /** nullopt for externally authenticated identities without local passwords. */
+    [[nodiscard]] foundation::Result<std::optional<bool>> passwordUpgradeNeeded(
+        const identity::core::IdentityId& identity) const;
+    [[nodiscard]] foundation::Result<bool> confirmPasswordUpgrade(
+        const identity::core::IdentityId& identity,
+        const foundation::SecretString& password);
     [[nodiscard]] foundation::Result<TotpEnrollmentStart> beginTotpEnrollment(
         const identity::core::IdentityId& identity,
         const foundation::SecretString& password,

@@ -227,6 +227,47 @@ foundation::Status InMemoryLocalAccountDirectory::verifyPassword(
     return foundation::ok();
 }
 
+foundation::Result<bool> InMemoryLocalAccountDirectory::passwordUpgradeNeeded(
+    const idp::ExternalSubject& subject)
+{
+    if (!m_passwordHasher.prefersArgon2id()) return false;
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const auto found = m_accounts.find(subject);
+    if (found == m_accounts.end()) {
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    const std::lock_guard<std::mutex> accountGuard{found->second->mutex};
+    return m_passwordHasher.needsRehash(found->second->password);
+}
+
+foundation::Result<bool> InMemoryLocalAccountDirectory::confirmPasswordUpgrade(
+    const idp::ExternalSubject& subject, const foundation::SecretString& password)
+{
+    if (!m_passwordHasher.prefersArgon2id()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id is not the selected password algorithm.");
+    }
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const auto found = m_accounts.find(subject);
+    if (found == m_accounts.end()) {
+        auto dummy = m_passwordHasher.verify(password, m_dummyHash);
+        if (!dummy) return foundation::fail(dummy.error());
+        return foundation::fail(authenticationFailure("Local account is unknown."));
+    }
+    const std::lock_guard<std::mutex> accountGuard{found->second->mutex};
+    auto verified = m_passwordHasher.verify(password, found->second->password);
+    if (!verified) return foundation::fail(verified.error());
+    if (!verified.value()) return foundation::fail(authenticationFailure(
+        "Local credential verification failed."));
+    auto needed = m_passwordHasher.needsRehash(found->second->password);
+    if (!needed) return foundation::fail(needed.error());
+    if (!needed.value()) return false;
+    auto upgraded = m_passwordHasher.hash(password);
+    if (!upgraded) return foundation::fail(upgraded.error());
+    found->second->password = std::move(upgraded).value();
+    return true;
+}
+
 foundation::Result<bool> InMemoryLocalAccountDirectory::hasTotp(
     const idp::ExternalSubject& subject)
 {

@@ -829,6 +829,30 @@ foundation::Result<std::optional<bool>> AccountService::totpEnabled(
     return std::optional<bool>{enabled.value()};
 }
 
+foundation::Result<std::optional<bool>> AccountService::passwordUpgradeNeeded(
+    const identity::core::IdentityId& identity) const
+{
+    auto subject = localSubject(identity);
+    if (!subject) return foundation::fail(subject.error());
+    if (!subject->has_value()) return std::optional<bool>{};
+    auto needed = m_localAccounts->passwordUpgradeNeeded(subject->value());
+    if (!needed) return foundation::fail(needed.error());
+    return std::optional<bool>{needed.value()};
+}
+
+foundation::Result<bool> AccountService::confirmPasswordUpgrade(
+    const identity::core::IdentityId& identity,
+    const foundation::SecretString& password)
+{
+    auto subject = localSubject(identity);
+    if (!subject) return foundation::fail(subject.error());
+    if (!subject->has_value()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "This identity has no local password.");
+    }
+    return m_localAccounts->confirmPasswordUpgrade(subject->value(), password);
+}
+
 foundation::Result<TotpEnrollmentStart> AccountService::beginTotpEnrollment(
     const identity::core::IdentityId& identity,
     const foundation::SecretString& password,

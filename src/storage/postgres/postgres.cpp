@@ -2303,6 +2303,78 @@ foundation::Status PostgresLocalAccountDirectory::verifyPassword(
     return foundation::ok();
 }
 
+foundation::Result<bool> PostgresLocalAccountDirectory::passwordUpgradeNeeded(
+    const identity::provider::ExternalSubject& subject)
+{
+    if (!m_passwordHasher.prefersArgon2id()) return false;
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer record = execParams(lease->get(),
+        "SELECT p.password_hash FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(record.get())) return foundation::fail(databaseError(
+        record.get(), "check password upgrade"));
+    if (PQntuples(record.get()) != 1) {
+        return foundation::fail(authenticationFailure("Local account is unavailable."));
+    }
+    auto parsed = credentials::PasswordHash::parse(field(record.get(), 0, 0));
+    if (!parsed) return foundation::fail(parsed.error());
+    return m_passwordHasher.needsRehash(parsed.value());
+}
+
+foundation::Result<bool> PostgresLocalAccountDirectory::confirmPasswordUpgrade(
+    const identity::provider::ExternalSubject& subject,
+    const foundation::SecretString& password)
+{
+    if (!m_passwordHasher.prefersArgon2id()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id is not the selected password algorithm.");
+    }
+    auto lease = m_pool->m_implementation->acquire();
+    if (!lease) return foundation::fail(lease.error());
+    ResultPointer record = execParams(lease->get(),
+        "SELECT e.identity_id,p.password_hash FROM openproof.external_identities e "
+        "JOIN openproof.identities i ON i.id=e.identity_id AND i.status=0 "
+        "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+        "WHERE e.provider=$1 AND e.external_subject=$2",
+        {std::string{m_provider.value()}, std::string{subject.value()}});
+    if (!tuplesOk(record.get())) return foundation::fail(databaseError(
+        record.get(), "confirm password upgrade"));
+    if (PQntuples(record.get()) != 1) {
+        auto dummy = m_passwordHasher.verify(password, m_dummyHash);
+        if (!dummy) return foundation::fail(dummy.error());
+        return foundation::fail(authenticationFailure("Local account is unavailable."));
+    }
+    const std::string identityId = field(record.get(), 0, 0);
+    const std::string encoded = field(record.get(), 0, 1);
+    auto stored = credentials::PasswordHash::parse(encoded);
+    if (!stored) return foundation::fail(stored.error());
+    auto verified = m_passwordHasher.verify(password, stored.value());
+    if (!verified) return foundation::fail(verified.error());
+    if (!verified.value()) return foundation::fail(authenticationFailure(
+        "Local credential verification failed."));
+    auto needed = m_passwordHasher.needsRehash(stored.value());
+    if (!needed) return foundation::fail(needed.error());
+    if (!needed.value()) return false;
+    auto upgraded = m_passwordHasher.hash(password);
+    if (!upgraded) return foundation::fail(upgraded.error());
+    ResultPointer changed = execParams(lease->get(),
+        "UPDATE openproof.password_credentials SET password_hash=$1 "
+        "WHERE identity_id=$2 AND password_hash=$3 RETURNING identity_id",
+        {std::string{upgraded->encoded()}, identityId, encoded});
+    if (!tuplesOk(changed.get())) return foundation::fail(databaseError(
+        changed.get(), "upgrade local password hash"));
+    // CAS race with a password reset: never overwrite a new password.
+    if (PQntuples(changed.get()) != 1) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Password changed during verification; try again.");
+    }
+    return true;
+}
+
 foundation::Result<bool> PostgresLocalAccountDirectory::hasTotp(
     const identity::provider::ExternalSubject& subject)
 {

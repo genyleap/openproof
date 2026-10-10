@@ -77,6 +77,42 @@ a bounded text field that already holds both self-identifying encodings.
 This migration does not modify OAuth/OIDC signing, sessions, existing TOTP
 secrets, or external identity provider credentials.
 
+
+## Existing-user confirmation prompt
+
+When `[security].password_hash_algorithm = "argon2id"` and an authenticated
+identity has a local password hash that `PasswordHasher::needsRehash()`
+identifies as outdated, `GET /account/password/upgrade` returns
+`{"available":true,"needs_upgrade":true,"target_algorithm":"argon2id"}`.
+Identity without a local password receives `available:false`, and an
+up-to-date identity receives `needs_upgrade:false`.
+
+The first-party `/account/security` page displays a dismissible modal and
+a persistent in-page reminder. The modal submits the current password to
+`POST /account/password/upgrade` **only at the OpenProof origin**, never
+to an integrating site. The endpoint requires a live authenticated session,
+same-origin HTTPS `Origin` (and compatible `Sec-Fetch-Site`), JSON content
+type, the current password, and both IP/route and identity-wide rate limiting.
+
+Reconfirmation verifies the existing KDF/pepper and uses a PostgreSQL
+compare-and-swap update of the stored hash. It does not alter the password,
+session, MFA enrollment, or `changed_at_ms`; a racing password reset is
+never overwritten. The endpoint is idempotent for already-upgraded accounts.
+There is no bulk migration and no prompt when scrypt remains the preferred
+policy. Browser dismissal is held in session storage; the inline reminder
+remains available.
+
+Connected applications may display a *link to the OpenProof origin* in their
+account settings. The status endpoint is intended for the first-party OpenProof
+page; it is not a cross-origin, credentialed status service. Integrating sites
+must never collect or proxy the OpenProof password themselves. Merely holding an OAuth/OIDC session does
+not prove knowledge of the current password and cannot perform the upgrade.
+
+Deploy this feature, run integration tests and browser checks, then explicitly
+enable Argon2id as the default in the **actual runtime configuration**. Keep
+legacy scrypt verification in all rollback-capable binaries, retain the current
+pepper, and monitor the 64 MiB/3-iteration Argon2id memory and CPU budget.
+
 ## Verification
 
 Automated regression tests cover legacy scrypt hashing, new Argon2id hashing,

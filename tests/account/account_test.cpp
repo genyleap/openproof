@@ -148,6 +148,18 @@ struct Fixture {
     CapturingDelivery delivery;
     std::unique_ptr<account::AccountService> service;
 };
+
+TEST(AccountPasswordUpgradeTest, ExternalOnlyIdentityNeverReceivesPrompt)
+{
+    Fixture fixture;
+    const auto identity = fixture.addActiveIdentity("id-external-only");
+    auto status = fixture.service->passwordUpgradeNeeded(identity);
+    ASSERT_TRUE(status);
+    EXPECT_FALSE(status->has_value());
+    EXPECT_FALSE(fixture.service->confirmPasswordUpgrade(
+        identity, fnd::SecretString{"unrelated-password"}));
+}
+
 TEST(AccountEmailLinkingTest, SignupConvergesOnExistingActiveVerifiedEmail)
 {
     Fixture fixture;

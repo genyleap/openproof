@@ -79,6 +79,7 @@ public:
     /** True when a successfully verified hash should be upgraded to the selected policy. */
     [[nodiscard]] foundation::Result<bool> needsRehash(const PasswordHash& hash) const;
     [[nodiscard]] static bool supportsArgon2id() noexcept;
+    [[nodiscard]] bool prefersArgon2id() const noexcept { return m_algorithm == "argon2id"; }
 
 private:
     PasswordHasher(foundation::SecretString pepper, PasswordPolicy policy,
