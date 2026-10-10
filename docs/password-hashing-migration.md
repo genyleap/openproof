@@ -102,9 +102,10 @@ There is no bulk migration and no prompt when scrypt remains the preferred
 policy. Browser dismissal is held in session storage; the inline reminder
 remains available.
 
-Connected applications may display a *link to the OpenProof origin* after
-checking the authenticated status endpoint. They must never collect or proxy
-the OpenProof password themselves. Merely holding an OAuth/OIDC session does
+Connected applications may display a *link to the OpenProof origin* in their
+account settings. The status endpoint is intended for the first-party OpenProof
+page; it is not a cross-origin, credentialed status service. Integrating sites
+must never collect or proxy the OpenProof password themselves. Merely holding an OAuth/OIDC session does
 not prove knowledge of the current password and cannot perform the upgrade.
 
 Deploy this feature, run integration tests and browser checks, then explicitly
