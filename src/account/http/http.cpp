@@ -774,6 +774,11 @@ gateway::HttpResponse AccountHttpApi::confirmPasswordUpgrade(gateway::HttpReques
     }
     auto actor = authorize(request);
     if (!actor) return error(actor.error(), request);
+    // Apply an identity-wide limit in addition to the route/IP limiter.
+    // A stolen session must not permit distributed password guessing.
+    if (!m_limiter->allow("account:password-upgrade:identity:" + std::string{actor->value()})) {
+        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
     auto body = objectBody(request);
     if (!body || !onlyFields(body.value(), {"password"})) {
         return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}

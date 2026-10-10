@@ -92,7 +92,7 @@ a persistent in-page reminder. The modal submits the current password to
 `POST /account/password/upgrade` **only at the OpenProof origin**, never
 to an integrating site. The endpoint requires a live authenticated session,
 same-origin HTTPS `Origin` (and compatible `Sec-Fetch-Site`), JSON content
-type, the current password, and the account-wide rate limiter.
+type, the current password, and both IP/route and identity-wide rate limiting.
 
 Reconfirmation verifies the existing KDF/pepper and uses a PostgreSQL
 compare-and-swap update of the stored hash. It does not alter the password,
