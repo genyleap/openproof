@@ -650,6 +650,30 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
             ++report.alreadyApplied;
             continue;
         }
+
+        // Historical releases embedded Genyleap-specific OAuth client seeds
+        // (0020-0022) in the global migration chain. A fresh or differently
+        // tenanted installation does not yet have the 'genyleap' organization;
+        // applying the seed would fail its foreign key. Defer all three files
+        // without marking them applied, so a later bootstrap of that tenant
+        // can apply the original checksummed SQL unchanged and in order.
+        // Existing installations with recorded checksums are unaffected.
+        const bool tenantSeed = version == "0020_genycaster_native_client.sql"
+            || version == "0021_genycaster_production_environment.sql"
+            || version == "0022_tegra_cms_browser_client.sql";
+        if (tenantSeed) {
+            ResultPointer tenant = exec(connection,
+                "SELECT 1 FROM openproof.organizations WHERE id='genyleap'");
+            if (!tuplesOk(tenant.get())) {
+                rollback(connection);
+                return foundation::fail(databaseError(tenant.get(), "check seed tenant"));
+            }
+            if (PQntuples(tenant.get()) == 0) {
+                auto committed = commit(connection);
+                if (!committed) return foundation::fail(committed.error());
+                continue;
+            }
+        }
         ResultPointer applied = exec(connection, sql);
         if (!commandOk(applied.get())) { rollback(connection); return foundation::fail(databaseError(applied.get(), "apply migration")); }
         ResultPointer recorded = execParams(connection,
