@@ -220,9 +220,11 @@ foundation::Status InMemoryLocalAccountDirectory::verifyPassword(
     const std::lock_guard<std::mutex> accountGuard{account->mutex};
     auto passwordMatches = m_passwordHasher.verify(password, account->password);
     if (!passwordMatches.has_value()) return foundation::fail(passwordMatches.error());
-    return passwordMatches.value()
-        ? foundation::ok()
-        : foundation::fail(authenticationFailure("Local password did not verify."));
+    if (!passwordMatches.value()) {
+        return foundation::fail(authenticationFailure("Local password did not verify."));
+    }
+    // Also used before recovery-code verification: no migration until MFA succeeds.
+    return foundation::ok();
 }
 
 foundation::Result<bool> InMemoryLocalAccountDirectory::hasTotp(
@@ -313,6 +315,11 @@ foundation::Result<LocalVerification> InMemoryLocalAccountDirectory::verify(
         return foundation::fail(authenticationFailure("Local password did not verify."));
     }
     if (!account->totp.has_value()) {
+        const auto required = m_passwordHasher.needsRehash(account->password);
+        if (required && required.value()) {
+            auto upgraded = m_passwordHasher.hash(password);
+            if (upgraded) account->password = std::move(upgraded).value();
+        }
         return LocalVerification::Password;
     }
     if (!totp.has_value()) {
@@ -325,6 +332,11 @@ foundation::Result<LocalVerification> InMemoryLocalAccountDirectory::verify(
         return foundation::fail(accepted.error());
     }
     account->lastAcceptedTotpStep = accepted.value();
+    const auto required = m_passwordHasher.needsRehash(account->password);
+    if (required && required.value()) {
+        auto upgraded = m_passwordHasher.hash(password);
+        if (upgraded) account->password = std::move(upgraded).value();
+    }
     return LocalVerification::PasswordAndTotp;
 }
 

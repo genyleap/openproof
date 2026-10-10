@@ -64,6 +64,51 @@ TEST(PasswordHasherTest, RejectsShortPasswordsAndWeakPeppers)
     EXPECT_FALSE(hasher->hash(fnd::SecretString{"short"}));
 }
 
+TEST(PasswordHasherTest, DualAlgorithmHashesSurvivePolicySwitch)
+{
+    const fnd::SecretString password{std::string(24U, 'p')};
+    auto legacy = cred::PasswordHasher::create(pepper(), cred::PasswordPolicy::recommended());
+    ASSERT_TRUE(legacy);
+    const auto historical = legacy->hash(password);
+    ASSERT_TRUE(historical);
+    EXPECT_TRUE(historical->encoded().starts_with("scrypt$v1$"));
+
+    auto stronger = cred::PasswordHasher::create(
+        pepper(), cred::PasswordPolicy::recommended(), "argon2id");
+    if (!cred::PasswordHasher::supportsArgon2id()) {
+        EXPECT_FALSE(stronger);
+        return;
+    }
+    ASSERT_TRUE(stronger);
+    EXPECT_TRUE(stronger->verify(password, historical.value()).value());
+    EXPECT_TRUE(stronger->needsRehash(historical.value()).value());
+
+    const auto modern = stronger->hash(password);
+    ASSERT_TRUE(modern);
+    EXPECT_TRUE(modern->encoded().starts_with("$argon2id$v=19$"));
+    ASSERT_TRUE(cred::PasswordHash::parse(std::string{modern->encoded()}));
+    EXPECT_TRUE(stronger->verify(password, modern.value()).value());
+    EXPECT_FALSE(stronger->needsRehash(modern.value()).value());
+
+    // Rollback of the preferred algorithm never prevents verification.
+    EXPECT_TRUE(legacy->verify(password, modern.value()).value());
+    EXPECT_TRUE(legacy->needsRehash(modern.value()).value());
+    EXPECT_FALSE(stronger->verify(fnd::SecretString{"incorrect-password"}, modern.value()).value());
+    auto unrelatedPepper = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'x')},
+        cred::PasswordPolicy::recommended(), "argon2id");
+    ASSERT_TRUE(unrelatedPepper);
+    EXPECT_FALSE(unrelatedPepper->verify(password, modern.value()).value());
+
+    // A DB-controlled hash must not induce an unbounded allocation.
+    EXPECT_FALSE(cred::PasswordHash::parse(
+        "$argon2id$v=19$m=1048576,t=3,p=1$abcdefghijklmnopqrstuv$"
+        "abcdefghijklmnopqrstuvabcdefghijklmnopqrstuv"));
+    EXPECT_FALSE(cred::PasswordHash::parse(
+        "$argon2id$v=19$m=65536,t=3,p=32$abcdefghijklmnopqrstuv$"
+        "abcdefghijklmnopqrstuvabcdefghijklmnopqrstuv"));
+}
+
 TEST(TotpTest, MatchesRfc6238Sha1VectorAtFiftyNineSeconds)
 {
     auto secret = cred::TotpSecret::create(

@@ -103,6 +103,7 @@ find "$ROOTFS/opt/openproof/migrations" -type d -exec chmod 0755 {} +
 find "$ROOTFS/opt/openproof/migrations" -type f -exec chmod 0644 {} +
 install -m 0644 "$ROOT/docs/OPERATIONS.md" "$ROOTFS/opt/openproof/docs/OPERATIONS.md"
 install -m 0644 "$ROOT/docs/CONFIGURATION.md" "$ROOTFS/opt/openproof/docs/CONFIGURATION.md"
+install -m 0644 "$ROOT/docs/password-hashing-migration.md" "$ROOTFS/opt/openproof/docs/password-hashing-migration.md"
 printf '%s\n' "$VERSION" >"$ROOTFS/opt/openproof/VERSION"
 
 install -m 0755 "$ROOT/installer/openproof" "$ROOTFS/usr/sbin/openproof"

@@ -77,6 +77,32 @@ TEST(ConfigTest, AppliesDefaultsWhenNothingIsConfigured)
     EXPECT_FALSE(configuration->gateway().enabled());
 }
 
+TEST(ConfigTest, PasswordHashAlgorithmIsValidatedAndBackwardCompatible)
+{
+    const cfg::MapEnvironment empty;
+    auto legacy = cfg::PlatformConfig::loadFromEnvironment(empty);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->security().passwordHashAlgorithm(), "scrypt");
+
+    auto argon = cfg::PlatformConfig::loadFromToml(
+        "[security]\npassword_hash_algorithm = \"argon2id\"\n", empty);
+    ASSERT_TRUE(argon);
+    EXPECT_EQ(argon->security().passwordHashAlgorithm(), "argon2id");
+
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[security]\npassword_hash_algorithm = \"md5\"\n", empty));
+
+    EXPECT_FALSE(cfg::PlatformConfig::loadFromToml(
+        "[security]\npassword_hash_algorithm = 7\n", empty));
+
+    cfg::MapEnvironment overrideConfig;
+    overrideConfig.set("OPENPROOF_PASSWORD_HASH_ALGORITHM", "scrypt");
+    auto overridden = cfg::PlatformConfig::loadFromToml(
+        "[security]\npassword_hash_algorithm = \"argon2id\"\n", overrideConfig);
+    ASSERT_TRUE(overridden);
+    EXPECT_EQ(overridden->security().passwordHashAlgorithm(), "scrypt");
+}
+
 TEST(ConfigTest, ReadsAuthenticatedMetricsConfigurationFromASecretReference)
 {
     cfg::MapEnvironment environment;

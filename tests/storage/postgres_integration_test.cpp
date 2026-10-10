@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <libpq-fe.h>
@@ -74,7 +75,8 @@ protected:
         pg::Migrator migrator{*pool};
         auto migrated = migrator.applyDirectory(
             std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
-        ASSERT_TRUE(migrated);
+        ASSERT_TRUE(migrated)
+            << (migrated ? "" : std::string{migrated.error().internalDetail()});
 
         direct.reset(PQconnectdb(connectionString.c_str()));
         ASSERT_NE(direct.get(), nullptr);
@@ -135,6 +137,39 @@ TEST_F(PostgresIntegrationTest, MigrationIsIdempotentAndPoolIsHealthy)
     EXPECT_EQ(result->applied, 0U);
     EXPECT_GE(result->alreadyApplied, 1U);
     EXPECT_EQ(pool->size(), 4U);
+}
+
+
+TEST_F(PostgresIntegrationTest, TenantSpecificSeedMigrationsWaitForOrganization)
+{
+    // These three historical migrations contain Genyleap-only client records.
+    // On a fresh instance they must not block the initial tenant bootstrap.
+    // Use the disposable integration fixture to exercise the deferred path.
+    execute("DELETE FROM openproof.schema_migrations "
+            "WHERE version IN ('0020_genycaster_native_client.sql',"
+            "'0021_genycaster_production_environment.sql',"
+            "'0022_tegra_cms_browser_client.sql')");
+    execute("INSERT INTO openproof.organizations(id,name,state,created_at_ms) "
+            "VALUES('genyleap','Genyleap',0,1770000000000)");
+    pg::Migrator migrator{*pool};
+    auto result = migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    ASSERT_TRUE(result)
+        << (result ? "" : std::string{result.error().internalDetail()});
+    EXPECT_EQ(result->applied, 3U);
+
+    std::unique_ptr<PGresult, ResultDeleter> seeded{PQexec(direct.get(),
+        "SELECT count(*) FROM openproof.applications "
+        "WHERE organization_id='genyleap' "
+        "AND identifier IN ('genycaster', 'tegra-cms')")};
+    ASSERT_NE(seeded.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(seeded.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(seeded.get(), 0, 0), "2");
+
+    auto repeated = migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    ASSERT_TRUE(repeated);
+    EXPECT_EQ(repeated->applied, 0U);
 }
 
 TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)
@@ -364,6 +399,74 @@ TEST_F(PostgresIntegrationTest, RejectedAuthorizationIsChainedAndPublished)
     ASSERT_EQ(PQresultStatus(evidence.get()), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 0), "1");
     EXPECT_STREQ(PQgetvalue(evidence.get(), 0, 1), "1");
+}
+
+
+TEST_F(PostgresIntegrationTest, PasswordKdfPolicySwitchPreservesAndUpgradesLogin)
+{
+    if (!cred::PasswordHasher::supportsArgon2id()) {
+        GTEST_SKIP() << "libsodium Argon2id is unavailable";
+    }
+
+    pg::PostgresExternalIdentityDirectory external{*pool};
+    const idp::ExternalSubject subject{"kdf-switch-user"};
+    auto link = core::IdentityLink::request(
+        core::IdentityId{"identity-1"},
+        core::ExternalIdentityRef{idp::ProviderId{"local"}, subject},
+        kNow, std::chrono::minutes{5}).value();
+    ASSERT_TRUE(link.requireVerification(kNow));
+    ASSERT_TRUE(link.markVerified(kNow));
+    ASSERT_TRUE(link.complete(kNow));
+    ASSERT_TRUE(external.attach(link));
+
+    auto policy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
+    auto makeDirectory = [&](std::string algorithm) {
+        auto hasher = cred::PasswordHasher::create(
+            fnd::SecretString{std::string(32U, 'p')}, policy,
+            std::move(algorithm)).value();
+        auto key = sec::AeadKey::create(
+            fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+        return pg::PostgresLocalAccountDirectory::create(
+            *pool, std::move(hasher), cred::TotpPolicy::recommended(),
+            std::move(key), 1U, idp::ProviderId{"local"}).value();
+    };
+
+    auto oldDirectory = makeDirectory("scrypt");
+    const fnd::SecretString password{"correct-password"};
+    ASSERT_TRUE(oldDirectory->enroll(subject, password.clone(), std::nullopt));
+    const auto readStored = [&]() {
+        std::unique_ptr<PGresult, ResultDeleter> row{PQexec(direct.get(),
+            "SELECT password_hash, changed_at_ms FROM "
+            "openproof.password_credentials WHERE identity_id='identity-1'")};
+        EXPECT_NE(row.get(), nullptr);
+        if (!row || PQresultStatus(row.get()) != PGRES_TUPLES_OK
+            || PQntuples(row.get()) != 1) return std::pair<std::string, std::string>{};
+        return std::pair<std::string, std::string>{
+            PQgetvalue(row.get(), 0, 0), PQgetvalue(row.get(), 0, 1)};
+    };
+
+    const auto previous = readStored();
+    ASSERT_TRUE(previous.first.starts_with("scrypt$v1$"));
+
+    auto modernDirectory = makeDirectory("argon2id");
+    EXPECT_FALSE(modernDirectory->verify(
+        subject, fnd::SecretString{"wrong-password"}, std::nullopt, kNow));
+    EXPECT_EQ(readStored(), previous);
+
+    auto verified = modernDirectory->verify(
+        subject, password.clone(), std::nullopt, kNow);
+    ASSERT_TRUE(verified);
+    EXPECT_EQ(verified.value(), local::LocalVerification::Password);
+    const auto upgraded = readStored();
+    EXPECT_TRUE(upgraded.first.starts_with("$argon2id$v=19$"));
+    // Re-encoding is not a password change; expiration timestamps are preserved.
+    EXPECT_EQ(upgraded.second, previous.second);
+
+    // Reverting the policy keeps Argon2id verification and can rehash to scrypt.
+    verified = oldDirectory->verify(subject, password.clone(), std::nullopt, kNow);
+    ASSERT_TRUE(verified);
+    EXPECT_TRUE(readStored().first.starts_with("scrypt$v1$"));
 }
 
 TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)

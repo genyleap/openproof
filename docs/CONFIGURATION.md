@@ -1,4 +1,6 @@
-# Configuration Reference
+# Configuration
+
+**Password hashing migration:** See [Password hashing policy](password-hashing-migration.md) for the `scrypt`/`Argon2id` selector, legacy verification, safe automatic rehashing, and rollback warnings. Reference
 
 Configuration is typed and total: `PlatformConfig` either loads fully valid or
 returns an error. There is no partially-initialized configuration, and no silent

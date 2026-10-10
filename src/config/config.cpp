@@ -116,10 +116,15 @@ constexpr std::uint16_t kDefaultPort = 8443;
             validateTableKeys(*security, "security", {
                 "token_signing_key", "credential_encryption_key",
                 "credential_encryption_key_version", "master_key_version",
-                "password_pepper", "recovery_code_pepper", "audit_chain_key",
+                "password_pepper", "password_hash_algorithm", "recovery_code_pepper", "audit_chain_key",
                 "oauth_client_secret_key"});
         if (!keys.has_value()) {
             return foundation::fail(keys.error());
+        }
+        if (const toml::node* value = security->get("password_hash_algorithm");
+            value != nullptr && !value->is_string()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "Password hash algorithm must be a string.");
         }
     }
     if (const toml::table* oidc = document["oidc"].as_table(); oidc != nullptr) {
@@ -275,7 +280,7 @@ constexpr std::uint16_t kDefaultPort = 8443;
         [](const auto& node) { return node.is_integer(); }, "an integer");
     if (!masterKeyVersion.has_value()) return foundation::fail(masterKeyVersion.error());
     for (const std::string_view key : {
-             "password_pepper", "recovery_code_pepper", "audit_chain_key",
+             "password_pepper", "password_hash_algorithm", "recovery_code_pepper", "audit_chain_key",
              "oauth_client_secret_key"}) {
         const foundation::Status type = requireType(
             "security", key, [](const auto& node) { return node.is_string(); },
@@ -627,12 +632,14 @@ SecurityConfig::SecurityConfig(
     foundation::SecretString passwordPepper,
     foundation::SecretString recoveryCodePepper,
     foundation::SecretString auditChainKey,
-    foundation::SecretString oauthClientSecretKey)
+    foundation::SecretString oauthClientSecretKey,
+    std::string passwordHashAlgorithm)
     : m_tokenSigningKey(std::move(tokenSigningKey)),
       m_credentialEncryptionKey(std::move(credentialEncryptionKey)),
       m_credentialEncryptionKeyVersion(credentialEncryptionKeyVersion),
       m_masterKeyVersion(masterKeyVersion),
       m_passwordPepper(std::move(passwordPepper)),
+      m_passwordHashAlgorithm(std::move(passwordHashAlgorithm)),
       m_recoveryCodePepper(std::move(recoveryCodePepper)),
       m_auditChainKey(std::move(auditChainKey)),
       m_oauthClientSecretKey(std::move(oauthClientSecretKey))
@@ -662,6 +669,11 @@ unsigned int SecurityConfig::masterKeyVersion() const noexcept
 const foundation::SecretString& SecurityConfig::passwordPepper() const noexcept
 {
     return m_passwordPepper;
+}
+
+std::string_view SecurityConfig::passwordHashAlgorithm() const noexcept
+{
+    return m_passwordHashAlgorithm;
 }
 
 const foundation::SecretString& SecurityConfig::recoveryCodePepper() const noexcept
@@ -1180,11 +1192,21 @@ foundation::Result<PlatformConfig> PlatformConfig::loadFromToml(std::string_view
             foundation::ErrorCode::FailedPrecondition,
             "A rotated master key requires every persistent security key to be explicit.");
     }
+    std::string passwordHashAlgorithm =
+        document["security"]["password_hash_algorithm"].value_or(std::string{"scrypt"});
+    if (const auto overrideValue = environment.get("OPENPROOF_PASSWORD_HASH_ALGORITHM")) {
+        passwordHashAlgorithm = *overrideValue;
+    }
+    if (passwordHashAlgorithm != "scrypt" && passwordHashAlgorithm != "argon2id") {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Password hash algorithm must be scrypt or argon2id.");
+    }
     security = SecurityConfig{
         std::move(masterKey), std::move(credentialEncryptionKey),
         credentialEncryptionKeyVersion, masterKeyVersion,
         std::move(passwordPepper).value(), std::move(recoveryCodePepper).value(),
-        std::move(auditChainKey).value(), std::move(oauthClientSecretKey).value()};
+        std::move(auditChainKey).value(), std::move(oauthClientSecretKey).value(),
+        std::move(passwordHashAlgorithm)};
 
     bool oidcEnabled = document["oidc"]["enabled"].value_or(false);
     std::string oidcIssuer = document["oidc"]["issuer"].value_or(std::string{});

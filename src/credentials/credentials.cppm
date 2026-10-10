@@ -47,7 +47,7 @@ private:
     std::uint64_t m_maximumMemoryBytes{};
 };
 
-/** A versioned, self-describing scrypt result. Sensitive, but not a credential. */
+/** Versioned scrypt or standard libsodium Argon2id encoding; never stores plaintext. */
 class PasswordHash final {
 public:
     [[nodiscard]] static foundation::Result<PasswordHash> parse(std::string encoded);
@@ -59,11 +59,12 @@ private:
     std::string m_encoded;
 };
 
-/** Password hashing with server-side HMAC pepper followed by scrypt. */
+/** Pepper-bound password hashing. New hashes use the configured algorithm; verification dispatches by stored hash. */
 class PasswordHasher final {
 public:
     [[nodiscard]] static foundation::Result<PasswordHasher>
-    create(foundation::SecretString pepper, PasswordPolicy policy);
+    create(foundation::SecretString pepper, PasswordPolicy policy,
+           std::string algorithm = "scrypt");
 
     PasswordHasher(const PasswordHasher&) = delete;
     PasswordHasher& operator=(const PasswordHasher&) = delete;
@@ -75,11 +76,16 @@ public:
     hash(const foundation::SecretString& password) const;
     [[nodiscard]] foundation::Result<bool>
     verify(const foundation::SecretString& password, const PasswordHash& expected) const;
+    /** True when a successfully verified hash should be upgraded to the selected policy. */
+    [[nodiscard]] foundation::Result<bool> needsRehash(const PasswordHash& hash) const;
+    [[nodiscard]] static bool supportsArgon2id() noexcept;
 
 private:
-    PasswordHasher(foundation::SecretString pepper, PasswordPolicy policy);
+    PasswordHasher(foundation::SecretString pepper, PasswordPolicy policy,
+                   std::string algorithm);
     foundation::SecretString m_pepper;
     PasswordPolicy m_policy;
+    std::string m_algorithm;
 };
 
 class TotpPolicy final {

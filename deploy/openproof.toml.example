@@ -13,6 +13,8 @@ metrics_bearer_token = "file:/run/openproof/secrets/metrics-bearer.token"
 metrics_maximum_series = 512
 
 [security]
+# New password hashes only. Existing scrypt/Argon2id hashes stay verifiable.
+password_hash_algorithm = "scrypt"
 token_signing_key = "file:/run/openproof/secrets/master.key"
 master_key_version = 1
 credential_encryption_key = "hexfile:/run/openproof/secrets/credential-encryption.key"
