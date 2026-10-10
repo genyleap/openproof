@@ -74,6 +74,19 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
     return std::move(parsed).as_object();
 }
 
+[[nodiscard]] bool trustedPasswordUpgradeOrigin(const gateway::HttpRequest& request)
+{
+    // Cookie-authenticated POSTs must be initiated by the same HTTPS origin.
+    // JSON-only input plus SameSite=Strict cookies are defense in depth.
+    const auto origin = request.header("origin");
+    const auto host = request.header("host");
+    if (!origin || !host || host->empty()) return false;
+    if (host->find_first_of("/\\\r\n") != std::string_view::npos) return false;
+    if (*origin != ("https://" + std::string{*host})) return false;
+    const auto site = request.header("sec-fetch-site");
+    return !site || *site == "same-origin";
+}
+
 [[nodiscard]] bool safeText(std::string_view text, std::size_t maximum) noexcept
 {
     return !text.empty() && text.size() <= maximum
@@ -224,6 +237,8 @@ gateway::HttpResponse AccountHttpApi::handle(gateway::HttpRequest request)
     if (request.method() == HttpMethod::Post && request.path() == "/account/password/reset") return resetPassword(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/recover") return recoveryPage(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/security") return securityPage(std::move(request));
+    if (request.method() == HttpMethod::Get && request.path() == "/account/password/upgrade") return passwordUpgradeStatus(std::move(request));
+    if (request.method() == HttpMethod::Post && request.path() == "/account/password/upgrade") return confirmPasswordUpgrade(std::move(request));
     if (request.method() == HttpMethod::Get && request.path() == "/account/totp") return totpStatus(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/totp/start") return beginTotpEnrollment(std::move(request));
     if (request.method() == HttpMethod::Post && request.path() == "/account/totp/complete") return completeTotpEnrollment(std::move(request));
@@ -535,6 +550,11 @@ gateway::HttpResponse AccountHttpApi::securityPage(gateway::HttpRequest request)
 .shell{width:min(100%,720px);margin:0 auto}.brand{display:flex;align-items:center;gap:12px;margin:8px 4px 18px;color:#e5e6ff;font-weight:800;font-size:20px}.brand-mark{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(135deg,#7478ff,#9c68ff);box-shadow:0 14px 34px rgba(102,92,255,.26)}.brand small{display:block;margin-top:2px;color:#8c91a4;font-size:10px;letter-spacing:.11em;text-transform:uppercase}
 .card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:26px;padding:clamp(22px,3vw,32px);box-shadow:0 26px 80px rgba(0,0,0,.36)}.kicker{display:inline-flex;padding:7px 11px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:11px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
 h1{font-size:clamp(32px,5vw,44px);line-height:1.04;letter-spacing:-.045em;margin:15px 0 10px}h2{font-size:18px;margin:0 0 8px}.lead,.muted{color:#aeb3c4;line-height:1.58}.lead{font-size:15px;margin:0 0 22px}.muted{font-size:14px;margin:0 0 14px}
+.upgrade-banner{display:none;margin:18px 0;padding:16px;border-radius:17px;border:1px solid rgba(127,152,255,.42);background:rgba(90,105,220,.12)}
+.upgrade-banner.show{display:block}.upgrade-overlay{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.78);display:grid;place-items:center;padding:20px}
+.upgrade-overlay[hidden]{display:none}.upgrade-dialog{width:min(100%,490px);border-radius:24px;background:#191e2b;border:1px solid #444c64;padding:26px;box-shadow:0 32px 110px #000b}
+.upgrade-dialog p{line-height:1.65;color:#bdc5d4}.upgrade-dialog h2{font-size:25px}.upgrade-dialog .actions{margin-top:18px}
+.upgrade-message{color:#fca5a5;min-height:18px;font-size:13px}.upgrade-dialog button:disabled{opacity:.6;cursor:wait}
 .status{display:flex;align-items:center;gap:13px;padding:16px 17px;border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#11141b}.status strong{font-size:15px}.status span{color:#9298ac;font-size:13px}.dot{width:11px;height:11px;border-radius:50%;background:#f59e0b;box-shadow:0 0 0 5px rgba(245,158,11,.09)}.dot.on{background:#4ade80;box-shadow:0 0 0 5px rgba(74,222,128,.09)}
 .panel{border-top:1px solid rgba(255,255,255,.08);padding-top:22px;margin-top:22px}.field{display:grid;gap:7px;margin:12px 0}.field>span{font-size:11px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
 input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:13px;background:#0d1016;color:#fff;padding:12px 14px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}
@@ -590,7 +610,24 @@ button,.button{appearance:none;border:0;border-radius:12px;background:linear-gra
 <pre id="recoveryCodes" class="codes"></pre><button id="copyRecovery" class="secondary" type="button">Copy recovery codes</button></div></div>)HTML";
     }
 
-    body += R"HTML(</section><p class="foot center">OpenProof keeps application sessions separate from your Genyleap credentials.</p></main>
+    body += R"HTML(<div id="upgradeBanner" class="upgrade-banner" role="status">
+<h2>Password protection upgrade available</h2>
+<p class="muted">Your existing password still works. Confirm it once to protect its stored hash with Argon2id; you do not need to change your password.</p>
+<button type="button" id="upgradeOpen">Confirm current password</button></div>
+</section><p class="foot center">OpenProof keeps application sessions separate from your Genyleap credentials.</p></main>
+<div id="upgradeOverlay" class="upgrade-overlay" hidden>
+<section class="upgrade-dialog" role="dialog" aria-modal="true" aria-labelledby="upgradeTitle" aria-describedby="upgradeDescription">
+<h2 id="upgradeTitle">Upgrade password protection</h2>
+<p id="upgradeDescription">OpenProof can now protect your stored password hash using Argon2id. Confirm your current OpenProof password to finish this optional upgrade. Your password and active sessions stay the same.</p>
+<form id="upgradeForm">
+<label class="field"><span>Current OpenProof password</span>
+<input id="upgradePassword" name="password" type="password" autocomplete="current-password" minlength="8" maxlength="1024" required></label>
+<div id="upgradeMessage" class="upgrade-message" role="alert" aria-live="polite"></div>
+<div class="actions">
+<button type="submit" id="upgradeSubmit">Confirm &amp; upgrade</button>
+<button type="button" class="secondary" id="upgradeLater">Not now</button></div></form>
+<p class="foot">Only confirm your password on the official OpenProof website. This does not add a new login factor.</p>
+</section></div>
 <script nonce=")HTML" + pageNonce + R"HTML(">
 const notice=document.querySelector('#notice');
 const show=(message,type='error')=>{notice.textContent=message;notice.className='notice show '+type};
@@ -601,6 +638,52 @@ async function api(url,method='GET',body){
   if(!response.ok)throw new Error(data?.error?.message||'The request could not be completed.');
   return data;
 }
+const upgradeBanner=document.querySelector('#upgradeBanner');
+const upgradeOverlay=document.querySelector('#upgradeOverlay');
+const upgradeForm=document.querySelector('#upgradeForm');
+const upgradeMessage=document.querySelector('#upgradeMessage');
+const upgradePassword=document.querySelector('#upgradePassword');
+const upgradeOpen=document.querySelector('#upgradeOpen');
+const upgradeLater=document.querySelector('#upgradeLater');
+const upgradeSubmit=document.querySelector('#upgradeSubmit');
+const upgradeDismissKey='openproof-password-upgrade-dismissed';
+function openUpgrade(){upgradeOverlay.hidden=false;upgradePassword.focus()}
+function closeUpgrade(snooze){
+  upgradeOverlay.hidden=true;upgradeForm.reset();upgradeMessage.textContent='';
+  if(snooze)sessionStorage.setItem(upgradeDismissKey,'1');
+  upgradeOpen.focus();
+}
+upgradeOpen.addEventListener('click',openUpgrade);
+upgradeLater.addEventListener('click',()=>closeUpgrade(true));
+upgradeOverlay.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){e.preventDefault();closeUpgrade(true)}
+  if(e.key==='Tab'){
+    const items=[upgradePassword,upgradeSubmit,upgradeLater].filter(x=>!x.disabled);
+    const first=items[0],last=items[items.length-1];
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+  }
+});
+upgradeForm.addEventListener('submit',async event=>{
+  event.preventDefault();
+  const password=String(new FormData(upgradeForm).get('password')||'');
+  upgradeMessage.textContent='';upgradeSubmit.disabled=true;
+  try{
+    const result=await api('/account/password/upgrade','POST',{password});
+    upgradeOverlay.hidden=true;upgradeForm.reset();
+    upgradeBanner.classList.remove('show');sessionStorage.removeItem(upgradeDismissKey);
+    show(result.upgraded?'Your password hash is now protected with Argon2id.':'Your password protection is already up to date.','ok');
+  }catch(error){
+    upgradeForm.reset();upgradePassword.focus();
+    upgradeMessage.textContent=error.message||'Unable to confirm this password.';
+  }finally{upgradeSubmit.disabled=false}
+});
+api('/account/password/upgrade').then(status=>{
+  if(!status.available||!status.needs_upgrade)return;
+  upgradeBanner.classList.add('show');
+  if(sessionStorage.getItem(upgradeDismissKey)!=='1')openUpgrade();
+}).catch(()=>{}); // Never interrupt existing security flows.
+
 let enrollmentId=null;
 const startForm=document.querySelector('#startForm');
 if(startForm)startForm.addEventListener('submit',async event=>{
@@ -668,6 +751,41 @@ if(copyRecovery)copyRecovery.addEventListener('click',async()=>{
             + "'; script-src 'nonce-" + pageNonce
             + "'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     return response;
+}
+
+gateway::HttpResponse AccountHttpApi::passwordUpgradeStatus(gateway::HttpRequest request)
+{
+    auto actor = authorize(request);
+    if (!actor) return error(actor.error(), request);
+    auto needed = m_accounts->passwordUpgradeNeeded(actor.value());
+    if (!needed) return error(needed.error(), request);
+    const bool available = needed->has_value();
+    return jsonResponse(200, json::object{
+        {"available", available},
+        {"needs_upgrade", needed->value_or(false)},
+        {"target_algorithm", "argon2id"}
+    });
+}
+
+gateway::HttpResponse AccountHttpApi::confirmPasswordUpgrade(gateway::HttpRequest request)
+{
+    if (!trustedPasswordUpgradeOrigin(request)) {
+        return error(foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
+    }
+    auto actor = authorize(request);
+    if (!actor) return error(actor.error(), request);
+    auto body = objectBody(request);
+    if (!body || !onlyFields(body.value(), {"password"})) {
+        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                          : body.error(), request);
+    }
+    auto password = requiredString(body.value(), "password", 1024U);
+    if (!password) return error(password.error(), request);
+    foundation::SecretString secret{std::move(password).value()};
+    auto upgraded = m_accounts->confirmPasswordUpgrade(actor.value(), secret);
+    if (!upgraded) return error(upgraded.error(), request);
+    return jsonResponse(200, json::object{{"upgraded", upgraded.value()},
+                                          {"needs_upgrade", false}});
 }
 
 gateway::HttpResponse AccountHttpApi::totpStatus(gateway::HttpRequest request)

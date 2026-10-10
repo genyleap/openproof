@@ -450,9 +450,14 @@ TEST_F(PostgresIntegrationTest, PasswordKdfPolicySwitchPreservesAndUpgradesLogin
     ASSERT_TRUE(previous.first.starts_with("scrypt$v1$"));
 
     auto modernDirectory = makeDirectory("argon2id");
-    EXPECT_FALSE(modernDirectory->verify(
-        subject, fnd::SecretString{"wrong-password"}, std::nullopt, kNow));
+    EXPECT_FALSE(oldDirectory->passwordUpgradeNeeded(subject).value());
+    EXPECT_TRUE(modernDirectory->passwordUpgradeNeeded(subject).value());
+    EXPECT_FALSE(modernDirectory->confirmPasswordUpgrade(
+        subject, fnd::SecretString{"wrong-password"}));
     EXPECT_EQ(readStored(), previous);
+    EXPECT_TRUE(modernDirectory->confirmPasswordUpgrade(subject, password.clone()).value());
+    EXPECT_FALSE(modernDirectory->passwordUpgradeNeeded(subject).value());
+    EXPECT_FALSE(modernDirectory->confirmPasswordUpgrade(subject, password.clone()).value());
 
     auto verified = modernDirectory->verify(
         subject, password.clone(), std::nullopt, kNow);

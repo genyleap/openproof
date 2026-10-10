@@ -346,6 +346,11 @@ public:
     [[nodiscard]] foundation::Status verifyPassword(
         const identity::provider::ExternalSubject& subject,
         const foundation::SecretString& password) override;
+    [[nodiscard]] foundation::Result<bool> passwordUpgradeNeeded(
+        const identity::provider::ExternalSubject& subject) override;
+    [[nodiscard]] foundation::Result<bool> confirmPasswordUpgrade(
+        const identity::provider::ExternalSubject& subject,
+        const foundation::SecretString& password) override;
     [[nodiscard]] foundation::Result<bool> hasTotp(
         const identity::provider::ExternalSubject& subject) override;
     [[nodiscard]] foundation::Status replaceTotp(

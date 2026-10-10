@@ -55,6 +55,32 @@ accountDirectory()
     return response;
 }
 
+
+TEST(LocalProviderTest, OptionalPasswordUpgradeRequiresCurrentPassword)
+{
+    if (!cred::PasswordHasher::supportsArgon2id()) {
+        GTEST_SKIP() << "Argon2id was not linked";
+    }
+    auto policy = cred::PasswordPolicy::create(
+        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U);
+    ASSERT_TRUE(policy);
+    auto modern = cred::PasswordHasher::create(
+        fnd::SecretString{std::string(32U, 'p')}, policy.value(), "argon2id");
+    ASSERT_TRUE(modern);
+    auto accounts = local::InMemoryLocalAccountDirectory::create(
+        std::move(modern).value(), cred::TotpPolicy::recommended());
+    ASSERT_TRUE(accounts);
+    const idp::ExternalSubject user{"alice"};
+    ASSERT_TRUE(accounts.value()->enroll(user, fnd::SecretString{"correct-password"}, std::nullopt));
+    EXPECT_FALSE(accounts.value()->passwordUpgradeNeeded(user).value());
+    EXPECT_FALSE(accounts.value()->confirmPasswordUpgrade(
+        user, fnd::SecretString{"incorrect-password"}));
+    EXPECT_FALSE(accounts.value()->confirmPasswordUpgrade(
+        user, fnd::SecretString{"correct-password"}).value());
+    EXPECT_TRUE(accounts.value()->verifyPassword(user, fnd::SecretString{"correct-password"}));
+    EXPECT_FALSE(accounts.value()->passwordUpgradeNeeded(idp::ExternalSubject{"missing"}));
+}
+
 TEST(LocalProviderTest, SubjectInvariantMatchesEnrollmentAndLogin)
 {
     auto directory = accountDirectory();

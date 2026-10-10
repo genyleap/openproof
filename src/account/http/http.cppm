@@ -43,6 +43,8 @@ private:
     [[nodiscard]] gateway::HttpResponse resetPassword(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse recoveryPage(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse securityPage(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse passwordUpgradeStatus(gateway::HttpRequest request);
+    [[nodiscard]] gateway::HttpResponse confirmPasswordUpgrade(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse totpStatus(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse beginTotpEnrollment(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse completeTotpEnrollment(gateway::HttpRequest request);
