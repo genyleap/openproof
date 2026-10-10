@@ -11,8 +11,22 @@ sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
   ca-certificates curl git ninja-build python3-pip \
   build-essential bzip2 xz-utils flex bison gawk texinfo wget \
-  libzstd-dev libssl-dev libpq-dev libtomlplusplus-dev postgresql-client \
+  libzstd-dev libssl-dev libsodium-dev libpq-dev libtomlplusplus-dev postgresql-client postgresql \
   libxml2-dev zlib1g-dev libldap2-dev
+
+# GitHub-hosted runners are disposable. Use a test-only database distinct from
+# all production/staging clusters: PostgreSQL integration fixtures TRUNCATE data.
+# The GITHUB_ENV file propagates this isolated URI to the workflow's CTest step.
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  sudo service postgresql start
+  sudo -u postgres psql -v ON_ERROR_STOP=1 \
+    -c "CREATE ROLE openproof_ci LOGIN PASSWORD 'ci_disposable_only'"
+  sudo -u postgres createdb -O openproof_ci openproof_ci
+  [[ -n ${GITHUB_ENV:-} ]] || { echo "GITHUB_ENV is missing; cannot isolate test DB" >&2; exit 1; }
+  printf '%s\n' \
+    'OPENPROOF_TEST_POSTGRES=postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_ci' \
+    >> "$GITHUB_ENV"
+fi
 
 sudo python3 -m pip install --break-system-packages --upgrade "cmake>=3.30,<4"
 

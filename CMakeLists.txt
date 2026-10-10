@@ -50,6 +50,11 @@ find_library(OPENPROOF_SODIUM_LIBRARY NAMES sodium libsodium
 find_path(OPENPROOF_SODIUM_INCLUDE_DIR NAMES sodium.h
     HINTS "${OPENPROOF_SODIUM_ROOT}/include"
           "${OPENPROOF_SODIUM_ROOT}/libsodium/src/libsodium/include")
+option(OPENPROOF_REQUIRE_ARGON2ID "Require libsodium for Argon2id password hashing" OFF)
+if((OPENPROOF_REQUIRE_ARGON2ID OR "$ENV{GITHUB_ACTIONS}" STREQUAL "true") AND
+   (NOT OPENPROOF_SODIUM_LIBRARY OR NOT OPENPROOF_SODIUM_INCLUDE_DIR))
+    message(FATAL_ERROR "Argon2id is required but libsodium could not be found")
+endif()
 if((OPENPROOF_SODIUM_LIBRARY AND NOT OPENPROOF_SODIUM_INCLUDE_DIR)
    OR (OPENPROOF_SODIUM_INCLUDE_DIR AND NOT OPENPROOF_SODIUM_LIBRARY))
     message(FATAL_ERROR "libsodium headers and library must both be available")
