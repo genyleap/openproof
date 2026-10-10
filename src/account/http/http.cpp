@@ -551,10 +551,10 @@ gateway::HttpResponse AccountHttpApi::securityPage(gateway::HttpRequest request)
 .card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:26px;padding:clamp(22px,3vw,32px);box-shadow:0 26px 80px rgba(0,0,0,.36)}.kicker{display:inline-flex;padding:7px 11px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:11px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
 h1{font-size:clamp(32px,5vw,44px);line-height:1.04;letter-spacing:-.045em;margin:15px 0 10px}h2{font-size:18px;margin:0 0 8px}.lead,.muted{color:#aeb3c4;line-height:1.58}.lead{font-size:15px;margin:0 0 22px}.muted{font-size:14px;margin:0 0 14px}
 .upgrade-banner{display:none;margin:18px 0;padding:16px;border-radius:17px;border:1px solid rgba(127,152,255,.42);background:rgba(90,105,220,.12)}
-.upgrade-banner.show{display:block}.upgrade-overlay{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.78);display:grid;place-items:center;padding:20px}
-.upgrade-overlay[hidden]{display:none}.upgrade-dialog{width:min(100%,490px);border-radius:24px;background:#191e2b;border:1px solid #444c64;padding:26px;box-shadow:0 32px 110px #000b}
+.upgrade-banner.show{display:block}.upgrade-overlay{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.78);display:grid;place-items:center;padding:20px;overflow:auto}
+.upgrade-overlay[hidden]{display:none}.upgrade-dialog{width:min(100%,490px);max-height:calc(100dvh - 40px);overflow:auto;border-radius:24px;background:#191e2b;border:1px solid #444c64;padding:26px;box-shadow:0 32px 110px #000b}
 .upgrade-dialog p{line-height:1.65;color:#bdc5d4}.upgrade-dialog h2{font-size:25px}.upgrade-dialog .actions{margin-top:18px}
-.upgrade-message{color:#fca5a5;min-height:18px;font-size:13px}.upgrade-dialog button:disabled{opacity:.6;cursor:wait}
+.upgrade-message{color:#fca5a5;min-height:18px;font-size:13px}.upgrade-dialog button{min-height:44px}.upgrade-dialog .foot{color:#b4bdd0}.upgrade-dialog button:disabled{opacity:.6;cursor:wait}
 .status{display:flex;align-items:center;gap:13px;padding:16px 17px;border:1px solid rgba(255,255,255,.09);border-radius:18px;background:#11141b}.status strong{font-size:15px}.status span{color:#9298ac;font-size:13px}.dot{width:11px;height:11px;border-radius:50%;background:#f59e0b;box-shadow:0 0 0 5px rgba(245,158,11,.09)}.dot.on{background:#4ade80;box-shadow:0 0 0 5px rgba(74,222,128,.09)}
 .panel{border-top:1px solid rgba(255,255,255,.08);padding-top:22px;margin-top:22px}.field{display:grid;gap:7px;margin:12px 0}.field>span{font-size:11px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}
 input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:13px;background:#0d1016;color:#fff;padding:12px 14px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}
@@ -574,7 +574,7 @@ button,.button{appearance:none;border:0;border-radius:12px;background:linear-gra
     body += R"HTML(</strong><br><span>Current session: )HTML";
     body += std::string{identity::provider::assuranceLevelName(
         authenticated->session().assurance())};
-    body += R"HTML(</span></div></div><div id="notice" class="notice" role="status" aria-live="polite"></div>)HTML";
+    body += R"HTML(</span></div></div><div id="notice" class="notice" role="status" aria-live="polite" tabindex="-1"></div>)HTML";
 
     if (!available) {
         body += R"HTML(<div class="panel"><h2>Authenticator unavailable</h2>
@@ -673,6 +673,7 @@ upgradeForm.addEventListener('submit',async event=>{
     upgradeOverlay.hidden=true;upgradeForm.reset();
     upgradeBanner.classList.remove('show');sessionStorage.removeItem(upgradeDismissKey);
     show(result.upgraded?'Your password hash is now protected with Argon2id.':'Your password protection is already up to date.','ok');
+    notice.focus();
   }catch(error){
     upgradeForm.reset();upgradePassword.focus();
     upgradeMessage.textContent=error.message||'Unable to confirm this password.';
