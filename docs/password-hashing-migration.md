@@ -54,7 +54,9 @@ Operators can also edit `[security].password_hash_algorithm` in
 5. **Do not roll back to an OpenProof binary without Argon2id support after
    any Argon2id hashes exist.** It could no longer verify those accounts.
    Switching the preference back to scrypt is safe ONLY while the binary
-   still knows how to verify Argon2id.
+   still knows how to verify Argon2id. Switching policy from Argon2id to
+   scrypt can progressively downgrade hashes after successful sign-in; this is
+   a security-sensitive change and must be reviewed explicitly.
 6. **Never rotate, discard, or replace the password pepper** simply to
    switch algorithms. Both encodings depend on the same stable dedicated
    pepper. Pepper rotation requires a separate explicit versioned migration.

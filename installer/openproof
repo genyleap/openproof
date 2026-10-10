@@ -295,10 +295,11 @@ cmd_config(){
       current=$(sed -nE '/^\[security\]$/,/^\[/{s/^[[:space:]]*password_hash_algorithm[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$CONFIG_FILE")
       [[ -n $current ]] || current=scrypt
       field "Current" "$current"
-      printf '\n%sWARNING:%s A policy switch changes hashes created for NEW passwords.\n' "$C_YELLOW" "$C_RESET"
+      printf '\n%sWARNING:%s A policy switch affects NEW passwords and accounts rehashed after a verified sign-in.\n' "$C_YELLOW" "$C_RESET"
       printf '  Existing stored scrypt and Argon2id hashes remain verifiable.\n'
       printf '  Passwords are not recoverable from hashes; old hashes are not bulk-converted.\n'
       printf '  On fully verified sign-in, old hashes are opportunistically upgraded.\n'
+      printf '  Switching from Argon2id back to scrypt can DOWNGRADE migrated hashes.\n'
       printf '  A rollback to an old binary WITHOUT Argon2id will lock out migrated users.\n'
       printf '  Future password resets will use the newly selected algorithm.\n'
       printf '  Keep the original password pepper; losing it prevents old credentials from verifying.\n'
