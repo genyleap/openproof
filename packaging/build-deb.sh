@@ -70,6 +70,7 @@ find "$PKG/opt/openproof/migrations" -type d -exec chmod 0755 {} +
 find "$PKG/opt/openproof/migrations" -type f -exec chmod 0644 {} +
 install -m 0644 "$ROOT/docs/OPERATIONS.md" "$PKG/opt/openproof/docs/OPERATIONS.md"
 install -m 0644 "$ROOT/docs/CONFIGURATION.md" "$PKG/opt/openproof/docs/CONFIGURATION.md"
+install -m 0644 "$ROOT/docs/password-hashing-migration.md" "$PKG/opt/openproof/docs/password-hashing-migration.md"
 
 install -m 0755 "$ROOT/installer/openproof" "$PKG/usr/sbin/openproof"
 install -m 0755 "$ROOT/installer/setup.sh" "$PKG/usr/lib/openproof/setup.sh"
@@ -92,7 +93,7 @@ Section: net
 Priority: optional
 Architecture: $ARCH
 Maintainer: Genyleap <support@genyleap.com>
-Depends: adduser, systemd, ca-certificates, curl, openssl, libpq5, libssl3t64 | libssl3, libldap2, libxml2, zlib1g
+Depends: adduser, systemd, ca-certificates, curl, openssl, libpq5, libssl3t64 | libssl3, libldap2, libxml2, zlib1g, libsodium23
 Recommends: nginx, postgresql
 Description: Self-hosted identity infrastructure
  OpenProof provides canonical identity, authentication, OAuth/OIDC, passkeys,

@@ -42,6 +42,19 @@ option(OPENPROOF_BUILD_COVERAGE_FUZZER
 #   Boost.Beast    bounded HTTP/1.1 listener and reverse-proxy transport.
 #   GTest          unit, integration and security test suites.
 find_package(OpenSSL 3.0 REQUIRED)
+# Argon2id backend; missing libsodium preserves existing scrypt builds.
+# OPENPROOF_SODIUM_ROOT is only needed for non-standard source builds.
+set(OPENPROOF_SODIUM_ROOT "" CACHE PATH "Optional non-system libsodium root")
+find_library(OPENPROOF_SODIUM_LIBRARY NAMES sodium libsodium
+    HINTS "${OPENPROOF_SODIUM_ROOT}/build" "${OPENPROOF_SODIUM_ROOT}/lib")
+find_path(OPENPROOF_SODIUM_INCLUDE_DIR NAMES sodium.h
+    HINTS "${OPENPROOF_SODIUM_ROOT}/include"
+          "${OPENPROOF_SODIUM_ROOT}/libsodium/src/libsodium/include")
+if((OPENPROOF_SODIUM_LIBRARY AND NOT OPENPROOF_SODIUM_INCLUDE_DIR)
+   OR (OPENPROOF_SODIUM_INCLUDE_DIR AND NOT OPENPROOF_SODIUM_LIBRARY))
+    message(FATAL_ERROR "libsodium headers and library must both be available")
+endif()
+
 find_package(tomlplusplus REQUIRED)
 find_package(Boost 1.88 REQUIRED)
 find_program(OPENPROOF_PG_CONFIG NAMES pg_config REQUIRED)

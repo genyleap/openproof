@@ -1155,7 +1155,8 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::InternalError;
     }
     auto passwordHasher = credentials::PasswordHasher::create(
-        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
+        std::string{platform.security().passwordHashAlgorithm()});
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
     auto auditKey = audit::AuditKey::create(std::move(auditSecret).value());
     auto generatedTotp = credentials::TotpSecret::generate();
@@ -1245,7 +1246,8 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::InternalError;
     }
     auto passwordHasher = credentials::PasswordHasher::create(
-        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
+        std::string{platform.security().passwordHashAlgorithm()});
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
     auto auditKey = audit::AuditKey::create(std::move(auditSecret).value());
     if (!passwordHasher || !totpKey || !auditKey) {
@@ -1478,13 +1480,15 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::InternalError;
     }
     auto administrationPasswordHasher = credentials::PasswordHasher::create(
-        passwordSecret->clone(), credentials::PasswordPolicy::recommended());
+        passwordSecret->clone(), credentials::PasswordPolicy::recommended(),
+        std::string{platform.security().passwordHashAlgorithm()});
     auto administrationTotpKey = security::AeadKey::create(totpSecret->clone());
     auto administrationAuditKey = audit::AuditKey::create(auditSecret->clone());
     auto authorizationAuditKey = audit::AuditKey::create(
         std::move(auditSecret).value());
     auto passwordHasher = credentials::PasswordHasher::create(
-        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended());
+        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
+        std::string{platform.security().passwordHashAlgorithm()});
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
     if (!passwordHasher || !totpKey || !administrationPasswordHasher
         || !administrationTotpKey || !administrationAuditKey
@@ -2473,6 +2477,14 @@ void reportStartupFailure(const fnd::Error& failure)
     }
 
     const cfg::PlatformConfig& platform = configuration.value();
+
+    if (platform.security().passwordHashAlgorithm() == "argon2id"
+        && !credentials::PasswordHasher::supportsArgon2id()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Argon2id selected but OpenProof was built without a usable libsodium backend."});
+        return ExitCode::ConfigurationError;
+    }
 
     if (commandLine->checkConfig()) {
         std::println("OpenProof configuration is valid.");

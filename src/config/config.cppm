@@ -177,7 +177,8 @@ public:
         foundation::SecretString passwordPepper = {},
         foundation::SecretString recoveryCodePepper = {},
         foundation::SecretString auditChainKey = {},
-        foundation::SecretString oauthClientSecretKey = {});
+        foundation::SecretString oauthClientSecretKey = {},
+        std::string passwordHashAlgorithm = "scrypt");
 
     SecurityConfig(const SecurityConfig&) = delete;
     SecurityConfig& operator=(const SecurityConfig&) = delete;
@@ -195,6 +196,8 @@ public:
     [[nodiscard]] unsigned int masterKeyVersion() const noexcept;
     /** Optional dedicated pepper for durable password hashes. */
     [[nodiscard]] const foundation::SecretString& passwordPepper() const noexcept;
+    /** Algorithm for NEW password hashes; stored hashes select their own verifier. */
+    [[nodiscard]] std::string_view passwordHashAlgorithm() const noexcept;
     /** Optional dedicated pepper for durable recovery-code digests. */
     [[nodiscard]] const foundation::SecretString& recoveryCodePepper() const noexcept;
     /** Optional dedicated key for the durable audit chain. */
@@ -210,6 +213,7 @@ private:
     unsigned int m_credentialEncryptionKeyVersion{1U};
     unsigned int m_masterKeyVersion{1U};
     foundation::SecretString m_passwordPepper;
+    std::string m_passwordHashAlgorithm{"scrypt"};
     foundation::SecretString m_recoveryCodePepper;
     foundation::SecretString m_auditChainKey;
     foundation::SecretString m_oauthClientSecretKey;

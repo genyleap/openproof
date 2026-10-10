@@ -75,6 +75,7 @@ Non-interactive environment:
   OPENPROOF_TLS_EMAIL
   OPENPROOF_TLS_CERT_FILE
   OPENPROOF_TLS_KEY_FILE
+  OPENPROOF_PASSWORD_HASH_ALGORITHM=scrypt|argon2id
   OPENPROOF_PROVIDERS=google,github,microsoft,apple,linkedin,telegram,x,ethereum,farcaster
 EOF
 }
@@ -250,6 +251,7 @@ validate_host(){ [[ -n $1 && $1 != *[[:space:]]* ]]; }
 validate_web_path(){ [[ $1 == /* && $1 != *[[:space:]]* ]]; }
 validate_readable_file(){ [[ -r $1 ]]; }
 validate_boolean(){ [[ $1 == true || $1 == false ]]; }
+validate_password_hash_algorithm(){ [[ $1 == scrypt || $1 == argon2id ]]; }
 validate_owner_password(){ [[ $(printf '%s' "$1" | wc -c) -ge 16 ]]; }
 validate_provider_list(){
   local raw=$1 p
@@ -749,6 +751,31 @@ configure_gateway(){
   fi
 }
 
+configure_password_hashing(){
+  section "Password hashing"
+  info "New password hashes can use scrypt (legacy) or Argon2id (libsodium)."
+  info "Existing password hashes remain verifiable when the default is changed."
+  if (( NON_INTERACTIVE == 0 )); then
+    option 1 "scrypt — compatible default"
+    option 2 "Argon2id — memory-hard modern alternative"
+  fi
+  local selected
+  selected=$(env_value OPENPROOF_PASSWORD_HASH_ALGORITHM)
+  if [[ -z $selected ]]; then
+    if (( NON_INTERACTIVE )); then
+      selected=scrypt
+    else
+      local choice
+      choice=$(prompt_choice "password hash algorithm" "1" "1,2")
+      [[ $choice == 2 ]] && selected=argon2id || selected=scrypt
+    fi
+  fi
+  validate_password_hash_algorithm "$selected" || die "invalid OPENPROOF_PASSWORD_HASH_ALGORITHM (expected scrypt or argon2id)"
+  PASSWORD_HASH_ALGORITHM=$selected
+  warn "Changing this selection later does not instantly rewrite existing password hashes."
+  warn "Never delete or rotate the password pepper without a separate recovery/migration plan."
+}
+
 write_base_config(){
 cat >"$CONFIG_FILE" <<EOF
 [server]
@@ -766,6 +793,7 @@ metrics_bearer_token = "file:$CREDENTIAL_DIR/metrics-bearer.token"
 metrics_maximum_series = 512
 
 [security]
+password_hash_algorithm = "$PASSWORD_HASH_ALGORITHM"
 token_signing_key = "file:$CREDENTIAL_DIR/master.key"
 master_key_version = 1
 credential_encryption_key = "hexfile:$CREDENTIAL_DIR/credential-encryption.key"
@@ -1132,6 +1160,7 @@ case "$DB_MODE" in local) configure_local_database;; external) configure_externa
 
 reconcile_existing_bootstrap || true
 
+configure_password_hashing
 configure_delivery
 configure_providers
 configure_gateway

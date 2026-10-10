@@ -2206,6 +2206,30 @@ foundation::Status PostgresLocalAccountDirectory::changePassword(
         : foundation::fail(authenticationFailure("Local account is unknown."));
 }
 
+namespace {
+
+// Rehash only AFTER a complete successful authentication. The compare-and-swap
+// predicate prevents a concurrent password change from being overwritten.
+// Rehash failures are deliberately non-fatal: the verified existing hash remains valid.
+void upgradeVerifiedPasswordIfNeeded(
+    PGconn* connection, credentials::PasswordHasher& hasher,
+    const foundation::SecretString& password,
+    const credentials::PasswordHash& verifiedHash,
+    const std::string& identityId, const std::string& previousEncoding)
+{
+    const auto required = hasher.needsRehash(verifiedHash);
+    if (!required || !required.value()) return;
+    auto next = hasher.hash(password);
+    if (!next) return;
+    ResultPointer updated = execParams(connection,
+        "UPDATE openproof.password_credentials SET password_hash=$1 "
+        "WHERE identity_id=$2 AND password_hash=$3",
+        {std::string{next->encoded()}, identityId, previousEncoding});
+    (void)updated;
+}
+
+} // namespace
+
 foundation::Status PostgresLocalAccountDirectory::verifyPassword(
     const identity::provider::ExternalSubject& subject,
     const foundation::SecretString& password)
@@ -2246,10 +2270,13 @@ foundation::Status PostgresLocalAccountDirectory::verifyPassword(
     if (!tuplesOk(current.get())) {
         return foundation::fail(databaseError(current.get(), "confirm local password"));
     }
-    return PQntuples(current.get()) == 1
-        ? foundation::ok()
-        : foundation::fail(authenticationFailure(
+    if (PQntuples(current.get()) != 1) {
+        return foundation::fail(authenticationFailure(
             "Local credential changed during verification."));
+    }
+    // This password-only check is also used BEFORE a recovery-code factor.
+    // Do not migrate the hash until multi-factor authentication is complete.
+    return foundation::ok();
 }
 
 foundation::Result<bool> PostgresLocalAccountDirectory::hasTotp(
@@ -2379,10 +2406,13 @@ PostgresLocalAccountDirectory::verify(
             "WHERE p.identity_id=$1 AND p.password_hash=$2 AND e.provider=$3 AND e.external_subject=$4",
             {identityId, encodedHash, std::string{m_provider.value()}, std::string{subject.value()}});
         if (!tuplesOk(current.get())) return foundation::fail(databaseError(current.get(), "confirm local credential"));
-        return PQntuples(current.get()) == 1
-            ? foundation::Result<provider::local::LocalVerification>{provider::local::LocalVerification::Password}
-            : foundation::Result<provider::local::LocalVerification>{foundation::fail(
-                authenticationFailure("Local credential changed during verification."))};
+        if (PQntuples(current.get()) != 1) {
+            return foundation::fail(
+                authenticationFailure("Local credential changed during verification."));
+        }
+        upgradeVerifiedPasswordIfNeeded(lease->get(), m_passwordHasher, password,
+                                        parsedHash.value(), identityId, encodedHash);
+        return provider::local::LocalVerification::Password;
     }
     if (!presentedTotp.has_value()) {
         return foundation::fail(authenticationFailure("A second factor is required."));
@@ -2421,10 +2451,13 @@ PostgresLocalAccountDirectory::verify(
         {identityId, encodedHash, std::string{m_provider.value()}, std::string{subject.value()},
          std::to_string(accepted.value()), std::to_string(m_keyVersion), encryptedHex});
     if (!tuplesOk(consumed.get())) return foundation::fail(databaseError(consumed.get(), "consume TOTP step"));
-    return PQntuples(consumed.get()) == 1
-        ? foundation::Result<provider::local::LocalVerification>{provider::local::LocalVerification::PasswordAndTotp}
-        : foundation::Result<provider::local::LocalVerification>{foundation::fail(
-            authenticationFailure("Local credential changed or TOTP was replayed."))};
+    if (PQntuples(consumed.get()) != 1) {
+        return foundation::fail(
+            authenticationFailure("Local credential changed or TOTP was replayed."));
+    }
+    upgradeVerifiedPasswordIfNeeded(lease->get(), m_passwordHasher, password,
+                                    parsedHash.value(), identityId, encodedHash);
+    return provider::local::LocalVerification::PasswordAndTotp;
 }
 
 PostgresAdministrationRepository::PostgresAdministrationRepository(

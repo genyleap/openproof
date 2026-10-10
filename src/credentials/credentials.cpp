@@ -17,7 +17,11 @@ module;
 #include <utility>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+#include <sodium.h>
+#endif
 #include <openssl/hmac.h>
 
 module openproof.credentials;
@@ -26,6 +30,11 @@ namespace openproof::credentials {
 namespace {
 
 constexpr std::string_view kPasswordPrefix = "scrypt$v1$";
+constexpr std::string_view kArgon2Prefix = "$argon2id$";
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+constexpr unsigned long long kArgon2Iterations = 3ULL;
+constexpr std::size_t kArgon2Memory = 64ULL * 1024ULL * 1024ULL;
+#endif
 constexpr std::size_t kMinimumPepperBytes = 32U;
 constexpr std::size_t kMinimumPasswordBytes = 8U;
 constexpr std::size_t kMaximumPasswordBytes = 1024U;
@@ -76,6 +85,35 @@ constexpr std::string_view kBase32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     }
     return fields;
 }
+
+[[nodiscard]] bool validArgon2Encoding(std::string_view encoded)
+{
+    if (!encoded.starts_with(kArgon2Prefix) || encoded.size() > 255U
+        || encoded.find('\0') != std::string_view::npos) return false;
+    const auto parts = split(encoded, '$');
+    if (parts.size() != 6U || parts[0] != "" || parts[1] != "argon2id"
+        || parts[2] != "v=19" || parts[4].size() < 16U || parts[4].size() > 86U
+        || parts[5].size() < 22U || parts[5].size() > 86U) return false;
+    const auto params = split(parts[3], ',');
+    if (params.size() != 3U || !params[0].starts_with("m=")
+        || !params[1].starts_with("t=") || !params[2].starts_with("p=")) return false;
+    const auto mem = parseUnsigned(params[0].substr(2U));
+    const auto iterations = parseUnsigned(params[1].substr(2U));
+    const auto parallelism = parseUnsigned(params[2].substr(2U));
+    // Bound attacker-controlled work factors before allocating KDF memory.
+    return mem && iterations && parallelism
+        && mem.value() >= 8'192U && mem.value() <= 262'144U
+        && iterations.value() >= 1U && iterations.value() <= 10U
+        && parallelism.value() == 1U;
+}
+
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+[[nodiscard]] bool sodiumReady() noexcept
+{
+    static const bool ready = sodium_init() >= 0;
+    return ready;
+}
+#endif
 
 [[nodiscard]] foundation::Result<std::vector<std::byte>> derive(
     const foundation::SecretString& pepper, const foundation::SecretString& password,
@@ -234,6 +272,7 @@ PasswordHash::PasswordHash(std::string encoded) : m_encoded(std::move(encoded)) 
 foundation::Result<PasswordHash> PasswordHash::parse(std::string encoded)
 {
     const auto fields = split(encoded, '$');
+    if (validArgon2Encoding(encoded)) return PasswordHash{std::move(encoded)};
     if (fields.size() != 8U || fields[0] != "scrypt" || fields[1] != "v1"
         || fields[2].empty() || fields[3].empty() || fields[4].empty()
         || fields[5].empty() || fields[6].empty() || fields[7].empty()) {
@@ -245,24 +284,59 @@ foundation::Result<PasswordHash> PasswordHash::parse(std::string encoded)
 
 std::string_view PasswordHash::encoded() const noexcept { return m_encoded; }
 
-PasswordHasher::PasswordHasher(foundation::SecretString pepper, PasswordPolicy policy)
-    : m_pepper(std::move(pepper)), m_policy(policy)
+PasswordHasher::PasswordHasher(foundation::SecretString pepper, PasswordPolicy policy,
+                               std::string algorithm)
+    : m_pepper(std::move(pepper)), m_policy(policy), m_algorithm(std::move(algorithm))
 {
 }
 
 foundation::Result<PasswordHasher>
-PasswordHasher::create(foundation::SecretString pepper, PasswordPolicy policy)
+PasswordHasher::create(foundation::SecretString pepper, PasswordPolicy policy,
+                       std::string algorithm)
 {
     if (pepper.expose().size() < kMinimumPepperBytes) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "A password pepper must contain at least 32 bytes.");
     }
-    return PasswordHasher{std::move(pepper), policy};
+    if (algorithm != "scrypt" && algorithm != "argon2id") {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "Unknown password hashing algorithm.");
+    }
+    if (algorithm == "argon2id" && !supportsArgon2id()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id requested but libsodium backend is unavailable.");
+    }
+    return PasswordHasher{std::move(pepper), policy, std::move(algorithm)};
 }
 
 foundation::Result<PasswordHash>
 PasswordHasher::hash(const foundation::SecretString& password) const
 {
+    if (m_algorithm == "argon2id") {
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+        if (!sodiumReady()) return foundation::fail(foundation::ErrorCode::Internal,
+                                                    "libsodium initialization failed.");
+        if (password.expose().size() < kMinimumPasswordBytes
+            || password.expose().size() > kMaximumPasswordBytes) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The password length is outside the accepted range.");
+        }
+        auto prehash = security::hmacSha256(m_pepper, password.expose());
+        if (!prehash) return foundation::fail(prehash.error());
+        auto& material = prehash.value();
+        char encoded[crypto_pwhash_STRBYTES]{};
+        const int result = crypto_pwhash_str(encoded,
+            reinterpret_cast<const char*>(material.data()), material.size(),
+            kArgon2Iterations, kArgon2Memory);
+        OPENSSL_cleanse(material.data(), material.size());
+        if (result != 0) return foundation::fail(foundation::ErrorCode::Internal,
+                                                 "Argon2id password derivation failed.");
+        return PasswordHash{std::string{encoded}};
+#else
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id backend unavailable.");
+#endif
+    }
     foundation::Result<std::vector<std::byte>> salt = security::randomBytes(m_policy.saltBytes());
     if (!salt.has_value()) {
         return foundation::fail(salt.error());
@@ -282,6 +356,26 @@ PasswordHasher::hash(const foundation::SecretString& password) const
 foundation::Result<bool> PasswordHasher::verify(
     const foundation::SecretString& password, const PasswordHash& expected) const
 {
+    if (expected.encoded().starts_with(kArgon2Prefix)) {
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+        if (!validArgon2Encoding(expected.encoded()) || !sodiumReady()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "Invalid or unsupported Argon2id hash.");
+        }
+        if (password.expose().size() < kMinimumPasswordBytes
+            || password.expose().size() > kMaximumPasswordBytes) return false;
+        auto prehash = security::hmacSha256(m_pepper, password.expose());
+        if (!prehash) return foundation::fail(prehash.error());
+        auto& material = prehash.value();
+        const int matched = crypto_pwhash_str_verify(expected.encoded().data(),
+            reinterpret_cast<const char*>(material.data()), material.size());
+        OPENSSL_cleanse(material.data(), material.size());
+        return matched == 0;
+#else
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id verifier is unavailable.");
+#endif
+    }
     const auto fields = split(expected.encoded(), '$');
     if (fields.size() != 8U || fields[0] != "scrypt" || fields[1] != "v1") {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -309,6 +403,42 @@ foundation::Result<bool> PasswordHasher::verify(
         return foundation::fail(actual.error());
     }
     return security::constantTimeEquals(actual.value(), wanted.value());
+}
+
+bool PasswordHasher::supportsArgon2id() noexcept
+{
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+    return sodiumReady();
+#else
+    return false;
+#endif
+}
+
+foundation::Result<bool> PasswordHasher::needsRehash(const PasswordHash& hash) const
+{
+    const std::string_view stored = hash.encoded();
+    if (m_algorithm == "argon2id") {
+        if (!stored.starts_with(kArgon2Prefix)) return true;
+#if defined(OPENPROOF_HAS_LIBSODIUM)
+        if (!validArgon2Encoding(stored) || !sodiumReady()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "Invalid Argon2id hash.");
+        }
+        return crypto_pwhash_str_needs_rehash(stored.data(),
+            kArgon2Iterations, kArgon2Memory) != 0;
+#else
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "Argon2id verifier is unavailable.");
+#endif
+    }
+    if (!stored.starts_with(kPasswordPrefix)) return true;
+    const auto fields = split(stored, '$');
+    if (fields.size() != 8U) return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                                       "Malformed legacy scrypt hash.");
+    return fields[2] != std::to_string(m_policy.cost())
+        || fields[3] != std::to_string(m_policy.blockSize())
+        || fields[4] != std::to_string(m_policy.parallelism())
+        || fields[5] != std::to_string(m_policy.maximumMemoryBytes());
 }
 
 TotpPolicy::TotpPolicy(foundation::Duration step, unsigned int digits,

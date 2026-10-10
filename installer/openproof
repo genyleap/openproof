@@ -126,8 +126,8 @@ $C_BOLD Operate $C_RESET
   stop                         Stop OpenProof
   restart                      Restart OpenProof
   setup [--non-interactive]    Configure a new installation
-  config [main|providers|delivery]
-                               Show or edit configuration
+  config [main|providers|delivery|hashing]
+                               Show or edit configuration; hashing selects new password hashes
 
 $C_BOLD Maintain $C_RESET
   update [options]             Install the newest selected release
@@ -288,6 +288,46 @@ cmd_config(){
       fi
       restart_openproof_or_rollback "$backup" "$CONFIG_FILE" "Main configuration"
       ;;
+    hashing|password-hashing)
+      [[ -f $CONFIG_FILE ]] || die "main configuration does not exist yet"
+      section "Password hashing algorithm"
+      local current selected choice confirmation
+      current=$(sed -nE '/^\[security\]$/,/^\[/{s/^[[:space:]]*password_hash_algorithm[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$CONFIG_FILE")
+      [[ -n $current ]] || current=scrypt
+      field "Current" "$current"
+      printf '\n%sWARNING:%s A policy switch changes hashes created for NEW passwords.\n' "$C_YELLOW" "$C_RESET"
+      printf '  Existing stored scrypt and Argon2id hashes remain verifiable.\n'
+      printf '  Passwords are not recoverable from hashes; old hashes are not bulk-converted.\n'
+      printf '  On fully verified sign-in, old hashes are opportunistically upgraded.\n'
+      printf '  A rollback to an old binary WITHOUT Argon2id will lock out migrated users.\n'
+      printf '  Future password resets will use the newly selected algorithm.\n'
+      printf '  Keep the original password pepper; losing it prevents old credentials from verifying.\n'
+      printf '  Argon2id requires the libsodium-enabled binary and allocates 64 MiB per hash.\n'
+      printf '  Check RAM/concurrency and ensure backups before proceeding.\n\n'
+      printf '  1) scrypt\n  2) argon2id\n'
+      read -r -p "Choose new default [1/2]: " choice
+      case "$choice" in 1) selected=scrypt ;; 2) selected=argon2id ;; *) die "select 1 or 2" ;; esac
+      if [[ $selected == "$current" ]]; then
+        ok "Password hashing algorithm is unchanged ($current)"
+        return
+      fi
+      [[ -z ${OPENPROOF_PASSWORD_HASH_ALGORITHM:-} ]] || die "OPENPROOF_PASSWORD_HASH_ALGORITHM overrides this file; remove the override first"
+      read -r -p "Type CHANGE to confirm the policy switch: " confirmation
+      [[ $confirmation == CHANGE ]] || die "Password hashing policy change canceled"
+      backup=$(backup_config_file "$CONFIG_FILE")
+      if grep -Eq '^[[:space:]]*password_hash_algorithm[[:space:]]*=' "$CONFIG_FILE"; then
+        sed -i -E "s|^[[:space:]]*password_hash_algorithm[[:space:]]*=.*$|password_hash_algorithm = \"$selected\"|" "$CONFIG_FILE"
+      else
+        sed -i "/^\[security\]$/a password_hash_algorithm = \"$selected\"" "$CONFIG_FILE"
+      fi
+      chmod 0640 "$CONFIG_FILE"
+      chown root:openproof "$CONFIG_FILE"
+      if ! "$INSTALL_ROOT/bin/opp" check-config --config "$CONFIG_FILE"; then
+        restore_config_file "$backup" "$CONFIG_FILE"
+        die "selected hashing algorithm is invalid; previous configuration restored"
+      fi
+      restart_openproof_or_rollback "$backup" "$CONFIG_FILE" "Password hashing policy"
+      ;;
     providers)
       [[ -f $PROVIDERS_FILE ]] || die "provider configuration does not exist yet"
       section "Provider configuration"
@@ -337,7 +377,7 @@ cmd_config(){
       field "Delivery" "$DELIVERY_FILE"
       field "Secrets" "$CONFIG_DIR/credentials"
       ;;
-    *) die "unknown config section: $section_name (use main, providers, or delivery)" ;;
+    *) die "unknown config section: $section_name (use main, providers, delivery or hashing)" ;;
   esac
 }
 

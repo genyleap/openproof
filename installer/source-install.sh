@@ -86,7 +86,7 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl git software-properties-common ninja-build \
   python3 python3-pip bzip2 xz-utils build-essential flex bison gawk texinfo wget \
-  libzstd-dev libssl-dev libpq-dev libtomlplusplus-dev libxml2-dev zlib1g-dev \
+  libzstd-dev libssl-dev libsodium-dev libpq-dev libtomlplusplus-dev libxml2-dev zlib1g-dev \
   libldap2-dev postgresql-client
 
 WORK=$(mktemp -d)
