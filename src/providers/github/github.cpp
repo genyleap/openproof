@@ -6,6 +6,7 @@ module;
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -197,12 +198,27 @@ struct HttpResponse final {
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
         parser.body_limit(kMaximumResponseBytes);
+        // GitHub's OAuth responses may carry >8 KiB of security/cache headers.
+        // Beast defaults to an 8 KiB header limit, causing a header_limit error
+        // before the token JSON can be read. Keep a bounded 32 KiB ceiling.
+        parser.header_limit(32U * 1024U);
         http::read(stream, buffer, parser);
         auto response = parser.release();
         beast::error_code ignored;
         stream.shutdown(ignored);
         return HttpResponse{response.result_int(), std::move(response.body())};
+    } catch (const boost::system::system_error& failure) {
+        // The hostname is fixed by this provider. Only emit a numeric library
+        // error identifier, not OAuth codes, headers, or response bodies.
+        std::cerr << "openproof github outbound HTTPS error"
+                  << " host=" << host
+                  << " error_code=" << failure.code().value()
+                  << " error_category=" << failure.code().category().name() << '\n';
+        return foundation::fail(foundation::ErrorCode::Unavailable,
+                                "The GitHub HTTPS request failed.");
     } catch (...) {
+        std::cerr << "openproof github outbound HTTPS unexpected failure"
+                  << " host=" << host << '\n';
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The GitHub HTTPS request failed.");
     }
@@ -382,8 +398,17 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     auto tokenResponse = httpsRequest(kTokenHost, "/login/oauth/access_token", http::verb::post,
                                       std::move(form), "application/x-www-form-urlencoded",
                                       std::nullopt, m_implementation->caFile);
-    if (!tokenResponse || tokenResponse->status != 200U) {
-        return foundation::fail(authFailure("The GitHub token exchange failed."));
+    if (!tokenResponse) {
+        // Keep transport failures distinct from GitHub HTTP rejections in
+        // operator-only diagnostics; never log the code, secret or response body.
+        return foundation::fail(authFailure("The GitHub token exchange transport failed."));
+    }
+    if (tokenResponse->status != 200U) {
+        // HTTP status is public protocol metadata; OAuth response bodies may
+        // carry credentials and must not be copied into diagnostics.
+        return foundation::fail(authFailure(
+            "The GitHub token exchange returned HTTP "
+            + std::to_string(tokenResponse->status) + "."));
     }
     auto tokenJson = parseJson(tokenResponse->body);
     if (!tokenJson || !tokenJson->is_object()) {
