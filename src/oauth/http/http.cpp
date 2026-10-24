@@ -824,7 +824,15 @@ gateway::HttpResponse OAuthHttpApi::loginSubmit(gateway::HttpRequest request)
         }
         return error(verified.error(), request);
     }
-    auto sessionGrant = m_sessions->issue(verified.value(), clientContext(request));
+    const auto priorCookie = cookieValue(request, kSessionCookie);
+    const std::optional<foundation::SecretString> priorToken =
+        priorCookie && !priorCookie->empty()
+            ? std::optional<foundation::SecretString>{
+                  std::in_place, std::string{*priorCookie}}
+            : std::nullopt;
+    auto sessionGrant = m_sessions->issueReplacing(
+        verified.value(), clientContext(request),
+        priorToken ? &*priorToken : nullptr);
     if (!sessionGrant) return error(sessionGrant.error(), request);
     auto response = redirect(returnTarget.value(), 303);
     response.addHeader("set-cookie", cookie(kSessionCookie, sessionGrant->token().expose(), "/", 8 * 60 * 60));

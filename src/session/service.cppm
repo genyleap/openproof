@@ -150,6 +150,18 @@ public:
     [[nodiscard]] foundation::Result<SessionGrant>
     issue(const authentication::VerifiedAuthentication& authentication,
           const identity::provider::ClientContext& client);
+    /**
+     * @brief Starts a newly verified login and retires the session whose cookie
+     * was presented by this browser (if the cookie is still valid).
+     *
+     * A bad credential never gets here. An invalid/stale previous cookie is
+     * ignored; a valid previous session is revoked only after the new one is
+     * persisted. Different browser sessions are not affected.
+     */
+    [[nodiscard]] foundation::Result<SessionGrant>
+    issueReplacing(const authentication::VerifiedAuthentication& authentication,
+                   const identity::provider::ClientContext& client,
+                   const foundation::SecretString* previousToken);
     [[nodiscard]] foundation::Result<AuthenticatedSession>
     authenticate(const foundation::SecretString& token);
     /**
