@@ -2,6 +2,31 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## 1.1.0-rc6 — 2026-10-24
+
+### Browser session correctness
+
+- Successful repeat sign-in now retires the previous **authenticated session cookie**
+  presented by that same browser, after a replacement session has been issued.
+  This applies to both JSON MFA login and OAuth browser form login.
+- A failed password/MFA verification cannot create a browser session and cannot
+  revoke a previously valid one. If revoking a previous session fails, the
+  replacement is revoked and the request fails closed.
+- Other sessions are never grouped or revoked by user-agent or IP address:
+  two identical browser labels do not establish device identity. Existing
+  historical duplicate sessions remain user-revocable from Account Security.
+- Added login-level regression coverage for failed proof and successful
+  same-cookie replacement while preserving account-session isolation.
+
+### Identity and security maintenance
+
+- Includes the Argon2id password-hash upgrade guidance and account-security
+  improvements merged into `main` after the RC5 tag.
+- Contains all previously merged RC5 OAuth/SDK hardening, documentation MCP
+  error sanitization, and migration artifact integrity protections.
+- The Genyleap website's login retry and session-list UX fixes are deployed
+  separately and are **not part of the OpenProof server binary archives**.
+
 ## 1.1.0-rc5 — 2026-10-05
 
 ### Browser authentication and account security

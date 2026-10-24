@@ -296,6 +296,36 @@ TEST(SessionServiceTest, StoresClientMetadataAndListsActiveSessions)
     EXPECT_EQ(*listed->front().remoteAddress(), "203.0.113.42");
 }
 
+TEST(SessionServiceTest, ReLoginRetiresOnlyPresentedCookieAndPreservesOtherBrowsers)
+{
+    Fixture fixture;
+    idp::ClientContext browser;
+    browser.setUserAgent("Mozilla/5.0 Same UA");
+    auto previous = fixture.service.issue(verifiedAuthentication(), browser).value();
+    auto independent = fixture.service.issue(verifiedAuthentication(), browser).value();
+    const fnd::SecretString oldCookie = previous.token().clone();
+    const fnd::SecretString otherCookie = independent.token().clone();
+
+    auto replacement = fixture.service.issueReplacing(
+        verifiedAuthentication(), browser, &oldCookie);
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_FALSE(fixture.service.authenticate(oldCookie));
+    EXPECT_TRUE(fixture.service.authenticate(replacement->token()));
+    EXPECT_TRUE(fixture.service.authenticate(otherCookie));
+    auto active = fixture.service.list(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(active);
+    EXPECT_EQ(active->size(), 2U);
+
+    // Stale cookies cannot authorize revocation of an unrelated session.
+    const fnd::SecretString staleCookie{"expired-or-unknown-cookie"};
+    auto next = fixture.service.issueReplacing(
+        verifiedAuthentication(), browser, &staleCookie);
+    ASSERT_TRUE(next);
+    EXPECT_TRUE(fixture.service.authenticate(replacement->token()));
+    EXPECT_TRUE(fixture.service.authenticate(otherCookie));
+    EXPECT_TRUE(fixture.service.authenticate(next->token()));
+}
+
 TEST(SessionServiceTest, RevokeOwnedChecksTheCanonicalIdentity)
 {
     Fixture fixture;
