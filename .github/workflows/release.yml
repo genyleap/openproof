@@ -28,6 +28,14 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Docs MCP dependency security and transport regression
+        working-directory: tools/docs-mcp
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm run check
+          npm test
+
   build:
     name: Package ${{ matrix.arch }}
     needs: validate

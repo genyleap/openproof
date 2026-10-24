@@ -32,6 +32,13 @@ jobs:
         run: node scripts/test-local-demo-portal-ui.mjs
       - name: JavaScript SDK
         run: node sdk/javascript/test.mjs
+      - name: Docs MCP dependency security and transport regression
+        working-directory: tools/docs-mcp
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm run check
+          npm test
       - name: Whitespace
         run: git diff --check
 
