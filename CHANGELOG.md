@@ -24,6 +24,10 @@ Notable user-facing changes to OpenProof are recorded here.
   improvements merged into `main` after the RC5 tag.
 - Contains all previously merged RC5 OAuth/SDK hardening, documentation MCP
   error sanitization, and migration artifact integrity protections.
+- Upgraded Docs MCP to `@modelcontextprotocol/sdk` 1.32.2 and Zod 4.6.7
+  with patched transitive dependencies; `npm audit` now reports zero known
+  vulnerabilities. CI and release validation now enforce the dependency audit
+  and authenticated MCP transport smoke test on the published source.
 - The Genyleap website's login retry and session-list UX fixes are deployed
   separately and are **not part of the OpenProof server binary archives**.
 
