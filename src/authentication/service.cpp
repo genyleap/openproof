@@ -450,9 +450,16 @@ AuthenticationService::completeExchange(
             foundation::Result<provider::AuthenticationOutcome> providerResult =
                 implementation->completeAuthentication(response);
             if (!providerResult.has_value()) {
+                // Preserve provider-specific operator diagnostics while keeping
+                // the public authentication failure indistinguishable.
+                std::string detail{
+                    "Authentication provider rejected the completion operation."};
+                if (providerResult.error().hasInternalDetail()) {
+                    detail.append(" Provider detail: ");
+                    detail.append(providerResult.error().internalDetail());
+                }
                 return foundation::Result<provider::AuthenticationOutcome>{foundation::fail(
-                    authenticationFailure(
-                        "Authentication provider rejected the completion operation."))};
+                    authenticationFailure(std::move(detail)))};
             }
             return providerResult;
         } catch (...) {

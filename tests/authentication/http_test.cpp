@@ -49,9 +49,12 @@ public:
 
 class RedirectProvider final : public idp::AuthenticationProvider {
 public:
+    explicit RedirectProvider(std::string providerId = "redirect")
+        : m_providerId(std::move(providerId)) {}
+
     [[nodiscard]] idp::ProviderId id() const override
     {
-        return idp::ProviderId{"redirect"};
+        return idp::ProviderId{m_providerId};
     }
 
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
@@ -83,11 +86,14 @@ public:
             return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
         return idp::AuthenticationOutcome::create(
-            idp::ProviderId{"redirect"}, idp::ExternalSubject{"redirect-subject"},
+            idp::ProviderId{m_providerId}, idp::ExternalSubject{"redirect-subject"},
             idp::VerifiedClaims{}, idp::AssuranceLevel::Ial1,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, true},
             idp::ProviderEvidence{}, kNow);
     }
+
+private:
+    std::string m_providerId;
 };
 
 class OAuth1RelayProvider final : public idp::AuthenticationProvider {
@@ -1043,6 +1049,53 @@ TEST(FederatedAuthenticationHttpApiTest, ConnectionConflictRedirectsBackToUiInst
     EXPECT_TRUE(conflicted.body().empty());
     EXPECT_TRUE(setCookieHeader(
         conflicted, "__Host-openproof-federation-continuation").contains("Max-Age=0"));
+}
+
+TEST(FederatedAuthenticationHttpApiTest, GitHubStateCookiesUseLaxWithoutChangingOtherProviders)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<RedirectProvider>("github")));
+    ASSERT_TRUE(registry.registerProvider(std::make_unique<RedirectProvider>()));
+
+    core::InMemoryExternalIdentityDirectory externalIdentities;
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"github"}, idp::AssuranceLevel::Ial1));
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"redirect"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{
+        registry, transactions, externalIdentities, clock, std::move(trust),
+        std::chrono::minutes{5}};
+    sess::InMemorySessionRepository sessionRepository;
+    sess::SessionService sessions{
+        sessionRepository, clock,
+        sess::SessionKey::create(fnd::SecretString{
+            "0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},
+                                    std::chrono::minutes{30}).value()};
+    gw::TokenBucketRateLimiter limiter = gw::TokenBucketRateLimiter::create(
+        clock, 1000.0, 1000.0, 1000U).value();
+    Fallback fallback;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication, registry, sessions, limiter, fallback};
+
+    const auto githubStart = api.handle(getRequest(
+        "/auth/federated/start?provider=github&return_to=%2Faccount"));
+    ASSERT_EQ(githubStart.status(), 302) << githubStart.body();
+    ASSERT_EQ(setCookies(githubStart).size(), 5U);
+    for (const auto& header : setCookies(githubStart)) {
+        EXPECT_NE(header.find("; SameSite=Lax"), std::string::npos);
+        EXPECT_NE(header.find("; Secure"), std::string::npos);
+        EXPECT_NE(header.find("; HttpOnly"), std::string::npos);
+    }
+
+    const auto otherStart = api.handle(getRequest(
+        "/auth/federated/start?provider=redirect&return_to=%2Faccount"));
+    ASSERT_EQ(otherStart.status(), 302) << otherStart.body();
+    ASSERT_EQ(setCookies(otherStart).size(), 5U);
+    for (const auto& header : setCookies(otherStart)) {
+        EXPECT_NE(header.find("; SameSite=None"), std::string::npos);
+    }
 }
 
 TEST(FederatedAuthenticationHttpApiTest, CallbackSessionSurvivesCrossSiteOAuthRedirect)

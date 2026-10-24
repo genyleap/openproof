@@ -3,6 +3,7 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -32,11 +33,12 @@ constexpr std::size_t kMaximumCallbackBody = 1024U * 1024U;
 constexpr std::size_t kMaximumHandoffBody = 16U * 1024U;
 
 [[nodiscard]] std::string cookie(std::string_view name, std::string_view value,
-                                 std::int64_t maximumAge)
+                                 std::int64_t maximumAge,
+                                 std::string_view sameSite = "None")
 {
     return std::string{name} + "=" + std::string{value}
         + "; Path=/; Max-Age=" + std::to_string(maximumAge)
-        + "; Secure; HttpOnly; SameSite=None";
+        + "; Secure; HttpOnly; SameSite=" + std::string{sameSite};
 }
 
 [[nodiscard]] std::string sessionCookie(std::string_view value, std::int64_t maximumAge)
@@ -47,6 +49,31 @@ constexpr std::size_t kMaximumHandoffBody = 16U * 1024U;
         // the cookie unavailable to subresource requests while allowing the
         // immediate same-origin OAuth authorization redirect to consume it.
         + "; Secure; HttpOnly; SameSite=Lax";
+}
+
+void traceCallbackFailure(const gateway::HttpRequest& request,
+                          std::string_view stage, const foundation::Error& failure)
+{
+    std::cerr << "openproof federated callback failure"
+              << " request_id=" << request.correlation().value()
+              << " stage=" << stage
+              << " code=" << foundation::errorCodeName(failure.code());
+    // Error::internalDetail() is explicitly operator-only. Only emit a short
+    // printable diagnostic: never log cookies, OAuth codes, tokens or claims.
+    if (stage == "provider_or_identity" && failure.hasInternalDetail()) {
+        const auto detail = failure.internalDetail();
+        // Only print known static GitHub provider diagnostics. Do not echo
+        // arbitrary failure details, which may contain user-supplied fields.
+        constexpr std::string_view githubPrefix =
+            "Authentication provider rejected the completion operation. Provider detail: The GitHub ";
+        if (detail.starts_with(githubPrefix) && detail.size() <= 240U
+            && std::ranges::all_of(detail, [](char ch) {
+                   return ch >= 0x20 && ch <= 0x7e;
+               })) {
+            std::cerr << " detail=" << detail;
+        }
+    }
+    std::cerr << '\n';
 }
 
 void secure(gateway::HttpResponse& response)
@@ -490,16 +517,20 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::startPrepared(
     }
     gateway::HttpResponse response{302, gateway::Headers{{"location", std::string{*authorizationUrl}}}, {}};
     secure(response);
+    // GitHub redirects back with a top-level GET. Lax allows that callback while
+    // avoiding SameSite=None's third-party-cookie treatment in some browsers.
+    // Other providers retain None because their callbacks may be cross-site POSTs.
+    const std::string_view sameSite = providerId.value() == "github" ? "Lax" : "None";
     response.addHeader("set-cookie", cookie(kContinuationCookie,
-        started->continuationToken().expose(), 600));
-    response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
+        started->continuationToken().expose(), 600, sameSite));
+    response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600, sameSite));
     response.addHeader("set-cookie", cookie(kTransactionCookie,
-        base64UrlText(started->transactionId().value()), 600));
+        base64UrlText(started->transactionId().value()), 600, sameSite));
     response.addHeader("set-cookie", cookie(kChallengeCookie,
-        base64UrlText(started->challenge().id().value()), 600));
-    response.addHeader("set-cookie", cookie(kReturnCookie, base64UrlText(returnTarget), 600));
+        base64UrlText(started->challenge().id().value()), 600, sameSite));
+    response.addHeader("set-cookie", cookie(kReturnCookie, base64UrlText(returnTarget), 600, sameSite));
     if (connectionTarget.has_value()) {
-        response.addHeader("set-cookie", cookie(kModeCookie, "link", 600));
+        response.addHeader("set-cookie", cookie(kModeCookie, "link", 600, sameSite));
     }
     return response;
 }
@@ -538,6 +569,7 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
         || !challengeCookie || !returnCookie || parameters->contains("error")
         || parameters->contains("denied")) {
         const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+        traceCallbackFailure(request, "missing_state_or_provider_error", failure);
         if (auto redirected = redirectConnectionFailure(failure)) {
             return std::move(*redirected);
         }
@@ -589,7 +621,9 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     auto binding = security::sha256(*bindingToken);
     if (!transactionText || !challengeText || !returnTarget || !binding
         || !validLocalReturn(returnTarget.value())) {
-        return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+        const foundation::Error failure{foundation::ErrorCode::AuthenticationFailed};
+        traceCallbackFailure(request, "invalid_state_cookie", failure);
+        return error(failure, request, true);
     }
     idp::AuthenticationResponse authenticationResponse{
         idp::ChallengeId{std::move(challengeText).value()}, clientContext(request)};
@@ -631,9 +665,15 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::callback(gateway::HttpRequ
     auto verified = m_authentication->complete(
         idp::TransactionId{std::move(transactionText).value()},
         foundation::SecretString{*continuation}, binding.value(), authenticationResponse);
-    if (!verified) return error(verified.error(), request, true);
+    if (!verified) {
+        traceCallbackFailure(request, "provider_or_identity", verified.error());
+        return error(verified.error(), request, true);
+    }
     auto session = m_sessions->issue(verified.value(), clientContext(request));
-    if (!session) return error(session.error(), request, true);
+    if (!session) {
+        traceCallbackFailure(request, "session_issue", session.error());
+        return error(session.error(), request, true);
+    }
     gateway::HttpResponse response{302, gateway::Headers{{"location", std::move(returnTarget).value()}}, {}};
     secure(response);
     clearState(response);
