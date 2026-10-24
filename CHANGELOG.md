@@ -27,7 +27,7 @@ Notable user-facing changes to OpenProof are recorded here.
 - Upgraded Docs MCP to `@modelcontextprotocol/sdk` 1.32.2 and Zod 4.6.7
   with patched transitive dependencies; `npm audit` now reports zero known
   vulnerabilities. CI and release validation now enforce the dependency audit
-  and authenticated MCP transport smoke test on the published source.
+  and public MCP protocol transport smoke test on the published source.
 - The Genyleap website's login retry and session-list UX fixes are deployed
   separately and are **not part of the OpenProof server binary archives**.
 
