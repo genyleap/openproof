@@ -255,6 +255,32 @@ foundation::Result<SessionGrant> SessionService::issue(
     return SessionGrant{std::move(id), std::move(token)};
 }
 
+foundation::Result<SessionGrant> SessionService::issueReplacing(
+    const authentication::VerifiedAuthentication& authentication,
+    const identity::provider::ClientContext& client,
+    const foundation::SecretString* previousToken)
+{
+    std::optional<SessionId> previousId;
+    if (previousToken != nullptr && !previousToken->empty()) {
+        auto existing = authenticate(*previousToken);
+        if (existing) previousId = existing->session().id();
+    }
+
+    auto created = issue(authentication, client);
+    if (!created) return foundation::fail(created.error());
+
+    if (previousId.has_value() && *previousId != created->id()) {
+        const auto revoked = revoke(*previousId);
+        if (!revoked) {
+            // Avoid returning a second valid session if replacing the old
+            // session failed. Never expose the newly issued bearer token.
+            static_cast<void>(revoke(created->id()));
+            return foundation::fail(revoked.error());
+        }
+    }
+    return created;
+}
+
 foundation::Result<AuthenticatedSession> SessionService::authenticate(
     const foundation::SecretString& token)
 {

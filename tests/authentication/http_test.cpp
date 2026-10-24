@@ -569,6 +569,73 @@ TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
     EXPECT_EQ(remaining.value(), 0U);
 }
 
+TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession)
+{
+    Fixture fixture;
+    const auto started = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})"));
+    ASSERT_EQ(started.status(), 202);
+    const auto beginBody = json::parse(started.body()).as_object();
+    json::object firstProof;
+    firstProof["transaction_id"] = beginBody.at("transaction_id");
+    firstProof["challenge_id"] = beginBody.at("challenge_id");
+    firstProof["password"] = "correct-password";
+    firstProof["totp"] = fixture.totpCode;
+    const auto completed = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(firstProof), preauthCookieHeader(started)));
+    ASSERT_EQ(completed.status(), 200);
+    const std::string oldToken = cookieValue(completed, "__Host-openproof-session");
+    ASSERT_FALSE(oldToken.empty());
+
+    // A failed login from the same browser must not create or revoke a session.
+    const std::string sameBrowserCookie = "__Host-openproof-session=" + oldToken;
+    const auto rejectedStart = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})", sameBrowserCookie));
+    ASSERT_EQ(rejectedStart.status(), 202);
+    const auto rejectedBody = json::parse(rejectedStart.body()).as_object();
+    json::object invalidProof;
+    invalidProof["transaction_id"] = rejectedBody.at("transaction_id");
+    invalidProof["challenge_id"] = rejectedBody.at("challenge_id");
+    invalidProof["password"] = "wrong-password";
+    invalidProof["totp"] = fixture.totpCode;
+    const auto failed = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(invalidProof),
+        preauthCookieHeader(rejectedStart) + "; " + sameBrowserCookie));
+    EXPECT_EQ(failed.status(), 401);
+    ASSERT_TRUE(fixture.sessionService.authenticate(fnd::SecretString{oldToken}));
+    auto stillOne = fixture.sessionService.list(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(stillOne);
+    EXPECT_EQ(stillOne->size(), 1U);
+
+    // Advance the authenticator clock: replay of an already used TOTP is refused.
+    fixture.clock.advance(std::chrono::seconds{31});
+    const auto secondStarted = fixture.api->handle(request(
+        "/auth/login", R"({"subject":"alice"})", sameBrowserCookie));
+    ASSERT_EQ(secondStarted.status(), 202);
+    const auto secondStartBody = json::parse(secondStarted.body()).as_object();
+    auto secondTotpSecret = cred::TotpSecret::create(
+        fnd::SecretString{"12345678901234567890"}).value();
+    const std::string newCode = cred::totpAt(
+        secondTotpSecret, cred::TotpPolicy::recommended(), fixture.clock.now()).value();
+    json::object secondProof;
+    secondProof["transaction_id"] = secondStartBody.at("transaction_id");
+    secondProof["challenge_id"] = secondStartBody.at("challenge_id");
+    secondProof["password"] = "correct-password";
+    secondProof["totp"] = newCode;
+    const auto relogged = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(secondProof),
+        preauthCookieHeader(secondStarted) + "; " + sameBrowserCookie));
+    ASSERT_EQ(relogged.status(), 200) << relogged.body();
+    const std::string newToken = cookieValue(relogged, "__Host-openproof-session");
+    ASSERT_FALSE(newToken.empty());
+    EXPECT_NE(newToken, oldToken);
+    EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{oldToken}));
+    EXPECT_TRUE(fixture.sessionService.authenticate(fnd::SecretString{newToken}));
+    const auto listed = fixture.sessionService.list(core::IdentityId{"identity-1"});
+    ASSERT_TRUE(listed);
+    EXPECT_EQ(listed->size(), 1U);
+}
+
 TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookies)
 {
     Fixture fixture;
@@ -587,6 +654,7 @@ TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookie
     EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth"), "");
     EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth-binding"), "");
     EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth-subject"), "");
+    EXPECT_EQ(fixture.sessionRepository.size(), 0U);
 }
 
 TEST(AuthenticationHttpApiTest, TamperedSubjectCookieCannotSwitchAccounts)

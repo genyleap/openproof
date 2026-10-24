@@ -359,7 +359,17 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
         foundation::SecretString{continuation.value()}, binding.value(),
         authenticationResponse);
     if (!verified.has_value()) return error(verified.error(), request, true);
-    auto grant = m_sessions->issue(verified.value(), clientContext(request));
+    // A retry after a successfully verified login must not leave an additional
+    // active session for the same browser. No session is touched on bad proof.
+    const auto priorCookie = cookieValue(request, "__Host-openproof-session");
+    const std::optional<foundation::SecretString> priorToken =
+        priorCookie && !priorCookie->empty()
+            ? std::optional<foundation::SecretString>{
+                  std::in_place, std::string{*priorCookie}}
+            : std::nullopt;
+    auto grant = m_sessions->issueReplacing(
+        verified.value(), clientContext(request),
+        priorToken ? &*priorToken : nullptr);
     if (!grant.has_value()) return error(grant.error(), request, true);
     json::object payload;
     payload["session_id"] = grant->id().value();
