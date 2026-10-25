@@ -939,7 +939,7 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     // authentication or changes the provider-bound OIDC subject.
     const auto& scopes = m_implementation->config.scopes();
     if (m_implementation->config.providerId().value() == "linkedin"
-        && std::ranges::find(scopes, "r_profile_basicinfo") != scopes.end()) {
+        && std::ranges::find(scopes, std::string{"r_profile_basicinfo"}) != scopes.end()) {
         std::string authorizationHeader{"Bearer "};
         authorizationHeader.append(*accessToken);
         const HttpsUrl detailsEndpoint{"api.linkedin.com", "443", "/rest/identityMe"};
