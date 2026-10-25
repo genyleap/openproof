@@ -1315,7 +1315,28 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
 
         auto authorization = m_devices->find(*userCode);
         if (!authorization) {
-            return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
+            if (authorization.error().code() != foundation::ErrorCode::NotFound) {
+                return error(authorization.error(), request);
+            }
+            // Expired, consumed, and unknown codes all receive the same
+            // non-revealing browser response. Do not redirect into login again:
+            // an old device code cannot be revived by authenticating.
+            const std::string content =
+                "<span class=\"kicker\">Device authorization</span>"
+                "<h1>Sign-in code expired</h1>"
+                "<p class=\"lead\">This one-time code is no longer available. It may have "
+                "expired or already been used. Your Genyleap sign-in is not affected.</p>"
+                "<p class=\"hint\">Return to the app and start a new sign-in to get a fresh "
+                "code. Do not reuse an earlier approval link.</p>"
+                "<div class=\"actions\"><a class=\"secondary\" href=\"https://caster.genyleap.com/\">"
+                "Back to GenyCaster</a>"
+                "<a class=\"primary\" href=\"/oauth/device\">Enter another code</a></div>";
+            gateway::HttpResponse response{
+                410, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+                devicePage(styleNonce.value(), "Sign-in code expired", content)};
+            secure(response);
+            response.setHeader("content-security-policy", devicePageCsp(styleNonce.value()));
+            return response;
         }
         const std::string returnTarget =
             std::string{"/oauth/device?user_code="} + percentEncode(*userCode);
