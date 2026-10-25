@@ -611,6 +611,40 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
     if (filesystemError) return foundation::fail(foundation::ErrorCode::Internal,
                                                   "The migration directory could not be read.");
     std::ranges::sort(files);
+
+    // Historical tenant-specific SQL is retained as an immutable checksum
+    // archive, never as an executable schema migration. Fresh installations
+    // must never provision an unrelated product's OAuth clients.
+    const auto legacyDirectory = directory / "legacy";
+    if (!std::filesystem::is_directory(legacyDirectory, filesystemError)
+        || filesystemError) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "The legacy migration checksum archive is missing.");
+    }
+    std::vector<std::pair<std::string, std::string>> archived;
+    for (std::filesystem::directory_iterator iterator{legacyDirectory, filesystemError};
+         !filesystemError && iterator != std::filesystem::directory_iterator{}; ++iterator) {
+        if (iterator->path().extension() != ".sql") continue;
+        if (!iterator->is_regular_file() || iterator->is_symlink()) {
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "The legacy migration archive contains an invalid file.");
+        }
+        std::ifstream stream{iterator->path(), std::ios::binary};
+        const std::string sql{std::istreambuf_iterator<char>{stream},
+                              std::istreambuf_iterator<char>{}};
+        if (stream.bad() || sql.empty()) {
+            return foundation::fail(foundation::ErrorCode::Internal,
+                                    "A legacy migration checksum could not be read.");
+        }
+        auto checksum = security::sha256(sql);
+        if (!checksum) return foundation::fail(checksum.error());
+        archived.emplace_back(iterator->path().filename().string(),
+                              foundation::toHex(checksum.value()));
+    }
+    if (filesystemError || archived.empty()) {
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "The legacy migration archive is incomplete.");
+    }
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     PGconn* connection = lease->get();
@@ -631,6 +665,12 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
         if (!checksum) return foundation::fail(checksum.error());
         const std::string version = path.filename().string();
         const std::string hex = foundation::toHex(checksum.value());
+        const auto historic = std::ranges::find_if(archived,
+            [&version](const auto& entry) { return entry.first == version; });
+        if (historic != archived.end() && historic->second != hex) {
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "A historical migration file has changed.");
+        }
         auto begun = beginTransaction(connection);
         if (!begun) return foundation::fail(begun.error());
         ResultPointer lock = exec(connection, "SELECT pg_advisory_xact_lock(1827364512)");
@@ -651,28 +691,13 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
             continue;
         }
 
-        // Historical releases embedded Genyleap-specific OAuth client seeds
-        // (0020-0022) in the global migration chain. A fresh or differently
-        // tenanted installation does not yet have the 'genyleap' organization;
-        // applying the seed would fail its foreign key. Defer all three files
-        // without marking them applied, so a later bootstrap of that tenant
-        // can apply the original checksummed SQL unchanged and in order.
-        // Existing installations with recorded checksums are unaffected.
-        const bool tenantSeed = version == "0020_genycaster_native_client.sql"
-            || version == "0021_genycaster_production_environment.sql"
-            || version == "0022_tegra_cms_browser_client.sql";
-        if (tenantSeed) {
-            ResultPointer tenant = exec(connection,
-                "SELECT 1 FROM openproof.organizations WHERE id='genyleap'");
-            if (!tuplesOk(tenant.get())) {
-                rollback(connection);
-                return foundation::fail(databaseError(tenant.get(), "check seed tenant"));
-            }
-            if (PQntuples(tenant.get()) == 0) {
-                auto committed = commit(connection);
-                if (!committed) return foundation::fail(committed.error());
-                continue;
-            }
+        // An older in-place upgrade might still leave the archived SQL files
+        // in the root directory. Verify their *unchanged bytes* and skip them.
+        // Never execute tenant-specific bootstrap SQL as a schema migration.
+        if (historic != archived.end()) {
+            auto committed = commit(connection);
+            if (!committed) return foundation::fail(committed.error());
+            continue;
         }
         ResultPointer applied = exec(connection, sql);
         if (!commandOk(applied.get())) { rollback(connection); return foundation::fail(databaseError(applied.get(), "apply migration")); }
@@ -683,6 +708,28 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
         auto committed = commit(connection);
         if (!committed) return foundation::fail(committed.error());
         ++report.applied;
+    }
+
+    // Preserve checksum validation for old installations which already applied
+    // the legacy SQL. Never apply those files on a new installation, even if a
+    // tenant happens to have the same organization identifier as the publisher.
+    for (const auto& [version, expected] : archived) {
+        const bool inRoot = std::ranges::any_of(files,
+            [&version](const auto& path) { return path.filename().string() == version; });
+        if (inRoot) continue; // Already checked in the root-file loop above.
+        ResultPointer existing = execParams(connection,
+            "SELECT encode(checksum, 'hex') FROM openproof.schema_migrations WHERE version=$1",
+            {version});
+        if (!tuplesOk(existing.get())) {
+            return foundation::fail(databaseError(existing.get(), "read archived migration state"));
+        }
+        if (PQntuples(existing.get()) == 1) {
+            if (field(existing.get(), 0, 0) != expected) {
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                        "An applied historical migration file has changed.");
+            }
+            ++report.alreadyApplied;
+        }
     }
     return report;
 }

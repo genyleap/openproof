@@ -16,6 +16,7 @@ operations:
 | [INSTALLATION.md](INSTALLATION.md) | packaged installation and setup wizard |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | module boundaries and system architecture |
 | [CONFIGURATION.md](CONFIGURATION.md) | complete configuration reference |
+| [PROTOCOL_INDEPENDENCE.md](PROTOCOL_INDEPENDENCE.md) | customer-neutral runtime boundaries, immutable legacy client migration checksums, and CI guard |
 | [API_GUIDE.md](API_GUIDE.md) | application-facing integration flows |
 | [PROVIDER_SETUP.md](PROVIDER_SETUP.md) | upstream identity-provider setup |
 | [OPERATIONS.md](OPERATIONS.md) | deployment, rotation, backup and incident procedures |

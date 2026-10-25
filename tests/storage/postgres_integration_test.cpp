@@ -140,23 +140,22 @@ TEST_F(PostgresIntegrationTest, MigrationIsIdempotentAndPoolIsHealthy)
 }
 
 
-TEST_F(PostgresIntegrationTest, TenantSpecificSeedMigrationsWaitForOrganization)
+TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
 {
-    // These three historical migrations contain Genyleap-only client records.
-    // On a fresh instance they must not block the initial tenant bootstrap.
-    // Use the disposable integration fixture to exercise the deferred path.
+    // Customer provisioning is never a schema migration: even an organization
+    // matching a historical vendor seed must not trigger creation of clients.
     execute("DELETE FROM openproof.schema_migrations "
             "WHERE version IN ('0020_genycaster_native_client.sql',"
             "'0021_genycaster_production_environment.sql',"
             "'0022_tegra_cms_browser_client.sql')");
     execute("INSERT INTO openproof.organizations(id,name,state,created_at_ms) "
-            "VALUES('genyleap','Genyleap',0,1770000000000)");
+            "VALUES('genyleap','Historical tenant',0,1770000000000)");
     pg::Migrator migrator{*pool};
     auto result = migrator.applyDirectory(
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(result)
         << (result ? "" : std::string{result.error().internalDetail()});
-    EXPECT_EQ(result->applied, 3U);
+    EXPECT_EQ(result->applied, 0U);
 
     std::unique_ptr<PGresult, ResultDeleter> seeded{PQexec(direct.get(),
         "SELECT count(*) FROM openproof.applications "
@@ -164,12 +163,37 @@ TEST_F(PostgresIntegrationTest, TenantSpecificSeedMigrationsWaitForOrganization)
         "AND identifier IN ('genycaster', 'tegra-cms')")};
     ASSERT_NE(seeded.get(), nullptr);
     ASSERT_EQ(PQresultStatus(seeded.get()), PGRES_TUPLES_OK);
-    EXPECT_STREQ(PQgetvalue(seeded.get(), 0, 0), "2");
+    EXPECT_STREQ(PQgetvalue(seeded.get(), 0, 0), "0");
+
+    std::unique_ptr<PGresult, ResultDeleter> recorded{PQexec(direct.get(),
+        "SELECT count(*) FROM openproof.schema_migrations "
+        "WHERE version LIKE '0020_%' OR version LIKE '0021_%' OR version LIKE '0022_%'")};
+    ASSERT_NE(recorded.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(recorded.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(recorded.get(), 0, 0), "0");
 
     auto repeated = migrator.applyDirectory(
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(repeated);
     EXPECT_EQ(repeated->applied, 0U);
+
+    // Previously applied records keep their exact historical checksum.
+    // An invalid archived checksum must prevent startup, not be rewritten.
+    execute("INSERT INTO openproof.schema_migrations(version,checksum) VALUES "
+            "('0020_genycaster_native_client.sql', "
+            "decode('b94bd75abaf5b1afc0ea740804d04a5c7518358321df5734b3e6084d4af97fa1','hex'))");
+    auto historical = migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    ASSERT_TRUE(historical);
+    EXPECT_EQ(historical->applied, 0U);
+    execute("UPDATE openproof.schema_migrations "
+            "SET checksum=decode(repeat('00',32),'hex') "
+            "WHERE version='0020_genycaster_native_client.sql'");
+    auto mismatched = migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    EXPECT_FALSE(mismatched);
+    execute("DELETE FROM openproof.schema_migrations "
+            "WHERE version='0020_genycaster_native_client.sql'");
 }
 
 TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)

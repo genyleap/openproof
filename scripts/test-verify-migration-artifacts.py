@@ -82,6 +82,28 @@ class MigrationArtifactTests(unittest.TestCase):
             checker["verify"]("deb", self.expected,
                               checker["read_deb"](self.root / "fixture.deb"))
 
+    def test_legacy_archive_packaged_but_not_promoted_to_root(self):
+        legacy = self.source / "legacy"
+        legacy.mkdir()
+        historical = legacy / "0020_historical_client.sql"
+        historical.write_text("INSERT INTO customer_client VALUES ('example');\n")
+        expected = checker["source_migrations"](self.source)
+        bundle = self.root / "legacy-bundle.tar.gz"
+        with tarfile.open(bundle, "w:gz") as archive:
+            for file in sorted(self.source.rglob("*.sql")):
+                relative = file.relative_to(self.source).as_posix()
+                data = file.read_bytes()
+                info = tarfile.TarInfo(f"./opt/openproof/migrations/{relative}")
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        actual = checker["read_bundle"](bundle)
+        checker["verify"]("legacy archive", expected, actual)
+        self.assertIn("legacy/0020_historical_client.sql", actual)
+        self.assertNotIn("0020_historical_client.sql", actual)
+        actual.pop("legacy/0020_historical_client.sql")
+        with self.assertRaisesRegex(ValueError, "missing="):
+            checker["verify"]("missing legacy checksum archive", expected, actual)
+
     def test_empty_source_rejected(self):
         for file in self.source.iterdir():
             file.unlink()

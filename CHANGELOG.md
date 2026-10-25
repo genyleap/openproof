@@ -2,6 +2,22 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## Unreleased — protocol independence hardening
+
+- Removed publisher/product-specific branding and Farcaster/Genycaster
+  assumptions from the built-in OAuth login, device authorization and
+  account-security HTML surfaces. Device approval now uses the registered
+  application's display name and requested scopes.
+- Archived the original immutable customer-client SQL migrations 0020–0022
+  without changing their historical checksums. These files no longer run
+  on fresh installations or when a matching tenant later appears.
+- Preserved old installation journal checksums, including in-place upgrades
+  with legacy root-level SQL files, while preventing silent creation or
+  replacement of product-specific OAuth clients.
+- Added CI and release gates for customer-neutral protocol runtime source,
+  executable schema migrations and the checksum-only historical archive.
+- See `docs/PROTOCOL_INDEPENDENCE.md` for compatibility and deployment policy.
+
 ## 1.1.0-rc6 — 2026-10-24
 
 ### Browser session correctness
