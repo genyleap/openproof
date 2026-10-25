@@ -28,6 +28,8 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Protocol independence gate
+        run: python3 scripts/check-protocol-neutrality.py
       - name: Docs MCP dependency security and transport regression
         working-directory: tools/docs-mcp
         run: |

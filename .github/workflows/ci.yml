@@ -26,6 +26,8 @@ jobs:
           shellcheck --severity=error installer/bootstrap.sh installer/setup.sh installer/openproof \
             packaging/build-deb.sh packaging/build-bundle.sh scripts/ci/install-build-deps.sh \
             scripts/backup-postgres.sh scripts/restore-postgres.sh
+      - name: Protocol independence gate
+        run: python3 scripts/check-protocol-neutrality.py
       - name: OpenAPI coverage
         run: python3 scripts/verify-openapi.py
       - name: Portal behavior

@@ -330,10 +330,10 @@ body{background:radial-gradient(circle at 18% 0%,rgba(113,118,255,.18),transpare
         + "</title><style nonce=\"" + htmlEscape(nonce) + "\">"
         + std::string{kDevicePageCss}
         + "</style></head><body><main class=\"shell\"><div class=\"brand\">"
-          "<div class=\"brand-mark\">G</div><div>Genyleap<small>Secured by OpenProof</small></div>"
+          "<div class=\"brand-mark\">O</div><div>OpenProof<small>Identity security</small></div>"
           "</div><section class=\"card\">"
         + std::string{content}
-        + "</section><p class=\"footer\">OpenProof keeps your app session separate from your Genyleap credentials.</p>"
+        + "</section><p class=\"footer\">OpenProof keeps your application session separate from your identity-provider session.</p>"
           "</main></body></html>";
 }
 
@@ -747,7 +747,7 @@ h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:
 input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}.code{font-variant-numeric:tabular-nums;letter-spacing:.14em}
 button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.notice{margin:0 0 18px;padding:13px 14px;border-radius:14px;font-size:13px;line-height:1.55}.notice.info{background:rgba(99,102,241,.11);border:1px solid rgba(129,140,248,.28);color:#d8dbff}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
 @media(max-width:560px){body{padding:16px}.card{border-radius:23px}}
-</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">O</span><span>OpenProof<small>Identity security</small></span></div>
 <section class="card"><span class="kicker">Secure sign in</span><h1>Sign in with OpenProof</h1>
 <p class="lead">Use your OpenProof account credentials. If you already enabled an authenticator, enter its current 6-digit code for an IAL2 session.</p>)HTML";
     if (totpEnrolled) {
@@ -765,7 +765,7 @@ button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-
 <button type="submit">Sign in securely</button>
 <p class="hint"><strong>No authenticator yet?</strong> Leave the code empty. For owner administration, OpenProof will take you to Account Security to set one up.</p>
 <p class="hint"><strong>Forgot your password?</strong> <a class="text-link" href="/account/recover">Reset it securely</a>.</p>
-</form></section><p class="footer">OpenProof keeps your application sessions separate from your Genyleap credentials.</p></main></body></html>)HTML";
+</form></section><p class="footer">OpenProof keeps your application sessions separate from your identity-provider session.</p></main></body></html>)HTML";
 
     gateway::HttpResponse response{
         200,
@@ -1298,13 +1298,13 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
             const std::string content =
                 "<span class=\"kicker\">Device authorization</span>"
                 "<h1>Connect a device</h1>"
-                "<p class=\"lead\">Enter the one-time code shown by the app that wants to use your Genyleap identity.</p>"
+                "<p class=\"lead\">Enter the one-time code shown by the application requesting your OpenProof identity.</p>"
                 "<form method=\"get\" class=\"stack\">"
                 "<label class=\"section-label\" for=\"user_code\">Sign-in code</label>"
                 "<input class=\"code-input\" id=\"user_code\" name=\"user_code\" autocomplete=\"one-time-code\" "
                 "autocapitalize=\"characters\" spellcheck=\"false\" placeholder=\"ABCD-EFGH\" required>"
                 "<button class=\"primary\" type=\"submit\">Continue securely</button></form>"
-                "<p class=\"hint\">Only approve codes you initiated yourself. OpenProof never asks the app for your Genyleap password.</p>";
+                "<p class=\"hint\">Only approve codes you initiated yourself. OpenProof never shares your password with the requesting application.</p>";
             gateway::HttpResponse response{
                 200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
                 devicePage(styleNonce.value(), "Connect a device", content)};
@@ -1341,9 +1341,9 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
         }
 
         std::string detail =
-            "<span class=\"kicker\">Genyleap sign-in</span>"
+            "<span class=\"kicker\">Device authorization</span>"
             "<h1>Approve " + htmlEscape(registered->displayName()) + "</h1>"
-            "<p class=\"lead\">This device is asking OpenProof to use your Genyleap identity. "
+            "<p class=\"lead\">This application is requesting access to your OpenProof identity. "
             "Your password and browser session are never copied into the app.</p>"
             "<div class=\"detail-grid\"><div class=\"detail\"><span>Application</span><strong>"
             + htmlEscape(registered->displayName())
@@ -1354,12 +1354,12 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
         }
         detail += "</div><div class=\"section-label\">Permissions requested</div><div class=\"scopes\">"
             + scopeBadges
-            + "</div><p class=\"hint\">For Genycaster, OpenProof proves which Genyleap identity you own. "
-              "Farcaster is a separate linked connection; Genycaster checks that connection before enabling your Farcaster account.</p>"
+            + "</div><p class=\"hint\">Approve only if you recognize the application and the requested permissions. "
+              "Any additional account-linking requirements belong to the requesting application.</p>"
               "<form method=\"post\" class=\"actions\"><input type=\"hidden\" name=\"user_code\" value=\""
             + htmlEscape(*userCode) + "\"><input type=\"hidden\" name=\"csrf\" value=\""
             + htmlEscape(csrf.value())
-            + "\"><button class=\"primary\" name=\"decision\" value=\"approve\" type=\"submit\">Approve Genycaster</button>"
+            + "\"><button class=\"primary\" name=\"decision\" value=\"approve\" type=\"submit\">Approve application</button>"
               "<button class=\"secondary\" name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form>";
 
         gateway::HttpResponse response{
@@ -1417,13 +1417,13 @@ gateway::HttpResponse OAuthHttpApi::deviceVerification(gateway::HttpRequest requ
     const bool approved = decision.value() == "approve";
     const std::string content = approved
         ? "<div class=\"status-icon\">&#10003;</div><span class=\"kicker\">Approved</span>"
-          "<h1>Device approved</h1><p class=\"lead\">Genycaster can now finish sign-in securely. "
+          "<h1>Device approved</h1><p class=\"lead\">The requesting application can now complete authorization. "
           "You may close this tab and return to the app.</p>"
-          "<p class=\"hint\">If your Genyleap identity does not yet have a Farcaster connection, "
-          "Genycaster will ask you to link one as the next step.</p>"
+          "<p class=\"hint\">If the application requires another linked identity, "
+          "it will explain the linking steps separately.</p>"
         : "<div class=\"status-icon denied\">×</div><span class=\"kicker\">Not approved</span>"
           "<h1>Device denied</h1><p class=\"lead\">No access was granted to this device. "
-          "You can close this tab and return to Genycaster.</p>";
+          "You can close this tab and return to the requesting application.</p>";
 
     gateway::HttpResponse response{
         200, gateway::Headers{{"content-type", "text/html; charset=utf-8"}},

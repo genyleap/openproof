@@ -432,7 +432,7 @@ input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;backg
 button,.button{appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.button.secondary{background:#171a23;border:1px solid rgba(255,255,255,.11)}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
 .notice{display:none;margin:18px 0 0;padding:13px 15px;border-radius:14px;font-size:13px;line-height:1.55}.notice.show{display:block}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.notice.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#bbf7d0}.panel{display:none}.panel.show{display:block}.foot{color:#747b8f;font-size:12px;line-height:1.55;margin:16px 0 0}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
 @media(max-width:560px){body{padding:16px}.card{border-radius:23px}.actions>*{width:100%}}
-</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">O</span><span>OpenProof<small>Identity security</small></span></div>
 <section class="card"><span class="kicker">Account recovery</span><h1>Reset your OpenProof password</h1>
 <p class="lead">OpenProof never reveals your existing password. Recovery verifies control of your email, then lets you choose a new password.</p>
 <div id="requestPanel" class="panel"><h2>Send a reset link</h2><p class="muted">Enter the email address used by your OpenProof account.</p>
@@ -564,7 +564,7 @@ button,.button{appearance:none;border:0;border-radius:12px;background:linear-gra
 .code{font-size:22px;letter-spacing:.18em;text-align:center;font-variant-numeric:tabular-nums}.foot{color:#747b8f;font-size:11px;line-height:1.5;margin:12px 0 0}.codes{white-space:pre-wrap;font:650 13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e7e8f2}.spaced{margin-top:10px}.center{text-align:center}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}
 @media(max-width:720px){.setup-grid{grid-template-columns:1fr}.shell{width:min(100%,620px)}}
 @media(max-width:560px){body{padding:12px}.brand{margin:6px 2px 14px}.card{border-radius:20px;padding:20px}.status{padding:13px 14px;border-radius:15px}.actions>*{width:100%}.key{align-items:stretch;flex-direction:column}.key button{width:100%}.setup{padding:12px}.setup-step{padding:13px}.code{font-size:20px}}
-</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">G</span><span>Genyleap<small>Secured by OpenProof</small></span></div>
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">O</span><span>OpenProof<small>Identity security</small></span></div>
 <section class="card"><span class="kicker">Account security</span><h1>Protect your OpenProof account</h1>
 <p class="lead">Set up an authenticator for IAL2 access. The setup key stays in this browser and is shown only for the active enrollment.</p>
 <div class="status"><span class="dot )HTML";
@@ -614,7 +614,7 @@ button,.button{appearance:none;border:0;border-radius:12px;background:linear-gra
 <h2>Password protection upgrade available</h2>
 <p class="muted">Your existing password still works. Confirm it once to protect its stored hash with Argon2id; you do not need to change your password.</p>
 <button type="button" id="upgradeOpen">Confirm current password</button></div>
-</section><p class="foot center">OpenProof keeps application sessions separate from your Genyleap credentials.</p></main>
+</section><p class="foot center">OpenProof keeps application sessions separate from your identity-provider session.</p></main>
 <div id="upgradeOverlay" class="upgrade-overlay" hidden>
 <section class="upgrade-dialog" role="dialog" aria-modal="true" aria-labelledby="upgradeTitle" aria-describedby="upgradeDescription">
 <h2 id="upgradeTitle">Upgrade password protection</h2>
@@ -696,7 +696,7 @@ if(startForm)startForm.addEventListener('submit',async event=>{
     enrollmentId=enrollment.enrollment_id;
     const secret=String(enrollment.secret_base32||'');
     document.querySelector('#secret').textContent=secret;
-    document.querySelector('#openAuthenticator').href='otpauth://totp/Genyleap%20OpenProof?secret='+encodeURIComponent(secret)+'&issuer=OpenProof&algorithm=SHA1&digits=6&period=30';
+    document.querySelector('#openAuthenticator').href='otpauth://totp/OpenProof?secret='+encodeURIComponent(secret)+'&issuer=OpenProof&algorithm=SHA1&digits=6&period=30';
     document.querySelector('#setup').classList.add('show');
     startForm.reset();
     show('Setup key created. Add it to your authenticator, then enter the 6-digit code.','ok');
