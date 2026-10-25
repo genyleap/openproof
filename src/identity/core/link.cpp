@@ -18,12 +18,14 @@ ExternalIdentityRef::ExternalIdentityRef(provider::ProviderId providerId,
                                          provider::ExternalSubject subject,
                                          std::optional<std::string> displayName,
                                          std::optional<std::string> preferredUsername,
-                                         std::optional<std::string> pictureUrl)
+                                         std::optional<std::string> pictureUrl,
+                                         std::optional<std::string> profileUrl)
     : m_providerId(std::move(providerId))
     , m_subject(std::move(subject))
     , m_displayName(std::move(displayName))
     , m_preferredUsername(std::move(preferredUsername))
     , m_pictureUrl(std::move(pictureUrl))
+    , m_profileUrl(std::move(profileUrl))
 {
 }
 
@@ -50,6 +52,11 @@ const std::optional<std::string>& ExternalIdentityRef::preferredUsername() const
 const std::optional<std::string>& ExternalIdentityRef::pictureUrl() const noexcept
 {
     return m_pictureUrl;
+}
+
+const std::optional<std::string>& ExternalIdentityRef::profileUrl() const noexcept
+{
+    return m_profileUrl;
 }
 
 bool operator==(const ExternalIdentityRef& left, const ExternalIdentityRef& right) noexcept
@@ -406,7 +413,8 @@ InMemoryExternalIdentityDirectory::updatePresentation(const ExternalIdentityRef&
             external.preferredUsername().has_value() ? external.preferredUsername() : previous.preferredUsername(),
             external.providerId().value() == "telegram"
                 ? external.pictureUrl()
-                : (external.pictureUrl().has_value() ? external.pictureUrl() : previous.pictureUrl())});
+                : (external.pictureUrl().has_value() ? external.pictureUrl() : previous.pictureUrl()),
+            external.profileUrl().has_value() ? external.profileUrl() : previous.profileUrl()});
     }
     return foundation::ok();
 }

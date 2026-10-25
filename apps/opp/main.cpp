@@ -1702,9 +1702,14 @@ addProtectedRoutes(gateway::Router& router,
     }
     {
         const auto linkedinIssuer = environment.get("OPENPROOF_LINKEDIN_ISSUER");
+        // The optional Verified on LinkedIn product has its own consent scope.
+        // Never add it by default: apps with only OIDC would lose sign-in access.
+        std::vector<std::string> linkedinScopes{"openid", "profile", "email"};
+        if (environment.get("OPENPROOF_LINKEDIN_PROFILE_DETAILS_ENABLED").value_or("") == "true")
+            linkedinScopes.emplace_back("r_profile_basicinfo");
         auto status = registerOidcProvider(
             "linkedin", linkedinIssuer.value_or("https://www.linkedin.com/oauth"),
-            {"openid", "profile", "email"}, "openproof/federation/linkedin/v1",
+            std::move(linkedinScopes), "openproof/federation/linkedin/v1",
             externalOidc::OidcClientAuthenticationMethod::ClientSecretPost,
             externalOidc::OidcAuthorizationResponseMode::Query,
             externalOidc::OidcPkceMode::Disabled,

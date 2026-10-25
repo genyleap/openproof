@@ -73,6 +73,8 @@ std::string_view claimNameKey(ClaimName name) noexcept
         return "locale";
     case ClaimName::PictureUrl:
         return "picture_url";
+    case ClaimName::ProfileUrl:
+        return "profile_url";
     }
     return "unknown";
 }

@@ -126,7 +126,10 @@ parseAssurance(std::string_view value) noexcept
         outcome.provider(), outcome.subject(),
         presentationClaim(outcome.claims(), provider::ClaimName::DisplayName, 256U),
         presentationClaim(outcome.claims(), provider::ClaimName::PreferredUsername, 128U),
-        presentationClaim(outcome.claims(), provider::ClaimName::PictureUrl, 2048U)};
+        presentationClaim(outcome.claims(), provider::ClaimName::PictureUrl, 2048U),
+        outcome.provider().value() == "linkedin"
+            ? presentationClaim(outcome.claims(), provider::ClaimName::ProfileUrl, 2048U)
+            : std::nullopt};
 }
 
 }

@@ -91,6 +91,7 @@ enum class ClaimName {
     PreferredUsername,
     Locale,
     PictureUrl,
+    ProfileUrl,  ///< Provider-returned public URL, never inferred from a name or subject.
 };
 
 /** @brief Returns the stable wire key of @p name, for example "email_verified". */

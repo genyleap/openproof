@@ -192,7 +192,7 @@ struct HttpResult final {
 [[nodiscard]] foundation::Result<HttpResult> httpsRequest(
     const HttpsUrl& endpoint, http::verb method, std::string body,
     std::string_view contentType, std::string_view caFile,
-    std::string_view authorization = {})
+    std::string_view authorization = {}, std::string_view linkedinVersion = {})
 {
     try {
         asio::io_context io;
@@ -219,6 +219,7 @@ struct HttpResult final {
         request.set(http::field::user_agent, "OpenProof/1");
         request.set(http::field::accept, "application/json");
         request.set(http::field::cache_control, "no-store");
+        if (!linkedinVersion.empty()) request.set("LinkedIn-Version", linkedinVersion);
         if (!authorization.empty()) {
             request.set(http::field::authorization, authorization);
         }
@@ -931,6 +932,31 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
     applyStandardProfileClaims(payload.value(), claims);
     if (userInfo) {
         applyStandardProfileClaims(*userInfo, claims);
+    }
+    // The standard OIDC /userinfo response does not contain LinkedIn's public
+    // member URL. The separate Verified on LinkedIn product requires explicit
+    // consent for r_profile_basicinfo. A failed optional lookup never blocks
+    // authentication or changes the provider-bound OIDC subject.
+    const auto& scopes = m_implementation->config.scopes();
+    if (m_implementation->config.providerId().value() == "linkedin"
+        && std::ranges::find(scopes, "r_profile_basicinfo") != scopes.end()) {
+        std::string authorizationHeader{"Bearer "};
+        authorizationHeader.append(*accessToken);
+        const HttpsUrl detailsEndpoint{"api.linkedin.com", "443", "/rest/identityMe"};
+        const auto detailsResponse = httpsRequest(detailsEndpoint, http::verb::get, {}, {},
+            m_implementation->caFile, authorizationHeader, "202510.03");
+        std::ranges::fill(authorizationHeader, char{});
+        if (detailsResponse && detailsResponse->status == 200U) {
+            const auto details = parseJsonObject(detailsResponse->body);
+            if (details && stringValue(details.value(), "id")) {
+                const auto* basicInfo = details->if_contains("basicInfo");
+                if (basicInfo && basicInfo->is_object()) {
+                    const auto profileUrl = stringValue(basicInfo->as_object(), "profileUrl");
+                    if (profileUrl && detail::validLinkedInProfileUrl(*profileUrl))
+                        claims.set(idp::ClaimName::ProfileUrl, *profileUrl);
+                }
+            }
+        }
     }
     if (m_implementation->config.providerId().value() == "telegram") {
         applyTelegramProfileAliases(payload.value(), claims);

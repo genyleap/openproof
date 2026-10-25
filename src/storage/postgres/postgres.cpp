@@ -1588,17 +1588,19 @@ foundation::Status PostgresExternalIdentityDirectory::attach(
     };
     ResultPointer result = execParams(lease->get(),
         "INSERT INTO openproof.external_identities("
-        "provider,external_subject,identity_id,linked_at_ms,display_name,preferred_username,picture_url) "
-        "VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,'')) "
+        "provider,external_subject,identity_id,linked_at_ms,display_name,preferred_username,picture_url,profile_url) "
+        "VALUES($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,'')) "
         "ON CONFLICT(provider,external_subject) DO UPDATE SET "
         "identity_id=EXCLUDED.identity_id,display_name=COALESCE(EXCLUDED.display_name,openproof.external_identities.display_name),"
         "preferred_username=COALESCE(EXCLUDED.preferred_username,openproof.external_identities.preferred_username),"
-        "picture_url=COALESCE(EXCLUDED.picture_url,openproof.external_identities.picture_url) "
+        "picture_url=COALESCE(EXCLUDED.picture_url,openproof.external_identities.picture_url),"
+        "profile_url=COALESCE(EXCLUDED.profile_url,openproof.external_identities.profile_url) "
         "WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id",
         {std::string{link.external().providerId().value()},
          std::string{link.external().subject().value()}, std::string{link.owner().value()},
          instant(link.requestedAt()), optionalText(link.external().displayName()),
-         optionalText(link.external().preferredUsername()), optionalText(link.external().pictureUrl())});
+         optionalText(link.external().preferredUsername()), optionalText(link.external().pictureUrl()),
+         optionalText(link.external().profileUrl())});
     if (!commandOk(result.get())) return foundation::fail(databaseError(result.get(), "attach external identity"));
     return std::string_view{PQcmdTuples(result.get())} == "1" ? foundation::ok()
         : foundation::fail(foundation::ErrorCode::Conflict,
@@ -1757,11 +1759,12 @@ PostgresExternalIdentityDirectory::updatePresentation(
         "display_name=COALESCE(NULLIF($3,''),display_name),"
         "preferred_username=COALESCE(NULLIF($4,''),preferred_username),"
         "picture_url=CASE WHEN $1='telegram' THEN NULLIF($5,'') "
-        "ELSE COALESCE(NULLIF($5,''),picture_url) END "
+        "ELSE COALESCE(NULLIF($5,''),picture_url) END,"
+        "profile_url=COALESCE(NULLIF($6,''),profile_url) "
         "WHERE provider=$1 AND external_subject=$2 RETURNING identity_id",
         {std::string{external.providerId().value()}, std::string{external.subject().value()},
          optionalText(external.displayName()), optionalText(external.preferredUsername()),
-         optionalText(external.pictureUrl())});
+         optionalText(external.pictureUrl()), optionalText(external.profileUrl())});
     if (!tuplesOk(result.get())) {
         return foundation::fail(databaseError(result.get(), "update external identity presentation"));
     }
@@ -1777,7 +1780,7 @@ PostgresExternalIdentityDirectory::externalIdentitiesOf(
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     ResultPointer result = execParams(lease->get(),
-        "SELECT provider,external_subject,display_name,preferred_username,picture_url "
+        "SELECT provider,external_subject,display_name,preferred_username,picture_url,profile_url "
         "FROM openproof.external_identities "
         "WHERE identity_id=$1 ORDER BY provider,external_subject", {std::string{owner.value()}});
     if (!tuplesOk(result.get())) return foundation::fail(databaseError(result.get(), "list external identities"));
@@ -1790,7 +1793,7 @@ PostgresExternalIdentityDirectory::externalIdentitiesOf(
     for (int row = 0; row < PQntuples(result.get()); ++row) {
         output.emplace_back(identity::provider::ProviderId{field(result.get(), row, 0)},
                             identity::provider::ExternalSubject{field(result.get(), row, 1)},
-                            nullable(row, 2), nullable(row, 3), nullable(row, 4));
+                            nullable(row, 2), nullable(row, 3), nullable(row, 4), nullable(row, 5));
     }
     return output;
 }

@@ -146,6 +146,20 @@ TEST(OidcProfileClaimTest, RejectsKnownCredentialedPictureEndpoints)
         "https://lh3.googleusercontent.com/a/example"));
 }
 
+TEST(OidcProfileClaimTest, AcceptsOnlyProviderBackedLinkedInMemberUrls)
+{
+    using openproof::provider::oidc::detail::validLinkedInProfileUrl;
+    EXPECT_TRUE(validLinkedInProfileUrl("https://www.linkedin.com/in/kambizasadzadeh"));
+    EXPECT_TRUE(validLinkedInProfileUrl(
+        "https://www.linkedin.com/profile-thirdparty-redirect/signed-link"));
+    EXPECT_FALSE(validLinkedInProfileUrl("https://www.linkedin.com/search/results/people/"));
+    EXPECT_FALSE(validLinkedInProfileUrl("https://www.linkedin.com/in/name?tracking=1"));
+    EXPECT_FALSE(validLinkedInProfileUrl("https://www.linkedin.com.evil.test/in/name"));
+    EXPECT_FALSE(validLinkedInProfileUrl("https://www.linkedin.com/in/a"));
+    EXPECT_FALSE(validLinkedInProfileUrl("https://www.linkedin.com/in/a%2Fb"));
+    EXPECT_FALSE(validLinkedInProfileUrl("http://www.linkedin.com/in/name"));
+}
+
 TEST(OidcUserInfoValidationTest, ValidatesBearerCredentialsAndTokenType)
 {
     using openproof::provider::oidc::detail::bearerTokenType;

@@ -118,6 +118,38 @@ inline constexpr std::size_t kPictureUrlMaximum = 2048U;
     return true;
 }
 
+/** Provider-backed member URL, not derived from OAuth sub or display name. */
+[[nodiscard]] inline bool validLinkedInProfileUrl(std::string_view value) noexcept
+{
+    constexpr std::string_view base{"https://www.linkedin.com/"};
+    if (!value.starts_with(base) || value.size() > 2048U
+        || value.contains('?') || value.contains('#') || value.contains('\\')
+        || std::ranges::any_of(value, [](const char ch) {
+               const auto c = static_cast<unsigned char>(ch);
+               return c <= 0x20U || c == 0x7FU;
+           })) return false;
+    value.remove_prefix(base.size());
+    constexpr std::string_view vanity{"in/"};
+    constexpr std::string_view redirect{"profile-thirdparty-redirect/"};
+    if (value.starts_with(vanity)) {
+        value.remove_prefix(vanity.size());
+        if (value.ends_with('/')) value.remove_suffix(1U);
+        return value.size() >= 3U && value.size() <= 100U
+            && std::ranges::all_of(value, [](const char c) {
+                   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                       || (c >= '0' && c <= '9') || c == '-' || c == '_';
+               });
+    }
+    if (!value.starts_with(redirect)) return false;
+    value.remove_prefix(redirect.size());
+    return !value.empty() && value.size() <= 1024U
+        && std::ranges::all_of(value, [](const char c) {
+               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                   || (c >= '0' && c <= '9') || c == '-' || c == '_'
+                   || c == '.' || c == '%';
+           });
+}
+
 [[nodiscard]] inline bool validPresentationPictureUrl(
     std::string_view value) noexcept
 {

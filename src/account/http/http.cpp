@@ -974,6 +974,8 @@ gateway::HttpResponse AccountHttpApi::connections(gateway::HttpRequest request)
         if (external.displayName()) item["display_name"] = *external.displayName();
         if (external.preferredUsername()) item["preferred_username"] = *external.preferredUsername();
         if (external.pictureUrl()) item["picture_url"] = *external.pictureUrl();
+        if (external.providerId().value() == "linkedin" && external.profileUrl())
+            item["profile_url"] = *external.profileUrl();
         if (external.providerId().value() == "farcaster") {
             const std::string fid{external.subject().value()};
             const bool numeric = !fid.empty()

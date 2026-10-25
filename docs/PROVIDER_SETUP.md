@@ -129,8 +129,22 @@ OPENPROOF_LINKEDIN_CLIENT_SECRET=...
 OPENPROOF_LINKEDIN_ISSUER=https://www.linkedin.com/oauth
 ```
 
-Use the OIDC product/scopes, not legacy profile APIs. The client must be treated
-as confidential and the configured redirect must match byte-for-byte.
+Use the OIDC product/scopes for sign-in. This alone returns an app-scoped member
+`sub`, not the public `/in/` slug. To obtain the provider-asserted public URL,
+add **Verified on LinkedIn** to the SAME LinkedIn developer app (Development tier
+works only for app administrators; Lite/Plus is required for production users).
+After the product is approved, set `OPENPROOF_LINKEDIN_PROFILE_DETAILS_ENABLED=true`.
+OpenProof then additionally requests `r_profile_basicinfo` with member consent
+and calls `GET https://api.linkedin.com/rest/identityMe` using the OAuth member
+access token. It validates and persists `basicInfo.profileUrl` in the
+`openproof.external_identities.profile_url` column (migration 0023) and exposes
+it as `profile_url` on `/account/connections`. Existing links require a new
+LinkedIn consent flow; old OIDC `sub` values cannot be converted to vanity URLs.
+
+**Leave this flag disabled until the Verified on LinkedIn product is approved.**
+Otherwise LinkedIn may reject the extra scope; login must remain unaffected when
+the separate profile-details API fails. The client must be treated as confidential
+and the configured redirect must match byte-for-byte.
 
 ## Telegram
 

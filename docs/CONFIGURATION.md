@@ -610,7 +610,13 @@ and JWKS HTTPS requests.
   optional `OPENPROOF_LINKEDIN_ISSUER` (default
   `https://www.linkedin.com/oauth`). Enable the **Sign in with LinkedIn using
   OpenID Connect** product for the application; OpenProof requests only
-  `openid profile email`.
+  `openid profile email`. To return a LinkedIn-authenticated public URL, first
+  obtain the **Verified on LinkedIn** product for the same app, apply migration
+  `0023_linkedin_profile_urls.sql`, then enable
+  `OPENPROOF_LINKEDIN_PROFILE_DETAILS_ENABLED=true`. This adds
+  `r_profile_basicinfo`, fetches `identityMe.basicInfo.profileUrl` on renewed
+  member consent and stores it as `profile_url`. Default is off to preserve
+  login for standard OIDC-only apps.
 - Telegram: `OPENPROOF_TELEGRAM_CLIENT_ID`,
   `OPENPROOF_TELEGRAM_CLIENT_SECRET`; optional `OPENPROOF_TELEGRAM_ISSUER`
   (default `https://oauth.telegram.org`). Obtain both values and register the

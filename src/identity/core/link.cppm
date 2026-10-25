@@ -30,13 +30,15 @@ public:
     ExternalIdentityRef(provider::ProviderId providerId, provider::ExternalSubject subject,
                         std::optional<std::string> displayName = std::nullopt,
                         std::optional<std::string> preferredUsername = std::nullopt,
-                        std::optional<std::string> pictureUrl = std::nullopt);
+                        std::optional<std::string> pictureUrl = std::nullopt,
+                        std::optional<std::string> profileUrl = std::nullopt);
 
     [[nodiscard]] const provider::ProviderId& providerId() const noexcept;
     [[nodiscard]] const provider::ExternalSubject& subject() const noexcept;
     [[nodiscard]] const std::optional<std::string>& displayName() const noexcept;
     [[nodiscard]] const std::optional<std::string>& preferredUsername() const noexcept;
     [[nodiscard]] const std::optional<std::string>& pictureUrl() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& profileUrl() const noexcept;
 
     friend bool operator==(const ExternalIdentityRef& left,
                            const ExternalIdentityRef& right) noexcept;
@@ -49,6 +51,7 @@ private:
     std::optional<std::string> m_displayName;
     std::optional<std::string> m_preferredUsername;
     std::optional<std::string> m_pictureUrl;
+    std::optional<std::string> m_profileUrl;
 };
 
 /**
