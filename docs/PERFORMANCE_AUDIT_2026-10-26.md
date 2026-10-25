@@ -1,0 +1,54 @@
+# OpenProof performance audit — 2026-10-26
+
+Status: **IN PROGRESS; not production-approved**. Scope: the public `genyleap/openproof` `main` revision `ccb396182936d717960fdca319999baf2f580ff9`. Production service was not modified.
+
+## Source audit
+
+The reproducible `node scripts/perf-source-audit.mjs` inventory scanned 216 C++ source/module files (52,875 lines) under `src/`. These counts refer to syntactic call sites, not execution frequency or a profiling result.
+
+- C++ coroutine keywords: 0.
+- Blocking SQL call sites: 3 (`PQexec` and `PQexecParams`; the helper functions are invoked from many repository operations).
+- Blocking `condition_variable::wait_for` in connection acquisition: 1.
+- Synchronous HTTP read/write call sites: 10; synchronous resolver call sites: 5.
+- Async HTTP `async_read`, `async_write`, and `async_accept`: 3.
+
+Critical path: `gateway/http.cpp` receives requests asynchronously but invokes `HttpHandler::handle` synchronously on an `io_context` worker. The handler may transitively execute synchronous libpq calls, synchronous provider HTTP requests, and synchronous upstream proxy operations. Thus unrelated clients can lose event-loop service during slow I/O.
+
+The pool in `storage/postgres/postgres.cpp` creates blocking libpq connections, acquires them with a timed condition-variable wait, and executes queries synchronously. Provider integrations under `providers/github`, `providers/oidc`, `providers/x`, `providers/web3`, plus `gateway/http.cpp` proxy, use synchronous resolve/connect/HTTP calls.
+
+## Implemented, isolated HTTP compatibility optimization
+
+On branch `perf/openproof-full-optimization-20261026`:
+- Move synchronous `HttpHandler::handle` from socket `io_context` to a finite `boost::asio::thread_pool`; preserve async HTTP read/write and original security-validated request parsing.
+- Limit outstanding dispatches; reject overload with a bounded HTTP 503 and Retry-After rather than allowing an arbitrarily long handler backlog.
+- Catch exceptions at the handler boundary and produce a sanitized HTTP 500 rather than terminating an event-loop worker.
+- Add integration tests for concurrent handler execution and safe exception behavior.
+
+This is **not** a coroutine conversion; it is a compatibility optimization whose value must be verified in product-shaped load tests.
+
+## Synthetic performance data (not OpenProof throughput)
+
+Reproducible local simulation: Boost.Asio/Beast HTTP; one pinned CPU; two socket workers; eight mock I/O slots; 32 clients; 1 ms synthetic CPU/request; mock blocking/waiting I/O.
+
+| Mock I/O wait | Blocking req/s | Bounded handler executor req/s | Coroutine req/s | Offload speedup |
+|---:|---:|---:|---:|---:|
+| 0 ms | 990.0 | 1001.2 | 984.6 | 1.01x |
+| 2 ms | 565.4 | 773.7 | 968.0 | 1.37x |
+| 20 ms | 93.9 | 281.9 | 363.3 | 3.00x |
+| 50 ms | 38.7 | 149.9 | 150.9 | 3.87x |
+
+20 ms mock I/O p95: 343.62 ms blocking, 118.91 ms bounded executor, 89.63 ms coroutine. Single-run synthetic measurements; not statistical confidence intervals. These show scheduler-level potential, not a product performance commitment.
+
+## Required verification and remaining work
+
+1. Finish clean GCC 16.2 / C++26 build and run CTest, sanitizer profile and concurrency regressions on the isolated worktree.
+2. Capture a baseline **of the same OpenProof commit** with an isolated PostgreSQL disposable `e2e` database and TLS edge, then optimized performance for matched OAuth token, UserInfo, introspection, consent, passkey, and reverse-proxy workloads. Report p50/p95/p99, RPS, CPU, RSS, errors, pool wait time and DB connections; repeat to control noise.
+3. Implement genuine non-blocking provider networking using Boost.Asio coroutines, persistent/reusable TLS sessions where safe, cancellation and propagated request deadlines, bounded provider concurrency and circuit/failure isolation.
+4. Implement genuinely asynchronous libpq read/write readiness and transaction-safe connection ownership. Preserve serializable administration, single-use tokens, refresh replay protection, optimistic locks and fail-closed security invariants; prohibit suspension while holding mutable sync locks.
+5. Profile CPU-limited Argon2id, WebAuthn, JWT signing and claim/policy handling; cap expensive operations separately instead of assuming coroutines optimize CPU work.
+6. Instrument per-endpoint handler queue duration, active handlers, DB wait duration, upstream DNS/connect/TLS/response duration, lock contention and error/timeout rates with **bounded cardinality** and no secrets.
+7. Compare optimized vs baseline on independent hardware as production has one vCPU and limited free disk; require no critical security/latency regressions before rollout.
+
+### Release gate
+
+Not deployable until matched E2E tests and benchmarks pass. No claim of complete end-to-end optimization is made by the bounded HTTP executor patch alone.

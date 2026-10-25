@@ -1,5 +1,6 @@
 module;
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,7 @@ module;
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
@@ -165,7 +167,8 @@ bool ServerConfig::trustProxyClientIp() const noexcept { return m_trustProxyClie
 class BeastHttpServer::Implementation final {
 public:
     Implementation(HttpHandler& handler, ServerConfig config)
-        : m_handler(&handler), m_config(std::move(config)), m_acceptor(m_context)
+        : m_handler(&handler), m_config(std::move(config)), m_acceptor(m_context),
+          m_handlerPool(std::clamp<std::size_t>(m_config.workerThreads() * 4U, 4U, 16U))
     {
     }
 
@@ -261,9 +264,66 @@ public:
                                     incoming.version()));
                 return;
             }
-            HttpResponse response = m_owner->m_handler->handle(std::move(request).value());
-            write(wireResponse(std::move(response), incoming.version(),
-                               incoming.method() == beastHttp::verb::head));
+            // Guard the executor queue: a slow provider/database must not turn
+            // the maximum HTTP connection count into an unbounded work backlog.
+            const std::size_t pendingLimit = std::clamp<std::size_t>(
+                m_owner->m_config.workerThreads() * 32U, 64U, 256U);
+            const std::size_t outstanding = m_owner->m_pendingHandlers.fetch_add(
+                1U, std::memory_order_acq_rel);
+            if (outstanding >= pendingLimit) {
+                m_owner->m_pendingHandlers.fetch_sub(1U, std::memory_order_acq_rel);
+                beastHttp::response<beastHttp::string_body> overload{
+                    beastHttp::status::service_unavailable, incoming.version()};
+                overload.set(beastHttp::field::content_type, "application/json");
+                overload.set(beastHttp::field::cache_control, "no-store");
+                overload.set(beastHttp::field::retry_after, "1");
+                overload.set("x-content-type-options", "nosniff");
+                if (incoming.method() != beastHttp::verb::head) {
+                    overload.body() = "{\"error\":{\"code\":\"UNAVAILABLE\","
+                                      "\"message\":\"The server is busy.\"}}";
+                }
+                overload.keep_alive(false);
+                overload.prepare_payload();
+                write(std::move(overload));
+                return;
+            }
+            // Keep blocking repository/provider/crypto work off the socket event loop.
+            // This is a bounded compatibility executor, not a claim that those
+            // operations have become coroutine-based or non-blocking.
+            const unsigned int version = incoming.version();
+            const bool headRequest = incoming.method() == beastHttp::verb::head;
+            asio::post(m_owner->m_handlerPool,
+                [self = shared_from_this(), operation = std::move(request).value(),
+                 version, headRequest]() mutable {
+                    beastHttp::response<beastHttp::string_body> wire;
+                    try {
+                        auto response = self->m_owner->m_handler->handle(
+                            std::move(operation));
+                        wire = wireResponse(std::move(response), version, headRequest);
+                    } catch (...) {
+                        // A faulty provider must not terminate an I/O worker.
+                        beastHttp::response<beastHttp::string_body> failure{
+                            beastHttp::status::internal_server_error, version};
+                        failure.set(beastHttp::field::content_type, "application/json");
+                        failure.set(beastHttp::field::cache_control, "no-store");
+                        failure.set("x-content-type-options", "nosniff");
+                        if (!headRequest) {
+                            failure.body() = "{\"error\":{\"code\":\"INTERNAL\","
+                                             "\"message\":\"The request failed.\"}}";
+                        }
+                        failure.keep_alive(false);
+                        failure.prepare_payload();
+                        wire = std::move(failure);
+                    }
+                    self->m_owner->m_pendingHandlers.fetch_sub(
+                        1U, std::memory_order_acq_rel);
+                    asio::post(self->m_owner->m_context,
+                        [self, result = std::move(wire)]() mutable {
+                            if (self->m_owner->m_running.load(std::memory_order_acquire)) {
+                                self->write(std::move(result));
+                            }
+                        });
+                });
         }
 
         void write(beastHttp::response<beastHttp::string_body> response)
@@ -327,6 +387,10 @@ public:
         m_acceptor.close(ignored);
         m_context.stop();
         m_workers.clear();
+        // Discard queued work instead of keeping shutdown behind a long queue.
+        // Running handlers can finish before the handler object is destroyed.
+        m_handlerPool.stop();
+        m_handlerPool.join();
         m_boundPort.store(0U, std::memory_order_relaxed);
     }
 
@@ -368,8 +432,10 @@ private:
     std::atomic<bool> m_started{false};
     std::atomic<std::uint16_t> m_boundPort{0U};
     std::atomic<std::size_t> m_connections{0U};
+    std::atomic<std::size_t> m_pendingHandlers{0U};
     asio::io_context m_context;
     Tcp::acceptor m_acceptor;
+    asio::thread_pool m_handlerPool;
     std::vector<std::jthread> m_workers;
 };
 
