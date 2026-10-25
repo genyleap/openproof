@@ -39,6 +39,8 @@ Reproducible local simulation: Boost.Asio/Beast HTTP; one pinned CPU; two socket
 
 20 ms mock I/O p95: 343.62 ms blocking, 118.91 ms bounded executor, 89.63 ms coroutine. Single-run synthetic measurements; not statistical confidence intervals. These show scheduler-level potential, not a product performance commitment.
 
+Repeated 20 ms test (five samples per mode): mean **93.78 / 281.10 / 351.10 req/s** (blocking / executor / coroutine), sample standard deviation **0.20 / 7.26 / 8.35 req/s**, and mean p95 **345.35 / 121.07 / 103.37 ms**. Thus bounded offload averaged **3.00x**, and true nonblocking coroutines averaged **3.74x**, versus the isolated blocking model. Zero request errors in all fifteen samples. Repeated samples are still synthetic, short-run measurements.
+
 ## Required verification and remaining work
 
 1. Finish clean GCC 16.2 / C++26 build and run CTest, sanitizer profile and concurrency regressions on the isolated worktree.
@@ -52,3 +54,7 @@ Reproducible local simulation: Boost.Asio/Beast HTTP; one pinned CPU; two socket
 ### Release gate
 
 Not deployable until matched E2E tests and benchmarks pass. No claim of complete end-to-end optimization is made by the bounded HTTP executor patch alone.
+
+### Build attempt and host contention
+
+A separate GCC 16.2 release build configured successfully, but was intentionally stopped at **274/624** Ninja steps (SIGTERM, not a compiler failure). The production host has one vCPU; at that time a separate GenyCaster WASM build was simultaneously active, disk usage was **92%**, and memory available was about **2.1 GiB**. Continuing two competing C++26 builds on that host would risk shared-service responsiveness. **No clean build or CTest pass has yet been established** for this branch. The independent `openproof-canonical.service` remained active.
