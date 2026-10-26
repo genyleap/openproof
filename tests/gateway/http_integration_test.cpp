@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -225,6 +226,15 @@ TEST(BeastHttpIntegrationTest, TrustedLoopbackProxySuppliesOneValidatedClientIp)
         std::chrono::seconds{2}, 64U, 2U, true).has_value());
 }
 
+asio::awaitable<void> collectAsyncProxyResponse(
+    httpAdapter::BeastProxyTransport& transport,
+    gw::Endpoint endpoint, gw::HttpRequest request, fnd::Duration timeout,
+    std::optional<fnd::Result<gw::HttpResponse>>& result)
+{
+    result.emplace(co_await transport.sendAsync(
+        std::move(endpoint), std::move(request), timeout));
+}
+
 TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
 {
     ClientIpHandler handler;
@@ -245,15 +255,18 @@ TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
     ASSERT_TRUE(request.has_value());
 
     asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> result;
     auto future = asio::co_spawn(
-        io, transport.value()->sendAsync(
-            std::move(endpoint).value(), std::move(request).value(),
-            std::chrono::seconds{2}), asio::use_future);
+        io, collectAsyncProxyResponse(
+            *transport.value(), std::move(endpoint).value(),
+            std::move(request).value(), std::chrono::seconds{2}, result),
+        asio::use_future);
     io.run();
-    const auto result = future.get();
+    future.get();
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result->status(), 200);
-    EXPECT_EQ(result->body(), "127.0.0.1");
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ(result->value().status(), 200);
+    EXPECT_EQ(result->value().body(), "127.0.0.1");
     upstream.stop();
 }
 
