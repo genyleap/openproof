@@ -270,6 +270,38 @@ TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
     upstream.stop();
 }
 
+TEST(BeastHttpIntegrationTest, NativeCoroutineProxyEnforcesUpstreamDeadline)
+{
+    WaitingHandler handler;
+    httpAdapter::BeastHttpServer upstream{handler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+
+    auto transport = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(transport.has_value());
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"deadline-upstream"}, "127.0.0.1",
+        upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint.has_value());
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/slow-response", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"native-coroutine-timeout"});
+    ASSERT_TRUE(request.has_value());
+
+    asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> result;
+    auto future = asio::co_spawn(
+        io, collectAsyncProxyResponse(
+            *transport.value(), std::move(endpoint).value(),
+            std::move(request).value(), std::chrono::milliseconds{5}, result),
+        asio::use_future);
+    io.run();
+    future.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->has_value());
+    upstream.stop();
+}
+
 TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
 {
     CoreFixture upstreamCore;

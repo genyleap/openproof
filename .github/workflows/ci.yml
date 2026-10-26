@@ -72,6 +72,27 @@ jobs:
       - name: Test
         run: ctest --preset gcc-release --output-on-failure
 
+      - name: Isolated OpenProof PostgreSQL E2E and mixed-read benchmark
+        timeout-minutes: 20
+        env:
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_e2e
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_E2E_LOAD_REQUESTS: "600"
+          OPENPROOF_E2E_LOAD_CONCURRENCY: "24"
+          OPENPROOF_E2E_METRICS_FILE: ${{ github.workspace }}/openproof-e2e-metrics.json
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_e2e
+          node scripts/e2e-identity-platform.mjs
+
+      - name: Preserve non-sensitive E2E benchmark metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-e2e-metrics
+          path: openproof-e2e-metrics.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Build release packages
         run: |
           mkdir -p dist

@@ -16,6 +16,7 @@ import { startLocalDemoPortal } from "./local-demo-portal.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
 const databaseAck = process.env.OPENPROOF_E2E_DATABASE_ACK ?? "";
+const metricsFile = process.env.OPENPROOF_E2E_METRICS_FILE ?? "";
 const mixedLoadRequests = Number.parseInt(
   process.env.OPENPROOF_E2E_LOAD_REQUESTS ?? "600", 10,
 );
@@ -1154,6 +1155,15 @@ async function main() {
       `${loadResult.requestsPerSecond.toFixed(1)} req/s, p50 ${loadResult.p50Ms.toFixed(1)} ms, `+
       `p95 ${loadResult.p95Ms.toFixed(1)} ms, p99 ${loadResult.p99Ms.toFixed(1)} ms`);
     console.log(`Disposable database retained for inspection: ${databaseName}`);
+    if (metricsFile) {
+      // Only non-sensitive aggregate metrics; no tokens, passwords or addresses.
+      fs.writeFileSync(metricsFile, JSON.stringify({
+        benchmark: "openproof-isolated-e2e-mixed-read",
+        commit: process.env.GITHUB_SHA ?? "local",
+        timestamp: new Date().toISOString(),
+        ...loadResult,
+      }, null, 2) + "\n", { mode: 0o600 });
+    }
     if (holdOpen) {
       if (!connectionFile) fail("OPENPROOF_E2E_CONNECTION_FILE is required while holding the demo open");
       if (realAuthMode) {
