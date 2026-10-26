@@ -57,6 +57,20 @@ for (const [label, key, higherIsBetter] of metrics) {
     " | " + (percent >= 0 ? "+" : "") + percent.toFixed(1) +
     "% favorable |");
 }
+for (const [label, key] of [
+  ["Server CPU ticks (same runner)", "serverCpuTicksDelta"],
+  ["Server RSS at workload end (KiB)", "serverRssKiBEnd"],
+]) {
+  const before = baseline[key], after = candidate[key];
+  if (Number.isFinite(before) && before > 0
+      && Number.isFinite(after) && after > 0) {
+    const favorable = (before / after - 1) * 100;
+    console.log("| " + label + " | " + before.toFixed(2) +
+      " | " + after.toFixed(2) + " | " +
+      (favorable >= 0 ? "+" : "") + favorable.toFixed(1) +
+      "% favorable |");
+  }
+}
 console.log("");
 console.log("NOT APPROVED: this tool compares point estimates, not statistically " +
   "significant results. The same hardware, build flags, warmed-up state, " +

@@ -168,3 +168,19 @@ preprocessor-included `asio_thread_context_extern.hpp` header, while the
 early inclusion ordering remains intact. This is a candidate correction that
 must pass a fresh CI build; no suppressed warning or permissive linker flag
 has been introduced.
+
+## E2E telemetry and secret-safe diagnostics
+
+The identity E2E harness now avoids printing OAuth authorization codes,
+`state` values or unexpected HTTP response bodies in CI failure messages.
+External-tool stderr and application startup logs are suppressed in the
+public CI error path because those sources can contain confidential
+test/database material. Error status and failing stage remain visible.
+
+On Linux runners, the harness also measures the **opp server process**
+(not its Node.js load generator) before and after the mixed-read sample:
+CPU user+system ticks consumed and final RSS in KiB. These aggregate values
+are included only when procfs inspection succeeds. Baseline/candidate
+comparison prints them on the same runner, which has a common CPU tick
+frequency. Single-run estimates remain insufficient to establish a
+statistically significant performance improvement or release readiness.

@@ -47,8 +47,9 @@ function command(program, args, options = {}) {
     ...options,
   });
   if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout || "no command output").trim();
-    fail(`${program} failed: ${detail}`);
+    // Child stderr/stdout may contain database URLs or credentials.
+    // Surface the failed executable and exit status, not raw output.
+    fail(`${program} failed with exit status ${result.status ?? "unknown"}`);
   }
   return result.stdout;
 }
@@ -142,13 +143,17 @@ function jsonBody(response) {
   try {
     return JSON.parse(response.body);
   } catch {
-    fail(`expected JSON from ${response.path}, received ${response.body.slice(0, 200)}`);
+    // Never print response paths (OAuth codes and state can be in query
+    // strings) or raw bodies (which may contain credentials) to CI logs.
+    fail("expected JSON response, received invalid JSON");
   }
 }
 
 function expectStatus(response, ...allowed) {
   if (!allowed.includes(response.status)) {
-    fail(`${response.method} ${response.path} returned ${response.status}: ${response.body.slice(0, 400)}`);
+    // CI logs must never contain OAuth codes, state, cookies, tokens,
+    // or secrets from query parameters and unexpected response bodies.
+    fail(`${response.method} request returned HTTP ${response.status}; expected ${allowed.join(", ")}`);
   }
 }
 
@@ -206,6 +211,25 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
     p95Ms: percentile(0.95),
     p99Ms: percentile(0.99),
   };
+}
+
+// Optional Linux-only process metrics: these measure the *opp server*,
+// not the Node.js load generator. The same runner provides the same tick
+// frequency for a paired baseline. No credentials or request data are saved.
+function readOppUsage(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return null;
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const tail = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/);
+    const userTicks = Number(tail[11]); // procfs fields 14 / 15
+    const systemTicks = Number(tail[12]);
+    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+    const rssKiB = Number(status.match(/^VmRSS:\s*(\d+)\s+kB$/m)?.[1]);
+    if (![userTicks, systemTicks, rssKiB].every(Number.isFinite)) return null;
+    return { cpuTicks: userTicks + systemTicks, rssKiB };
+  } catch {
+    return null;
+  }
 }
 
 async function main() {
@@ -366,6 +390,7 @@ async function main() {
   let oppProcess;
   let oppLog = "";
   let loadResult;
+  let loadResourceMetrics = {};
   let nativeClientId = "";
   const masterKey = base64Url(crypto.randomBytes(48));
   const ownerPassword = `E2E-owner-${base64Url(crypto.randomBytes(24))}`;
@@ -550,7 +575,9 @@ async function main() {
   async function waitUntilReady() {
     let lastError;
     for (let attempt = 0; attempt < 100; ++attempt) {
-      if (oppProcess.exitCode !== null) fail(`opp exited during startup:\n${oppLog.slice(-2000)}`);
+      if (oppProcess.exitCode !== null) {
+        fail(`opp exited during startup (status ${oppProcess.exitCode}); raw service logs withheld`);
+      }
       try {
         const response = await edgeRequest("/health/ready");
         if (response.status === 200) return;
@@ -560,7 +587,7 @@ async function main() {
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    fail(`readiness timed out: ${lastError?.message ?? "unknown error"}\n${oppLog.slice(-2000)}`);
+    fail(`readiness timed out: ${lastError?.message ?? "unknown error"}; raw service logs withheld`);
   }
 
   async function jsonRequest(requestPath, method, value, jar, extraHeaders = {}) {
@@ -994,6 +1021,7 @@ async function main() {
     expectStatus(introspection, 200);
     assert.equal(jsonBody(introspection).active, true);
 
+    const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
       () => edgeRequest("/health/ready"),
       () => edgeRequest("/.well-known/openid-configuration"),
@@ -1010,6 +1038,14 @@ async function main() {
         body: introspectionForm.toString(),
       }),
     ], mixedLoadRequests, mixedLoadConcurrency);
+    const afterLoadUsage = readOppUsage(oppProcess?.pid);
+    if (beforeLoadUsage && afterLoadUsage) {
+      loadResourceMetrics = {
+        serverCpuTicksDelta: Math.max(0,
+          afterLoadUsage.cpuTicks - beforeLoadUsage.cpuTicks),
+        serverRssKiBEnd: afterLoadUsage.rssKiB,
+      };
+    }
 
     const refreshForm = new URLSearchParams({
       grant_type: "refresh_token",
@@ -1184,6 +1220,7 @@ async function main() {
         commit: process.env.OPENPROOF_E2E_COMMIT ?? process.env.GITHUB_SHA ?? "local",
         timestamp: new Date().toISOString(),
         ...loadResult,
+        ...loadResourceMetrics,
       }, null, 2) + "\n", { mode: 0o600 });
     }
     if (holdOpen) {
