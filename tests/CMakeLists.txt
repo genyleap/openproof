@@ -143,3 +143,38 @@ gtest_discover_tests(openproof_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "unit"
 )
+
+# Lightweight validation target for the HTTP concurrency/overload boundary.
+# Does not require compiling the PostgreSQL, OAuth or provider integration suite.
+add_executable(openproof_gateway_http_tests gateway/http_integration_test.cpp)
+target_compile_features(openproof_gateway_http_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_gateway_http_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include"
+    "${googletest_SOURCE_DIR}/googletest")
+target_compile_definitions(openproof_gateway_http_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_gateway_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON
+    CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+    set_source_files_properties(gateway/http_integration_test.cpp PROPERTIES
+        COMPILE_OPTIONS "-Wno-error=array-bounds")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_gateway_http_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+target_link_libraries(openproof_gateway_http_tests PRIVATE
+    openproof_gateway_http
+    openproof_gateway
+    openproof_foundation
+    openproof_session
+    openproof_policy
+    openproof_security
+    Boost::headers
+    GTest::gtest_main
+    openproof_test_compile_options)
+gtest_discover_tests(openproof_gateway_http_tests
+    TEST_PREFIX "FocusedGateway."
+    DISCOVERY_MODE PRE_TEST
+    DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "gateway")
