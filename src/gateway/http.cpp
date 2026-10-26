@@ -16,6 +16,11 @@ module;
 #include <utility>
 #include <vector>
 
+// Declare the explicit Asio TLS instantiation before Asio's networking
+// templates can odr-use it. GCC 16 named modules otherwise emit duplicate
+// strong symbols when combined with ordinary C++ translation units.
+#include <boost/asio/detail/thread_context.hpp>
+#include "asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -26,13 +31,6 @@ module;
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 #include <openssl/ssl.h>
-
-// GCC 16 module implementations can emit Boost.Asio's call_stack static TLS
-// member as a strong symbol instead of COMDAT, conflicting with non-module
-// OAuth providers. Suppress this instantiation in the module unit. A dedicated
-// ordinary (non-module) TU explicitly owns the instantiation for all consumers.
-// This does not disable Asio threading or relax linker duplicate checks.
-#include "asio_thread_context_extern.hpp"
 
 module openproof.gateway.http;
 

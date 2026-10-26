@@ -111,3 +111,11 @@ partition requires clean CI validation before it is considered fixed.
 There are still **no successful end-to-end `opp` benchmark results**, because
 the full Build/Test CI job stops before the E2E step. Migration acceptance
 remains NOT APPROVED.
+
+## 2026-10-26 late CI validation
+
+- Commit `3d7f663` CI confirmed `apps/opp/opp` **linked successfully** and the umbrella unit test runner `tests/openproof_tests` linked successfully.
+- The remaining independent `tests/openproof_gateway_http_tests` link failed with duplicate Boost.Asio `call_stack<thread_context,thread_info_base>::top_`, between its Beast test translation unit and the named HTTP module implementation. This is **not** an OpenProof security test failure; it is a compiler/module interop/linker failure.
+- The pending fix makes the test and HTTP module include a common explicit-instantiation declaration **before** `boost/asio.hpp`; the non-module `asio_thread_context.cpp` retains ownership of the sole definition. Until clean link this is only a candidate fix.
+- E2E/benchmark in the CI workflow is now ordered immediately after the successful `opp` binary link, ahead of independently linking the full test binaries. This isolates real-product E2E evidence from unrelated test-executable linker problems, **without approving the candidate or bypassing tests as a release gate**.
+- The main application remains partly synchronous in database repositories, OAuth providers, LDAP and the proxy dispatch. Native libpq transport is not yet used by production repository methods. The release gate remains **NOT APPROVED**.

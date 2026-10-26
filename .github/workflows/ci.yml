@@ -74,12 +74,9 @@ jobs:
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 
-      - name: Build
-        run: cmake --build --preset gcc-release --parallel 2
-
-      - name: Test
-        run: ctest --preset gcc-release --output-on-failure
-
+      # Run the real application E2E immediately after the executable
+      # links, even if another independent test binary cannot link. A
+      # benchmark result is still NOT release approval without all gates.
       - name: Isolated OpenProof PostgreSQL E2E and mixed-read benchmark
         timeout-minutes: 20
         env:
@@ -100,6 +97,12 @@ jobs:
           path: openproof-e2e-metrics.json
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Build
+        run: cmake --build --preset gcc-release --parallel 2
+
+      - name: Test
+        run: ctest --preset gcc-release --output-on-failure
 
       - name: Build release packages
         run: |
