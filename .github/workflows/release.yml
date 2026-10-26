@@ -30,6 +30,8 @@ jobs:
 
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
+      - name: End-to-end Coroutine migration gate
+        run: node scripts/verify-coroutine-coverage.mjs
       - name: Docs MCP dependency security and transport regression
         working-directory: tools/docs-mcp
         run: |

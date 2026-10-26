@@ -69,3 +69,15 @@ A new `BeastProxyTransport::sendAsync` API has been introduced with asynchronous
 Run `node scripts/verify-coroutine-coverage.mjs` to see the failing static migration gate. It currently flags synchronous libpq/pool acquisition, the legacy synchronous proxy, Github/OIDC/X/Web3 and Enterprise LDAP providers, and application HTTP handlers. A native `co_await` counter is not a substitute for proving that a request cannot block a socket reactor; targeted static review and fault-injection E2E tests remain mandatory.
 
 No production cutover, merge recommendation, or performance improvement factor is justified at this checkpoint.
+
+## Actual-product E2E benchmark instrumentation
+
+The feature branch CI builds the real `opp` binary with GCC 16.2 and runs the real `scripts/e2e-identity-platform.mjs` against a disposable, empty `openproof_e2e` PostgreSQL database (separate from the `openproof_ci` CTest database). The harness exercises full identity/security workflows and a 600-request mixed-read sample at 24-way concurrency. Upon successful completion it writes **only aggregate throughput and percentile latency measurements**, and CI uploads `openproof-e2e-metrics.json`.
+
+To compare baseline and candidate *real-product* measurements:
+
+```sh
+node scripts/compare-e2e-metrics.mjs baseline.json candidate.json
+```
+
+This comparison **does not indicate statistical significance or justify release** from single samples. Paired repetitions on identical hardware, full error budgets, and transaction/cancellation fault tests remain required. A successful CTest or E2E result cannot bypass the independent `verify-coroutine-coverage.mjs` hard-failure gate. The branch release workflow now runs that gate before any publication.
