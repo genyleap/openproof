@@ -619,7 +619,23 @@ async function main() {
         body: form.toString(),
       });
       expectStatus(response, 303);
-      response = await edgeRequest(response.headers.location, { jar: ownerJar });
+      // Consent may redirect directly to the registered OAuth client. That
+      // Location is an output of the authorization protocol, NOT a path to
+      // replay against the identity server. Only follow an internal second
+      // authorization step, never an arbitrary external callback URL.
+      const continuation = new URL(response.headers.location, issuer);
+      const registeredCallback = new URL(redirectUri);
+      if (continuation.origin === registeredCallback.origin
+          && continuation.pathname === registeredCallback.pathname) {
+        // OAuth authorization completed; validate the final redirect below.
+      } else if (continuation.origin === new URL(issuer).origin
+          && continuation.pathname === "/oauth/authorize") {
+        response = await edgeRequest(continuation.pathname + continuation.search, {
+          jar: ownerJar,
+        });
+      } else {
+        fail("consent redirected to an unexpected location");
+      }
     }
     expectStatus(response, 302, 303);
     const callback = new URL(response.headers.location);
