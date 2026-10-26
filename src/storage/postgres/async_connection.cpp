@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -213,11 +214,16 @@ asio::awaitable<QueryRows> AsyncConnection::query(
             const int rowCount = PQntuples(result.get());
             const int fieldCount = PQnfields(result.get());
             for (int row = 0; row < rowCount; ++row) {
-                std::vector<std::string> fields;
+                std::vector<std::optional<std::string>> fields;
                 fields.reserve(static_cast<std::size_t>(fieldCount));
                 for (int column = 0; column < fieldCount; ++column) {
-                    fields.emplace_back(PQgetisnull(result.get(), row, column)
-                        ? "" : PQgetvalue(result.get(), row, column));
+                    if (PQgetisnull(result.get(), row, column)) {
+                        fields.emplace_back(std::nullopt);
+                    } else {
+                        fields.emplace_back(std::string{
+                            PQgetvalue(result.get(), row, column),
+                            static_cast<std::size_t>(PQgetlength(result.get(), row, column))});
+                    }
                 }
                 output.rows.push_back(std::move(fields));
             }

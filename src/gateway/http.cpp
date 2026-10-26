@@ -32,13 +32,7 @@ module;
 // OAuth providers. Suppress this instantiation in the module unit. A dedicated
 // ordinary (non-module) TU explicitly owns the instantiation for all consumers.
 // This does not disable Asio threading or relax linker duplicate checks.
-extern template boost::asio::detail::tss_ptr<
-    boost::asio::detail::call_stack<
-        boost::asio::detail::thread_context,
-        boost::asio::detail::thread_info_base>::context>
-boost::asio::detail::call_stack<
-    boost::asio::detail::thread_context,
-    boost::asio::detail::thread_info_base>::top_;
+#include "asio_thread_context_extern.hpp"
 
 module openproof.gateway.http;
 

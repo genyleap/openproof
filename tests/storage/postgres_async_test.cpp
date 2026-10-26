@@ -28,6 +28,16 @@ asio::awaitable<void> queryWithParameter(
     rows.emplace(std::move(reply));
 }
 
+asio::awaitable<void> queryWithNull(
+    std::string connectionString, std::optional<pg::QueryRows>& rows)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    auto response = co_await connection->query(
+        "SELECT NULL::text, ''::text", {}, 2s);
+    rows.emplace(std::move(response));
+}
+
 asio::awaitable<void> queryWithDeadline(
     std::string connectionString, bool& failedAsExpected, bool& safelyDiscarded)
 {
@@ -78,6 +88,29 @@ TEST(PostgresNativeCoroutineTest, ParameterizedQueryHasRealAsyncLibpqTransport)
     ASSERT_EQ(rows->rows.size(), 1U);
     ASSERT_EQ(rows->rows.front().size(), 1U);
     EXPECT_EQ(rows->rows.front().front(), "native-async-pg");
+}
+
+TEST(PostgresNativeCoroutineTest, SqlNullIsDistinctFromEmptyText)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    std::optional<pg::QueryRows> rows;
+    auto result = asio::co_spawn(context,
+        queryWithNull(connectionString, rows), asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->rows.size(), 1U);
+    ASSERT_EQ(rows->rows.front().size(), 2U);
+    EXPECT_FALSE(rows->rows.front()[0].has_value());
+    ASSERT_TRUE(rows->rows.front()[1].has_value());
+    EXPECT_EQ(rows->rows.front()[1].value(), "");
 }
 
 TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)

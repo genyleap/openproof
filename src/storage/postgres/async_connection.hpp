@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,7 +17,8 @@ struct pg_conn;
 namespace openproof::storage::postgres::async_detail {
 
 struct QueryRows final {
-    std::vector<std::vector<std::string>> rows;
+    // SQL NULL is semantically distinct from an empty string.
+    std::vector<std::vector<std::optional<std::string>>> rows;
 };
 
 class AsyncConnection final {
