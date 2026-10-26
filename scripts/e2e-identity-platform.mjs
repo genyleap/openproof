@@ -750,7 +750,9 @@ async function main() {
     const relayChallenge = jsonBody(relayStart);
     assert.equal(relayChallenge.statement, "Farcaster Auth");
     assert.equal(relayChallenge.chain_id, "10");
-    assert.equal(relayChallenge.resource_prefix, "farcaster://fids/");
+    // Canonical output is singular /fid/; the provider separately accepts
+    // historic /fids/ input for backward compatibility.
+    assert.equal(relayChallenge.resource_prefix, "farcaster://fid/");
     assert.ok(relayChallenge.nonce && !relayChallenge.message);
 
     const farcasterJar = new CookieJar();
@@ -764,7 +766,7 @@ async function main() {
     assert.equal(farcasterChallenge.signer_kind, "custody");
     assert.match(farcasterChallenge.message, /\n\nFarcaster Auth\n\n/);
     assert.match(farcasterChallenge.message, /\nChain ID: 10\n/);
-    assert.match(farcasterChallenge.message, /\nResources:\n- farcaster:\/\/fids\/6841$/);
+    assert.match(farcasterChallenge.message, /\nResources:\n- farcaster:\/\/fid\/6841$/);
     const farcasterComplete = await jsonRequest("/auth/web3/complete", "POST", {
       message: farcasterChallenge.message,
       signature: "0x0102",
