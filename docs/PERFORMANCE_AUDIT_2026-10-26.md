@@ -81,3 +81,12 @@ node scripts/compare-e2e-metrics.mjs baseline.json candidate.json
 ```
 
 This comparison **does not indicate statistical significance or justify release** from single samples. Paired repetitions on identical hardware, full error budgets, and transaction/cancellation fault tests remain required. A successful CTest or E2E result cannot bypass the independent `verify-coroutine-coverage.mjs` hard-failure gate. The branch release workflow now runs that gate before any publication.
+
+
+## CI and native libpq checkpoint (2026-10-26)
+
+- On commit `d9a593a`, full application linking failed with duplicate Boost.Asio `keyword_tss_ptr<...>::value_` between the C++ module `http.cpp.o` and ordinary OAuth provider objects. No executable or product E2E benchmark was produced.
+- On commit `e88e75c`, switching all GNU/Linux OpenProof targets to Boost.Asio's pthread TSS backend exposed the same ODR problem at `call_stack<thread_context,thread_info_base>::top_`. This confirms uniform TLS configuration is necessary but **insufficient**.
+- A dedicated ordinary C++ translation unit, `src/gateway/asio_thread_context.cpp`, now owns the explicit Asio thread-context template instantiation, while the C++ module unit declares an `extern template`. This is a **candidate fix only** until a clean application link succeeds.
+- The new native PostgreSQL coroutine adapter builds locally with GCC 16.2. Its two local GTest cases were skipped without a disposable DB. In the `1de8777` CI workflow, the independent `Native PostgreSQL coroutine integration` step **succeeded** with CI-provisioned PostgreSQL. It does not establish async repository, transaction or pooling coverage.
+- `opp` before/after E2E figures remain **unavailable** because full candidate linking has not yet passed. Synthetic benchmark numbers must not be advertised as OpenProof application performance.

@@ -35,7 +35,7 @@ separate from the C++ server qualification.
 | **Reflection** (P2996) | ✅ `__cpp_impl_reflection` 202603 | ❌ **blocked** | Works standalone; `-freflection` miscompiles module partitions — §3 |
 | **`std::simd`** | ❌ | ❌ | x86-only in this libstdc++ — §4 |
 | **`import std;`** | ❌ | ❌ | libstdc++ module source is a 1-byte stub — §5 |
-| **Coroutines / `std::generator`** | ✅ 202207 | ❌ | Not currently used; asynchronous I/O remains transport-specific — §6 |
+| **Coroutines / `std::generator`** | ✅ 202207 | ⚠️ partial | Native Boost.Asio coroutines exist in the WIP HTTP/Proxy adapters and isolated PostgreSQL adapter; `std::generator` unused; end-to-end release gate still fails — §6 |
 | **`std::mdspan`** | ✅ 202406 | ❌ | No multidimensional data in this domain |
 | **`std::indirect` / `std::polymorphic`** | ✅ 202502 | ❌ | No current requirement — §6 |
 
@@ -200,9 +200,13 @@ appear in each module's global module fragment.
 
 Listing these so their absence reads as a decision rather than an oversight.
 
-- **`std::generator` / coroutines.** The natural use is asynchronous I/O.
-  Repository and gateway paths currently avoid introducing suspension points
-  across shared synchronization boundaries.
+- **`std::generator` / coroutines.** `std::generator` remains unused.
+  Coroutine-based HTTP, proxy and isolated libpq transport code is being
+  developed in the performance branch. Existing repository implementations,
+  main gateway dispatch and external providers are still synchronous and
+  must not be labelled migrated. No suspension may cross a blocking mutex,
+  a borrowed transaction lease or a lifetime-unsafe resource boundary.
+  See `docs/COROUTINE_ACCEPTANCE.md` for the intentionally failing gate.
 - **`std::indirect` / `std::polymorphic`.** These give *value* semantics to
   polymorphic or incomplete members. `ProviderRegistry` deliberately has
   *reference* semantics and owns providers via `unique_ptr`; using

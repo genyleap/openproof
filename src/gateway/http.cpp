@@ -27,6 +27,19 @@ module;
 #include <boost/beast/ssl.hpp>
 #include <openssl/ssl.h>
 
+// GCC 16 module implementations can emit Boost.Asio's call_stack static TLS
+// member as a strong symbol instead of COMDAT, conflicting with non-module
+// OAuth providers. Suppress this instantiation in the module unit. A dedicated
+// ordinary (non-module) TU explicitly owns the instantiation for all consumers.
+// This does not disable Asio threading or relax linker duplicate checks.
+extern template boost::asio::detail::tss_ptr<
+    boost::asio::detail::call_stack<
+        boost::asio::detail::thread_context,
+        boost::asio::detail::thread_info_base>::context>
+boost::asio::detail::call_stack<
+    boost::asio::detail::thread_context,
+    boost::asio::detail::thread_info_base>::top_;
+
 module openproof.gateway.http;
 
 import openproof.security;

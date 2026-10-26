@@ -41,6 +41,22 @@ asio::awaitable<void> queryWithDeadline(
     }
     safelyDiscarded = !connection->healthy();
 }
+asio::awaitable<void> queryWithSqlError(
+    std::string connectionString, bool& redacted, bool& discarded)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    try {
+        static_cast<void>(co_await connection->query(
+            "SELECT FROM malformed_syntax", {}, 2s));
+    } catch (const std::runtime_error& error) {
+        // Neither statement content nor database server diagnostics should
+        // appear in the exception observed by an application boundary.
+        redacted = std::string{error.what()} ==
+            "PostgreSQL query returned an error";
+    }
+    discarded = !connection->healthy();
+}
 } // namespace
 
 TEST(PostgresNativeCoroutineTest, ParameterizedQueryHasRealAsyncLibpqTransport)
@@ -83,4 +99,25 @@ TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
     ASSERT_NO_THROW(result.get());
     EXPECT_TRUE(failedAsExpected);
     EXPECT_TRUE(safelyDiscarded);
+}
+
+TEST(PostgresNativeCoroutineTest, SqlErrorsAreRedactedAndConnectionDiscarded)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool redacted = false;
+    bool discarded = false;
+    auto result = asio::co_spawn(context,
+        queryWithSqlError(connectionString, redacted, discarded),
+        asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    EXPECT_TRUE(redacted);
+    EXPECT_TRUE(discarded);
 }

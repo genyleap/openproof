@@ -7,6 +7,7 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -83,7 +84,7 @@ asio::awaitable<void> waitForSocket(
 struct AsyncConnection::Impl final {
     asio::any_io_executor executor;
     PgPointer connection;
-    bool busy{false};
+    std::atomic<bool> busy{false};
 
     Impl(asio::any_io_executor executorValue, PGconn* handle)
         : executor(std::move(executorValue)), connection(handle) {}
@@ -105,7 +106,16 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
 {
     const Deadline deadline = makeDeadline(timeout);
     auto executor = co_await asio::this_coro::executor;
-    PgPointer connection{PQconnectStart(connectionString.c_str())};
+    PGconn* rawConnection = PQconnectStart(connectionString.c_str());
+    // Libpq retains its own configuration; erase the caller-owned credential
+    // buffer before the first suspension point. This does not erase copies
+    // held by libc, libpq or the allocator.
+    volatile char* secret = connectionString.data();
+    for (std::size_t index = 0; index < connectionString.size(); ++index) {
+        secret[index] = '\0';
+    }
+    connectionString.clear();
+    PgPointer connection{rawConnection};
     if (!connection) {
         throw std::runtime_error{"Unable to create PostgreSQL connection"};
     }
@@ -144,15 +154,16 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     std::chrono::milliseconds timeout)
 {
     const Deadline deadline = makeDeadline(timeout);
-    if (!healthy() || m_impl->busy) {
-        throw std::runtime_error{"PostgreSQL connection is unavailable or busy"};
+    if (m_impl->busy.exchange(true, std::memory_order_acq_rel)) {
+        throw std::runtime_error{"PostgreSQL connection is already busy"};
     }
-    m_impl->busy = true;
     struct BusyReset final {
-        bool& value;
-        ~BusyReset() { value = false; }
+        std::atomic<bool>& value;
+        ~BusyReset() { value.store(false, std::memory_order_release); }
     } busyReset{m_impl->busy};
-
+    if (!healthy()) {
+        throw std::runtime_error{"PostgreSQL connection is unavailable"};
+    }
     PGconn* connection = m_impl->connection.get();
     try {
         std::vector<const char*> values;

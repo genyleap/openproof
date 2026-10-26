@@ -18,6 +18,7 @@ openproof_add_module(openproof_gateway_http
         http.cppm
     SOURCES
         http.cpp
+        asio_thread_context.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_gateway
