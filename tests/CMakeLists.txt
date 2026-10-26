@@ -178,3 +178,26 @@ gtest_discover_tests(openproof_gateway_http_tests
     DISCOVERY_MODE PRE_TEST
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "gateway")
+
+# Native libpq coroutine adapter, isolated from existing synchronous repositories
+# until transaction ownership and async repository APIs are fully migrated.
+add_executable(openproof_postgres_async_tests
+    storage/postgres_async_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/storage/postgres/async_connection.cpp)
+target_compile_features(openproof_postgres_async_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_postgres_async_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_tests PRIVATE
+    Boost::headers OpenProof::libpq GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_tests
+    TEST_PREFIX "NativePostgres."
+    DISCOVERY_MODE PRE_TEST
+    DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async")

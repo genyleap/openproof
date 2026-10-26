@@ -36,3 +36,29 @@ Fails nonzero until every critical boundary has a native coroutine site and the 
 ## Verified partial checkpoint (2026-10-26)
 
 The previous offloading-only patch built `openproof_gateway_http`, and six focused HTTP CTest integration tests passed. That is not end-to-end coroutine execution. Current work is replacing its callback-based socket accept/read/write with native Boost.Asio awaitables. The migration remains blocked by synchronous libpq, synchronous outbound provider HTTP and synchronous Gateway Proxy, plus transport-neutral application SPIs. The branch must remain unapproved until all gates pass.
+
+## PostgreSQL adapter validation checkpoint — still NOT APPROVED
+
+A separate internal `async_detail::AsyncConnection` adapter now uses
+`PQconnectStart/PQconnectPoll` for socket connection state and
+`PQsendQueryParams/PQflush/PQconsumeInput/PQisBusy/PQgetResult`
+for parameterized SQL, suspending on PostgreSQL socket readiness with Asio.
+Every wait shares the operation's absolute deadline. A timeout or I/O error
+closes the PGconn rather than placing an indeterminate transaction state back
+in a connection pool. Raw SQL, credentials and database error strings are not
+included in thrown exception messages. Connection ownership is single-owner;
+overlapping operations are forbidden.
+
+**Limitations:** this internal adapter has NOT replaced existing synchronous
+repository methods, transaction/retry APIs, connection pooling, credential
+rotation, migrations or health checks. Native hostname resolution performed
+by libpq may still be synchronous on some platforms. Cancellation behavior
+and pool lease ownership need fault-injection validation; nonblocking cannot
+be inferred merely from the presence of `co_await`.
+
+The standalone C++26 target `openproof_postgres_async_tests` compiled and
+linked on GCC 16.2, but its two tests were **skipped locally** because no
+isolated test PostgreSQL URI was supplied. CI must run these tests with the
+isolated `OPENPROOF_TEST_POSTGRES` database and fail if it is missing.
+
+These are compatibility foundations only. The release gate remains red.
