@@ -184,3 +184,22 @@ are included only when procfs inspection succeeds. Baseline/candidate
 comparison prints them on the same runner, which has a common CPU tick
 frequency. Single-run estimates remain insufficient to establish a
 statistically significant performance improvement or release readiness.
+
+## First successful real-product E2E result — CI 40403283036
+
+The GitHub Actions run on commit `e915059ac16ef54cded0ca53c441729b02ae2b2c`
+has passed the complete OpenProof identity E2E workflow against an isolated
+PostgreSQL database, as well as the `opp` executable build, full Build and
+CTest. Its uploaded `openproof-e2e-metrics` artifact reports:
+
+- 600 mixed read HTTP requests, concurrency 24 (five endpoint classes).
+- **450.5598123 requests/second**.
+- p50 **52.530854 ms**, p95 **58.725514 ms**, p99 **62.767793 ms**.
+- Timestamp: 2026-10-26T21:26:30.700Z.
+
+This is a **measured real `opp` result**, not an Asio timer simulation.
+It is **NOT a before/after speedup claim**: the pinned baseline is still
+being built/tested, and no paired repeats or latency error bars exist. The
+effective I/O hot paths are still partly synchronous and the full
+Coroutine release gate still fails. Do not ship or merge based on this
+single result.
