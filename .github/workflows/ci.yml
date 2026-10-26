@@ -66,6 +66,11 @@ jobs:
           cmake --preset gcc-release \
             -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
 
+      - name: Native PostgreSQL coroutine integration
+        run: |
+          cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*'
+
       - name: Build
         run: cmake --build --preset gcc-release --parallel 2
 
