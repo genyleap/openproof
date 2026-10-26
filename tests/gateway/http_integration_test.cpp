@@ -225,6 +225,38 @@ TEST(BeastHttpIntegrationTest, TrustedLoopbackProxySuppliesOneValidatedClientIp)
         std::chrono::seconds{2}, 64U, 2U, true).has_value());
 }
 
+TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
+{
+    ClientIpHandler handler;
+    httpAdapter::BeastHttpServer upstream{handler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+
+    auto transport = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(transport.has_value());
+
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"awaitable-upstream"}, "127.0.0.1",
+        upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint.has_value());
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/native-coroutine", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"coroutine-test-1"});
+    ASSERT_TRUE(request.has_value());
+
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, transport.value()->sendAsync(
+            std::move(endpoint).value(), std::move(request).value(),
+            std::chrono::seconds{2}), asio::use_future);
+    io.run();
+    const auto result = future.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->status(), 200);
+    EXPECT_EQ(result->body(), "127.0.0.1");
+    upstream.stop();
+}
+
 TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
 {
     CoreFixture upstreamCore;

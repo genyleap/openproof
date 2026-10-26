@@ -6,6 +6,8 @@ module;
 #include <string>
 #include <string_view>
 
+#include <boost/asio/awaitable.hpp>
+
 export module openproof.gateway.http;
 
 import openproof.foundation;
@@ -100,6 +102,13 @@ public:
     [[nodiscard]] foundation::Result<HttpResponse>
     send(const Endpoint& endpoint, const HttpRequest& request,
          foundation::Duration timeout) override;
+
+    /** Native nonblocking transport used by the future async gateway path.
+     *  Does not call the synchronous ProxyTransport::send implementation.
+     *  Input arguments are owned across suspension; launch on an Asio executor.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<HttpResponse>>
+    sendAsync(Endpoint endpoint, HttpRequest request, foundation::Duration timeout);
 
 private:
     class Implementation;

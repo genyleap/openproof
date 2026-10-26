@@ -58,3 +58,14 @@ Not deployable until matched E2E tests and benchmarks pass. No claim of complete
 ### Build attempt and host contention
 
 A separate GCC 16.2 release build configured successfully, but was intentionally stopped at **274/624** Ninja steps (SIGTERM, not a compiler failure). The production host has one vCPU; at that time a separate GenyCaster WASM build was simultaneously active, disk usage was **92%**, and memory available was about **2.1 GiB**. Continuing two competing C++26 builds on that host would risk shared-service responsiveness. A later targeted RelWithDebInfo build of `openproof_gateway_http` completed successfully (**38/38 build steps; exit 0**), followed by a separate focused HTTP integration test executable (**20/20 build steps; exit 0**). The focused CTest run passed **6/6 tests in 0.46 seconds**, covering concurrent handlers, sanitized exception responses, loopback-proxy IP validation, reverse-proxy round trip, HTTP parser limits and maximum socket connections. **The complete application build, complete CTest suite and real before/after OpenProof E2E performance benchmark remain unfinished**. The independent `openproof-canonical.service` remained active and untouched.
+
+
+## Coroutine migration checkpoint (2026-10-26; **NOT APPROVED**)
+
+The incoming Beast HTTP listener now uses native `boost::asio::co_spawn` and `asio::awaitable` for accept, request read and response write. It is not an end-to-end async request path: the bounded compatibility handler executor still invokes synchronous `HttpHandler::handle`. The coroutine-native listener built successfully with GCC 16.2.0 (RelWithDebInfo), and all six focused HTTP integration tests passed.
+
+A new `BeastProxyTransport::sendAsync` API has been introduced with asynchronous DNS resolution (cancelable via a deadline timer), TCP connect, TLS handshake with unchanged certificate/hostname verification, HTTP write/read and TLS shutdown. The existing synchronous `ProxyTransport::send` implementation has deliberately NOT been removed or silently replaced. Gateway routing still calls it, so this does **not** unlock real end-to-end coroutine execution. The native async proxy API and its direct round-trip integration test are under separate build verification.
+
+Run `node scripts/verify-coroutine-coverage.mjs` to see the failing static migration gate. It currently flags synchronous libpq/pool acquisition, the legacy synchronous proxy, Github/OIDC/X/Web3 and Enterprise LDAP providers, and application HTTP handlers. A native `co_await` counter is not a substitute for proving that a request cannot block a socket reactor; targeted static review and fault-injection E2E tests remain mandatory.
+
+No production cutover, merge recommendation, or performance improvement factor is justified at this checkpoint.

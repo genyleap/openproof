@@ -5,6 +5,7 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,10 @@ module;
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
@@ -186,20 +191,33 @@ public:
 
         void start()
         {
+            // Socket operations now have a native C++ coroutine lifetime.
+            // The transport-neutral handler is still dispatched to the bounded
+            // compatibility pool until repository/provider SPIs are async.
+            asio::co_spawn(m_stream.get_executor(), readRequest(),
+                [self = shared_from_this()](std::exception_ptr error) {
+                    // co_spawn must consume exceptions rather than terminate a worker.
+                    if (error) {
+                        try { std::rethrow_exception(error); }
+                        catch (...) {}
+                    }
+                });
+        }
+
+    private:
+        asio::awaitable<void> readRequest()
+        {
             m_parser.emplace();
             m_parser->header_limit(static_cast<std::uint32_t>(
                 m_owner->m_config.headerLimitBytes()));
             m_parser->body_limit(m_owner->m_config.bodyLimitBytes());
             m_stream.expires_after(m_owner->m_config.readTimeout());
-            beastHttp::async_read(m_stream, m_buffer, *m_parser,
-                [self = shared_from_this()](boost::system::error_code error,
-                                             std::size_t bytes) {
-                    static_cast<void>(bytes);
-                    self->onRead(error);
-                });
+            boost::system::error_code error;
+            static_cast<void>(co_await beastHttp::async_read(
+                m_stream, m_buffer, *m_parser,
+                asio::redirect_error(asio::use_awaitable, error)));
+            onRead(error);
         }
-
-    private:
         void onRead(const boost::system::error_code& error)
         {
             if (error) {
@@ -329,14 +347,24 @@ public:
         void write(beastHttp::response<beastHttp::string_body> response)
         {
             m_response.emplace(std::move(response));
-            m_stream.expires_after(m_owner->m_config.writeTimeout());
-            beastHttp::async_write(m_stream, *m_response,
-                [self = shared_from_this()](boost::system::error_code,
-                                             std::size_t bytes) {
-                    static_cast<void>(bytes);
-                    boost::system::error_code ignored;
-                    self->m_stream.socket().shutdown(Tcp::socket::shutdown_send, ignored);
+            asio::co_spawn(m_stream.get_executor(), writeResponse(),
+                [self = shared_from_this()](std::exception_ptr error) {
+                    if (error) {
+                        try { std::rethrow_exception(error); }
+                        catch (...) {}
+                    }
                 });
+        }
+
+        asio::awaitable<void> writeResponse()
+        {
+            m_stream.expires_after(m_owner->m_config.writeTimeout());
+            boost::system::error_code error;
+            static_cast<void>(co_await beastHttp::async_write(
+                m_stream, *m_response,
+                asio::redirect_error(asio::use_awaitable, error)));
+            boost::system::error_code ignored;
+            m_stream.socket().shutdown(Tcp::socket::shutdown_send, ignored);
         }
 
         beast::tcp_stream m_stream;
@@ -409,8 +437,23 @@ private:
 
     void accept()
     {
-        m_acceptor.async_accept([this](boost::system::error_code error, Tcp::socket socket) {
-            if (!error) {
+        asio::co_spawn(m_context, acceptLoop(),
+            [](std::exception_ptr error) {
+                if (error) {
+                    try { std::rethrow_exception(error); }
+                    catch (...) {}
+                }
+            });
+    }
+
+    asio::awaitable<void> acceptLoop()
+    {
+            while (m_running.load(std::memory_order_acquire)) {
+                boost::system::error_code error;
+                Tcp::socket socket = co_await m_acceptor.async_accept(
+                    asio::redirect_error(asio::use_awaitable, error));
+                if (error == asio::error::operation_aborted) co_return;
+                if (error) continue;
                 const std::size_t count =
                     m_connections.fetch_add(1U, std::memory_order_relaxed) + 1U;
                 if (count > m_config.maximumConnections()) {
@@ -422,8 +465,6 @@ private:
                     std::make_shared<Connection>(std::move(socket), *this)->start();
                 }
             }
-            if (m_running.load() && error != asio::error::operation_aborted) accept();
-        });
     }
 
     HttpHandler* m_handler;
@@ -504,6 +545,69 @@ public:
                               : sendPlain(endpoint, request, timeout);
     }
 
+    asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
+        Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
+    {
+        if (timeout <= foundation::Duration::zero()) {
+            co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                        "The upstream timeout must be positive.");
+        }
+        auto executor = co_await asio::this_coro::executor;
+        auto resolver = std::make_shared<Tcp::resolver>(executor);
+        asio::steady_timer resolverDeadline{executor};
+        resolverDeadline.expires_after(timeout);
+        resolverDeadline.async_wait(
+            [weak = std::weak_ptr<Tcp::resolver>{resolver}](boost::system::error_code error) {
+                if (!error) {
+                    if (auto active = weak.lock()) active->cancel();
+                }
+            });
+        boost::system::error_code error;
+        auto endpoints = co_await resolver->async_resolve(
+            std::string{endpoint.host()}, std::to_string(endpoint.port()),
+            asio::redirect_error(asio::use_awaitable, error));
+        resolverDeadline.cancel();
+        if (error) co_return foundation::fail(networkError("resolve upstream", error));
+
+        if (!endpoint.tls()) {
+            beast::tcp_stream stream{executor};
+            stream.expires_after(timeout);
+            static_cast<void>(co_await stream.async_connect(endpoints,
+                asio::redirect_error(asio::use_awaitable, error)));
+            if (error) co_return foundation::fail(networkError("connect upstream", error));
+            auto response = co_await exchangeAsync(stream, endpoint, request, timeout);
+            boost::system::error_code ignored;
+            stream.socket().shutdown(Tcp::socket::shutdown_both, ignored);
+            co_return response;
+        }
+
+        beast::ssl_stream<beast::tcp_stream> stream{executor, m_tlsContext};
+        const std::string host{endpoint.host()};
+        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                     TLSEXT_NAMETYPE_host_name,
+                     const_cast<char*>(host.c_str())) != 1) {
+            co_return foundation::fail(foundation::ErrorCode::Internal,
+                                        "TLS SNI configuration failed.");
+        }
+        stream.set_verify_callback(ssl::host_name_verification{host});
+        beast::get_lowest_layer(stream).expires_after(timeout);
+        static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
+            endpoints, asio::redirect_error(asio::use_awaitable, error)));
+        if (error) co_return foundation::fail(networkError("connect TLS upstream", error));
+        beast::get_lowest_layer(stream).expires_after(timeout);
+        co_await stream.async_handshake(
+            ssl::stream_base::client, asio::redirect_error(asio::use_awaitable, error));
+        if (error) co_return foundation::fail(networkError("verify TLS upstream", error));
+        auto response = co_await exchangeAsync(stream, endpoint, request, timeout);
+        beast::get_lowest_layer(stream).expires_after(timeout);
+        co_await stream.async_shutdown(asio::redirect_error(asio::use_awaitable, error));
+        if (error == asio::error::eof || error == ssl::error::stream_truncated) error.clear();
+        if (error && response.has_value()) {
+            co_return foundation::fail(networkError("shutdown TLS upstream", error));
+        }
+        co_return response;
+    }
+
 private:
     foundation::Result<Tcp::resolver::results_type> resolve(
         asio::io_context& context, const Endpoint& endpoint)
@@ -514,6 +618,30 @@ private:
                                         std::to_string(endpoint.port()), error);
         if (error) return foundation::fail(networkError("resolve upstream", error));
         return results;
+    }
+
+    template <typename Stream>
+    asio::awaitable<foundation::Result<HttpResponse>> exchangeAsync(
+        Stream& stream, const Endpoint& endpoint, const HttpRequest& request,
+        foundation::Duration timeout)
+    {
+        boost::system::error_code error;
+        auto outgoing = toBeast(endpoint, request);
+        beast::get_lowest_layer(stream).expires_after(timeout);
+        static_cast<void>(co_await beastHttp::async_write(
+            stream, outgoing, asio::redirect_error(asio::use_awaitable, error)));
+        if (error) co_return foundation::fail(networkError("write upstream request", error));
+
+        beastHttp::response_parser<beastHttp::string_body> parser;
+        parser.header_limit(static_cast<std::uint32_t>(
+            m_config.responseHeaderLimitBytes()));
+        parser.body_limit(m_config.responseBodyLimitBytes());
+        beast::flat_buffer buffer;
+        beast::get_lowest_layer(stream).expires_after(timeout);
+        static_cast<void>(co_await beastHttp::async_read(
+            stream, buffer, parser, asio::redirect_error(asio::use_awaitable, error)));
+        if (error) co_return foundation::fail(networkError("read upstream response", error));
+        co_return fromBeast(parser.release());
     }
 
     template <typename Stream>
@@ -614,6 +742,14 @@ foundation::Result<HttpResponse> BeastProxyTransport::send(
     foundation::Duration timeout)
 {
     return m_implementation->send(endpoint, request, timeout);
+}
+
+boost::asio::awaitable<foundation::Result<HttpResponse>>
+BeastProxyTransport::sendAsync(
+    Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
+{
+    co_return co_await m_implementation->sendAsync(
+        std::move(endpoint), std::move(request), timeout);
 }
 
 }
