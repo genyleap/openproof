@@ -35,7 +35,9 @@ add_executable(openproof_tests
     providers/passkey_test.cpp
     providers/web3_test.cpp
     gateway/gateway_test.cpp
-    gateway/http_integration_test.cpp
+    # The Beast wire suite has its own executable below. Compiling it into
+    # the umbrella binary duplicates GCC16/Boost.Asio TSS definitions when
+    # linked with independent OAuth provider objects.
     storage/postgres_integration_test.cpp
     identity/merge_test.cpp
     organization/organization_test.cpp
@@ -54,8 +56,8 @@ target_include_directories(openproof_tests BEFORE PRIVATE
     "${googletest_SOURCE_DIR}/googletest/include"
     "${googletest_SOURCE_DIR}/googletest")
 
-# Same Boost.Config Darwin/GCC correction as the HTTP adapter target. This test
-# includes Beast directly to exercise the wire boundary.
+# Same Boost.Config Darwin/GCC correction as the HTTP adapter target.
+# The Beast wire tests are compiled exclusively by openproof_gateway_http_tests.
 target_compile_definitions(openproof_tests PRIVATE BOOST_HAS_LONG_LONG=1)
 target_compile_definitions(openproof_tests PRIVATE
     OPENPROOF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -64,16 +66,6 @@ set_target_properties(openproof_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON
     CXX_EXTENSIONS OFF
 )
-
-# GCC 16 + glibc fortify can emit a false-positive -Warray-bounds diagnostic
-# while inlining Boost.Asio resolver internals in this integration test. Keep
-# the warning visible, but do not promote this third-party-header diagnostic to
-# an error for this one translation unit.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
-   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
-    set_source_files_properties(gateway/http_integration_test.cpp PROPERTIES
-        COMPILE_OPTIONS "-Wno-error=array-bounds")
-endif()
 
 # CI uses a private GCC 16 runtime that is newer than Ubuntu 24.04's system
 # libstdc++. Link the test runner's C++ runtime statically so CTest does not
@@ -182,15 +174,14 @@ gtest_discover_tests(openproof_gateway_http_tests
 # Native libpq coroutine adapter, isolated from existing synchronous repositories
 # until transaction ownership and async repository APIs are fully migrated.
 add_executable(openproof_postgres_async_tests
-    storage/postgres_async_test.cpp
-    ${PROJECT_SOURCE_DIR}/src/storage/postgres/async_connection.cpp)
+    storage/postgres_async_test.cpp)
 target_compile_features(openproof_postgres_async_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_postgres_async_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/src/storage/postgres"
     "${googletest_SOURCE_DIR}/googletest/include")
 target_compile_definitions(openproof_postgres_async_tests PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_tests PRIVATE
-    Boost::headers OpenProof::libpq GTest::gtest_main
+    openproof_postgres_async_io GTest::gtest_main
     openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_async_tests PRIVATE

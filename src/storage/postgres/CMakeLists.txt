@@ -1,3 +1,19 @@
+# Native socket-driven libpq implementation, independent of the legacy
+# synchronous repository SPI until transaction and lease lifetimes are migrated.
+# Build it as a normal translation unit to avoid leaking Boost.Asio types
+# through the OpenProof C++ module interfaces.
+add_library(openproof_postgres_async_io STATIC async_connection.cpp)
+target_compile_features(openproof_postgres_async_io PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_io PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(openproof_postgres_async_io
+    PUBLIC Boost::headers OpenProof::libpq
+    PRIVATE openproof_compile_options)
+target_compile_definitions(openproof_postgres_async_io PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_postgres_async_io PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+
 openproof_add_module(openproof_storage_postgres
     MODULES
         postgres.cppm
@@ -29,4 +45,5 @@ openproof_add_module(openproof_storage_postgres
         openproof_policy
     LINK_PRIVATE
         OpenProof::libpq
+        openproof_postgres_async_io
 )

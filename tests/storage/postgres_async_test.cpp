@@ -34,7 +34,7 @@ asio::awaitable<void> queryWithNull(
     auto connection = co_await pg::AsyncConnection::connect(
         std::move(connectionString), 2s);
     auto response = co_await connection->query(
-        "SELECT NULL::text, ''::text", {}, 2s);
+        "SELECT $1::text, $2::text", {std::nullopt, std::string{}}, 2s);
     rows.emplace(std::move(response));
 }
 
@@ -51,6 +51,27 @@ asio::awaitable<void> queryWithDeadline(
     }
     safelyDiscarded = !connection->healthy();
 }
+asio::awaitable<void> slowQuery(
+    std::string connectionString, bool& slowCompleted)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    static_cast<void>(co_await connection->query(
+        "SELECT pg_sleep(0.5)", {}, 2s));
+    slowCompleted = true;
+}
+
+asio::awaitable<void> independentQuery(
+    std::string connectionString, const bool& slowCompleted,
+    bool& fastFinishedFirst)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    const auto result = co_await connection->query(
+        "SELECT 1", {}, 2s);
+    fastFinishedFirst = !slowCompleted && result.rows.size() == 1U;
+}
+
 asio::awaitable<void> queryWithSqlError(
     std::string connectionString, bool& redacted, bool& discarded)
 {
@@ -132,6 +153,31 @@ TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
     ASSERT_NO_THROW(result.get());
     EXPECT_TRUE(failedAsExpected);
     EXPECT_TRUE(safelyDiscarded);
+}
+
+TEST(PostgresNativeCoroutineTest, SlowQueryDoesNotBlockIndependentSocket)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool slowCompleted = false;
+    bool fastFinishedFirst = false;
+    auto slow = asio::co_spawn(context,
+        slowQuery(connectionString, slowCompleted), asio::use_future);
+    auto fast = asio::co_spawn(context,
+        independentQuery(connectionString, slowCompleted, fastFinishedFirst),
+        asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(fast.get());
+    ASSERT_NO_THROW(slow.get());
+    EXPECT_TRUE(slowCompleted);
+    EXPECT_TRUE(fastFinishedFirst)
+        << "A waiting PostgreSQL operation starved unrelated Asio work";
 }
 
 TEST(PostgresNativeCoroutineTest, SqlErrorsAreRedactedAndConnectionDiscarded)

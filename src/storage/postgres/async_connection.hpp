@@ -40,7 +40,7 @@ public:
     // Throws sanitized errors; a timeout or cancellation invalidates the
     // connection rather than returning a PGconn with unknown transaction state.
     boost::asio::awaitable<QueryRows> query(
-        std::string sql, std::vector<std::string> params,
+        std::string sql, std::vector<std::optional<std::string>> params,
         std::chrono::milliseconds timeout);
 
     [[nodiscard]] bool healthy() const noexcept;

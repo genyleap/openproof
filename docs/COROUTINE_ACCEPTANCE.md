@@ -66,8 +66,21 @@ These are compatibility foundations only. The release gate remains red.
 ### Native libpq data-integrity checkpoint
 
 The isolated adapter preserves PostgreSQL SQL NULL distinctly from an empty text
-value using `std::optional<std::string>`. It copies cell values with
-`PQgetlength` instead of relying on NUL-terminated strings. A dedicated
-disposable-DB integration test covers `SELECT NULL::text, ''::text` to avoid
-silently corrupting account/consent semantics during the future repository migration.
+value using `std::optional<std::string>` for both bound SQL parameters and
+returned cells. It copies cell values with `PQgetlength` instead of relying
+on NUL-terminated strings. A dedicated disposable-DB integration test binds a
+NULL parameter and an empty-string parameter into `SELECT $1::text, $2::text`,
+preventing silent corruption of account/consent semantics during repository migration.
 The test and adaptation are **not sufficient** to approve the repository migration.
+
+### Build integration boundary
+
+The native libpq adapter now has a standalone, ordinary-C++ CMake library
+target `openproof_postgres_async_io`, and the PostgreSQL module links against
+it without exporting Boost.Asio types in OpenProof domain module interfaces.
+The focused `openproof_postgres_async_tests` executable links this same
+library rather than recompiling a second copy of the transport. This is a
+prerequisite for replacing the legacy synchronous repositories but **does not
+yet make their runtime SQL calls nonblocking**. Local GCC16.2 library + test
+link passed; the extra nullable-bound-parameter integration test still
+requires execution against the disposable CI database.

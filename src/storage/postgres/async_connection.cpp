@@ -151,7 +151,7 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
 }
 
 asio::awaitable<QueryRows> AsyncConnection::query(
-    std::string sql, std::vector<std::string> params,
+    std::string sql, std::vector<std::optional<std::string>> params,
     std::chrono::milliseconds timeout)
 {
     const Deadline deadline = makeDeadline(timeout);
@@ -169,7 +169,9 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     try {
         std::vector<const char*> values;
         values.reserve(params.size());
-        for (const auto& parameter : params) values.push_back(parameter.c_str());
+        for (const auto& parameter : params) {
+            values.push_back(parameter.has_value() ? parameter->c_str() : nullptr);
+        }
         if (PQsendQueryParams(connection, sql.c_str(),
                 static_cast<int>(values.size()), nullptr,
                 values.empty() ? nullptr : values.data(),

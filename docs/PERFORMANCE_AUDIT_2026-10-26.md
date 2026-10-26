@@ -90,3 +90,24 @@ This comparison **does not indicate statistical significance or justify release*
 - A dedicated ordinary C++ translation unit, `src/gateway/asio_thread_context.cpp`, now owns the explicit Asio thread-context template instantiation, while the C++ module unit declares an `extern template`. This is a **candidate fix only** until a clean application link succeeds.
 - The new native PostgreSQL coroutine adapter builds locally with GCC 16.2. Its two local GTest cases were skipped without a disposable DB. In the `1de8777` CI workflow, the independent `Native PostgreSQL coroutine integration` step **succeeded** with CI-provisioned PostgreSQL. It does not establish async repository, transaction or pooling coverage.
 - `opp` before/after E2E figures remain **unavailable** because full candidate linking has not yet passed. Synthetic benchmark numbers must not be advertised as OpenProof application performance.
+
+## CI regression checkpoint — link isolation
+
+On commit `d7e53d7` the CI Build progressed past linking
+`apps/opp/opp` after moving the GCC16/Asio explicit TSS instantiation to a
+non-module TU with its `extern template` declaration included from the
+global module fragment. However, the same full Build failed while linking
+`tests/openproof_tests`: the Beast HTTP integration source was compiled into
+both the umbrella binary and its separate focused test binary. The umbrella
+link also pulls OIDC Asio objects, producing a duplicate
+`call_stack<thread_context,thread_info_base>::top_` symbol.
+
+The tests have therefore been partitioned: the full suite retains
+`gateway/gateway_test.cpp`, and the exact Beast HTTP integration source is
+compiled exclusively in `openproof_gateway_http_tests` (already
+CTest-discovered). No coverage is intentionally dropped. This test-target
+partition requires clean CI validation before it is considered fixed.
+
+There are still **no successful end-to-end `opp` benchmark results**, because
+the full Build/Test CI job stops before the E2E step. Migration acceptance
+remains NOT APPROVED.

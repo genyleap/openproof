@@ -71,6 +71,9 @@ jobs:
           cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*'
 
+      - name: Build opp executable
+        run: cmake --build --preset gcc-release --target opp --parallel 2
+
       - name: Build
         run: cmake --build --preset gcc-release --parallel 2
 
