@@ -134,3 +134,37 @@ The E2E test now accepts **exactly** either `1.1.0` or
 start metric. All remaining identity and security E2E steps must still pass
 before an aggregate benchmark artifact is emitted. No valid real-product
 throughput/latency result exists from the failed attempt.
+
+## Matched mainline versus optimized E2E benchmark (prepared, not yet executed)
+
+The new CI helper `scripts/ci/run-paired-e2e-baseline.sh` pins the
+pre-optimization **base commit**
+`ccb396182936d717960fdca319999baf2f580ff9`, builds its own `opp`
+binary with the same GCC16/Boost toolchain on the *same CI runner* as the
+candidate and runs the **candidate branch's identical E2E harness** with
+600 mixed read requests and concurrency 24 against a **different empty**
+disposable PostgreSQL database. It attributes the baseline artifact to the
+actual baseline commit through `OPENPROOF_E2E_COMMIT`, rather than wrongly
+using the candidate's `GITHUB_SHA`.
+
+The paired baseline only runs after the candidate E2E and complete CTest
+suite pass. Separate CI artifacts will expose both aggregate metric records
+and a human-readable comparison. No p50/p95/p99, throughput improvement,
+or significance claim is valid until the job completes successfully.
+
+The initial paired run is a **smoke comparison, not a statistically robust
+benchmark**. Production-grade release criteria remain: multiple paired
+repetitions, warm-up controls, fixed CPU quota and PostgreSQL settings,
+errors and timeouts, CPU/RSS data, and regression checks on CPU-heavy routes.
+The full Coroutine coverage gate still independently blocks release.
+
+## Compiler fragment regression corrected (CI 40397926993)
+
+The CI attempt containing the earlier Asio TLS predeclaration failed before
+linking: GCC16's `-Werror=global-module` prohibits spelling
+`namespace boost::asio::detail {...}` directly inside a Global Module
+Fragment. The incomplete forward declarations have now been moved to the
+preprocessor-included `asio_thread_context_extern.hpp` header, while the
+early inclusion ordering remains intact. This is a candidate correction that
+must pass a fresh CI build; no suppressed warning or permissive linker flag
+has been introduced.

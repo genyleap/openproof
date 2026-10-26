@@ -1163,7 +1163,7 @@ async function main() {
       // Only non-sensitive aggregate metrics; no tokens, passwords or addresses.
       fs.writeFileSync(metricsFile, JSON.stringify({
         benchmark: "openproof-isolated-e2e-mixed-read",
-        commit: process.env.GITHUB_SHA ?? "local",
+        commit: process.env.OPENPROOF_E2E_COMMIT ?? process.env.GITHUB_SHA ?? "local",
         timestamp: new Date().toISOString(),
         ...loadResult,
       }, null, 2) + "\n", { mode: 0o600 });

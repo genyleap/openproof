@@ -13,10 +13,6 @@
 // Suppress the duplicate thread-context variable instantiation before Asio
 // creates any io_context types; the library owns its explicit definition.
 #include <boost/asio/detail/call_stack.hpp>
-namespace boost::asio::detail {
-class thread_context;
-class thread_info_base;
-}
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>

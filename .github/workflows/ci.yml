@@ -25,6 +25,7 @@ jobs:
         run: |
           shellcheck --severity=error installer/bootstrap.sh installer/setup.sh installer/openproof \
             packaging/build-deb.sh packaging/build-bundle.sh scripts/ci/install-build-deps.sh \
+            scripts/ci/run-paired-e2e-baseline.sh \
             scripts/backup-postgres.sh scripts/restore-postgres.sh
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
@@ -103,6 +104,22 @@ jobs:
 
       - name: Test
         run: ctest --preset gcc-release --output-on-failure
+
+      # Paired comparison is deliberately gated on the *full* test suite.
+      # The candidate and pinned mainline baseline run on the same runner,
+      # with distinct disposable databases and the same E2E workload.
+      - name: Paired baseline E2E benchmark
+        timeout-minutes: 35
+        run: bash scripts/ci/run-paired-e2e-baseline.sh
+
+      - name: Preserve pinned baseline benchmark metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-e2e-baseline-metrics
+          path: openproof-e2e-metrics-baseline.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Build release packages
         run: |
