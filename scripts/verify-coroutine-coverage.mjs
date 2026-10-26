@@ -27,7 +27,9 @@ const forbidden = [
   ["blocking DNS", /\b(?:resolver|m_resolver)\.resolve\s*\(/g],
   ["blocking stream connect", /\b(?:stream|m_stream)\.connect\s*\(/g],
   ["blocking TLS handshake", /\b(?:stream|m_stream)\.handshake\s*\(/g],
-  ["blocking pool acquisition", /\b(?:m_condition|m_cv|m_cond)\.wait_for\s*\(/g]
+  ["blocking pool acquisition", /\b(?:m_condition|m_cv|m_cond)\.wait_for\s*\(/g],
+  ["blocking LDAP bind/search", /\bldap_(?:sasl_bind_s|search_ext_s|simple_bind_s)\s*\(/g],
+  ["blocking LDAP shutdown", /\bldap_unbind_ext_s\s*\(/g]
 ];
 const checked = segments.map(([name, relative]) => {
   const source = fs.readFileSync(path.join(root,relative),"utf8");
@@ -44,13 +46,50 @@ const checked = segments.map(([name, relative]) => {
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
   return {name,file:relative,coAwaitCount:awaitCount,issues};
 });
-const failures=checked.reduce((count,area)=>count+area.issues.length,0);
+// Do not silently overlook newly added storage/provider/transport files.
+// The fixed boundary matrix above verifies coroutine presence; this additional
+// inventory checks *every* implementation unit for concrete synchronous I/O
+// primitives, even when it was not previously named in the release gate.
+const namedPaths = new Set(segments.map(([, relative]) => relative));
+const uncoveredBlockingSources = [];
+const globalForbidden = [
+  ...forbidden,
+  ["blocking cURL", /\bcurl_easy_perform\s*\(/g],
+  ["blocking OpenSSL transport", /\bSSL_(?:connect|accept|read|write)\s*\(/g]
+];
+function auditDirectory(directory) {
+  for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      auditDirectory(absolute);
+      continue;
+    }
+    if (!/\.(?:cpp|cppm|cc|cxx)$/.test(entry.name)) continue;
+    const relative = path.relative(root, absolute).split(path.sep).join("/");
+    if (namedPaths.has(relative)) continue;
+    const source = fs.readFileSync(absolute,"utf8");
+    const issues = [];
+    for (const [kind, regex] of globalForbidden) {
+      for (const match of source.matchAll(regex)) {
+        issues.push({
+          line: source.slice(0,match.index).split("\n").length,
+          kind, expression: match[0],
+        });
+      }
+    }
+    if (issues.length) uncoveredBlockingSources.push({file:relative,issues});
+  }
+}
+auditDirectory(path.join(root,"src"));
+const failures=checked.reduce((count,area)=>count+area.issues.length,0)
+  + uncoveredBlockingSources.reduce((count,source)=>count+source.issues.length,0);
 const report={
   status:failures===0?"STATIC_GATE_PASSED_REQUIRES_DYNAMIC_VALIDATION":"NOT_APPROVED",
   reviewRequired:true,
   releaseApproved:false,
   blockingFindings:failures,
-  areas:checked
+  areas:checked,
+  uncoveredBlockingSources,
 };
 if(process.argv.includes("--json"))console.log(JSON.stringify(report,null,2));
 else{
@@ -58,6 +97,12 @@ else{
   for(const area of checked){
     console.log((area.issues.length?"FAIL":"PASS")+" "+area.name+" ["+area.file+"] co_await="+area.coAwaitCount);
     for(const issue of area.issues)console.log("  "+issue.line+" "+issue.kind+": "+issue.expression);
+  }
+  for (const untracked of uncoveredBlockingSources) {
+    console.log("FAIL untracked blocking I/O [" + untracked.file + "]");
+    for (const issue of untracked.issues) {
+      console.log("  " + issue.line + " " + issue.kind + ": " + issue.expression);
+    }
   }
   console.log("Release always requires full build, security regression, E2E tests, comparative baseline and latency/error-budget measurements.");
 }

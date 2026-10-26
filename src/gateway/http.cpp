@@ -19,7 +19,11 @@ module;
 // Declare the explicit Asio TLS instantiation before Asio's networking
 // templates can odr-use it. GCC 16 named modules otherwise emit duplicate
 // strong symbols when combined with ordinary C++ translation units.
-#include <boost/asio/detail/thread_context.hpp>
+#include <boost/asio/detail/call_stack.hpp>
+namespace boost::asio::detail {
+class thread_context;
+class thread_info_base;
+}
 #include "asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>

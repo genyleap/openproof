@@ -95,3 +95,31 @@ PostgreSQL integration suite tests `BEGIN`, rejection of reuse during an
 open transaction, and `ROLLBACK` restoring the idle state.
 This is an invariant check only; connection leasing and cleanup remain
 unmigrated, and this branch is still NOT APPROVED.
+
+### Enterprise LDAP static-gate correction
+
+The coroutine release verifier explicitly flags OpenLDAP's synchronous
+`ldap_sasl_bind_s`, `ldap_search_ext_s` and `ldap_unbind_ext_s` call sites
+in the Enterprise provider. These were previously omitted from the static
+pattern list even though the manual audit identified them. They remain
+**blocking** and must be replaced by reactor-driven LDAP operations with
+correct TLS validation, cancellation and connection lifetime tests before
+release. The verifier continues to fail until the actual adapter and call
+paths are converted; **adding a coroutine keyword without eliminating blocking
+LDAP does not satisfy this gate**.
+
+### Source coverage: no hidden blocking implementation files
+
+The automated gate scans every `.cpp`, `.cppm`, `.cc` and `.cxx`
+implementation under `src/` in addition to the explicitly named eleven
+critical execution boundaries. Any unlisted file containing a known
+synchronous PostgreSQL, HTTP, LDAP, cURL or OpenSSL transport call causes a
+hard failure and appears under `uncoveredBlockingSources` in the JSON output.
+This is a *source-level completeness check*, not a runtime proof: function
+pointer dispatches, third-party internals, synchronous DNS inside libpq and
+CPU-heavy password hashing must also be profiled and manually reviewed.
+
+At this checkpoint the release gate reports **40 known outstanding static
+findings across eleven named areas**, including the three explicit synchronous
+Enterprise LDAP operations. This number is a count of source-level findings,
+not a count of runtime paths, requests or performance regressions.
