@@ -101,8 +101,16 @@ if(NOT _openproof_previous_module_fingerprint STREQUAL
         "${OPENPROOF_MODULE_BUILD_FINGERPRINT}\n")
 endif()
 
+# GCC 16 C++26 modules and Boost.Asio 1.88 may emit a non-COMDAT
+# keyword_tss_ptr thread-local instantiation from a module implementation,
+# conflicting with the same Asio TLS symbol in a non-module provider.
+# Select the supported pthread TSS backend uniformly for *every* OpenProof
+# translation unit (including tests) to avoid the duplicate definition and
+# the more dangerous mixed Asio thread-context backends.
+# NEVER set only on gateway: all Asio users must use the same TLS model.
 target_compile_definitions(openproof_compile_options INTERFACE
-    OPENPROOF_MODULE_BUILD_FINGERPRINT=0x${OPENPROOF_MODULE_BUILD_FINGERPRINT_SHORT}ULL)
+    OPENPROOF_MODULE_BUILD_FINGERPRINT=0x${OPENPROOF_MODULE_BUILD_FINGERPRINT_SHORT}ULL
+    $<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Linux>>:BOOST_ASIO_DISABLE_THREAD_KEYWORD_EXTENSION=1>)
 
 message(STATUS
     "OpenProof: module source fingerprint = ${OPENPROOF_MODULE_SOURCE_FINGERPRINT_SHORT}")
