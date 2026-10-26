@@ -102,6 +102,13 @@ bool AsyncConnection::healthy() const noexcept
         && PQstatus(m_impl->connection.get()) == CONNECTION_OK;
 }
 
+bool AsyncConnection::reusable() const noexcept
+{
+    return !m_impl->busy.load(std::memory_order_acquire)
+        && healthy()
+        && PQtransactionStatus(m_impl->connection.get()) == PQTRANS_IDLE;
+}
+
 asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     std::string connectionString, std::chrono::milliseconds timeout)
 {

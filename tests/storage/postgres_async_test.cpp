@@ -51,6 +51,19 @@ asio::awaitable<void> queryWithDeadline(
     }
     safelyDiscarded = !connection->healthy();
 }
+asio::awaitable<void> transactionBoundary(
+    std::string connectionString, bool& initialIdle,
+    bool& blockedDuringTransaction, bool& returnedIdle)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    initialIdle = connection->reusable();
+    static_cast<void>(co_await connection->query("BEGIN", {}, 2s));
+    blockedDuringTransaction = !connection->reusable();
+    static_cast<void>(co_await connection->query("ROLLBACK", {}, 2s));
+    returnedIdle = connection->reusable();
+}
+
 asio::awaitable<void> slowQuery(
     std::string connectionString, bool& slowCompleted)
 {
@@ -153,6 +166,30 @@ TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
     ASSERT_NO_THROW(result.get());
     EXPECT_TRUE(failedAsExpected);
     EXPECT_TRUE(safelyDiscarded);
+}
+
+TEST(PostgresNativeCoroutineTest, TransactionIsNotReusableUntilRollback)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool initialIdle = false;
+    bool blockedDuringTransaction = false;
+    bool returnedIdle = false;
+    auto result = asio::co_spawn(context,
+        transactionBoundary(connectionString, initialIdle,
+            blockedDuringTransaction, returnedIdle), asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    EXPECT_TRUE(initialIdle);
+    EXPECT_TRUE(blockedDuringTransaction)
+        << "A leased transaction must never be returned to another tenant";
+    EXPECT_TRUE(returnedIdle);
 }
 
 TEST(PostgresNativeCoroutineTest, SlowQueryDoesNotBlockIndependentSocket)

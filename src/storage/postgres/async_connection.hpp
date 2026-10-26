@@ -45,6 +45,10 @@ public:
 
     [[nodiscard]] bool healthy() const noexcept;
 
+    // Pool admission must require an idle transaction boundary, not merely
+    // CONNECTION_OK. No caller may share the same lease concurrently.
+    [[nodiscard]] bool reusable() const noexcept;
+
 private:
     AsyncConnection(boost::asio::any_io_executor executor, pg_conn* handle);
     struct Impl;

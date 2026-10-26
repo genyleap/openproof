@@ -84,3 +84,14 @@ prerequisite for replacing the legacy synchronous repositories but **does not
 yet make their runtime SQL calls nonblocking**. Local GCC16.2 library + test
 link passed; the extra nullable-bound-parameter integration test still
 requires execution against the disposable CI database.
+
+### Transaction return-to-pool invariant
+
+`AsyncConnection::healthy()` means the physical connection is available;
+that does **not** prove it is safe for a different request or tenant.
+The new `reusable()` check requires `PQTRANS_IDLE` and no in-flight query
+before any future async pool is allowed to recycle a lease. The disposable
+PostgreSQL integration suite tests `BEGIN`, rejection of reuse during an
+open transaction, and `ROLLBACK` restoring the idle state.
+This is an invariant check only; connection leasing and cleanup remain
+unmigrated, and this branch is still NOT APPROVED.
