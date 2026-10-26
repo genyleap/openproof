@@ -123,3 +123,13 @@ At this checkpoint the release gate reports **40 known outstanding static
 findings across eleven named areas**, including the three explicit synchronous
 Enterprise LDAP operations. This number is a count of source-level findings,
 not a count of runtime paths, requests or performance regressions.
+
+### Libpq parameter NUL-boundary regression
+
+The native async libpq adapter now refuses embedded NUL bytes in text
+parameters before invoking `PQsendQueryParams`, whose text inputs are
+NUL-terminated by libpq. Without this validation an attacker-controlled
+value could be truncated silently (a correctness and identity-isolation risk).
+The isolated database test verifies the value is rejected while the clean
+connection remains available for future safe queries. This does not replace
+negative application-level authorization and tenant-isolation tests.

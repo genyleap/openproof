@@ -119,3 +119,18 @@ remains NOT APPROVED.
 - The pending fix makes the test and HTTP module include a common explicit-instantiation declaration **before** `boost/asio.hpp`; the non-module `asio_thread_context.cpp` retains ownership of the sole definition. Until clean link this is only a candidate fix.
 - E2E/benchmark in the CI workflow is now ordered immediately after the successful `opp` binary link, ahead of independently linking the full test binaries. This isolates real-product E2E evidence from unrelated test-executable linker problems, **without approving the candidate or bypassing tests as a release gate**.
 - The main application remains partly synchronous in database repositories, OAuth providers, LDAP and the proxy dispatch. Native libpq transport is not yet used by production repository methods. The release gate remains **NOT APPROVED**.
+
+## CI E2E harness release-candidate compatibility
+
+CI run `40396015855` confirmed that the `opp` executable links and that
+the isolated real-application E2E workflow **started**. Its first failure
+was a test assertion on Prometheus' process-start metric: the executable
+correctly reported `version="1.1.0-rc6"` while the harness insisted on
+release-only `version="1.1.0"`. This is a version-label assertion defect,
+not evidence of a production or authentication defect.
+
+The E2E test now accepts **exactly** either `1.1.0` or
+`1.1.0-rc<positive-integer>` and still requires a single correct process
+start metric. All remaining identity and security E2E steps must still pass
+before an aggregate benchmark artifact is emitted. No valid real-product
+throughput/latency result exists from the failed attempt.

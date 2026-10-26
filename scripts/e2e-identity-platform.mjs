@@ -693,7 +693,11 @@ async function main() {
     });
     expectStatus(metrics, 200);
     assert.match(metrics.headers["content-type"], /^text\/plain; version=0\.0\.4/);
-    assert.match(metrics.body, /openproof_process_starts_total\{version="1\.1\.0"\} 1/);
+    // The production protocol version and a release-candidate suffix both
+    // represent a valid 1.1.0 build. Keep the Prometheus metric and counter
+    // assertion strict without hard-coding release-only version labels.
+    assert.match(metrics.body,
+      /^openproof_process_starts_total\{version="1\.1\.0(?:-rc[1-9][0-9]*)?"\} 1$/m);
     assert.match(metrics.body, /openproof_http_requests_total\{method="GET",status_class="2xx"\}/);
     assert.ok(!metrics.body.includes("/health/ready"));
     assert.ok(!metrics.body.includes("e2e-owner"));

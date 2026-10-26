@@ -172,6 +172,15 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     if (!healthy()) {
         throw std::runtime_error{"PostgreSQL connection is unavailable"};
     }
+    // libpq's text-parameter protocol uses NUL-terminated strings when
+    // lengths are omitted. Refuse embedded NUL bytes rather than silently
+    // submitting truncated identity, credential or tenant values.
+    for (const auto& parameter : params) {
+        if (parameter.has_value() && parameter->find('\0') != std::string::npos) {
+            throw std::invalid_argument{"PostgreSQL text parameter contains NUL"};
+        }
+    }
+
     PGconn* connection = m_impl->connection.get();
     try {
         std::vector<const char*> values;
