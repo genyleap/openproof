@@ -203,3 +203,36 @@ being built/tested, and no paired repeats or latency error bars exist. The
 effective I/O hot paths are still partly synchronous and the full
 Coroutine release gate still fails. Do not ship or merge based on this
 single result.
+
+## Measured paired baseline comparison — GitHub Actions 40403283036
+
+The completed CI run on candidate `e915059ac16ef54cded0ca53c441729b02ae2b2c`
+has **passed**: native async PostgreSQL integration tests, the `opp`
+executable link, complete isolated identity E2E, full C++ project Build,
+CTest, pinned-baseline E2E comparison, and release package build.
+**Static Coroutine coverage intentionally remains FAIL**, so the branch
+is **NOT APPROVED** for merge or production deployment.
+
+The independently archived metrics are:
+
+| Metric | Original `ccb3961` | Candidate `e915059` | Change from original |
+| --- | ---: | ---: | ---: |
+| Throughput (req/s) | 446.52 | 450.56 | +0.90% |
+| p50 (ms) | 53.13 | 52.53 | -1.13% |
+| p95 (ms) | 59.94 | 58.73 | -2.03% |
+| p99 (ms) | 62.85 | 62.77 | -0.13% |
+
+Both had 600 HTTP requests at 24 concurrent clients and an identical
+mixed-read E2E workload, on the same GitHub Actions runner with separate
+disposable PostgreSQL databases and the same GCC16/Boost toolchain.
+This is a single paired run, **not a significance test**. A 0.90%
+throughput change is far too small to present as a confirmed speedup.
+In particular, the old simulated coroutine microbenchmarks showing
+multiples of throughput were **not** real OpenProof application results.
+
+Raw artifacts are in the GitHub Actions workflow run
+`https://github.com/genyleap/openproof/actions/runs/40403283036`.
+Until the remaining synchronous repository, HTTP dispatch, provider, LDAP
+and proxy paths are migrated and independently revalidated with repeated,
+fault-injected benchmarks, the full Coroutine acceptance decision remains
+**NOT APPROVED**.
