@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/openproof-full-optimization-20261026]
   pull_request:
   workflow_dispatch:
 
@@ -43,6 +43,8 @@ jobs:
           npm test
       - name: Whitespace
         run: git diff --check
+      - name: End-to-end coroutine coverage gate
+        run: node scripts/verify-coroutine-coverage.mjs
 
   build:
     name: Build and test
