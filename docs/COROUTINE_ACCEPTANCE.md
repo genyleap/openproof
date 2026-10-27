@@ -413,3 +413,8 @@ token cannot be used, repeated revocation is idempotent, a missing row is not
 confused with success, and revoking one identity's sessions does not revoke an
 unrelated identity's session. These are internal SQL primitives only; real
 request handlers and public SessionService still require coroutine wiring.
+
+The two-query idempotent revoke path now shares one monotonic time budget:
+its follow-up state lookup cannot silently reset the caller's deadline after
+the initial update. This is a scope-limited SQL deadline, not yet request
+cancellation propagated from the HTTP socket.

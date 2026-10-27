@@ -118,6 +118,10 @@ asio::awaitable<AsyncSessionSql::RevokeStatus> AsyncSessionSql::revoke(
     if (!validId(sessionId) || nowMilliseconds < 0) {
         throw std::invalid_argument{"Invalid async session revocation arguments"};
     }
+    if (deadline <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument{"Invalid async session revocation deadline"};
+    }
+    const auto expiresAt = std::chrono::steady_clock::now() + deadline;
     const std::string update =
         "UPDATE " + tableName(m_table) +
         " SET state=1,revoked_at_ms=$2 WHERE id=$1 AND state=0 RETURNING id";
@@ -133,7 +137,12 @@ asio::awaitable<AsyncSessionSql::RevokeStatus> AsyncSessionSql::revoke(
     // but missing or expired must never mint an authenticated session.
     const std::string sql =
         "SELECT state FROM " + tableName(m_table) + " WHERE id=$1";
-    auto state = co_await connection.query(sql, {std::move(sessionId)}, deadline);
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        expiresAt - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error{"Async session revocation deadline exceeded"};
+    }
+    auto state = co_await connection.query(sql, {std::move(sessionId)}, remaining);
     if (state.rows.empty()) co_return RevokeStatus::NotFound;
     if (state.rows.size() != 1U || state.rows.front().size() != 1U
         || !state.rows.front().front().has_value()) {
