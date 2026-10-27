@@ -72,6 +72,13 @@ jobs:
           cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*'
 
+      - name: Native Gateway coroutine and real TCP regression
+        timeout-minutes: 15
+        run: |
+          cmake --build --preset gcc-release --target openproof_gateway_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_gateway_http_tests \
+            --gtest_filter='BeastHttpIntegrationTest.*'
+
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 

@@ -285,3 +285,43 @@ workload says **nothing about blocking authenticated PostgreSQL/OAuth paths**.
 
 A passing numerical comparison can NEVER override the independent
 Coroutine-completeness gate or the security regression suite.
+
+## Actual Gateway/TCP I/O-wait benchmark — successful CI 40455238540
+
+On commit `cbd1e929feb7878a4c110b0071dc632fd6164757`,
+the GitHub Actions job passed **the complete project Build, all 506
+CTest tests, isolated PostgreSQL-backed identity/OAuth E2E, pinned E2E
+baseline comparison, and the real Gateway delayed-upstream benchmark**.
+Static Coroutine acceptance remains **FAIL**, so this is not approved.
+
+A deliberately slow local HTTP upstream responded after 50ms. We measured
+the unchanged mainline `opp` binary at commit
+`ccb396182936d717960fdca319999baf2f580ff9`
+and the candidate `opp` binary on the same CI runner, with 600 actual
+HTTP/TCP requests, 24 concurrent clients and zero HTTP errors:
+
+| Measure | Baseline | Candidate | Observed difference |
+| --- | ---: | ---: | ---: |
+| Throughput (requests/sec) | 75.8256 | 376.3701 | **4.9636x (+396.35%)** |
+| p50 (ms) | 316.2216 | 63.3794 | -79.96% |
+| p95 (ms) | 320.1821 | 68.0268 | -78.75% |
+| p99 (ms) | 320.9243 | 69.3460 | -78.39% |
+| Measured server CPU ticks | 23 | 39 | higher total across shorter test |
+| Final server RSS (KiB) | 17008 | 19052 | +2044 KiB |
+
+These figures are sourced from the **two independent JSON artifacts**
+named `openproof-gateway-tcp-benchmark` in
+`https://github.com/genyleap/openproof/actions/runs/40455238540`.
+They are a **single paired observation, not a significance claim**.
+This particular gateway configuration has **auth disabled and metrics
+disabled**; it does not exercise blocking session/PostgreSQL/OAuth/LDAP
+paths. The controlled 50ms network wait magnifies the benefit of
+nonblocking upstream forwarding and MUST NOT be used to claim
+4.96x identity platform throughput. The earlier full identity mixed-read
+comparison observed only approximately +0.90% candidate throughput.
+
+The follow-on CI change uses five alternating candidate/baseline paired
+repeats, reports median per-pair changes with exploratory uncertainty
+intervals, and retains all raw runs. No acceptance is possible before
+the live repository/provider migration, correctness and performance gates
+pass.
