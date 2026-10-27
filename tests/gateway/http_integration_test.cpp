@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <latch>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -103,6 +104,32 @@ public:
 private:
     std::atomic<int> m_active{0};
     std::atomic<int> m_peak{0};
+};
+
+class CoroutineProxyHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    CoroutineProxyHandler(httpAdapter::BeastProxyTransport& proxy, gw::Endpoint endpoint)
+        : m_proxy(&proxy), m_endpoint(std::move(endpoint)) {}
+
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        throw std::runtime_error{"synchronous proxy fallback was used"};
+    }
+
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest request) override
+    {
+        auto result = co_await m_proxy->sendAsync(
+            m_endpoint, std::move(request), std::chrono::seconds{2});
+        if (!result) {
+            co_return gw::HttpResponse{502, {}, "upstream unavailable"};
+        }
+        co_return std::move(result).value();
+    }
+
+private:
+    httpAdapter::BeastProxyTransport* m_proxy;
+    gw::Endpoint m_endpoint;
 };
 
 class CoroutineThrowingHandler final : public httpAdapter::CoroutineHttpHandler {
@@ -236,10 +263,13 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     httpAdapter::BeastHttpServer server{handler, serverConfig()};
     ASSERT_TRUE(server.start());
     std::atomic<int> success{0};
+    std::latch simultaneousStart{17};
     std::vector<std::thread> clients;
     clients.reserve(16);
     for (int index = 0; index < 16; ++index) {
         clients.emplace_back([&] {
+            simultaneousStart.count_down();
+            simultaneousStart.wait();
             try {
                 const auto response = sendRequest(server.boundPort(),
                     beastHttp::verb::get, "/");
@@ -250,12 +280,39 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
             } catch (...) {}
         });
     }
+    simultaneousStart.count_down();
+    simultaneousStart.wait();
     for (auto& client : clients) client.join();
     EXPECT_EQ(success.load(), 16);
     // The bounded worker pool has only 8 threads. A real suspension must
     // allow more than 8 outstanding handler coroutines simultaneously.
     EXPECT_GT(handler.peak(), 8);
     server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, NativeAsyncProxyPerformsRealTcpRoundTrip)
+{
+    WaitingHandler upstreamHandler;
+    httpAdapter::BeastHttpServer upstreamServer{upstreamHandler, serverConfig()};
+    ASSERT_TRUE(upstreamServer.start());
+
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    CoroutineProxyHandler edgeHandler{
+        *proxy.value(), gw::Endpoint::create(
+            gw::EndpointId{"loopback-upstream"}, "127.0.0.1",
+            upstreamServer.boundPort(), false, 1U).value()};
+    httpAdapter::BeastHttpServer edgeServer{edgeHandler, serverConfig()};
+    ASSERT_TRUE(edgeServer.start());
+
+    const auto response = sendRequest(
+        edgeServer.boundPort(), beastHttp::verb::get, "/api/items");
+    EXPECT_EQ(response.result(), beastHttp::status::ok);
+    EXPECT_EQ(response.body(), "ok");
+
+    edgeServer.stop();
+    upstreamServer.stop();
 }
 
 TEST(BeastHttpIntegrationTest, CoroutineExceptionIsRedactedAfterSuspension)

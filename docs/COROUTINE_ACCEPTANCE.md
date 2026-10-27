@@ -157,3 +157,13 @@ synchronous methods. The coroutine-aware listener must not be advertised
 as an async identity platform until their real I/O dependencies are
 converted and the release gate passes. A successfully built but unused
 coroutine adapter is insufficient evidence.
+
+The wire suite also includes a real TCP loopback proxy integration: a
+`CoroutineHttpHandler` delegates to `BeastProxyTransport::sendAsync` and
+returns the upstream response without ever calling its synchronous
+`handle()` fallback. It proves the listener and existing asynchronous
+Beast proxy transport can compose through an Asio executor.
+
+Passing this adapter test is **not equivalent** to converting the
+OpenProof Gateway's authorization, OAuth, account and storage call chains.
+Those interfaces remain subject to the NOT_APPROVED release gate.
