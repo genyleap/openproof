@@ -106,6 +106,14 @@ asio::awaitable<void> verifyLegacySessionReadAndRevoke(
         && fromNew->value().state() == ses::SessionState::Revoked;
 }
 
+asio::awaitable<void> verifyNewRejectsLegacyRevocation(
+    pg::CoroutinePostgresSessionRepository& repository, bool& denied)
+{
+    auto attempt = co_await repository.use(digestOf(0x61), kNow + 3min);
+    denied = !attempt
+        && attempt.error().code() == fnd::ErrorCode::AuthenticationFailed;
+}
+
 struct Results {
     bool issued{};
     bool touched{};
@@ -241,15 +249,12 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     ASSERT_TRUE(legacy.revoke(
         ses::SessionId{"async-interop"}, kNow + 2min));
     io.restart();
+    bool rejected = false;
     auto deniedByNew = asio::co_spawn(
-        io, repository.use(digestOf(0x61), kNow + 3min),
+        io, verifyNewRejectsLegacyRevocation(repository, rejected),
         asio::use_future);
     io.run();
-    const auto rejected = deniedByNew.get();
-    EXPECT_FALSE(rejected);
-    if (!rejected) {
-        EXPECT_EQ(rejected.error().code(),
-                  fnd::ErrorCode::AuthenticationFailed);
-    }
+    ASSERT_NO_THROW(deniedByNew.get());
+    EXPECT_TRUE(rejected);
     EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 2U);
 }

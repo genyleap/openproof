@@ -581,3 +581,13 @@ The focused test target now compiles the existing
 directly, without linking unrelated HTTP services or changing the
 production executable. No Boost.JSON package version is silently mixed,
 and there is exactly one implementation TU per test executable.
+
+### Boost.Asio co_spawn result compatibility in the test harness
+
+The `4b9db21` isolated CI run linked the domain binary dependencies and
+reached the interoperability test source. Boost 1.88 `co_spawn(use_future)`
+requires a default-constructible result type for its exception path, while
+`foundation::Result<session::Session>` is intentionally not
+default-constructible. The test now awaits that Result inside a `void`
+coroutine and reports only the denial assertion back to GoogleTest. The
+domain Result type was not weakened or given a synthetic default Session.
