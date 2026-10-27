@@ -317,13 +317,13 @@ public:
             const bool headRequest = incoming.method() == beastHttp::verb::head;
             asio::co_spawn(m_owner->m_handlerPool,
                 dispatchHandler(std::move(request).value(), version, headRequest),
-                [self = shared_from_this()](std::exception_ptr error) {
+                [self = shared_from_this()](std::exception_ptr coroutineError) {
                     // The operation owns request state and its connection is
                     // pinned by this completion callback until it finishes.
-                    if (error) {
+                    if (coroutineError) {
                         self->m_owner->m_pendingHandlers.fetch_sub(
                             1U, std::memory_order_acq_rel);
-                        try { std::rethrow_exception(error); }
+                        try { std::rethrow_exception(coroutineError); }
                         catch (...) {}
                     }
                 });
