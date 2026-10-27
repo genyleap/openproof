@@ -1,0 +1,22 @@
+# GitHub Linguist: report maintained OpenProof runtime and SDK languages.
+# C++26 module interface units are C++ source files.
+*.cppm linguist-language=C++
+*.qml linguist-language=QML
+
+# Verification, examples, and local development scripts are auxiliary.
+tests/** linguist-detectable=false
+fuzz/** linguist-detectable=false
+examples/** linguist-detectable=false
+scripts/** linguist-detectable=false
+sdk/javascript/test.mjs linguist-detectable=false
+sdk/kotlin/src/test/** linguist-detectable=false
+sdk/swift/Tests/** linguist-detectable=false
+tools/docs-mcp/test.mjs linguist-detectable=false
+
+# Reference documentation does not represent implementation languages.
+docs/** linguist-documentation
+
+# Future imported and generated sources.
+vendor/** linguist-vendored
+third_party/** linguist-vendored
+generated/** linguist-generated
