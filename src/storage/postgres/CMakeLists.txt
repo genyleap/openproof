@@ -57,7 +57,8 @@ openproof_add_module(openproof_storage_postgres
 # when a test/executable uses both imports and Boost.Asio includes.
 add_library(openproof_postgres_async_repository STATIC
     session_domain.cpp
-    coroutine_session_repository.cpp)
+    coroutine_session_repository.cpp
+    coroutine_session_authenticator.cpp)
 target_compile_features(openproof_postgres_async_repository PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_repository PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")

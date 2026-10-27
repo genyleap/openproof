@@ -4,11 +4,13 @@
 #include <chrono>
 #include <future>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "coroutine_session_repository.hpp"
+#include "coroutine_session_authenticator.hpp"
 
 import openproof.foundation;
 import openproof.identity.core;
@@ -152,4 +154,48 @@ TEST(PostgresCoroutineDomainTest, NativeRepositoryUsesAsyncPoolAndFailsClosed)
     EXPECT_TRUE(writeDenied);
     EXPECT_TRUE(collectionDenied);
 }
+
+boost::asio::awaitable<void> verifyBearerAuthenticationBridge(
+    pg::CoroutineSessionAuthenticator& authenticator,
+    bool& emptyRejected, bool& dbFailedClosed)
+{
+    auto empty = co_await authenticator.authenticate(
+        openproof::foundation::SecretString{std::string{}});
+    emptyRejected = !empty && empty.error().code()
+        == openproof::foundation::ErrorCode::AuthenticationFailed;
+    auto validShape = co_await authenticator.authenticate(
+        openproof::foundation::SecretString{
+            "only-a-test-bearer-not-a-real-credential"});
+    dbFailedClosed = !validShape && validShape.error().code()
+        == openproof::foundation::ErrorCode::Unavailable;
+}
+
+TEST(PostgresCoroutineDomainTest, BearerHmacAuthenticationUsesAsyncRepository)
+{
+    namespace fnd = openproof::foundation;
+    boost::asio::io_context io;
+    pg::CoroutinePostgresSessionRepository repository{
+        io.get_executor(),
+        fnd::SecretString{"openproof_invalid_connection_keyword=invalid"},
+        1U, std::chrono::milliseconds{100},
+        std::chrono::milliseconds{100}, std::chrono::milliseconds{100}};
+    const fnd::ManualClockSource clock{
+        fnd::Instant{std::chrono::milliseconds{1800}}};
+    EXPECT_THROW((pg::CoroutineSessionAuthenticator{
+        repository, clock, fnd::SecretString{std::string(31, 'k')}}),
+        std::invalid_argument);
+    pg::CoroutineSessionAuthenticator authenticator{
+        repository, clock, fnd::SecretString{std::string(32, 'k')}};
+    bool emptyRejected = false;
+    bool dbFailedClosed = false;
+    auto future = boost::asio::co_spawn(
+        io, verifyBearerAuthenticationBridge(
+            authenticator, emptyRejected, dbFailedClosed),
+        boost::asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(emptyRejected);
+    EXPECT_TRUE(dbFailedClosed);
+}
+
 } // namespace

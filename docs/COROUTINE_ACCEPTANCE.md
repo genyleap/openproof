@@ -621,3 +621,23 @@ local test may be used with a production database.
 Acceptance remains **NOT_APPROVED** until a complete local build, real DB
 regressions, full request-path coroutine migration, security checks and
 full-workload performance comparisons pass.
+
+### Native coroutine session bearer authentication (local-only)
+
+The experimental async storage integration now provides a
+`CoroutineSessionAuthenticator` that accepts an **owned**
+`foundation::SecretString` bearer, validates the same minimum 32-byte
+server-side HMAC key used by the synchronous SessionService, computes the
+HMAC-SHA-256 token digest *before its first suspension*, and awaits the
+nonblocking `CoroutinePostgresSessionRepository::use` call. The raw bearer
+is never passed to SQL, put into a coroutine I/O frame or included in a
+database error. An empty token fails as `AuthenticationFailed` without
+opening a DB connection; a cryptographic provider failure maps to
+`Internal`, rather than being misreported as an invalid credential.
+The fake-connection local test also requires a sanitized `Unavailable`
+result for a syntactically valid bearer.
+
+This is a first application-level authentication bridge, not proof the
+existing HTTP/SessionService path is migrated. It is not deployed, and
+its new test remains pending compilation on the resource-limited shared
+server.
