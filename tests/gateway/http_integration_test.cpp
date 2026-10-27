@@ -107,6 +107,23 @@ private:
     std::atomic<int> m_peak{0};
 };
 
+class MetricsFacadeStub final : public gw::HttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest request) override
+    {
+        if (request.path() != "/metrics") {
+            throw std::runtime_error{"metrics facade handled a non-metrics route"};
+        }
+        const auto authorization = request.header("authorization");
+        if (!authorization || *authorization != "Bearer test-only") {
+            return gw::HttpResponse{401,
+                gw::Headers{{"cache-control", "no-store"}}, ""};
+        }
+        return gw::HttpResponse{200,
+            gw::Headers{{"content-type", "text/plain"}}, "counter 1"};
+    }
+};
+
 class CoroutineProxyHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
     CoroutineProxyHandler(httpAdapter::BeastProxyTransport& proxy, gw::Endpoint endpoint)
@@ -211,7 +228,7 @@ struct CoreFixture {
 [[nodiscard]] beastHttp::response<beastHttp::string_body>
 sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
             std::string body = {}, std::string largeHeader = {},
-            std::string forwardedClientIp = {})
+            std::string forwardedClientIp = {}, std::string bearerToken = {})
 {
     asio::io_context context;
     Tcp::resolver resolver{context};
@@ -220,6 +237,7 @@ sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
     stream.connect(resolver.resolve("127.0.0.1", std::to_string(port)));
     beastHttp::request<beastHttp::string_body> request{method, std::move(target), 11};
     request.set(beastHttp::field::host, "localhost");
+    if (!bearerToken.empty()) request.set(beastHttp::field::authorization, bearerToken);
     if (!largeHeader.empty()) request.set("x-large", largeHeader);
     if (!forwardedClientIp.empty()) {
         request.set("x-forwarded-for", std::move(forwardedClientIp));
@@ -288,6 +306,43 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     // The bounded worker pool has only 8 threads. A real suspension must
     // allow more than 8 outstanding handler coroutines simultaneously.
     EXPECT_GT(handler.peak(), 8);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, CoroutineMetricsWrapperKeepsGuardAndAsyncFallback)
+{
+    MetricsFacadeStub facade;
+    CoroutineWaitingHandler asyncFallback;
+    std::atomic<int> observations{0};
+    std::atomic<int> lastStatus{0};
+    httpAdapter::CoroutineMetricsAdapter handler{
+        facade, asyncFallback,
+        [&observations, &lastStatus](
+            gw::HttpMethod method, int status, double duration) {
+            if (method == gw::HttpMethod::Get && duration > 0.0) {
+                lastStatus.store(status, std::memory_order_relaxed);
+                observations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }};
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto denied = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/metrics");
+    EXPECT_EQ(denied.result(), beastHttp::status::unauthorized);
+    EXPECT_EQ(denied.at("cache-control"), "no-store");
+    const auto allowed = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/metrics",
+        {}, {}, {}, "Bearer test-only");
+    EXPECT_EQ(allowed.result(), beastHttp::status::ok);
+    EXPECT_EQ(allowed.body(), "counter 1");
+
+    const auto forwarded = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/api/ping");
+    EXPECT_EQ(forwarded.result(), beastHttp::status::ok);
+    EXPECT_EQ(forwarded.body(), "async");
+    EXPECT_EQ(observations.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(lastStatus.load(std::memory_order_relaxed), 200);
     server.stop();
 }
 

@@ -193,3 +193,30 @@ authentication) still exposes synchronous handlers. The async plan's
 authorization phase remains synchronous until the PostgreSQL repository,
 provider and session SPIs are converted. This is a step toward the end-to-end
 implementation, not an approval.
+
+### Async Gateway with authenticated Prometheus middleware
+
+The `openproof.gateway.http` transport adapter now contains
+`CoroutineMetricsAdapter`, an optional wrapper for a
+`CoroutineHttpHandler` behind the existing `MetricsHttpApi` facade.
+
+- **Exact `/metrics` requests remain in the original MetricsHttpApi**
+  (its constant-time bearer-token verification, supported-method checks,
+  fixed no-store response headers and bounded/low-cardinality counters
+  remain authoritative).
+- All other requests are passed to the coroutine fallback via
+  `co_await handleAsync`. The facade's observer receives the same method,
+  response status and elapsed time as the legacy HTTP instrumentation.
+- In the `opp` composition root this bridge activates automatically only
+  when metrics is enabled **and the underlying handler supports async**.
+  Authentication-enabled stacks that have not been migrated continue to
+  use their existing synchronous middleware until migrated, so no auth
+  decision or protected route is bypassed.
+- A focused Beast/TCP integration regression verifies that an unauthenticated
+  metrics scrape remains HTTP 401, a valid scrape stays HTTP 200, and a
+  non-metrics request reaches an actually suspended Coroutine handler,
+  with exactly one response observation.
+
+This is a partial transport/middleware migration. Production repository,
+OAuth account and enterprise provider blocking operations still fail the
+independent release acceptance gate.

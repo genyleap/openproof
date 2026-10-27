@@ -182,6 +182,12 @@ std::string MetricsHttpApi::prometheus() const
     return output;
 }
 
+void MetricsHttpApi::observeAsyncResponse(
+    gateway::HttpMethod method, int status, double elapsedSeconds) noexcept
+{
+    record(method, status, elapsedSeconds);
+}
+
 gateway::HttpResponse MetricsHttpApi::handle(gateway::HttpRequest request)
 {
     const gateway::HttpMethod method = request.method();

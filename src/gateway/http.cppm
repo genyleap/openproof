@@ -2,6 +2,7 @@ module;
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -134,6 +135,28 @@ private:
  * Until repository SPIs are migrated, auth/authorization may still block
  * a bounded handler worker; this is NOT full coroutine coverage.
  */
+/** Optional transport-level middleware bridge. When a telemetry facade
+ * exposes a synchronous /metrics endpoint, the remaining (non-metrics)
+ * request is forwarded to the native asynchronous handler. The callback
+ * preserves response status and latency accounting without blocking the
+ * network reactor or importing operations code into the gateway transport.
+ */
+class CoroutineMetricsAdapter final : public CoroutineHttpHandler {
+public:
+    using Observer = std::function<void(HttpMethod, int, double)>;
+
+    CoroutineMetricsAdapter(HttpHandler& metricsFacade,
+                            CoroutineHttpHandler& fallback, Observer observer);
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<HttpResponse>
+    handleAsync(HttpRequest request) override;
+
+private:
+    HttpHandler* m_metricsFacade;
+    CoroutineHttpHandler* m_fallback;
+    Observer m_observer;
+};
+
 class CoroutineGatewayAdapter final : public CoroutineHttpHandler {
 public:
     CoroutineGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport);

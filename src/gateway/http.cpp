@@ -785,6 +785,37 @@ BeastProxyTransport::sendAsync(
         std::move(endpoint), std::move(request), timeout);
 }
 
+CoroutineMetricsAdapter::CoroutineMetricsAdapter(
+    HttpHandler& metricsFacade, CoroutineHttpHandler& fallback, Observer observer)
+    : m_metricsFacade(&metricsFacade), m_fallback(&fallback),
+      m_observer(std::move(observer))
+{
+}
+
+HttpResponse CoroutineMetricsAdapter::handle(HttpRequest request)
+{
+    // Only the legacy synchronous entry goes through the telemetry facade.
+    return m_metricsFacade->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineMetricsAdapter::handleAsync(HttpRequest request)
+{
+    if (request.path() == "/metrics") {
+        // The security-sensitive constant-time bearer verification and the
+        // Prometheus response are still owned by MetricsHttpApi. Never bypass
+        // that facade or synthesize a metrics response in the transport.
+        co_return m_metricsFacade->handle(std::move(request));
+    }
+    const HttpMethod method = request.method();
+    const auto started = std::chrono::steady_clock::now();
+    HttpResponse result = co_await m_fallback->handleAsync(std::move(request));
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    m_observer(method, result.status(), elapsed);
+    co_return result;
+}
+
 CoroutineGatewayAdapter::CoroutineGatewayAdapter(
     Gateway& gateway, BeastProxyTransport& transport)
     : m_gateway(&gateway), m_transport(&transport)

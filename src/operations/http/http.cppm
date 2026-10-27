@@ -53,6 +53,13 @@ public:
                    gateway::HttpHandler& fallback);
     ~MetricsHttpApi() override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
+
+    /** Records an async fallback response using the identical bounded,
+     * low-cardinality counters as the synchronous middleware path.
+     * Path, identity, address and token contents are never captured.
+     */
+    void observeAsyncResponse(gateway::HttpMethod method, int status,
+                              double elapsedSeconds) noexcept;
 private:
     struct MetricsState;
     void record(gateway::HttpMethod method, int status, double elapsedSeconds) noexcept;

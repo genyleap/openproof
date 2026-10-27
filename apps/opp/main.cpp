@@ -1300,6 +1300,7 @@ addProtectedRoutes(gateway::Router& router,
     }
     std::unique_ptr<telemetry::MetricRegistry> metrics;
     std::unique_ptr<operationsHttp::MetricsHttpApi> metricsApi;
+    std::unique_ptr<gatewayHttp::CoroutineMetricsAdapter> asyncMetricsApi;
     gateway::HttpHandler* listenerHandler = &handler;
     if (platform.operations().metricsEnabled()) {
         metrics = std::make_unique<telemetry::MetricRegistry>(
@@ -1309,6 +1310,19 @@ addProtectedRoutes(gateway::Router& router,
         metricsApi = std::make_unique<operationsHttp::MetricsHttpApi>(
             *metrics, platform.operations().metricsBearerToken().clone(), handler);
         listenerHandler = metricsApi.get();
+        if (auto* asyncFallback =
+                dynamic_cast<gatewayHttp::CoroutineHttpHandler*>(&handler)) {
+            // Metrics is still authenticated by the original facade; all
+            // non-metrics Gateway requests retain their coroutine transport
+            // and the same low-cardinality request instrumentation.
+            asyncMetricsApi = std::make_unique<gatewayHttp::CoroutineMetricsAdapter>(
+                *metricsApi, *asyncFallback,
+                [observer = metricsApi.get()](
+                    gateway::HttpMethod method, int status, double elapsed) noexcept {
+                    observer->observeAsyncResponse(method, status, elapsed);
+                });
+            listenerHandler = asyncMetricsApi.get();
+        }
     }
     gatewayHttp::BeastHttpServer server{
         *listenerHandler, std::move(serverConfig).value()};
