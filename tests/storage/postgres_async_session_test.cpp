@@ -204,6 +204,42 @@ asio::awaitable<void> sessionCreationListingAndPurge(
 
 } // namespace
 
+TEST(PostgresAsyncSessionSqlTest, StrictlyDecodesRowsBeforeDomainRestore)
+{
+    pg::AsyncSessionSql::SessionFields fields{
+        "sample-id", "sample-identity", "sample-provider", "1", "3", "t",
+        "0", std::string{kDigestA}, "1000", "1000", "1500", "10000",
+        "3000", std::nullopt, "sample-agent", std::nullopt
+    };
+    const auto snapshot = pg::AsyncSessionSql::decodeRow(fields);
+    EXPECT_EQ(snapshot.id, "sample-id");
+    EXPECT_EQ(snapshot.identityId, "sample-identity");
+    EXPECT_EQ(snapshot.factors, 3U);
+    EXPECT_TRUE(snapshot.phishingResistant);
+    EXPECT_EQ(snapshot.lastSeenAtMs, 1500);
+    EXPECT_FALSE(snapshot.revokedAtMs.has_value());
+    ASSERT_TRUE(snapshot.userAgent.has_value());
+    EXPECT_EQ(*snapshot.userAgent, "sample-agent");
+
+    fields[6] = "1";
+    EXPECT_THROW(static_cast<void>(pg::AsyncSessionSql::decodeRow(fields)), std::runtime_error);
+    fields[13] = "1600";
+    const auto revoked = pg::AsyncSessionSql::decodeRow(fields);
+    EXPECT_EQ(revoked.state, 1U);
+    ASSERT_TRUE(revoked.revokedAtMs.has_value());
+    EXPECT_EQ(*revoked.revokedAtMs, 1600);
+    fields[5] = "unexpected";
+    EXPECT_THROW(static_cast<void>(pg::AsyncSessionSql::decodeRow(fields)), std::runtime_error);
+    fields[5] = "t";
+    fields[7] = "not-a-digest";
+    EXPECT_THROW(static_cast<void>(pg::AsyncSessionSql::decodeRow(fields)), std::runtime_error);
+    fields[7] = std::string{kDigestA};
+    fields[12] = "-1";
+    EXPECT_THROW(static_cast<void>(pg::AsyncSessionSql::decodeRow(fields)), std::runtime_error);
+    fields.pop_back();
+    EXPECT_THROW(static_cast<void>(pg::AsyncSessionSql::decodeRow(fields)), std::runtime_error);
+}
+
 TEST(PostgresAsyncSessionSqlTest, AtomicUseRotationReplayAndIdleExpiry)
 {
     const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");

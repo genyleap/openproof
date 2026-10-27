@@ -458,3 +458,17 @@ These methods complete the **internal SQL command coverage**, not the
 public coroutine session SPI, domain object materialization, or production
 integration. A session list that exceeds the transport's result cap still
 fails closed; a paginated client-facing API is needed before deployment.
+
+
+### Storage-to-domain session row boundary
+
+A synchronous, deterministic `AsyncSessionSql::decodeRow` now converts the
+native libpq adapter's fully owned sixteen-column result into a typed
+`SessionSnapshot` with numeric assurance, factor, state and timestamps,
+SQL NULL-safe optional fields, and an owned hexadecimal token digest. It
+rejects invalid PostgreSQL boolean text, invalid digest encodings, missing
+required columns, invalid enum ranges, impossible timestamp order, invalid
+idle timeout and inconsistent revoked-state timestamps. A DB-independent
+negative test exercises valid and intentionally malformed rows. Domain
+`session::Session::restore` still must run after this storage validation
+when the actual repository interface is migrated.

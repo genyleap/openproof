@@ -56,6 +56,27 @@ constexpr std::string_view kSessionFields =
     return std::move(rows.rows.front());
 }
 
+template <typename Integer>
+[[nodiscard]] Integer parseRequiredNumber(
+    const std::optional<std::string>& field)
+{
+    if (!field) throw std::runtime_error{"PostgreSQL session field is NULL"};
+    Integer value{};
+    const auto [end, ec] = std::from_chars(
+        field->data(), field->data() + field->size(), value);
+    if (ec != std::errc{} || end != field->data() + field->size()) {
+        throw std::runtime_error{"PostgreSQL session number is invalid"};
+    }
+    return value;
+}
+
+[[nodiscard]] const std::string& requiredText(
+    const std::optional<std::string>& field)
+{
+    if (!field) throw std::runtime_error{"PostgreSQL session field is NULL"};
+    return *field;
+}
+
 [[nodiscard]] std::size_t parseScalarCount(const QueryRows& rows)
 {
     if (rows.rows.size() != 1U || rows.rows[0].size() != 1U
@@ -82,6 +103,49 @@ asio::awaitable<void> executeInsert(
 }
 
 } // namespace
+
+AsyncSessionSql::SessionSnapshot AsyncSessionSql::decodeRow(
+    const SessionFields& fields)
+{
+    if (fields.size() != 16U) {
+        throw std::runtime_error{"PostgreSQL session row has invalid shape"};
+    }
+    SessionSnapshot result;
+    result.id = requiredText(fields[0]);
+    result.identityId = requiredText(fields[1]);
+    result.provider = requiredText(fields[2]);
+    result.assurance = parseRequiredNumber<unsigned int>(fields[3]);
+    result.factors = parseRequiredNumber<unsigned int>(fields[4]);
+    const std::string& resistant = requiredText(fields[5]);
+    if (resistant != "t" && resistant != "f") {
+        throw std::runtime_error{"PostgreSQL session boolean is invalid"};
+    }
+    result.phishingResistant = resistant == "t";
+    result.state = parseRequiredNumber<unsigned int>(fields[6]);
+    result.tokenDigestHex = requiredText(fields[7]);
+    result.authenticatedAtMs = parseRequiredNumber<std::int64_t>(fields[8]);
+    result.issuedAtMs = parseRequiredNumber<std::int64_t>(fields[9]);
+    result.lastSeenAtMs = parseRequiredNumber<std::int64_t>(fields[10]);
+    result.absoluteExpiresAtMs = parseRequiredNumber<std::int64_t>(fields[11]);
+    result.idleTimeoutMs = parseRequiredNumber<std::int64_t>(fields[12]);
+    if (fields[13]) {
+        result.revokedAtMs = parseRequiredNumber<std::int64_t>(fields[13]);
+    }
+    result.userAgent = fields[14];
+    result.remoteAddress = fields[15];
+
+    if (!validId(result.id) || !validId(result.identityId)
+        || !validId(result.provider) || !validDigest(result.tokenDigestHex)
+        || result.assurance > 4U || result.factors > 7U || result.state > 2U
+        || result.authenticatedAtMs > result.issuedAtMs
+        || result.issuedAtMs > result.lastSeenAtMs
+        || result.lastSeenAtMs >= result.absoluteExpiresAtMs
+        || result.idleTimeoutMs <= 0
+        || (result.state == 1U) != result.revokedAtMs.has_value()) {
+        throw std::runtime_error{"PostgreSQL session data violates invariants"};
+    }
+    return result;
+}
 
 asio::awaitable<void> AsyncSessionSql::add(
     AsyncConnection& connection, NewSession session,

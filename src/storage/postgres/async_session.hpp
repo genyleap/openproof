@@ -22,6 +22,29 @@ public:
 
     using SessionFields = std::vector<std::optional<std::string>>;
 
+    // Strict, owned row representation at the storage-to-domain boundary.
+    // A future coroutine repository converts this into session::Session only
+    // after shape, enum values, timestamps and digest have been validated.
+    struct SessionSnapshot final {
+        std::string id;
+        std::string identityId;
+        std::string provider;
+        std::string tokenDigestHex;
+        unsigned int assurance{};
+        unsigned int factors{};
+        bool phishingResistant{};
+        unsigned int state{};
+        std::int64_t authenticatedAtMs{};
+        std::int64_t issuedAtMs{};
+        std::int64_t lastSeenAtMs{};
+        std::int64_t absoluteExpiresAtMs{};
+        std::int64_t idleTimeoutMs{};
+        std::optional<std::int64_t> revokedAtMs;
+        std::optional<std::string> userAgent;
+        std::optional<std::string> remoteAddress;
+    };
+    [[nodiscard]] static SessionSnapshot decodeRow(const SessionFields& fields);
+
     struct NewSession final {
         std::string id;
         std::string identityId;
