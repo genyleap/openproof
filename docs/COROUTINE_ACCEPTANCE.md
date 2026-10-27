@@ -551,3 +551,20 @@ coroutine in a GoogleTest translation unit. Exactly the two new coroutine
 the warning in logs; **production and all other diagnostics retain
 `-Werror`**. The new isolated real PostgreSQL full-lifecycle test remains
 unapproved until it actually passes.
+
+The same isolated fixture now also checks **live-format repository
+interoperability**: it inserts an active session through the original
+synchronous `PostgresSessionRepository`, reads and touches the bearer from
+the new coroutine repository, revokes that row using the coroutine path,
+and verifies that the legacy synchronous repository immediately refuses
+reuse of the revoked token. The test is intentionally sequential across
+the reactor/synchronous boundary and never calls a blocking repository
+method from within an Asio worker coroutine. This verifies durable session
+format compatibility, not thread-level throughput or full service migration.
+
+For the reverse direction, the fixture inserts a session through the
+**coroutine** repository and checks the existing synchronous repository
+can authenticate it, then revokes it through the synchronous path and
+checks that the coroutine repository denies its bearer. Thus creation,
+validation and revocation are checked in both cross-implementation directions
+against the same isolated real PostgreSQL schema.

@@ -92,6 +92,20 @@ void seedOrganizationAndIdentities(std::string_view url)
     return ses::TokenDigest{digest};
 }
 
+asio::awaitable<void> verifyLegacySessionReadAndRevoke(
+    pg::CoroutinePostgresSessionRepository& repository,
+    bool& crossReadable, bool& crossRevoked)
+{
+    auto used = co_await repository.use(digestOf(0x51), kNow + 1min);
+    crossReadable = used && used->id().value() == "legacy-interop"
+        && used->lastSeenAt() == kNow + 1min;
+    auto revoked = co_await repository.revoke(
+        ses::SessionId{"legacy-interop"}, kNow + 2min);
+    auto fromNew = co_await repository.find(ses::SessionId{"legacy-interop"});
+    crossRevoked = revoked && fromNew && fromNew->has_value()
+        && fromNew->value().state() == ses::SessionState::Revoked;
+}
+
 struct Results {
     bool issued{};
     bool touched{};
@@ -191,4 +205,51 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(results.revoked);
     EXPECT_TRUE(results.identityScoped);
     EXPECT_TRUE(results.purged);
+
+    // Migration compatibility is bidirectional: a session written by the
+    // deployed synchronous repository must still be valid to the new
+    // nonblocking repository, and a revoke by the new path must be visible
+    // immediately to the old one. All changes stay in this disposable DB.
+    pg::PostgresSessionRepository legacy{*syncPool.value()};
+    ASSERT_TRUE(legacy.add(
+        createSession("legacy-interop", "coroutine-user-a", 0x51)));
+    io.restart();
+    bool crossReadable = false, crossRevoked = false;
+    auto interoperability = asio::co_spawn(
+        io, verifyLegacySessionReadAndRevoke(
+            repository, crossReadable, crossRevoked), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(interoperability.get());
+    EXPECT_TRUE(crossReadable);
+    EXPECT_TRUE(crossRevoked);
+    const auto deniedByOld = legacy.use(digestOf(0x51), kNow + 3min);
+    EXPECT_FALSE(deniedByOld);
+    if (!deniedByOld) {
+        EXPECT_EQ(deniedByOld.error().code(),
+                  fnd::ErrorCode::AuthenticationFailed);
+    }
+    io.restart();
+    auto asyncInsert = asio::co_spawn(
+        io, repository.add(createSession(
+            "async-interop", "coroutine-user-b", 0x61)),
+        asio::use_future);
+    io.run();
+    ASSERT_TRUE(asyncInsert.get());
+    const auto acceptedByOld = legacy.use(digestOf(0x61), kNow + 1min);
+    ASSERT_TRUE(acceptedByOld);
+    EXPECT_EQ(acceptedByOld->id().value(), "async-interop");
+    ASSERT_TRUE(legacy.revoke(
+        ses::SessionId{"async-interop"}, kNow + 2min));
+    io.restart();
+    auto deniedByNew = asio::co_spawn(
+        io, repository.use(digestOf(0x61), kNow + 3min),
+        asio::use_future);
+    io.run();
+    const auto rejected = deniedByNew.get();
+    EXPECT_FALSE(rejected);
+    if (!rejected) {
+        EXPECT_EQ(rejected.error().code(),
+                  fnd::ErrorCode::AuthenticationFailed);
+    }
+    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 2U);
 }
