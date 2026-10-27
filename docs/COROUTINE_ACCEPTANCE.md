@@ -735,3 +735,82 @@ Pending: cancellation after partial commit; complete domain-to-HTTP
 coroutine propagation; external providers; and whole-application paired
 performance tests. The release gate remains NOT_APPROVED until all original
 blockers are eliminated and CI is green.
+
+### Experimental coroutine HTTP session mutation adapter
+
+A separate, **opt-in** `CoroutineSessionHttpHandler` now targets the three
+existing POST endpoints `/auth/session/rotate`, `/auth/logout`, and
+`/auth/logout-all`. Unlike a synchronous forwarding shim, its
+`handleAsync()` genuinely suspends on
+`CoroutinePostgresSessionService` and the native PostgreSQL repository.
+The original `takeSessionCredential()` parser is reused so ambiguous
+cookie/Bearer combinations and malformed tokens do not bypass protocol
+rules. The existing per-IP auth rate limit, session-cookie attributes
+(Secure, HttpOnly, SameSite=Strict, Path=/), cache headers, error mapping,
+missing-token logout behavior, token rotation and post-revocation logout
+semantics are preserved. An unavailable DB cannot produce a fresh cookie
+or clear a session cookie misleadingly. Other paths are passed unchanged
+to an asynchronous fallback callback.
+
+The adapter exposes only `handleAsync()`, not a synchronous
+`handle()` method. It cannot silently dispatch session mutations to
+the old blocking repository. This class is not wired into the canonical
+server; activation requires an explicit network transport bridge, audited
+shutdown/executor lifetime handling, full HTTP policy parity and integration
+with the nested auth/OAuth handler chain.
+
+A new suite `PostgresCoroutineHttpTest` exercises genuine
+`HttpRequest`/`HttpResponse` objects through the coroutine session
+application handler (without constructing the heavyweight Beast listener)
+to check unauthenticated rotation, anonymous logout cookies, database
+outage, ambiguous simultaneous Bearer and Cookie credentials, forbidden
+HTTP methods, and async fallback continuity. The isolated real-PostgreSQL integration fixture additionally
+issues a trusted login, rotates the bearer through the coroutine HTTP
+adapter, verifies cookie delivery, rejects old-token replay and revokes
+the new token by HTTP Logout. These two suites must pass locally before
+this HTTP application bridge is considered verified. The listener integration
+is expressly **not verified** until a true Beast loopback wire test passes.
+The full Gateway HTTP compiler rebuild was stopped locally after it spent
+over half an hour compiling the existing `gateway/http.cpp` with GCC 16
+on the shared single-vCPU server. To avoid modifying production optimization
+or disrupting other services, the new handler instead depends only on the
+transport-neutral `openproof.gateway` module and an asynchronous callback.
+The listener wiring remains a tracked blocker. No production redeployment
+or GitHub Actions push is authorized.
+
+### Verified coroutine HTTP application handler checkpoint (local-only)
+
+The initial Beast-coupled adapter was decomposed into a small
+`CoroutineSessionHttpHandler` depending on the transport-neutral
+`openproof.gateway` module and an awaitable fallback callback. This
+preserves the true `HttpRequest`/`HttpResponse` contract, including
+credential extraction, no-store error responses and session cookie headers,
+without rebuilding the heavyweight `openproof.gateway.http` transport for
+every experimental revision. In particular, the HTTP handler does **not**
+inherit the live listener's transport interface and has **not** been
+registered in `apps/opp`.
+
+The new application handler compiled with GCC 16.2 and `-Werror`.
+Eight `PostgresCoroutineHttpTest` cases passed on the server and all
+six standalone domain tests remained green: uncredentialed rotation,
+anonymous Logout, fail-closed 503 on unavailable DB, ambiguous
+Bearer+Cookie rejection, rejecting wrong HTTP methods, throttling on
+IP rate-limit exhaustion, rejecting repeated session cookies and coroutine
+fallback to other routes. These are real application message objects,
+**not socket-level HTTP/1.1 wire tests**.
+
+The disposable PostgreSQL 16 container also passed 24/24 native SQL,
+connection and pool tests, and 1/1 real-schema domain integration test.
+That expanded end-to-end *application handler* fixture covers successful
+Rotate response, accepting the replacement session cookie, rejecting
+old-token replay, individual Logout, and Logout-All with two sessions
+belonging to the requesting identity while a third session belonging to
+a different identity remains authenticated. The last expanded database
+integration ran in 424 ms; this is wall time for the test, not a
+comparative throughput benchmark. The runner removed the container.
+
+The pending transport tasks are: an audited Beast
+`CoroutineHttpHandler` bridge; insertion in the live auth/OAuth handler
+chain without sync fallback; use of a shared executor/lifetime budget;
+request cancellation; and real loopback/synthetic production workload
+comparisons. HTTP transport migration remains **NOT_APPROVED**.

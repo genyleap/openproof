@@ -176,6 +176,7 @@ gtest_discover_tests(openproof_gateway_http_tests
 add_executable(openproof_postgres_domain_tests
     storage/postgres_async_domain_test.cpp
     storage/postgres_coroutine_repository_integration_test.cpp
+    storage/postgres_coroutine_http_test.cpp
     # PostgreSQL storage links Evidence's Boost.JSON-using verifier objects.
     # Reuse the project's Boost.JSON implementation unit without bringing
     # unrelated HTTP service libraries into this isolated test binary.
@@ -187,7 +188,7 @@ target_compile_definitions(openproof_postgres_domain_tests PRIVATE
 set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
-    openproof_postgres_async_repository
+    openproof_postgres_async_http openproof_postgres_async_repository
     openproof_storage_postgres openproof_session openproof_foundation
     Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 # GCC 16's inlined Boost.Asio aligned coroutine-frame allocator produces a
@@ -198,6 +199,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(
         storage/postgres_async_domain_test.cpp
         storage/postgres_coroutine_repository_integration_test.cpp
+        storage/postgres_coroutine_http_test.cpp
         PROPERTIES COMPILE_OPTIONS "-Wno-error=mismatched-new-delete")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)

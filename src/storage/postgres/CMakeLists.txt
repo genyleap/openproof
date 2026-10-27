@@ -82,3 +82,26 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_session_service.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
+
+# Authentication/session HTTP routes are a separate, opt-in coroutine
+# transport facade; production's synchronous auth handler is not rewired.
+add_library(openproof_postgres_async_http STATIC coroutine_session_http.cpp)
+target_compile_features(openproof_postgres_async_http PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_http PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_postgres_async_http PROPERTIES
+    CXX_SCAN_FOR_MODULES ON
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_http PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_http
+    PUBLIC openproof_postgres_async_repository
+        openproof_gateway openproof_foundation Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 16 misattributes aligned allocations in Boost.Asio awaitable frames.
+    # Do not remove -Werror or the allocation diagnostic.
+    set_source_files_properties(coroutine_session_http.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()

@@ -3,6 +3,7 @@
 
 #include "coroutine_session_authenticator.hpp"
 #include "coroutine_session_service.hpp"
+#include "coroutine_session_http.hpp"
 #include <libpq-fe.h>
 
 #include <array>
@@ -22,6 +23,7 @@
 
 import openproof.authentication;
 import openproof.foundation;
+import openproof.gateway;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
@@ -431,6 +433,97 @@ TEST(PostgresCoroutineDomainTest, DatabaseOutageNeverIssuesOrReplacesBearer)
     EXPECT_TRUE(deniedIssuance);
 }
 
+struct HttpRouteResults {
+    bool rotated{};
+    bool oldReplayRejected{};
+    bool newCookieAuthenticated{};
+    bool logoutCleared{};
+    bool logoutRevoked{};
+    bool logoutAllScoped{};
+};
+
+asio::awaitable<void> verifyHttpSessionMutations(
+    pg::CoroutinePostgresSessionRepository& repository,
+    auth::VerifiedAuthentication trustedLogin,
+    HttpRouteResults& checks)
+{
+    namespace gw = openproof::gateway;
+    fnd::ManualClockSource clock{kNow};
+    auto policy = ses::SessionPolicy::create(8h, 30min);
+    if (!policy) co_return;
+    pg::CoroutinePostgresSessionService service{
+        repository, clock, fnd::SecretString{std::string(32, 'H')},
+        std::move(policy).value()};
+    idp::ClientContext client;
+    auto issued = co_await service.issue(trustedLogin, client);
+    if (!issued) co_return;
+    const auto original = issued->token().clone();
+
+    auto limiter = gw::TokenBucketRateLimiter::create(clock, 100.0, 100.0, 100U);
+    if (!limiter) co_return;
+    pg::CoroutineSessionHttpHandler http{
+        service, limiter.value(),
+        [](gw::HttpRequest) -> asio::awaitable<gw::HttpResponse> {
+            co_return gw::HttpResponse{404, {}, ""};
+        }};
+    auto makeRequest = [](std::string route, std::string credential) {
+        return gw::HttpRequest::create(
+            gw::HttpMethod::Post, std::move(route),
+            std::vector<std::pair<std::string, std::string>>{
+                {"authorization", "Bearer " + std::move(credential)}},
+            {}, "127.0.0.1", fnd::CorrelationId{"http-session-real"}).value();
+    };
+
+    auto rotated = co_await http.handleAsync(makeRequest(
+        "/auth/session/rotate", std::string{original.expose()}));
+    checks.rotated = rotated.status() == 200
+        && rotated.body().find("session_id") != std::string_view::npos;
+    const auto setCookie = rotated.headers().find("set-cookie");
+    if (setCookie == rotated.headers().end()) co_return;
+    const std::string& field = setCookie->second;
+    const auto equal = field.find('=');
+    const auto end = field.find(';', equal);
+    if (equal == std::string::npos || end == std::string::npos
+        || equal >= end) co_return;
+    const std::string freshBearer = field.substr(equal + 1U, end - equal - 1U);
+    auto fresh = co_await service.authenticate(fnd::SecretString{freshBearer});
+    auto old = co_await service.authenticate(original.clone());
+    checks.newCookieAuthenticated = fresh
+        && fresh->id() == issued->id();
+    checks.oldReplayRejected = !old
+        && old.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    auto logout = co_await http.handleAsync(makeRequest(
+        "/auth/logout", freshBearer));
+    const auto cleared = logout.headers().find("set-cookie");
+    checks.logoutCleared = logout.status() == 204
+        && cleared != logout.headers().end()
+        && cleared->second.find("Max-Age=0") != std::string::npos;
+    auto after = co_await service.authenticate(fnd::SecretString{freshBearer});
+    checks.logoutRevoked = !after
+        && after.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    // The HTTP logout-all operation must revoke *only* the authenticated
+    // identity. A separate identity with a valid session stays authorized.
+    auto a1 = co_await service.issue(trustedLogin, client);
+    auto a2 = co_await service.issue(trustedLogin, client);
+    if (!a1 || !a2) co_return;
+    auto b = co_await repository.add(
+        createSession("http-unrelated-identity-b", "coroutine-user-b", 0x71));
+    if (!b) co_return;
+    const auto bulkLogout = co_await http.handleAsync(makeRequest(
+        "/auth/logout-all", std::string{a1->token().expose()}));
+    auto a1After = co_await service.authenticate(a1->token().clone());
+    auto a2After = co_await service.authenticate(a2->token().clone());
+    auto bAfter = co_await repository.use(digestOf(0x71), kNow + 1min);
+    checks.logoutAllScoped = bulkLogout.status() == 204
+        && bulkLogout.headers().contains("set-cookie")
+        && !a1After && !a2After && bAfter
+        && a1After.error().code() == fnd::ErrorCode::AuthenticationFailed
+        && a2After.error().code() == fnd::ErrorCode::AuthenticationFailed
+        && bAfter->identity() == ids::IdentityId{"coroutine-user-b"};
+}
+
 struct Results {
     bool issued{};
     bool touched{};
@@ -662,5 +755,21 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(loginChecks.onlyOldRevoked);
     EXPECT_TRUE(loginChecks.staleCookieIgnored);
     EXPECT_TRUE(loginChecks.noCrossIdentityRevoke);
+    EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
+
+    io.restart();
+    HttpRouteResults httpChecks;
+    auto httpMutation = asio::co_spawn(
+        io, verifyHttpSessionMutations(
+            repository, verifiedCoroutineLogin(), httpChecks),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(httpMutation.get());
+    EXPECT_TRUE(httpChecks.rotated);
+    EXPECT_TRUE(httpChecks.newCookieAuthenticated);
+    EXPECT_TRUE(httpChecks.oldReplayRejected);
+    EXPECT_TRUE(httpChecks.logoutCleared);
+    EXPECT_TRUE(httpChecks.logoutRevoked);
+    EXPECT_TRUE(httpChecks.logoutAllScoped);
     EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
 }
