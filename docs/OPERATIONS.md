@@ -19,6 +19,22 @@ and fails closed otherwise.
 Neither endpoint returns configuration, version, database, or error details.
 Use liveness only to restart a stuck process and readiness to control traffic.
 
+Before and after every deployment, check both endpoints with the read-only
+preflight script. For a loopback listener configured with
+`trust_proxy_client_ip=true`, supply the one trusted `X-Forwarded-For` client
+address the reverse proxy normally injects; requests lacking this header
+are rejected with HTTP 400 **by design**, not because PostgreSQL is down:
+
+```sh
+node scripts/verify-running-service.mjs http://127.0.0.1:18443/ 127.0.0.1
+```
+
+Use your deployment's loopback port. The script refuses plain HTTP to
+non-loopback addresses and will only send a caller-specified proxy IP to a
+loopback listener. For public HTTPS reverse-proxy probes, omit the proxy-IP
+argument. Do not interpret these read-only health checks as proof that OAuth,
+consent, migrations or tenant isolation have passed the pre-release E2E gates.
+
 ## Metrics and alerting
 
 Prometheus exposition is disabled by default. Generate a dedicated credential,

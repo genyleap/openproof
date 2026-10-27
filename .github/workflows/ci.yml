@@ -70,6 +70,9 @@ jobs:
       - name: Repeated Gateway benchmark analysis regression
         run: node tests/scripts/gateway-bench-summary-test.mjs
 
+      - name: Read-only deployment readiness probe regression
+        run: node tests/scripts/live-readiness-test.mjs
+
       - name: Native PostgreSQL coroutine integration
         run: |
           cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
