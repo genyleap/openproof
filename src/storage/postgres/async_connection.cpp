@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -25,6 +27,10 @@ namespace {
 namespace asio = boost::asio;
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
+// Bound the application-owned copy of a SQL result. The underlying libpq
+// PGresult is still buffered; streaming large responses is a separate gate.
+constexpr std::size_t kMaximumCopiedResultBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaximumResultCells = 250'000U;
 
 struct PgDeleter final {
     void operator()(PGconn* connection) const noexcept
@@ -211,6 +217,12 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 nullptr, nullptr, 0) == 0) {
             throw std::runtime_error{"PostgreSQL query could not be submitted"};
         }
+        // Enable libpq's row-at-a-time protocol immediately after send.
+        // Without this, libpq buffers an entire PGresult before our own
+        // result-copy limit can reject oversized queries.
+        if (PQsetSingleRowMode(connection) != 1) {
+            throw std::runtime_error{"PostgreSQL single-row mode unavailable"};
+        }
 
         for (;;) {
             const int flushStatus = PQflush(connection);
@@ -222,49 +234,75 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 asio::posix::stream_descriptor::wait_write, deadline);
         }
 
+        QueryRows output;
+        std::size_t copiedBytes = 0U;
+        std::size_t copiedCells = 0U;
+        bool finished = false;
         for (;;) {
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL operation timed out"};
+            }
             if (PQconsumeInput(connection) == 0) {
                 throw std::runtime_error{"PostgreSQL query read failed"};
             }
-            if (PQisBusy(connection) == 0) break;
-            co_await waitForSocket(m_impl->executor, connection,
-                asio::posix::stream_descriptor::wait_read, deadline);
-        }
-
-        QueryRows output;
-        bool gotResult = false;
-        for (;;) {
-            ResultPointer result{PQgetResult(connection)};
-            if (!result) break;
-            if (gotResult) {
-                throw std::runtime_error{"Unexpected multiple PostgreSQL results"};
+            if (PQisBusy(connection) != 0) {
+                co_await waitForSocket(m_impl->executor, connection,
+                    asio::posix::stream_descriptor::wait_read, deadline);
+                continue;
             }
-            gotResult = true;
+            ResultPointer result{PQgetResult(connection)};
+            if (!result) {
+                if (!finished) {
+                    throw std::runtime_error{"PostgreSQL returned no complete result"};
+                }
+                break;
+            }
             const ExecStatusType status = PQresultStatus(result.get());
-            if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-                // Do not include PQerrorMessage or SQL in exception strings;
-                // these may contain credentials or tenant content.
+            if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
+                if (finished || PQntuples(result.get()) != 0) {
+                    throw std::runtime_error{"Unexpected PostgreSQL result completion"};
+                }
+                finished = true;
+                continue;
+            }
+            if (status != PGRES_SINGLE_TUPLE || finished) {
+                // An error after partial rows discards both the rows and the
+                // connection; nothing escapes before the terminal result.
                 throw std::runtime_error{"PostgreSQL query returned an error"};
             }
             const int rowCount = PQntuples(result.get());
             const int fieldCount = PQnfields(result.get());
+            if (rowCount < 0 || fieldCount < 0
+                || static_cast<std::uint64_t>(rowCount)
+                    * static_cast<std::uint64_t>(fieldCount)
+                    > kMaximumResultCells - copiedCells) {
+                throw std::runtime_error{"PostgreSQL result cell limit exceeded"};
+            }
             for (int row = 0; row < rowCount; ++row) {
+                if (Clock::now() >= deadline) {
+                    throw std::runtime_error{"PostgreSQL operation timed out"};
+                }
                 std::vector<std::optional<std::string>> fields;
                 fields.reserve(static_cast<std::size_t>(fieldCount));
                 for (int column = 0; column < fieldCount; ++column) {
+                    ++copiedCells;
                     if (PQgetisnull(result.get(), row, column)) {
                         fields.emplace_back(std::nullopt);
                     } else {
+                        const int length = PQgetlength(result.get(), row, column);
+                        if (length < 0
+                            || static_cast<std::size_t>(length)
+                                > kMaximumCopiedResultBytes - copiedBytes) {
+                            throw std::runtime_error{"PostgreSQL result size limit exceeded"};
+                        }
+                        copiedBytes += static_cast<std::size_t>(length);
                         fields.emplace_back(std::string{
                             PQgetvalue(result.get(), row, column),
-                            static_cast<std::size_t>(PQgetlength(result.get(), row, column))});
+                            static_cast<std::size_t>(length)});
                     }
                 }
                 output.rows.push_back(std::move(fields));
             }
-        }
-        if (!gotResult) {
-            throw std::runtime_error{"PostgreSQL returned no query result"};
         }
         co_return output;
     } catch (...) {

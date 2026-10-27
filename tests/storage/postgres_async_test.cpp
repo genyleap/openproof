@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -149,6 +150,45 @@ asio::awaitable<void> queryWithSqlError(
     }
     discarded = !connection->healthy();
 }
+asio::awaitable<void> streamingRowsPreserveResult(
+    std::string connectionString, std::optional<pg::QueryRows>& rows)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 3s);
+    auto result = co_await connection->query(
+        "SELECT n::text FROM generate_series(1, 4) AS n", {}, 3s);
+    rows.emplace(std::move(result));
+}
+
+asio::awaitable<void> partialStreamingFailureIsDiscarded(
+    std::string connectionString, bool& errorCaught, bool& invalidated)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 3s);
+    try {
+        static_cast<void>(co_await connection->query(
+            "SELECT 10 / (4 - n) FROM generate_series(1, 4) AS n", {}, 3s));
+    } catch (const std::runtime_error&) {
+        errorCaught = true;
+    }
+    invalidated = !connection->healthy() && !connection->reusable();
+}
+
+asio::awaitable<void> oversizedResultIsRejected(
+    std::string connectionString, bool& bounded, bool& invalidated)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 3s);
+    try {
+        static_cast<void>(co_await connection->query(
+            "SELECT repeat('x', 8388609)", {}, 8s));
+    } catch (const std::runtime_error& error) {
+        bounded = std::string_view{error.what()} ==
+            "PostgreSQL result size limit exceeded";
+    }
+    invalidated = !connection->healthy() && !connection->reusable();
+}
+
 } // namespace
 
 TEST(PostgresNativeCoroutineTest, ParameterizedQueryHasRealAsyncLibpqTransport)
@@ -327,6 +367,71 @@ TEST(PostgresNativeCoroutineTest, EmbeddedNulSqlIsRejectedWithoutPoisoningConnec
     ASSERT_NO_THROW(result.get());
     EXPECT_TRUE(rejected);
     EXPECT_TRUE(remainsReusable);
+}
+
+TEST(PostgresNativeCoroutineTest, SingleRowModeAccumulatesMultipleRows)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    std::optional<pg::QueryRows> rows;
+    auto future = asio::co_spawn(context,
+        streamingRowsPreserveResult(connectionString, rows), asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(future.get());
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->rows.size(), 4U);
+    for (std::size_t i = 0; i < 4U; ++i) {
+        ASSERT_EQ(rows->rows[i].size(), 1U);
+        EXPECT_EQ(rows->rows[i][0], std::to_string(i + 1U));
+    }
+}
+
+TEST(PostgresNativeCoroutineTest, LateStreamingErrorInvalidatesConnection)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool errorCaught = false;
+    bool invalidated = false;
+    auto future = asio::co_spawn(context,
+        partialStreamingFailureIsDiscarded(connectionString, errorCaught, invalidated),
+        asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(errorCaught);
+    EXPECT_TRUE(invalidated);
+}
+
+TEST(PostgresNativeCoroutineTest, OversizedResultIsRejectedAndConnectionDiscarded)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool bounded = false;
+    bool invalidated = false;
+    auto result = asio::co_spawn(context,
+        oversizedResultIsRejected(connectionString, bounded, invalidated),
+        asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    EXPECT_TRUE(bounded);
+    EXPECT_TRUE(invalidated) << "Oversized results must never enter a new lease";
 }
 
 TEST(PostgresNativeCoroutineTest, SqlErrorsAreRedactedAndConnectionDiscarded)

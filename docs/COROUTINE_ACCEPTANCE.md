@@ -301,3 +301,28 @@ it does not establish a whole-request deadline for slow PostgreSQL, OAuth,
 session authorization, or unrelated provider calls. Cross-layer cancellation,
 end-to-end deadlines, and the remaining 40 static findings still block
 release approval.
+
+### Async PostgreSQL result-copy limits (experimental)
+
+The internal `AsyncConnection::query()` now limits the application-owned
+copy of SQL results to 8 MiB of non-NULL cell payloads and 250,000 cells,
+checks the absolute deadline during row materialization, and closes the
+physical connection if a result violates either bound. A disposable DB
+regression intentionally returns an oversized string and asserts both a
+sanitized exception and rejection of the connection for future pool leases.
+The limits are conservative transport defaults, not protocol fields.
+
+`PQsetSingleRowMode` is now enabled immediately after the parameterized
+send, and `PQconsumeInput`/`PQisBusy`/`PQgetResult` advance each individual
+`PGRES_SINGLE_TUPLE` without buffering all rows in one `PGresult`.
+Rows are retained only until the terminal `PGRES_TUPLES_OK` arrives; an
+error *after* some rows discards all accumulated data and invalidates the
+connection. Tests cover multiple rows, late streaming SQL errors, and an
+oversized single field that exceeds the copy limit.
+
+**Remaining memory-safety gap:** a single enormous row or field can still
+be buffered internally by libpq before its length is checked; the 8 MiB
+application-owned result limit does not provide a strict wire-level buffer
+ceiling. Reactor-driven cancellation, a bounded in-flight network buffer,
+backpressure, resource accounting, and actual async repository integration
+are still required before end-to-end acceptance.
