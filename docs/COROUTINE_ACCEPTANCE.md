@@ -497,11 +497,12 @@ end-to-end coroutine acceptance.
 
 An experimental `CoroutinePostgresSessionRepository` now lives in the
 real `openproof.storage.postgres` C++ module, next to (but separate from)
-the legacy synchronous `PostgresSessionRepository`. Its first two native
-operations, `use()` and `find()`, suspend on a bounded
-`AsyncConnectionPool::acquire()`, execute the corresponding
-`AsyncSessionSql` query with a deadline, and restore the **real domain
-`session::Session`** through `PostgresSessionDomainAdapter`.
+the legacy synchronous `PostgresSessionRepository`. Its native
+`use()`, `find()`, `add()`, `rotate()`, `revoke()`, `revokeAll()`, `list()`,
+`purgeExpired()`, and `size()` suspend on a bounded
+`AsyncConnectionPool::acquire()` and execute `AsyncSessionSql` calls with a
+deadline. Lookup and list results restore **real domain
+`session::Session`** objects through `PostgresSessionDomainAdapter`.
 A missing/revoked/expired digest is denied as `AuthenticationFailed`;
 an unavailable database results in a sanitized `Unavailable`, with no
 exception leaked to a route handler. The coroutine owns all identity/digest

@@ -5,9 +5,11 @@
 #include <future>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 import openproof.foundation;
+import openproof.identity.core;
 import openproof.session;
 import openproof.security;
 import openproof.storage.postgres;
@@ -97,7 +99,8 @@ TEST(PostgresCoroutineDomainTest, CorruptedRowsAreDeniedWithoutException)
 
 boost::asio::awaitable<void> verifyCoroutineRepositoryFailureIsolation(
     pg::CoroutinePostgresSessionRepository& repository,
-    bool& findDenied, bool& useDenied)
+    bool& findDenied, bool& useDenied,
+    bool& writeDenied, bool& collectionDenied)
 {
     // A deliberately invalid libpq keyword avoids reaching any live DB.
     // The repository must discard a failed physical connect and return a
@@ -110,6 +113,18 @@ boost::asio::awaitable<void> verifyCoroutineRepositoryFailureIsolation(
         openproof::foundation::Instant{std::chrono::milliseconds{1800}});
     useDenied = !next &&
         next.error().code() == openproof::foundation::ErrorCode::Unavailable;
+    auto source = pg::PostgresSessionDomainAdapter::restore(activeRow());
+    if (source) {
+        auto stored = co_await repository.add(std::move(source).value());
+        writeDenied = !stored && stored.error().code()
+            == openproof::foundation::ErrorCode::Unavailable;
+    }
+    const auto listing = co_await repository.list(
+        openproof::identity::core::IdentityId{"identity-1"});
+    const auto counted = co_await repository.size();
+    collectionDenied = !listing && !counted &&
+        listing.error().code() == openproof::foundation::ErrorCode::Unavailable
+        && counted.error().code() == openproof::foundation::ErrorCode::Unavailable;
 }
 
 TEST(PostgresCoroutineDomainTest, NativeRepositoryUsesAsyncPoolAndFailsClosed)
@@ -123,12 +138,16 @@ TEST(PostgresCoroutineDomainTest, NativeRepositoryUsesAsyncPoolAndFailsClosed)
         std::chrono::milliseconds{100},
         std::chrono::milliseconds{100}};
     bool findDenied = false, useDenied = false;
+    bool writeDenied = false, collectionDenied = false;
     auto future = boost::asio::co_spawn(io,
         verifyCoroutineRepositoryFailureIsolation(
-            repository, findDenied, useDenied), boost::asio::use_future);
+            repository, findDenied, useDenied,
+            writeDenied, collectionDenied), boost::asio::use_future);
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(findDenied);
     EXPECT_TRUE(useDenied);
+    EXPECT_TRUE(writeDenied);
+    EXPECT_TRUE(collectionDenied);
 }
 } // namespace

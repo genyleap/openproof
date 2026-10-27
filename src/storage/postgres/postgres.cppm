@@ -216,6 +216,29 @@ public:
         foundation::Result<std::optional<session::Session>>>
     find(session::SessionId id);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    add(session::Session value);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    rotate(session::SessionId id, session::TokenDigest expected,
+           session::TokenDigest replacement, foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    revoke(session::SessionId id, foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
+    revokeAll(identity::core::IdentityId identity, foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<std::vector<session::Session>>>
+    list(identity::core::IdentityId identity);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
+    purgeExpired(foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
+    size();
+
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;
