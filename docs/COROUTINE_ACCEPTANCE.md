@@ -515,3 +515,26 @@ authentication handler integration, shared cancellation budgets, lifecycle
 shutdown and extensive DB integration tests are required before this
 repository replaces the synchronous interface. The live deployment remains
 untouched.
+
+### Isolated real-schema coroutine session repository regression
+
+A dedicated test now exercises the **real domain-typed repository** end to
+end against a new, disposable, CI-owned `openproof_coroutine_ci` database,
+including applying the project SQL migrations, creating two test identities,
+issuing a session, reading and touching it, rotating its digest, rejecting
+old-token replay, revoking twice, rejecting the revoked digest, revoking all
+sessions for one identity while preserving another, and purging expired rows.
+
+The database setup is intentionally impossible to run against an arbitrary
+configured connection string: the test enforces the exact local CI-only URI
+and a second explicit acknowledgement. CI creates that disposable database
+in its own isolated PostgreSQL instance immediately before the dedicated
+test step; the generic CTest pass skips this destructive fixture when those
+environment variables are absent. A passing SQL fixture alone is not enough;
+these assertions verify the real exported C++ domain types and the actual
+Asio/libpq pool through the full call chain. The test has **not** passed yet
+until the new branch CI completes.
+
+This is still not an authenticated HTTP request-path migration. Neither
+synchronous `SessionService` nor other domain repositories/providers may be
+counted as complete.

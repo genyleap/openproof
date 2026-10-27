@@ -174,15 +174,17 @@ gtest_discover_tests(openproof_gateway_http_tests
 # Direct C++ module boundary test for the native PostgreSQL session adapter.
 # This intentionally links the real domain module, not a duplicate model.
 add_executable(openproof_postgres_domain_tests
-    storage/postgres_async_domain_test.cpp)
+    storage/postgres_async_domain_test.cpp
+    storage/postgres_coroutine_repository_integration_test.cpp)
 target_compile_features(openproof_postgres_domain_tests PRIVATE cxx_std_26)
 target_compile_definitions(openproof_postgres_domain_tests PRIVATE
-    BOOST_HAS_LONG_LONG=1)
+    BOOST_HAS_LONG_LONG=1
+    OPENPROOF_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\")
 set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
     openproof_storage_postgres openproof_session openproof_foundation
-    GTest::gtest_main openproof_test_compile_options)
+    OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_domain_tests PRIVATE
         -static-libstdc++ -static-libgcc)
