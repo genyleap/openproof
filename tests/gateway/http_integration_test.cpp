@@ -77,6 +77,50 @@ private:
     std::atomic<int> m_peak{0};
 };
 
+class CoroutineWaitingHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        // This route must never fall back to the synchronous handler.
+        throw std::runtime_error{"synchronous fallback was used"};
+    }
+
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest) override
+    {
+        const int active = m_active.fetch_add(1, std::memory_order_relaxed) + 1;
+        int peak = m_peak.load(std::memory_order_relaxed);
+        while (active > peak && !m_peak.compare_exchange_weak(
+            peak, active, std::memory_order_relaxed)) {}
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(std::chrono::milliseconds{125});
+        co_await timer.async_wait(asio::use_awaitable);
+        m_active.fetch_sub(1, std::memory_order_relaxed);
+        co_return gw::HttpResponse{200, {}, "async"};
+    }
+
+    [[nodiscard]] int peak() const noexcept { return m_peak.load(); }
+private:
+    std::atomic<int> m_active{0};
+    std::atomic<int> m_peak{0};
+};
+
+class CoroutineThrowingHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        throw std::runtime_error{"wrong handler method"};
+    }
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest) override
+    {
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(std::chrono::milliseconds{2});
+        co_await timer.async_wait(asio::use_awaitable);
+        throw std::runtime_error{"sensitive coroutine exception"};
+    }
+};
+
 class ThrowingHandler final : public gw::HttpHandler {
 public:
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
@@ -183,6 +227,45 @@ TEST(BeastHttpIntegrationTest, BlockingHandlersDoNotOccupySocketEventLoop)
     for (auto& client : clients) client.join();
     EXPECT_EQ(success.load(), 12);
     EXPECT_GE(handler.peak(), 3);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorkers)
+{
+    CoroutineWaitingHandler handler;
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    std::atomic<int> success{0};
+    std::vector<std::thread> clients;
+    clients.reserve(16);
+    for (int index = 0; index < 16; ++index) {
+        clients.emplace_back([&] {
+            try {
+                const auto response = sendRequest(server.boundPort(),
+                    beastHttp::verb::get, "/");
+                if (response.result() == beastHttp::status::ok
+                    && response.body() == "async") {
+                    success.fetch_add(1, std::memory_order_relaxed);
+                }
+            } catch (...) {}
+        });
+    }
+    for (auto& client : clients) client.join();
+    EXPECT_EQ(success.load(), 16);
+    // The bounded worker pool has only 8 threads. A real suspension must
+    // allow more than 8 outstanding handler coroutines simultaneously.
+    EXPECT_GT(handler.peak(), 8);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, CoroutineExceptionIsRedactedAfterSuspension)
+{
+    CoroutineThrowingHandler handler;
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto response = sendRequest(server.boundPort(), beastHttp::verb::get, "/");
+    EXPECT_EQ(response.result(), beastHttp::status::internal_server_error);
+    EXPECT_EQ(response.body().find("sensitive"), std::string::npos);
     server.stop();
 }
 

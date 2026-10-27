@@ -310,43 +310,63 @@ public:
                 write(std::move(overload));
                 return;
             }
-            // Keep blocking repository/provider/crypto work off the socket event loop.
-            // This is a bounded compatibility executor, not a claim that those
-            // operations have become coroutine-based or non-blocking.
+            // Run both legacy handlers and native coroutine handlers on
+            // the bounded execution context, never on the socket reactor.
+            // A suspended CoroutineHttpHandler does not occupy a pool worker.
             const unsigned int version = incoming.version();
             const bool headRequest = incoming.method() == beastHttp::verb::head;
-            asio::post(m_owner->m_handlerPool,
-                [self = shared_from_this(), operation = std::move(request).value(),
-                 version, headRequest]() mutable {
-                    beastHttp::response<beastHttp::string_body> wire;
-                    try {
-                        auto response = self->m_owner->m_handler->handle(
-                            std::move(operation));
-                        wire = wireResponse(std::move(response), version, headRequest);
-                    } catch (...) {
-                        // A faulty provider must not terminate an I/O worker.
-                        beastHttp::response<beastHttp::string_body> failure{
-                            beastHttp::status::internal_server_error, version};
-                        failure.set(beastHttp::field::content_type, "application/json");
-                        failure.set(beastHttp::field::cache_control, "no-store");
-                        failure.set("x-content-type-options", "nosniff");
-                        if (!headRequest) {
-                            failure.body() = "{\"error\":{\"code\":\"INTERNAL\","
-                                             "\"message\":\"The request failed.\"}}";
-                        }
-                        failure.keep_alive(false);
-                        failure.prepare_payload();
-                        wire = std::move(failure);
+            asio::co_spawn(m_owner->m_handlerPool,
+                dispatchHandler(std::move(request).value(), version, headRequest),
+                [self = shared_from_this()](std::exception_ptr error) {
+                    // The operation owns request state and its connection is
+                    // pinned by this completion callback until it finishes.
+                    if (error) {
+                        self->m_owner->m_pendingHandlers.fetch_sub(
+                            1U, std::memory_order_acq_rel);
+                        try { std::rethrow_exception(error); }
+                        catch (...) {}
                     }
-                    self->m_owner->m_pendingHandlers.fetch_sub(
-                        1U, std::memory_order_acq_rel);
-                    asio::post(self->m_owner->m_context,
-                        [self, result = std::move(wire)]() mutable {
-                            if (self->m_owner->m_running.load(std::memory_order_acquire)) {
-                                self->write(std::move(result));
-                            }
-                        });
                 });
+        }
+
+        asio::awaitable<void> dispatchHandler(
+            HttpRequest operation, unsigned int version, bool headRequest)
+        {
+            beastHttp::response<beastHttp::string_body> wire;
+            try {
+                auto* asyncHandler =
+                    dynamic_cast<CoroutineHttpHandler*>(m_owner->m_handler);
+                auto response = asyncHandler
+                    ? co_await asyncHandler->handleAsync(std::move(operation))
+                    : m_owner->m_handler->handle(std::move(operation));
+                wire = wireResponse(std::move(response), version, headRequest);
+            } catch (...) {
+                // Preserve a sanitized server error even when an async
+                // provider throws after resuming from an I/O suspension.
+                beastHttp::response<beastHttp::string_body> failure{
+                    beastHttp::status::internal_server_error, version};
+                failure.set(beastHttp::field::content_type, "application/json");
+                failure.set(beastHttp::field::cache_control, "no-store");
+                failure.set("x-content-type-options", "nosniff");
+                if (!headRequest) {
+                    failure.body() = "{\"error\":{\"code\":\"INTERNAL\","
+                                     "\"message\":\"The request failed.\"}}";
+                }
+                failure.keep_alive(false);
+                failure.prepare_payload();
+                wire = std::move(failure);
+            }
+            // Post the completion first. If posting fails, co_spawn's
+            // exception callback owns the pending-handler decrement; doing
+            // the decrement earlier would underflow the admission counter.
+            asio::post(m_owner->m_context,
+                [self = shared_from_this(), result = std::move(wire)]() mutable {
+                    if (self->m_owner->m_running.load(std::memory_order_acquire)) {
+                        self->write(std::move(result));
+                    }
+                });
+            m_owner->m_pendingHandlers.fetch_sub(
+                1U, std::memory_order_acq_rel);
         }
 
         void write(beastHttp::response<beastHttp::string_body> response)

@@ -15,6 +15,18 @@ import openproof.gateway;
 
 export namespace openproof::gateway::http {
 
+/** Adapter-local coroutine handler boundary. Keep Boost.Asio out of the
+ * transport-neutral OpenProof gateway module to preserve its independence
+ * and prevent GCC16 module/header ODR conflicts.
+ */
+class CoroutineHttpHandler : public gateway::HttpHandler {
+public:
+    [[nodiscard]] virtual boost::asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest request) = 0;
+protected:
+    CoroutineHttpHandler() = default;
+};
+
 class ServerConfig final {
 public:
     [[nodiscard]] static foundation::Result<ServerConfig>

@@ -133,3 +133,27 @@ value could be truncated silently (a correctness and identity-isolation risk).
 The isolated database test verifies the value is rejected while the clean
 connection remains available for future safe queries. This does not replace
 negative application-level authorization and tenant-isolation tests.
+
+### Coroutine-aware inbound HTTP handler dispatch (experimental)
+
+The Beast listener now recognizes `openproof::gateway::http::CoroutineHttpHandler`
+at runtime,
+launches `handleAsync(HttpRequest)` with `asio::co_spawn` on its bounded
+handler executor, and marshals the completed HTTP response back to the
+socket reactor. A native coroutine suspends without occupying a handler
+thread; legacy `HttpHandler::handle` remains isolated on the executor until
+all synchronous repository and provider implementations are removed.
+
+The focused HTTP wire tests exercise **more than eight outstanding
+asynchronous handler calls with only eight handler workers** (a genuine
+`steady_timer` suspension rather than a blocking sleep), plus a provider
+exception thrown after suspension, which must produce a sanitized HTTP 500.
+Both legacy blocking-handler and parser/connection-limit regression tests
+are retained.
+
+This boundary is **NOT the full migration**: application OAuth/account
+handlers and the production PostgreSQL repository SPI still call
+synchronous methods. The coroutine-aware listener must not be advertised
+as an async identity platform until their real I/O dependencies are
+converted and the release gate passes. A successfully built but unused
+coroutine adapter is insufficient evidence.
