@@ -128,4 +128,22 @@ private:
     std::unique_ptr<Implementation> m_implementation;
 };
 
+/** Native Coroutine Gateway bridge. Core routing, authorization, header
+ * sanitization and circuit-breaker accounting remain in the independent
+ * Gateway domain. Only the upstream network I/O is suspended with Asio.
+ * Until repository SPIs are migrated, auth/authorization may still block
+ * a bounded handler worker; this is NOT full coroutine coverage.
+ */
+class CoroutineGatewayAdapter final : public CoroutineHttpHandler {
+public:
+    CoroutineGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport);
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<HttpResponse>
+    handleAsync(HttpRequest request) override;
+
+private:
+    Gateway* m_gateway;
+    BeastProxyTransport* m_transport;
+};
+
 }

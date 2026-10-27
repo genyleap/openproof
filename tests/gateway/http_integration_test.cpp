@@ -21,6 +21,7 @@
 import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
+import openproof.identity.core;
 import openproof.policy;
 import openproof.session;
 
@@ -478,7 +479,10 @@ TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
         edgeCore.discovery, edgeCore.balancer, edgeCore.circuits, *proxy.value(),
         edgeCore.signer,
         std::chrono::seconds{2}};
-    httpAdapter::BeastHttpServer edgeServer{edgeGateway, serverConfig()};
+    // Exercise the real Gateway authorization and context-sealing stages,
+    // then suspend for the actual upstream TCP I/O rather than calling send().
+    httpAdapter::CoroutineGatewayAdapter asyncGateway{edgeGateway, *proxy.value()};
+    httpAdapter::BeastHttpServer edgeServer{asyncGateway, serverConfig()};
     ASSERT_TRUE(edgeServer.start());
 
     const auto response = sendRequest(edgeServer.boundPort(), beastHttp::verb::get,
@@ -498,6 +502,37 @@ TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
 
     edgeServer.stop();
     upstreamServer.stop();
+}
+
+TEST(BeastHttpIntegrationTest, CoroutineGatewayStillRejectsMissingIdentity)
+{
+    CoreFixture core;
+    gw::Router router;
+    ASSERT_TRUE(router.add(gw::Route::create(
+        gw::RouteId{"protected"}, gw::HttpMethod::Get, "/api",
+        gw::ServiceId{"service"}, true,
+        openproof::identity::core::OrganizationId{"organization"},
+        pol::Action{"read"}, pol::Resource{"document"}).value()));
+    ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"}, {
+        gw::Endpoint::create(gw::EndpointId{"must-not-contact"}, "127.0.0.1",
+                             1U, false, 1U).value()}));
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    gw::Gateway gatewayCore{
+        router, core.sessions, core.access, core.limiter,
+        core.discovery, core.balancer, core.circuits, *proxy.value(),
+        core.signer, std::chrono::seconds{1}};
+    httpAdapter::CoroutineGatewayAdapter asyncGateway{gatewayCore, *proxy.value()};
+    httpAdapter::BeastHttpServer server{asyncGateway, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/api/document");
+    EXPECT_EQ(response.result(), beastHttp::status::unauthorized);
+    EXPECT_EQ(response.at("cache-control"), "no-store");
+    EXPECT_EQ(response.base().find("x-openproof-identity"), response.base().end());
+    server.stop();
 }
 
 TEST(BeastHttpIntegrationTest, ParserEnforcesBodyAndHeaderLimits)

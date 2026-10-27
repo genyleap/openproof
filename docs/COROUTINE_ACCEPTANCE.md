@@ -167,3 +167,29 @@ Beast proxy transport can compose through an Asio executor.
 Passing this adapter test is **not equivalent** to converting the
 OpenProof Gateway's authorization, OAuth, account and storage call chains.
 Those interfaces remain subject to the NOT_APPROVED release gate.
+
+### Transport-neutral Gateway forwarding state machine (experimental)
+
+The independent `openproof.gateway` module now prepares an **owned**
+`GatewayForwardPlan` after **all existing** routing, rate limiting, delegated
+sender proof verification, policy authorization, privileged header stripping,
+Trusted Context sealing and service discovery have finished. This plan cannot
+be constructed by transport clients. The same Gateway domain methods own
+circuit-breaker selection, retry policy and response security headers for both
+the legacy synchronous `handle()` and the asynchronous transport path, so
+the security and tenant logic is not copied into Beast.
+
+`CoroutineGatewayAdapter` resides **only** in the
+`openproof.gateway.http` transport adapter. It drives the shared plan via
+`co_await BeastProxyTransport::sendAsync`. The no-authentication gateway
+composition in `apps/opp/main.cpp` now uses this real async forwarding path
+when its listener is not wrapped by synchronous HTTP middleware. The
+Gateway+Beast integration test uses this adapter for an actual TCP roundtrip,
+retaining Trusted Context response and cookie assertions.
+
+**Unfinished:** the production HTTP middleware chain
+(OAuth/account/administration/metrics, and protected repository/provider
+authentication) still exposes synchronous handlers. The async plan's
+authorization phase remains synchronous until the PostgreSQL repository,
+provider and session SPIs are converted. This is a step toward the end-to-end
+implementation, not an approval.

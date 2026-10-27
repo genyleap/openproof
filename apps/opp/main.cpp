@@ -1420,7 +1420,11 @@ addProtectedRoutes(gateway::Router& router,
         gateway::Gateway gatewayCore{
             router, sessions, access, limiter.value(), discovery, loadBalancer,
             circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
-        return runListener(platform, gatewayCore, logger);
+        // The public, non-authenticated gateway uses the same routing,
+        // security-header and circuit-breaker decisions as the legacy path,
+        // but awaits its upstream network I/O instead of blocking a worker.
+        gatewayHttp::CoroutineGatewayAdapter asyncGateway{gatewayCore, *proxy.value()};
+        return runListener(platform, asyncGateway, logger);
     }
 
     auto poolConfig = postgres::PoolConfig::create(

@@ -14,6 +14,7 @@ module;
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // Declare the explicit Asio TLS instantiation before Asio's networking
@@ -782,6 +783,42 @@ BeastProxyTransport::sendAsync(
 {
     co_return co_await m_implementation->sendAsync(
         std::move(endpoint), std::move(request), timeout);
+}
+
+CoroutineGatewayAdapter::CoroutineGatewayAdapter(
+    Gateway& gateway, BeastProxyTransport& transport)
+    : m_gateway(&gateway), m_transport(&transport)
+{
+}
+
+HttpResponse CoroutineGatewayAdapter::handle(HttpRequest request)
+{
+    // Compatibility method for legacy transport-neutral middleware.
+    // Such callers are still blocking and remain subject to the release gate.
+    return m_gateway->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineGatewayAdapter::handleAsync(HttpRequest request)
+{
+    // Authorization, rate limiting and context sealing are performed by the
+    // exact same Gateway domain operations used by its synchronous entry.
+    auto prepared = m_gateway->prepareForward(std::move(request));
+    if (auto* immediate = std::get_if<HttpResponse>(&prepared)) {
+        co_return std::move(*immediate);
+    }
+    auto& plan = std::get<GatewayForwardPlan>(prepared);
+    while (auto endpoint = m_gateway->nextForwardEndpoint(plan)) {
+        // Own a copy of the sanitized request across every suspension point.
+        // Never keep borrowed header or transaction state in the coroutine.
+        auto result = co_await m_transport->sendAsync(
+            *endpoint, plan.request(), m_gateway->upstreamTimeout());
+        if (auto response = m_gateway->recordForwardResult(
+                plan, *endpoint, std::move(result))) {
+            co_return std::move(*response);
+        }
+    }
+    co_return m_gateway->finishForward(plan);
 }
 
 }

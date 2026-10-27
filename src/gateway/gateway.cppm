@@ -8,6 +8,7 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 export module openproof.gateway;
@@ -361,6 +362,35 @@ protected:
     SenderConstraintVerifier() = default;
 };
 
+/** Owned state returned only after the Gateway has completed routing,
+ * credential processing, authorization and trusted-context sealing.
+ * The transport can suspend safely without holding borrowed header state.
+ */
+class GatewayForwardPlan final {
+public:
+    GatewayForwardPlan(GatewayForwardPlan&&) noexcept = default;
+    GatewayForwardPlan& operator=(GatewayForwardPlan&&) noexcept = default;
+    GatewayForwardPlan(const GatewayForwardPlan&) = delete;
+    GatewayForwardPlan& operator=(const GatewayForwardPlan&) = delete;
+
+    [[nodiscard]] const HttpRequest& request() const noexcept { return m_request; }
+
+private:
+    friend class Gateway;
+    GatewayForwardPlan(HttpRequest request, ServiceId service,
+                       std::vector<Endpoint> endpoints, std::size_t attempts)
+        : m_request(std::move(request)), m_service(std::move(service)),
+          m_endpoints(std::move(endpoints)), m_attempts(attempts) {}
+
+    HttpRequest m_request;
+    ServiceId m_service;
+    std::vector<Endpoint> m_endpoints;
+    std::vector<EndpointId> m_excluded;
+    std::size_t m_attempts{};
+    std::size_t m_sentAttempts{};
+    foundation::Error m_lastFailure{foundation::ErrorCode::Unavailable};
+};
+
 class Gateway final : public HttpHandler {
 public:
     Gateway(const Router& router, session::SessionService& sessions,
@@ -373,6 +403,20 @@ public:
             SenderConstraintVerifier* senderConstraintVerifier = nullptr);
 
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+
+    /** Shared authorization/identity-context stage for both synchronous
+     * and asynchronous proxy transports. Never forwards a request before
+     * this method has completed the original access-control checks.
+     */
+    [[nodiscard]] std::variant<HttpResponse, GatewayForwardPlan>
+    prepareForward(HttpRequest request);
+    [[nodiscard]] std::optional<Endpoint>
+    nextForwardEndpoint(GatewayForwardPlan& plan);
+    [[nodiscard]] std::optional<HttpResponse>
+    recordForwardResult(GatewayForwardPlan& plan, const Endpoint& endpoint,
+                        foundation::Result<HttpResponse> result);
+    [[nodiscard]] HttpResponse finishForward(const GatewayForwardPlan& plan) const;
+    [[nodiscard]] foundation::Duration upstreamTimeout() const noexcept;
 
 private:
     [[nodiscard]] HttpResponse errorResponse(const foundation::Error& error,

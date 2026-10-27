@@ -12,6 +12,7 @@ module;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 module openproof.gateway;
@@ -803,7 +804,8 @@ HttpResponse Gateway::errorResponse(const foundation::Error& error,
     return response;
 }
 
-HttpResponse Gateway::handle(HttpRequest request)
+std::variant<HttpResponse, GatewayForwardPlan>
+Gateway::prepareForward(HttpRequest request)
 {
     const auto route = m_router->match(request.method(), request.path());
     if (!route.has_value()) {
@@ -902,37 +904,77 @@ HttpResponse Gateway::handle(HttpRequest request)
 
     auto endpoints = m_discovery->resolve(route->service());
     if (!endpoints.has_value()) return errorResponse(endpoints.error(), request);
-    std::vector<EndpointId> excluded;
     const std::size_t attempts = retryable(request.method())
         ? std::min<std::size_t>(2U, endpoints->size()) : 1U;
-    foundation::Error lastFailure{foundation::ErrorCode::Unavailable};
-    std::size_t sentAttempts = 0U;
-    while (sentAttempts < attempts && excluded.size() < endpoints->size()) {
-        auto endpoint = m_loadBalancer->choose(route->service(), endpoints.value(), excluded);
+    return GatewayForwardPlan{
+        std::move(request), route->service(), std::move(endpoints).value(), attempts};
+}
+
+std::optional<Endpoint> Gateway::nextForwardEndpoint(GatewayForwardPlan& plan)
+{
+    while (plan.m_sentAttempts < plan.m_attempts
+           && plan.m_excluded.size() < plan.m_endpoints.size()) {
+        auto endpoint = m_loadBalancer->choose(
+            plan.m_service, plan.m_endpoints, plan.m_excluded);
         if (!endpoint.has_value()) break;
-        excluded.push_back(endpoint->id());
-        if (!m_circuits->allow(endpoint->id())) {
-            continue;
-        }
-        ++sentAttempts;
-        auto response = m_proxy->send(endpoint.value(), request, m_upstreamTimeout);
-        if (response.has_value()) {
-            if (response->status() < 100 || response->status() > 599) {
-                m_circuits->recordFailure(endpoint->id());
-                return errorResponse(foundation::Error{foundation::ErrorCode::Unavailable},
-                                     request);
-            }
-            if (response->status() >= 500) m_circuits->recordFailure(endpoint->id());
-            else m_circuits->recordSuccess(endpoint->id());
-            secureResponse(response.value());
-            return std::move(response).value();
-        }
-        m_circuits->recordFailure(endpoint->id());
-        lastFailure = response.error();
+        plan.m_excluded.push_back(endpoint->id());
+        if (!m_circuits->allow(endpoint->id())) continue;
+        ++plan.m_sentAttempts;
+        return endpoint;
     }
-    return errorResponse(lastFailure.code() == foundation::ErrorCode::Timeout
-                             ? lastFailure
-                             : foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    return std::nullopt;
+}
+
+std::optional<HttpResponse> Gateway::recordForwardResult(
+    GatewayForwardPlan& plan, const Endpoint& endpoint,
+    foundation::Result<HttpResponse> result)
+{
+    if (result.has_value()) {
+        if (result->status() < 100 || result->status() > 599) {
+            m_circuits->recordFailure(endpoint.id());
+            return errorResponse(
+                foundation::Error{foundation::ErrorCode::Unavailable}, plan.m_request);
+        }
+        if (result->status() >= 500) m_circuits->recordFailure(endpoint.id());
+        else m_circuits->recordSuccess(endpoint.id());
+        secureResponse(result.value());
+        return std::move(result).value();
+    }
+    m_circuits->recordFailure(endpoint.id());
+    plan.m_lastFailure = result.error();
+    return std::nullopt;
+}
+
+HttpResponse Gateway::finishForward(const GatewayForwardPlan& plan) const
+{
+    return errorResponse(
+        plan.m_lastFailure.code() == foundation::ErrorCode::Timeout
+            ? plan.m_lastFailure
+            : foundation::Error{foundation::ErrorCode::Unavailable},
+        plan.m_request);
+}
+
+foundation::Duration Gateway::upstreamTimeout() const noexcept
+{
+    return m_upstreamTimeout;
+}
+
+HttpResponse Gateway::handle(HttpRequest request)
+{
+    auto prepared = prepareForward(std::move(request));
+    if (auto* immediate = std::get_if<HttpResponse>(&prepared)) {
+        return std::move(*immediate);
+    }
+    auto& plan = std::get<GatewayForwardPlan>(prepared);
+    while (auto endpoint = nextForwardEndpoint(plan)) {
+        auto result = m_proxy->send(
+            *endpoint, plan.request(), m_upstreamTimeout);
+        if (auto response = recordForwardResult(
+                plan, *endpoint, std::move(result))) {
+            return std::move(*response);
+        }
+    }
+    return finishForward(plan);
 }
 
 }
