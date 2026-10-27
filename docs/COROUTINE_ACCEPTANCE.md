@@ -538,3 +538,16 @@ until the new branch CI completes.
 This is still not an authenticated HTTP request-path migration. Neither
 synchronous `SessionService` nor other domain repositories/providers may be
 counted as complete.
+
+### GCC 16 coroutine allocation warning: scoped test-only mitigation
+
+The isolated CI build at `cca2290` compiled the **production**
+`coroutine_session_repository.cpp` with `-Werror` after eliminating
+shadowed names and separating synchronous record preparation from the
+awaitable insert. Its remaining failure was the already observed GCC 16
+false-positive `-Wmismatched-new-delete` in an inlined Boost.Asio
+coroutine in a GoogleTest translation unit. Exactly the two new coroutine
+**test sources** have `-Wno-error=mismatched-new-delete` to preserve
+the warning in logs; **production and all other diagnostics retain
+`-Werror`**. The new isolated real PostgreSQL full-lifecycle test remains
+unapproved until it actually passes.

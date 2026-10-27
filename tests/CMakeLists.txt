@@ -185,6 +185,16 @@ set_target_properties(openproof_postgres_domain_tests PROPERTIES
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
     openproof_storage_postgres openproof_session openproof_foundation
     Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
+# GCC 16's inlined Boost.Asio aligned coroutine-frame allocator produces a
+# false-positive mismatched-new-delete diagnostic inside large TEST bodies.
+# Keep it visible but do not fail compilation of these two test sources.
+# The PostgreSQL adapter and all production coroutine code retain -Werror.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(
+        storage/postgres_async_domain_test.cpp
+        storage/postgres_coroutine_repository_integration_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-Wno-error=mismatched-new-delete")
+endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_domain_tests PRIVATE
         -static-libstdc++ -static-libgcc)
