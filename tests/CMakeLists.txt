@@ -184,7 +184,7 @@ set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
     openproof_storage_postgres openproof_session openproof_foundation
-    OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
+    Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_domain_tests PRIVATE
         -static-libstdc++ -static-libgcc)
