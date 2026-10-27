@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "coroutine_session_repository.hpp"
+
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.session;

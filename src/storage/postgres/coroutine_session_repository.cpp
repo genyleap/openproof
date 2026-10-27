@@ -1,5 +1,4 @@
-module;
-
+#include "coroutine_session_repository.hpp"
 #include "async_pool.hpp"
 #include "async_session.hpp"
 
@@ -14,8 +13,7 @@ module;
 #include <utility>
 #include <vector>
 
-module openproof.storage.postgres;
-
+import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.session;

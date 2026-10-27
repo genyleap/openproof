@@ -1,8 +1,5 @@
 module;
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/awaitable.hpp>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -178,72 +175,8 @@ private:
     ConnectionPool* m_pool;
 };
 
-/**
- * Strict storage-to-session-domain bridge for the native coroutine SQL path.
- * No Boost/Asio implementation type crosses this exported module boundary.
- * Invalid SQL rows yield a sanitized Internal error, never authenticated
- * Session objects or a partial recovered session.
- */
-class PostgresSessionDomainAdapter final {
-public:
-    [[nodiscard]] static foundation::Result<session::Session> restore(
-        const std::vector<std::optional<std::string>>& fields);
-};
-
-/**
- * Real coroutine PostgreSQL repository path for session lookup and use.
- * This is deliberately a separate type from the legacy synchronous SPI.
- * The owner must outlive in-flight async calls. Authenticated production HTTP
- * handlers are not yet switched to this interface.
- */
-class CoroutinePostgresSessionRepository final {
-public:
-    CoroutinePostgresSessionRepository(
-        boost::asio::any_io_executor executor,
-        foundation::SecretString connectionString,
-        std::size_t maxConnections,
-        foundation::Duration acquireTimeout,
-        foundation::Duration connectTimeout,
-        foundation::Duration queryTimeout);
-    CoroutinePostgresSessionRepository(const CoroutinePostgresSessionRepository&) = delete;
-    CoroutinePostgresSessionRepository& operator=(const CoroutinePostgresSessionRepository&) = delete;
-    ~CoroutinePostgresSessionRepository();
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
-    use(session::TokenDigest token, foundation::Instant now);
-
-    [[nodiscard]] boost::asio::awaitable<
-        foundation::Result<std::optional<session::Session>>>
-    find(session::SessionId id);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Status>
-    add(session::Session value);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Status>
-    rotate(session::SessionId id, session::TokenDigest expected,
-           session::TokenDigest replacement, foundation::Instant now);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Status>
-    revoke(session::SessionId id, foundation::Instant now);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
-    revokeAll(identity::core::IdentityId identity, foundation::Instant now);
-
-    [[nodiscard]] boost::asio::awaitable<
-        foundation::Result<std::vector<session::Session>>>
-    list(identity::core::IdentityId identity);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
-    purgeExpired(foundation::Instant now);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
-    size();
-
-private:
-    class Impl;
-    std::unique_ptr<Impl> m_impl;
-};
-
+// The optional asynchronous PostgreSQL adapter is a conventional C++
+// library, deliberately outside this portable storage module.
 class PostgresSessionRepository final : public session::SessionRepository {
 public:
     explicit PostgresSessionRepository(ConnectionPool& pool);

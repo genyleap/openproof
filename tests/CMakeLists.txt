@@ -187,6 +187,7 @@ target_compile_definitions(openproof_postgres_domain_tests PRIVATE
 set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
+    openproof_postgres_async_repository
     openproof_storage_postgres openproof_session openproof_foundation
     Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 # GCC 16's inlined Boost.Asio aligned coroutine-frame allocator produces a

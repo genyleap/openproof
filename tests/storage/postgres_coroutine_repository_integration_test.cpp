@@ -15,6 +15,8 @@
 #include <string_view>
 #include <utility>
 
+#include "coroutine_session_repository.hpp"
+
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;

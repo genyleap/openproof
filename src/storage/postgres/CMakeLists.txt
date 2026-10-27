@@ -22,8 +22,6 @@ openproof_add_module(openproof_storage_postgres
         postgres.cppm
     SOURCES
         postgres.cpp
-        session_domain.cpp
-        coroutine_session_repository.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_account
@@ -53,8 +51,23 @@ openproof_add_module(openproof_storage_postgres
         openproof_postgres_async_io
 )
 
-# The exported coroutine repository now names Boost.Asio awaitables in the
-# storage module's global fragment, just like openproof_gateway_http.
-# Keep the Darwin/GCC Boost.Config long-long correction target-local.
-target_compile_definitions(openproof_storage_postgres PRIVATE
+# Keep native Asio types in ordinary C++ translation units rather than
+# attaching their Boost headers (and thread-local template definitions) to
+# the exported storage module. GCC 16 otherwise produces duplicate symbols
+# when a test/executable uses both imports and Boost.Asio includes.
+add_library(openproof_postgres_async_repository STATIC
+    session_domain.cpp
+    coroutine_session_repository.cpp)
+target_compile_features(openproof_postgres_async_repository PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_repository PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_postgres_async_repository PROPERTIES
+    CXX_SCAN_FOR_MODULES ON
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_repository PRIVATE
     BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_repository
+    PUBLIC openproof_storage_postgres openproof_postgres_async_io
+        openproof_session openproof_foundation Boost::headers
+    PRIVATE openproof_compile_options)

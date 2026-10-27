@@ -1,8 +1,8 @@
 name: Native coroutine PostgreSQL integration
 
 on:
-  push:
-    branches: [perf/openproof-full-optimization-20261026]
+  # This experimental workflow is deliberately opt-in to avoid a notification
+  # storm while validation is performed locally on the isolated build tree.
   workflow_dispatch:
 
 permissions:
