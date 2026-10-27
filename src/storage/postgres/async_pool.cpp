@@ -116,6 +116,18 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
         // the local lease reissues a null permit from its noexcept destructor.
         lease.m_connection = co_await AsyncConnection::connect(
             state->connectionString, state->connectTimeout);
+    } else {
+        // PQTRANS_IDLE does not prove session isolation: SET ROLE, session
+        // GUCs, temporary objects and advisory locks can outlive COMMIT.
+        // Reset every recycled connection *before* returning it to a new
+        // tenant, using the same nonblocking SQL transport and a deadline.
+        try {
+            static_cast<void>(co_await lease.m_connection->query(
+                "DISCARD ALL", {}, state->connectTimeout));
+        } catch (...) {
+            lease.m_connection.reset();
+            throw std::runtime_error{"Async PostgreSQL session reset failed"};
+        }
     }
     co_return std::move(lease);
 }

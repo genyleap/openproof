@@ -346,8 +346,15 @@ permits after a failed libpq connection **without requiring a database**.
 The disposable database suite checks bounded nonblocking acquisition,
 lease return after a timed-out waiter, and fail-closed physical reconnection
 both after a still-open transaction and after a SQL error inside an explicit
-transaction. Invalid pool capacities
-and nonpositive deadlines are rejected before any network activity.
+transaction. Every recycled connection is now subject to an asynchronous,
+deadline-bounded PostgreSQL `DISCARD ALL` before the next lease is handed out;
+this is required because `PQTRANS_IDLE` alone does **not** reset session
+variables, role state, prepared objects, temporary relations or advisory
+locks. An isolated-database test sets a session marker on one lease and
+asserts it does not survive into the next lease. Failed session reset closes
+the physical connection and fails the acquisition rather than passing an
+untrusted session to another tenant. Invalid pool capacities and nonpositive
+deadlines are rejected before any network activity.
 
 **Not release approved:** this internal pool is deliberately not wired to the
 legacy synchronous repository SPIs or the active production service. It
