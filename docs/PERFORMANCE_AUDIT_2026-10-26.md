@@ -347,3 +347,43 @@ The original 4.96x measured Gateway speedup was obtained with
 `metrics_enabled=false` and **MUST NOT** be copied to this new
 metrics-enabled experiment. A new number is only valid if the CI job
 successfully completes and the paired raw artifacts are reviewed.
+
+## Repeated paired real Gateway TCP benchmark — 2026-10-27
+
+GitHub Actions run `40463484142` uploaded the complete
+`openproof-gateway-tcp-benchmark` artifact (ID `12716765475`):
+**five** alternating candidate/mainline pairs, **600 real HTTP requests
+per trial**, concurrency 24, a loopback HTTP upstream delayed by 50ms,
+and **authenticated Prometheus Metrics enabled in both binaries**. All
+ten trials reported zero application/HTTP errors. The main Build, full
+CTest and PostgreSQL-backed identity E2E succeeded earlier in the run;
+the job was ultimately *cancelled* by the next branch push during
+release packaging, **after** the Gateway benchmark artifact had been
+uploaded. Do not describe the overall CI run as passing.
+
+| Metric (median across 5 runs) | Mainline `ccb3961` | Candidate `7e565d0` |
+| --- | ---: | ---: |
+| Throughput (req/s) | 75.7773 | 377.8383 |
+| p50 (ms) | 316.9802 | 63.2005 |
+| p95 (ms) | 319.7538 | 68.1126 |
+| p99 (ms) | 321.8413 | 70.1997 |
+
+The *median paired throughput change* was **+396.83% (4.968x)**. The
+exploratory resampled interval for that paired change was **+395.93% to
++402.97%**. This interval captures only five paired observations on one
+shared runner and is **not** a production confidence bound. The method
+is intentionally an I/O-wait workload: it establishes a strong,
+repeatable Gateway throughput improvement under the selected upstream
+delay, **not** a 5x speedup in identity, OAuth or actual PostgreSQL
+operations. The full mixed-identity E2E showed only ~0.9% advantage in
+the earlier single pair; future repeated identity experiments are
+required.
+
+Candidate server CPU tick counts were 37–39 versus 23–25 for mainline
+in their respective **shorter versus longer** workloads; final RSS was
+19,512–19,716 KiB versus 17,456–17,508 KiB. These do not normalize
+CPU usage by time, so they must not be presented as CPU efficiency
+improvement. The unconverted synchronous 11-area, 40-finding Coroutine
+coverage gate remains **NOT APPROVED**.
+
+Source: https://github.com/genyleap/openproof/actions/runs/40463484142
