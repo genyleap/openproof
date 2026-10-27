@@ -175,7 +175,11 @@ gtest_discover_tests(openproof_gateway_http_tests
 # This intentionally links the real domain module, not a duplicate model.
 add_executable(openproof_postgres_domain_tests
     storage/postgres_async_domain_test.cpp
-    storage/postgres_coroutine_repository_integration_test.cpp)
+    storage/postgres_coroutine_repository_integration_test.cpp
+    # PostgreSQL storage links Evidence's Boost.JSON-using verifier objects.
+    # Reuse the project's Boost.JSON implementation unit without bringing
+    # unrelated HTTP service libraries into this isolated test binary.
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
 target_compile_features(openproof_postgres_domain_tests PRIVATE cxx_std_26)
 target_compile_definitions(openproof_postgres_domain_tests PRIVATE
     BOOST_HAS_LONG_LONG=1

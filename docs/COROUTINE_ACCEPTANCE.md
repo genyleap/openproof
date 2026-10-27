@@ -568,3 +568,16 @@ can authenticate it, then revokes it through the synchronous path and
 checks that the coroutine repository denies its bearer. Thus creation,
 validation and revocation are checked in both cross-implementation directions
 against the same isolated real PostgreSQL schema.
+
+### Isolated C++ module test link boundary
+
+The CI build of `b3a1180` compiled the actual coroutine PostgreSQL
+repository and the module-importing domain tests, then failed only at
+linking the independent test executable. Storage's transitive Evidence
+static library uses Boost.JSON, whose out-of-line implementation is linked
+by HTTP binaries but was not present in this standalone test target.
+The focused test target now compiles the existing
+`src/authentication/http/boost_json.cpp` implementation translation unit
+directly, without linking unrelated HTTP services or changing the
+production executable. No Boost.JSON package version is silently mixed,
+and there is exactly one implementation TU per test executable.
