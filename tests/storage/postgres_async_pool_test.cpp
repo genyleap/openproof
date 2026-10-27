@@ -56,6 +56,24 @@ asio::awaitable<void> boundedAcquireAndReuse(
         && rows.rows[0][0] == "7";
 }
 
+asio::awaitable<void> uncommittedLeaseIsReplaced(
+    std::string connectionString, bool& freshLease)
+{
+    pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
+        std::move(connectionString), 1U, 1s, 2s};
+    {
+        auto lease = co_await pool.acquire();
+        static_cast<void>(co_await lease.connection().query("BEGIN", {}, 2s));
+        EXPECT_FALSE(lease.connection().reusable());
+    }
+    auto replacement = co_await pool.acquire();
+    const auto result = co_await replacement.connection().query(
+        "SELECT 23::text", {}, 2s);
+    freshLease = replacement.connection().reusable()
+        && result.rows.size() == 1U && result.rows[0].size() == 1U
+        && result.rows[0][0] == "23";
+}
+
 asio::awaitable<void> poisonedLeaseIsReplaced(
     std::string connectionString, bool& deniedPoison, bool& freshLease)
 {
@@ -110,6 +128,22 @@ TEST(PostgresAsyncPoolTest, TimedAcquireReturnsPermitForSubsequentLease)
     ASSERT_NO_THROW(done.get());
     EXPECT_TRUE(timedOut);
     EXPECT_TRUE(reused);
+}
+
+TEST(PostgresAsyncPoolTest, OpenTransactionCannotLeakIntoNextLease)
+{
+    const char* connectionString = disposableDatabase();
+    if (!connectionString || !*connectionString) {
+        requireDisposableDatabase();
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context io;
+    bool freshLease = false;
+    auto done = asio::co_spawn(io, uncommittedLeaseIsReplaced(
+        connectionString, freshLease), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(freshLease);
 }
 
 TEST(PostgresAsyncPoolTest, AbortedTransactionReopensPhysicalConnection)

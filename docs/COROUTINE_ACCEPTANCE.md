@@ -343,7 +343,8 @@ access. The pool lifetime is retained by outstanding leases.
 
 The disposable database suite now checks bounded nonblocking acquisition,
 lease return after a timed-out waiter, and fail-closed physical reconnection
-following a SQL error inside an explicit transaction. Invalid pool capacities
+both after a still-open transaction and after a SQL error inside an explicit
+transaction. Invalid pool capacities
 and nonpositive deadlines are rejected before any network activity.
 
 **Not release approved:** this internal pool is deliberately not wired to the
