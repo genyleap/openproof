@@ -3,12 +3,14 @@
 #include <boost/asio.hpp>
 #include <boost/asio/cancel_after.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/redirect_error.hpp>
 
 #include <libpq-fe.h>
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -130,6 +132,11 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
 
     try {
         for (;;) {
+            // One absolute deadline includes all polling, including ACTIVE.
+            // Without this check an unexpected libpq ACTIVE loop spins forever.
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL connection timed out"};
+            }
             // libpq owns and may replace its socket during connect polling.
             const PostgresPollingStatusType step = PQconnectPoll(connection.get());
             if (step == PGRES_POLLING_OK) break;
@@ -144,7 +151,11 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
                         : asio::posix::stream_descriptor::wait_write,
                     deadline);
             }
-            // PGRES_POLLING_ACTIVE: advance the state machine immediately.
+            // ACTIVE can be repeated; yield to other ready operations
+            // instead of monopolizing one CPU thread.
+            if (step == PGRES_POLLING_ACTIVE) {
+                co_await asio::post(executor, asio::use_awaitable);
+            }
         }
         if (PQsetnonblocking(connection.get(), 1) != 0) {
             throw std::runtime_error{"Unable to enable nonblocking PostgreSQL"};
@@ -181,6 +192,12 @@ asio::awaitable<QueryRows> AsyncConnection::query(
         }
     }
 
+    if (sql.find('\0') != std::string::npos) {
+        throw std::invalid_argument{"PostgreSQL SQL text contains NUL"};
+    }
+    if (params.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument{"PostgreSQL parameter count exceeds libpq bounds"};
+    }
     PGconn* connection = m_impl->connection.get();
     try {
         std::vector<const char*> values;

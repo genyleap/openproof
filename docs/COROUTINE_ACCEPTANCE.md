@@ -220,3 +220,24 @@ The `openproof.gateway.http` transport adapter now contains
 This is a partial transport/middleware migration. Production repository,
 OAuth account and enterprise provider blocking operations still fail the
 independent release acceptance gate.
+
+### Native PostgreSQL coroutine bounded-polling and SQL integrity
+
+The isolated asynchronous libpq transport now checks an **absolute
+connection deadline during every PQconnectPoll iteration**, including
+the `PGRES_POLLING_ACTIVE` state, and yields to its Asio executor when
+libpq requests immediate repolling, rather than monopolizing a worker.
+The connection is discarded if polling fails. This addresses a potential
+runaway active-poll CPU loop; it does **not** eliminate possible blocking
+name resolution inside libpq, and the normal repository SPI remains
+synchronous.
+
+Before sending `PQsendQueryParams`, the adapter also rejects SQL text
+containing embedded NUL and parameter counts beyond libpq's signed-int
+bound. An isolated disposable-PostgreSQL regression checks SQL NUL
+rejection and that a validated connection remains reusable afterward.
+
+The updated `openproof_postgres_async_tests` executable compiles and
+links with GCC 16.2 locally; the **new** disposable-database assertion
+has not passed CI until a subsequent workflow executes it. The
+whole-project Coroutine gate remains NOT APPROVED.
