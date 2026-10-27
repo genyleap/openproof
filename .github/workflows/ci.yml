@@ -78,8 +78,9 @@ jobs:
 
       - name: Native PostgreSQL coroutine integration
         run: |
-          cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
+          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
+          ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests --gtest_filter='PostgresCoroutineDomainTest.*'
 
       - name: Native Gateway coroutine and real TCP regression
         timeout-minutes: 15

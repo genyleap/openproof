@@ -1,0 +1,94 @@
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <optional>
+#include <string>
+#include <vector>
+
+import openproof.foundation;
+import openproof.session;
+import openproof.storage.postgres;
+
+namespace {
+namespace pg = openproof::storage::postgres;
+namespace sess = openproof::session;
+using Fields = std::vector<std::optional<std::string>>;
+
+[[nodiscard]] Fields activeRow()
+{
+    return {
+        "session-domain-1", "identity-1", "provider-1",
+        "1", "3", "t", "0",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "1000", "1200", "1500", "10000", "3000",
+        std::nullopt, "Test client", std::nullopt
+    };
+}
+
+TEST(PostgresCoroutineDomainTest, ValidRowRestoresStronglyTypedSession)
+{
+    const auto restored = pg::PostgresSessionDomainAdapter::restore(activeRow());
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->id().value(), "session-domain-1");
+    EXPECT_EQ(restored->identity().value(), "identity-1");
+    EXPECT_EQ(restored->provider().value(), "provider-1");
+    EXPECT_EQ(restored->state(), sess::SessionState::Active);
+    EXPECT_EQ(restored->lastSeenAt().time_since_epoch().count(), 1500);
+    EXPECT_EQ(restored->idleTimeout().count(), 3000);
+    ASSERT_TRUE(restored->userAgent().has_value());
+    EXPECT_EQ(*restored->userAgent(), "Test client");
+    EXPECT_FALSE(restored->remoteAddress().has_value());
+    EXPECT_FALSE(restored->revokedAt().has_value());
+}
+
+TEST(PostgresCoroutineDomainTest, RevokedSessionRestoresWithoutAuthBypass)
+{
+    auto row = activeRow();
+    row[6] = "1";
+    row[13] = "1700";
+    auto restored = pg::PostgresSessionDomainAdapter::restore(row);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->state(), sess::SessionState::Revoked);
+    const auto digest = restored->tokenDigest();
+    const auto used = restored->use(
+        digest, openproof::foundation::Instant{std::chrono::milliseconds{1800}});
+    EXPECT_FALSE(used);
+}
+
+TEST(PostgresCoroutineDomainTest, CorruptedRowsAreDeniedWithoutException)
+{
+    const auto original = activeRow();
+    const auto checkInvalid = [](Fields row) {
+        const auto result = pg::PostgresSessionDomainAdapter::restore(row);
+        EXPECT_FALSE(result);
+        if (!result) {
+            EXPECT_EQ(result.error().code(),
+                          openproof::foundation::ErrorCode::Internal);
+        }
+    };
+    auto empty = original;
+    empty.pop_back();
+    checkInvalid(empty);
+    auto badBoolean = original;
+    badBoolean[5] = "true";
+    checkInvalid(badBoolean);
+    auto missingDigest = original;
+    missingDigest[7] = "nonhex-digest";
+    checkInvalid(missingDigest);
+    auto illegalState = original;
+    illegalState[6] = "3";
+    checkInvalid(illegalState);
+    auto missingRequired = original;
+    missingRequired[0] = std::nullopt;
+    checkInvalid(missingRequired);
+    auto invalidLifetime = original;
+    invalidLifetime[11] = "1499";
+    checkInvalid(invalidLifetime);
+    auto orphanRevocation = original;
+    orphanRevocation[13] = "1900";
+    checkInvalid(orphanRevocation);
+    auto overlongAgent = original;
+    overlongAgent[14] = std::string(1025, 'x');
+    checkInvalid(overlongAgent);
+}
+} // namespace

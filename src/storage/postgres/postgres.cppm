@@ -5,6 +5,7 @@ module;
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -171,6 +172,18 @@ public:
 
 private:
     ConnectionPool* m_pool;
+};
+
+/**
+ * Strict storage-to-session-domain bridge for the native coroutine SQL path.
+ * No Boost/Asio implementation type crosses this exported module boundary.
+ * Invalid SQL rows yield a sanitized Internal error, never authenticated
+ * Session objects or a partial recovered session.
+ */
+class PostgresSessionDomainAdapter final {
+public:
+    [[nodiscard]] static foundation::Result<session::Session> restore(
+        const std::vector<std::optional<std::string>>& fields);
 };
 
 class PostgresSessionRepository final : public session::SessionRepository {

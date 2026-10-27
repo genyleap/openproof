@@ -171,6 +171,28 @@ gtest_discover_tests(openproof_gateway_http_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "gateway")
 
+# Direct C++ module boundary test for the native PostgreSQL session adapter.
+# This intentionally links the real domain module, not a duplicate model.
+add_executable(openproof_postgres_domain_tests
+    storage/postgres_async_domain_test.cpp)
+target_compile_features(openproof_postgres_domain_tests PRIVATE cxx_std_26)
+target_compile_definitions(openproof_postgres_domain_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_postgres_domain_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_postgres_domain_tests PRIVATE
+    openproof_storage_postgres openproof_session openproof_foundation
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_domain_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_domain_tests
+    TEST_PREFIX "NativePostgresDomain."
+    DISCOVERY_MODE PRE_TEST
+    DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;domain")
+
 # Native libpq coroutine adapter, isolated from existing synchronous repositories
 # until transaction ownership and async repository APIs are fully migrated.
 add_executable(openproof_postgres_async_tests

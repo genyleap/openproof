@@ -22,6 +22,7 @@ openproof_add_module(openproof_storage_postgres
         postgres.cppm
     SOURCES
         postgres.cpp
+        session_domain.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_account

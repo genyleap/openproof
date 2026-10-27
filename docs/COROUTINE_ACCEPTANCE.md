@@ -472,3 +472,23 @@ idle timeout and inconsistent revoked-state timestamps. A DB-independent
 negative test exercises valid and intentionally malformed rows. Domain
 `session::Session::restore` still must run after this storage validation
 when the actual repository interface is migrated.
+
+### Coroutine SQL-to-domain session restoration (module boundary)
+
+The storage module now exports a `PostgresSessionDomainAdapter::restore()`
+function taking an **owned** sixteen-column SQL result. Its implementation
+calls the native `AsyncSessionSql::decodeRow` validator and the actual
+`session::Session::restore` aggregate constructor. A malformed digest,
+revocation state, timestamp, row shape or client metadata fails closed with
+a sanitized `Internal` error and **never** yields a usable authenticated
+session. Unlike a new duplicate session type, the restored result is the
+same C++ module-defined `session::Session` used by the synchronous
+repositories, OAuth and HTTP layers.
+
+A separate `openproof_postgres_domain_tests` binary imports the actual
+`openproof.storage.postgres` and `openproof.session` C++ modules to
+verify valid active/revoked restoration and malformed-row rejection without
+needing a database. This is a real cross-module seam, but public
+`SessionRepository` and `SessionService` remain synchronous and still
+must be migrated; the new adapter must not be counted as production
+end-to-end coroutine acceptance.
