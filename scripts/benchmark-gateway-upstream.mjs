@@ -20,6 +20,8 @@ if (!binary || !outputFile || !fs.existsSync(binary)) {
 const requests = Number(process.env.OPENPROOF_GATEWAY_BENCH_REQUESTS ?? 600);
 const concurrency = Number(process.env.OPENPROOF_GATEWAY_BENCH_CONCURRENCY ?? 24);
 const delayMs = Number(process.env.OPENPROOF_GATEWAY_BENCH_DELAY_MS ?? 50);
+const metricsEnabled = process.env.OPENPROOF_GATEWAY_BENCH_METRICS !== "0";
+const metricsToken = crypto.randomBytes(32).toString("base64url");
 assert(Number.isInteger(requests) && requests >= concurrency && concurrency > 0);
 assert(Number.isInteger(delayMs) && delayMs >= 1 && delayMs <= 500);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,6 +58,23 @@ function request(port) {
       response.on("error", reject);
     });
     pending.on("timeout", () => pending.destroy(new Error("Gateway request timeout")));
+    pending.on("error", reject);
+  });
+}
+function metricRequest(port, authorization) {
+  return new Promise((resolve, reject) => {
+    const pending = http.get({
+      host:"127.0.0.1", port, path:"/metrics", agent:false,
+      timeout:5000,
+      headers:authorization ? {authorization} : {},
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (piece) => { body += piece; });
+      response.on("end", () => resolve({status:response.statusCode, body}));
+      response.on("error", reject);
+    });
+    pending.on("timeout", () => pending.destroy(new Error("Metrics request timeout")));
     pending.on("error", reject);
   });
 }
@@ -118,7 +137,10 @@ try {
     'level = "error"',
     "console = false",
     "[operations]",
-    "metrics_enabled = false",
+    "metrics_enabled = " + (metricsEnabled ? "true" : "false"),
+    ...(metricsEnabled
+      ? ['metrics_bearer_token = "env:OPENPROOF_METRICS_BEARER_TOKEN"']
+      : []),
     "[security]",
     'token_signing_key = "env:OPENPROOF_TOKEN_SIGNING_KEY"',
     "[gateway]",
@@ -137,6 +159,7 @@ try {
   const env = {
     ...process.env,
     OPENPROOF_TOKEN_SIGNING_KEY: crypto.randomBytes(48).toString("base64url"),
+    ...(metricsEnabled ? {OPENPROOF_METRICS_BEARER_TOKEN:metricsToken} : {}),
   };
   const check = spawnSync(binary, ["check-config", "--config", configFile], {
     env, encoding: "utf8", timeout: 15000,
@@ -151,6 +174,13 @@ try {
     try { await request(oppPort); ready = true; break; } catch { await sleep(75); }
   }
   if (!ready) throw new Error("Gateway benchmark server did not become ready");
+  if (metricsEnabled) {
+    const denied = await metricRequest(oppPort, null);
+    const allowed = await metricRequest(oppPort, "Bearer " + metricsToken);
+    assert.equal(denied.status, 401, "Metrics must reject unauthenticated clients");
+    assert.equal(allowed.status, 200, "Authenticated metrics must remain available");
+    assert.match(allowed.body, /openproof_process_starts_total/);
+  }
   await runLoad(oppPort, 48, Math.min(concurrency, 12)); // warmup
   const before = usage(child.pid);
   const metrics = await runLoad(oppPort, requests, concurrency);
@@ -161,6 +191,7 @@ try {
       ?? process.env.GITHUB_SHA ?? "local",
     timestamp: new Date().toISOString(),
     upstreamDelayMs: delayMs,
+    metricsEnabled,
     ...metrics,
     ...(Number.isFinite(before.cpuTicks) && Number.isFinite(after.cpuTicks)
       ? { serverCpuTicksDelta: Math.max(0, after.cpuTicks - before.cpuTicks) } : {}),

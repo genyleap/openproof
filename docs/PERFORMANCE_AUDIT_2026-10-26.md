@@ -325,3 +325,25 @@ repeats, reports median per-pair changes with exploratory uncertainty
 intervals, and retains all raw runs. No acceptance is possible before
 the live repository/provider migration, correctness and performance gates
 pass.
+
+## Follow-up benchmark: Prometheus protection cannot be dropped for speed
+
+The next five-pair controlled-latency Gateway benchmark enables
+`[operations] metrics_enabled=true` in **both** baseline and optimized
+`opp` binaries. Each start creates a disposable secret token and tests
+that an unauthenticated `GET /metrics` returns HTTP 401, while an
+authenticated scrape returns HTTP 200 and includes the process-start
+metric. Only after those assertions does the 600-request mixed TCP
+load run. The same metrics-enabled mode must be present in both members
+of every compared pair or the aggregator fails.
+
+This directly validates `CoroutineMetricsAdapter`, which preserves
+the existing authenticated Prometheus facade and request instrumentation
+while forwarding non-metrics requests to the real asynchronous Gateway
+transport. The Node regression `tests/scripts/gateway-bench-summary-test.mjs`
+passes locally and rejects failed requests or unequal metrics settings.
+
+The original 4.96x measured Gateway speedup was obtained with
+`metrics_enabled=false` and **MUST NOT** be copied to this new
+metrics-enabled experiment. A new number is only valid if the CI job
+successfully completes and the paired raw artifacts are reviewed.

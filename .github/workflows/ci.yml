@@ -67,6 +67,9 @@ jobs:
           cmake --preset gcc-release \
             -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
 
+      - name: Repeated Gateway benchmark analysis regression
+        run: node tests/scripts/gateway-bench-summary-test.mjs
+
       - name: Native PostgreSQL coroutine integration
         run: |
           cmake --build --preset gcc-release --target openproof_postgres_async_tests --parallel 2
@@ -137,6 +140,7 @@ jobs:
           OPENPROOF_GATEWAY_BENCH_REQUESTS: "600"
           OPENPROOF_GATEWAY_BENCH_CONCURRENCY: "24"
           OPENPROOF_GATEWAY_BENCH_DELAY_MS: "50"
+          OPENPROOF_GATEWAY_BENCH_METRICS: "1"
         run: |
           mkdir -p gateway-bench
           # Alternate execution order on the SAME runner to limit bias from

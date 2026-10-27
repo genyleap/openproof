@@ -22,7 +22,7 @@ function load(file) {
 }
 const baseline = load(baselineFile);
 const candidate = load(candidateFile);
-for (const key of ["requests","concurrency","upstreamDelayMs"]) {
+for (const key of ["requests","concurrency","upstreamDelayMs","metricsEnabled"]) {
   assert.equal(candidate[key], baseline[key], "Workload mismatch: " + key);
 }
 console.log("# OpenProof actual Gateway TCP controlled-I/O comparison");

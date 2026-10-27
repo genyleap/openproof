@@ -28,7 +28,7 @@ const pairs = baselineFiles.map((file,i) => {
       assert(Number.isFinite(item[key]) && item[key] > 0);
     }
   }
-  for (const key of ["requests","concurrency","upstreamDelayMs"]) {
+  for (const key of ["requests","concurrency","upstreamDelayMs","metricsEnabled"]) {
     assert.equal(a[key], b[key], "Different workload: " + key);
   }
   return { baseline:a, candidate:b };
@@ -66,6 +66,7 @@ const results = {
     requests:pairs[0].baseline.requests,
     concurrency:pairs[0].baseline.concurrency,
     upstreamDelayMs:pairs[0].baseline.upstreamDelayMs,
+    metricsEnabled:pairs[0].baseline.metricsEnabled,
   },
   baselineCommit:pairs[0].baseline.commit,
   candidateCommit:pairs[0].candidate.commit,
