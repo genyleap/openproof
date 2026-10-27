@@ -236,3 +236,31 @@ Until the remaining synchronous repository, HTTP dispatch, provider, LDAP
 and proxy paths are migrated and independently revalidated with repeated,
 fault-injected benchmarks, the full Coroutine acceptance decision remains
 **NOT APPROVED**.
+
+## New operational Gateway Coroutine measurement protocol
+
+A second **actual `opp` executable** benchmark is now available:
+`scripts/benchmark-gateway-upstream.mjs` starts the OpenProof Gateway
+with authentication and metrics middleware disabled, a localhost Node HTTP
+upstream that introduces **50ms of controlled response latency**, then
+records 600 end-to-end HTTP/TCP requests at concurrency 24 after warmup.
+The full path exercises the candidate's `CoroutineGatewayAdapter` from the
+`opp` composition root, including service discovery and signed trusted
+headers. The exact same script runs the pinned original `ccb3961` binary
+with a distinct local upstream and the same runner/toolchain configuration.
+The associated comparison and both source JSON measurement files are
+uploaded as `openproof-gateway-tcp-benchmark`.
+
+This **controlled upstream-wait** experiment is deliberately separate from
+the complete identity/OAuth PostgreSQL E2E workload; it is not a proxy for
+identity throughput, nor evidence that authentication and repository calls
+are nonblocking. Each sample must report zero errors, and no claimed
+improvement is accepted from a single paired run. CPU ticks and RSS are
+collected from the actual `opp` server process, not from the Node generator.
+
+The first attempted CI for `36f8291` failed to compile Gateway forwarding
+because `WeightedRoundRobin::choose` returns
+`std::expected<Endpoint, Error>` rather than the newly exposed
+`std::optional<Endpoint>`. The conversion is corrected in the following
+branch revision, but **the full build, E2E, new Gateway TCP benchmark and
+new authorization tests must pass before this patch is accepted**.

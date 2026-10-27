@@ -121,6 +121,38 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Real opp server binaries with a controlled 50ms local HTTP upstream.
+      # Unlike the identity E2E sample, this exposes whether upstream network
+      # waiting has stopped monopolizing the bounded handler workers.
+      - name: Matched Gateway TCP delayed-upstream benchmark
+        timeout-minutes: 10
+        env:
+          OPENPROOF_GATEWAY_BENCH_REQUESTS: "600"
+          OPENPROOF_GATEWAY_BENCH_CONCURRENCY: "24"
+          OPENPROOF_GATEWAY_BENCH_DELAY_MS: "50"
+        run: |
+          node scripts/benchmark-gateway-upstream.mjs \
+            ./cmake-build-gcc-release/apps/opp/opp \
+            openproof-gateway-bench-candidate.json
+          OPENPROOF_GATEWAY_BENCH_COMMIT=ccb396182936d717960fdca319999baf2f580ff9 \
+          node scripts/benchmark-gateway-upstream.mjs \
+            "${RUNNER_TEMP}/openproof-perf-baseline/cmake-build-gcc-release/apps/opp/opp" \
+            openproof-gateway-bench-baseline.json
+          node scripts/compare-gateway-bench.mjs \
+            openproof-gateway-bench-baseline.json \
+            openproof-gateway-bench-candidate.json
+
+      - name: Preserve actual Gateway TCP measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-gateway-tcp-benchmark
+          path: |
+            openproof-gateway-bench-baseline.json
+            openproof-gateway-bench-candidate.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Build release packages
         run: |
           mkdir -p dist

@@ -920,7 +920,7 @@ std::optional<Endpoint> Gateway::nextForwardEndpoint(GatewayForwardPlan& plan)
         plan.m_excluded.push_back(endpoint->id());
         if (!m_circuits->allow(endpoint->id())) continue;
         ++plan.m_sentAttempts;
-        return endpoint;
+        return std::move(endpoint).value();
     }
     return std::nullopt;
 }

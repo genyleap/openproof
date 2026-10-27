@@ -504,6 +504,59 @@ TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
     upstreamServer.stop();
 }
 
+TEST(BeastHttpIntegrationTest, GatewayAsyncProxyHandlesSlowTcpUpstreamsConcurrently)
+{
+    // Both hops perform actual HTTP/TCP I/O. The upstream deliberately
+    // suspends for 125ms, proving the gateway's async forwarding does not
+    // monopolize the eight bounded handler workers.
+    CoroutineWaitingHandler upstreamHandler;
+    httpAdapter::BeastHttpServer upstreamServer{upstreamHandler, serverConfig()};
+    ASSERT_TRUE(upstreamServer.start());
+
+    CoreFixture edgeCore;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route()));
+    ASSERT_TRUE(edgeCore.discovery.set(gw::ServiceId{"service"}, {
+        gw::Endpoint::create(gw::EndpointId{"slow-upstream"}, "127.0.0.1",
+                             upstreamServer.boundPort(), false, 1U).value()}));
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    gw::Gateway gatewayCore{
+        router, edgeCore.sessions, edgeCore.access, edgeCore.limiter,
+        edgeCore.discovery, edgeCore.balancer, edgeCore.circuits,
+        *proxy.value(), edgeCore.signer, std::chrono::seconds{2}};
+    httpAdapter::CoroutineGatewayAdapter asyncGateway{gatewayCore, *proxy.value()};
+    httpAdapter::BeastHttpServer edgeServer{asyncGateway, serverConfig()};
+    ASSERT_TRUE(edgeServer.start());
+
+    std::latch start{17};
+    std::atomic<int> successes{0};
+    std::vector<std::thread> clients;
+    clients.reserve(16);
+    for (int index = 0; index < 16; ++index) {
+        clients.emplace_back([&] {
+            start.count_down();
+            start.wait();
+            try {
+                const auto response = sendRequest(
+                    edgeServer.boundPort(), beastHttp::verb::get, "/api");
+                if (response.result() == beastHttp::status::ok
+                    && response.body() == "async") {
+                    successes.fetch_add(1, std::memory_order_relaxed);
+                }
+            } catch (...) {}
+        });
+    }
+    start.count_down();
+    start.wait();
+    for (auto& client : clients) client.join();
+    EXPECT_EQ(successes.load(), 16);
+    EXPECT_GT(upstreamHandler.peak(), 8);
+    edgeServer.stop();
+    upstreamServer.stop();
+}
+
 TEST(BeastHttpIntegrationTest, CoroutineGatewayStillRejectsMissingIdentity)
 {
     CoreFixture core;
