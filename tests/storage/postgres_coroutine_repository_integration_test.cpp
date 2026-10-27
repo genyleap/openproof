@@ -36,6 +36,8 @@ namespace pg = openproof::storage::postgres;
 using namespace std::chrono_literals;
 constexpr std::string_view kDisposableDatabase =
     "postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_coroutine_ci";
+constexpr std::string_view kDisposableServerDatabase =
+    "postgresql://openproof_ci:ci_disposable_only@127.0.0.1:55432/openproof_coroutine_ci";
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1770000000000}};
 
 struct PqDeleter {
@@ -183,10 +185,32 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
         // step must explicitly supply the disposable database and ack.
         GTEST_SKIP() << "No explicitly acknowledged disposable coroutine database";
     }
-    // Refuse any arbitrary URL, even if the user sets the env variable by
-    // mistake: this fixture applies schema migrations and modifies data.
-    ASSERT_EQ(std::string_view{uri}, kDisposableDatabase);
+    // This fixture applies schema migrations and inserts records. Only a
+    // disposable GitHub runner OR a verified pg_virtualenv temporary cluster
+    // on a non-production port may be accepted. Merely setting the ACK is
+    // insufficient to authorize access to a real production database.
     ASSERT_STREQ(ack, "YES_EXCLUSIVE_DISPOSABLE_DATABASE");
+    const bool hostedCi = std::getenv("GITHUB_ACTIONS") != nullptr
+        && std::string_view{uri} == kDisposableDatabase;
+    const bool localVirtualEnv = std::string_view{uri} == kDisposableServerDatabase
+        && std::getenv("PG_CLUSTER_CONF_ROOT") != nullptr
+        && std::string_view{std::getenv("PG_CLUSTER_CONF_ROOT")}
+            .starts_with("/tmp/pg_virtualenv.");
+    ASSERT_TRUE(hostedCi || localVirtualEnv)
+        << "Not an explicitly permitted disposable PostgreSQL cluster";
+    if (localVirtualEnv) {
+        // Independently verify actual server storage, rather than trusting
+        // environment variables or a socket on the expected port.
+        std::unique_ptr<PGconn, PqDeleter> isolation{PQconnectdb(uri)};
+        ASSERT_TRUE(isolation && PQstatus(isolation.get()) == CONNECTION_OK);
+        std::unique_ptr<PGresult, PqResultDeleter> actual{
+            PQexec(isolation.get(), "SHOW data_directory")};
+        ASSERT_TRUE(actual && PQresultStatus(actual.get()) == PGRES_TUPLES_OK);
+        ASSERT_EQ(PQntuples(actual.get()), 1);
+        ASSERT_EQ(PQnfields(actual.get()), 1);
+        ASSERT_TRUE(std::string_view{PQgetvalue(actual.get(), 0, 0)}
+                        .starts_with("/tmp/pg_virtualenv."));
+    }
 
     auto config = pg::PoolConfig::create(
         fnd::SecretString{uri}, 2U, 2s);

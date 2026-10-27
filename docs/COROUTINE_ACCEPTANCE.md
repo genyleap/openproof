@@ -591,3 +591,33 @@ requires a default-constructible result type for its exception path, while
 default-constructible. The test now awaits that Result inside a `void`
 coroutine and reports only the denial assertion back to GoogleTest. The
 domain Result type was not weakened or given a synthetic default Session.
+
+
+### VPS-only validation without noisy GitHub Actions (2026-10-27)
+
+The experimental branch's ordinary GitHub CI now remains restricted to
+`main` pushes, pull requests and manual dispatch; the extra
+`native-coroutine.yml` workflow is manual-dispatch only. Work-in-progress
+changes are committed **locally** and not pushed per edit. One final
+consolidated push can follow an actual passing local verification, without
+automatically starting the branch's workflows.
+
+The Asio-based coroutine session repository has been moved out of the
+exported `openproof.storage.postgres` C++ module and into the conventional
+`openproof_postgres_async_repository` library. The core storage module
+contains no Asio declarations, preventing the GCC 16 duplicate Asio TLS
+symbol encountered when module-importing GoogleTests included Asio headers.
+
+For real local DB tests, `python3 scripts/ci/test-local-coroutine-postgres.py`
+uses Debian `pg_virtualenv -t` on the dedicated localhost **55432** port,
+not the system-managed PostgreSQL instance. It verifies the port is unused,
+creates the temporary PostgreSQL cluster with disposable credentials,
+checks the real `data_directory` lives in `/tmp/pg_virtualenv.*`,
+creates a disposable role/database, runs the real domain repository CTest
+and destroys the temporary cluster on exit. The C++ test enforces the same
+directory check before applying any migration. Neither the script nor the
+local test may be used with a production database.
+
+Acceptance remains **NOT_APPROVED** until a complete local build, real DB
+regressions, full request-path coroutine migration, security checks and
+full-workload performance comparisons pass.
