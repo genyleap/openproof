@@ -1,0 +1,60 @@
+name: Native coroutine PostgreSQL integration
+
+on:
+  push:
+    branches: [perf/openproof-full-optimization-20261026]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Independent of the full release/benchmark pipeline: the full coroutine
+# acceptance gate remains mandatory before any merge or deployment.
+concurrency:
+  group: native-coroutine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-domain:
+    name: Isolated coroutine SQL and domain lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Boost and qualified GCC
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openproof/boost-1.88.0
+          key: boost-1.88.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install verified toolchain and disposable PostgreSQL
+        run: ./scripts/ci/install-build-deps.sh
+
+      - name: Configure native C++26 modules
+        run: |
+          cmake --preset gcc-release \
+            -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
+
+      - name: Compile native coroutine transport and real domain repository
+        run: |
+          cmake --build --preset gcc-release \
+            --target openproof_postgres_async_tests openproof_postgres_domain_tests \
+            --parallel 2
+
+      - name: Exercise isolated libpq, SQL, and real session domain lifecycle
+        env:
+          OPENPROOF_TEST_POSTGRES_DOMAIN: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_coroutine_ci
+          OPENPROOF_TEST_POSTGRES_DOMAIN_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
+          ./cmake-build-gcc-release/tests/openproof_postgres_async_tests \
+            --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
+          ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests \
+            --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
+
+      - name: Independence and unchanged release gate status
+        run: |
+          python3 scripts/check-protocol-neutrality.py
+          node scripts/verify-coroutine-coverage.mjs --json > coroutine-coverage.json || test "$?" -eq 1
+          python3 -c 'import json; v=json.load(open("coroutine-coverage.json")); assert v["releaseApproved"] is False and v["blockingFindings"] > 0, "Update this pre-release workflow when acceptance becomes complete"'
