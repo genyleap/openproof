@@ -1,5 +1,5 @@
-#include "coroutine_session_repository.hpp"
 #include "async_session.hpp"
+#include "coroutine_session_repository.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -39,7 +39,7 @@ foundation::Result<session::Session> PostgresSessionDomainAdapter::restore(
             revokedAt = foundation::Instant{
                 foundation::Duration{*row.revokedAtMs}};
         }
-        return session::Session::restore(
+        auto restored = session::Session::restore(
             session::SessionId{std::move(row.id)},
             identity::core::IdentityId{std::move(row.identityId)},
             identity::provider::ProviderId{std::move(row.provider)},
@@ -55,6 +55,14 @@ foundation::Result<session::Session> PostgresSessionDomainAdapter::restore(
             foundation::Instant{foundation::Duration{row.absoluteExpiresAtMs}},
             foundation::Duration{row.idleTimeoutMs}, revokedAt,
             std::move(row.userAgent), std::move(row.remoteAddress));
+        if (!restored) {
+            // The row came from storage, not from the caller. Never leak
+            // domain validation details or misclassify corruption as a
+            // client's InvalidArgument / AuthenticationFailed response.
+            return foundation::fail(foundation::ErrorCode::Internal,
+                                    "PostgreSQL session row could not be restored.");
+        }
+        return restored;
     } catch (const std::exception&) {
         return foundation::fail(foundation::ErrorCode::Internal,
                                 "PostgreSQL session row could not be restored.");

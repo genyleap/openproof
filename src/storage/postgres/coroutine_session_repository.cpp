@@ -1,4 +1,3 @@
-#include "coroutine_session_repository.hpp"
 #include "async_pool.hpp"
 #include "async_session.hpp"
 
@@ -12,6 +11,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// Import modules only after all transitive textual standard/Asio headers.
+#include "coroutine_session_repository.hpp"
 
 import openproof.storage.postgres;
 import openproof.foundation;
