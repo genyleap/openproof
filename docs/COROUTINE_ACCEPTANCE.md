@@ -290,8 +290,11 @@ the actual transport instead of resetting it between retries. If a legacy
 upstream ignores its timeout and completes after the deadline, the Gateway
 rejects even a successful response with a sanitized 504 and does not contact
 a second upstream. The core regression suite tests late successes, exhausted
-retry budgets, and shrinking budgets on fast failures. The network transport
-already uses one deadline for DNS/connect/TLS/write/read within each attempt.
+retry budgets, and shrinking budgets on fast failures. A separate actual
+Gateway/Beast/TCP regression proves that a slow first upstream cannot trigger
+a fresh full-budget retry to an otherwise healthy second upstream.
+The network transport already uses one deadline for
+DNS/connect/TLS/write/read within each attempt.
 
 **Scope:** this change bounds the Gateway's *upstream forwarding sequence*;
 it does not establish a whole-request deadline for slow PostgreSQL, OAuth,

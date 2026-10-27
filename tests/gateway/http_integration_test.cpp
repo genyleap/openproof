@@ -79,6 +79,16 @@ private:
     std::atomic<int> m_peak{0};
 };
 
+class CountingFastHandler final : public gw::HttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        received.fetch_add(1, std::memory_order_relaxed);
+        return gw::HttpResponse{200, {}, "fast"};
+    }
+    std::atomic<int> received{0};
+};
+
 class CoroutineWaitingHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
@@ -602,6 +612,45 @@ TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
 
     edgeServer.stop();
     upstreamServer.stop();
+}
+
+TEST(BeastHttpIntegrationTest, GatewayRetrySharesOneDeadlineAcrossRealTcpUpstreams)
+{
+    CoroutineWaitingHandler slowUpstream;
+    CountingFastHandler fastUpstream;
+    httpAdapter::BeastHttpServer slowServer{slowUpstream, serverConfig()};
+    httpAdapter::BeastHttpServer fastServer{fastUpstream, serverConfig()};
+    ASSERT_TRUE(slowServer.start());
+    ASSERT_TRUE(fastServer.start());
+
+    CoreFixture core;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route()));
+    // WeightedRoundRobin starts at slot zero: the slow upstream is always
+    // selected first, and the next attempt would select the fast endpoint.
+    ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"}, {
+        gw::Endpoint::create(gw::EndpointId{"first-slow"}, "127.0.0.1",
+                             slowServer.boundPort(), false, 1U).value(),
+        gw::Endpoint::create(gw::EndpointId{"second-fast"}, "127.0.0.1",
+                             fastServer.boundPort(), false, 1U).value()}));
+    auto transport = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(transport);
+    gw::Gateway gatewayCore{
+        router, core.sessions, core.access, core.limiter,
+        core.discovery, core.balancer, core.circuits, *transport.value(),
+        core.signer, std::chrono::milliseconds{35}};
+    httpAdapter::CoroutineGatewayAdapter asyncGateway{gatewayCore, *transport.value()};
+    httpAdapter::BeastHttpServer edgeServer{asyncGateway, serverConfig()};
+    ASSERT_TRUE(edgeServer.start());
+
+    const auto response = sendRequest(
+        edgeServer.boundPort(), beastHttp::verb::get, "/api/items");
+    EXPECT_EQ(response.result(), beastHttp::status::gateway_timeout);
+    EXPECT_EQ(fastUpstream.received.load(std::memory_order_relaxed), 0);
+    edgeServer.stop();
+    fastServer.stop();
+    slowServer.stop();
 }
 
 TEST(BeastHttpIntegrationTest, GatewayAsyncProxyHandlesSlowTcpUpstreamsConcurrently)
