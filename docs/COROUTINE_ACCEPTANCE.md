@@ -356,3 +356,13 @@ string handling, per-tenant fairness, coordinated shutdown, and transaction
 cancellation across the public repository and HTTP boundaries need further
 design and tests. The existing synchronous pool and repository operations
 remain forbidden by the full migration gate.
+
+
+### CI run preservation while migration is incomplete
+
+GitHub Actions now keeps a running complete CI/benchmark run for the named
+performance branch instead of cancelling it on every follow-up commit.
+Pending runs can still be coalesced by GitHub's concurrency scheduler. Mainline
+and ordinary PR workflows retain cancellation of superseded runs. A
+successful isolated PostgreSQL/Gateway/E2E build job does not override the
+deliberately failing static completeness gate or authorize deployment.
