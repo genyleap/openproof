@@ -12,7 +12,7 @@ namespace openproof::storage::postgres::async_detail {
 // Native async implementation of the session token SQL critical section.
 // The caller owns an exclusive AsyncConnectionPool::Lease throughout each call;
 // there is no sync compatibility wait, borrowed PGresult, or thread offload.
-// Domain-level Session::restore and AuthenticationService integration remain
+// Domain-level Session::restore and AuthenticationService wiring remain
 // separate pending migrations. Only approved fixed table identifiers exist.
 class AsyncSessionSql final {
 public:
