@@ -1,12 +1,15 @@
 #include <gtest/gtest.h>
+#include <boost/asio.hpp>
 
 #include <chrono>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
 
 import openproof.foundation;
 import openproof.session;
+import openproof.security;
 import openproof.storage.postgres;
 
 namespace {
@@ -90,5 +93,42 @@ TEST(PostgresCoroutineDomainTest, CorruptedRowsAreDeniedWithoutException)
     auto overlongAgent = original;
     overlongAgent[14] = std::string(1025, 'x');
     checkInvalid(overlongAgent);
+}
+
+boost::asio::awaitable<void> verifyCoroutineRepositoryFailureIsolation(
+    pg::CoroutinePostgresSessionRepository& repository,
+    bool& findDenied, bool& useDenied)
+{
+    // A deliberately invalid libpq keyword avoids reaching any live DB.
+    // The repository must discard a failed physical connect and return a
+    // sanitized error rather than leaking credentials or throwing at HTTP.
+    auto first = co_await repository.find(sess::SessionId{"missing"});
+    findDenied = !first &&
+        first.error().code() == openproof::foundation::ErrorCode::Unavailable;
+    auto next = co_await repository.use(
+        sess::TokenDigest{openproof::security::Sha256Digest{}},
+        openproof::foundation::Instant{std::chrono::milliseconds{1800}});
+    useDenied = !next &&
+        next.error().code() == openproof::foundation::ErrorCode::Unavailable;
+}
+
+TEST(PostgresCoroutineDomainTest, NativeRepositoryUsesAsyncPoolAndFailsClosed)
+{
+    boost::asio::io_context io;
+    pg::CoroutinePostgresSessionRepository repository{
+        io.get_executor(),
+        openproof::foundation::SecretString{
+            "openproof_invalid_connection_keyword=invalid"},
+        1U, std::chrono::milliseconds{100},
+        std::chrono::milliseconds{100},
+        std::chrono::milliseconds{100}};
+    bool findDenied = false, useDenied = false;
+    auto future = boost::asio::co_spawn(io,
+        verifyCoroutineRepositoryFailureIsolation(
+            repository, findDenied, useDenied), boost::asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(findDenied);
+    EXPECT_TRUE(useDenied);
 }
 } // namespace

@@ -1,5 +1,9 @@
 module;
 
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/awaitable.hpp>
+
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -184,6 +188,37 @@ class PostgresSessionDomainAdapter final {
 public:
     [[nodiscard]] static foundation::Result<session::Session> restore(
         const std::vector<std::optional<std::string>>& fields);
+};
+
+/**
+ * Real coroutine PostgreSQL repository path for session lookup and use.
+ * This is deliberately a separate type from the legacy synchronous SPI.
+ * The owner must outlive in-flight async calls. Authenticated production HTTP
+ * handlers are not yet switched to this interface.
+ */
+class CoroutinePostgresSessionRepository final {
+public:
+    CoroutinePostgresSessionRepository(
+        boost::asio::any_io_executor executor,
+        foundation::SecretString connectionString,
+        std::size_t maxConnections,
+        foundation::Duration acquireTimeout,
+        foundation::Duration connectTimeout,
+        foundation::Duration queryTimeout);
+    CoroutinePostgresSessionRepository(const CoroutinePostgresSessionRepository&) = delete;
+    CoroutinePostgresSessionRepository& operator=(const CoroutinePostgresSessionRepository&) = delete;
+    ~CoroutinePostgresSessionRepository();
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
+    use(session::TokenDigest token, foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<std::optional<session::Session>>>
+    find(session::SessionId id);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 class PostgresSessionRepository final : public session::SessionRepository {

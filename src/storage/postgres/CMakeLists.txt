@@ -23,6 +23,7 @@ openproof_add_module(openproof_storage_postgres
     SOURCES
         postgres.cpp
         session_domain.cpp
+        coroutine_session_repository.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_account

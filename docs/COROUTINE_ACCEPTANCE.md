@@ -492,3 +492,25 @@ needing a database. This is a real cross-module seam, but public
 `SessionRepository` and `SessionService` remain synchronous and still
 must be migrated; the new adapter must not be counted as production
 end-to-end coroutine acceptance.
+
+### First domain-typed native coroutine PostgreSQL repository path
+
+An experimental `CoroutinePostgresSessionRepository` now lives in the
+real `openproof.storage.postgres` C++ module, next to (but separate from)
+the legacy synchronous `PostgresSessionRepository`. Its first two native
+operations, `use()` and `find()`, suspend on a bounded
+`AsyncConnectionPool::acquire()`, execute the corresponding
+`AsyncSessionSql` query with a deadline, and restore the **real domain
+`session::Session`** through `PostgresSessionDomainAdapter`.
+A missing/revoked/expired digest is denied as `AuthenticationFailed`;
+an unavailable database results in a sanitized `Unavailable`, with no
+exception leaked to a route handler. The coroutine owns all identity/digest
+argument values across suspension. A module-importing regression verifies
+two successive failed connection attempts without touching a live database.
+
+This is **not a production request-path migration** yet. Additional
+methods and a coroutine-native `SessionService`, OAuth consent and
+authentication handler integration, shared cancellation budgets, lifecycle
+shutdown and extensive DB integration tests are required before this
+repository replaces the synchronous interface. The live deployment remains
+untouched.
