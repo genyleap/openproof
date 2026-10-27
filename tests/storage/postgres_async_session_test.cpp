@@ -88,6 +88,50 @@ asio::awaitable<void> boundaryAndInvalidDigest(
     untouched = current.has_value() && (*current)[6] == "0"
         && (*current)[10] == "1000" && conn->reusable();
 }
+asio::awaitable<void> revokeAndBulkRevoke(
+    std::string connectionString, bool& revoked, bool& idempotent,
+    bool& absentDenied, bool& bulkIsolated)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+    const auto initial = co_await sql.revoke(*conn, "test-session-1", 1700, 3s);
+    revoked = initial == pg::AsyncSessionSql::RevokeStatus::Revoked;
+    const auto again = co_await sql.revoke(*conn, "test-session-1", 1800, 3s);
+    idempotent = again == pg::AsyncSessionSql::RevokeStatus::AlreadyRevoked;
+    auto token = co_await sql.useToken(*conn, kDigestA, 1900, 3s);
+    const auto snapshot = co_await sql.find(*conn, "test-session-1", 3s);
+    const auto unknown = co_await sql.revoke(*conn, "missing-session", 1800, 3s);
+    absentDenied = !token.has_value() && snapshot.has_value()
+        && (*snapshot)[6] == "1" && (*snapshot)[13] == "1700"
+        && unknown == pg::AsyncSessionSql::RevokeStatus::NotFound;
+
+    // Only one still-active session from test-identity may be affected.
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'test-session-2',identity_id,provider,assurance,factors,"
+        "phishing_resistant,0,decode($1,'hex'),authenticated_at_ms,"
+        "issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,"
+        "NULL,user_agent,remote_address "
+        "FROM pg_temp.sessions WHERE id='test-session-1'",
+        {kDigestB}, 3s));
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'other-session','another-identity',provider,assurance,factors,"
+        "phishing_resistant,0,decode($1,'hex'),authenticated_at_ms,"
+        "issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,"
+        "NULL,user_agent,remote_address "
+        "FROM pg_temp.sessions WHERE id='test-session-1'",
+        {"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}, 3s));
+    const auto affected = co_await sql.revokeAll(
+        *conn, "test-identity", 1900, 3s);
+    const auto untouched = co_await sql.find(*conn, "other-session", 3s);
+    const auto revokedSecond = co_await sql.find(*conn, "test-session-2", 3s);
+    bulkIsolated = affected == 1U && untouched.has_value()
+        && (*untouched)[6] == "0" && revokedSecond.has_value()
+        && (*revokedSecond)[6] == "1";
+}
+
 } // namespace
 
 TEST(PostgresAsyncSessionSqlTest, AtomicUseRotationReplayAndIdleExpiry)
@@ -133,4 +177,27 @@ TEST(PostgresAsyncSessionSqlTest, InclusiveBoundaryAndBadDigestFailClosed)
     EXPECT_TRUE(exactDeadlineDenied);
     EXPECT_TRUE(invalidRejected);
     EXPECT_TRUE(untouched);
+}
+
+TEST(PostgresAsyncSessionSqlTest, RevocationIsIdempotentAndIdentityScoped)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool revoked = false, idempotent = false;
+    bool absentDenied = false, bulkIsolated = false;
+    auto future = asio::co_spawn(io,
+        revokeAndBulkRevoke(uri, revoked, idempotent, absentDenied, bulkIsolated),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(revoked);
+    EXPECT_TRUE(idempotent);
+    EXPECT_TRUE(absentDenied);
+    EXPECT_TRUE(bulkIsolated);
 }

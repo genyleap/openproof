@@ -2,6 +2,7 @@
 #include "async_connection.hpp"
 #include <boost/asio/awaitable.hpp>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -31,6 +32,20 @@ public:
     [[nodiscard]] boost::asio::awaitable<bool> rotateToken(
         AsyncConnection& connection, std::string sessionId,
         std::string oldDigestHex, std::string newDigestHex,
+        std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
+
+    enum class RevokeStatus { Revoked, AlreadyRevoked, NotFound, Expired };
+
+    // Idempotent revocation, retaining the legacy distinction between an
+    // unknown session, an already-revoked session and an expired session.
+    [[nodiscard]] boost::asio::awaitable<RevokeStatus> revoke(
+        AsyncConnection& connection, std::string sessionId,
+        std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
+
+    // Atomically revoke all still-active sessions for an identity. No caller
+    // can observe a partially revoked batch; result is the affected count.
+    [[nodiscard]] boost::asio::awaitable<std::size_t> revokeAll(
+        AsyncConnection& connection, std::string identityId,
         std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
 
     // A direct lookup must not renew last-seen or mark an expired row active.

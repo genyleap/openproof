@@ -400,3 +400,16 @@ yet an implementation of the public `session::SessionRepository` interface.
 The required type restoration into `session::Session`, application-service
 async SPI, complete session CRUD/revocation and production HTTP wiring remain
 unfinished. Do not merge or deploy based on this checkpoint.
+
+
+The same coroutine SQL command layer also implements idempotent
+single-session revocation and identity-scoped bulk revocation. Single-session
+revoke distinguishes an original successful transition, an already-revoked
+row, an unknown identifier and an expired row, matching the legacy API's
+authorization consequences. The bulk operation is one atomic
+`UPDATE ... RETURNING` on the identity ID; it never crosses tenant identity
+boundaries. A disposable-PG temporary-table regression verifies that a revoked
+token cannot be used, repeated revocation is idempotent, a missing row is not
+confused with success, and revoking one identity's sessions does not revoke an
+unrelated identity's session. These are internal SQL primitives only; real
+request handlers and public SessionService still require coroutine wiring.

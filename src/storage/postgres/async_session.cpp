@@ -111,6 +111,66 @@ asio::awaitable<bool> AsyncSessionSql::rotateToken(
     co_return rows.rows.size() == 1U;
 }
 
+asio::awaitable<AsyncSessionSql::RevokeStatus> AsyncSessionSql::revoke(
+    AsyncConnection& connection, std::string sessionId,
+    std::int64_t nowMilliseconds, std::chrono::milliseconds deadline)
+{
+    if (!validId(sessionId) || nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid async session revocation arguments"};
+    }
+    const std::string update =
+        "UPDATE " + tableName(m_table) +
+        " SET state=1,revoked_at_ms=$2 WHERE id=$1 AND state=0 RETURNING id";
+    const std::string now = std::to_string(nowMilliseconds);
+    auto rows = co_await connection.query(update, {sessionId, now}, deadline);
+    if (rows.rows.size() > 1U
+        || (!rows.rows.empty() && rows.rows.front().size() != 1U)) {
+        throw std::runtime_error{"PostgreSQL revocation returned invalid shape"};
+    }
+    if (rows.rows.size() == 1U) co_return RevokeStatus::Revoked;
+
+    // Serialize a retry through this lease. Already-revoked is successful,
+    // but missing or expired must never mint an authenticated session.
+    const std::string sql =
+        "SELECT state FROM " + tableName(m_table) + " WHERE id=$1";
+    auto state = co_await connection.query(sql, {std::move(sessionId)}, deadline);
+    if (state.rows.empty()) co_return RevokeStatus::NotFound;
+    if (state.rows.size() != 1U || state.rows.front().size() != 1U
+        || !state.rows.front().front().has_value()) {
+        throw std::runtime_error{"PostgreSQL session state returned invalid shape"};
+    }
+    if (state.rows.front().front() == "1") {
+        co_return RevokeStatus::AlreadyRevoked;
+    }
+    if (state.rows.front().front() == "2") {
+        co_return RevokeStatus::Expired;
+    }
+    throw std::runtime_error{"PostgreSQL session state changed unexpectedly"};
+}
+
+asio::awaitable<std::size_t> AsyncSessionSql::revokeAll(
+    AsyncConnection& connection, std::string identityId,
+    std::int64_t nowMilliseconds, std::chrono::milliseconds deadline)
+{
+    if (!validId(identityId) || nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid async session identity revocation arguments"};
+    }
+    // Statement-level atomicity matches the original repository contract.
+    // RETURNING avoids a synchronous PQcmdTuples() result on this adapter.
+    const std::string sql =
+        "UPDATE " + tableName(m_table)
+        + " SET state=1,revoked_at_ms=$2 WHERE identity_id=$1 AND state=0 "
+          "RETURNING id";
+    auto rows = co_await connection.query(
+        sql, {std::move(identityId), std::to_string(nowMilliseconds)}, deadline);
+    for (const auto& row : rows.rows) {
+        if (row.size() != 1U || !row.front().has_value()) {
+            throw std::runtime_error{"PostgreSQL bulk revocation returned invalid shape"};
+        }
+    }
+    co_return rows.rows.size();
+}
+
 asio::awaitable<std::optional<AsyncSessionSql::SessionFields>>
 AsyncSessionSql::find(AsyncConnection& connection, std::string sessionId,
                       std::chrono::milliseconds deadline)
