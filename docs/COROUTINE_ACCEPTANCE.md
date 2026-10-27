@@ -418,3 +418,12 @@ The two-query idempotent revoke path now shares one monotonic time budget:
 its follow-up state lookup cannot silently reset the caller's deadline after
 the initial update. This is a scope-limited SQL deadline, not yet request
 cancellation propagated from the HTTP socket.
+
+The first GCC 16.2 CI build of the native session SQL test identified a
+third-party Boost.Asio coroutine-frame allocation diagnostic:
+`-Wmismatched-new-delete` in a large inlined test coroutine, with the
+allocator originating inside Asio's `aligned_alloc` implementation. The
+warning is now demoted from error to warning **for that one test source only**
+so it stays in build logs. Production compilation and all other source files
+retain the original `-Werror` policy. This is a compiler/allocator warning
+mitigation, not evidence that the new SQL tests have passed yet.

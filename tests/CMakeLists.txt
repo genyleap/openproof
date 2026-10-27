@@ -185,6 +185,14 @@ target_compile_definitions(openproof_postgres_async_tests PRIVATE BOOST_HAS_LONG
 target_link_libraries(openproof_postgres_async_tests PRIVATE
     openproof_postgres_async_io GTest::gtest_main
     openproof_test_compile_options)
+# GCC 16 -O2 can mistake Boost.Asio's custom aligned coroutine-frame
+# allocator for a mismatched new/delete when it inlines long test coroutines.
+# Demote only this warning in this one TEST translation unit; all production
+# sources and other diagnostics retain -Werror, and the warning stays visible.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_session_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-Wno-error=mismatched-new-delete")
+endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_async_tests PRIVATE
         -static-libstdc++ -static-libgcc)
