@@ -161,6 +161,47 @@ asio::awaitable<void> bulkRevocationReturnsScalarCount(
     noCrossIdentity = separate.has_value() && (*separate)[6] == "0";
 }
 
+asio::awaitable<void> sessionCreationListingAndPurge(
+    std::string connectionString, bool& created,
+    bool& sorted, bool& purged, bool& rejectedBadInput)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+    pg::AsyncSessionSql::NewSession fresh{
+        "new-session-2", "test-identity", "test-provider", kDigestB,
+        1U, 3U, true, 1100, 1200, 1500, 9000, 5000,
+        std::nullopt, std::nullopt
+    };
+    co_await sql.add(*conn, std::move(fresh), 3s);
+    auto count = co_await sql.size(*conn, 3s);
+    auto list = co_await sql.list(*conn, "test-identity", 3s);
+    auto found = co_await sql.find(*conn, "new-session-2", 3s);
+    created = count == 2U && found.has_value()
+        && (*found)[13] == std::nullopt && (*found)[14] == std::nullopt;
+    sorted = list.size() == 2U && list[0].size() == 16U
+        && list[0][0] == "new-session-2"
+        && list[1].size() == 16U && list[1][0] == "test-session-1";
+    auto removed = co_await sql.purgeExpired(*conn, 2000, 3s);
+    auto countAfter = co_await sql.size(*conn, 3s);
+    auto stillThere = co_await sql.find(*conn, "new-session-2", 3s);
+    auto expiredGone = co_await sql.find(*conn, "test-session-1", 3s);
+    purged = removed == 1U && countAfter == 1U
+        && stillThere.has_value() && !expiredGone.has_value();
+    pg::AsyncSessionSql::NewSession invalid{
+        "bad-session", "test-identity", "test-provider", "bad",
+        1U, 3U, true, 1100, 1200, 1500, 9000, 5000,
+        std::nullopt, std::nullopt
+    };
+    try {
+        co_await sql.add(*conn, std::move(invalid), 3s);
+    } catch (const std::invalid_argument&) {
+        rejectedBadInput = true;
+    }
+    const auto final = co_await sql.size(*conn, 3s);
+    rejectedBadInput = rejectedBadInput && final == 1U && conn->reusable();
+}
+
 } // namespace
 
 TEST(PostgresAsyncSessionSqlTest, AtomicUseRotationReplayAndIdleExpiry)
@@ -249,4 +290,27 @@ TEST(PostgresAsyncSessionSqlTest, BulkRevocationReturnsBoundedCountForThousands)
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(exactCount);
     EXPECT_TRUE(noCrossIdentity);
+}
+
+TEST(PostgresAsyncSessionSqlTest, CreateListAndPurgePreserveSessionBoundaries)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool created = false, sorted = false, purged = false, rejectedBadInput = false;
+    auto future = asio::co_spawn(io,
+        sessionCreationListingAndPurge(
+            uri, created, sorted, purged, rejectedBadInput),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(created);
+    EXPECT_TRUE(sorted);
+    EXPECT_TRUE(purged);
+    EXPECT_TRUE(rejectedBadInput);
 }

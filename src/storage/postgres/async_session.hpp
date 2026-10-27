@@ -22,6 +22,29 @@ public:
 
     using SessionFields = std::vector<std::optional<std::string>>;
 
+    struct NewSession final {
+        std::string id;
+        std::string identityId;
+        std::string provider;
+        std::string tokenDigestHex;
+        unsigned int assurance{};
+        unsigned int factors{};
+        bool phishingResistant{};
+        std::int64_t authenticatedAtMs{};
+        std::int64_t issuedAtMs{};
+        std::int64_t lastSeenAtMs{};
+        std::int64_t absoluteExpiresAtMs{};
+        std::int64_t idleTimeoutMs{};
+        std::optional<std::string> userAgent;
+        std::optional<std::string> remoteAddress;
+    };
+
+    // Persist a new active session with the same 16-column contract as the
+    // existing sync repository, without storing the raw bearer secret.
+    [[nodiscard]] boost::asio::awaitable<void> add(
+        AsyncConnection& connection, NewSession session,
+        std::chrono::milliseconds deadline);
+
     // Atomic update+return; nullopt means unknown, revoked or expired.
     [[nodiscard]] boost::asio::awaitable<std::optional<SessionFields>> useToken(
         AsyncConnection& connection, std::string digestHex,
@@ -52,6 +75,20 @@ public:
     [[nodiscard]] boost::asio::awaitable<std::optional<SessionFields>> find(
         AsyncConnection& connection, std::string sessionId,
         std::chrono::milliseconds deadline);
+
+    // Returns all available rows, ordered by descending last-seen. The
+    // transport's explicit result bound rejects oversized sets; pagination
+    // must be added to the public session listing API prior to deployment.
+    [[nodiscard]] boost::asio::awaitable<std::vector<SessionFields>> list(
+        AsyncConnection& connection, std::string identityId,
+        std::chrono::milliseconds deadline);
+
+    [[nodiscard]] boost::asio::awaitable<std::size_t> purgeExpired(
+        AsyncConnection& connection, std::int64_t nowMilliseconds,
+        std::chrono::milliseconds deadline);
+
+    [[nodiscard]] boost::asio::awaitable<std::size_t> size(
+        AsyncConnection& connection, std::chrono::milliseconds deadline);
 
 private:
     Table m_table;

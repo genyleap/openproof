@@ -441,3 +441,20 @@ statement, is strictly parsed as an unsigned integer, and requires only one
 client-visible row regardless of the number of sessions revoked. An isolated
 PostgreSQL regression exercises 2,048 sessions, an idempotent second call,
 and a different identity left untouched.
+
+
+### Native async session SQL command coverage
+
+The internal `AsyncSessionSql` SQL command layer now also implements active
+session insertion (`add`), 16-column identity-scoped and last-seen-sorted
+listing, session count and expiry purging. The insertion uses bound parameters,
+validates session IDs, digest, assurance/factor ranges, timestamps and positive
+idle timeout, and preserves SQL NULL in optional user-agent/remote-address
+fields. Bulk expiry deletion uses a data-modifying CTE with a scalar count,
+matching the safe bounded response shape of the bulk-revoke fix. The isolated
+temporary-table test verifies insert/list ordering, NULL fields, inclusive
+expiry purging, and rejection of an invalid digest without modifying the table.
+These methods complete the **internal SQL command coverage**, not the
+public coroutine session SPI, domain object materialization, or production
+integration. A session list that exceeds the transport's result cap still
+fails closed; a paginated client-facing API is needed before deployment.

@@ -56,7 +56,70 @@ constexpr std::string_view kSessionFields =
     return std::move(rows.rows.front());
 }
 
+[[nodiscard]] std::size_t parseScalarCount(const QueryRows& rows)
+{
+    if (rows.rows.size() != 1U || rows.rows[0].size() != 1U
+        || !rows.rows[0][0].has_value()) {
+        throw std::runtime_error{"PostgreSQL session count returned invalid shape"};
+    }
+    const std::string& count = *rows.rows[0][0];
+    std::size_t total{};
+    const auto [end, ec] = std::from_chars(
+        count.data(), count.data() + count.size(), total);
+    if (ec != std::errc{} || end != count.data() + count.size()) {
+        throw std::runtime_error{"PostgreSQL session count was invalid"};
+    }
+    return total;
+}
+
+asio::awaitable<void> executeInsert(
+    AsyncConnection& connection, std::string sql,
+    std::vector<std::optional<std::string>> params,
+    std::chrono::milliseconds deadline)
+{
+    static_cast<void>(co_await connection.query(
+        std::move(sql), std::move(params), deadline));
+}
+
 } // namespace
+
+asio::awaitable<void> AsyncSessionSql::add(
+    AsyncConnection& connection, NewSession session,
+    std::chrono::milliseconds deadline)
+{
+    if (!validId(session.id) || !validId(session.identityId)
+        || !validId(session.provider) || !validDigest(session.tokenDigestHex)
+        || session.assurance > 4U || session.factors > 7U
+        || session.authenticatedAtMs > session.issuedAtMs
+        || session.issuedAtMs > session.lastSeenAtMs
+        || session.lastSeenAtMs >= session.absoluteExpiresAtMs
+        || session.idleTimeoutMs <= 0) {
+        throw std::invalid_argument{"Invalid async session insert arguments"};
+    }
+    const std::string sql =
+        "INSERT INTO " + tableName(m_table) +
+        " (id,identity_id,provider,assurance,factors,phishing_resistant,"
+        "state,token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "absolute_expires_at_ms,idle_timeout_ms,revoked_at_ms,user_agent,remote_address) "
+        "VALUES($1,$2,$3,$4,$5,$6,0,decode($7,'hex'),$8,$9,$10,$11,$12,NULL,$13,$14)";
+    // Preserve SQL NULL distinct from an empty string in the transport.
+    // The original repository maps empty metadata strings to SQL NULL.
+    if (session.userAgent && session.userAgent->empty()) session.userAgent.reset();
+    if (session.remoteAddress && session.remoteAddress->empty()) session.remoteAddress.reset();
+    return executeInsert(connection, sql, {
+        std::move(session.id), std::move(session.identityId),
+        std::move(session.provider), std::to_string(session.assurance),
+        std::to_string(session.factors),
+        session.phishingResistant ? "true" : "false",
+        std::move(session.tokenDigestHex),
+        std::to_string(session.authenticatedAtMs),
+        std::to_string(session.issuedAtMs),
+        std::to_string(session.lastSeenAtMs),
+        std::to_string(session.absoluteExpiresAtMs),
+        std::to_string(session.idleTimeoutMs),
+        std::move(session.userAgent), std::move(session.remoteAddress)
+    }, deadline);
+}
 
 asio::awaitable<std::optional<AsyncSessionSql::SessionFields>>
 AsyncSessionSql::useToken(AsyncConnection& connection, std::string digestHex,
@@ -176,18 +239,7 @@ asio::awaitable<std::size_t> AsyncSessionSql::revokeAll(
           "RETURNING 1) SELECT count(*)::text FROM changed";
     auto rows = co_await connection.query(
         sql, {std::move(identityId), std::to_string(nowMilliseconds)}, deadline);
-    if (rows.rows.size() != 1U || rows.rows[0].size() != 1U
-        || !rows.rows[0][0].has_value()) {
-        throw std::runtime_error{"PostgreSQL bulk revocation returned invalid shape"};
-    }
-    const std::string& count = *rows.rows[0][0];
-    std::size_t total{};
-    const auto [end, ec] = std::from_chars(
-        count.data(), count.data() + count.size(), total);
-    if (ec != std::errc{} || end != count.data() + count.size()) {
-        throw std::runtime_error{"PostgreSQL bulk revocation count was invalid"};
-    }
-    co_return total;
+    co_return parseScalarCount(rows);
 }
 
 asio::awaitable<std::optional<AsyncSessionSql::SessionFields>>
@@ -204,4 +256,50 @@ AsyncSessionSql::find(AsyncConnection& connection, std::string sessionId,
         sql, {std::move(sessionId)}, deadline);
     co_return singleSession(std::move(rows));
 }
+asio::awaitable<std::vector<AsyncSessionSql::SessionFields>>
+AsyncSessionSql::list(AsyncConnection& connection, std::string identityId,
+                       std::chrono::milliseconds deadline)
+{
+    if (!validId(identityId)) {
+        throw std::invalid_argument{"Invalid async session list identity"};
+    }
+    const std::string sql =
+        "SELECT " + std::string{kSessionFields} + " FROM "
+        + tableName(m_table)
+        + " WHERE identity_id=$1 ORDER BY last_seen_at_ms DESC";
+    auto rows = co_await connection.query(sql, {std::move(identityId)}, deadline);
+    for (const auto& row : rows.rows) {
+        if (row.size() != 16U) {
+            throw std::runtime_error{"PostgreSQL session list returned invalid shape"};
+        }
+    }
+    co_return std::move(rows.rows);
+}
+
+asio::awaitable<std::size_t> AsyncSessionSql::purgeExpired(
+    AsyncConnection& connection, std::int64_t nowMilliseconds,
+    std::chrono::milliseconds deadline)
+{
+    if (nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid async session purge timestamp"};
+    }
+    const std::string sql =
+        "WITH removed AS (DELETE FROM " + tableName(m_table)
+        + " WHERE $1::bigint>=absolute_expires_at_ms "
+          "OR $1::bigint>=last_seen_at_ms+idle_timeout_ms RETURNING 1) "
+          "SELECT count(*)::text FROM removed";
+    auto rows = co_await connection.query(
+        sql, {std::to_string(nowMilliseconds)}, deadline);
+    co_return parseScalarCount(rows);
+}
+
+asio::awaitable<std::size_t> AsyncSessionSql::size(
+    AsyncConnection& connection, std::chrono::milliseconds deadline)
+{
+    const std::string sql =
+        "SELECT count(*)::text FROM " + tableName(m_table);
+    auto rows = co_await connection.query(sql, {}, deadline);
+    co_return parseScalarCount(rows);
+}
+
 } // namespace openproof::storage::postgres::async_detail
