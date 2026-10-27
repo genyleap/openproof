@@ -326,3 +326,30 @@ application-owned result limit does not provide a strict wire-level buffer
 ceiling. Reactor-driven cancellation, a bounded in-flight network buffer,
 backpressure, resource accounting, and actual async repository integration
 are still required before end-to-end acceptance.
+
+
+### Coroutine-native PostgreSQL pool permit and lease adapter
+
+An experimental internal `AsyncConnectionPool` now uses an Asio
+`experimental::concurrent_channel` of exactly N move-only connection
+permits instead of a condition-variable wait. `acquire()` suspends with an
+acquisition deadline and returns an exclusive move-only lease. A null permit
+creates its physical libpq connection asynchronously; a healthy idle lease
+returns the same connection, while a failed query or in-flight transaction
+returns only a null permit so the next owner must establish a fresh physical
+connection. A failed connection attempt also returns its permit automatically.
+The channel supports multiple executor workers without unsynchronized queue
+access. The pool lifetime is retained by outstanding leases.
+
+The disposable database suite now checks bounded nonblocking acquisition,
+lease return after a timed-out waiter, and fail-closed physical reconnection
+following a SQL error inside an explicit transaction. Invalid pool capacities
+and nonpositive deadlines are rejected before any network activity.
+
+**Not release approved:** this internal pool is deliberately not wired to the
+legacy synchronous repository SPIs or the active production service. It
+retains a live connection string in process memory for reconnection. Connection
+string handling, per-tenant fairness, coordinated shutdown, and transaction
+cancellation across the public repository and HTTP boundaries need further
+design and tests. The existing synchronous pool and repository operations
+remain forbidden by the full migration gate.

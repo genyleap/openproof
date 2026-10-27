@@ -2,7 +2,7 @@
 # synchronous repository SPI until transaction and lease lifetimes are migrated.
 # Build it as a normal translation unit to avoid leaking Boost.Asio types
 # through the OpenProof C++ module interfaces.
-add_library(openproof_postgres_async_io STATIC async_connection.cpp)
+add_library(openproof_postgres_async_io STATIC async_connection.cpp async_pool.cpp)
 target_compile_features(openproof_postgres_async_io PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_io PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
