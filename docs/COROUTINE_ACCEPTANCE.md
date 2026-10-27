@@ -267,3 +267,13 @@ coroutine path. A separately authenticated `/metrics` request continues
 to use the original metrics authorization guard, and must not increment the
 protected API observation count. Neither wrapper may synthesize or bypass
 authorization in the independent OpenProof Gateway core.
+
+### Aborted transaction disposal (native coroutine libpq)
+
+The disposable PostgreSQL integration suite now intentionally opens
+`BEGIN`, runs a SQL statement that fails, and verifies that the connection
+is **physically invalidated** before any future lease can see PostgreSQL's
+`PQTRANS_INERROR` state. This is a critical invariant for the eventual
+nonblocking connection pool: stale transaction state from one user or
+organization must never become another tenant's session. The test does not
+assert that the legacy synchronous repository is already migrated.

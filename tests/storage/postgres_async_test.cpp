@@ -64,6 +64,23 @@ asio::awaitable<void> transactionBoundary(
     returnedIdle = connection->reusable();
 }
 
+asio::awaitable<void> transactionErrorInvalidatesConnection(
+    std::string connectionString, bool& errorCaught, bool& rejectedLease)
+{
+    auto connection = co_await pg::AsyncConnection::connect(
+        std::move(connectionString), 2s);
+    static_cast<void>(co_await connection->query("BEGIN", {}, 2s));
+    try {
+        static_cast<void>(co_await connection->query(
+            "SELECT 1 / 0", {}, 2s));
+    } catch (const std::runtime_error&) {
+        errorCaught = true;
+    }
+    // A failed SQL statement inside a transaction must NEVER leave an
+    // aborted PGconn available to another session or tenant.
+    rejectedLease = !connection->healthy() && !connection->reusable();
+}
+
 asio::awaitable<void> slowQuery(
     std::string connectionString, bool& slowCompleted)
 {
@@ -221,6 +238,28 @@ TEST(PostgresNativeCoroutineTest, TransactionIsNotReusableUntilRollback)
     EXPECT_TRUE(blockedDuringTransaction)
         << "A leased transaction must never be returned to another tenant";
     EXPECT_TRUE(returnedIdle);
+}
+
+TEST(PostgresNativeCoroutineTest, FailedStatementCannotReturnAbortedLease)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool errorCaught = false;
+    bool rejectedLease = false;
+    auto result = asio::co_spawn(context,
+        transactionErrorInvalidatesConnection(
+            connectionString, errorCaught, rejectedLease), asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    EXPECT_TRUE(errorCaught);
+    EXPECT_TRUE(rejectedLease)
+        << "Aborted PostgreSQL transactions must never leak into another lease";
 }
 
 TEST(PostgresNativeCoroutineTest, SlowQueryDoesNotBlockIndependentSocket)
