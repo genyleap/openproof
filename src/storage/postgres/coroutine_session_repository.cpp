@@ -43,16 +43,36 @@ captureSessionRecord(const session::Session& value)
         value.userAgent(), value.remoteAddress()
     };
 }
+
+asio::awaitable<foundation::Status> insertCapturedSession(
+    async_detail::AsyncConnectionPool& pool,
+    async_detail::AsyncSessionSql& sql,
+    foundation::Duration timeout,
+    std::optional<async_detail::AsyncSessionSql::NewSession> row)
+{
+    if (!row) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                   "Only active sessions can be added.");
+    }
+    try {
+        auto lease = co_await pool.acquire();
+        co_await sql.add(lease.connection(), std::move(*row), timeout);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "Session persistence unavailable.");
+    }
+}
 } // namespace
 
 class CoroutinePostgresSessionRepository::Impl final {
 public:
     Impl(asio::any_io_executor executor, std::string connectionString,
          std::size_t capacity, foundation::Duration acquireTimeout,
-         foundation::Duration connectTimeout, foundation::Duration queryTimeout)
+         foundation::Duration connectTimeout, foundation::Duration queryTimeoutValue)
         : pool(std::move(executor), std::move(connectionString),
                capacity, acquireTimeout, connectTimeout),
-          queryTimeout(queryTimeout) {}
+          queryTimeout(queryTimeoutValue) {}
     async_detail::AsyncConnectionPool pool;
     async_detail::AsyncSessionSql sql;
     foundation::Duration queryTimeout{};
@@ -118,22 +138,12 @@ CoroutinePostgresSessionRepository::find(session::SessionId id)
 asio::awaitable<foundation::Status>
 CoroutinePostgresSessionRepository::add(session::Session value)
 {
-    if (value.state() != session::SessionState::Active) {
-        co_return foundation::fail(
-            foundation::ErrorCode::InvalidArgument,
-            "Only an active session can be issued.");
+    std::optional<async_detail::AsyncSessionSql::NewSession> row;
+    if (value.state() == session::SessionState::Active) {
+        row.emplace(captureSessionRecord(value));
     }
-    try {
-        auto record = captureSessionRecord(value);
-        auto lease = co_await m_impl->pool.acquire();
-        co_await m_impl->sql.add(
-            lease.connection(), std::move(record), m_impl->queryTimeout);
-        co_return foundation::ok();
-    } catch (const std::exception&) {
-        co_return foundation::fail(
-            foundation::ErrorCode::Unavailable,
-            "The session could not be persisted.");
-    }
+    return insertCapturedSession(
+        m_impl->pool, m_impl->sql, m_impl->queryTimeout, std::move(row));
 }
 
 asio::awaitable<foundation::Status>
