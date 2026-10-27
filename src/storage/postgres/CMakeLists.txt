@@ -105,3 +105,24 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_session_http.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
+
+# Explicit opt-in network listener bridge. Production does not link this
+# target until the authenticated request chain is fully coroutine-driven.
+add_library(openproof_postgres_async_listener STATIC coroutine_session_listener.cpp)
+target_compile_features(openproof_postgres_async_listener PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_listener PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_postgres_async_listener PROPERTIES
+    CXX_SCAN_FOR_MODULES ON
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_listener PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_listener
+    PUBLIC openproof_postgres_async_http openproof_gateway_http
+        openproof_gateway openproof_foundation Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_session_listener.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()

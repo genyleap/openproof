@@ -243,3 +243,37 @@ gtest_discover_tests(openproof_postgres_async_tests
     DISCOVERY_MODE PRE_TEST
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async")
+
+# Explicit opt-in socket-level verification for the coroutine session listener
+# bridge. Unlike the lightweight handler suite, this exercises real Beast
+# HTTP/1.1 framing and the CoroutineHttpHandler dynamic-dispatch boundary.
+add_executable(openproof_postgres_network_tests
+    storage/postgres_coroutine_network_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_postgres_network_tests PRIVATE cxx_std_26)
+target_compile_definitions(openproof_postgres_network_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_postgres_network_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_postgres_network_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_link_libraries(openproof_postgres_network_tests PRIVATE
+    openproof_postgres_async_listener
+    openproof_postgres_async_http openproof_postgres_async_repository
+    openproof_gateway_http openproof_gateway openproof_storage_postgres
+    openproof_session openproof_foundation openproof_security
+    Boost::headers OpenProof::libpq GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_coroutine_network_test.cpp
+        PROPERTIES COMPILE_OPTIONS
+        "-Wno-error=mismatched-new-delete;-Wno-error=array-bounds")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_network_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_network_tests
+    TEST_PREFIX "NativePostgresNetwork."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;network")

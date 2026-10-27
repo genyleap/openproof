@@ -814,3 +814,55 @@ The pending transport tasks are: an audited Beast
 chain without sync fallback; use of a shared executor/lifetime budget;
 request cancellation; and real loopback/synthetic production workload
 comparisons. HTTP transport migration remains **NOT_APPROVED**.
+
+### Experimental listener-bound coroutine session bridge (not yet verified)
+
+A separate opt-in `CoroutineSessionListenerAdapter` now implements the
+original `openproof.gateway.http::CoroutineHttpHandler` virtual contract,
+forwarding real `handleAsync()` dispatch to the audited session HTTP
+application adapter. Its synchronous `handle()` entry always returns
+a sanitized 503 and no session cookie, instead of falling back to the
+blocking legacy session repository. Both the application handler and
+fallback must outlive in-flight requests. This target is not referenced
+by `apps/opp`, does not change the active network listener or routes,
+and does not create a production cutover.
+
+A dedicated independent `openproof_postgres_network_tests` executable
+provides socket-level Beast HTTP/1.1 tests against `127.0.0.1` and
+port zero (assigned by the OS). Planned assertions include native
+asynchronous fallback dispatch, missing-credential rotation, anonymous
+logout cookie attributes, database outage preserving cookies, ambiguous
+Bearer+Cookie rejection, and the fail-closed synchronous entry point.
+The adapter explicitly uses the existing standalone Asio thread-context
+extern-template declaration to avoid GCC 16 module TLS duplication.
+
+**Verification status:** this network test and the listener bridge have
+not yet passed a complete build and must not be described as tested.
+The GCC 16 full optimized `gateway/http.cpp` rebuild took a disproportionate
+share of a shared single-vCPU production host, and a separate unrelated
+project began compiling concurrently. The OpenProof test Build was
+interrupted deliberately to protect shared host responsiveness. Never
+work around this by weakening application `-Werror`, deploying changes
+or firing GitHub Actions for each experimental fix. The previously
+verified 39 application/domain/real-PostgreSQL tests remain distinct;
+only a **successful socket test** closes this specific transport gap.
+
+#### Compile-only proof, pending listener test
+
+The original listener bridge object and the new socket-test translation
+unit both compiled independently with GCC 16.2 and `-Werror`, using existing
+module BMI artifacts and without rebuilding the large Gateway transport.
+This verifies translation-unit correctness only; no new linked executable
+or loopback socket test is claimed. All 14 existing domain/application
+handler tests and all 6 existing focused Beast transport tests were
+re-run and passed independently, while the neutrality audit remains green.
+
+A follow-up `CoroutineSessionListenerStack` now constructs and owns the
+application adapter and native listener adapter in a defined order, while
+accepting an already-native fallback handler. Its fallback lambda explicitly
+awaits `CoroutineHttpHandler::handleAsync()`; it never invokes legacy
+`handle()`. The socket fixture now uses that composition to exercise
+true caller lifetime. The updated composition still needs its own
+compile/link and socket checks. Two unrelated builds occupy the server's
+long-running process slots, so no concurrent heavyweight OpenProof build
+was started to verify that latest change. Production is untouched.
