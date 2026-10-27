@@ -30,6 +30,23 @@ void requireDisposableDatabase()
     }
 }
 
+asio::awaitable<void> failedConnectRestoresPermit(bool& repeatedFailure)
+{
+    // An unknown libpq setting fails before touching any socket or database.
+    pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
+        "openproof_nonexistent_libpq_parameter=bad", 1U, 100ms, 100ms};
+    unsigned int failures = 0U;
+    for (unsigned int attempt = 0U; attempt < 2U; ++attempt) {
+        try {
+            auto lease = co_await pool.acquire();
+            static_cast<void>(lease);
+        } catch (const std::runtime_error&) {
+            ++failures;
+        }
+    }
+    repeatedFailure = failures == 2U;
+}
+
 asio::awaitable<void> boundedAcquireAndReuse(
     std::string connectionString, bool& timedOut, bool& reused)
 {
@@ -110,6 +127,17 @@ TEST(PostgresAsyncPoolTest, InvalidCapacityAndDeadlinesFailClosed)
         1U, 0ms, 1s}), std::invalid_argument);
     EXPECT_THROW((pg::AsyncConnectionPool{io.get_executor(), "irrelevant",
         1U, 1s, 0ms}), std::invalid_argument);
+}
+
+TEST(PostgresAsyncPoolTest, FailedConnectReturnsPermitWithoutBlocking)
+{
+    asio::io_context io;
+    bool repeatedFailure = false;
+    auto done = asio::co_spawn(io,
+        failedConnectRestoresPermit(repeatedFailure), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(repeatedFailure);
 }
 
 TEST(PostgresAsyncPoolTest, TimedAcquireReturnsPermitForSubsequentLease)

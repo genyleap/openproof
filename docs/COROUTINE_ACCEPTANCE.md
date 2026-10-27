@@ -341,7 +341,9 @@ connection. A failed connection attempt also returns its permit automatically.
 The channel supports multiple executor workers without unsynchronized queue
 access. The pool lifetime is retained by outstanding leases.
 
-The disposable database suite now checks bounded nonblocking acquisition,
+The tests now check capacity/deadline validation and restoration of pool
+permits after a failed libpq connection **without requiring a database**.
+The disposable database suite checks bounded nonblocking acquisition,
 lease return after a timed-out waiter, and fail-closed physical reconnection
 both after a still-open transaction and after a SQL error inside an explicit
 transaction. Invalid pool capacities
