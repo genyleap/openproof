@@ -2,6 +2,7 @@
 #include <boost/asio.hpp>
 
 #include "coroutine_session_authenticator.hpp"
+#include "coroutine_session_service.hpp"
 #include <libpq-fe.h>
 
 #include <array>
@@ -19,6 +20,7 @@
 
 #include "coroutine_session_repository.hpp"
 
+import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
@@ -28,6 +30,7 @@ import openproof.storage.postgres;
 
 namespace {
 namespace asio = boost::asio;
+namespace auth = openproof::authentication;
 namespace fnd = openproof::foundation;
 namespace ids = openproof::identity::core;
 namespace idp = openproof::identity::provider;
@@ -175,6 +178,257 @@ asio::awaitable<void> verifyRealBearerHmac(
         fnd::SecretString{rawBearer});
     checks.revokedDenied = revoked && !denied
         && denied.error().code() == fnd::ErrorCode::AuthenticationFailed;
+}
+
+struct ServiceChecks final {
+    bool authenticated{};
+    bool ownerProtected{};
+    bool listed{};
+    bool rotated{};
+    bool replayDenied{};
+    bool revoked{};
+    bool listEmptyAfterRevoke{};
+};
+
+asio::awaitable<void> verifyCoroutineServiceAuthorization(
+    pg::CoroutinePostgresSessionRepository& repository,
+    ServiceChecks& checks)
+{
+    const std::string bearer{"isolated-coroutine-service-token"};
+    const fnd::SecretString key{std::string(32, 's')};
+    const auto fingerprint = sec::hmacSha256(key, bearer);
+    if (!fingerprint) co_return;
+    auto session = ses::Session::create(
+        ses::SessionId{"coroutine-service-session"},
+        ids::IdentityId{"coroutine-user-a"},
+        idp::ProviderId{"test-oidc"},
+        idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{
+            idp::AuthenticationFactor::Knowledge |
+            idp::AuthenticationFactor::Possession, false},
+        kNow, ses::TokenDigest{fingerprint.value()}, kNow, 2h, 15min);
+    if (!session) co_return;
+    auto inserted = co_await repository.add(std::move(session).value());
+    if (!inserted) co_return;
+
+    fnd::ManualClockSource clock{kNow + 1min};
+    auto policy = ses::SessionPolicy::create(2h, 15min);
+    if (!policy) co_return;
+    pg::CoroutinePostgresSessionService service{
+        repository, clock, key.clone(), std::move(policy).value()};
+
+    auto authenticated = co_await service.authenticate(fnd::SecretString{bearer});
+    checks.authenticated = authenticated
+        && authenticated->id().value() == "coroutine-service-session";
+    auto listed = co_await service.list(ids::IdentityId{"coroutine-user-a"});
+    checks.listed = listed && listed->size() == 1U
+        && listed->front().id().value() == "coroutine-service-session";
+
+    auto notOwner = co_await service.revokeOwned(
+        ids::IdentityId{"coroutine-user-b"},
+        ses::SessionId{"coroutine-service-session"});
+    checks.ownerProtected = !notOwner
+        && notOwner.error().code() == fnd::ErrorCode::NotFound;
+    auto rotated = co_await service.rotate(fnd::SecretString{bearer});
+    checks.rotated = rotated
+        && rotated->id().value() == "coroutine-service-session";
+    auto replay = co_await service.authenticate(fnd::SecretString{bearer});
+    checks.replayDenied = !replay
+        && replay.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    if (!rotated) co_return;
+    auto newToken = co_await service.authenticate(rotated->token().clone());
+    auto revoked = co_await service.revokeOwned(
+        ids::IdentityId{"coroutine-user-a"},
+        ses::SessionId{"coroutine-service-session"});
+    auto after = co_await service.authenticate(rotated->token().clone());
+    checks.revoked = newToken && revoked && !after
+        && after.error().code() == fnd::ErrorCode::AuthenticationFailed;
+    auto empty = co_await service.list(ids::IdentityId{"coroutine-user-a"});
+    checks.listEmptyAfterRevoke = empty && empty->empty();
+}
+
+class CoroutineSessionProofProvider final : public idp::AuthenticationProvider {
+public:
+    [[nodiscard]] idp::ProviderId id() const override {
+        return idp::ProviderId{"session-test"};
+    }
+    [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override {
+        return idp::InteractionModel::ChallengeResponse;
+    }
+    [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override {
+        return idp::AssuranceLevel::Ial3;
+    }
+    [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
+    beginAuthentication(const idp::AuthenticationRequest&) override {
+        return idp::AuthenticationChallenge{
+            idp::ChallengeId{"coroutine-session-proof-challenge"}, kNow + 5min};
+    }
+    [[nodiscard]] fnd::Result<idp::AuthenticationOutcome>
+    completeAuthentication(const idp::AuthenticationResponse&) override {
+        return idp::AuthenticationOutcome::create(
+            id(), idp::ExternalSubject{"coroutine-user-a-external"},
+            idp::VerifiedClaims{}, idp::AssuranceLevel::Ial3,
+            idp::AuthenticationStrength{
+                idp::AuthenticationFactor::Possession |
+                idp::AuthenticationFactor::Inherence, true},
+            idp::ProviderEvidence{}, kNow);
+    }
+};
+
+[[nodiscard]] auth::VerifiedAuthentication verifiedCoroutineLogin()
+{
+    idp::ProviderRegistry providers;
+    if (!providers.registerProvider(
+            std::make_unique<CoroutineSessionProofProvider>())) {
+        throw std::runtime_error{"Could not register test-only provider"};
+    }
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    ids::InMemoryExternalIdentityDirectory identities;
+    auto link = ids::IdentityLink::request(
+        ids::IdentityId{"coroutine-user-a"},
+        ids::ExternalIdentityRef{
+            idp::ProviderId{"session-test"},
+            idp::ExternalSubject{"coroutine-user-a-external"}},
+        kNow, 5min);
+    if (!link || !link->requireVerification(kNow)
+        || !link->markVerified(kNow) || !link->complete(kNow)
+        || !identities.attach(*link)) {
+        throw std::runtime_error{"Test identity linking was refused"};
+    }
+    auth::ProviderTrustPolicy trust;
+    if (!trust.trust(idp::ProviderId{"session-test"},
+                     idp::AssuranceLevel::Ial3)) {
+        throw std::runtime_error{"Test provider trust was refused"};
+    }
+    fnd::ManualClockSource clock{kNow};
+    auth::AuthenticationService authenticator{
+        providers, transactions, identities, clock, std::move(trust), 5min};
+    idp::AuthenticationRequest request{
+        idp::ProviderId{"session-test"}, idp::ClientContext{}};
+    request.setRequestedAssurance(idp::AssuranceLevel::Ial3);
+    auto binding = sec::sha256("coroutine-test-bound-channel");
+    if (!binding) throw std::runtime_error{"Binding digest generation failed"};
+    auto started = authenticator.begin(
+        request, binding.value(), fnd::CorrelationId{"coroutine-auth-correlation"});
+    if (!started) throw std::runtime_error{"Test authentication begin failed"};
+    idp::AuthenticationResponse response{
+        started->challenge().id(), idp::ClientContext{}};
+    auto completed = authenticator.complete(
+        started->transactionId(), started->continuationToken(),
+        binding.value(), response);
+    if (!completed) throw std::runtime_error{"Test authentication completion failed"};
+    return std::move(completed).value();
+}
+
+struct LoginChecks final {
+    bool issued{};
+    bool firstPartyAccepted{};
+    bool metadataPreserved{};
+    bool onlyOldRevoked{};
+    bool staleCookieIgnored{};
+    bool noCrossIdentityRevoke{};
+};
+
+asio::awaitable<void> verifyCoroutineLoginLifecycle(
+    pg::CoroutinePostgresSessionRepository& repository,
+    auth::VerifiedAuthentication trustedLogin,
+    LoginChecks& checks)
+{
+    fnd::ManualClockSource clock{kNow};
+    auto policy = ses::SessionPolicy::create(8h, 30min);
+    if (!policy) co_return;
+    pg::CoroutinePostgresSessionService service{
+        repository, clock, fnd::SecretString{std::string(32, 'L')},
+        std::move(policy).value()};
+    idp::ClientContext client;
+    client.setUserAgent("OpenProof coroutine browser test");
+    client.setRemoteAddress("192.0.2.10");
+
+    auto previous = co_await service.issue(trustedLogin, client);
+    if (!previous) co_return;
+    checks.issued = !previous->id().empty()
+        && previous->token().size() == 43U;
+    auto oldCookie = previous->token().clone();
+    auto independent = co_await service.issue(trustedLogin, client);
+    if (!independent) co_return;
+    auto independentCookie = independent->token().clone();
+    auto authenticated = co_await service.authenticate(oldCookie.clone());
+    checks.firstPartyAccepted = authenticated
+        && authenticated->identity() == ids::IdentityId{"coroutine-user-a"}
+        && authenticated->assurance() == idp::AssuranceLevel::Ial3;
+    checks.metadataPreserved = authenticated
+        && authenticated->userAgent().has_value()
+        && authenticated->userAgent().value() == "OpenProof coroutine browser test"
+        && authenticated->remoteAddress().has_value()
+        && authenticated->remoteAddress().value() == "192.0.2.10";
+
+    auto replacement = co_await service.issueReplacing(
+        trustedLogin, client, &oldCookie);
+    if (!replacement) co_return;
+    auto oldDenied = co_await service.authenticate(oldCookie.clone());
+    auto newAccepted = co_await service.authenticate(replacement->token().clone());
+    auto independentAccepted =
+        co_await service.authenticate(independentCookie.clone());
+    checks.onlyOldRevoked = !oldDenied && newAccepted && independentAccepted
+        && oldDenied.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    const fnd::SecretString stale{"unknown-or-expired-cookie"};
+    auto extra = co_await service.issueReplacing(trustedLogin, client, &stale);
+    auto stillValid = co_await service.authenticate(replacement->token().clone());
+    checks.staleCookieIgnored = extra && stillValid;
+    auto unrelated = co_await service.revokeOwned(
+        ids::IdentityId{"coroutine-user-b"}, replacement->id());
+    checks.noCrossIdentityRevoke = !unrelated
+        && unrelated.error().code() == fnd::ErrorCode::NotFound;
+
+    auto revoked = co_await service.revokeAll(ids::IdentityId{"coroutine-user-a"});
+    auto excluded = co_await service.list(ids::IdentityId{"coroutine-user-a"});
+    if (!revoked || !excluded || !excluded->empty()) {
+        checks.noCrossIdentityRevoke = false;
+    }
+}
+
+asio::awaitable<void> verifyReplacementRefusesDatabaseOutage(
+    pg::CoroutinePostgresSessionService& service,
+    auth::VerifiedAuthentication trustedLogin,
+    bool& replacementDenied,
+    bool& initialIssuanceDenied)
+{
+    const fnd::SecretString priorCookie{"previous-test-browser-cookie"};
+    const idp::ClientContext client{};
+    auto replaced = co_await service.issueReplacing(
+        trustedLogin, client, &priorCookie);
+    replacementDenied = !replaced
+        && replaced.error().code() == fnd::ErrorCode::Unavailable;
+    auto issued = co_await service.issue(trustedLogin, client);
+    initialIssuanceDenied = !issued
+        && issued.error().code() == fnd::ErrorCode::Unavailable;
+}
+
+TEST(PostgresCoroutineDomainTest, DatabaseOutageNeverIssuesOrReplacesBearer)
+{
+    asio::io_context io;
+    pg::CoroutinePostgresSessionRepository unavailable{
+        io.get_executor(),
+        fnd::SecretString{"openproof_invalid_connection_keyword=invalid"},
+        1U, 100ms, 100ms, 100ms};
+    const fnd::ManualClockSource clock{kNow};
+    auto policy = ses::SessionPolicy::create(8h, 30min);
+    ASSERT_TRUE(policy);
+    pg::CoroutinePostgresSessionService service{
+        unavailable, clock, fnd::SecretString{std::string(32, 'L')},
+        std::move(policy).value()};
+    bool deniedReplacement = false;
+    bool deniedIssuance = false;
+    auto tested = asio::co_spawn(
+        io, verifyReplacementRefusesDatabaseOutage(
+            service, verifiedCoroutineLogin(), deniedReplacement, deniedIssuance),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(tested.get());
+    EXPECT_TRUE(deniedReplacement);
+    EXPECT_TRUE(deniedIssuance);
 }
 
 struct Results {
@@ -376,4 +630,37 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(hmac.wrongKeyDenied);
     EXPECT_TRUE(hmac.revokedDenied);
     EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 1U);
+
+    io.restart();
+    ServiceChecks serviceChecks;
+    auto serviceRun = asio::co_spawn(
+        io, verifyCoroutineServiceAuthorization(repository, serviceChecks),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(serviceRun.get());
+    EXPECT_TRUE(serviceChecks.authenticated);
+    EXPECT_TRUE(serviceChecks.ownerProtected);
+    EXPECT_TRUE(serviceChecks.listed);
+    EXPECT_TRUE(serviceChecks.rotated);
+    EXPECT_TRUE(serviceChecks.replayDenied);
+    EXPECT_TRUE(serviceChecks.revoked);
+    EXPECT_TRUE(serviceChecks.listEmptyAfterRevoke);
+    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 1U);
+
+    // Verify genuine trusted AuthenticationService outputs, not a forged
+    // VerifiedAuthentication, and browser replacement semantics end-to-end.
+    io.restart();
+    LoginChecks loginChecks;
+    auto login = asio::co_spawn(
+        io, verifyCoroutineLoginLifecycle(
+            repository, verifiedCoroutineLogin(), loginChecks), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(login.get());
+    EXPECT_TRUE(loginChecks.issued);
+    EXPECT_TRUE(loginChecks.firstPartyAccepted);
+    EXPECT_TRUE(loginChecks.metadataPreserved);
+    EXPECT_TRUE(loginChecks.onlyOldRevoked);
+    EXPECT_TRUE(loginChecks.staleCookieIgnored);
+    EXPECT_TRUE(loginChecks.noCrossIdentityRevoke);
+    EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
 }

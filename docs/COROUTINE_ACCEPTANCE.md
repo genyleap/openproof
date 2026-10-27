@@ -678,3 +678,60 @@ components only. Production HTTP handlers, full coroutine SessionService,
 other synchronous SQL repositories, external OAuth/OIDC/wallet/LDAP transports,
 cancellation budgets, security acceptance and paired end-to-end workload
 benchmarks still require migration and testing.
+
+### Coroutine first-party SessionService adapter — local checkpoint
+
+A dedicated `CoroutinePostgresSessionService` now provides **native
+Asio-awaitable** first-party session issuance, current-cookie replacement,
+authentication, token rotation, revocation, bulk revocation, active-session
+listing and identity-scoped revocation. It owns a minimum-32-byte server
+HMAC key, accepts only the original trusted
+`authentication::VerifiedAuthentication` as an issuance authority, uses
+the project's CSPRNG for 32-byte session IDs and bearer secrets, and
+persists native `session::Session` objects through the nonblocking
+`CoroutinePostgresSessionRepository` instead of blocking pool calls.
+
+The independent `CoroutineSessionGrant` holds a move-only
+`foundation::SecretString`. This adapter intentionally remains outside
+the portable OpenProof C++ modules until the public async repository SPI
+and gateway integration are designed. It is not the original
+`session::SessionGrant` and **is not yet wired to HTTP**.
+
+**Security parity checks:** an old browser cookie is revoked only *after*
+the replacement is persisted; on failure to revoke the previous browser
+session, the replacement bearer is never returned and a compensating
+revocation of the replacement is attempted. Database unavailability
+during old-cookie lookup is not treated as an invalid/stale cookie, so it
+must not issue a new token. A missing, stale or revoked cookie does not
+authorize revocation of an unrelated browser session. Identity-scoped
+revoke-first checks map missing or foreign sessions to the same NotFound.
+Listing hides inactive and expired sessions. Token rotation compares
+the expected digest atomically, so replay cannot recover a valid bearer.
+
+**Local verification:** GCC 16.2 `RelWithDebInfo` compiled the new
+service with `-Werror` retained. A restricted `-fno-inline` GCC
+source option on the *service translation unit only* prevents a verified
+false-positive in Boost.Asio's aligned coroutine-frame allocation without
+disabling allocator warnings or changing the rest of the optimization
+profile. A real, ephemeral Docker PostgreSQL 16 test included a genuine
+`VerifiedAuthentication` minted by the domain's
+`AuthenticationService`, browser metadata, two independently active
+cookies, successful replacement of only the presented cookie, stale-cookie
+handling, and owner isolation. Real PostgreSQL native transport tests
+remained 24/24 green and the domain integration 1/1 green.
+
+**Final local regression in this checkpoint:** the additional domain
+failure-injection test confirmed that an unavailable PostgreSQL connection
+prevents both ordinary issuance and old-cookie replacement, without exposing
+a freshly minted bearer. Six out of six standalone domain tests passed.
+A repeat isolated Docker PostgreSQL run passed all twenty-four native tests
+and the expanded trusted-login/session-replacement integration test
+(449 ms in this run); the container was removed afterward. The new service
+compiled under GCC 16.2 with `-Werror`, with only its single source file
+configured to avoid the compiler's Boost.Asio allocation inlining false
+positive.
+
+Pending: cancellation after partial commit; complete domain-to-HTTP
+coroutine propagation; external providers; and whole-application paired
+performance tests. The release gate remains NOT_APPROVED until all original
+blockers are eliminated and CI is green.

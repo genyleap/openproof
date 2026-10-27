@@ -58,7 +58,8 @@ openproof_add_module(openproof_storage_postgres
 add_library(openproof_postgres_async_repository STATIC
     session_domain.cpp
     coroutine_session_repository.cpp
-    coroutine_session_authenticator.cpp)
+    coroutine_session_authenticator.cpp
+    coroutine_session_service.cpp)
 target_compile_features(openproof_postgres_async_repository PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_repository PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -72,3 +73,12 @@ target_link_libraries(openproof_postgres_async_repository
     PUBLIC openproof_storage_postgres openproof_postgres_async_io
         openproof_session openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
+
+# GCC 16.2 misidentifies Boost.Asio's own aligned coroutine-frame allocator
+# as mismatched new/delete when inlining the session-service awaitable frames.
+# Preserve -Werror and all diagnostics, but prevent that inlining only in
+# this transitional translation unit. Other production code retains -O2.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_session_service.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
