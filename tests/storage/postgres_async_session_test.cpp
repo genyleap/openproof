@@ -132,6 +132,35 @@ asio::awaitable<void> revokeAndBulkRevoke(
         && (*revokedSecond)[6] == "1";
 }
 
+asio::awaitable<void> bulkRevocationReturnsScalarCount(
+    std::string connectionString, bool& exactCount, bool& noCrossIdentity)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'mass-' || n::text, 'mass-identity', provider, assurance,"
+        "factors,phishing_resistant,0,decode(md5(n::text) || md5(n::text),'hex'),"
+        "authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "absolute_expires_at_ms,idle_timeout_ms,NULL,NULL,NULL "
+        "FROM pg_temp.sessions CROSS JOIN generate_series(1, 2048) AS n "
+        "WHERE id='test-session-1'",
+        {}, 3s));
+    const auto changed = co_await sql.revokeAll(*conn, "mass-identity", 1700, 5s);
+    const auto repeated = co_await sql.revokeAll(*conn, "mass-identity", 1701, 5s);
+    auto verified = co_await conn->query(
+        "SELECT count(*)::text FROM pg_temp.sessions "
+        "WHERE identity_id='mass-identity' AND state=1",
+        {}, 3s);
+    exactCount = changed == 2048U && repeated == 0U
+        && verified.rows.size() == 1U
+        && verified.rows[0].size() == 1U
+        && verified.rows[0][0] == "2048";
+    auto separate = co_await sql.find(*conn, "test-session-1", 3s);
+    noCrossIdentity = separate.has_value() && (*separate)[6] == "0";
+}
+
 } // namespace
 
 TEST(PostgresAsyncSessionSqlTest, AtomicUseRotationReplayAndIdleExpiry)
@@ -200,4 +229,24 @@ TEST(PostgresAsyncSessionSqlTest, RevocationIsIdempotentAndIdentityScoped)
     EXPECT_TRUE(idempotent);
     EXPECT_TRUE(absentDenied);
     EXPECT_TRUE(bulkIsolated);
+}
+
+TEST(PostgresAsyncSessionSqlTest, BulkRevocationReturnsBoundedCountForThousands)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool exactCount = false, noCrossIdentity = false;
+    auto future = asio::co_spawn(io,
+        bulkRevocationReturnsScalarCount(uri, exactCount, noCrossIdentity),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(exactCount);
+    EXPECT_TRUE(noCrossIdentity);
 }

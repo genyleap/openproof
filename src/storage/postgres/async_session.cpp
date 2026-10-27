@@ -3,6 +3,7 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -164,20 +166,28 @@ asio::awaitable<std::size_t> AsyncSessionSql::revokeAll(
     if (!validId(identityId) || nowMilliseconds < 0) {
         throw std::invalid_argument{"Invalid async session identity revocation arguments"};
     }
-    // Statement-level atomicity matches the original repository contract.
-    // RETURNING avoids a synchronous PQcmdTuples() result on this adapter.
+    // Return one count row rather than one row per revoked session: the
+    // latter could breach the bounded AsyncConnection result-copy limit
+    // *after* PostgreSQL had already committed the UPDATE.
+    // The data modification and its count remain one atomic statement.
     const std::string sql =
-        "UPDATE " + tableName(m_table)
+        "WITH changed AS (UPDATE " + tableName(m_table)
         + " SET state=1,revoked_at_ms=$2 WHERE identity_id=$1 AND state=0 "
-          "RETURNING id";
+          "RETURNING 1) SELECT count(*)::text FROM changed";
     auto rows = co_await connection.query(
         sql, {std::move(identityId), std::to_string(nowMilliseconds)}, deadline);
-    for (const auto& row : rows.rows) {
-        if (row.size() != 1U || !row.front().has_value()) {
-            throw std::runtime_error{"PostgreSQL bulk revocation returned invalid shape"};
-        }
+    if (rows.rows.size() != 1U || rows.rows[0].size() != 1U
+        || !rows.rows[0][0].has_value()) {
+        throw std::runtime_error{"PostgreSQL bulk revocation returned invalid shape"};
     }
-    co_return rows.rows.size();
+    const std::string& count = *rows.rows[0][0];
+    std::size_t total{};
+    const auto [end, ec] = std::from_chars(
+        count.data(), count.data() + count.size(), total);
+    if (ec != std::errc{} || end != count.data() + count.size()) {
+        throw std::runtime_error{"PostgreSQL bulk revocation count was invalid"};
+    }
+    co_return total;
 }
 
 asio::awaitable<std::optional<AsyncSessionSql::SessionFields>>

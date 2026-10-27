@@ -427,3 +427,17 @@ warning is now demoted from error to warning **for that one test source only**
 so it stays in build logs. Production compilation and all other source files
 retain the original `-Werror` policy. This is a compiler/allocator warning
 mitigation, not evidence that the new SQL tests have passed yet.
+
+
+### Bounded bulk-session revocation count
+
+The native async bulk-revocation statement now uses one data-modifying CTE,
+`WITH changed AS (UPDATE ... RETURNING 1) SELECT count(*) FROM changed`,
+instead of returning one identity/session identifier per affected row.
+Previously, a sufficiently large `RETURNING id` result could exceed the
+adapter's 8 MiB / 250,000-cell copy budget **after** the database had already
+committed the modification. The scalar count remains part of the same atomic
+statement, is strictly parsed as an unsigned integer, and requires only one
+client-visible row regardless of the number of sessions revoked. An isolated
+PostgreSQL regression exercises 2,048 sessions, an idempotent second call,
+and a different identity left untouched.
