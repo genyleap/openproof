@@ -264,3 +264,24 @@ because `WeightedRoundRobin::choose` returns
 `std::optional<Endpoint>`. The conversion is corrected in the following
 branch revision, but **the full build, E2E, new Gateway TCP benchmark and
 new authorization tests must pass before this patch is accepted**.
+
+## Repeatability upgrade for the dedicated Gateway experiment
+
+The controlled-latency **real OpenProof binary** benchmark now uses **five
+paired candidate/baseline trials**, alternating candidate-first and
+baseline-first ordering on the same CI runner. Every trial constructs a
+fresh no-auth Gateway, warms it up, and exercises 600 HTTP requests at 24-way
+concurrency against a local upstream that deliberately responds after 50ms.
+The input workload and configured network delay are verified identical
+before comparison. Any failed HTTP request causes a hard failure.
+
+`scripts/summarize-gateway-bench.mjs` reports the *median paired
+throughput/p50/p95/p99 changes* and exploratory percentile-bootstrap
+intervals. The source JSON files for each individual run and machine-readable
+aggregate summary are uploaded together, not only the preferred run. These
+intervals are descriptive: five pairs on one shared CI runner do not meet the
+requirements of an isolated, production-grade significance study, and this
+workload says **nothing about blocking authenticated PostgreSQL/OAuth paths**.
+
+A passing numerical comparison can NEVER override the independent
+Coroutine-completeness gate or the security regression suite.

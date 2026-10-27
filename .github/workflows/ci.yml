@@ -131,25 +131,36 @@ jobs:
           OPENPROOF_GATEWAY_BENCH_CONCURRENCY: "24"
           OPENPROOF_GATEWAY_BENCH_DELAY_MS: "50"
         run: |
-          node scripts/benchmark-gateway-upstream.mjs \
-            ./cmake-build-gcc-release/apps/opp/opp \
-            openproof-gateway-bench-candidate.json
-          OPENPROOF_GATEWAY_BENCH_COMMIT=ccb396182936d717960fdca319999baf2f580ff9 \
-          node scripts/benchmark-gateway-upstream.mjs \
-            "${RUNNER_TEMP}/openproof-perf-baseline/cmake-build-gcc-release/apps/opp/opp" \
-            openproof-gateway-bench-baseline.json
-          node scripts/compare-gateway-bench.mjs \
-            openproof-gateway-bench-baseline.json \
-            openproof-gateway-bench-candidate.json
+          mkdir -p gateway-bench
+          # Alternate execution order on the SAME runner to limit bias from
+          # warm-up, CPU frequency and shared-runner scheduling.
+          for trial in 1 2 3 4 5; do
+            if (( trial % 2 == 0 )); then
+              OPENPROOF_GATEWAY_BENCH_COMMIT=ccb396182936d717960fdca319999baf2f580ff9 \
+                node scripts/benchmark-gateway-upstream.mjs \
+                "${RUNNER_TEMP}/openproof-perf-baseline/cmake-build-gcc-release/apps/opp/opp" \
+                "gateway-bench/baseline-${trial}.json"
+              node scripts/benchmark-gateway-upstream.mjs \
+                ./cmake-build-gcc-release/apps/opp/opp \
+                "gateway-bench/candidate-${trial}.json"
+            else
+              node scripts/benchmark-gateway-upstream.mjs \
+                ./cmake-build-gcc-release/apps/opp/opp \
+                "gateway-bench/candidate-${trial}.json"
+              OPENPROOF_GATEWAY_BENCH_COMMIT=ccb396182936d717960fdca319999baf2f580ff9 \
+                node scripts/benchmark-gateway-upstream.mjs \
+                "${RUNNER_TEMP}/openproof-perf-baseline/cmake-build-gcc-release/apps/opp/opp" \
+                "gateway-bench/baseline-${trial}.json"
+            fi
+          done
+          node scripts/summarize-gateway-bench.mjs gateway-bench
 
       - name: Preserve actual Gateway TCP measurements
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: openproof-gateway-tcp-benchmark
-          path: |
-            openproof-gateway-bench-baseline.json
-            openproof-gateway-bench-candidate.json
+          path: gateway-bench/
           if-no-files-found: ignore
           retention-days: 14
 
