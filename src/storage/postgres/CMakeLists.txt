@@ -52,3 +52,9 @@ openproof_add_module(openproof_storage_postgres
         OpenProof::libpq
         openproof_postgres_async_io
 )
+
+# The exported coroutine repository now names Boost.Asio awaitables in the
+# storage module's global fragment, just like openproof_gateway_http.
+# Keep the Darwin/GCC Boost.Config long-long correction target-local.
+target_compile_definitions(openproof_storage_postgres PRIVATE
+    BOOST_HAS_LONG_LONG=1)

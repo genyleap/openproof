@@ -23,6 +23,28 @@ import openproof.session;
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
 
+namespace {
+[[nodiscard]] async_detail::AsyncSessionSql::NewSession
+captureSessionRecord(const session::Session& value)
+{
+    return {
+        std::string{value.id().value()},
+        std::string{value.identity().value()},
+        std::string{value.provider().value()},
+        foundation::toHex(value.tokenDigest().bytes()),
+        static_cast<unsigned int>(value.assurance()),
+        static_cast<unsigned int>(value.strength().factors()),
+        value.strength().isPhishingResistant(),
+        value.authenticatedAt().time_since_epoch().count(),
+        value.issuedAt().time_since_epoch().count(),
+        value.lastSeenAt().time_since_epoch().count(),
+        value.absoluteExpiresAt().time_since_epoch().count(),
+        value.idleTimeout().count(),
+        value.userAgent(), value.remoteAddress()
+    };
+}
+} // namespace
+
 class CoroutinePostgresSessionRepository::Impl final {
 public:
     Impl(asio::any_io_executor executor, std::string connectionString,
@@ -102,21 +124,7 @@ CoroutinePostgresSessionRepository::add(session::Session value)
             "Only an active session can be issued.");
     }
     try {
-        async_detail::AsyncSessionSql::NewSession record{
-            std::string{value.id().value()},
-            std::string{value.identity().value()},
-            std::string{value.provider().value()},
-            foundation::toHex(value.tokenDigest().bytes()),
-            static_cast<unsigned int>(value.assurance()),
-            static_cast<unsigned int>(value.strength().factors()),
-            value.strength().isPhishingResistant(),
-            value.authenticatedAt().time_since_epoch().count(),
-            value.issuedAt().time_since_epoch().count(),
-            value.lastSeenAt().time_since_epoch().count(),
-            value.absoluteExpiresAt().time_since_epoch().count(),
-            value.idleTimeout().count(),
-            value.userAgent(), value.remoteAddress()
-        };
+        auto record = captureSessionRecord(value);
         auto lease = co_await m_impl->pool.acquire();
         co_await m_impl->sql.add(
             lease.connection(), std::move(record), m_impl->queryTimeout);
