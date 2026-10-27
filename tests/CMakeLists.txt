@@ -175,7 +175,8 @@ gtest_discover_tests(openproof_gateway_http_tests
 # until transaction ownership and async repository APIs are fully migrated.
 add_executable(openproof_postgres_async_tests
     storage/postgres_async_test.cpp
-    storage/postgres_async_pool_test.cpp)
+    storage/postgres_async_pool_test.cpp
+    storage/postgres_async_session_test.cpp)
 target_compile_features(openproof_postgres_async_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_postgres_async_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/src/storage/postgres"

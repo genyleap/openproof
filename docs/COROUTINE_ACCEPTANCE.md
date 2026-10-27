@@ -373,3 +373,30 @@ Pending runs can still be coalesced by GitHub's concurrency scheduler. Mainline
 and ordinary PR workflows retain cancellation of superseded runs. A
 successful isolated PostgreSQL/Gateway/E2E build job does not override the
 deliberately failing static completeness gate or authorize deployment.
+
+
+### Native session token SQL critical section (in integration)
+
+An internal `AsyncSessionSql` now executes the existing PostgreSQL session
+`UPDATE ... RETURNING` use/last-seen transition and compare-and-swap digest
+rotation as **real** asynchronous `AsyncConnection::query` calls. Its fixed
+production table is `openproof.sessions`; the separate test-only selector
+targets only `pg_temp.sessions` so isolated integration tests cannot mutate
+production schema objects. Digest inputs are verified as exactly 64
+hexadecimal characters before query submission, and all user-controlled
+values remain SQL parameters. A successful use can return the 16-column
+session data contract only when the updated state remains active. Expired,
+revoked or unknown tokens return no authenticated row; rotation requires the
+expected old digest and checks both inclusive expiry boundaries atomically.
+A single lookup never renews idle time.
+
+The test fixture uses a session-local temporary table with the real schema's
+sixteen session columns; it checks a successful touch, token rotation,
+old-digest replay denial, inclusive idle deadline, bad-digest rejection,
+persistent expired state, and no late identity disclosure. The test still
+requires an isolated PostgreSQL database and its result must be verified in
+CI. This is genuine nonblocking SQL for the **session command layer**, not
+yet an implementation of the public `session::SessionRepository` interface.
+The required type restoration into `session::Session`, application-service
+async SPI, complete session CRUD/revocation and production HTTP wiring remain
+unfinished. Do not merge or deploy based on this checkpoint.
