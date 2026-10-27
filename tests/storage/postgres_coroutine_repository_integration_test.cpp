@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <boost/asio.hpp>
+
+#include "coroutine_session_authenticator.hpp"
 #include <libpq-fe.h>
 
 #include <array>
@@ -118,6 +120,63 @@ asio::awaitable<void> verifyNewRejectsLegacyRevocation(
         && attempt.error().code() == fnd::ErrorCode::AuthenticationFailed;
 }
 
+struct HmacResults {
+    bool accepted{};
+    bool wrongKeyDenied{};
+    bool wrongBearerDenied{};
+    bool revokedDenied{};
+};
+
+asio::awaitable<void> verifyRealBearerHmac(
+    pg::CoroutinePostgresSessionRepository& repository, HmacResults& checks)
+{
+    // Test-only credentials are never used outside the throwaway database.
+    const std::string rawBearer{"isolated-test-cookie-raw-value"};
+    const fnd::SecretString signingKey{std::string(32, 'k')};
+    auto fingerprint = sec::hmacSha256(signingKey, rawBearer);
+    if (!fingerprint) co_return;
+    auto issued = ses::Session::create(
+        ses::SessionId{"hmac-real-session"},
+        ids::IdentityId{"coroutine-user-a"},
+        idp::ProviderId{"test-oidc"}, idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{
+            idp::AuthenticationFactor::Knowledge |
+            idp::AuthenticationFactor::Possession, false},
+        kNow, ses::TokenDigest{fingerprint.value()},
+        kNow, 2h, 15min);
+    if (!issued) co_return;
+    const auto stored = co_await repository.add(std::move(issued).value());
+    if (!stored) co_return;
+
+    fnd::ManualClockSource clock{kNow + 1min};
+    pg::CoroutineSessionAuthenticator authenticator{
+        repository, clock, signingKey.clone()};
+    auto accepted = co_await authenticator.authenticate(
+        fnd::SecretString{rawBearer});
+    checks.accepted = accepted
+        && accepted->id().value() == "hmac-real-session"
+        && accepted->lastSeenAt() == kNow + 1min;
+    auto wrongBearer = co_await authenticator.authenticate(
+        fnd::SecretString{"another-isolated-test-cookie"});
+    checks.wrongBearerDenied = !wrongBearer
+        && wrongBearer.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    pg::CoroutineSessionAuthenticator wrongKey{
+        repository, clock, fnd::SecretString{std::string(32, 'w')}};
+    auto wrongSigningKey = co_await wrongKey.authenticate(
+        fnd::SecretString{rawBearer});
+    checks.wrongKeyDenied = !wrongSigningKey
+        && wrongSigningKey.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    auto revoked = co_await repository.revoke(
+        ses::SessionId{"hmac-real-session"}, kNow + 2min);
+    clock.set(kNow + 3min);
+    auto denied = co_await authenticator.authenticate(
+        fnd::SecretString{rawBearer});
+    checks.revokedDenied = revoked && !denied
+        && denied.error().code() == fnd::ErrorCode::AuthenticationFailed;
+}
+
 struct Results {
     bool issued{};
     bool touched{};
@@ -196,8 +255,30 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
         && std::getenv("PG_CLUSTER_CONF_ROOT") != nullptr
         && std::string_view{std::getenv("PG_CLUSTER_CONF_ROOT")}
             .starts_with("/tmp/pg_virtualenv.");
-    ASSERT_TRUE(hostedCi || localVirtualEnv)
+    const char* localMode = std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_MODE");
+    const bool localDocker = std::string_view{uri} == kDisposableServerDatabase
+        && localMode != nullptr
+        && std::string_view{localMode} == "isolated-docker-55432";
+    ASSERT_TRUE(hostedCi || localVirtualEnv || localDocker)
         << "Not an explicitly permitted disposable PostgreSQL cluster";
+    if (localDocker) {
+        // A second, server-sourced assertion is required; an environment
+        // variable and a localhost port alone never prove DB isolation.
+        std::unique_ptr<PGconn, PqDeleter> isolation{PQconnectdb(uri)};
+        ASSERT_TRUE(isolation && PQstatus(isolation.get()) == CONNECTION_OK);
+        std::unique_ptr<PGresult, PqResultDeleter> identity{
+            PQexec(isolation.get(), "SHOW cluster_name")};
+        ASSERT_TRUE(identity && PQresultStatus(identity.get()) == PGRES_TUPLES_OK);
+        ASSERT_EQ(PQntuples(identity.get()), 1);
+        ASSERT_STREQ(PQgetvalue(identity.get(), 0, 0),
+                    "openproof_disposable_coroutine_55432");
+        std::unique_ptr<PGresult, PqResultDeleter> location{
+            PQexec(isolation.get(), "SHOW data_directory")};
+        ASSERT_TRUE(location && PQresultStatus(location.get()) == PGRES_TUPLES_OK);
+        ASSERT_EQ(PQntuples(location.get()), 1);
+        ASSERT_STREQ(PQgetvalue(location.get(), 0, 0),
+                    "/var/lib/postgresql/data");
+    }
     if (localVirtualEnv) {
         // Independently verify actual server storage, rather than trusting
         // environment variables or a socket on the expected port.
@@ -283,4 +364,16 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     ASSERT_NO_THROW(deniedByNew.get());
     EXPECT_TRUE(rejected);
     EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 2U);
+
+    io.restart();
+    HmacResults hmac;
+    auto verifiedBearer = asio::co_spawn(
+        io, verifyRealBearerHmac(repository, hmac), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(verifiedBearer.get());
+    EXPECT_TRUE(hmac.accepted);
+    EXPECT_TRUE(hmac.wrongBearerDenied);
+    EXPECT_TRUE(hmac.wrongKeyDenied);
+    EXPECT_TRUE(hmac.revokedDenied);
+    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 1U);
 }

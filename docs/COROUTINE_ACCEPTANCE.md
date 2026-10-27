@@ -641,3 +641,40 @@ This is a first application-level authentication bridge, not proof the
 existing HTTP/SessionService path is migrated. It is not deployed, and
 its new test remains pending compilation on the resource-limited shared
 server.
+
+### Verified local disposable PostgreSQL 16 integration checkpoint — 2026-10-27
+
+Using `scripts/ci/test-local-coroutine-docker.py` on the shared server,
+a freshly initialized and temporary PostgreSQL 16 container was bound only
+to `127.0.0.1:55432`, with a tmpfs-backed data directory, a distinct
+`cluster_name` checked by the C++ test, CPU/memory limits, and guaranteed
+container removal. The local `pg_virtualenv` method could not switch UID
+on this host, so the Docker fixture supplies real SQL isolation without
+touching the managed service or database.
+
+**Actual passing results** (not skipped, not mocks):
+- **24/24** native libpq, pool and async session SQL tests, covering
+  cancellations/timeouts, tenant-state isolation, poisoned and aborted
+  transactions, bounded results, non-blocking slow SQL, and atomic session
+  rotation/revocation (including 2,048 sessions).
+- **5/5** standalone domain security tests, including strict typed row
+  restoration and the new HMAC bearer authentication bridge.
+- **1/1** isolated real-schema integration test, including bidirectional
+  synchronous/coroutine repository interoperability, identity scoping,
+  replay protection, and actual HMAC bearer authentication with wrong-bearer,
+  wrong-signing-key and revoked-session rejection.
+- The real-schema test ran in **469 ms**, and the native set in **1,760 ms**
+  on this server. These are **test elapsed times**, not comparative production
+  throughput or valid old-versus-new latency benchmarks.
+
+The Docker runner rejects occupied ports, existing containers and unexpected
+server identities. It checks published TCP readiness, runs both test binaries
+with strict pass/no-skip assertions, and removes the disposable database in a
+finally block. The ordinary CI workflow was not triggered and changes remain
+local-only.
+
+**Release status: NOT_APPROVED.** This verifies native storage/session
+components only. Production HTTP handlers, full coroutine SessionService,
+other synchronous SQL repositories, external OAuth/OIDC/wallet/LDAP transports,
+cancellation budgets, security acceptance and paired end-to-end workload
+benchmarks still require migration and testing.
