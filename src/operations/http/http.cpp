@@ -227,11 +227,21 @@ gateway::HttpResponse MetricsHttpApi::handle(gateway::HttpRequest request)
     }
 
     const auto started = std::chrono::steady_clock::now();
-    gateway::HttpResponse response = m_fallback->handle(std::move(request));
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - started).count();
-    record(method, response.status(), elapsed);
-    return response;
+    const auto recordCompletion = [this, method, started](int status) noexcept {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        record(method, status, elapsed);
+    };
+    try {
+        gateway::HttpResponse response = m_fallback->handle(std::move(request));
+        recordCompletion(response.status());
+        return response;
+    } catch (...) {
+        // The Beast boundary converts the exception to sanitized HTTP 500.
+        // Count it even on legacy synchronous middleware routes.
+        recordCompletion(500);
+        throw;
+    }
 }
 
 } // namespace openproof::operations::http

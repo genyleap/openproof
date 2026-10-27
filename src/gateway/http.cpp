@@ -809,11 +809,25 @@ CoroutineMetricsAdapter::handleAsync(HttpRequest request)
     }
     const HttpMethod method = request.method();
     const auto started = std::chrono::steady_clock::now();
-    HttpResponse result = co_await m_fallback->handleAsync(std::move(request));
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - started).count();
-    m_observer(method, result.status(), elapsed);
-    co_return result;
+    const auto observe = [this, method, started](int status) noexcept {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        // Observability must never change the result or turn an application
+        // error into an uncaught exception. Count all async 500 responses.
+        try {
+            if (m_observer) m_observer(method, status, elapsed);
+        } catch (...) {}
+    };
+    try {
+        HttpResponse result = co_await m_fallback->handleAsync(std::move(request));
+        observe(result.status());
+        co_return result;
+    } catch (...) {
+        // Beast translates the rethrown exception into a sanitized HTTP 500;
+        // record that outcome just like the synchronous Metrics middleware.
+        observe(500);
+        throw;
+    }
 }
 
 CoroutineGatewayAdapter::CoroutineGatewayAdapter(

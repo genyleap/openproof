@@ -241,3 +241,29 @@ The updated `openproof_postgres_async_tests` executable compiles and
 links with GCC 16.2 locally; the **new** disposable-database assertion
 has not passed CI until a subsequent workflow executes it. The
 whole-project Coroutine gate remains NOT APPROVED.
+
+### Async metrics failure accounting and isolation regression
+
+The instrumented `CoroutineMetricsAdapter` records the same bounded
+HTTP status-class and duration aggregates as the legacy Metrics HTTP
+middleware. When an asynchronous downstream handler throws **after a
+suspension**, the adapter records the eventual sanitized HTTP 500 outcome
+and rethrows so the Beast listener preserves the existing error boundary.
+Failures inside the observer itself are ignored: instrumentation must
+never change a legitimate downstream HTTP 200 into a 500. The old
+synchronous middleware now likewise counts downstream exceptions as HTTP
+500 instead of silently omitting them. Focused TCP tests exercise both
+conditions, keeping raw paths/tokens out of metric labels.
+
+This does **not** convert the synchronous identity or storage repositories.
+No release approval is implied by metrics middleware compatibility.
+
+The security regression now also composes all three actual layers —
+`BeastHttpServer` -> `CoroutineMetricsAdapter` ->
+`CoroutineGatewayAdapter` — with a protected Gateway route. Without an
+authenticated session, the request must be rejected with HTTP 401 before
+contacting any upstream, despite the metrics middleware taking the native
+coroutine path. A separately authenticated `/metrics` request continues
+to use the original metrics authorization guard, and must not increment the
+protected API observation count. Neither wrapper may synthesize or bypass
+authorization in the independent OpenProof Gateway core.

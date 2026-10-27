@@ -346,6 +346,51 @@ TEST(BeastHttpIntegrationTest, CoroutineMetricsWrapperKeepsGuardAndAsyncFallback
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, CoroutineMetricsCountsFailureAfterSuspension)
+{
+    MetricsFacadeStub facade;
+    CoroutineThrowingHandler throwing;
+    std::atomic<int> observations{0};
+    std::atomic<int> failureStatus{0};
+    httpAdapter::CoroutineMetricsAdapter handler{
+        facade, throwing,
+        [&observations, &failureStatus](
+            gw::HttpMethod method, int status, double duration) {
+            if (method == gw::HttpMethod::Get && duration > 0.0) {
+                failureStatus.store(status, std::memory_order_relaxed);
+                observations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }};
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/api/private");
+    EXPECT_EQ(response.result(), beastHttp::status::internal_server_error);
+    EXPECT_EQ(response.body().find("sensitive"), std::string::npos);
+    EXPECT_EQ(observations.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(failureStatus.load(std::memory_order_relaxed), 500);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, CoroutineMetricsObserverFailureDoesNotAlterHttpResponse)
+{
+    MetricsFacadeStub facade;
+    CoroutineWaitingHandler asyncFallback;
+    httpAdapter::CoroutineMetricsAdapter handler{
+        facade, asyncFallback,
+        [](gw::HttpMethod, int, double) {
+            throw std::runtime_error{"metrics instrumentation failed"};
+        }};
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/api/health");
+    EXPECT_EQ(response.result(), beastHttp::status::ok);
+    EXPECT_EQ(response.body(), "async");
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, NativeAsyncProxyPerformsRealTcpRoundTrip)
 {
     WaitingHandler upstreamHandler;
@@ -640,6 +685,57 @@ TEST(BeastHttpIntegrationTest, CoroutineGatewayStillRejectsMissingIdentity)
     EXPECT_EQ(response.result(), beastHttp::status::unauthorized);
     EXPECT_EQ(response.at("cache-control"), "no-store");
     EXPECT_EQ(response.base().find("x-openproof-identity"), response.base().end());
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, MetricsWrapperDoesNotBypassGatewayAuthorization)
+{
+    CoreFixture core;
+    gw::Router router;
+    ASSERT_TRUE(router.add(gw::Route::create(
+        gw::RouteId{"protected-with-metrics"}, gw::HttpMethod::Get, "/api",
+        gw::ServiceId{"service"}, true,
+        openproof::identity::core::OrganizationId{"organization"},
+        pol::Action{"read"}, pol::Resource{"document"}).value()));
+    ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"}, {
+        gw::Endpoint::create(gw::EndpointId{"never-contact"}, "127.0.0.1",
+                             1U, false, 1U).value()}));
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    gw::Gateway gatewayCore{
+        router, core.sessions, core.access, core.limiter,
+        core.discovery, core.balancer, core.circuits, *proxy.value(),
+        core.signer, std::chrono::seconds{1}};
+    httpAdapter::CoroutineGatewayAdapter asyncGateway{gatewayCore, *proxy.value()};
+    MetricsFacadeStub facade;
+    std::atomic<int> observedProtected{0};
+    httpAdapter::CoroutineMetricsAdapter middleware{
+        facade, asyncGateway,
+        [&observedProtected](gw::HttpMethod, int status, double) {
+            if (status == 401) {
+                observedProtected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }};
+    httpAdapter::BeastHttpServer server{middleware, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto protectedResponse = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/api/document");
+    EXPECT_EQ(protectedResponse.result(), beastHttp::status::unauthorized);
+    EXPECT_EQ(protectedResponse.at("cache-control"), "no-store");
+    EXPECT_EQ(protectedResponse.base().find("x-openproof-identity"),
+              protectedResponse.base().end());
+    EXPECT_EQ(observedProtected.load(std::memory_order_relaxed), 1);
+
+    const auto deniedMetrics = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/metrics");
+    EXPECT_EQ(deniedMetrics.result(), beastHttp::status::unauthorized);
+    const auto allowedMetrics = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/metrics",
+        {}, {}, {}, "Bearer test-only");
+    EXPECT_EQ(allowedMetrics.result(), beastHttp::status::ok);
+    EXPECT_EQ(observedProtected.load(std::memory_order_relaxed), 1);
     server.stop();
 }
 
