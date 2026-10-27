@@ -277,3 +277,24 @@ is **physically invalidated** before any future lease can see PostgreSQL's
 nonblocking connection pool: stale transaction state from one user or
 organization must never become another tenant's session. The test does not
 assert that the legacy synchronous repository is already migrated.
+
+### Total Gateway upstream retry deadline (coroutine and compatibility)
+
+Gateway retry attempts now share **one monotonic upstream time budget**,
+starting after trusted-context sealing and endpoint discovery. The core owns
+this deadline inside `GatewayForwardPlan` (which cannot be constructed by a
+transport caller), and calculates the remaining time independently for each
+attempt. Both the legacy `ProxyTransport::send` loop and the native
+`CoroutineGatewayAdapter::handleAsync` loop pass this remaining budget to
+the actual transport instead of resetting it between retries. If a legacy
+upstream ignores its timeout and completes after the deadline, the Gateway
+rejects even a successful response with a sanitized 504 and does not contact
+a second upstream. The core regression suite tests late successes, exhausted
+retry budgets, and shrinking budgets on fast failures. The network transport
+already uses one deadline for DNS/connect/TLS/write/read within each attempt.
+
+**Scope:** this change bounds the Gateway's *upstream forwarding sequence*;
+it does not establish a whole-request deadline for slow PostgreSQL, OAuth,
+session authorization, or unrelated provider calls. Cross-layer cancellation,
+end-to-end deadlines, and the remaining 40 static findings still block
+release approval.

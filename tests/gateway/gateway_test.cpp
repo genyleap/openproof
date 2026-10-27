@@ -147,6 +147,35 @@ public:
     std::vector<gw::EndpointId> attempted;
 };
 
+class SlowFailingProxy final : public gw::ProxyTransport {
+public:
+    [[nodiscard]] fnd::Result<gw::HttpResponse> send(
+        const gw::Endpoint&, const gw::HttpRequest&,
+        fnd::Duration timeout) override
+    {
+        budgets.push_back(timeout);
+        if (budgets.size() == 1U) {
+            // Simulate a legacy/blocking upstream that ignores its timeout.
+            std::this_thread::sleep_for(firstDelay);
+        }
+        return fnd::fail(fnd::ErrorCode::Unavailable, "upstream failed");
+    }
+    std::chrono::milliseconds firstDelay{40};
+    std::vector<fnd::Duration> budgets;
+};
+
+class SlowSuccessProxy final : public gw::ProxyTransport {
+public:
+    [[nodiscard]] fnd::Result<gw::HttpResponse> send(
+        const gw::Endpoint&, const gw::HttpRequest&, fnd::Duration) override
+    {
+        ++attempts;
+        std::this_thread::sleep_for(std::chrono::milliseconds{40});
+        return gw::HttpResponse{200, {}, "too late"};
+    }
+    int attempts{};
+};
+
 class ServerErrorProxy final : public gw::ProxyTransport {
 public:
     [[nodiscard]] fnd::Result<gw::HttpResponse> send(
@@ -430,6 +459,55 @@ TEST(GatewayTest, RetriesOnlyIdempotentRequestsAcrossDistinctEndpoints)
                             std::chrono::seconds{2}};
     EXPECT_EQ(postGateway.handle(request({}, gw::HttpMethod::Post)).status(), 503);
     EXPECT_EQ(postProxy.attempted.size(), 1U);
+}
+
+TEST(GatewayTest, RetryBudgetIsSharedAndStopsAfterTotalDeadline)
+{
+    GatewayFixture fixture;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route(false, gw::HttpMethod::Get)));
+    SlowFailingProxy proxy;
+    gw::Gateway gateway{router, fixture.sessions, fixture.access, fixture.limiter,
+                        fixture.discovery, fixture.balancer, fixture.circuits, proxy,
+                        fixture.signer, std::chrono::milliseconds{20}};
+    // A blocking adapter can overrun its own supplied deadline. The Gateway
+    // must still reject a second retry and report the total timeout.
+    const auto result = gateway.handle(request({}, gw::HttpMethod::Get));
+    EXPECT_EQ(result.status(), 504);
+    ASSERT_EQ(proxy.budgets.size(), 1U);
+    EXPECT_GT(proxy.budgets.front(), fnd::Duration::zero());
+    EXPECT_LE(proxy.budgets.front(), std::chrono::milliseconds{20});
+}
+
+TEST(GatewayTest, LateUpstreamSuccessNeverBypassesTotalDeadline)
+{
+    GatewayFixture fixture;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route(false, gw::HttpMethod::Get)));
+    SlowSuccessProxy proxy;
+    gw::Gateway gateway{router, fixture.sessions, fixture.access, fixture.limiter,
+                        fixture.discovery, fixture.balancer, fixture.circuits, proxy,
+                        fixture.signer, std::chrono::milliseconds{20}};
+    const auto result = gateway.handle(request({}, gw::HttpMethod::Get));
+    EXPECT_EQ(result.status(), 504);
+    EXPECT_EQ(result.body().find("too late"), std::string_view::npos);
+    EXPECT_EQ(proxy.attempts, 1);
+    EXPECT_EQ(result.headers().at("cache-control"), "no-store");
+}
+
+TEST(GatewayTest, RetryBudgetDecreasesAcrossFastFailures)
+{
+    GatewayFixture fixture;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route(false, gw::HttpMethod::Get)));
+    SlowFailingProxy proxy;
+    gw::Gateway gateway{router, fixture.sessions, fixture.access, fixture.limiter,
+                        fixture.discovery, fixture.balancer, fixture.circuits, proxy,
+                        fixture.signer, std::chrono::seconds{3}};
+    const auto result = gateway.handle(request({}, gw::HttpMethod::Get));
+    EXPECT_EQ(result.status(), 503);
+    ASSERT_EQ(proxy.budgets.size(), 2U);
+    EXPECT_LT(proxy.budgets.at(1U), proxy.budgets.at(0U));
 }
 
 TEST(TrustedContextSignerTest, DetectsTamperingAndExpiredContexts)

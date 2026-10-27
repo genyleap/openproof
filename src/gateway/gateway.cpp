@@ -907,7 +907,8 @@ Gateway::prepareForward(HttpRequest request)
     const std::size_t attempts = retryable(request.method())
         ? std::min<std::size_t>(2U, endpoints->size()) : 1U;
     return GatewayForwardPlan{
-        std::move(request), route->service(), std::move(endpoints).value(), attempts};
+        std::move(request), route->service(), std::move(endpoints).value(),
+        attempts, m_upstreamTimeout};
 }
 
 std::optional<Endpoint> Gateway::nextForwardEndpoint(GatewayForwardPlan& plan)
@@ -929,6 +930,13 @@ std::optional<HttpResponse> Gateway::recordForwardResult(
     GatewayForwardPlan& plan, const Endpoint& endpoint,
     foundation::Result<HttpResponse> result)
 {
+    // A transport implementation may return after its instructed deadline.
+    // Never turn such a late upstream success into an accepted response.
+    if (remainingForwardBudget(plan) <= foundation::Duration::zero()) {
+        m_circuits->recordFailure(endpoint.id());
+        plan.m_lastFailure = foundation::Error{foundation::ErrorCode::Timeout};
+        return std::nullopt;
+    }
     if (result.has_value()) {
         if (result->status() < 100 || result->status() > 599) {
             m_circuits->recordFailure(endpoint.id());
@@ -947,11 +955,23 @@ std::optional<HttpResponse> Gateway::recordForwardResult(
 
 HttpResponse Gateway::finishForward(const GatewayForwardPlan& plan) const
 {
+    const bool deadlineExpired = remainingForwardBudget(plan) <=
+        foundation::Duration::zero();
     return errorResponse(
-        plan.m_lastFailure.code() == foundation::ErrorCode::Timeout
-            ? plan.m_lastFailure
-            : foundation::Error{foundation::ErrorCode::Unavailable},
+        deadlineExpired
+            ? foundation::Error{foundation::ErrorCode::Timeout}
+            : plan.m_lastFailure.code() == foundation::ErrorCode::Timeout
+                ? plan.m_lastFailure
+                : foundation::Error{foundation::ErrorCode::Unavailable},
         plan.m_request);
+}
+
+foundation::Duration Gateway::remainingForwardBudget(
+    const GatewayForwardPlan& plan) const noexcept
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= plan.m_deadline) return foundation::Duration::zero();
+    return std::chrono::duration_cast<foundation::Duration>(plan.m_deadline - now);
 }
 
 foundation::Duration Gateway::upstreamTimeout() const noexcept
@@ -967,8 +987,10 @@ HttpResponse Gateway::handle(HttpRequest request)
     }
     auto& plan = std::get<GatewayForwardPlan>(prepared);
     while (auto endpoint = nextForwardEndpoint(plan)) {
+        const foundation::Duration remaining = remainingForwardBudget(plan);
+        if (remaining <= foundation::Duration::zero()) break;
         auto result = m_proxy->send(
-            *endpoint, plan.request(), m_upstreamTimeout);
+            *endpoint, plan.request(), remaining);
         if (auto response = recordForwardResult(
                 plan, *endpoint, std::move(result))) {
             return std::move(*response);

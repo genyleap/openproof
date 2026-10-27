@@ -1,5 +1,6 @@
 module;
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -378,9 +379,11 @@ public:
 private:
     friend class Gateway;
     GatewayForwardPlan(HttpRequest request, ServiceId service,
-                       std::vector<Endpoint> endpoints, std::size_t attempts)
+                       std::vector<Endpoint> endpoints, std::size_t attempts,
+                       foundation::Duration totalUpstreamBudget)
         : m_request(std::move(request)), m_service(std::move(service)),
-          m_endpoints(std::move(endpoints)), m_attempts(attempts) {}
+          m_endpoints(std::move(endpoints)), m_attempts(attempts),
+          m_deadline(std::chrono::steady_clock::now() + totalUpstreamBudget) {}
 
     HttpRequest m_request;
     ServiceId m_service;
@@ -388,6 +391,7 @@ private:
     std::vector<EndpointId> m_excluded;
     std::size_t m_attempts{};
     std::size_t m_sentAttempts{};
+    std::chrono::steady_clock::time_point m_deadline;
     foundation::Error m_lastFailure{foundation::ErrorCode::Unavailable};
 };
 
@@ -416,6 +420,9 @@ public:
     recordForwardResult(GatewayForwardPlan& plan, const Endpoint& endpoint,
                         foundation::Result<HttpResponse> result);
     [[nodiscard]] HttpResponse finishForward(const GatewayForwardPlan& plan) const;
+    /** Remaining total upstream budget, shared across all retry attempts. */
+    [[nodiscard]] foundation::Duration remainingForwardBudget(
+        const GatewayForwardPlan& plan) const noexcept;
     [[nodiscard]] foundation::Duration upstreamTimeout() const noexcept;
 
 private:

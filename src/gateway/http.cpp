@@ -854,10 +854,14 @@ CoroutineGatewayAdapter::handleAsync(HttpRequest request)
     }
     auto& plan = std::get<GatewayForwardPlan>(prepared);
     while (auto endpoint = m_gateway->nextForwardEndpoint(plan)) {
+        // The entire retry sequence shares one deadline. A failing or slow
+        // upstream must not reset the budget before contacting the next peer.
+        const foundation::Duration remaining = m_gateway->remainingForwardBudget(plan);
+        if (remaining <= foundation::Duration::zero()) break;
         // Own a copy of the sanitized request across every suspension point.
         // Never keep borrowed header or transaction state in the coroutine.
         auto result = co_await m_transport->sendAsync(
-            *endpoint, plan.request(), m_gateway->upstreamTimeout());
+            *endpoint, plan.request(), remaining);
         if (auto response = m_gateway->recordForwardResult(
                 plan, *endpoint, std::move(result))) {
             co_return std::move(*response);
