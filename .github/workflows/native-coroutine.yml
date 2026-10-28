@@ -39,7 +39,7 @@ jobs:
       - name: Compile native coroutine transport and real domain repository
         run: |
           cmake --build --preset gcc-release \
-            --target openproof_postgres_async_tests openproof_postgres_domain_tests \
+            --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_network_tests \
             --parallel 2
 
       - name: Exercise isolated libpq, SQL, and real session domain lifecycle
@@ -52,6 +52,10 @@ jobs:
             --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
           ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests \
             --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
+          # Real loopback HTTP/1.1 exercises native coroutine dispatch
+          # without connecting to the production PostgreSQL database.
+          ./cmake-build-gcc-release/tests/openproof_postgres_network_tests \
+            --gtest_filter='PostgresCoroutineNetworkTest.*'
 
       - name: Independence and unchanged release gate status
         run: |

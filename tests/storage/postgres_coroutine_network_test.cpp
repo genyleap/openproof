@@ -166,6 +166,43 @@ TEST(PostgresCoroutineNetworkTest, AmbiguousCredentialsRejectedOverSocket)
     EXPECT_EQ(result.base().count(wire::field::set_cookie), 0U);
 }
 
+TEST(PostgresCoroutineNetworkTest, WrongMethodNeverMutatesOverSocket)
+{
+    Fixture f;
+    ASSERT_TRUE(f.listener.start());
+    const auto result = send(
+        f.listener.boundPort(), wire::verb::get, "/auth/logout");
+    EXPECT_EQ(result.result_int(), 404);
+    EXPECT_EQ(result.base().count(wire::field::set_cookie), 0U);
+    EXPECT_EQ(f.forwarded.load(), 0);
+}
+
+TEST(PostgresCoroutineNetworkTest, DuplicateCookiesAreDeniedOverSocket)
+{
+    Fixture f;
+    ASSERT_TRUE(f.listener.start());
+    const auto result = send(
+        f.listener.boundPort(), wire::verb::post, "/auth/session/rotate",
+        std::nullopt,
+        std::string{"__Host-openproof-session=one; "
+                    "__Host-openproof-session=two"});
+    EXPECT_EQ(result.result_int(), 401);
+    EXPECT_EQ(result.base().count(wire::field::set_cookie), 0U);
+    EXPECT_EQ(f.forwarded.load(), 0);
+}
+
+TEST(PostgresCoroutineNetworkTest, RateLimiterRejectsBeforeDatabaseOverSocket)
+{
+    Fixture f;
+    ASSERT_TRUE(f.listener.start());
+    ASSERT_TRUE(f.limiter.allow("auth-ip:127.0.0.1", 20.0));
+    const auto result = send(
+        f.listener.boundPort(), wire::verb::post, "/auth/logout");
+    EXPECT_EQ(result.result_int(), 429);
+    EXPECT_EQ(result.base().count(wire::field::set_cookie), 0U);
+    EXPECT_EQ(f.forwarded.load(), 0);
+}
+
 TEST(PostgresCoroutineNetworkTest, SynchronousCompatibilityEntryFailsClosed)
 {
     Fixture f;

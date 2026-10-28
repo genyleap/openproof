@@ -863,6 +863,30 @@ accepting an already-native fallback handler. Its fallback lambda explicitly
 awaits `CoroutineHttpHandler::handleAsync()`; it never invokes legacy
 `handle()`. The socket fixture now uses that composition to exercise
 true caller lifetime. The updated composition still needs its own
-compile/link and socket checks. Two unrelated builds occupy the server's
-long-running process slots, so no concurrent heavyweight OpenProof build
-was started to verify that latest change. Production is untouched.
+compile/link and socket checks. Two unrelated builds occupied the shared
+server's limited CPU capacity, so a full optimized Gateway rebuild was
+not accepted as a production-safe shortcut. Production is untouched.
+
+#### 2026-10-28 verification and network security regression checkpoint
+
+The standalone `postgres_coroutine_network_test.cpp` translation unit,
+including the composition stack and three additional negative socket tests,
+compiled successfully with GCC 16.2/C++26. The new tests cover rejected
+HTTP GET session mutation, duplicate session cookies, and a fully exhausted
+per-IP rate limiter before database access. The existing manual-only
+`native-coroutine.yml` workflow now explicitly builds and invokes the
+socket-level test target; this does not trigger any automatic CI run.
+
+On the isolated worktree, the 14 previously linked coroutine domain/HTTP
+tests and 6 focused Beast tests passed (20/20), as did protocol neutrality,
+migration checksum preservation, the gateway benchmark summary regression
+when run without competing heavy compiler load, and `git diff --check`.
+These are historical linked binaries, not proof of the newly compiled
+socket fixture executing. A heavyweight full Gateway rebuild was stopped
+after prolonged single-vCPU contention; until the listener object is linked
+with a matching Gateway library and the network test executable actually
+runs, the new transport regressions remain **NOT VERIFIED**.
+
+The full protocol coroutine coverage scan still reports 40 findings across
+11 critical areas. End-to-end migration and deployment approval remain
+**NOT APPROVED**.
