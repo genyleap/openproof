@@ -25,6 +25,8 @@ add_subdirectory(evidence/verifiers)
 add_subdirectory(trust)
 
 add_subdirectory(credentials)
+# Native nonblocking HTTPS support shared by future external-provider adapters.
+add_subdirectory(providers/http)
 add_subdirectory(providers/local)
 add_subdirectory(providers/oidc)
 add_subdirectory(providers/github)

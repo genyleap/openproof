@@ -212,6 +212,27 @@ gtest_discover_tests(openproof_postgres_domain_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;domain")
 
+# Standalone provider outbound HTTPS coroutine test. Does not load legacy
+# provider modules or launch real external OAuth calls.
+add_executable(openproof_provider_async_https_tests
+    providers/async_https_test.cpp)
+target_compile_features(openproof_provider_async_https_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_provider_async_https_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/providers/http"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_provider_async_https_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_provider_async_https_tests PRIVATE
+    openproof_provider_async_https GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_provider_async_https_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_provider_async_https_tests
+    TEST_PREFIX "ProviderHttps."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "provider;async;network")
+
 # Native libpq coroutine adapter, isolated from existing synchronous repositories
 # until transaction ownership and async repository APIs are fully migrated.
 add_executable(openproof_postgres_async_tests

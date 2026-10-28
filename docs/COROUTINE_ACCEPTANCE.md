@@ -939,3 +939,36 @@ impact shared production services. A focused compilation of the changed test
 translation unit is the bounded local gate. Successful object compilation is
 **not** a substitute for a linked socket test, nor a reason to merge the
 experimental branch.
+
+
+#### Shared coroutine provider HTTPS transport (2026-10-29)
+
+An ordinary C++26 adapter library `openproof_provider_async_https` now
+provides a common native-Boost.Asio/Beast HTTPS transport for future GitHub,
+OIDC, X and Web3 provider migrations. Unlike the blocking provider-specific
+`httpsRequest()` helpers, its DNS resolution, TCP connection, verified TLS
+handshake, HTTP write/read and shutdown are awaitable, with a shared monotonic
+operation deadline. Its TLS context is configured once and held by the client;
+no request can disable certificate/hostname verification. Caller-controlled
+Host, framing and hop-by-hop headers, duplicate header names, CRLF insertion,
+absolute-form HTTP targets and oversized requests are rejected;
+upstream response headers/bodies are bounded, and redirects are returned to
+provider policy without being followed. No OAuth credential
+or upstream response body is logged on failure.
+
+The opt-in target has a dedicated local-only test executable. Seven focused
+tests cover malformed hosts and injected/duplicate headers, configuration
+bounds, an ephemeral loopback TLS server trusted through a disposable CA,
+untrusted certificate rejection, upstream body limit, an undereferenced
+cross-origin 302 redirect and a deliberately delayed upstream response
+failing within the total deadline. Test certificates and their private keys
+are generated afresh in process: no private key or external provider calls
+are required.
+
+**Boundary still open:** This is a reusable I/O transport, not yet a
+replacement for the synchronous `AuthenticationProvider` SPI or any active
+provider calls. Provider-level endpoint policy, DNS rebinding / private IP
+restrictions, SSRF decisions, OAuth/JWKS validation and complete coroutine
+application-handler wiring remain required. It is NOT proof of end-to-end
+provider migration and does not authorize a release, main merge, GitHub
+Actions run or deployment. Full coroutine acceptance remains NOT APPROVED.
