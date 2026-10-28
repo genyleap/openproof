@@ -68,6 +68,17 @@ public:
         AsyncConnection& connection, NewSession session,
         std::chrono::milliseconds deadline);
 
+    // One PostgreSQL statement atomically revokes the expected active prior
+    // session and inserts its replacement. A missing, rotated or expired prior
+    // returns false and never persists the new bearer. No explicit transaction
+    // crosses a coroutine suspension; libpq cancellation cannot expose a
+    // partially issued/revoked pair. A stale cookie is handled by the service
+    // as a separate initial issuance, not by this method.
+    [[nodiscard]] boost::asio::awaitable<bool> replace(
+        AsyncConnection& connection, NewSession session,
+        std::string priorId, std::string priorDigestHex,
+        std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
+
     // Atomic update+return; nullopt means unknown, revoked or expired.
     [[nodiscard]] boost::asio::awaitable<std::optional<SessionFields>> useToken(
         AsyncConnection& connection, std::string digestHex,

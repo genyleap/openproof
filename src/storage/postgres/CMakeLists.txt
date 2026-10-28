@@ -16,6 +16,14 @@ target_compile_definitions(openproof_postgres_async_io PRIVATE
     BOOST_HAS_LONG_LONG=1)
 set_target_properties(openproof_postgres_async_io PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
+# GCC 16.2 incorrectly diagnoses Boost.Asio's aligned awaitable allocation
+# when the new replacement coroutine is inlined into the surrounding SQL
+# adapter. Preserve -Werror (including mismatched-new-delete) instead of
+# suppressing any diagnostic. No application or protocol module is affected.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(async_session.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
 
 openproof_add_module(openproof_storage_postgres
     MODULES
@@ -74,12 +82,13 @@ target_link_libraries(openproof_postgres_async_repository
         openproof_session openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
 
-# GCC 16.2 misidentifies Boost.Asio's own aligned coroutine-frame allocator
-# as mismatched new/delete when inlining the session-service awaitable frames.
-# Preserve -Werror and all diagnostics, but prevent that inlining only in
-# this transitional translation unit. Other production code retains -O2.
+# GCC 16.2 misidentifies Boost.Asio's own aligned coroutine-frame
+# allocator as mismatched new/delete when inlining the session service and
+# repository replacement awaitable frames. Preserve -Werror and diagnostic
+# coverage; disable inlining only for these transitional storage units.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(coroutine_session_service.cpp
+    set_source_files_properties(
+        coroutine_session_repository.cpp coroutine_session_service.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 

@@ -93,6 +93,19 @@ template <typename Integer>
     return total;
 }
 
+void validateNewSession(const AsyncSessionSql::NewSession& session)
+{
+    if (!validId(session.id) || !validId(session.identityId)
+        || !validId(session.provider) || !validDigest(session.tokenDigestHex)
+        || session.assurance > 4U || session.factors > 7U
+        || session.authenticatedAtMs > session.issuedAtMs
+        || session.issuedAtMs > session.lastSeenAtMs
+        || session.lastSeenAtMs >= session.absoluteExpiresAtMs
+        || session.idleTimeoutMs <= 0) {
+        throw std::invalid_argument{"Invalid async session insert arguments"};
+    }
+}
+
 asio::awaitable<void> executeInsert(
     AsyncConnection& connection, std::string sql,
     std::vector<std::optional<std::string>> params,
@@ -151,15 +164,7 @@ asio::awaitable<void> AsyncSessionSql::add(
     AsyncConnection& connection, NewSession session,
     std::chrono::milliseconds deadline)
 {
-    if (!validId(session.id) || !validId(session.identityId)
-        || !validId(session.provider) || !validDigest(session.tokenDigestHex)
-        || session.assurance > 4U || session.factors > 7U
-        || session.authenticatedAtMs > session.issuedAtMs
-        || session.issuedAtMs > session.lastSeenAtMs
-        || session.lastSeenAtMs >= session.absoluteExpiresAtMs
-        || session.idleTimeoutMs <= 0) {
-        throw std::invalid_argument{"Invalid async session insert arguments"};
-    }
+    validateNewSession(session);
     const std::string sql =
         "INSERT INTO " + tableName(m_table) +
         " (id,identity_id,provider,assurance,factors,phishing_resistant,"
@@ -183,6 +188,60 @@ asio::awaitable<void> AsyncSessionSql::add(
         std::to_string(session.idleTimeoutMs),
         std::move(session.userAgent), std::move(session.remoteAddress)
     }, deadline);
+}
+
+asio::awaitable<bool> AsyncSessionSql::replace(
+    AsyncConnection& connection, NewSession session,
+    std::string priorId, std::string priorDigestHex,
+    std::int64_t nowMilliseconds, std::chrono::milliseconds deadline)
+{
+    validateNewSession(session);
+    if (!validId(priorId) || !validDigest(priorDigestHex)
+        || nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid async session replacement arguments"};
+    }
+    // Data-modifying CTEs are part of ONE PostgreSQL statement: the insertion
+    // is conditional on the expected prior digest still being active and
+    // unexpired. SQL failure rolls back both mutations, including failures
+    // from new-session uniqueness or FK constraints. This deliberately avoids
+    // BEGIN / multiple co_await calls and the associated cancellation gap.
+    const std::string sql =
+        "WITH prior AS (UPDATE " + tableName(m_table) +
+        " SET state=1,revoked_at_ms=$17::bigint "
+        "WHERE id=$15 AND token_digest=decode($16,'hex') AND state=0 "
+        "AND $17::bigint<absolute_expires_at_ms "
+        "AND $17::bigint<last_seen_at_ms+idle_timeout_ms RETURNING id), "
+        "issued AS (INSERT INTO " + tableName(m_table) +
+        " (id,identity_id,provider,assurance,factors,phishing_resistant,"
+        "state,token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "absolute_expires_at_ms,idle_timeout_ms,revoked_at_ms,user_agent,remote_address) "
+        "SELECT $1,$2,$3,$4,$5,$6,0,decode($7,'hex'),$8,$9,$10,$11,$12,"
+        "NULL,$13,$14 FROM prior RETURNING id) "
+        "SELECT count(*)::text FROM issued";
+    if (session.userAgent && session.userAgent->empty()) session.userAgent.reset();
+    if (session.remoteAddress && session.remoteAddress->empty()) {
+        session.remoteAddress.reset();
+    }
+    auto rows = co_await connection.query(sql, {
+        std::move(session.id), std::move(session.identityId),
+        std::move(session.provider), std::to_string(session.assurance),
+        std::to_string(session.factors),
+        session.phishingResistant ? "true" : "false",
+        std::move(session.tokenDigestHex),
+        std::to_string(session.authenticatedAtMs),
+        std::to_string(session.issuedAtMs),
+        std::to_string(session.lastSeenAtMs),
+        std::to_string(session.absoluteExpiresAtMs),
+        std::to_string(session.idleTimeoutMs),
+        std::move(session.userAgent), std::move(session.remoteAddress),
+        std::move(priorId), std::move(priorDigestHex),
+        std::to_string(nowMilliseconds)
+    }, deadline);
+    const auto changed = parseScalarCount(rows);
+    if (changed > 1U) {
+        throw std::runtime_error{"PostgreSQL session replacement returned invalid count"};
+    }
+    co_return changed == 1U;
 }
 
 asio::awaitable<std::optional<AsyncSessionSql::SessionFields>>

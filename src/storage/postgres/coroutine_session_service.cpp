@@ -94,16 +94,20 @@ foundation::Result<PreparedIssue> prepareIssue(
     }
 
     auto item = std::move(prepared).value();
-    auto saved = co_await repo.add(std::move(item.session));
-    if (!saved) co_return foundation::fail(saved.error());
-    if (previousId && *previousId != item.grant.id()) {
-        auto revoked = co_await repo.revoke(*previousId, clock.now());
-        if (!revoked) {
-            // Never disclose the newly persisted bearer when replacement of
-            // the previous browser session was unsuccessful.
-            static_cast<void>(co_await repo.revoke(item.grant.id(), clock.now()));
-            co_return foundation::fail(revoked.error());
-        }
+    if (previousId && oldDigest) {
+        // Single PostgreSQL statement: the prior digest must still be active
+        // and the new session is inserted only as part of the same statement.
+        // No second coroutine suspension can strand a newly issued bearer
+        // if revocation fails, nor can rollback failure create a second grant.
+        auto saved = co_await repo.replace(
+            std::move(item.session), std::move(*previousId),
+            std::move(*oldDigest), clock.now());
+        if (!saved) co_return foundation::fail(saved.error());
+    } else {
+        // An unknown / expired browser cookie is not an authenticated prior
+        // session. Retain first-party fresh-login semantics.
+        auto saved = co_await repo.add(std::move(item.session));
+        if (!saved) co_return foundation::fail(saved.error());
     }
     co_return std::move(item.grant);
 }

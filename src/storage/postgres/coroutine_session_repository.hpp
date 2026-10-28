@@ -55,6 +55,12 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     add(session::Session value);
 
+    // One-statement, cancellation-safe replacement of a previously verified
+    // active session; stale/unknown cookies must use add() instead.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    replace(session::Session value, session::SessionId previousId,
+            session::TokenDigest previousDigest, foundation::Instant now);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     rotate(session::SessionId id, session::TokenDigest expected,
            session::TokenDigest replacement, foundation::Instant now);

@@ -891,6 +891,38 @@ The full protocol coroutine coverage scan still reports 40 findings across
 11 critical areas. End-to-end migration and deployment approval remain
 **NOT APPROVED**.
 
+#### Atomic first-party coroutine session replacement (2026-10-28)
+
+The coroutine service previously performed `add(new)` followed by
+`revoke(old)` with two independent database operations and a compensating
+revocation on failure. A cancellation or failed compensation could leave the
+old and new sessions simultaneously active. Native replacement now uses a
+single parameterized PostgreSQL writable-CTE statement, contingent on the
+prior ID/digest still being active, unrotated and unexpired. PostgreSQL
+commits the revocation and insertion together or neither. Stale/unknown
+prior cookies retain the existing fresh-login behavior, but a verified
+prior that becomes invalid during replacement refuses to issue a bearer.
+
+The new low-level disposable PostgreSQL tests cover stale digest, successful
+replacement and replay. A real-schema disposable-database integration
+regression deliberately collides with another session's primary key
+*after attempting revocation*, then verifies via a fresh pool lease that
+the previous session survived, the unrelated session was unchanged and
+a subsequent legitimate replacement still works. A query error causes the
+native libpq connection to be discarded, never reused across tenants.
+
+**Focused verification:** the changed async SQL, repository, session
+service, and both PostgreSQL test translation units have compiled with
+GCC 16.2/C++26 without a full application release build. The GCC/Asio
+aligned-allocation false positive required the existing narrowly scoped
+`-fno-inline` workaround for the two affected storage files; `-Werror`
+remains enabled for production code. These object compilations **do not**
+execute the newly written disposable-database tests, link an application
+binary, or prove cancellation/rollback semantics at runtime.
+
+No production migration, release build, GitHub Actions run or deployment
+is authorized by this checkpoint.
+
 #### Additional post-suspension network error containment regression
 
 The native socket fixture now includes an opt-in fallback that deliberately

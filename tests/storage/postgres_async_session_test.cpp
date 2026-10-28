@@ -202,7 +202,115 @@ asio::awaitable<void> sessionCreationListingAndPurge(
     rejectedBadInput = rejectedBadInput && final == 1U && conn->reusable();
 }
 
+asio::awaitable<void> atomicReplacement(
+    std::string connectionString, bool& staleRejected, bool& replaced,
+    bool& replayRejected, bool& unchangedOther)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+    auto replacement = [](std::string id, std::string digest) {
+        return pg::AsyncSessionSql::NewSession{
+            std::move(id), "test-identity", "test-provider", std::move(digest),
+            1U, 3U, true, 1100, 1100, 1100, 10000, 1000,
+            std::nullopt, std::nullopt
+        };
+    };
+
+    const bool refused = co_await sql.replace(
+        *conn, replacement("should-not-exist", kDigestB),
+        "test-session-1", kDigestB, 1300, 3s);
+    const auto original = co_await sql.find(*conn, "test-session-1", 3s);
+    const auto countBefore = co_await sql.size(*conn, 3s);
+    staleRejected = !refused && countBefore == 1U
+        && original.has_value() && (*original)[6] == "0";
+
+    const bool issued = co_await sql.replace(
+        *conn, replacement("replacement-session", kDigestB),
+        "test-session-1", kDigestA, 1400, 3s);
+    const auto old = co_await sql.find(*conn, "test-session-1", 3s);
+    const auto fresh = co_await sql.find(*conn, "replacement-session", 3s);
+    replaced = issued && old.has_value() && fresh.has_value()
+        && (*old)[6] == "1" && (*old)[13] == "1400"
+        && (*fresh)[6] == "0" && (*fresh)[7] == kDigestB;
+
+    const bool repeated = co_await sql.replace(
+        *conn, replacement("replay-session", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        "test-session-1", kDigestA, 1500, 3s);
+    const auto countAfter = co_await sql.size(*conn, 3s);
+    replayRejected = !repeated && countAfter == 2U
+        && !(co_await sql.find(*conn, "replay-session", 3s)).has_value();
+
+    // A failed replacement must never touch an independent active session.
+    unchangedOther = (co_await sql.useToken(*conn, kDigestB, 1500, 3s)).has_value()
+        && !(co_await sql.useToken(*conn, kDigestA, 1500, 3s)).has_value();
+}
+
+asio::awaitable<void> replacementInsertFailureRollsBack(
+    std::string connectionString, bool& rolledBack)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+    pg::AsyncSessionSql::NewSession duplicate{
+        "test-session-1", "test-identity", "test-provider", kDigestB,
+        1U, 3U, true, 1100, 1100, 1100, 10000, 1000,
+        std::nullopt, std::nullopt
+    };
+    bool denied = false;
+    try {
+        static_cast<void>(co_await sql.replace(
+            *conn, std::move(duplicate), "test-session-1", kDigestA, 1300, 3s));
+    } catch (const std::runtime_error&) {
+        denied = true;
+    }
+    // AsyncConnection deliberately discards PGconn after any SQL error;
+    // never issue a verification query through the poisoned lease. The SQL
+    // statement's atomicity is a PostgreSQL guarantee; cross-connection
+    // rollback verification belongs in the disposable real-schema suite.
+    rolledBack = denied && !conn->healthy() && !conn->reusable();
+}
+
 } // namespace
+
+TEST(PostgresAsyncSessionSqlTest, AtomicReplacementRejectsStaleAndReplay)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool stale = false, replaced = false, replay = false, isolated = false;
+    auto done = asio::co_spawn(io,
+        atomicReplacement(uri, stale, replaced, replay, isolated), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(stale);
+    EXPECT_TRUE(replaced);
+    EXPECT_TRUE(replay);
+    EXPECT_TRUE(isolated);
+}
+
+TEST(PostgresAsyncSessionSqlTest, ReplacementInsertFailureRollsBackRevocation)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool rolledBack = false;
+    auto done = asio::co_spawn(
+        io, replacementInsertFailureRollsBack(uri, rolledBack), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(rolledBack);
+}
 
 TEST(PostgresAsyncSessionSqlTest, StrictlyDecodesRowsBeforeDomainRestore)
 {

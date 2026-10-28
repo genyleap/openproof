@@ -580,6 +580,62 @@ asio::awaitable<void> verifyRealPostgresRepository(
     auto empty = co_await repository.size();
     r.purged = removed && *removed == 3U && empty && *empty == 0U;
 }
+struct AtomicReplacementChecks final {
+    bool failedInsertRetainsOld{};
+    bool committedPair{};
+    bool replayDenied{};
+    bool unrelatedUntouched{};
+};
+
+asio::awaitable<void> verifyAtomicReplacementRollback(
+    pg::CoroutinePostgresSessionRepository& repository,
+    AtomicReplacementChecks& checks)
+{
+    const auto prior = co_await repository.add(
+        createSession("atomic-previous", "coroutine-user-a", 0x71));
+    const auto independent = co_await repository.add(
+        createSession("atomic-conflicting-id", "coroutine-user-b", 0x72));
+    if (!prior || !independent) co_return;
+
+    // A previously valid old digest must NOT be revoked if the INSERT
+    // part fails due to an independent session's primary-key constraint.
+    const auto failed = co_await repository.replace(
+        createSession("atomic-conflicting-id", "coroutine-user-a", 0x73),
+        ses::SessionId{"atomic-previous"}, digestOf(0x71), kNow + 1min);
+    const auto stillOld = co_await repository.find(
+        ses::SessionId{"atomic-previous"});
+    const auto count = co_await repository.size();
+    checks.failedInsertRetainsOld = !failed
+        && failed.error().code() == fnd::ErrorCode::Unavailable
+        && stillOld && stillOld->has_value()
+        && stillOld->value().state() == ses::SessionState::Active
+        && count && *count == 2U;
+
+    const auto committed = co_await repository.replace(
+        createSession("atomic-replacement", "coroutine-user-a", 0x73),
+        ses::SessionId{"atomic-previous"}, digestOf(0x71), kNow + 2min);
+    const auto old = co_await repository.find(
+        ses::SessionId{"atomic-previous"});
+    const auto fresh = co_await repository.find(
+        ses::SessionId{"atomic-replacement"});
+    checks.committedPair = committed && old && old->has_value()
+        && old->value().state() == ses::SessionState::Revoked
+        && fresh && fresh->has_value()
+        && fresh->value().state() == ses::SessionState::Active;
+
+    const auto replay = co_await repository.replace(
+        createSession("atomic-replay", "coroutine-user-a", 0x74),
+        ses::SessionId{"atomic-previous"}, digestOf(0x71), kNow + 3min);
+    const auto after = co_await repository.size();
+    checks.replayDenied = !replay
+        && replay.error().code() == fnd::ErrorCode::FailedPrecondition
+        && after && *after == 3U;
+    const auto separate = co_await repository.find(
+        ses::SessionId{"atomic-conflicting-id"});
+    checks.unrelatedUntouched = separate && separate->has_value()
+        && separate->value().state() == ses::SessionState::Active;
+}
+
 } // namespace
 
 TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolation)
@@ -772,4 +828,19 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(httpChecks.logoutRevoked);
     EXPECT_TRUE(httpChecks.logoutAllScoped);
     EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
+
+    // The replacement failpoint uses real unique/FK constraints and verifies
+    // rollback from a DIFFERENT physical pooled connection after the failed
+    // libpq query was discarded. No production schema or data is touched.
+    io.restart();
+    AtomicReplacementChecks atomicChecks;
+    auto atomic = asio::co_spawn(
+        io, verifyAtomicReplacementRollback(repository, atomicChecks),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(atomic.get());
+    EXPECT_TRUE(atomicChecks.failedInsertRetainsOld);
+    EXPECT_TRUE(atomicChecks.committedPair);
+    EXPECT_TRUE(atomicChecks.replayDenied);
+    EXPECT_TRUE(atomicChecks.unrelatedUntouched);
 }

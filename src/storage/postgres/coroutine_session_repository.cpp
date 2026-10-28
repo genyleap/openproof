@@ -147,6 +147,37 @@ CoroutinePostgresSessionRepository::add(session::Session value)
 }
 
 asio::awaitable<foundation::Status>
+CoroutinePostgresSessionRepository::replace(
+    session::Session value, session::SessionId previousId,
+    session::TokenDigest previousDigest, foundation::Instant now)
+{
+    if (value.state() != session::SessionState::Active
+        || value.id() == previousId) {
+        co_return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "The replacement session must be new and active.");
+    }
+    try {
+        auto row = captureSessionRecord(value);
+        auto lease = co_await m_impl->pool.acquire();
+        const bool replaced = co_await m_impl->sql.replace(
+            lease.connection(), std::move(row), std::string{previousId.value()},
+            foundation::toHex(previousDigest.bytes()),
+            now.time_since_epoch().count(), m_impl->queryTimeout);
+        if (!replaced) {
+            co_return foundation::fail(
+                foundation::ErrorCode::FailedPrecondition,
+                "The previous session is no longer active.");
+        }
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(
+            foundation::ErrorCode::Unavailable,
+            "The session could not be replaced.");
+    }
+}
+
+asio::awaitable<foundation::Status>
 CoroutinePostgresSessionRepository::rotate(
     session::SessionId id, session::TokenDigest expected,
     session::TokenDigest replacement, foundation::Instant now)
