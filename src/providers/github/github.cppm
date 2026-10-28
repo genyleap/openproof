@@ -1,6 +1,10 @@
 module;
 
 #include <memory>
+// GCC 16 named-module Asio TSS must be explicitly anchored in an ordinary TU.
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <string>
 #include <string_view>
 
@@ -57,6 +61,14 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    /** Native nonblocking GitHub OAuth code exchange and identity lookup.
+     * Owns the callback across every await; callers must separately enforce
+     * the authentication transaction's single-use and expiry constraints.
+     */
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response);
 
 private:
     class Implementation;

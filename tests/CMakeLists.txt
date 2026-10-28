@@ -212,6 +212,32 @@ gtest_discover_tests(openproof_postgres_domain_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;domain")
 
+# GitHub provider's coroutine completion must reject malformed or unbound
+# OAuth callbacks before issuing any external HTTPS request. Keep its module
+# test separate from the legacy umbrella binary and use no external network.
+add_executable(openproof_github_coroutine_tests
+    providers/github_coroutine_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_github_coroutine_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_github_coroutine_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_github_coroutine_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_github_coroutine_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_github_coroutine_tests PRIVATE
+    openproof_provider_github openproof_identity_provider
+    openproof_foundation openproof_security Boost::headers
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_github_coroutine_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_github_coroutine_tests
+    TEST_PREFIX "NativeGitHub."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "provider;async;oauth")
+
 # Standalone provider outbound HTTPS coroutine test. Does not load legacy
 # provider modules or launch real external OAuth calls.
 add_executable(openproof_provider_async_https_tests

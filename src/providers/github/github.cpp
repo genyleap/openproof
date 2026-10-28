@@ -16,6 +16,8 @@ module;
 #include <string_view>
 #include <utility>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -27,6 +29,7 @@ module;
 #include <openssl/ssl.h>
 
 #include "response_validation.hpp"
+#include "../http/async_https.hpp"
 
 module openproof.provider.github;
 
@@ -224,6 +227,39 @@ struct HttpResponse final {
     }
 }
 
+// The coroutine-native counterpart shares the exact GitHub endpoint and
+// security policy but never calls the blocking legacy HTTPS implementation.
+[[nodiscard]] asio::awaitable<foundation::Result<HttpResponse>> httpsRequestAsync(
+    openproof::provider::http::async_detail::AsyncHttpsClient& client,
+    std::string_view host, std::string_view target, http::verb method,
+    std::string body, std::string_view contentType,
+    std::optional<std::string_view> bearer)
+{
+    using Request = openproof::provider::http::async_detail::HttpsRequest;
+    Request request;
+    request.host = std::string{host};
+    request.target = std::string{target};
+    request.method = method == http::verb::post
+        ? Request::Method::Post : Request::Method::Get;
+    request.timeout = std::chrono::seconds{10};
+    request.headers.emplace_back("accept", host == kTokenHost
+        ? "application/json" : "application/vnd.github+json");
+    request.headers.emplace_back("X-GitHub-Api-Version", std::string{kApiVersion});
+    if (bearer) {
+        request.headers.emplace_back("authorization", "Bearer " + std::string{*bearer});
+    }
+    if (!body.empty()) {
+        request.headers.emplace_back("content-type", std::string{contentType});
+        request.body = std::move(body);
+    }
+    const auto result = co_await client.exchange(std::move(request));
+    if (!result.success) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The GitHub HTTPS request failed.");
+    }
+    co_return HttpResponse{result.response.status, std::move(result.response.body)};
+}
+
 [[nodiscard]] foundation::Result<json::value> parseJson(std::string_view body)
 {
     boost::system::error_code error;
@@ -291,11 +327,15 @@ public:
                    const foundation::ClockSource& clockSource,
                    std::string certificateAuthorityFile)
         : config(std::move(providerConfig)), clock(&clockSource),
-          caFile(std::move(certificateAuthorityFile)) {}
+          caFile(std::move(certificateAuthorityFile)),
+          asyncClient(caFile) {}
 
     GitHubProviderConfig config;
     const foundation::ClockSource* clock;
     std::string caFile;
+    // Construct before any asynchronous request so CA loading cannot suspend
+    // a provider coroutine. Only immutable TLS context data is shared.
+    openproof::provider::http::async_detail::AsyncHttpsClient asyncClient;
 };
 
 GitHubProviderConfig::GitHubProviderConfig(
@@ -473,6 +513,118 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     evidence.add("github_account_id", std::to_string(*accountId));
     evidence.add("login", *login);
     return idp::AuthenticationOutcome::create(
+        id(), idp::ExternalSubject{std::to_string(*accountId)}, std::move(claims),
+        idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::None, false},
+        std::move(evidence), m_implementation->clock->now());
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    const auto code = credential(response.parameters(), "code");
+    const auto state = credential(response.parameters(), "state");
+    if (!code || !state || code->size() > 4096U || state->size() > 512U) {
+        co_return foundation::fail(authFailure("The GitHub callback is incomplete."));
+    }
+    auto expectedState = derived(m_implementation->config.derivationKey(), "state", response.challengeId());
+    auto verifier = derived(m_implementation->config.derivationKey(), "pkce", response.challengeId());
+    if (!expectedState || !verifier || !security::constantTimeEquals(*state, expectedState.value())) {
+        co_return foundation::fail(authFailure("The GitHub state binding is invalid."));
+    }
+
+    std::string form;
+    const auto append = [&form](std::string_view key, std::string_view value) {
+        if (!form.empty()) form.push_back('&');
+        form.append(percentEncode(key));
+        form.push_back('=');
+        form.append(percentEncode(value));
+    };
+    append("client_id", m_implementation->config.clientId());
+    append("client_secret", m_implementation->config.clientSecret().expose());
+    append("code", *code);
+    append("redirect_uri", m_implementation->config.callbackUri());
+    append("code_verifier", verifier.value());
+    auto tokenResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
+        kTokenHost, "/login/oauth/access_token", http::verb::post,
+                                      std::move(form), "application/x-www-form-urlencoded",
+                                      std::nullopt);
+    if (!tokenResponse) {
+        // Keep transport failures distinct from GitHub HTTP rejections in
+        // operator-only diagnostics; never log the code, secret or response body.
+        co_return foundation::fail(authFailure("The GitHub token exchange transport failed."));
+    }
+    if (tokenResponse->status != 200U) {
+        // HTTP status is public protocol metadata; OAuth response bodies may
+        // carry credentials and must not be copied into diagnostics.
+        co_return foundation::fail(authFailure(
+            "The GitHub token exchange returned HTTP "
+            + std::to_string(tokenResponse->status) + "."));
+    }
+    auto tokenJson = parseJson(tokenResponse->body);
+    if (!tokenJson || !tokenJson->is_object()) {
+        co_return foundation::fail(authFailure("The GitHub token response is malformed."));
+    }
+    const auto accessToken = stringValue(tokenJson->as_object(), "access_token");
+    const auto grantedScopes = stringValue(tokenJson->as_object(), "scope");
+    const auto tokenType = stringValue(tokenJson->as_object(), "token_type");
+    if (!accessToken || !detail::validBearerCredential(*accessToken)
+        || !grantedScopes || !detail::validScopeResponse(*grantedScopes)
+        || !tokenType || !bearerTokenType(*tokenType)) {
+        co_return foundation::fail(authFailure("The GitHub token response is invalid."));
+    }
+
+    auto userResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
+        kApiHost, "/user", http::verb::get, {}, {},
+                                     *accessToken);
+    if (!userResponse || userResponse->status != 200U) {
+        co_return foundation::fail(authFailure("The GitHub authenticated-user endpoint failed."));
+    }
+    auto userJson = parseJson(userResponse->body);
+    if (!userJson || !userJson->is_object()) {
+        co_return foundation::fail(authFailure("The GitHub user response is malformed."));
+    }
+    const auto accountId = unsignedValue(userJson->as_object(), "id");
+    const auto login = stringValue(userJson->as_object(), "login");
+    if (!accountId || *accountId == 0U || !login
+        || !detail::safeProfileText(*login, detail::kPreferredUsernameMaximum)) {
+        co_return foundation::fail(authFailure("The GitHub user identity is incomplete."));
+    }
+
+    std::optional<std::string> verifiedPrimaryEmail;
+    if (detail::hasEmailScope(*grantedScopes)) {
+        auto emailResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
+            kApiHost, "/user/emails?per_page=100", http::verb::get, {}, {},
+            *accessToken);
+        if (emailResponse && emailResponse->status == 200U) {
+            auto emailJson = parseJson(emailResponse->body);
+            if (emailJson && emailJson->is_array()) {
+                verifiedPrimaryEmail =
+                    detail::uniqueVerifiedPrimaryEmail(emailJson->as_array());
+            }
+        }
+    }
+
+    idp::VerifiedClaims claims;
+    claims.set(idp::ClaimName::PreferredUsername, *login);
+    if (verifiedPrimaryEmail) {
+        claims.set(idp::ClaimName::Email, *verifiedPrimaryEmail);
+        claims.set(idp::ClaimName::EmailVerified, "true");
+    }
+    if (const auto name = stringValue(userJson->as_object(), "name");
+        name && detail::safeProfileText(*name, detail::kDisplayNameMaximum)) {
+        claims.set(idp::ClaimName::DisplayName, *name);
+    }
+    if (const auto avatar = stringValue(userJson->as_object(), "avatar_url");
+        avatar && avatar->size() <= detail::kPictureUrlMaximum
+        && validHttpsUrl(*avatar)) {
+        claims.set(idp::ClaimName::PictureUrl, *avatar);
+    }
+    idp::ProviderEvidence evidence;
+    evidence.add("protocol", "github_oauth_authorization_code_pkce");
+    evidence.add("github_account_id", std::to_string(*accountId));
+    evidence.add("login", *login);
+    co_return idp::AuthenticationOutcome::create(
         id(), idp::ExternalSubject{std::to_string(*accountId)}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::None, false},

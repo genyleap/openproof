@@ -972,3 +972,25 @@ restrictions, SSRF decisions, OAuth/JWKS validation and complete coroutine
 application-handler wiring remain required. It is NOT proof of end-to-end
 provider migration and does not authorize a release, main merge, GitHub
 Actions run or deployment. Full coroutine acceptance remains NOT APPROVED.
+
+
+#### GitHub provider native OAuth completion (2026-10-29)
+
+The GitHub provider has a dedicated `completeAuthenticationAsync` coroutine.
+It owns the move-only OAuth callback across suspensions and performs the
+authorization-code token exchange, authenticated user lookup and optional
+verified primary email lookup through the shared nonblocking HTTPS adapter.
+The code preserves the provider's PKCE/state constant-time verification,
+access-token grammar, scope/type validation, account identifier checks,
+verified-email selection, evidence and claim-boundary rules. Public GitHub
+hostname, API version and token/user/email endpoints remain fixed.
+The legacy synchronous provider SPI remains separately implemented for
+compatibility; its full orchestrator migration, concurrent transaction
+single-use handling and dispatch wiring are not yet complete.
+
+A separate local-only coroutine provider test target verifies that missing
+code/state or an incorrect state are rejected before any outbound I/O.
+These tests do not use real OAuth credentials or contact GitHub and do not
+replace end-to-end tests with a disposable fake OAuth provider. The acceptance
+gate stays NOT APPROVED until compiled and runtime-tested on the full
+nonblocking authentication pipeline.
