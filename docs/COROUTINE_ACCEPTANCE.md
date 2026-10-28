@@ -1017,3 +1017,26 @@ disposable-only override.
 This gate supplements, but does not replace, provider-level hostname
 allowlisting, proxy egress rules and end-to-end authenticated request flow
 tests. Release approval remains NOT APPROVED.
+
+
+#### OIDC coroutine federation pathway (2026-10-29)
+
+The OIDC provider now has opt-in `beginAuthenticationAsync` and
+`completeAuthenticationAsync` methods. Native discovery is async and
+uses the same trusted issuer, RS256 / authorization-code, subject type,
+client-auth, PKCE S256, response-mode and metadata validation as the legacy
+synchronous code. Token exchange, signing-key JWKS retrieval and optional
+subject-bound UserInfo use the shared nonblocking HTTPS transport with the
+default public-destination DNS policy. Callback inputs are owned across every
+suspension. The code retains ID Token RS256 verification, issuer, audience,
+authorized-party, nonce, at_hash, iat/exp and claim/evidence validation;
+there is no skip-signature or fallback-to-unsigned path.
+
+The coroutine entry points are opt-in. The existing synchronous
+`AuthenticationProvider` interface and `AuthenticationService`
+orchestrator still require migration before production dispatch can use them.
+The current isolated negative tests verify invalid provider and malformed
+or unbound callbacks fail prior to network operations; real disposable
+issuer/JWKS/TLS interoperability and concurrent transaction cancellation
+remain required acceptance checks. Build/test status is independently
+recorded; source presence is not release approval.

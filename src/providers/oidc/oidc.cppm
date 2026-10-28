@@ -1,6 +1,10 @@
 module;
 
 #include <chrono>
+// GCC 16 named-module Asio TLS definition is owned by an ordinary TU.
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -146,6 +150,15 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    // Native asynchronous OIDC discovery/challenge and code-exchange/JWKS
+    // verification. Own the request/response across all network suspensions.
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request);
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response);
 
 private:
     class Implementation;

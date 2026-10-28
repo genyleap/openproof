@@ -17,6 +17,8 @@ module;
 #include <utility>
 #include <vector>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -29,6 +31,7 @@ module;
 #include <boost/json.hpp>
 #include <openssl/ssl.h>
 
+#include "../http/async_https.hpp"
 #include "id_token_validation.hpp"
 #include "profile_claims.hpp"
 
@@ -242,6 +245,48 @@ struct HttpResult final {
     }
 }
 
+// Native coroutine transport, retaining the existing endpoint URL parser
+// and HTTP response semantics. No blocking resolver, TLS or Beast call on this
+// path; all stages share the transport's per-exchange absolute deadline.
+[[nodiscard]] asio::awaitable<foundation::Result<HttpResult>> httpsRequestAsync(
+    openproof::provider::http::async_detail::AsyncHttpsClient& client,
+    const HttpsUrl& endpoint, http::verb method, std::string body,
+    std::string_view contentType, std::string_view authorization = {})
+{
+    using Request = openproof::provider::http::async_detail::HttpsRequest;
+    unsigned int port{};
+    const auto parsed = std::from_chars(
+        endpoint.port.data(), endpoint.port.data() + endpoint.port.size(), port);
+    if (parsed.ec != std::errc{} || parsed.ptr != endpoint.port.data() + endpoint.port.size()
+        || port == 0U || port > 65535U) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                   "The OIDC HTTPS endpoint port is invalid.");
+    }
+    Request outgoing;
+    outgoing.host = endpoint.host;
+    outgoing.port = static_cast<std::uint16_t>(port);
+    outgoing.target = endpoint.target;
+    outgoing.method = method == http::verb::post
+        ? Request::Method::Post : Request::Method::Get;
+    outgoing.timeout = std::chrono::seconds{10};
+    outgoing.headers.emplace_back("accept", "application/json");
+    if (!authorization.empty()) {
+        outgoing.headers.emplace_back("authorization", std::string{authorization});
+    }
+    if (!body.empty()) {
+        outgoing.headers.emplace_back("content-type", std::string{contentType});
+        outgoing.body = std::move(body);
+    }
+    // PublicInternet is deliberately the default; discovery metadata cannot
+    // opt a supplied URL into private-network access.
+    auto result = co_await client.exchange(std::move(outgoing));
+    if (!result.success) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The OIDC HTTPS request failed.");
+    }
+    co_return HttpResult{result.response.status, std::move(result.response.body)};
+}
+
 [[nodiscard]] std::string standardBase64(std::string_view input)
 {
     std::vector<std::byte> bytes;
@@ -440,7 +485,8 @@ public:
                    const foundation::ClockSource& clockSource,
                    std::string certificateAuthorityFile)
         : config(std::move(providerConfig)), clock(&clockSource),
-          caFile(std::move(certificateAuthorityFile)) {}
+          caFile(std::move(certificateAuthorityFile)),
+          asyncClient(caFile, kMaximumResponseBytes, 8192U) {}
 
     [[nodiscard]] foundation::Result<Discovery> discovery()
     {
@@ -523,9 +569,95 @@ public:
         return value;
     }
 
+    // Mirror the exact discovery validation in the synchronous compatibility
+    // path, but suspend on native HTTPS rather than blocking the reactor.
+    [[nodiscard]] asio::awaitable<foundation::Result<Discovery>> discoveryAsync()
+    {
+        const auto now = clock->now();
+        {
+            const std::lock_guard guard{mutex};
+            if (cached && cached->expiresAt > now) co_return *cached;
+        }
+        auto endpoint = parseHttpsUrl(std::string{config.issuer()} + "/.well-known/openid-configuration");
+        if (!endpoint) co_return foundation::fail(endpoint.error());
+        auto response = co_await httpsRequestAsync(
+            asyncClient, endpoint.value(), http::verb::get, {}, {});
+        if (!response || response->status != 200U) {
+            co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                    "OIDC discovery is unavailable.");
+        }
+        auto object = parseJsonObject(response->body);
+        if (!object) co_return foundation::fail(object.error());
+        if (!detail::discoveryAdvertisesRs256IdTokens(object.value())) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not advertise the required RS256 ID Token signing algorithm."));
+        }
+        if (!detail::discoverySupportsAuthorizationCodeFlow(object.value())) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not support the required Authorization Code flow."));
+        }
+        const auto issuer = stringValue(object.value(), "issuer");
+        const auto authorization = stringValue(object.value(), "authorization_endpoint");
+        const auto token = stringValue(object.value(), "token_endpoint");
+        const auto jwks = stringValue(object.value(), "jwks_uri");
+        std::optional<std::string> userInfo;
+        if (const auto* value = object->if_contains("userinfo_endpoint"); value != nullptr) {
+            if (!value->is_string() || value->as_string().empty()
+                || value->as_string().size() > 4096U) {
+                co_return foundation::fail(authFailure(
+                    "OIDC discovery UserInfo metadata is malformed."));
+            }
+            userInfo = std::string{value->as_string()};
+            if (!parseHttpsUrl(*userInfo)) {
+                co_return foundation::fail(authFailure(
+                    "OIDC discovery UserInfo metadata is malformed."));
+            }
+        }
+        if (!issuer || *issuer != config.issuer() || !authorization || !token || !jwks
+            || !parseHttpsUrl(*authorization) || !parseHttpsUrl(*token) || !parseHttpsUrl(*jwks)) {
+            co_return foundation::fail(authFailure("OIDC discovery metadata failed validation."));
+        }
+        if (!detail::discoveryHasSupportedSubjectType(object.value())) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not advertise a supported subject identifier type."));
+        }
+        const std::string_view requiredMethod =
+            config.clientAuthentication()
+                    == OidcClientAuthenticationMethod::ClientSecretBasic
+                ? "client_secret_basic" : "client_secret_post";
+        if (!detail::discoveryOptionalArraySupports(
+                object.value(), "token_endpoint_auth_methods_supported", requiredMethod)) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not support the configured client authentication method."));
+        }
+        if (config.pkceMode() == OidcPkceMode::S256
+            && !detail::discoveryOptionalArraySupports(
+                object.value(), "code_challenge_methods_supported", "S256")) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not support the required S256 PKCE method."));
+        }
+        const std::string_view requiredResponseMode =
+            config.authorizationResponseMode() == OidcAuthorizationResponseMode::FormPost
+                ? "form_post" : "query";
+        if (!detail::discoverySupportsResponseMode(
+                object.value(), requiredResponseMode)) {
+            co_return foundation::fail(authFailure(
+                "OIDC discovery does not support the configured authorization response mode."));
+        }
+        Discovery value{*authorization, *token, *jwks, std::move(userInfo),
+                        now + std::chrono::hours{1}};
+        {
+            const std::lock_guard guard{mutex};
+            cached = value;
+        }
+        co_return value;
+    }
+
     OidcProviderConfig config;
     const foundation::ClockSource* clock;
     std::string caFile;
+    // CA roots load once before any coroutine suspension.
+    openproof::provider::http::async_detail::AsyncHttpsClient asyncClient;
     std::mutex mutex;
     std::optional<Discovery> cached;
 };
@@ -954,6 +1086,282 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
             : "oidc_authorization_code");
     if (userInfo) evidence.add("userinfo", "subject_bound");
     return idp::AuthenticationOutcome::create(
+        m_implementation->config.providerId(), idp::ExternalSubject{*subject},
+        std::move(claims), idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::None, false},
+        std::move(evidence), now);
+}
+
+// Native coroutine entry points preserve all of the legacy OIDC proof and
+// claims-validation steps. Only the outbound I/O path is substituted.
+asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+OidcAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    if (request.provider() != m_implementation->config.providerId()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The OIDC authentication request targets another provider.");
+    }
+    auto metadata = co_await m_implementation->discoveryAsync();
+    if (!metadata) co_return foundation::fail(metadata.error());
+    auto random = security::randomTokenBase64Url(24U);
+    if (!random) co_return foundation::fail(random.error());
+    idp::ChallengeId challengeId{"opc_" + std::move(random).value()};
+    auto state = derived(m_implementation->config.derivationKey(), "state", challengeId);
+    if (!state) {
+        co_return foundation::fail(foundation::ErrorCode::Internal,
+                                "OIDC challenge derivation failed.");
+    }
+    std::optional<std::string> nonce;
+    if (m_implementation->config.nonceMode() == OidcNonceMode::Required) {
+        auto derivedNonce = derived(
+            m_implementation->config.derivationKey(), "nonce", challengeId);
+        if (!derivedNonce) {
+            co_return foundation::fail(foundation::ErrorCode::Internal,
+                                    "OIDC nonce derivation failed.");
+        }
+        nonce = std::move(derivedNonce).value();
+    }
+    std::optional<std::string> verifier;
+    if (m_implementation->config.pkceMode() == OidcPkceMode::S256) {
+        auto derivedVerifier = derived(
+            m_implementation->config.derivationKey(), "pkce", challengeId);
+        if (!derivedVerifier) {
+            co_return foundation::fail(foundation::ErrorCode::Internal,
+                                    "OIDC PKCE derivation failed.");
+        }
+        verifier = std::move(derivedVerifier).value();
+    }
+    std::string scope;
+    for (const auto& item : m_implementation->config.scopes()) {
+        if (!scope.empty()) scope.push_back(' ');
+        scope.append(item);
+    }
+    std::string url = metadata->authorizationEndpoint;
+    url = queryAppend(std::move(url), "response_type", "code");
+    url = queryAppend(std::move(url), "client_id", m_implementation->config.clientId());
+    url = queryAppend(std::move(url), "redirect_uri", m_implementation->config.callbackUri());
+    url = queryAppend(std::move(url), "scope", scope);
+    url = queryAppend(std::move(url), "state", state.value());
+    if (nonce) url = queryAppend(std::move(url), "nonce", *nonce);
+    if (m_implementation->config.authorizationResponseMode()
+        == OidcAuthorizationResponseMode::FormPost) {
+        url = queryAppend(std::move(url), "response_mode", "form_post");
+    }
+    if (verifier) {
+        auto verifierDigest = security::sha256(*verifier);
+        if (!verifierDigest) co_return foundation::fail(verifierDigest.error());
+        url = queryAppend(std::move(url), "code_challenge",
+                          foundation::toBase64Url(verifierDigest.value()));
+        url = queryAppend(std::move(url), "code_challenge_method", "S256");
+    }
+    idp::AuthenticationChallenge challenge{
+        challengeId, m_implementation->clock->now() + m_implementation->config.challengeLifetime()};
+    challenge.setParameter("authorization_url", std::move(url));
+    co_return challenge;
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    const auto code = credential(response.parameters(), "code");
+    const auto state = credential(response.parameters(), "state");
+    if (!code || !state || code->size() > 4096U || state->size() > 512U) {
+        co_return foundation::fail(authFailure("The OIDC callback is incomplete."));
+    }
+    auto expectedState = derived(
+        m_implementation->config.derivationKey(), "state", response.challengeId());
+    if (!expectedState
+        || !security::constantTimeEquals(*state, expectedState.value())) {
+        co_return foundation::fail(authFailure("The OIDC state binding is invalid."));
+    }
+    std::optional<std::string> nonce;
+    if (m_implementation->config.nonceMode() == OidcNonceMode::Required) {
+        auto derivedNonce = derived(
+            m_implementation->config.derivationKey(), "nonce", response.challengeId());
+        if (!derivedNonce) {
+            co_return foundation::fail(authFailure("The OIDC nonce binding is unavailable."));
+        }
+        nonce = std::move(derivedNonce).value();
+    }
+    std::optional<std::string> verifier;
+    if (m_implementation->config.pkceMode() == OidcPkceMode::S256) {
+        auto derivedVerifier = derived(
+            m_implementation->config.derivationKey(), "pkce", response.challengeId());
+        if (!derivedVerifier) {
+            co_return foundation::fail(authFailure("The OIDC PKCE binding is unavailable."));
+        }
+        verifier = std::move(derivedVerifier).value();
+    }
+    auto metadata = co_await m_implementation->discoveryAsync();
+    if (!metadata) co_return foundation::fail(metadata.error());
+    auto tokenEndpoint = parseHttpsUrl(metadata->tokenEndpoint);
+    if (!tokenEndpoint) co_return foundation::fail(tokenEndpoint.error());
+    std::string form;
+    const auto append = [&form](std::string_view key, std::string_view value) {
+        if (!form.empty()) form.push_back('&');
+        form.append(formEncode(key));
+        form.push_back('=');
+        form.append(formEncode(value));
+    };
+    append("grant_type", "authorization_code");
+    append("code", *code);
+    append("redirect_uri", m_implementation->config.callbackUri());
+    append("client_id", m_implementation->config.clientId());
+    auto clientSecret = m_implementation->config.clientSecretAt(
+        m_implementation->clock->now());
+    if (!clientSecret) {
+        co_return foundation::fail(authFailure(
+            "The OIDC client authentication material is unavailable."));
+    }
+    std::string authorization;
+    if (m_implementation->config.clientAuthentication()
+        == OidcClientAuthenticationMethod::ClientSecretPost) {
+        append("client_secret", clientSecret->expose());
+    } else {
+        std::string credentials = formEncode(m_implementation->config.clientId());
+        credentials.push_back(':');
+        credentials.append(formEncode(clientSecret->expose()));
+        authorization = "Basic " + standardBase64(credentials);
+        std::ranges::fill(credentials, '\0');
+    }
+    if (verifier) append("code_verifier", *verifier);
+    auto tokenResponse = co_await httpsRequestAsync(
+        m_implementation->asyncClient, tokenEndpoint.value(), http::verb::post, std::move(form),
+                                      "application/x-www-form-urlencoded",
+                                      authorization);
+    if (!tokenResponse || tokenResponse->status != 200U) {
+        co_return foundation::fail(authFailure("The OIDC token exchange failed."));
+    }
+    auto tokenObject = parseJsonObject(tokenResponse->body);
+    if (!tokenObject) co_return foundation::fail(tokenObject.error());
+    const auto accessToken = stringValue(tokenObject.value(), "access_token");
+    const auto tokenType = stringValue(tokenObject.value(), "token_type");
+    const auto idToken = stringValue(tokenObject.value(), "id_token");
+    if (!accessToken || !detail::validBearerAccessToken(*accessToken)
+        || !tokenType || !detail::bearerTokenType(*tokenType)) {
+        co_return foundation::fail(authFailure(
+            "The OIDC token response did not contain a valid Bearer access token."));
+    }
+    if (!idToken || idToken->size() > 32U * 1024U) {
+        co_return foundation::fail(authFailure("The OIDC token response did not contain an ID Token."));
+    }
+
+    const auto firstDot = idToken->find('.');
+    if (firstDot == std::string::npos) {
+        co_return foundation::fail(authFailure("The OIDC ID Token is malformed."));
+    }
+    auto headerBytes = foundation::fromBase64Url(std::string_view{*idToken}.substr(0U, firstDot));
+    if (!headerBytes || headerBytes->size() > 4096U) {
+        co_return foundation::fail(authFailure("The OIDC ID Token header is malformed."));
+    }
+    std::string headerJson{reinterpret_cast<const char*>(headerBytes->data()), headerBytes->size()};
+    auto header = parseJsonObject(headerJson);
+    const auto kid = header ? stringValue(header.value(), "kid") : std::nullopt;
+    const auto alg = header ? stringValue(header.value(), "alg") : std::nullopt;
+    if (!header || !kid || !alg || *alg != "RS256" || kid->empty() || kid->size() > 256U
+        || !detail::joseHeaderUsesSupportedExtensions(header.value())) {
+        co_return foundation::fail(authFailure("The OIDC ID Token JOSE header is invalid."));
+    }
+
+    auto jwksEndpoint = parseHttpsUrl(metadata->jwksUri);
+    if (!jwksEndpoint) co_return foundation::fail(jwksEndpoint.error());
+    auto jwksResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
+        jwksEndpoint.value(), http::verb::get, {}, {});
+    if (!jwksResponse || jwksResponse->status != 200U) {
+        co_return foundation::fail(authFailure("The OIDC signing keys are unavailable."));
+    }
+    auto jwks = parseJsonObject(jwksResponse->body);
+    const json::value* keysValue = jwks ? jwks->if_contains("keys") : nullptr;
+    if (!jwks || keysValue == nullptr || !keysValue->is_array()) {
+        co_return foundation::fail(authFailure("The OIDC JWKS is malformed."));
+    }
+    auto signingKey = detail::uniqueRs256VerificationKey(
+        keysValue->as_array(), *kid);
+    if (!signingKey) {
+        co_return foundation::fail(authFailure(
+            "The OIDC signing key was not found or was ambiguous."));
+    }
+    auto verified = security::verifyRs256Jwk(
+        signingKey->modulus, signingKey->exponent, *idToken);
+    if (!verified) co_return foundation::fail(authFailure("The OIDC ID Token signature is invalid."));
+    auto payload = parseJsonObject(verified->payloadJson());
+    if (!payload) co_return foundation::fail(payload.error());
+    const auto issuer = stringValue(payload.value(), "iss");
+    const auto subject = stringValue(payload.value(), "sub");
+    const auto tokenNonce = stringValue(payload.value(), "nonce");
+    const bool nonceValid = nonce
+        ? (tokenNonce && security::constantTimeEquals(*tokenNonce, *nonce))
+        : true;
+    const auto issuedAt = integerValue(payload.value(), "iat");
+    const auto expiresAt = integerValue(payload.value(), "exp");
+    const bool audienceValid = detail::audienceMatchesClientExclusively(
+        payload.value(), m_implementation->config.clientId());
+    const auto authorizedParty = stringValue(payload.value(), "azp");
+    auto accessHashMatches = accessTokenHashMatches(payload.value(), *accessToken);
+    if (!accessHashMatches) co_return foundation::fail(accessHashMatches.error());
+    const auto now = m_implementation->clock->now();
+    if (!issuer || *issuer != m_implementation->config.idTokenIssuer()
+        || !subject || !detail::validSubjectIdentifier(*subject) || !nonceValid
+        || !issuedAt || !expiresAt || !audienceValid
+        || !accessHashMatches.value()
+        || !detail::authorizedPartyMatches(
+            authorizedParty ? std::optional<std::string_view>{*authorizedParty} : std::nullopt,
+            m_implementation->config.clientId())
+        || fromUnixSeconds(*issuedAt) > now + kClockSkew
+        || fromUnixSeconds(*issuedAt) < now - std::chrono::hours{24}
+        || fromUnixSeconds(*expiresAt) <= now - kClockSkew
+        || fromUnixSeconds(*expiresAt) > now + std::chrono::hours{24}) {
+        co_return foundation::fail(authFailure("The OIDC ID Token claims are invalid."));
+    }
+
+    std::optional<json::object> userInfo;
+    if (metadata->userInfoEndpoint) {
+        auto userInfoEndpoint = parseHttpsUrl(*metadata->userInfoEndpoint);
+        if (userInfoEndpoint) {
+            std::string bearerAuthorization{"Bearer "};
+            bearerAuthorization.append(*accessToken);
+            auto userInfoResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
+                userInfoEndpoint.value(), http::verb::get, {}, {},
+                bearerAuthorization);
+            std::ranges::fill(bearerAuthorization, '\0');
+            if (userInfoResponse && userInfoResponse->status == 200U) {
+                auto parsedUserInfo = parseJsonObject(userInfoResponse->body);
+                if (parsedUserInfo
+                    && detail::userInfoSubjectMatches(
+                        parsedUserInfo.value(), *subject)) {
+                    userInfo = std::move(parsedUserInfo).value();
+                }
+            }
+        }
+    }
+
+    idp::VerifiedClaims claims;
+    applyStandardProfileClaims(payload.value(), claims);
+    if (userInfo) {
+        applyStandardProfileClaims(*userInfo, claims);
+    }
+    if (m_implementation->config.providerId().value() == "telegram") {
+        applyTelegramProfileAliases(payload.value(), claims);
+        if (userInfo) applyTelegramProfileAliases(*userInfo, claims);
+    }
+    if (!claims.get(idp::ClaimName::DisplayName)
+        && m_implementation->config.providerId().value() == "apple") {
+        const auto appleName = appleDisplayName(response.parameters());
+        if (appleName) {
+            claims.set(idp::ClaimName::DisplayName, *appleName);
+        }
+    }
+
+    idp::ProviderEvidence evidence;
+    evidence.add("issuer", *issuer);
+    evidence.add("kid", *kid);
+    evidence.add("algorithm", "RS256");
+    evidence.add("protocol",
+        m_implementation->config.pkceMode() == OidcPkceMode::S256
+            ? "oidc_authorization_code_pkce"
+            : "oidc_authorization_code");
+    if (userInfo) evidence.add("userinfo", "subject_bound");
+    co_return idp::AuthenticationOutcome::create(
         m_implementation->config.providerId(), idp::ExternalSubject{*subject},
         std::move(claims), idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::None, false},
