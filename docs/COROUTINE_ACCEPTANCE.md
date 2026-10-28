@@ -890,3 +890,20 @@ runs, the new transport regressions remain **NOT VERIFIED**.
 The full protocol coroutine coverage scan still reports 40 findings across
 11 critical areas. End-to-end migration and deployment approval remain
 **NOT APPROVED**.
+
+#### Additional post-suspension network error containment regression
+
+The native socket fixture now includes an opt-in fallback that deliberately
+suspends on an Asio timer and then throws a test-only diagnostic. Its wire
+assertions require a sanitized HTTP 500 with `Cache-Control: no-store`, no
+diagnostic reflected in the response body, and a successful independent
+HTTP request afterward (so a handler exception cannot poison future
+dispatch). This regression is distinct from synchronous exception handling.
+
+On the single-vCPU host, the first full Release build of the new network test
+spent approximately ten minutes rebuilding the unrelated optimized Gateway
+transport without reaching the link stage; it was terminated rather than
+impact shared production services. A focused compilation of the changed test
+translation unit is the bounded local gate. Successful object compilation is
+**not** a substitute for a linked socket test, nor a reason to merge the
+experimental branch.

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -57,6 +58,7 @@ using namespace std::chrono_literals;
 
 struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     std::atomic<int>* observed;
+    std::atomic<bool> throwAfterSuspend{false};
     explicit NativeFallback(std::atomic<int>& counter) : observed(&counter) {}
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -66,6 +68,13 @@ struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     handleAsync(gw::HttpRequest) override
     {
         ++(*observed);
+        if (throwAfterSuspend.load()) {
+            // Exercise the post-suspension exception boundary on real TCP.
+            asio::steady_timer timer{co_await asio::this_coro::executor};
+            timer.expires_after(1ms);
+            co_await timer.async_wait(asio::use_awaitable);
+            throw std::runtime_error{"test-only-private-provider-diagnostic"};
+        }
         co_return gw::HttpResponse{209, {}, "async-route"};
     }
 };
@@ -109,6 +118,25 @@ TEST(PostgresCoroutineNetworkTest, SocketRoutesThroughAwaitableForNonSession)
     EXPECT_EQ(result.result_int(), 209);
     EXPECT_EQ(result.body(), "async-route");
     EXPECT_EQ(f.forwarded.load(), 1);
+}
+
+TEST(PostgresCoroutineNetworkTest, SuspendedFallbackExceptionIsSanitized)
+{
+    Fixture f;
+    f.fallback.throwAfterSuspend.store(true);
+    ASSERT_TRUE(f.listener.start());
+    const auto failed = send(
+        f.listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(failed.result_int(), 500);
+    EXPECT_EQ(failed.base()[wire::field::cache_control], "no-store");
+    EXPECT_EQ(failed.body().find("test-only-private-provider-diagnostic"),
+              std::string::npos);
+    f.fallback.throwAfterSuspend.store(false);
+    const auto recovered = send(
+        f.listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(recovered.result_int(), 209);
+    EXPECT_EQ(recovered.body(), "async-route");
+    EXPECT_EQ(f.forwarded.load(), 2);
 }
 
 TEST(PostgresCoroutineNetworkTest, RotationMissingBearerIsDeniedOverSocket)
