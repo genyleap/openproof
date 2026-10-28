@@ -179,6 +179,9 @@ pghttp::HttpsRequest loopback(std::uint16_t port)
     pghttp::HttpsRequest request;
     request.host = "localhost";
     request.port = port;
+    // Only the explicitly controlled disposable TLS fixture can use a
+    // nonpublic address. Production provider calls use PublicInternet.
+    request.addressPolicy = pghttp::HttpsRequest::AddressPolicy::PermitPrivate;
     request.target = "/oauth/test";
     request.timeout = 2000ms;
     return request;
@@ -302,4 +305,16 @@ TEST(AsyncProviderHttpsTest, SlowTlsPeerUsesEndToEndDeadline)
     EXPECT_EQ(result.failure, pghttp::HttpsFailure::Timeout);
     // The client must not wait on an upstream that has not responded yet.
     EXPECT_LT(elapsed, 200ms);
+}
+
+TEST(AsyncProviderHttpsTest, PublicAddressPolicyRejectsPrivateDnsBeforeConnect)
+{
+    pghttp::AsyncHttpsClient client;
+    auto request = loopback(443);
+    request.addressPolicy =
+        pghttp::HttpsRequest::AddressPolicy::PublicInternet;
+    const auto result = execute(client, std::move(request));
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.failure, pghttp::HttpsFailure::UnsafeAddress);
+    EXPECT_TRUE(result.response.body.empty());
 }

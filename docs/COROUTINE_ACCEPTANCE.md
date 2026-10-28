@@ -994,3 +994,26 @@ These tests do not use real OAuth credentials or contact GitHub and do not
 replace end-to-end tests with a disposable fake OAuth provider. The acceptance
 gate stays NOT APPROVED until compiled and runtime-tested on the full
 nonblocking authentication pipeline.
+
+
+#### Outbound provider DNS-rebinding / SSRF guard (2026-10-29)
+
+The shared nonblocking HTTPS transport now rejects nonpublic DNS answers
+**before creating a TCP connection**, including any mixed public/private
+answer set. The default policy denies loopback, RFC1918, CGNAT, link-local
+metadata, documentation/benchmarking, multicast, reserved IPv4 ranges,
+non-global IPv6, mapped/tunnelled/private and known documentation prefixes.
+This protects the new GitHub coroutine path even if a public DNS hostname is
+unexpectedly resolved to an internal destination. Trusting a TLS certificate
+by itself is not a replacement for the network destination boundary.
+
+The override `PermitPrivate` is explicit at the request site and is reserved
+for a separately trusted endpoint such as the local disposable TLS tests;
+provider configuration or caller-provided URLs must never select it.
+An isolated network test requires PublicInternet to fail closed when DNS
+resolves `localhost`; the existing pinned-CA localhost tests opt into the
+disposable-only override.
+
+This gate supplements, but does not replace, provider-level hostname
+allowlisting, proxy egress rules and end-to-end authenticated request flow
+tests. Release approval remains NOT APPROVED.

@@ -31,6 +31,46 @@ constexpr std::size_t kMaxRequestBody = 1024U * 1024U;
 constexpr std::size_t kMaxRequestHeaders = 32U;
 constexpr std::size_t kMaxRequestHeaderBytes = 16384U;
 
+// A resolved destination must be globally routable, not merely syntactically
+// valid or accompanied by a trusted TLS certificate. Fail the *whole* DNS
+// answer set if even one result could route to loopback, a local network,
+// special-use Internet infrastructure or an IPv4 tunnelling address.
+// Endpoint hostname allowlisting remains a separate provider policy.
+[[nodiscard]] bool publiclyRoutable(const asio::ip::address& address) noexcept
+{
+    if (address.is_v4()) {
+        const std::uint32_t value = address.to_v4().to_uint();
+        const auto inRange = [value](unsigned int bits, std::uint32_t base) {
+            return (value >> (32U - bits)) == (base >> (32U - bits));
+        };
+        return !(inRange(8U, 0x00000000U)        // 0/8 unspecified
+            || inRange(8U, 0x0A000000U)          // 10/8 private
+            || inRange(10U, 0x64400000U)         // shared CGNAT
+            || inRange(8U, 0x7F000000U)          // loopback
+            || inRange(16U, 0xA9FE0000U)         // link-local/metadata
+            || inRange(12U, 0xAC100000U)         // 172.16/12
+            || inRange(16U, 0xC0A80000U)         // 192.168/16
+            || inRange(24U, 0xC0000000U)         // 192.0.0/24 special use
+            || inRange(24U, 0xC0000200U)         // 192.0.2/24 documentation
+            || inRange(24U, 0xC0586300U)         // deprecated 6to4 relay
+            || inRange(15U, 0xC6120000U)         // benchmarking
+            || inRange(24U, 0xC6336400U)         // documentation
+            || inRange(24U, 0xCB007100U)         // documentation
+            || inRange(4U, 0xE0000000U)          // multicast
+            || inRange(4U, 0xF0000000U));        // future/reserved
+    }
+    if (!address.is_v6()) return false;
+    const auto bytes = address.to_v6().to_bytes();
+    if ((bytes[0] & 0xE0U) != 0x20U) return false; // not global-unicast /3
+    if (bytes[0] == 0x20U && bytes[1] == 0x02U) return false; // 6to4
+    if (bytes[0] == 0x20U && bytes[1] == 0x01U) {
+        if (bytes[2] == 0U || (bytes[2] == 0x0DU && bytes[3] == 0xB8U)) {
+            return false; // Teredo and 2001:db8 documentation prefix
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool isDnsName(std::string_view host) noexcept
 {
     if (host.empty() || host.size() > 253U || host.back() == '.') return false;
@@ -170,6 +210,18 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
                 asio::redirect_error(asio::use_awaitable, error)));
         if (error) co_return connectionFailure(error, deadline);
         if (Clock::now() >= deadline) co_return failure(HttpsFailure::Timeout);
+        if (request.addressPolicy == HttpsRequest::AddressPolicy::PublicInternet) {
+            // Reject mixed answers as well: falling back from a public to a
+            // private address after a connection error is an SSRF primitive.
+            bool observed = false;
+            for (const auto& resolved : endpoints) {
+                observed = true;
+                if (!publiclyRoutable(resolved.endpoint().address())) {
+                    co_return failure(HttpsFailure::UnsafeAddress);
+                }
+            }
+            if (!observed) co_return failure(HttpsFailure::Connection);
+        }
 
         beast::ssl_stream<beast::tcp_stream> stream{executor, m_context};
         if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,

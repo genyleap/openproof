@@ -14,7 +14,13 @@ namespace openproof::provider::http::async_detail {
 
 struct HttpsRequest final {
     enum class Method { Get, Post };
+    // PublicInternet rejects all special-use/private DNS answers before
+    // opening a TCP socket, including mixed public + internal answer sets.
+    // PermitPrivate is solely for trusted, explicitly authorized endpoints
+    // such as isolated test servers; never derive it from a supplied URL.
+    enum class AddressPolicy { PublicInternet, PermitPrivate };
     Method method{Method::Get};
+    AddressPolicy addressPolicy{AddressPolicy::PublicInternet};
     std::string host;
     std::uint16_t port{443U};
     std::string target{"/"};
@@ -36,6 +42,7 @@ enum class HttpsFailure {
     Timeout,
     Connection,
     Certificate,
+    UnsafeAddress,
     ResponseLimit
 };
 
@@ -47,8 +54,9 @@ struct HttpsResult final {
 
 // Shared native Boost.Asio/Beast HTTPS client for first-party OAuth providers.
 // Does not follow redirects or expose a synchronous fallback. The provider
-// policy owns endpoint allowlisting, DNS rebinding and private-IP restrictions;
-// this transport does not independently enforce a network-address allowlist.
+// policy still owns hostname allowlisting and redirects. The default address
+// policy additionally rejects private/special-use resolved IP addresses before
+// the first connection, preventing ordinary DNS-rebinding into local networks.
 // The client and SSL context must outlive every in-flight exchange.
 class AsyncHttpsClient final {
 public:
