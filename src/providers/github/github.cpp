@@ -521,6 +521,14 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
         std::move(evidence), m_implementation->clock->now());
 }
 
+asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+GitHubAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    // GitHub challenge generation is entirely local cryptography, unlike the
+    // discovery/request-token flows of other federated providers.
+    co_return beginAuthentication(request);
+}
+
 asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
 GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
 {

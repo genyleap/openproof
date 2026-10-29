@@ -14,7 +14,8 @@
  *     openproof.identity.farcaster ┤          (this module)
  *     ... future providers ───┘
  *
- * Providers depend on this SPI. The SPI depends on nothing but openproof.foundation.
+ * Providers depend on this SPI. The SPI uses foundation, security primitives,
+ * and a provider-agnostic Boost.Asio awaitable type, never a concrete provider.
  * The identity core consumes AuthenticationOutcome and never learns which
  * protocol produced it. If a change here requires naming a specific provider,
  * the change belongs in that provider instead.

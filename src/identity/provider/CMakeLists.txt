@@ -1,5 +1,5 @@
-# Deliberately links only openproof_foundation. If this target ever needs to link a
-# concrete provider, the provider-agnostic boundary has been broken.
+# The SPI depends only on shared foundation/security primitives and the
+# provider-neutral Boost.Asio coroutine type. Never link a concrete provider.
 openproof_add_module(openproof_identity_provider
     MODULES
         provider.cppm
@@ -16,6 +16,10 @@ openproof_add_module(openproof_identity_provider
         registry.cpp
     LINK_PUBLIC
         openproof_foundation
+        # Public coroutine awaitable types must use the exact same Boost.Asio
+        # headers as concrete providers. System Boost and pinned Boost 1.88
+        # cannot coexist inside GCC16 C++ module BMIs.
+        Boost::headers
         # openproof_security is a downward, non-domain dependency: the transaction
         # model compares nonces and bindings in constant time, and that check
         # belongs with the invariant rather than duplicated in every provider.

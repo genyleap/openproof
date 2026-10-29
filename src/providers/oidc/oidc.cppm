@@ -136,7 +136,8 @@ private:
  * accepted only after RS256 signature, issuer, audience, expiry, issued-at and configured
  * nonce-binding checks.
  */
-class OidcAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class OidcAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                           public identity::provider::CoroutineAuthenticationProvider {
 public:
     OidcAuthenticationProvider(OidcProviderConfig config,
                                const foundation::ClockSource& clock,
@@ -155,10 +156,10 @@ public:
     // verification. Own the request/response across all network suspensions.
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationChallenge>>
-    beginAuthenticationAsync(identity::provider::AuthenticationRequest request);
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationOutcome>>
-    completeAuthenticationAsync(identity::provider::AuthenticationResponse response);
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

@@ -1080,3 +1080,23 @@ callbacks and forged challenge envelopes fail before outbound network I/O.
 The synchronous compatibility provider remains for the existing SPI; the
 trusted authentication service and HTTP dispatch have not yet been migrated.
 This does not authorize a main merge, production rollout or release.
+
+
+#### Provider-neutral native coroutine SPI capability (2026-10-29)
+
+The identity provider SPI declares `CoroutineAuthenticationProvider` as a
+strictly provider-neutral, opt-in polymorphic capability alongside the
+legacy `AuthenticationProvider`. Its begin/complete operations own request and
+move-only response values across suspension and return the same normalized
+`foundation::Result` types as the synchronous SPI. GitHub, OIDC and X implement
+both interfaces; GitHub's challenge generation is local CPU work while its
+three outbound OAuth exchanges use native TLS. This module adds no
+provider-specific imports or vendor-specific protocol assumptions.
+
+The existing `AuthenticationService` still uses its synchronous interface.
+No HTTP handler may bypass its transaction consumption, assurance trust policy
+or canonical identity checks by calling the new capability directly. Next
+integration must dispatch the async capability **inside** that trusted
+coordinator with fail-closed handling of non-coroutine providers and
+preserve purpose-bound login/connection ceremonies. This milestone alone does
+not reduce the outstanding synchronous API and database blockers.

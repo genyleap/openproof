@@ -28,7 +28,7 @@ namespace xProvider = openproof::provider::x;
 }
 
 asio::awaitable<void> checkInvalidStart(
-    xProvider::XAuthenticationProvider& provider, bool& rejected)
+    idp::CoroutineAuthenticationProvider& provider, bool& rejected)
 {
     auto result = co_await provider.beginAuthenticationAsync(
         idp::AuthenticationRequest{
@@ -37,7 +37,7 @@ asio::awaitable<void> checkInvalidStart(
 }
 
 asio::awaitable<void> checkInvalidCompletion(
-    xProvider::XAuthenticationProvider& provider,
+    idp::CoroutineAuthenticationProvider& provider,
     idp::AuthenticationResponse response, bool& rejected)
 {
     auto result = co_await provider.completeAuthenticationAsync(std::move(response));
@@ -51,9 +51,14 @@ TEST(XCoroutineProviderTest, IncorrectProviderRejectedBeforeTokenExchange)
     fnd::ManualClockSource clock{
         fnd::Instant{std::chrono::milliseconds{1770000000000}}};
     xProvider::XAuthenticationProvider provider{std::move(configuration).value(), clock};
+    // Resolve by the provider-neutral polymorphic SPI rather than dispatching
+    // on the provider's name or calling concrete protocol methods.
+    idp::AuthenticationProvider& registered = provider;
+    auto* native = dynamic_cast<idp::CoroutineAuthenticationProvider*>(&registered);
+    ASSERT_NE(native, nullptr);
     bool rejected = false;
     asio::io_context io;
-    auto result = asio::co_spawn(io, checkInvalidStart(provider, rejected), asio::use_future);
+    auto result = asio::co_spawn(io, checkInvalidStart(*native, rejected), asio::use_future);
     io.run();
     ASSERT_NO_THROW(result.get());
     EXPECT_TRUE(rejected);

@@ -2,6 +2,12 @@ module;
 
 #include <optional>
 #include <memory>
+// Pin Asio's thread-context TLS symbol to the ordinary non-module TU.
+// Otherwise exporting awaitable from this GCC16 BMI duplicates a strong
+// call_stack::top_ definition in consumers of the provider SPI.
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <string>
 #include <string_view>
 
@@ -244,6 +250,35 @@ public:
 
 protected:
     AuthenticationProvider() = default;
+};
+
+/**
+ * @brief Provider-neutral optional capability for asynchronous verification.
+ *
+ * A provider implements this alongside AuthenticationProvider when its
+ * challenge issuance or proof verification can suspend on network I/O.
+ * The trusted coordinator, not an HTTP handler, owns transaction redemption,
+ * binding checks, assurance caps and canonical identity resolution. A provider
+ * that does not implement this capability must never be invoked synchronously
+ * on a coroutine reactor as an implicit fallback.
+ *
+ * Requests are move-only values: an implementation owns the entire callback
+ * and credentials for the lifetime of any suspension.
+ */
+class CoroutineAuthenticationProvider {
+public:
+    CoroutineAuthenticationProvider(const CoroutineAuthenticationProvider&) = delete;
+    CoroutineAuthenticationProvider& operator=(const CoroutineAuthenticationProvider&) = delete;
+    virtual ~CoroutineAuthenticationProvider() = default;
+
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<AuthenticationChallenge>>
+    beginAuthenticationAsync(AuthenticationRequest request) = 0;
+
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<AuthenticationOutcome>>
+    completeAuthenticationAsync(AuthenticationResponse response) = 0;
+
+protected:
+    CoroutineAuthenticationProvider() = default;
 };
 
 }

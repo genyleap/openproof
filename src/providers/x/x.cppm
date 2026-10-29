@@ -52,7 +52,8 @@ private:
  * supplies the stable X user id and screen name, so OpenProof does not call a
  * profile/user lookup endpoint just to establish identity.
  */
-class XAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class XAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                        public identity::provider::CoroutineAuthenticationProvider {
 public:
     XAuthenticationProvider(XProviderConfig config,
                             const foundation::ClockSource& clock,
@@ -70,12 +71,12 @@ public:
     /** Nonblocking OAuth 1.0a request-token exchange; owns request across awaits. */
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationChallenge>>
-    beginAuthenticationAsync(identity::provider::AuthenticationRequest request);
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
 
     /** Nonblocking OAuth 1.0a access-token completion with sealed challenge binding. */
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationOutcome>>
-    completeAuthenticationAsync(identity::provider::AuthenticationResponse response);
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

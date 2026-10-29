@@ -47,7 +47,8 @@ private:
 };
 
 /** @brief GitHub OAuth Authorization Code + PKCE identity provider. */
-class GitHubAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class GitHubAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                            public identity::provider::CoroutineAuthenticationProvider {
 public:
     GitHubAuthenticationProvider(GitHubProviderConfig config,
                                  const foundation::ClockSource& clock,
@@ -62,13 +63,17 @@ public:
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
 
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
+
     /** Native nonblocking GitHub OAuth code exchange and identity lookup.
      * Owns the callback across every await; callers must separately enforce
      * the authentication transaction's single-use and expiry constraints.
      */
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationOutcome>>
-    completeAuthenticationAsync(identity::provider::AuthenticationResponse response);
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;
