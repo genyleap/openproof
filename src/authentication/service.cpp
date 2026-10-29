@@ -1,6 +1,9 @@
 module;
 
 #include <algorithm>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -308,6 +311,34 @@ foundation::Result<AuthenticationStart> AuthenticationService::beginConnection(
     return beginInternal(request, binding, std::move(correlation), &identity);
 }
 
+boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+AuthenticationService::beginAsync(
+    provider::AuthenticationRequest request,
+    provider::BindingDigest binding,
+    foundation::CorrelationId correlation)
+{
+    co_return co_await beginInternalAsync(
+        std::move(request), std::move(binding), std::move(correlation), std::nullopt);
+}
+
+boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+AuthenticationService::beginConnectionAsync(
+    provider::AuthenticationRequest request,
+    provider::BindingDigest binding,
+    foundation::CorrelationId correlation,
+    identity::core::IdentityId identity)
+{
+    if (identity.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                   "A connection ceremony requires a canonical identity.");
+    }
+    auto active = requireActiveIdentity(identity);
+    if (!active) co_return foundation::fail(active.error());
+    co_return co_await beginInternalAsync(
+        std::move(request), std::move(binding), std::move(correlation),
+        std::move(identity));
+}
+
 foundation::Result<AuthenticationStart> AuthenticationService::beginInternal(
     const provider::AuthenticationRequest& request,
     const provider::BindingDigest& binding,
@@ -405,6 +436,107 @@ foundation::Result<AuthenticationStart> AuthenticationService::beginInternal(
     }
 
     return AuthenticationStart{std::move(transactionId), std::move(challenge).value(),
+                               std::move(continuationToken)};
+}
+
+boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+AuthenticationService::beginInternalAsync(
+    provider::AuthenticationRequest request,
+    provider::BindingDigest binding,
+    foundation::CorrelationId correlation,
+    std::optional<identity::core::IdentityId> connectionTarget)
+{
+    provider::AuthenticationProvider* const implementation =
+        m_providers.find(request.provider());
+    if (implementation == nullptr) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication start refused: provider is not registered."));
+    }
+
+    const std::optional<provider::AssuranceLevel> maximum =
+        effectiveMaximum(*implementation, request.provider());
+    if (!maximum.has_value()) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication start refused: provider has no operator trust policy."));
+    }
+    if (request.requestedAssurance().has_value()
+        && !provider::meetsAssurance(*maximum, *request.requestedAssurance())) {
+        co_return foundation::fail(
+            foundation::ErrorCode::AssuranceInsufficient,
+            std::string{foundation::defaultErrorMessage(
+                foundation::ErrorCode::AssuranceInsufficient)},
+            "Requested assurance exceeds the lower of the provider-declared and "
+            "operator-configured caps.");
+    }
+
+    // The registered provider's optional async capability is selected only
+    // after identity and operator assurance checks, never by provider name.
+    auto* const native =
+        dynamic_cast<provider::CoroutineAuthenticationProvider*>(implementation);
+    if (native == nullptr) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication provider has no native coroutine capability."));
+    }
+    foundation::Result<provider::AuthenticationChallenge> challenge =
+        foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        challenge = co_await native->beginAuthenticationAsync(request);
+    } catch (...) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication provider threw while starting an async exchange."));
+    }
+    if (!challenge.has_value()) {
+        co_return foundation::fail(challenge.error());
+    }
+
+    const foundation::Instant now = m_clock.now();
+    if (challenge->id().empty() || challenge->isExpiredAt(now)) {
+        co_return foundation::fail(authenticationFailure(
+            "Provider returned an empty or already-expired challenge."));
+    }
+
+    foundation::Result<std::string> generatedId =
+        security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    if (!generatedId.has_value()) {
+        co_return foundation::fail(generatedId.error());
+    }
+    foundation::Result<std::string> generatedContinuation =
+        security::randomTokenBase64Url(kContinuationEntropyBytes);
+    if (!generatedContinuation.has_value()) {
+        co_return foundation::fail(generatedContinuation.error());
+    }
+
+    provider::TransactionId transactionId{std::move(generatedId).value()};
+    foundation::SecretString continuationToken{std::move(generatedContinuation).value()};
+    const foundation::Duration challengeLifetime = challenge->expiresAt() - now;
+    const foundation::Duration lifetime =
+        std::min(challengeLifetime, m_maximumTransactionLifetime);
+
+    foundation::Result<provider::AuthenticationTransaction> transaction =
+        provider::AuthenticationTransaction::create(
+            transactionId, request.provider(), implementation->interactionModel(),
+            continuationToken.clone(), binding, std::move(correlation), now, lifetime);
+    if (!transaction.has_value()) {
+        co_return foundation::fail(transaction.error());
+    }
+    transaction->setMetadata(std::string{kChallengeIdMetadata},
+                             std::string{challenge->id().value()});
+    if (request.requestedAssurance().has_value()) {
+        transaction->setMetadata(
+            std::string{kRequestedAssuranceMetadata},
+            std::string{provider::assuranceLevelName(*request.requestedAssurance())});
+    }
+    if (connectionTarget.has_value()) {
+        transaction->setMetadata(std::string{kConnectionIdentityMetadata},
+                                 std::string{connectionTarget->value()});
+    }
+
+    const foundation::Status recorded = m_transactions.begin(std::move(transaction).value());
+    if (!recorded.has_value()) {
+        co_return foundation::fail(recorded.error());
+    }
+
+    co_return AuthenticationStart{std::move(transactionId), std::move(challenge).value(),
                                std::move(continuationToken)};
 }
 
@@ -519,6 +651,117 @@ AuthenticationService::completeExchange(
         std::move(outcome).value(), std::move(connectionTarget), completionFinishedAt};
 }
 
+boost::asio::awaitable<foundation::Result<AuthenticationService::CompletedExchange>>
+AuthenticationService::completeExchangeAsync(
+    provider::TransactionId transactionId,
+    foundation::SecretString continuationToken,
+    provider::BindingDigest binding,
+    provider::AuthenticationResponse response,
+    bool requireConnection)
+{
+    const foundation::Instant now = m_clock.now();
+    foundation::Result<provider::AuthenticationTransaction> transaction =
+        m_transactions.consume(transactionId, continuationToken, binding, now);
+    if (!transaction.has_value()) {
+        co_return foundation::fail(transaction.error());
+    }
+
+    const auto expectedChallenge = transaction->metadata().find(kChallengeIdMetadata);
+    if (expectedChallenge == transaction->metadata().end()
+        || expectedChallenge->second != response.challengeId().value()) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: challenge identifier does not match the "
+            "server-side transaction."));
+    }
+
+    provider::AuthenticationProvider* const implementation =
+        m_providers.find(transaction->provider());
+    if (implementation == nullptr) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: transaction provider is no longer registered."));
+    }
+
+    const std::optional<provider::AssuranceLevel> maximum =
+        effectiveMaximum(*implementation, transaction->provider());
+    if (!maximum.has_value()) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: provider trust policy is absent."));
+    }
+
+    // Resolve the async capability only from the same registered provider
+    // whose identity and operator trust policy were checked above.
+    // No synchronous fallback may run on the coroutine event loop.
+    auto* const native =
+        dynamic_cast<provider::CoroutineAuthenticationProvider*>(implementation);
+    if (native == nullptr) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication provider has no native coroutine capability."));
+    }
+    foundation::Result<provider::AuthenticationOutcome> outcome =
+        foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        outcome = co_await native->completeAuthenticationAsync(std::move(response));
+    } catch (...) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication provider threw while completing an async exchange."));
+    }
+    if (!outcome.has_value()) {
+        std::string detail{
+            "Authentication provider rejected the completion operation."};
+        if (outcome.error().hasInternalDetail()) {
+            detail.append(" Provider detail: ");
+            detail.append(outcome.error().internalDetail());
+        }
+        co_return foundation::fail(authenticationFailure(std::move(detail)));
+    }
+    // The provider may legitimately read the same real clock after the broker
+    // consumed the transaction. Using the pre-call timestamp as an upper bound
+    // makes every millisecond crossed inside provider verification look like a
+    // future assertion. Bound against a fresh post-verification reading.
+    const foundation::Instant completionFinishedAt = m_clock.now();
+    if (outcome->provider() != transaction->provider()) {
+        co_return foundation::fail(authenticationFailure(
+            "Provider returned an outcome under a different provider identifier."));
+    }
+    if (!provider::meetsAssurance(*maximum, outcome->claimedAssurance())) {
+        co_return foundation::fail(authenticationFailure(
+            "Provider outcome exceeded its effective assurance cap."));
+    }
+
+    const auto requested = transaction->metadata().find(kRequestedAssuranceMetadata);
+    if (requested != transaction->metadata().end()) {
+        const std::optional<provider::AssuranceLevel> required =
+            parseAssurance(requested->second);
+        if (!required.has_value()
+            || !provider::meetsAssurance(outcome->claimedAssurance(), *required)) {
+            co_return foundation::fail(
+                foundation::ErrorCode::AssuranceInsufficient,
+                std::string{foundation::defaultErrorMessage(
+                    foundation::ErrorCode::AssuranceInsufficient)},
+                "Provider completed the exchange below the assurance requested at start.");
+        }
+    }
+
+    if (outcome->verifiedAt() < transaction->createdAt()
+        || outcome->verifiedAt() > completionFinishedAt) {
+        co_return foundation::fail(authenticationFailure(
+            "Provider returned a verification timestamp outside the transaction window."));
+    }
+
+    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
+    const bool isConnection = connection != transaction->metadata().end();
+    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: ceremony purpose does not match the endpoint."));
+    }
+    std::optional<identity::core::IdentityId> connectionTarget;
+    if (isConnection) {
+        connectionTarget.emplace(connection->second);
+    }
+    co_return CompletedExchange{
+        std::move(outcome).value(), std::move(connectionTarget), completionFinishedAt};
+}
+
 foundation::Status AuthenticationService::requireActiveIdentity(
     const identity::core::IdentityId& identity) const
 {
@@ -562,8 +805,28 @@ foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
     auto exchange = completeExchange(
         transactionId, continuationToken, binding, response, false);
     if (!exchange) return foundation::fail(exchange.error());
-    auto outcome = std::move(exchange->outcome);
-    const auto completedAt = exchange->completedAt;
+    return finishVerified(std::move(exchange).value());
+}
+
+boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+AuthenticationService::completeAsync(
+    provider::TransactionId transactionId,
+    foundation::SecretString continuationToken,
+    provider::BindingDigest binding,
+    provider::AuthenticationResponse response)
+{
+    auto exchange = co_await completeExchangeAsync(
+        std::move(transactionId), std::move(continuationToken),
+        std::move(binding), std::move(response), false);
+    if (!exchange) co_return foundation::fail(exchange.error());
+    co_return finishVerified(std::move(exchange).value());
+}
+
+foundation::Result<VerifiedAuthentication>
+AuthenticationService::finishVerified(CompletedExchange exchange)
+{
+    auto outcome = std::move(exchange.outcome);
+    const auto completedAt = exchange.completedAt;
     const auto external = externalFromOutcome(outcome);
     foundation::Result<std::optional<identity::core::IdentityId>> owner =
         m_identities.ownerOf(external);

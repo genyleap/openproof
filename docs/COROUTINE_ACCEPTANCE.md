@@ -1100,3 +1100,30 @@ integration must dispatch the async capability **inside** that trusted
 coordinator with fail-closed handling of non-coroutine providers and
 preserve purpose-bound login/connection ceremonies. This milestone alone does
 not reduce the outstanding synchronous API and database blockers.
+
+
+#### Trusted authentication coroutine coordination (2026-10-29, pending validation)
+
+An opt-in `AuthenticationService::beginAsync`, `beginConnectionAsync`
+and `completeAsync` pathway is under test. The coordinator selects
+`CoroutineAuthenticationProvider` by provider-neutral polymorphism *only
+after* finding the registered provider and checking independently configured
+trust and effective assurance caps. It refuses providers without native
+coroutine capability instead of synchronously dispatching them on an I/O
+reactor. Transaction start continues recording server-owned purpose,
+challenge, binding and random continuation metadata.
+
+During completion the coordinator atomically consumes the one-time
+transaction before suspending on the provider, validates the challenge id
+and policy, and then checks the returned provider identity, assurance,
+verification time, requested assurance and connection-versus-login purpose.
+The canonical identity resolution and persistence logic is shared with
+the original synchronous flow, not bypassed.
+
+**Important acceptance boundary:** the transaction repository and canonical
+identity/profile repositories used by this new route are still synchronous;
+thus the new path is NOT yet an all-coroutine HTTP-to-storage flow, and
+production HTTP dispatch is not connected. These remain blocking release
+findings. The full source must pass GCC16 C++26 build plus isolated tests
+before this milestone is classified as verified. No merge or release
+approval is implied.

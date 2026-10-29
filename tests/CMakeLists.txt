@@ -373,3 +373,36 @@ gtest_discover_tests(openproof_postgres_network_tests
     TEST_PREFIX "NativePostgresNetwork."
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;network")
+
+# Isolated coroutine authentication-coordinator tests. Exercise the same
+# provider-neutral SPI and trusted transaction/identity gates as production,
+# without pulling in the complete legacy HTTP/OAuth umbrella suite.
+add_executable(openproof_authentication_coroutine_tests
+    authentication/coroutine_service_test.cpp)
+target_compile_features(openproof_authentication_coroutine_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_authentication_coroutine_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_authentication_coroutine_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_authentication_coroutine_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_authentication_coroutine_tests PRIVATE
+    openproof_authentication openproof_identity_provider
+    openproof_identity_core openproof_identity_profile
+    openproof_foundation openproof_security
+    Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_authentication_coroutine_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_authentication_coroutine_tests
+    TEST_PREFIX "TrustedAsyncAuth."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "authentication;async;security")
+
+# Same GCC16 Asio coroutine-frame allocation diagnostic in this single test TU.
+# Keep the test suite's -Werror diagnostics in force.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(authentication/coroutine_service_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()

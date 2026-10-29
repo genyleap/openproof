@@ -1,6 +1,9 @@
 module;
 
 #include <map>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -192,12 +195,25 @@ public:
           const provider::BindingDigest& binding,
           foundation::CorrelationId correlation);
 
+    /** Starts an auth transaction through a trusted, native coroutine provider. */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+    beginAsync(provider::AuthenticationRequest request,
+               provider::BindingDigest binding,
+               foundation::CorrelationId correlation);
+
     /** @brief Starts a provider proof that may only attach to @p identity. */
     [[nodiscard]] foundation::Result<AuthenticationStart>
     beginConnection(const provider::AuthenticationRequest& request,
                     const provider::BindingDigest& binding,
                     foundation::CorrelationId correlation,
                     const identity::core::IdentityId& identity);
+
+    /** Starts a purpose-bound connection via native coroutine provider. */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+    beginConnectionAsync(provider::AuthenticationRequest request,
+                         provider::BindingDigest binding,
+                         foundation::CorrelationId correlation,
+                         identity::core::IdentityId identity);
 
     /**
      * @brief Redeems an exchange exactly once and validates the provider outcome.
@@ -213,6 +229,20 @@ public:
              const foundation::SecretString& continuationToken,
              const provider::BindingDigest& binding,
              const provider::AuthenticationResponse& response);
+
+    /**
+     * @brief Opt-in provider-neutral nonblocking proof verification.
+     *
+     * Burns the server-side one-time transaction before awaiting a registered
+     * coroutine-capable provider. Never falls back to a blocking provider on
+     * the event loop. Canonical identity persistence still uses its existing
+     * synchronous repositories until the storage migration is complete.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+    completeAsync(provider::TransactionId transactionId,
+                  foundation::SecretString continuationToken,
+                  provider::BindingDigest binding,
+                  provider::AuthenticationResponse response);
 
     /**
      * @brief Converts a completed first-party email-verification ceremony into
@@ -309,12 +339,28 @@ private:
                   foundation::CorrelationId correlation,
                   const identity::core::IdentityId* connectionTarget);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<AuthenticationStart>>
+    beginInternalAsync(provider::AuthenticationRequest request,
+                       provider::BindingDigest binding,
+                       foundation::CorrelationId correlation,
+                       std::optional<identity::core::IdentityId> connectionTarget);
+
     [[nodiscard]] foundation::Result<CompletedExchange>
     completeExchange(const provider::TransactionId& transactionId,
                      const foundation::SecretString& continuationToken,
                      const provider::BindingDigest& binding,
                      const provider::AuthenticationResponse& response,
                      bool requireConnection);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<CompletedExchange>>
+    completeExchangeAsync(provider::TransactionId transactionId,
+                          foundation::SecretString continuationToken,
+                          provider::BindingDigest binding,
+                          provider::AuthenticationResponse response,
+                          bool requireConnection);
+
+    [[nodiscard]] foundation::Result<VerifiedAuthentication>
+    finishVerified(CompletedExchange exchange);
 
     [[nodiscard]] foundation::Status requireActiveIdentity(
         const identity::core::IdentityId& identity) const;
