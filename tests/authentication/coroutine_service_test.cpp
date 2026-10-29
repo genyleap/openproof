@@ -370,4 +370,86 @@ TEST(TrustedAuthenticationCoroutineTest, IncorrectChallengeBurnsTransactionBefor
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(denied);
 }
+
+// Two independent request handlers race the same server-owned continuation.
+// The provider deliberately suspends after entering verification. Only one
+// redemption is allowed to reach the provider even while the first is pending.
+TEST(TrustedAuthenticationCoroutineTest, ConcurrentCompletionsVerifyOnlyOnce)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    const auto bound = binding("two-racing-handlers");
+    asio::io_context io;
+    auto startedFuture = asio::co_spawn(
+        io, service.beginAsync(
+            fixture.request(), bound, fnd::CorrelationId{"race-test"}),
+        asio::use_future);
+    io.run();
+    auto started = startedFuture.get();
+    ASSERT_TRUE(started);
+
+    const auto id = idp::TransactionId{
+        std::string{started->transactionId().value()}};
+    const auto challenge = std::string{started->challenge().id().value()};
+
+    io.restart();
+    auto first = asio::co_spawn(io,
+        service.completeAsync(
+            id, started->continuationToken().clone(), bound, proof(challenge)),
+        asio::use_future);
+    auto second = asio::co_spawn(io,
+        service.completeAsync(
+            id, started->continuationToken().clone(), bound, proof(challenge)),
+        asio::use_future);
+    io.run();
+
+    auto firstResult = first.get();
+    auto secondResult = second.get();
+    EXPECT_NE(firstResult.has_value(), secondResult.has_value());
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+}
+
+// A forged callback is consumed before any provider coroutine suspends,
+// so a correct callback cannot redeem the same continuation afterward.
+TEST(TrustedAuthenticationCoroutineTest, ConcurrentForgedCallbackNeverDuplicatesVerification)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    const auto bound = binding("forged-racing-handler");
+    asio::io_context io;
+    auto startedFuture = asio::co_spawn(
+        io, service.beginAsync(
+            fixture.request(), bound, fnd::CorrelationId{"forged-race"}),
+        asio::use_future);
+    io.run();
+    auto started = startedFuture.get();
+    ASSERT_TRUE(started);
+
+    const auto id = idp::TransactionId{
+        std::string{started->transactionId().value()}};
+    const auto challenge = std::string{started->challenge().id().value()};
+    io.restart();
+    auto forged = asio::co_spawn(io,
+        service.completeAsync(
+            id, started->continuationToken().clone(), bound,
+            proof("attacker-replaced-challenge")),
+        asio::use_future);
+    auto valid = asio::co_spawn(io,
+        service.completeAsync(
+            id, started->continuationToken().clone(), bound, proof(challenge)),
+        asio::use_future);
+    io.run();
+
+    // Whichever callback acquires the transaction first determines whether
+    // the legitimate request succeeds or the forged request burns the token.
+    // Neither interleaving may allow a forged outcome or two verifications.
+    const auto forgedResult = forged.get();
+    const auto validResult = valid.get();
+    EXPECT_FALSE(forgedResult);
+    EXPECT_LE(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,
+              validResult.has_value() ? 1 : 0);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+}
 } // namespace
