@@ -999,10 +999,30 @@ AuthenticationService::completeConnection(
     auto exchange = completeExchange(
         transactionId, continuationToken, binding, response, true);
     if (!exchange) return foundation::fail(exchange.error());
-    const auto& target = *exchange->connectionTarget;
+    return finishConnection(std::move(exchange).value());
+}
+
+boost::asio::awaitable<foundation::Result<identity::core::ExternalIdentityRef>>
+AuthenticationService::completeConnectionAsync(
+    provider::TransactionId transactionId,
+    foundation::SecretString continuationToken,
+    provider::BindingDigest binding,
+    provider::AuthenticationResponse response)
+{
+    auto exchange = co_await completeExchangeAsync(
+        std::move(transactionId), std::move(continuationToken),
+        std::move(binding), std::move(response), true);
+    if (!exchange) co_return foundation::fail(exchange.error());
+    co_return finishConnection(std::move(exchange).value());
+}
+
+foundation::Result<identity::core::ExternalIdentityRef>
+AuthenticationService::finishConnection(CompletedExchange exchange)
+{
+    const auto& target = *exchange.connectionTarget;
     auto active = requireActiveIdentity(target);
     if (!active) return foundation::fail(active.error());
-    const auto external = externalFromOutcome(exchange->outcome);
+    const auto external = externalFromOutcome(exchange.outcome);
     const std::lock_guard guard{m_connectionMutex};
     auto owner = m_identities.ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
@@ -1012,7 +1032,7 @@ AuthenticationService::completeConnection(
             "That external account is already connected to another OpenProof identity.");
     }
     if (!owner->has_value()) {
-        auto attached = attachVerified(target, external, exchange->completedAt);
+        auto attached = attachVerified(target, external, exchange.completedAt);
         if (!attached) return foundation::fail(attached.error());
     }
     auto presentationSaved = m_identities.updatePresentation(external);
@@ -1023,16 +1043,16 @@ AuthenticationService::completeConnection(
         if (stored->has_value()) {
             auto profile = stored->value();
             auto refreshed = profile.refreshPresentationClaims(
-                exchange->outcome.claims(), exchange->completedAt);
+                exchange.outcome.claims(), exchange.completedAt);
             if (!refreshed) return foundation::fail(refreshed.error());
             auto saved = m_profileRepository->save(profile);
             if (!saved) return foundation::fail(saved.error());
         } else {
             auto profile = identity::profile::IdentityProfile::create(
-                target, exchange->completedAt);
+                target, exchange.completedAt);
             if (!profile) return foundation::fail(profile.error());
             auto refreshed = profile->refreshPresentationClaims(
-                exchange->outcome.claims(), exchange->completedAt);
+                exchange.outcome.claims(), exchange.completedAt);
             if (!refreshed) return foundation::fail(refreshed.error());
             auto saved = m_profileRepository->save(profile.value());
             if (!saved) return foundation::fail(saved.error());

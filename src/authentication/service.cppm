@@ -265,6 +265,17 @@ public:
                        const provider::BindingDigest& binding,
                        const provider::AuthenticationResponse& response);
 
+    /** Completes a native coroutine connection with the exact same purpose,
+     * single-use transaction and canonical ownership constraints as the
+     * synchronous compatibility API.
+     */
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::core::ExternalIdentityRef>>
+    completeConnectionAsync(provider::TransactionId transactionId,
+                            foundation::SecretString continuationToken,
+                            provider::BindingDigest binding,
+                            provider::AuthenticationResponse response);
+
     /**
      * @brief Refreshes display-only metadata for an already verified connection.
      *
@@ -361,6 +372,9 @@ private:
 
     [[nodiscard]] foundation::Result<VerifiedAuthentication>
     finishVerified(CompletedExchange exchange);
+
+    [[nodiscard]] foundation::Result<identity::core::ExternalIdentityRef>
+    finishConnection(CompletedExchange exchange);
 
     [[nodiscard]] foundation::Status requireActiveIdentity(
         const identity::core::IdentityId& identity) const;

@@ -1127,3 +1127,18 @@ production HTTP dispatch is not connected. These remain blocking release
 findings. The full source must pass GCC16 C++26 build plus isolated tests
 before this milestone is classified as verified. No merge or release
 approval is implied.
+
+#### Async connection completion and purpose separation
+
+The trusted authentication service now includes
+`completeConnectionAsync` alongside its async login completion. Both
+consume the same single-use authentication transactions before awaiting
+provider proof verification, and both rely on the same provider-neutral,
+independently trust-capped SPI. Native connection completion reuses the
+canonical ownership, conflict prevention, active identity and profile update
+code from synchronous compatibility. No coroutine provider is permitted to
+return a login session for a connection ceremony, or attach an account from a
+login transaction. The test suite explicitly covers accepted connections,
+replay, purpose mismatch in both directions and burn-on-wrong-challenge.
+Canonical repository methods remain synchronous and are an outstanding
+performance/acceptance blocker. No production switch or release authorization.

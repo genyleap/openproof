@@ -276,4 +276,98 @@ TEST(TrustedAuthenticationCoroutineTest, ForgedOutcomeProviderCannotBeAccepted)
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(denied);
 }
+
+asio::awaitable<void> nativeConnection(
+    auth::AuthenticationService& service, Fixture& fixture, bool& accepted)
+{
+    const auto bound = binding("linked-client");
+    auto started = co_await service.beginConnectionAsync(
+        fixture.request(), bound, fnd::CorrelationId{"link-native"},
+        ids::IdentityId{"canonical-identity"});
+    if (!started) co_return;
+    auto id = idp::TransactionId{std::string{started->transactionId().value()}};
+    auto token = started->continuationToken().clone();
+    auto challenge = std::string{started->challenge().id().value()};
+    auto linked = co_await service.completeConnectionAsync(
+        id, token.clone(), bound, proof(challenge));
+    auto replay = co_await service.completeConnectionAsync(
+        std::move(id), std::move(token), bound, proof(challenge));
+    accepted = linked
+        && linked->providerId() == idp::ProviderId{"async-test"}
+        && linked->subject() == idp::ExternalSubject{"verified-subject"}
+        && !replay && fixture.coroutineProvider->nativeCompleteCalls == 1
+        && fixture.coroutineProvider->syncCalls == 0;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeConnectionBindsCanonicalIdentityAndPreventsReplay)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    bool accepted = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, nativeConnection(service, fixture, accepted), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(accepted);
+}
+
+asio::awaitable<void> loginIsNotConnection(
+    auth::AuthenticationService& service, Fixture& fixture, bool& denied)
+{
+    const auto bound = binding("login-only");
+    auto started = co_await service.beginAsync(
+        fixture.request(), bound, fnd::CorrelationId{"no-link-upgrade"});
+    if (!started) co_return;
+    auto connected = co_await service.completeConnectionAsync(
+        idp::TransactionId{std::string{started->transactionId().value()}},
+        started->continuationToken().clone(), bound,
+        proof(std::string{started->challenge().id().value()}));
+    denied = !connected && fixture.coroutineProvider->nativeCompleteCalls == 1;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, LoginTransactionCannotBecomeConnection)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    bool denied = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, loginIsNotConnection(service, fixture, denied), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(denied);
+}
+
+asio::awaitable<void> wrongChallengeBurnsTransaction(
+    auth::AuthenticationService& service, Fixture& fixture, bool& denied)
+{
+    const auto bound = binding("challenge-bound");
+    auto started = co_await service.beginAsync(
+        fixture.request(), bound, fnd::CorrelationId{"invalid-challenge"});
+    if (!started) co_return;
+    auto token = started->continuationToken().clone();
+    auto id = idp::TransactionId{std::string{started->transactionId().value()}};
+    auto invalid = co_await service.completeAsync(
+        id, token.clone(), bound, proof("wrong-challenge"));
+    auto valid = co_await service.completeAsync(
+        std::move(id), std::move(token), bound,
+        proof(std::string{started->challenge().id().value()}));
+    denied = !invalid && !valid
+        && fixture.coroutineProvider->nativeCompleteCalls == 0;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, IncorrectChallengeBurnsTransactionBeforeProviderIo)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    bool denied = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, wrongChallengeBurnsTransaction(service, fixture, denied),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(denied);
+}
 } // namespace
