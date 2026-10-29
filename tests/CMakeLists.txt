@@ -237,6 +237,30 @@ gtest_discover_tests(openproof_oidc_coroutine_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "provider;async;oidc")
 
+# X OAuth 1.0a coroutine tests run without network access or credentials.
+add_executable(openproof_x_coroutine_tests
+    providers/x_coroutine_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_x_coroutine_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_x_coroutine_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_x_coroutine_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_x_coroutine_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_x_coroutine_tests PRIVATE
+    openproof_provider_x openproof_identity_provider
+    openproof_foundation openproof_security Boost::headers
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_x_coroutine_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_x_coroutine_tests
+    TEST_PREFIX "NativeX."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "provider;async;oauth1")
+
 # GitHub provider's coroutine completion must reject malformed or unbound
 # OAuth callbacks before issuing any external HTTPS request. Keep its module
 # test separate from the legacy umbrella binary and use no external network.

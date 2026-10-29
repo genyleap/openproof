@@ -1060,3 +1060,23 @@ absolute deadline, and a deliberately slow TLS peer is cancelled within a
 short shared budget despite an individually longer request timeout. This
 does not yet replace request-scoped cancellation propagation from the HTTP
 socket or bounded CPU executor accounting, which remain release blockers.
+
+
+#### X OAuth 1.0a native coroutine pathway (2026-10-29)
+
+The X provider now exposes nonblocking `beginAuthenticationAsync` and
+`completeAuthenticationAsync` entry points. The request-token and access-token
+POSTs use the shared HTTPS client's public-internet address policy, fixed
+`api.x.com` hostname, peer verification, no-follow redirects and a 10-second
+total per-operation deadline. OAuth 1.0a signing (including signed callback,
+nonce/timestamp, verifier and request-token secret), AEAD-sealed challenge
+ownership and constant-time callback-token comparison are unchanged.
+Provider state and the move-only completion response stay alive across
+`co_await` suspension. The coroutine does not log untrusted upstream
+message bodies or OAuth credentials on transport failures.
+
+Independent negative coroutine tests check wrong-provider starts, incomplete
+callbacks and forged challenge envelopes fail before outbound network I/O.
+The synchronous compatibility provider remains for the existing SPI; the
+trusted authentication service and HTTP dispatch have not yet been migrated.
+This does not authorize a main merge, production rollout or release.
