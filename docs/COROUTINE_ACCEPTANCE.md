@@ -1040,3 +1040,23 @@ or unbound callbacks fail prior to network operations; real disposable
 issuer/JWKS/TLS interoperability and concurrent transaction cancellation
 remain required acceptance checks. Build/test status is independently
 recorded; source presence is not release approval.
+
+
+#### Multi-hop OAuth total deadline propagation (2026-10-29)
+
+The native HTTPS request type can now carry an optional **absolute monotonic**
+deadline in addition to its per-request relative timeout. DNS, TCP, verified
+TLS, write, read and shutdown take the earlier of the two deadlines. An
+already-expired flow is refused before DNS/network allocation. Both native
+GitHub and native OIDC entry points now establish one 15-second total budget
+and pass that same deadline to every outbound token/user/email or
+discovery/token/JWKS/UserInfo exchange; a successful first call can no longer
+reset the clock for subsequent calls. Individual exchanges retain a smaller
+10-second cap. The interactive browser redirect interval is separate and
+remains governed by its authentication transaction expiry.
+
+Dedicated HTTPS tests verify immediate fail-closed on a previously expired
+absolute deadline, and a deliberately slow TLS peer is cancelled within a
+short shared budget despite an individually longer request timeout. This
+does not yet replace request-scoped cancellation propagation from the HTTP
+socket or bounded CPU executor accounting, which remain release blockers.

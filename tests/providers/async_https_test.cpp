@@ -318,3 +318,32 @@ TEST(AsyncProviderHttpsTest, PublicAddressPolicyRejectsPrivateDnsBeforeConnect)
     EXPECT_EQ(result.failure, pghttp::HttpsFailure::UnsafeAddress);
     EXPECT_TRUE(result.response.body.empty());
 }
+
+TEST(AsyncProviderHttpsTest, ExpiredSharedDeadlineRefusesRequestBeforeDns)
+{
+    pghttp::AsyncHttpsClient client;
+    auto request = loopback(443);
+    request.timeout = 2000ms;
+    request.absoluteDeadline = std::chrono::steady_clock::now() - 1ms;
+    const auto result = execute(client, std::move(request));
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.failure, pghttp::HttpsFailure::Timeout);
+    EXPECT_TRUE(result.response.body.empty());
+}
+
+TEST(AsyncProviderHttpsTest, AbsoluteDeadlineCapsLongPerHopTimeout)
+{
+    LocalTlsServer server;
+    server.replyDelay = 250ms;
+    server.start();
+    pghttp::AsyncHttpsClient client{server.caFile};
+    auto request = loopback(server.port());
+    request.timeout = 2000ms;
+    const auto started = std::chrono::steady_clock::now();
+    request.absoluteDeadline = started + 40ms;
+    const auto result = execute(client, std::move(request));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.failure, pghttp::HttpsFailure::Timeout);
+    EXPECT_LT(elapsed, 200ms);
+}

@@ -251,7 +251,8 @@ struct HttpResult final {
 [[nodiscard]] asio::awaitable<foundation::Result<HttpResult>> httpsRequestAsync(
     openproof::provider::http::async_detail::AsyncHttpsClient& client,
     const HttpsUrl& endpoint, http::verb method, std::string body,
-    std::string_view contentType, std::string_view authorization = {})
+    std::string_view contentType, std::chrono::steady_clock::time_point deadline,
+    std::string_view authorization = {})
 {
     using Request = openproof::provider::http::async_detail::HttpsRequest;
     unsigned int port{};
@@ -269,6 +270,7 @@ struct HttpResult final {
     outgoing.method = method == http::verb::post
         ? Request::Method::Post : Request::Method::Get;
     outgoing.timeout = std::chrono::seconds{10};
+    outgoing.absoluteDeadline = deadline;
     outgoing.headers.emplace_back("accept", "application/json");
     if (!authorization.empty()) {
         outgoing.headers.emplace_back("authorization", std::string{authorization});
@@ -571,7 +573,8 @@ public:
 
     // Mirror the exact discovery validation in the synchronous compatibility
     // path, but suspend on native HTTPS rather than blocking the reactor.
-    [[nodiscard]] asio::awaitable<foundation::Result<Discovery>> discoveryAsync()
+    [[nodiscard]] asio::awaitable<foundation::Result<Discovery>> discoveryAsync(
+        std::chrono::steady_clock::time_point deadline)
     {
         const auto now = clock->now();
         {
@@ -581,7 +584,7 @@ public:
         auto endpoint = parseHttpsUrl(std::string{config.issuer()} + "/.well-known/openid-configuration");
         if (!endpoint) co_return foundation::fail(endpoint.error());
         auto response = co_await httpsRequestAsync(
-            asyncClient, endpoint.value(), http::verb::get, {}, {});
+            asyncClient, endpoint.value(), http::verb::get, {}, {}, deadline);
         if (!response || response->status != 200U) {
             co_return foundation::fail(foundation::ErrorCode::Unavailable,
                                     "OIDC discovery is unavailable.");
@@ -1097,11 +1100,13 @@ OidcAuthenticationProvider::completeAuthentication(const idp::AuthenticationResp
 asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
 OidcAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
 {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds{15};
     if (request.provider() != m_implementation->config.providerId()) {
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The OIDC authentication request targets another provider.");
     }
-    auto metadata = co_await m_implementation->discoveryAsync();
+    auto metadata = co_await m_implementation->discoveryAsync(deadline);
     if (!metadata) co_return foundation::fail(metadata.error());
     auto random = security::randomTokenBase64Url(24U);
     if (!random) co_return foundation::fail(random.error());
@@ -1163,6 +1168,8 @@ OidcAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest 
 asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
 OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
 {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds{15};
     const auto code = credential(response.parameters(), "code");
     const auto state = credential(response.parameters(), "state");
     if (!code || !state || code->size() > 4096U || state->size() > 512U) {
@@ -1192,7 +1199,7 @@ OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
         }
         verifier = std::move(derivedVerifier).value();
     }
-    auto metadata = co_await m_implementation->discoveryAsync();
+    auto metadata = co_await m_implementation->discoveryAsync(deadline);
     if (!metadata) co_return foundation::fail(metadata.error());
     auto tokenEndpoint = parseHttpsUrl(metadata->tokenEndpoint);
     if (!tokenEndpoint) co_return foundation::fail(tokenEndpoint.error());
@@ -1228,7 +1235,7 @@ OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
     auto tokenResponse = co_await httpsRequestAsync(
         m_implementation->asyncClient, tokenEndpoint.value(), http::verb::post, std::move(form),
                                       "application/x-www-form-urlencoded",
-                                      authorization);
+                                      deadline, authorization);
     if (!tokenResponse || tokenResponse->status != 200U) {
         co_return foundation::fail(authFailure("The OIDC token exchange failed."));
     }
@@ -1266,7 +1273,7 @@ OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
     auto jwksEndpoint = parseHttpsUrl(metadata->jwksUri);
     if (!jwksEndpoint) co_return foundation::fail(jwksEndpoint.error());
     auto jwksResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
-        jwksEndpoint.value(), http::verb::get, {}, {});
+        jwksEndpoint.value(), http::verb::get, {}, {}, deadline);
     if (!jwksResponse || jwksResponse->status != 200U) {
         co_return foundation::fail(authFailure("The OIDC signing keys are unavailable."));
     }
@@ -1322,7 +1329,7 @@ OidcAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
             bearerAuthorization.append(*accessToken);
             auto userInfoResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
                 userInfoEndpoint.value(), http::verb::get, {}, {},
-                bearerAuthorization);
+                deadline, bearerAuthorization);
             std::ranges::fill(bearerAuthorization, '\0');
             if (userInfoResponse && userInfoResponse->status == 200U) {
                 auto parsedUserInfo = parseJsonObject(userInfoResponse->body);

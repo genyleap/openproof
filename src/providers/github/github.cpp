@@ -233,7 +233,8 @@ struct HttpResponse final {
     openproof::provider::http::async_detail::AsyncHttpsClient& client,
     std::string_view host, std::string_view target, http::verb method,
     std::string body, std::string_view contentType,
-    std::optional<std::string_view> bearer)
+    std::optional<std::string_view> bearer,
+    std::chrono::steady_clock::time_point absoluteDeadline)
 {
     using Request = openproof::provider::http::async_detail::HttpsRequest;
     Request request;
@@ -242,6 +243,7 @@ struct HttpResponse final {
     request.method = method == http::verb::post
         ? Request::Method::Post : Request::Method::Get;
     request.timeout = std::chrono::seconds{10};
+    request.absoluteDeadline = absoluteDeadline;
     request.headers.emplace_back("accept", host == kTokenHost
         ? "application/json" : "application/vnd.github+json");
     request.headers.emplace_back("X-GitHub-Api-Version", std::string{kApiVersion});
@@ -522,6 +524,10 @@ GitHubAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
 asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
 GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
 {
+    // The three outbound hops share one deadline; each individual exchange
+    // also retains its smaller per-request limit.
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds{15};
     const auto code = credential(response.parameters(), "code");
     const auto state = credential(response.parameters(), "state");
     if (!code || !state || code->size() > 4096U || state->size() > 512U) {
@@ -548,7 +554,7 @@ GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRes
     auto tokenResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
         kTokenHost, "/login/oauth/access_token", http::verb::post,
                                       std::move(form), "application/x-www-form-urlencoded",
-                                      std::nullopt);
+                                      std::nullopt, deadline);
     if (!tokenResponse) {
         // Keep transport failures distinct from GitHub HTTP rejections in
         // operator-only diagnostics; never log the code, secret or response body.
@@ -576,7 +582,7 @@ GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRes
 
     auto userResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
         kApiHost, "/user", http::verb::get, {}, {},
-                                     *accessToken);
+                                     *accessToken, deadline);
     if (!userResponse || userResponse->status != 200U) {
         co_return foundation::fail(authFailure("The GitHub authenticated-user endpoint failed."));
     }
@@ -595,7 +601,7 @@ GitHubAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRes
     if (detail::hasEmailScope(*grantedScopes)) {
         auto emailResponse = co_await httpsRequestAsync(m_implementation->asyncClient,
             kApiHost, "/user/emails?per_page=100", http::verb::get, {}, {},
-            *accessToken);
+            *accessToken, deadline);
         if (emailResponse && emailResponse->status == 200U) {
             auto emailJson = parseJson(emailResponse->body);
             if (emailJson && emailJson->is_array()) {

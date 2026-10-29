@@ -197,7 +197,11 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
 
     try {
         auto executor = co_await asio::this_coro::executor;
-        const auto deadline = Clock::now() + request.timeout;
+        const auto now = Clock::now();
+        const auto deadline = std::min(
+            now + request.timeout,
+            request.absoluteDeadline.value_or(Clock::time_point::max()));
+        if (deadline <= now) co_return failure(HttpsFailure::Timeout);
         Tcp::resolver resolver{executor};
         boost::system::error_code error;
 
@@ -206,7 +210,7 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
         // there is no detached cancellation handler using an expired resolver.
         auto endpoints = co_await resolver.async_resolve(
             request.host, std::to_string(request.port),
-            asio::cancel_after(request.timeout,
+            asio::cancel_after(deadline - Clock::now(),
                 asio::redirect_error(asio::use_awaitable, error)));
         if (error) co_return connectionFailure(error, deadline);
         if (Clock::now() >= deadline) co_return failure(HttpsFailure::Timeout);

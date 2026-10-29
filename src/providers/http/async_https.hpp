@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,7 +27,11 @@ struct HttpsRequest final {
     std::string target{"/"};
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // Optional monotonic deadline shared by several consecutive OAuth
+    // exchanges. Every operation is bounded by min(timeout, absoluteDeadline).
+    // The next hop must never reset the total authorization budget.
     std::chrono::milliseconds timeout{10000};
+    std::optional<std::chrono::steady_clock::time_point> absoluteDeadline;
 };
 
 struct HttpsResponse final {
