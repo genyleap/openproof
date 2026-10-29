@@ -1159,3 +1159,21 @@ This wallet-path change does **not** migrate Farcaster on-chain lookup, the
 HTTP handler or the canonical storage adapters, and does not approve rollout.
 Isolated negative tests cover wrong-provider requests, incomplete callbacks
 and forged smart-wallet signatures without configured RPCs.
+
+#### Farcaster native FIP-11 coroutine on-chain verification (2026-10-30)
+
+The Farcaster provider now implements the provider-neutral coroutine SPI.
+Both direct signer challenge issuance and SIWF proof completion use a separate
+`CoroutineFarcasterChainVerifier` capability. Production RPC verification
+implements that capability using the shared nonblocking HTTPS adapter for
+Optimism chain identity, ERC-6492/1271 signature verification, custody FID
+lookup and auth-address checks. Every operation in the same challenge or
+verification uses one monotonic deadline. Injected sync-only verifiers are
+explicitly refused on the coroutine reactor, never invoked as a fallback.
+The existing sync verifier API is retained for compatibility.
+
+The independent local fake-verifier tests require real awaitable suspension
+during chain verification and signer checks; they also assert zero calls to
+the legacy blocking verifier methods. These are unit tests, not external
+Optimism-network integration tests. HTTP dispatch, canonical storage and
+other remaining legacy blocking paths still block release acceptance.

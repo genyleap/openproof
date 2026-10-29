@@ -1,5 +1,6 @@
 module;
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -172,8 +173,36 @@ protected:
     FarcasterChainVerifier() = default;
 };
 
+/** Native Farcaster on-chain verifier: independent of any RPC vendor.
+ * One monotonic deadline is shared across every verification hop. Injected
+ * verifiers that do not expose this capability fail closed in coroutine mode.
+ */
+class CoroutineFarcasterChainVerifier {
+public:
+    CoroutineFarcasterChainVerifier(const CoroutineFarcasterChainVerifier&) = delete;
+    CoroutineFarcasterChainVerifier& operator=(const CoroutineFarcasterChainVerifier&) = delete;
+    virtual ~CoroutineFarcasterChainVerifier() = default;
+
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<bool>>
+    chainMatchesAsync(std::chrono::steady_clock::time_point deadline) = 0;
+
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<bool>>
+    verifySignatureAsync(std::string_view address, std::string_view message,
+                         std::string_view signature,
+                         std::chrono::steady_clock::time_point deadline) = 0;
+
+    [[nodiscard]] virtual boost::asio::awaitable<
+        foundation::Result<std::optional<FarcasterSignerKind>>>
+    authorizeSignerAsync(std::uint64_t fid, std::string_view address,
+                         std::chrono::steady_clock::time_point deadline) = 0;
+
+protected:
+    CoroutineFarcasterChainVerifier() = default;
+};
+
 /** @brief Farcaster provider proving a FID through its current on-chain custody address. */
-class FarcasterAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class FarcasterAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                              public identity::provider::CoroutineAuthenticationProvider {
 public:
     FarcasterAuthenticationProvider(FarcasterProviderConfig config,
                                     const foundation::ClockSource& clock,
@@ -187,6 +216,14 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

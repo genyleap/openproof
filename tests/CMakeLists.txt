@@ -411,6 +411,7 @@ endif()
 # local-only and cannot contact an external JSON-RPC endpoint.
 add_executable(openproof_web3_coroutine_tests
     providers/web3_coroutine_test.cpp
+    providers/farcaster_coroutine_test.cpp
     ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
 target_compile_features(openproof_web3_coroutine_tests PRIVATE cxx_std_26)
 set_target_properties(openproof_web3_coroutine_tests PROPERTIES

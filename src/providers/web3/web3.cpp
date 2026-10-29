@@ -962,6 +962,64 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     return state.value() == 1U && keyType.value() == kFarcasterAuthAddressKeyType;
 }
 
+[[nodiscard]] asio::awaitable<foundation::Result<std::uint64_t>> farcasterIdOfAsync(
+    NativeRpcClient& client, std::string_view endpoint, std::string_view registry, std::string_view address,
+    const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    auto selector = functionSelector("idOf(address)");
+    if (!selector) co_return foundation::fail(selector.error());
+    std::string data{"0x"};
+    data.append(*selector);
+    data.append(24U, '0');
+    data.append(address.substr(2U));
+    json::object call;
+    call["to"] = registry;
+    call["data"] = std::move(data);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    if (!result || !result->starts_with("0x") || result->size() > 66U) {
+        co_return foundation::fail(result ? foundation::Error{foundation::ErrorCode::Unavailable}
+                                       : result.error());
+    }
+    std::uint64_t value{};
+    std::string_view text{*result};
+    text.remove_prefix(2U);
+    while (text.size() > 16U && text.front() == '0') text.remove_prefix(1U);
+    if (text.size() > 16U) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The Farcaster FID exceeds the supported 64-bit range.");
+    }
+    if (text.empty()) co_return std::uint64_t{0};
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+    co_return value;
+}
+
+[[nodiscard]] asio::awaitable<foundation::Result<bool>> farcasterAuthAddressValidAsync(
+    NativeRpcClient& client, std::string_view endpoint, std::string_view registry, std::uint64_t fid,
+    std::string_view address, const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    auto selector = functionSelector("keyDataOf(uint256,bytes)");
+    if (!selector) co_return foundation::fail(selector.error());
+    std::string data{"0x"};
+    data.append(*selector);
+    data.append(uint256Hex(fid));
+    data.append(uint256Hex(64U));
+    data.append(uint256Hex(32U));
+    data.append(24U, '0');
+    data.append(address.substr(2U));
+    json::object call;
+    call["to"] = registry;
+    call["data"] = std::move(data);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    if (!result) co_return foundation::fail(result.error());
+    auto state = abiUint64(*result, 0U);
+    auto keyType = abiUint64(*result, 1U);
+    if (!state || !keyType) co_return foundation::fail(state ? keyType.error() : state.error());
+    co_return state.value() == 1U && keyType.value() == kFarcasterAuthAddressKeyType;
+}
+
 [[nodiscard]] std::optional<std::string_view> publicParameter(
     const idp::AttributeMap& values, std::string_view name)
 {
@@ -1334,10 +1392,12 @@ struct ParsedFarcasterSiwe final {
     return ParsedFarcasterSiwe{std::move(*address), *fid};
 }
 
-class RpcFarcasterChainVerifier final : public FarcasterChainVerifier {
+class RpcFarcasterChainVerifier final : public FarcasterChainVerifier,
+                                        public CoroutineFarcasterChainVerifier {
 public:
     explicit RpcFarcasterChainVerifier(const FarcasterProviderConfig& config)
-        : m_config(&config) {}
+        : m_config(&config),
+          m_rpcClient(std::string{config.caFile()}, kMaximumRpcResponse) {}
 
     [[nodiscard]] foundation::Result<bool> chainMatches() override
     {
@@ -1374,8 +1434,54 @@ public:
         return std::optional<FarcasterSignerKind>{};
     }
 
+    // Both production RPC and injected native-verifier implementations must
+    // use the SAME monotonic deadline during all chain/identity probes.
+    [[nodiscard]] asio::awaitable<foundation::Result<bool>>
+    chainMatchesAsync(RpcDeadline deadline) override
+    {
+        co_return co_await rpcChainMatchesAsync(
+            m_rpcClient, m_config->rpcEndpoint(), m_config->chainId(),
+            m_config->authorizationHeader(), deadline);
+    }
+
+    [[nodiscard]] asio::awaitable<foundation::Result<bool>>
+    verifySignatureAsync(std::string_view address, std::string_view message,
+                         std::string_view signature, RpcDeadline deadline) override
+    {
+        auto digest = ethereumMessageHash(message);
+        if (!digest) co_return foundation::fail(digest.error());
+        co_return co_await contractWalletValidAsync(
+            m_rpcClient, m_config->rpcEndpoint(), address,
+            digest.value(), signature, m_config->authorizationHeader(), deadline);
+    }
+
+    [[nodiscard]] asio::awaitable<
+        foundation::Result<std::optional<FarcasterSignerKind>>>
+    authorizeSignerAsync(std::uint64_t fid, std::string_view address,
+                         RpcDeadline deadline) override
+    {
+        auto custodyFid = co_await farcasterIdOfAsync(
+            m_rpcClient, m_config->rpcEndpoint(),
+            m_config->idRegistryAddress(), address,
+            m_config->authorizationHeader(), deadline);
+        if (!custodyFid) co_return foundation::fail(custodyFid.error());
+        if (custodyFid.value() == fid)
+            co_return std::optional<FarcasterSignerKind>{FarcasterSignerKind::Custody};
+        if (m_config->keyRegistryAddress().empty())
+            co_return std::optional<FarcasterSignerKind>{};
+        auto valid = co_await farcasterAuthAddressValidAsync(
+            m_rpcClient, m_config->rpcEndpoint(),
+            m_config->keyRegistryAddress(), fid, address,
+            m_config->authorizationHeader(), deadline);
+        if (!valid) co_return foundation::fail(valid.error());
+        if (valid.value())
+            co_return std::optional<FarcasterSignerKind>{FarcasterSignerKind::AuthAddress};
+        co_return std::optional<FarcasterSignerKind>{};
+    }
+
 private:
     const FarcasterProviderConfig* m_config;
+    NativeRpcClient m_rpcClient;
 };
 
 } // namespace
@@ -1780,6 +1886,122 @@ FarcasterAuthenticationProvider::completeAuthentication(const idp::Authenticatio
         evidence.add("key_registry", std::string{m_implementation->config.keyRegistryAddress()});
     }
     return idp::AuthenticationOutcome::create(
+        id(), idp::ExternalSubject{std::to_string(parsed->fid)}, std::move(claims),
+        idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
+        std::move(evidence), m_implementation->clock->now());
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+FarcasterAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    if (request.provider() != id()) co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const auto addressValue = publicParameter(request.parameters(), "address");
+    const auto fidValue = publicParameter(request.parameters(), "fid");
+    if (addressValue.has_value() != fidValue.has_value()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A direct SIWF request must provide both address and FID.");
+    }
+    auto* const native =
+        dynamic_cast<CoroutineFarcasterChainVerifier*>(m_implementation->verifier.get());
+    if (native == nullptr)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "The Farcaster verifier is not coroutine-capable.");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    auto chain = co_await native->chainMatchesAsync(deadline);
+    if (!chain || !chain.value()) co_return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
+                                                            : chain.error());
+    std::optional<std::string> address;
+    std::optional<std::uint64_t> fid;
+    std::optional<FarcasterSignerKind> signerKind;
+    if (addressValue && fidValue) {
+        address = normalizeAddress(*addressValue);
+        auto parsedFid = parseDecimal(*fidValue);
+        if (!address || !parsedFid || parsedFid.value() == 0U) {
+            co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The direct SIWF address or FID is invalid.");
+        }
+        fid = parsedFid.value();
+        auto authorized = co_await native->authorizeSignerAsync(*fid, *address, deadline);
+        if (!authorized || !authorized.value()) {
+            co_return foundation::fail(authorized
+                ? authenticationFailure("The address is not an active custody or auth address for that FID.")
+                : authorized.error());
+        }
+        signerKind = *authorized.value();
+    }
+    const auto now = m_implementation->clock->now();
+    auto challengeId = makeChallengeId("fcsiwf_", now);
+    if (!challengeId) co_return foundation::fail(challengeId.error());
+    auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
+    if (!nonce) co_return foundation::fail(nonce.error());
+    idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
+    challenge.setParameter("nonce", nonce.value());
+    challenge.setParameter("domain", std::string{m_implementation->config.domain()});
+    challenge.setParameter("uri", std::string{m_implementation->config.uri()});
+    challenge.setParameter("statement", std::string{kFarcasterStatement});
+    challenge.setParameter("resource_prefix", "farcaster://fid/");
+    challenge.setParameter("chain_id", std::to_string(m_implementation->config.chainId()));
+    if (address && fid && signerKind) {
+        challenge.setParameter("message", buildFarcasterMessage(
+            m_implementation->config.domain(), *address, m_implementation->config.uri(),
+            nonce.value(), now, now + m_implementation->config.challengeLifetime(), *fid));
+        challenge.setParameter("address", *address);
+        challenge.setParameter("fid", std::to_string(*fid));
+        challenge.setParameter("signer_kind",
+            *signerKind == FarcasterSignerKind::Custody ? "custody" : "auth_address");
+    }
+    co_return challenge;
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+FarcasterAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    auto* const native =
+        dynamic_cast<CoroutineFarcasterChainVerifier*>(m_implementation->verifier.get());
+    if (native == nullptr)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "The Farcaster verifier is not coroutine-capable.");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    const auto message = credential(response.parameters(), "message");
+    const auto signature = credential(response.parameters(), "signature");
+    if (!message || !signature || signature->size() > 8192U) {
+        co_return foundation::fail(authenticationFailure("The Farcaster SIWF completion is incomplete."));
+    }
+    auto parsed = validateFarcasterMessage(*message, response.challengeId(),
+        m_implementation->config.domain(), m_implementation->config.uri(),
+        m_implementation->config.derivationKey(), m_implementation->config.challengeLifetime(),
+        m_implementation->clock->now());
+    if (!parsed) co_return foundation::fail(parsed.error());
+    auto signatureValid = co_await native->verifySignatureAsync(
+        parsed->address, *message, *signature, deadline);
+    if (!signatureValid || !signatureValid.value()) {
+        co_return foundation::fail(signatureValid ? authenticationFailure("The Farcaster SIWF signature is invalid.")
+                                               : signatureValid.error());
+    }
+    auto authorized = co_await native->authorizeSignerAsync(parsed->fid, parsed->address, deadline);
+    if (!authorized || !authorized.value()) {
+        co_return foundation::fail(authorized
+            ? authenticationFailure("The Farcaster signer was revoked or changed before verification completed.")
+            : authorized.error());
+    }
+    const bool custody = *authorized.value() == FarcasterSignerKind::Custody;
+    idp::VerifiedClaims claims;
+    claims.setExtension("fid", std::to_string(parsed->fid));
+    claims.setExtension("signer_address", parsed->address);
+    claims.setExtension("signer_kind", custody ? "custody" : "auth_address");
+    if (custody) claims.setExtension("custody_address", parsed->address);
+    claims.setExtension("chain_id", std::to_string(m_implementation->config.chainId()));
+    idp::ProviderEvidence evidence;
+    evidence.add("protocol", "farcaster_fip11_siwf");
+    evidence.add("fid", std::to_string(parsed->fid));
+    evidence.add("signer_address", parsed->address);
+    evidence.add("signer_kind", custody ? "custody" : "auth_address");
+    evidence.add("id_registry", std::string{m_implementation->config.idRegistryAddress()});
+    if (!m_implementation->config.keyRegistryAddress().empty()) {
+        evidence.add("key_registry", std::string{m_implementation->config.keyRegistryAddress()});
+    }
+    co_return idp::AuthenticationOutcome::create(
         id(), idp::ExternalSubject{std::to_string(parsed->fid)}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
