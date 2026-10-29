@@ -3,6 +3,9 @@ module;
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -62,7 +65,8 @@ private:
 };
 
 /** @brief ERC-4361 Sign-In with Ethereum provider supporting EOAs and ERC-1271 wallets. */
-class WalletAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class WalletAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                           public identity::provider::CoroutineAuthenticationProvider {
 public:
     WalletAuthenticationProvider(WalletProviderConfig config,
                                  const foundation::ClockSource& clock);
@@ -75,6 +79,14 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
+
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

@@ -406,3 +406,28 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(authentication/coroutine_service_test.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
+
+# Native SIWE/contract-wallet verification tests: all negative cases are
+# local-only and cannot contact an external JSON-RPC endpoint.
+add_executable(openproof_web3_coroutine_tests
+    providers/web3_coroutine_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_web3_coroutine_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_web3_coroutine_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_web3_coroutine_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_web3_coroutine_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_web3_coroutine_tests PRIVATE
+    openproof_provider_web3 openproof_identity_provider
+    openproof_foundation openproof_security Boost::headers
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_web3_coroutine_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_web3_coroutine_tests
+    TEST_PREFIX "NativeWeb3."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "provider;async;web3")

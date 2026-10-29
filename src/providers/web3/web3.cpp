@@ -18,6 +18,10 @@ module;
 #include <utility>
 #include <vector>
 
+#include "../http/async_https.hpp"
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -584,6 +588,81 @@ struct RpcResponse final { json::value result; };
     return std::string{response->result.as_string()};
 }
 
+// Native Web3 RPC transport. The configured HTTPS authority is immutable
+// provider state, and all redirects/private DNS answers are rejected by the
+// shared transport. A single monotonic deadline bounds all RPC probes in one
+// signature verification; retries never reset that budget.
+using NativeRpcClient = openproof::provider::http::async_detail::AsyncHttpsClient;
+using NativeRpcRequest = openproof::provider::http::async_detail::HttpsRequest;
+using RpcDeadline = std::chrono::steady_clock::time_point;
+
+[[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
+    NativeRpcClient& client, std::string_view endpoint,
+    std::string_view method, json::array parameters,
+    const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    const auto parsed = parseHttpsUrl(endpoint);
+    if (!parsed) co_return foundation::fail(parsed.error());
+
+    json::object body;
+    body["jsonrpc"] = "2.0";
+    body["id"] = 1;
+    body["method"] = method;
+    body["params"] = std::move(parameters);
+
+    NativeRpcRequest request;
+    request.method = NativeRpcRequest::Method::Post;
+    request.host = parsed->host;
+    const auto port = std::string_view{parsed->port};
+    unsigned int number{};
+    const auto result = std::from_chars(port.data(), port.data() + port.size(), number);
+    if (result.ec != std::errc{} || number == 0U || number > 65535U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    request.port = static_cast<std::uint16_t>(number);
+    request.target = parsed->target;
+    request.timeout = std::chrono::seconds{10};
+    request.absoluteDeadline = deadline;
+    request.headers.emplace_back("accept", "application/json");
+    request.headers.emplace_back("content-type", "application/json");
+    if (!authorization.empty()) {
+        request.headers.emplace_back("authorization",
+            std::string{authorization.expose()});
+    }
+    request.body = json::serialize(body);
+    auto response = co_await client.exchange(std::move(request));
+    if (!response.success || response.response.status != 200U)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The Web3 RPC request failed.");
+
+    boost::system::error_code parseError;
+    auto decoded = json::parse(response.response.body, parseError);
+    if (parseError || !decoded.is_object())
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The Web3 RPC response is malformed.");
+    const auto& object = decoded.as_object();
+    if (object.if_contains("error") != nullptr)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The Web3 RPC endpoint reported an error.");
+    const auto* value = object.if_contains("result");
+    if (value == nullptr)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The Web3 RPC response has no result.");
+    co_return RpcResponse{*value};
+}
+
+[[nodiscard]] asio::awaitable<foundation::Result<std::string>> rpcStringAsync(
+    NativeRpcClient& client, std::string_view endpoint,
+    std::string_view method, json::array parameters,
+    const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    auto response = co_await rpcAsync(
+        client, endpoint, method, std::move(parameters), authorization, deadline);
+    if (!response || !response->result.is_string())
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "The Web3 RPC result is not a string.");
+    co_return std::string{response->result.as_string()};
+}
+
 [[nodiscard]] std::string uint256Hex(std::uint64_t value)
 {
     std::array<std::byte, 32> bytes{};
@@ -701,6 +780,107 @@ struct RpcResponse final { json::value result; };
         return static_cast<char>(std::tolower(symbol));
     });
     return lowered.starts_with(kErc1271Magic);
+}
+
+[[nodiscard]] asio::awaitable<foundation::Result<bool>> rpcChainMatchesAsync(
+    NativeRpcClient& client, std::string_view endpoint, std::uint64_t expected, const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    auto chain = co_await rpcStringAsync(client, endpoint, "eth_chainId", {}, authorization, deadline);
+    if (!chain || !chain->starts_with("0x") || chain->size() > 34U) {
+        co_return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::Unavailable}
+                                      : chain.error());
+    }
+    std::uint64_t parsed{};
+    const auto text = std::string_view{*chain}.substr(2U);
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed, 16);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+    co_return parsed == expected;
+}
+
+[[nodiscard]] asio::awaitable<foundation::Result<bool>> universalSignatureValidAsync(
+    NativeRpcClient& client, std::string_view endpoint, std::string_view address,
+    std::span<const std::byte, 32> digest, std::string_view signature,
+    const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    auto signatureBytes = decodeHex(signature);
+    if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 8192U) {
+        co_return foundation::fail(authenticationFailure(
+            "The universal signature encoding is invalid."));
+    }
+    std::string data{kUniversalSignatureValidatorByteCode};
+    data.append(24U, '0');
+    data.append(address.substr(2U));
+    data.append(encodeHex(digest, false));
+    data.append(uint256Hex(96U));
+    data.append(uint256Hex(signatureBytes->size()));
+    data.append(encodeHex(*signatureBytes, false));
+    const std::size_t remainder = signatureBytes->size() % 32U;
+    if (remainder != 0U) data.append((32U - remainder) * 2U, '0');
+
+    json::object call;
+    call["data"] = std::move(data);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call",
+        json::array{std::move(call), "latest"}, authorization, deadline);
+    if (!result) co_return foundation::fail(result.error());
+    if (!result->starts_with("0x") || result->size() > 66U) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                "The universal signature verifier returned malformed data.");
+    }
+    std::string_view value{*result};
+    value.remove_prefix(2U);
+    while (value.size() > 1U && value.front() == '0') value.remove_prefix(1U);
+    co_return value == "1";
+}
+
+[[nodiscard]] asio::awaitable<foundation::Result<bool>> contractWalletValidAsync(
+    NativeRpcClient& client, std::string_view endpoint, std::string_view address,
+    std::span<const std::byte, 32> digest, std::string_view signature,
+    const foundation::SecretString& authorization, RpcDeadline deadline)
+{
+    // Match the verifier used by Farcaster AuthKit/viem. The deployless
+    // ERC-6492 validator handles EOAs, deployed ERC-1271 wallets, and
+    // counterfactual smart accounts without persisting any deployment.
+    auto universal = co_await universalSignatureValidAsync(
+        client, endpoint, address, digest, signature, authorization, deadline);
+    if (universal) co_return universal.value();
+
+    // Preserve the previous direct paths as a compatibility fallback for RPC
+    // providers that do not permit contract-creation eth_call simulations.
+    auto code = co_await rpcStringAsync(client, endpoint, "eth_getCode", json::array{address, "latest"}, authorization, deadline);
+    if (!code) co_return foundation::fail(code.error());
+    const bool contract = *code != "0x" && *code != "0x0" && *code != "0x00";
+    if (!contract) {
+        auto recovered = recoverAddress(digest, signature);
+        if (!recovered) co_return foundation::fail(recovered.error());
+        co_return security::constantTimeEquals(*recovered, address);
+    }
+
+    auto signatureBytes = decodeHex(signature);
+    if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 4096U) {
+        co_return foundation::fail(authenticationFailure("The ERC-1271 signature encoding is invalid."));
+    }
+    auto selector = functionSelector("isValidSignature(bytes32,bytes)");
+    if (!selector) co_return foundation::fail(selector.error());
+    std::string data{"0x"};
+    data.append(*selector);
+    data.append(encodeHex(digest, false));
+    data.append(uint256Hex(64U));
+    data.append(uint256Hex(signatureBytes->size()));
+    data.append(encodeHex(*signatureBytes, false));
+    const std::size_t remainder = signatureBytes->size() % 32U;
+    if (remainder != 0U) data.append((32U - remainder) * 2U, '0');
+    json::object call;
+    call["to"] = address;
+    call["data"] = std::move(data);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    if (!result) co_return foundation::fail(result.error());
+    std::string lowered = *result;
+    std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
+        return static_cast<char>(std::tolower(symbol));
+    });
+    co_return lowered.starts_with(kErc1271Magic);
 }
 
 [[nodiscard]] foundation::Result<std::uint64_t> farcasterIdOf(
@@ -1270,9 +1450,11 @@ const foundation::SecretString& WalletProviderConfig::authorizationHeader() cons
 class WalletAuthenticationProvider::Implementation final {
 public:
     Implementation(WalletProviderConfig value, const foundation::ClockSource& source)
-        : config(std::move(value)), clock(&source) {}
+        : config(std::move(value)), clock(&source),
+          rpcClient(std::string{config.caFile()}, kMaximumRpcResponse) {}
     WalletProviderConfig config;
     const foundation::ClockSource* clock;
+    NativeRpcClient rpcClient;
 };
 
 WalletAuthenticationProvider::WalletAuthenticationProvider(
@@ -1363,6 +1545,68 @@ WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationRe
     evidence.add("chain_id", std::to_string(parsed->chainId));
     evidence.add("wallet_address", parsed->address);
     return idp::AuthenticationOutcome::create(
+        id(), idp::ExternalSubject{parsed->address}, std::move(claims), idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
+        std::move(evidence), m_implementation->clock->now());
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+WalletAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    // Local challenge generation has no outbound network calls.
+    co_return beginAuthentication(request);
+}
+
+asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+WalletAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    const auto message = credential(response.parameters(), "message");
+    const auto signature = credential(response.parameters(), "signature");
+    if (!message || !signature || signature->size() > 8192U) {
+        co_return foundation::fail(authenticationFailure("The SIWE completion is incomplete."));
+    }
+    auto parsed = validateSiweMessage(*message, response.challengeId(), "siwe_",
+        m_implementation->config.domain(), m_implementation->config.uri(),
+        kWalletStatement, m_implementation->config.derivationKey(),
+        m_implementation->config.challengeLifetime(), m_implementation->clock->now());
+    if (!parsed) co_return foundation::fail(parsed.error());
+    auto digest = ethereumMessageHash(*message);
+    if (!digest) co_return foundation::fail(digest.error());
+
+    bool verified = false;
+    auto recovered = recoverAddress(digest.value(), *signature);
+    if (recovered && security::constantTimeEquals(*recovered, parsed->address)) {
+        verified = true;
+    } else if (const auto endpoint = m_implementation->config.rpcEndpoint(parsed->chainId)) {
+        auto matchingChain = co_await rpcChainMatchesAsync(
+            m_implementation->rpcClient, *endpoint, parsed->chainId,
+            m_implementation->config.authorizationHeader(), deadline);
+        if (!matchingChain) co_return foundation::fail(matchingChain.error());
+        if (!matchingChain.value()) {
+            co_return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "The configured smart-wallet RPC reports the wrong chain.");
+        }
+        auto valid = co_await contractWalletValidAsync(
+            m_implementation->rpcClient, *endpoint, parsed->address,
+            digest.value(), *signature,
+            m_implementation->config.authorizationHeader(), deadline);
+        if (!valid) co_return foundation::fail(valid.error());
+        verified = valid.value();
+    }
+    if (!verified) {
+        co_return foundation::fail(authenticationFailure(
+            "The SIWE signature is invalid, or this smart-account chain has no configured RPC."));
+    }
+
+    idp::VerifiedClaims claims;
+    claims.setExtension("wallet_address", parsed->address);
+    claims.setExtension("chain_id", std::to_string(parsed->chainId));
+    idp::ProviderEvidence evidence;
+    evidence.add("protocol", "erc4361_siwe");
+    evidence.add("chain_id", std::to_string(parsed->chainId));
+    evidence.add("wallet_address", parsed->address);
+    co_return idp::AuthenticationOutcome::create(
         id(), idp::ExternalSubject{parsed->address}, std::move(claims), idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
         std::move(evidence), m_implementation->clock->now());

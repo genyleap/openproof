@@ -1142,3 +1142,20 @@ login transaction. The test suite explicitly covers accepted connections,
 replay, purpose mismatch in both directions and burn-on-wrong-challenge.
 Canonical repository methods remain synchronous and are an outstanding
 performance/acceptance blocker. No production switch or release authorization.
+
+#### Ethereum wallet native SIWE coroutine path (2026-10-30)
+
+The wallet provider has a provider-neutral coroutine SPI implementation for
+challenge creation and response verification. EOA signatures are checked
+locally. Smart-wallet ERC-6492/1271 fallback now uses nonblocking, verified
+HTTPS JSON-RPC (including chain-ID validation and all code/simulation/eth_call
+probes) with a single monotonic 10-second budget for the complete verification,
+rather than a new timeout per RPC call. Configured RPC URLs are parsed with the
+existing strict HTTPS authority/port validation; the shared transport prevents
+private DNS SSRF, header injection, redirects and overlarge responses.
+
+The synchronous compatibility implementation is kept for existing call sites.
+This wallet-path change does **not** migrate Farcaster on-chain lookup, the
+HTTP handler or the canonical storage adapters, and does not approve rollout.
+Isolated negative tests cover wrong-provider requests, incomplete callbacks
+and forged smart-wallet signatures without configured RPCs.
