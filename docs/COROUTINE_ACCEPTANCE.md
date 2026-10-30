@@ -1193,3 +1193,27 @@ PostgreSQL completion claim: a nonblocking PostgreSQL transaction-store
 implementation and fully async canonical identity/profile persistence are
 still outstanding. The test suite verifies fail-closed dispatch for a
 legacy-only transaction store.
+
+#### Native PostgreSQL authentication-transaction storage (2026-10-30)
+
+`CoroutinePostgresAuthenticationTransactionStore` now implements the
+provider-neutral transaction coroutine capability with a socket-driven libpq
+pool. The async SQL adapter records server-issued metadata, consumes
+pending transactions using one atomic UPDATE, commits invalid nonce/binding
+and expired-state burns, and returns restored domain records only after
+reading bounded immutable metadata under an exclusive database lease. A
+single monotonic budget spans transaction, metadata and commit operations.
+Poisoned or aborted libpq transactions are not returned to the pool.
+The sync compatibility entry points reject use without opening connections.
+
+The C++26/GCC16 PostgreSQL async library and repository compile and link.
+An offline fail-closed test passes. Two SQL integration cases are compiled
+but **SKIPPED on this development host**, because
+`OPENPROOF_TEST_POSTGRES` is not set to a disposable database. The isolated
+Unix-socket fixture helper
+`scripts/run-disposable-postgres-auth-tests.sh` is available for an authorized
+shell to run those cases against its own ephemeral cluster. The Remote Ops
+restricted command policy did not allow executing that shell fixture here.
+**Neither SQL test is claimed as passed.** Production PostgreSQL, the live
+HTTP handler, canonical identity/profile repositories and remaining blocking
+calls have not been switched. The acceptance gate remains NOT APPROVED.

@@ -432,3 +432,57 @@ gtest_discover_tests(openproof_web3_coroutine_tests
     TEST_PREFIX "NativeWeb3."
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "provider;async;web3")
+
+# Isolated libpq coroutine authentication transaction tests; use TEMP tables
+# on a dedicated test connection and never mutate canonical production tables.
+add_executable(openproof_postgres_async_auth_transaction_tests
+    storage/postgres_async_auth_transaction_test.cpp)
+target_compile_features(openproof_postgres_async_auth_transaction_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_postgres_async_auth_transaction_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_auth_transaction_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_auth_transaction_tests PRIVATE
+    openproof_postgres_async_io GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_auth_transaction_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_auth_transaction_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_auth_transaction_tests
+    TEST_PREFIX "NativePgAuthTransaction."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;security")
+
+# Offline security gate: the native transaction repository cannot silently
+# invoke the legacy synchronous SPI even when its database is unreachable.
+add_executable(openproof_postgres_async_auth_store_tests
+    storage/postgres_async_auth_store_test.cpp)
+target_compile_features(openproof_postgres_async_auth_store_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_postgres_async_auth_store_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_postgres_async_auth_store_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_auth_store_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_auth_store_tests PRIVATE
+    openproof_postgres_async_auth_repository openproof_postgres_async_io
+    openproof_identity_provider openproof_security openproof_foundation
+    Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_auth_store_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_auth_store_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_auth_store_tests
+    TEST_PREFIX "NativePgAuthStore."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;security")

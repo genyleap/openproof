@@ -5,7 +5,8 @@
 add_library(openproof_postgres_async_io STATIC
     async_connection.cpp
     async_pool.cpp
-    async_session.cpp)
+    async_session.cpp
+    async_auth_transaction.cpp)
 target_compile_features(openproof_postgres_async_io PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_io PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -133,5 +134,26 @@ target_link_libraries(openproof_postgres_async_listener
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_session_listener.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
+# Provider-neutral opt-in authentication transaction store backed by the
+# native socket-driven libpq pool. The synchronous transaction interface is
+# implemented only as fail-closed compatibility (never blocks the reactor).
+add_library(openproof_postgres_async_auth_repository STATIC
+    coroutine_auth_transaction_store.cpp)
+target_compile_features(openproof_postgres_async_auth_repository PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_auth_repository PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_postgres_async_auth_repository PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_auth_repository PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_auth_repository PUBLIC
+    openproof_postgres_async_io openproof_identity_provider
+    openproof_foundation openproof_security Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_auth_transaction_store.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
