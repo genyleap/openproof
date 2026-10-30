@@ -1,6 +1,9 @@
 module;
 
 #include <cstddef>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -240,6 +243,35 @@ protected:
 };
 
 /**
+ * @brief Native coroutine capability for single-use authentication state.
+ *
+ * Implementations must atomically redeem the nonce and binding, including
+ * consuming incorrect/expired transactions, without blocking an Asio reactor.
+ * The trusted authentication coordinator selects this optional interface only
+ * after all provider trust and challenge checks. A missing capability must
+ * fail closed rather than invoke synchronous database I/O.
+ */
+class CoroutineAuthenticationTransactionStore {
+public:
+    CoroutineAuthenticationTransactionStore(
+        const CoroutineAuthenticationTransactionStore&) = delete;
+    CoroutineAuthenticationTransactionStore& operator=(
+        const CoroutineAuthenticationTransactionStore&) = delete;
+    virtual ~CoroutineAuthenticationTransactionStore() = default;
+
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    beginAsync(AuthenticationTransaction transaction) = 0;
+
+    [[nodiscard]] virtual boost::asio::awaitable<
+        foundation::Result<AuthenticationTransaction>>
+    consumeAsync(TransactionId id, foundation::SecretString nonce,
+                 BindingDigest binding, foundation::Instant now) = 0;
+
+protected:
+    CoroutineAuthenticationTransactionStore() = default;
+};
+
+/**
  * @brief In-memory transaction store.
  *
  * Correct for a single process. A multi-node deployment needs a shared store,
@@ -250,7 +282,9 @@ protected:
  *
  * @note Thread-safe.
  */
-class InMemoryAuthenticationTransactionStore final : public AuthenticationTransactionStore {
+class InMemoryAuthenticationTransactionStore final
+    : public AuthenticationTransactionStore,
+      public CoroutineAuthenticationTransactionStore {
 public:
     InMemoryAuthenticationTransactionStore() = default;
 
@@ -266,6 +300,13 @@ public:
     [[nodiscard]] std::size_t purgeExpired(foundation::Instant now) override;
 
     [[nodiscard]] std::size_t size() const override;
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    beginAsync(AuthenticationTransaction transaction) override;
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<AuthenticationTransaction>>
+    consumeAsync(TransactionId id, foundation::SecretString nonce,
+                 BindingDigest binding, foundation::Instant now) override;
 
 private:
     mutable std::mutex m_mutex;

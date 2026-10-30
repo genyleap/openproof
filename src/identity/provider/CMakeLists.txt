@@ -25,3 +25,11 @@ openproof_add_module(openproof_identity_provider
         # belongs with the invariant rather than duplicated in every provider.
         openproof_security
 )
+
+# GCC 16 reports a false-positive mismatched allocator for Boost.Asio
+# coroutine frames when inlining the in-memory transaction capability.
+# Restrict the workaround to that TU; -Werror remains enabled.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(transaction.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-inline")
+endif()

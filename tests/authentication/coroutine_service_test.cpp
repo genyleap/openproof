@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -371,41 +372,64 @@ TEST(TrustedAuthenticationCoroutineTest, IncorrectChallengeBurnsTransactionBefor
     EXPECT_TRUE(denied);
 }
 
-// Two independent request handlers race the same server-owned continuation.
-// The provider deliberately suspends after entering verification. Only one
-// redemption is allowed to reach the provider even while the first is pending.
+// Convert move-only non-default-constructible domain results into
+// awaitable<void> completion flags so Boost.Asio co_spawn never needs to
+// default-construct std::expected<AuthenticationStart/VerifiedAuthentication>.
+asio::awaitable<void> startRacingTransaction(
+    auth::AuthenticationService& service, idp::AuthenticationRequest request,
+    idp::BindingDigest bound, fnd::CorrelationId correlation,
+    std::optional<fnd::Result<auth::AuthenticationStart>>& destination)
+{
+    destination.emplace(co_await service.beginAsync(
+        std::move(request), bound, std::move(correlation)));
+}
+
+asio::awaitable<void> completeRacingTransaction(
+    auth::AuthenticationService& service, idp::TransactionId id,
+    fnd::SecretString continuation, idp::BindingDigest bound,
+    std::string challenge, bool& accepted)
+{
+    auto completed = co_await service.completeAsync(
+        std::move(id), std::move(continuation), bound, proof(std::move(challenge)));
+    accepted = completed.has_value();
+}
+
 TEST(TrustedAuthenticationCoroutineTest, ConcurrentCompletionsVerifyOnlyOnce)
 {
     Fixture fixture;
     auto service = fixture.service();
     const auto bound = binding("two-racing-handlers");
     asio::io_context io;
+    std::optional<fnd::Result<auth::AuthenticationStart>> startResult;
     auto startedFuture = asio::co_spawn(
-        io, service.beginAsync(
-            fixture.request(), bound, fnd::CorrelationId{"race-test"}),
+        io, startRacingTransaction(service, fixture.request(), bound,
+             fnd::CorrelationId{"race-test"}, startResult),
         asio::use_future);
     io.run();
-    auto started = startedFuture.get();
+    ASSERT_NO_THROW(startedFuture.get());
+    ASSERT_TRUE(startResult.has_value());
+    auto started = std::move(*startResult);
     ASSERT_TRUE(started);
 
     const auto id = idp::TransactionId{
         std::string{started->transactionId().value()}};
     const auto challenge = std::string{started->challenge().id().value()};
 
+    bool firstAccepted = false, secondAccepted = false;
     io.restart();
     auto first = asio::co_spawn(io,
-        service.completeAsync(
-            id, started->continuationToken().clone(), bound, proof(challenge)),
-        asio::use_future);
+        completeRacingTransaction(
+            service, id, started->continuationToken().clone(), bound,
+            challenge, firstAccepted), asio::use_future);
     auto second = asio::co_spawn(io,
-        service.completeAsync(
-            id, started->continuationToken().clone(), bound, proof(challenge)),
-        asio::use_future);
+        completeRacingTransaction(
+            service, id, started->continuationToken().clone(), bound,
+            challenge, secondAccepted), asio::use_future);
     io.run();
+    ASSERT_NO_THROW(first.get());
+    ASSERT_NO_THROW(second.get());
 
-    auto firstResult = first.get();
-    auto secondResult = second.get();
-    EXPECT_NE(firstResult.has_value(), secondResult.has_value());
+    EXPECT_NE(firstAccepted, secondAccepted);
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
 }
@@ -418,38 +442,94 @@ TEST(TrustedAuthenticationCoroutineTest, ConcurrentForgedCallbackNeverDuplicates
     auto service = fixture.service();
     const auto bound = binding("forged-racing-handler");
     asio::io_context io;
+    std::optional<fnd::Result<auth::AuthenticationStart>> startResult;
     auto startedFuture = asio::co_spawn(
-        io, service.beginAsync(
-            fixture.request(), bound, fnd::CorrelationId{"forged-race"}),
+        io, startRacingTransaction(service, fixture.request(), bound,
+             fnd::CorrelationId{"forged-race"}, startResult),
         asio::use_future);
     io.run();
-    auto started = startedFuture.get();
+    ASSERT_NO_THROW(startedFuture.get());
+    ASSERT_TRUE(startResult.has_value());
+    auto started = std::move(*startResult);
     ASSERT_TRUE(started);
 
     const auto id = idp::TransactionId{
         std::string{started->transactionId().value()}};
     const auto challenge = std::string{started->challenge().id().value()};
+    bool forgedAccepted = false, validAccepted = false;
     io.restart();
     auto forged = asio::co_spawn(io,
-        service.completeAsync(
-            id, started->continuationToken().clone(), bound,
-            proof("attacker-replaced-challenge")),
-        asio::use_future);
+        completeRacingTransaction(
+            service, id, started->continuationToken().clone(), bound,
+            "attacker-replaced-challenge", forgedAccepted), asio::use_future);
     auto valid = asio::co_spawn(io,
-        service.completeAsync(
-            id, started->continuationToken().clone(), bound, proof(challenge)),
-        asio::use_future);
+        completeRacingTransaction(
+            service, id, started->continuationToken().clone(), bound,
+            challenge, validAccepted), asio::use_future);
     io.run();
+    ASSERT_NO_THROW(forged.get());
+    ASSERT_NO_THROW(valid.get());
 
-    // Whichever callback acquires the transaction first determines whether
-    // the legitimate request succeeds or the forged request burns the token.
-    // Neither interleaving may allow a forged outcome or two verifications.
-    const auto forgedResult = forged.get();
-    const auto validResult = valid.get();
-    EXPECT_FALSE(forgedResult);
+    EXPECT_FALSE(forgedAccepted);
     EXPECT_LE(fixture.coroutineProvider->nativeCompleteCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,
-              validResult.has_value() ? 1 : 0);
+              validAccepted ? 1 : 0);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+}
+
+class LegacyOnlyTransactionStore final : public idp::AuthenticationTransactionStore {
+public:
+    [[nodiscard]] fnd::Status begin(idp::AuthenticationTransaction) override
+    { ++blockingCalls; return fnd::ok(); }
+
+    [[nodiscard]] fnd::Result<idp::AuthenticationTransaction>
+    consume(const idp::TransactionId&, const fnd::SecretString&,
+            const idp::BindingDigest&, fnd::Instant) override
+    {
+        ++blockingCalls;
+        return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+    }
+
+    [[nodiscard]] fnd::Result<std::optional<idp::AuthenticationTransaction>>
+    find(const idp::TransactionId&) const override
+    { return std::optional<idp::AuthenticationTransaction>{}; }
+
+    [[nodiscard]] std::size_t purgeExpired(fnd::Instant) override { return 0U; }
+    [[nodiscard]] std::size_t size() const override { return 0U; }
+    int blockingCalls{};
+};
+
+asio::awaitable<void> missingNativeStore(
+    auth::AuthenticationService& service, bool& rejected)
+{
+    auto started = co_await service.beginAsync(
+        idp::AuthenticationRequest{idp::ProviderId{"async-test"}, idp::ClientContext{}},
+        binding("must-not-fall-back"), fnd::CorrelationId{"legacy-store-rejection"});
+    rejected = !started && started.error().code() == fnd::ErrorCode::Unavailable;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, BlockingTransactionStoreCannotRunOnReactor)
+{
+    idp::ProviderRegistry providers;
+    auto owned = std::make_unique<NativeProofProvider>();
+    auto* native = owned.get();
+    ASSERT_TRUE(providers.registerProvider(std::move(owned)));
+    LegacyOnlyTransactionStore legacy;
+    ids::InMemoryExternalIdentityDirectory identities;
+    fnd::ManualClockSource clock{kNow};
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"async-test"}, idp::AssuranceLevel::Ial2));
+    auth::AuthenticationService service{
+        providers, legacy, identities, clock, std::move(policy), kLifetime};
+    bool rejected = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, missingNativeStore(service, rejected), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(rejected);
+    EXPECT_EQ(legacy.blockingCalls, 0);
+    EXPECT_EQ(native->nativeBeginCalls, 0);
+    EXPECT_EQ(native->syncCalls, 0);
 }
 } // namespace

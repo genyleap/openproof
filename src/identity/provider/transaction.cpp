@@ -1,6 +1,9 @@
 module;
 
 #include <chrono>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <cstddef>
 #include <mutex>
 #include <optional>
@@ -284,6 +287,22 @@ foundation::Result<AuthenticationTransaction> InMemoryAuthenticationTransactionS
     }
 
     return position->second;
+}
+
+boost::asio::awaitable<foundation::Status>
+InMemoryAuthenticationTransactionStore::beginAsync(AuthenticationTransaction transaction)
+{
+    // The in-memory adapter has no network I/O. Its small mutex-protected
+    // operation is atomic and does not suspend while holding a lock.
+    co_return begin(std::move(transaction));
+}
+
+boost::asio::awaitable<foundation::Result<AuthenticationTransaction>>
+InMemoryAuthenticationTransactionStore::consumeAsync(
+    TransactionId id, foundation::SecretString nonce,
+    BindingDigest binding, foundation::Instant now)
+{
+    co_return consume(id, nonce, binding, now);
 }
 
 foundation::Result<std::optional<AuthenticationTransaction>>

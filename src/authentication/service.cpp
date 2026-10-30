@@ -477,6 +477,12 @@ AuthenticationService::beginInternalAsync(
         co_return foundation::fail(authenticationFailure(
             "Authentication provider has no native coroutine capability."));
     }
+    auto* const nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (nativeTransactions == nullptr) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Authentication transaction storage has no native coroutine capability.");
+    }
     foundation::Result<provider::AuthenticationChallenge> challenge =
         foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
@@ -531,7 +537,13 @@ AuthenticationService::beginInternalAsync(
                                  std::string{connectionTarget->value()});
     }
 
-    const foundation::Status recorded = m_transactions.begin(std::move(transaction).value());
+    foundation::Status recorded = foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        recorded = co_await nativeTransactions->beginAsync(std::move(transaction).value());
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Unable to persist the authentication transaction.");
+    }
     if (!recorded.has_value()) {
         co_return foundation::fail(recorded.error());
     }
@@ -659,9 +671,22 @@ AuthenticationService::completeExchangeAsync(
     provider::AuthenticationResponse response,
     bool requireConnection)
 {
+    auto* const nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (nativeTransactions == nullptr) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Authentication transaction storage has no native coroutine capability.");
+    }
     const foundation::Instant now = m_clock.now();
     foundation::Result<provider::AuthenticationTransaction> transaction =
-        m_transactions.consume(transactionId, continuationToken, binding, now);
+        foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        transaction = co_await nativeTransactions->consumeAsync(
+            std::move(transactionId), std::move(continuationToken), binding, now);
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Unable to redeem the authentication transaction.");
+    }
     if (!transaction.has_value()) {
         co_return foundation::fail(transaction.error());
     }

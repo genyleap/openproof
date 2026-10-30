@@ -1177,3 +1177,19 @@ during chain verification and signer checks; they also assert zero calls to
 the legacy blocking verifier methods. These are unit tests, not external
 Optimism-network integration tests. HTTP dispatch, canonical storage and
 other remaining legacy blocking paths still block release acceptance.
+
+#### Provider-neutral coroutine transaction redemption capability
+
+The trusted authentication coordinator now requires a native coroutine
+transaction-store capability when executing its asynchronous start or complete
+flow. It rejects stores with only blocking interfaces **before** contacting
+an upstream provider, and never performs synchronous PostgreSQL persistence
+or credential redemption on the reactor as a hidden fallback.
+
+The single-process in-memory store implements this capability with atomic
+mutex-protected transactions, preserving nonce/binding mismatch burn behavior,
+single-use state transitions and replay resistance. This is **not** a
+PostgreSQL completion claim: a nonblocking PostgreSQL transaction-store
+implementation and fully async canonical identity/profile persistence are
+still outstanding. The test suite verifies fail-closed dispatch for a
+legacy-only transaction store.
