@@ -1217,3 +1217,15 @@ restricted command policy did not allow executing that shell fixture here.
 **Neither SQL test is claimed as passed.** Production PostgreSQL, the live
 HTTP handler, canonical identity/profile repositories and remaining blocking
 calls have not been switched. The acceptance gate remains NOT APPROVED.
+
+#### Explicit-port HTTPS authority hardening (2026-10-30)
+
+The shared coroutine HTTPS transport now writes the HTTP/1.1 `Host`
+header from its validated TLS endpoint, including `:port` when the
+configured port differs from 443. TLS SNI and certificate hostname
+verification continue using only the DNS hostname. Callers still cannot
+override Host through arbitrary outbound headers. The disposable local TLS
+server records the authority and asserts the nonstandard listener port is
+present. All ten isolated HTTPS security/deadline tests passed on GCC16;
+the private-address DNS policy, redirect policy and request bounds remain
+unchanged. This does not authorize production deployment.

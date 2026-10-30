@@ -252,7 +252,15 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
             request.method == HttpsRequest::Method::Get
                 ? wire::verb::get : wire::verb::post,
             request.target, 11};
-        outgoing.set(wire::field::host, request.host);
+        // HTTP/1.1 requires the effective authority, including an explicit
+        // non-default port. Never accept a caller-supplied Host header:
+        // its sole source must be the TLS-verified request endpoint.
+        std::string authority = request.host;
+        if (request.port != 443U) {
+            authority.push_back(':');
+            authority.append(std::to_string(request.port));
+        }
+        outgoing.set(wire::field::host, authority);
         outgoing.set(wire::field::user_agent, "OpenProof/1");
         outgoing.set(wire::field::cache_control, "no-store");
         for (const auto& [name, value] : request.headers) {

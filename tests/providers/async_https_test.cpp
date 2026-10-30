@@ -51,6 +51,7 @@ struct LocalTlsServer final {
     std::string caFile;
     bool observedRequest{};
     std::string observedAuthorization;
+    std::string observedHost;
     unsigned int replyStatus{200U};
     std::string replyBody{"{\"provider\":\"isolated\"}"};
     std::chrono::milliseconds replyDelay{0};
@@ -145,6 +146,8 @@ struct LocalTlsServer final {
                     request[wire::field::authorization];
                 observedAuthorization.assign(
                     authorization.data(), authorization.size());
+                const auto host = request[wire::field::host];
+                observedHost.assign(host.data(), host.size());
                 if (replyDelay > 0ms) std::this_thread::sleep_for(replyDelay);
                 wire::response<wire::string_body> response{
                     static_cast<wire::status>(replyStatus), request.version()};
@@ -252,6 +255,11 @@ TEST(AsyncProviderHttpsTest, NativeLoopbackTlsWithPinnedTestCa)
     if (server.thread.joinable()) server.thread.join();
     EXPECT_TRUE(server.observedRequest);
     EXPECT_EQ(server.observedAuthorization, "Bearer test-only");
+    // The disposable listener uses a nonstandard port. The transmitted
+    // authority must match that port, while the TLS certificate is verified
+    // only against the DNS hostname (without a port suffix).
+    EXPECT_EQ(server.observedHost,
+              "localhost:" + std::to_string(server.port()));
 }
 
 TEST(AsyncProviderHttpsTest, UntrustedLoopbackCertificateCannotBeAccepted)
