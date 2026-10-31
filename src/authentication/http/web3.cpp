@@ -9,6 +9,9 @@ module;
 #include <string_view>
 #include <utility>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <boost/json.hpp>
 
 #include "web3_presentation.hpp"
@@ -102,7 +105,10 @@ void clearState(gateway::HttpResponse& response)
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
     const auto contentType = request.header("content-type");
-    if (!contentType || !contentType->starts_with("application/json")) {
+    // Reject lookalike MIME types such as application/jsonp. Both the
+    // compatibility handler and the coroutine handler use this parser.
+    if (!contentType || (*contentType != "application/json"
+        && !contentType->starts_with("application/json;"))) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
     boost::system::error_code parseError;
@@ -357,7 +363,13 @@ gateway::HttpResponse Web3AuthenticationHttpApi::start(
     auto chainId = stringField(body.value(), "chain_id", 32U);
     auto fid = stringField(body.value(), "fid", 32U);
     auto handoffTicket = stringField(body.value(), "handoff_ticket", 256U);
-    if (!providerName || !web3Provider(*providerName)
+    // Present-but-malformed optional parameters are not absent parameters.
+    // Never silently discard an invalid handoff ticket or wallet selector.
+    if ((body->contains("address") && !address)
+        || (body->contains("chain_id") && !chainId)
+        || (body->contains("fid") && !fid)
+        || (body->contains("handoff_ticket") && !handoffTicket)
+        || !providerName || !web3Provider(*providerName)
         || (*providerName == "ethereum-wallet" && (!address || !chainId))
         || (*providerName == "farcaster" && (address.has_value() != fid.has_value() || chainId))
         || (handoffTicket && (*providerName != "ethereum-wallet"
@@ -533,6 +545,240 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
     clearState(response);
     response.addHeader("set-cookie", sessionCookie(issued->token().expose(), 8 * 60 * 60));
     return response;
+}
+
+// Native HTTP handler is opt-in; its blocking compatibility API remains
+// unchanged for production until all downstream repositories are coroutine.
+boost::asio::awaitable<gateway::HttpResponse>
+Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
+{
+    const auto path = request.path();
+    const auto method = request.method();
+    if (path == "/auth/web3/start" && method == gateway::HttpMethod::Post)
+        co_return co_await startAsync(std::move(request), false);
+    if (path == "/auth/web3/complete" && method == gateway::HttpMethod::Post)
+        co_return co_await completeAsync(std::move(request), false);
+    if (path == "/account/connections/web3/start"
+        && method == gateway::HttpMethod::Post)
+        co_return co_await startAsync(std::move(request), true);
+    if (path == "/account/connections/web3/complete"
+        && method == gateway::HttpMethod::Post)
+        co_return co_await completeAsync(std::move(request), true);
+    // Browser handoff endpoints still use synchronous token/session storage,
+    // so never dispatch them through the I/O reactor as a hidden fallback.
+    if (path.starts_with("/auth/web3/")
+        || path.starts_with("/account/connections/web3/")) {
+        co_return error(
+            foundation::Error{foundation::ErrorCode::Unavailable}, request, true);
+    }
+    if (auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback))
+        co_return co_await native->handleAsync(std::move(request));
+    co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                    request);
+}
+
+boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAsync(
+    gateway::HttpRequest request, bool connection)
+{
+    if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(),
+                             {"provider", "address", "chain_id", "fid", "handoff_ticket"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request, true);
+    }
+    auto providerName = stringField(body.value(), "provider", 64U);
+    auto address = stringField(body.value(), "address", 64U);
+    auto chainId = stringField(body.value(), "chain_id", 32U);
+    auto fid = stringField(body.value(), "fid", 32U);
+    auto handoffTicket = stringField(body.value(), "handoff_ticket", 256U);
+    // Present-but-malformed optional parameters are not absent parameters.
+    // Never silently discard an invalid handoff ticket or wallet selector.
+    if ((body->contains("address") && !address)
+        || (body->contains("chain_id") && !chainId)
+        || (body->contains("fid") && !fid)
+        || (body->contains("handoff_ticket") && !handoffTicket)
+        || !providerName || !web3Provider(*providerName)
+        || (*providerName == "ethereum-wallet" && (!address || !chainId))
+        || (*providerName == "farcaster" && (address.has_value() != fid.has_value() || chainId))
+        || (handoffTicket && (*providerName != "ethereum-wallet"
+                              || !validTicket(*handoffTicket)))) {
+        co_return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request, true);
+    }
+    idp::ProviderId providerId{*providerName};
+    auto* implementation = m_providers->find(providerId);
+    if (implementation == nullptr
+        || implementation->interactionModel() != idp::InteractionModel::ChallengeResponse) {
+        co_return error(foundation::Error{foundation::ErrorCode::NotFound}, request, true);
+    }
+    std::optional<identity::core::IdentityId> connectionTarget;
+    if (connection) {
+        if (handoffTicket) {
+            auto target = m_authentication->consumeBrowserConnectionHandoff(
+                foundation::SecretString{*handoffTicket});
+            if (!target || target->providerId != providerId || target->returnTarget != "/account") {
+                co_return error(target
+                    ? foundation::Error{foundation::ErrorCode::AuthenticationFailed}
+                    : target.error(), request, true);
+            }
+            connectionTarget.emplace(std::move(target->identity));
+        } else {
+            auto credential = gateway::takeSessionCredential(request);
+            if (!credential || !credential->has_value()) {
+                co_return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},
+                             request, true);
+            }
+            auto authenticated = m_sessions->authenticate(
+                credential->value(), m_delegated, "account");
+            if (!authenticated) co_return error(authenticated.error(), request, true);
+            connectionTarget.emplace(authenticated->session().identity());
+        }
+    }
+    auto bindingToken = security::randomTokenBase64Url(32U);
+    if (!bindingToken) co_return error(bindingToken.error(), request, true);
+    auto binding = security::sha256(bindingToken.value());
+    if (!binding) co_return error(binding.error(), request, true);
+
+    idp::AuthenticationRequest authenticationRequest{providerId, clientContext(request)};
+    authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
+    if (address) authenticationRequest.setParameter("address", *address);
+    if (chainId) authenticationRequest.setParameter("chain_id", *chainId);
+    if (fid) {
+        authenticationRequest.setParameter("fid", *fid);
+    }
+    auto started = connection
+        ? co_await m_authentication->beginConnectionAsync(
+            std::move(authenticationRequest), binding.value(),
+            request.correlation(), *connectionTarget)
+        : co_await m_authentication->beginAsync(
+            std::move(authenticationRequest), binding.value(),
+            request.correlation());
+    if (!started) co_return error(started.error(), request, true);
+    const auto message = challengeParameter(started->challenge(), "message");
+    if ((message && (message->empty() || message->size() > 8192U))
+        || (!message && *providerName != "farcaster")) {
+        co_return error(foundation::Error{foundation::ErrorCode::Internal}, request, true);
+    }
+
+    json::object payload;
+    payload["provider"] = *providerName;
+    payload["challenge_id"] = started->challenge().id().value();
+    if (message) payload["message"] = *message;
+    payload["expires_at"] = foundation::toIso8601(started->challenge().expiresAt());
+    if (const auto value = challengeParameter(started->challenge(), "address")) payload["address"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "fid")) payload["fid"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "chain_id")) payload["chain_id"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "nonce")) payload["nonce"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "domain")) payload["domain"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "uri")) payload["uri"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "statement")) payload["statement"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "resource_prefix")) payload["resource_prefix"] = *value;
+    if (const auto value = challengeParameter(started->challenge(), "signer_kind")) payload["signer_kind"] = *value;
+    gateway::HttpResponse response{200, gateway::Headers{{"content-type", "application/json"}},
+                                   json::serialize(payload)};
+    secure(response);
+    response.addHeader("set-cookie", cookie(kContinuationCookie, started->continuationToken().expose(), 600));
+    response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
+    response.addHeader("set-cookie", cookie(kTransactionCookie, started->transactionId().value(), 600));
+    response.addHeader("set-cookie", cookie(kChallengeCookie, started->challenge().id().value(), 600));
+    if (connection) {
+        response.addHeader("set-cookie", cookie(kModeCookie, "link", 600));
+    } else if (handoffTicket) {
+        response.addHeader("set-cookie",
+                           cookie(kAuthenticationHandoffCookie, *handoffTicket, 180));
+    }
+    co_return response;
+}
+
+boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::completeAsync(
+    gateway::HttpRequest request, bool connection)
+{
+    if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"message", "signature", "display_name",
+                                                  "preferred_username", "picture_url"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request, true);
+    }
+    auto message = stringField(body.value(), "message", 8192U);
+    auto signature = stringField(body.value(), "signature", 8192U);
+    auto displayName = detail::presentationText(
+        stringField(body.value(), "display_name", 256U), 256U);
+    auto preferredUsername = detail::presentationText(
+        stringField(body.value(), "preferred_username", 128U), 128U);
+    auto pictureUrl = detail::presentationPictureUrl(
+        stringField(body.value(), "picture_url", 2048U));
+    const auto continuation = cookieValue(request, kContinuationCookie, 256U);
+    const auto bindingToken = cookieValue(request, kBindingCookie, 256U);
+    const auto transaction = cookieValue(request, kTransactionCookie, 256U);
+    const auto challenge = cookieValue(request, kChallengeCookie, 512U);
+    const auto mode = cookieValue(request, kModeCookie, 16U);
+    const auto authenticationHandoff =
+        cookieValue(request, kAuthenticationHandoffCookie, 256U);
+    if (!message || !signature || !continuation || !bindingToken || !transaction || !challenge
+        || (connection && (!mode || *mode != "link")) || (!connection && mode.has_value())) {
+        co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+    }
+    auto binding = security::sha256(*bindingToken);
+    if (!binding) co_return error(binding.error(), request, true);
+    idp::AuthenticationResponse authenticationResponse{idp::ChallengeId{*challenge}, clientContext(request)};
+    authenticationResponse.setParameter("message", idp::CredentialValue{std::move(*message)});
+    authenticationResponse.setParameter("signature", idp::CredentialValue{std::move(*signature)});
+    if (connection) {
+        auto connected = co_await m_authentication->completeConnectionAsync(
+            idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
+            binding.value(), std::move(authenticationResponse));
+        if (!connected) co_return error(connected.error(), request, true);
+        static_cast<void>(m_authentication->updateConnectionPresentation(
+            connected.value(), displayName, preferredUsername, pictureUrl));
+        json::object payload;
+        payload["connected"] = true;
+        payload["provider"] = connected->providerId().value();
+        payload["subject"] = connected->subject().value();
+        gateway::HttpResponse response{
+            200, gateway::Headers{{"content-type", "application/json"}},
+            json::serialize(payload)};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
+    auto verified = co_await m_authentication->completeAsync(
+        idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
+        binding.value(), std::move(authenticationResponse));
+    if (!verified) co_return error(verified.error(), request, true);
+    static_cast<void>(m_authentication->updateConnectionPresentation(
+        identity::core::ExternalIdentityRef{
+            verified->outcome().provider(), verified->outcome().subject()},
+        displayName, preferredUsername, pictureUrl));
+    if (authenticationHandoff) {
+        auto published = m_authentication->publishBrowserAuthenticationHandoff(
+            foundation::SecretString{*authenticationHandoff}, verified.value());
+        if (!published) co_return error(published.error(), request, true);
+        json::object payload;
+        payload["published"] = true;
+        payload["provider"] = verified->outcome().provider().value();
+        gateway::HttpResponse response{
+            200, gateway::Headers{{"content-type", "application/json"}},
+            json::serialize(payload)};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
+    auto issued = m_sessions->issue(verified.value(), clientContext(request));
+    if (!issued) co_return error(issued.error(), request, true);
+    json::object payload;
+    payload["authenticated"] = true;
+    payload["identity_id"] = verified->identity().value();
+    gateway::HttpResponse response{200, gateway::Headers{{"content-type", "application/json"}},
+                                   json::serialize(payload)};
+    secure(response);
+    clearState(response);
+    response.addHeader("set-cookie", sessionCookie(issued->token().expose(), 8 * 60 * 60));
+    co_return response;
 }
 
 } // namespace openproof::authentication::http

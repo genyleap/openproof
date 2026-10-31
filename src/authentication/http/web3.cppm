@@ -1,10 +1,15 @@
 module;
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
+
 export module openproof.authentication.web3.http;
 
 import openproof.authentication;
 import openproof.foundation;
 import openproof.gateway;
+import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.session;
@@ -12,7 +17,7 @@ import openproof.session;
 export namespace openproof::authentication::http {
 
 /** @brief Same-origin SIWE challenge/response surface for Ethereum and Farcaster login. */
-class Web3AuthenticationHttpApi final : public gateway::HttpHandler {
+class Web3AuthenticationHttpApi final : public gateway::http::CoroutineHttpHandler {
 public:
     Web3AuthenticationHttpApi(AuthenticationService& authentication,
                               identity::provider::ProviderRegistry& providers,
@@ -22,8 +27,14 @@ public:
                               session::DelegatedAccessAuthenticator* delegated = nullptr);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    startAsync(gateway::HttpRequest request, bool connection);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    completeAsync(gateway::HttpRequest request, bool connection);
     [[nodiscard]] gateway::HttpResponse issueAuthenticationHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse redeemAuthenticationHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse issueConnectionHandoff(gateway::HttpRequest request);

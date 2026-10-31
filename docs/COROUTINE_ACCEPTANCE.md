@@ -1229,3 +1229,38 @@ server records the authority and asserts the nonstandard listener port is
 present. All ten isolated HTTPS security/deadline tests passed on GCC16;
 the private-address DNS policy, redirect policy and request bounds remain
 unchanged. This does not authorize production deployment.
+
+#### Opt-in Web3/Farcaster HTTP coroutine dispatch (2026-10-30)
+
+The same-origin Web3 authentication handler now implements the gateway's
+provider-neutral `CoroutineHttpHandler` alongside its unchanged synchronous
+compatibility entry point. Native `/auth/web3/start` and
+`/auth/web3/complete` dispatch through the trusted authentication
+coordinator's `beginAsync` and `completeAsync` APIs; account connection
+start/complete use `beginConnectionAsync` and
+`completeConnectionAsync`. Challenge IDs, binding cookies, one-time
+continuation tokens, purpose separation, IP rate limiting, outbound provider
+trust and session-cookie security policy are retained. A synchronous-only
+fallback HTTP handler is never called from `handleAsync`; unsupported
+handoff routes are explicitly rejected with an unavailable response.
+
+This is an **opt-in bridge**, not production adoption or complete end-to-end
+nonblocking storage: some session, connection-handoff and canonical identity/
+presentation repository operations within the existing coordinator/handler
+remain synchronous and must be migrated before using the new HTTP handler
+on a network reactor in production. This is not release approval.
+Native coroutine HTTP regression tests are added for malformed input
+rejection, blocking fallback refusal, a registered provider that only supports
+blocking calls, an asynchronous provider whose blocking API must never run,
+and an in-memory wallet login to session issuance. JSON parsing now rejects
+lookalike MIME types (such as `application/jsonp`), and a malformed but
+present optional `handoff_ticket` is rejected instead of being silently
+treated as absent. These checks cover both the legacy and coroutine handler
+entry points.
+
+**Validation status:** source-only review and static checks; the new native
+Web3 HTTP target and its tests have **not** been compiled or executed in this
+checkpoint. They must not be reported as passing until an explicitly
+time-bounded build and test execution succeeds. Real PostgreSQL integration,
+nonblocking session/identity repositories, and production listener wiring
+remain outstanding.

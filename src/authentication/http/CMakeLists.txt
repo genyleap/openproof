@@ -27,8 +27,16 @@ openproof_add_module(openproof_authentication_http
         openproof_provider_passkey
         openproof_provider_local
         openproof_gateway
+        openproof_gateway_http
     LINK_PRIVATE
         Boost::headers
 )
 
 target_compile_definitions(openproof_authentication_http PRIVATE BOOST_HAS_LONG_LONG=1)
+
+# GCC16 can incorrectly diagnose Boost.Asio's aligned coroutine frame
+# allocation when inlining named module implementations. Preserve -Werror
+# and disable only this TU's allocator inlining.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(web3.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()

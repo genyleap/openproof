@@ -486,3 +486,34 @@ gtest_discover_tests(openproof_postgres_async_auth_store_tests
     TEST_PREFIX "NativePgAuthStore."
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;security")
+
+# Native Web3 HTTP dispatch regression, independent of legacy test umbrella.
+# Explicitly confirms no synchronous HTTP fallback is called from reactor.
+add_executable(openproof_web3_coroutine_http_tests
+    authentication/web3_coroutine_http_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_web3_coroutine_http_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_web3_coroutine_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_web3_coroutine_http_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_web3_coroutine_http_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_web3_coroutine_http_tests PRIVATE
+    openproof_authentication_http openproof_authentication
+    openproof_gateway_http openproof_gateway openproof_session
+    openproof_identity_provider openproof_identity_core
+    openproof_foundation openproof_security
+    Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(authentication/web3_coroutine_http_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_web3_coroutine_http_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_web3_coroutine_http_tests
+    TEST_PREFIX "Web3HttpAsync."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "authentication;async;http;web3")
