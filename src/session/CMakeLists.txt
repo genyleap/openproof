@@ -6,6 +6,7 @@ openproof_add_module(openproof_session
         model.cppm
         repository.cppm
         service.cppm
+        coroutine.cppm
     SOURCES
         model.cpp
         repository.cpp

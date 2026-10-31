@@ -44,7 +44,7 @@ private:
  * Not wired to live HTTP yet. Repository, clock and this service must
  * outlive every outstanding coroutine.
  */
-class CoroutinePostgresSessionService final {
+class CoroutinePostgresSessionService final : public session::CoroutineSessionIssuer {
 public:
     CoroutinePostgresSessionService(
         CoroutinePostgresSessionRepository& repository,
@@ -55,6 +55,12 @@ public:
     CoroutinePostgresSessionService& operator=(const CoroutinePostgresSessionService&) = delete;
     CoroutinePostgresSessionService(CoroutinePostgresSessionService&&) = delete;
     CoroutinePostgresSessionService& operator=(CoroutinePostgresSessionService&&) = delete;
+
+    // Provider-neutral native capability used by HTTP authentication.
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<session::CoroutineIssuedSession>>
+    issueAsync(const authentication::VerifiedAuthentication& verification,
+               identity::provider::ClientContext client) override;
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<CoroutineSessionGrant>>
     issue(const authentication::VerifiedAuthentication& verification,

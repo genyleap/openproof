@@ -121,6 +121,39 @@ public:
     int blockingCalls{};
 };
 
+// Test-only adapter: its repository is explicitly in-memory, and has no
+// network/disk I/O. Production must inject a native PostgreSQL issuer instead.
+class InMemoryCoroutineSessionIssuer final : public sess::CoroutineSessionIssuer {
+public:
+    explicit InMemoryCoroutineSessionIssuer(sess::SessionService& service)
+        : m_service(&service) {}
+
+    [[nodiscard]] asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueAsync(const auth::VerifiedAuthentication& verified,
+               idp::ClientContext client) override
+    {
+        ++nativeCalls;
+        co_await asio::post(asio::use_awaitable);
+        if (rejectIssuance)
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        if (malformedGrant) {
+            co_return sess::CoroutineIssuedSession{
+                sess::SessionId{"forged-id"},
+                fnd::SecretString{"unsafe;Injected=1"}};
+        }
+        auto issued = m_service->issue(verified, client);
+        if (!issued) co_return fnd::fail(issued.error());
+        co_return sess::CoroutineIssuedSession{
+            issued->id(), issued->token().clone()};
+    }
+
+    int nativeCalls{};
+    bool rejectIssuance{};
+    bool malformedGrant{};
+private:
+    sess::SessionService* m_service;
+};
+
 struct Fixture {
     fnd::ManualClockSource clock{
         fnd::Instant{std::chrono::milliseconds{1770000000000LL}}};
@@ -140,6 +173,7 @@ struct Fixture {
             fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value(),
         sess::SessionPolicy::create(std::chrono::hours{8},
                                     std::chrono::minutes{30}).value()};
+    InMemoryCoroutineSessionIssuer nativeSessions{sessions};
     gateway::TokenBucketRateLimiter limiter =
         gateway::TokenBucketRateLimiter::create(clock, 1000.0, 1000.0, 1000U).value();
     BlockingFallback fallback;
@@ -147,7 +181,8 @@ struct Fixture {
         providers, transactions, identities, clock, std::move(policy),
         std::chrono::minutes{5}};
     http::Web3AuthenticationHttpApi api{
-        authentication, providers, sessions, limiter, fallback};
+        authentication, providers, sessions, limiter, fallback,
+        nullptr, &nativeSessions};
 };
 
 [[nodiscard]] gateway::HttpRequest request(
@@ -278,6 +313,49 @@ TEST(Web3HttpCoroutineTest, RegisteredLegacyProviderNeverRunsOnAsyncDispatch)
     EXPECT_EQ(fixture.fallback.calls, 0);
 }
 
+TEST(Web3HttpCoroutineTest, NativeStartRequiresAsyncSessionIssuerBeforeStartingProof)
+{
+    Fixture fixture;
+    http::Web3AuthenticationHttpApi withoutNativeSessions{
+        fixture.authentication, fixture.providers, fixture.sessions,
+        fixture.limiter, fixture.fallback};
+    // On the actual Beast listener, this instance must dispatch through the
+    // unchanged synchronous handler instead of selecting native HTTP.
+    EXPECT_FALSE(withoutNativeSessions.nativeEnabled());
+    EXPECT_TRUE(fixture.api.nativeEnabled());
+    auto owned = std::make_unique<NativeWalletProvider>();
+    auto* provider = owned.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
+    int status = 0;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, check(withoutNativeSessions, request(
+            "/auth/web3/start",
+            R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1"})"),
+            status), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(status, 503);
+    EXPECT_EQ(provider->nativeCalls, 0);
+    EXPECT_EQ(provider->blockingCalls, 0);
+    EXPECT_EQ(fixture.transactions.size(), 0U);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, ConnectionHandoffRejectsBeforeSyncSessionLookup)
+{
+    Fixture fixture;
+    EXPECT_EQ(execute(fixture, request(
+        "/account/connections/web3/start",
+        R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1"})")), 503);
+    EXPECT_EQ(execute(fixture, request(
+        "/account/connections/web3/complete",
+        R"({"message":"proof","signature":"signed"})")), 503);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
+    EXPECT_EQ(fixture.transactions.size(), 0U);
+    EXPECT_EQ(fixture.fallback.calls, 0);
+}
+
 TEST(Web3HttpCoroutineTest, UnmatchedRouteCannotInvokeSynchronousFallback)
 {
     Fixture fixture;
@@ -363,26 +441,96 @@ asio::awaitable<void> positiveWalletFlow(
     }
 }
 
+void attachWalletIdentity(Fixture& fixture)
+{
+    const auto now = fnd::Instant{std::chrono::milliseconds{1770000000000LL}};
+    auto link = identity::IdentityLink::request(
+        identity::IdentityId{"wallet-canonical-identity"},
+        identity::ExternalIdentityRef{
+            idp::ProviderId{"ethereum-wallet"}, idp::ExternalSubject{"wallet-user"}},
+        now, std::chrono::minutes{5});
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(now));
+    ASSERT_TRUE(link->markVerified(now));
+    ASSERT_TRUE(link->complete(now));
+    ASSERT_TRUE(fixture.identities.attach(link.value()));
+}
+
+TEST(Web3HttpCoroutineTest, NativeSessionStorageFailureNeverIssuesCookie)
+{
+    Fixture fixture;
+    fixture.nativeSessions.rejectIssuance = true;
+    auto owned = std::make_unique<NativeWalletProvider>();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
+    attachWalletIdentity(fixture);
+    int startStatus = 0, completionStatus = 0;
+    bool hasSession = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(io,
+        positiveWalletFlow(fixture.api, startStatus, completionStatus, hasSession),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(startStatus, 200);
+    EXPECT_EQ(completionStatus, 503);
+    EXPECT_FALSE(hasSession);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 1);
+    EXPECT_EQ(fixture.sessionsRepository.size(), 0U);
+    EXPECT_EQ(fixture.fallback.calls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, MalformedNativeIssuerGrantCannotInjectSessionCookie)
+{
+    Fixture fixture;
+    fixture.nativeSessions.malformedGrant = true;
+    ASSERT_TRUE(fixture.providers.registerProvider(
+        std::make_unique<NativeWalletProvider>()));
+    attachWalletIdentity(fixture);
+    int startStatus = 0, completionStatus = 0;
+    bool hasSession = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(io,
+        positiveWalletFlow(fixture.api, startStatus, completionStatus, hasSession),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(startStatus, 200);
+    EXPECT_EQ(completionStatus, 500);
+    EXPECT_FALSE(hasSession);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 1);
+    EXPECT_EQ(fixture.sessionsRepository.size(), 0U);
+}
+
+TEST(Web3HttpCoroutineTest, NativeHandoffStartFailsBeforeCreatingTransaction)
+{
+    Fixture fixture;
+    auto owned = std::make_unique<NativeWalletProvider>();
+    auto* provider = owned.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
+    EXPECT_EQ(execute(fixture, request(
+        "/auth/web3/start",
+        R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1","handoff_ticket":"test.ticket"})")), 503);
+    EXPECT_EQ(fixture.transactions.size(), 0U);
+    EXPECT_EQ(provider->nativeCalls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, NativeProfileWriteFailsBeforeReadingCredentials)
+{
+    Fixture fixture;
+    EXPECT_EQ(execute(fixture, request(
+        "/auth/web3/complete",
+        R"({"message":"test","signature":"sig","display_name":"Example"})")), 503);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
+    EXPECT_EQ(fixture.transactions.size(), 0U);
+}
+
 TEST(Web3HttpCoroutineTest, WalletChallengeToSessionGoesThroughNativeCoordinator)
 {
     Fixture fixture;
     auto providerOwned = std::make_unique<NativeWalletProvider>();
     auto* provider = providerOwned.get();
     ASSERT_TRUE(fixture.providers.registerProvider(std::move(providerOwned)));
-    auto link = identity::IdentityLink::request(
-        identity::IdentityId{"wallet-canonical-identity"},
-        identity::ExternalIdentityRef{
-            idp::ProviderId{"ethereum-wallet"}, idp::ExternalSubject{"wallet-user"}},
-        fnd::Instant{std::chrono::milliseconds{1770000000000LL}},
-        std::chrono::minutes{5});
-    ASSERT_TRUE(link);
-    ASSERT_TRUE(link->requireVerification(
-        fnd::Instant{std::chrono::milliseconds{1770000000000LL}}));
-    ASSERT_TRUE(link->markVerified(
-        fnd::Instant{std::chrono::milliseconds{1770000000000LL}}));
-    ASSERT_TRUE(link->complete(
-        fnd::Instant{std::chrono::milliseconds{1770000000000LL}}));
-    ASSERT_TRUE(fixture.identities.attach(link.value()));
+    attachWalletIdentity(fixture);
     int startStatus = 0, completionStatus = 0;
     bool hasSession = false;
     asio::io_context io;
@@ -397,6 +545,8 @@ TEST(Web3HttpCoroutineTest, WalletChallengeToSessionGoesThroughNativeCoordinator
     EXPECT_TRUE(hasSession);
     EXPECT_EQ(provider->nativeCalls, 2);
     EXPECT_EQ(provider->blockingCalls, 0);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 1);
+    EXPECT_EQ(fixture.sessionsRepository.size(), 1U);
     EXPECT_EQ(fixture.transactions.size(), 1U);
     EXPECT_EQ(fixture.fallback.calls, 0);
 }

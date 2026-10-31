@@ -1236,19 +1236,21 @@ The same-origin Web3 authentication handler now implements the gateway's
 provider-neutral `CoroutineHttpHandler` alongside its unchanged synchronous
 compatibility entry point. Native `/auth/web3/start` and
 `/auth/web3/complete` dispatch through the trusted authentication
-coordinator's `beginAsync` and `completeAsync` APIs; account connection
-start/complete use `beginConnectionAsync` and
-`completeConnectionAsync`. Challenge IDs, binding cookies, one-time
-continuation tokens, purpose separation, IP rate limiting, outbound provider
-trust and session-cookie security policy are retained. A synchronous-only
-fallback HTTP handler is never called from `handleAsync`; unsupported
-handoff routes are explicitly rejected with an unavailable response.
+coordinator's `beginAsync` and `completeAsync` APIs. Native account
+connection and browser handoff routes are **fail-closed (HTTP 503)** until
+their native session, canonical identity and handoff-storage capabilities
+are implemented; the synchronous compatibility API retains existing routes.
+Challenge IDs, binding cookies, one-time continuation tokens, purpose
+separation, IP rate limiting, outbound provider trust and session-cookie
+security policy are retained. A synchronous-only fallback HTTP handler
+is never called from `handleAsync`.
 
 This is an **opt-in bridge**, not production adoption or complete end-to-end
-nonblocking storage: some session, connection-handoff and canonical identity/
-presentation repository operations within the existing coordinator/handler
-remain synchronous and must be migrated before using the new HTTP handler
-on a network reactor in production. This is not release approval.
+nonblocking storage: the trusted coordinator's canonical identity and profile
+repositories still use synchronous methods. The new HTTP completion path now
+requires an injected native coroutine session issuer, and rejects native
+profile/handoff writes before burning a proof. The live HTTP composition
+remains synchronous and unchanged. This is not release approval.
 Native coroutine HTTP regression tests are added for malformed input
 rejection, blocking fallback refusal, a registered provider that only supports
 blocking calls, an asynchronous provider whose blocking API must never run,
@@ -1268,9 +1270,64 @@ remain outstanding.
 #### Static coverage of native Web3 dispatch (2026-10-31)
 
 The source pre-gate now treats `src/authentication/http/web3.cpp` as a named
-HTTP coroutine boundary, requires direct awaits of the trusted coordinator's
-four Web3 authentication/connection operations, and flags a synchronous HTTP
-fallback appearing in the native handler section. The check passed on the
+HTTP coroutine boundary, requires the supported trusted coordinator's
+`beginAsync` and `completeAsync`, requires asynchronous session issuance,
+and flags synchronous HTTP/session/handoff persistence inside the native
+handler section. Unsupported connection/handoff operations fail closed.
+The check passed on the
 current branch, while the complete gate remains **NOT_APPROVED with 36
 blocking findings** in other areas. Static inspection is not a substitute
 for compiling the new target and exercising its negative tests.
+
+#### Provider-neutral coroutine session issuance (2026-10-31)
+
+The exported `openproof.session:coroutine` capability now defines
+`CoroutineSessionIssuer::issueAsync` and an owned, token-bearing
+`CoroutineIssuedSession`. The existing `CoroutinePostgresSessionService`
+implements that contract by awaiting its native libpq-backed session
+repository. A synchronous `SessionService` does not implement this
+capability and cannot be used as the native HTTP persistence fallback.
+
+The opt-in Web3 HTTP coroutine handler requires this capability **before
+issuing the authentication challenge** and uses it to persist the login
+session after trusted verification. Without the capability, the request
+fails with HTTP 503; an unavailable database must never result in a valid
+browser session cookie. Issuer-supplied IDs and bearer tokens are validated
+as bounded base64url before interpolation into `Set-Cookie` or HTTP output;
+a malformed grant fails closed with HTTP 500. A test-only in-memory
+adapter is explicitly scoped to an in-memory repository and does not
+justify synchronous production storage on an I/O executor.
+
+Native account-connection ceremonies, mobile/browser handoffs, and
+request-supplied presentation updates remain fail-closed until their
+asynchronous storage and authorization boundaries are implemented. The
+trusted coordinator still resolves canonical identities and profiles using
+its legacy synchronous repositories; therefore **end-to-end migration
+remains NOT APPROVED**. None of the changes in this checkpoint have been
+compiled, linked or dynamically tested. Static protocol-neutrality and
+coroutine-source checks are only pre-gates, not release evidence.
+
+#### Preserve production HTTP dispatch when native session storage is absent
+
+The Beast listener no longer selects coroutine dispatch solely because a
+handler implements `CoroutineHttpHandler`. The transport interface exposes
+`nativeEnabled()` (true by default for existing native handlers); Web3
+overrides it to return true **only when an asynchronous session issuer is
+explicitly injected**. Without that issuer, the listener invokes Web3's
+unchanged synchronous `handle()` compatibility path on the bounded handler
+executor. Direct calls to `handleAsync()` still fail closed without an
+issuer, rather than using synchronous storage accidentally.
+
+A new loopback Beast HTTP test checks that a coroutine-capable handler
+with `nativeEnabled() == false` returns the legacy response and never
+invokes its coroutine method. Source pre-gates require both dispatch
+guards. These tests have **not** been built or run in this checkpoint; this
+compatibility design still requires a time-bounded GCC16 build, wire
+regression, and a production-like dry run before any merge or deployment.
+
+The compatibility gate also propagates through `CoroutineMetricsAdapter`:
+a disabled native fallback disables the wrapper's own coroutine selection.
+Otherwise the listener would have entered async dispatch via the metrics
+middleware despite Web3 being unconfigured. A second loopback regression
+tests this nested legacy path and confirms no asynchronous fallback call.
+The existing metrics authorization/observation implementation is unchanged.

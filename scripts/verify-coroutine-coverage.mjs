@@ -17,6 +17,7 @@ const segments = [
   ["Enterprise LDAP", "src/providers/enterprise/enterprise.cpp"],
   ["HTTP authentication API", "src/authentication/http/http.cpp"],
   ["HTTP Web3 coroutine API", "src/authentication/http/web3.cpp"],
+  ["PostgreSQL coroutine session issuance", "src/storage/postgres/coroutine_session_service.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
   ["HTTP administration API", "src/administration/administration.cpp"],
@@ -45,11 +46,31 @@ const checked = segments.map(([name, relative]) => {
   const awaitCount=[...source.matchAll(/\bco_await\b/g)].length;
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
+  if(relative==="src/gateway/http.cpp"){
+    if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabled\s*\(/.test(source))
+      issues.push({line:0,kind:"missing opt-in coroutine dispatch guard",expression:"asyncHandler->nativeEnabled("});
+    const interfaceSource=fs.readFileSync(
+      path.join(root,"src/gateway/http.cppm"),"utf8");
+    if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
+      issues.push({line:0,kind:"missing middleware coroutine capability propagation",expression:"m_fallback->nativeEnabled()"});
+  }
+  if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
+    if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)
+        || !/\bco_await\s+issue\s*\(/.test(source))
+      issues.push({line:0,kind:"missing native session issuer adapter",expression:"issueAsync / co_await issue"});
+  }
   if(relative==="src/authentication/http/web3.cpp"){
+    // Web3 must leave the listener's compatibility dispatch enabled by
+    // default when no native asynchronous session service is configured.
+    const interfaceSource=fs.readFileSync(
+      path.join(root,"src/authentication/http/web3.cppm"),"utf8");
+    if(!/nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_asyncSessions\s*!=\s*nullptr;/.test(interfaceSource))
+      issues.push({line:0,kind:"missing Web3 compatibility gate",expression:"nativeEnabled()"});
     // Require the actual trusted coordinator awaits, not merely a synthetic
     // coroutine wrapper around the synchronous HTTP handler.
-    for(const method of ["beginAsync","beginConnectionAsync",
-                         "completeAsync","completeConnectionAsync"]){
+    // Connection/handoff paths are intentionally fail-closed until their
+    // synchronous persistence dependencies have native coroutine ports.
+    for(const method of ["beginAsync","completeAsync"]){
       const call=new RegExp("\\bco_await\\s+m_authentication->"+method+"\\s*\\(");
       if(!call.test(source))
         issues.push({line:0,kind:"missing trusted Web3 coroutine flow",expression:method+"("});
@@ -58,11 +79,22 @@ const checked = segments.map(([name, relative]) => {
     if(nativeIndex<0){
       issues.push({line:0,kind:"missing native Web3 HTTP entry",expression:"handleAsync("});
     }else{
-      // The compatibility handler is intentionally still present above the
-      // coroutine implementation. Only the latter must reject blocking fallback.
+      // Only inspect native entry points: compatibility handlers above this
+      // boundary may continue blocking until the complete migration passes.
       const nativeSection=source.slice(nativeIndex);
       if(/\bm_fallback->handle\s*\(/.test(nativeSection))
         issues.push({line:0,kind:"blocking native HTTP fallback",expression:"m_fallback->handle("});
+      for(const expression of [
+        /\bm_sessions->(?:issue|authenticate|issueReplacing)\s*\(/,
+        /\bm_authentication->(?:publishBrowserAuthenticationHandoff|consumeBrowserConnectionHandoff|updateConnectionPresentation)\s*\(/
+      ]){
+        if(expression.test(nativeSection))
+          issues.push({line:0,kind:"legacy blocking call in native Web3 handler",expression:expression.source});
+      }
+      if(!/\bco_await\s+m_asyncSessions->issueAsync\s*\(/.test(nativeSection))
+        issues.push({line:0,kind:"missing native session persistence",expression:"m_asyncSessions->issueAsync("});
+      if(!/if\s*\(connection\s*\|\|\s*m_asyncSessions\s*==\s*nullptr\)/.test(nativeSection))
+        issues.push({line:0,kind:"missing fail-closed session/connection gate",expression:"connection || m_asyncSessions == nullptr"});
     }
   }
   return {name,file:relative,coAwaitCount:awaitCount,issues};

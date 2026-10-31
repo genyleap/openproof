@@ -89,6 +89,27 @@ public:
     std::atomic<int> received{0};
 };
 
+class DisabledCoroutineHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
+
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        synchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        return gw::HttpResponse{200, {}, "legacy-compatible"};
+    }
+
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest) override
+    {
+        asynchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        co_return gw::HttpResponse{503, {}, "should-not-execute"};
+    }
+
+    std::atomic<int> synchronousCalls{0};
+    std::atomic<int> asynchronousCalls{0};
+};
+
 class CoroutineWaitingHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
@@ -115,6 +136,18 @@ public:
 private:
     std::atomic<int> m_active{0};
     std::atomic<int> m_peak{0};
+};
+
+class DelegatingMetricsFacadeStub final : public gw::HttpHandler {
+public:
+    explicit DelegatingMetricsFacadeStub(gw::HttpHandler& fallback)
+        : m_fallback(&fallback) {}
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest request) override
+    {
+        return m_fallback->handle(std::move(request));
+    }
+private:
+    gw::HttpHandler* m_fallback;
 };
 
 class MetricsFacadeStub final : public gw::HttpHandler {
@@ -283,6 +316,40 @@ TEST(BeastHttpIntegrationTest, BlockingHandlersDoNotOccupySocketEventLoop)
     for (auto& client : clients) client.join();
     EXPECT_EQ(success.load(), 12);
     EXPECT_GE(handler.peak(), 3);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, DisabledCoroutineCapabilityUsesOriginalWireHandler)
+{
+    DisabledCoroutineHandler handler;
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/auth/web3/start");
+    EXPECT_EQ(response.result(), beastHttp::status::ok);
+    EXPECT_EQ(response.body(), "legacy-compatible");
+    EXPECT_EQ(handler.synchronousCalls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(handler.asynchronousCalls.load(std::memory_order_relaxed), 0);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, DisabledCoroutineBehindMetricsKeepsLegacyDispatch)
+{
+    DisabledCoroutineHandler fallback;
+    DelegatingMetricsFacadeStub metricsFacade{fallback};
+    httpAdapter::CoroutineMetricsAdapter wrapper{
+        metricsFacade, fallback, [](gw::HttpMethod, int, double) {}};
+    EXPECT_FALSE(wrapper.nativeEnabled());
+    httpAdapter::BeastHttpServer server{wrapper, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/auth/web3/start");
+    EXPECT_EQ(response.result(), beastHttp::status::ok);
+    EXPECT_EQ(response.body(), "legacy-compatible");
+    EXPECT_EQ(fallback.synchronousCalls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(fallback.asynchronousCalls.load(std::memory_order_relaxed), 0);
     server.stop();
 }
 

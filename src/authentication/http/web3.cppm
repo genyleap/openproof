@@ -24,9 +24,13 @@ public:
                               session::SessionService& sessions,
                               gateway::TokenBucketRateLimiter& rateLimiter,
                               gateway::HttpHandler& fallback,
-                              session::DelegatedAccessAuthenticator* delegated = nullptr);
+                              session::DelegatedAccessAuthenticator* delegated = nullptr,
+                              session::CoroutineSessionIssuer* asyncSessions = nullptr);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
+    [[nodiscard]] bool nativeEnabled() const noexcept override {
+        return m_asyncSessions != nullptr;
+    }
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) override;
 
@@ -48,6 +52,7 @@ private:
     identity::provider::ProviderRegistry* m_providers;
     session::SessionService* m_sessions;
     session::DelegatedAccessAuthenticator* m_delegated;
+    session::CoroutineSessionIssuer* m_asyncSessions;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;
 };

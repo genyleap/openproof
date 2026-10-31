@@ -51,6 +51,17 @@ constexpr std::size_t kMaximumBody = 16U * 1024U;
         + "; Secure; HttpOnly; SameSite=Strict";
 }
 
+[[nodiscard]] bool validSessionCredential(std::string_view value) noexcept
+{
+    // Native session issuers are an injected SPI. Never interpolate an
+    // untrusted/invalid result into a Set-Cookie header.
+    return !value.empty() && value.size() <= 128U
+        && std::ranges::all_of(value, [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9') || c == '-' || c == '_';
+        });
+}
+
 void secure(gateway::HttpResponse& response)
 {
     response.setHeader("cache-control", "no-store");
@@ -181,9 +192,11 @@ Web3AuthenticationHttpApi::Web3AuthenticationHttpApi(
     AuthenticationService& authentication, idp::ProviderRegistry& providers,
     session::SessionService& sessions, gateway::TokenBucketRateLimiter& rateLimiter,
     gateway::HttpHandler& fallback,
-    session::DelegatedAccessAuthenticator* delegated)
+    session::DelegatedAccessAuthenticator* delegated,
+    session::CoroutineSessionIssuer* asyncSessions)
     : m_authentication(&authentication), m_providers(&providers), m_sessions(&sessions),
-      m_delegated(delegated), m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
+      m_delegated(delegated), m_asyncSessions(asyncSessions),
+      m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
 
 gateway::HttpResponse Web3AuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request,
@@ -580,8 +593,16 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAsync(
     gateway::HttpRequest request, bool connection)
 {
+    // The native route must never call synchronous session authentication or
+    // one-time browser-handoff storage on a handler executor. Connection
+    // ceremonies remain on the legacy compatibility route until both have
+    // native persistence capabilities.
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
+    }
+    if (connection || m_asyncSessions == nullptr) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
     }
     auto body = parseObject(request);
     if (!body || !onlyFields(body.value(),
@@ -613,28 +634,11 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
         || implementation->interactionModel() != idp::InteractionModel::ChallengeResponse) {
         co_return error(foundation::Error{foundation::ErrorCode::NotFound}, request, true);
     }
-    std::optional<identity::core::IdentityId> connectionTarget;
-    if (connection) {
-        if (handoffTicket) {
-            auto target = m_authentication->consumeBrowserConnectionHandoff(
-                foundation::SecretString{*handoffTicket});
-            if (!target || target->providerId != providerId || target->returnTarget != "/account") {
-                co_return error(target
-                    ? foundation::Error{foundation::ErrorCode::AuthenticationFailed}
-                    : target.error(), request, true);
-            }
-            connectionTarget.emplace(std::move(target->identity));
-        } else {
-            auto credential = gateway::takeSessionCredential(request);
-            if (!credential || !credential->has_value()) {
-                co_return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},
-                             request, true);
-            }
-            auto authenticated = m_sessions->authenticate(
-                credential->value(), m_delegated, "account");
-            if (!authenticated) co_return error(authenticated.error(), request, true);
-            connectionTarget.emplace(authenticated->session().identity());
-        }
+    // Native browser handoff consumption/publication still has synchronous
+    // persistence. Do not start a challenge which cannot be completed.
+    if (handoffTicket) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
     }
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken) co_return error(bindingToken.error(), request, true);
@@ -648,13 +652,9 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     if (fid) {
         authenticationRequest.setParameter("fid", *fid);
     }
-    auto started = connection
-        ? co_await m_authentication->beginConnectionAsync(
-            std::move(authenticationRequest), binding.value(),
-            request.correlation(), *connectionTarget)
-        : co_await m_authentication->beginAsync(
-            std::move(authenticationRequest), binding.value(),
-            request.correlation());
+    auto started = co_await m_authentication->beginAsync(
+        std::move(authenticationRequest), binding.value(),
+        request.correlation());
     if (!started) co_return error(started.error(), request, true);
     const auto message = challengeParameter(started->challenge(), "message");
     if ((message && (message->empty() || message->size() > 8192U))
@@ -683,20 +683,20 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
     response.addHeader("set-cookie", cookie(kTransactionCookie, started->transactionId().value(), 600));
     response.addHeader("set-cookie", cookie(kChallengeCookie, started->challenge().id().value(), 600));
-    if (connection) {
-        response.addHeader("set-cookie", cookie(kModeCookie, "link", 600));
-    } else if (handoffTicket) {
-        response.addHeader("set-cookie",
-                           cookie(kAuthenticationHandoffCookie, *handoffTicket, 180));
-    }
     co_return response;
 }
 
 boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::completeAsync(
     gateway::HttpRequest request, bool connection)
 {
+    // Reject unsupported session/handoff operations before consuming the
+    // one-time proof. No blocking session repository is allowed here.
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
+    }
+    if (connection || m_asyncSessions == nullptr) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
     }
     auto body = parseObject(request);
     if (!body || !onlyFields(body.value(), {"message", "signature", "display_name",
@@ -704,14 +704,16 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
                      request, true);
     }
+    // Profile presentation persistence is still synchronous. Reject these
+    // fields before burning the one-time proof on the native route.
+    if (body->contains("display_name")
+        || body->contains("preferred_username")
+        || body->contains("picture_url")) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
     auto message = stringField(body.value(), "message", 8192U);
     auto signature = stringField(body.value(), "signature", 8192U);
-    auto displayName = detail::presentationText(
-        stringField(body.value(), "display_name", 256U), 256U);
-    auto preferredUsername = detail::presentationText(
-        stringField(body.value(), "preferred_username", 128U), 128U);
-    auto pictureUrl = detail::presentationPictureUrl(
-        stringField(body.value(), "picture_url", 2048U));
     const auto continuation = cookieValue(request, kContinuationCookie, 256U);
     const auto bindingToken = cookieValue(request, kBindingCookie, 256U);
     const auto transaction = cookieValue(request, kTransactionCookie, 256U);
@@ -719,6 +721,12 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     const auto mode = cookieValue(request, kModeCookie, 16U);
     const auto authenticationHandoff =
         cookieValue(request, kAuthenticationHandoffCookie, 256U);
+    // Browser handoff publication still requires synchronous token storage.
+    // Reject it before burning the one-time authentication challenge.
+    if (authenticationHandoff) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
     if (!message || !signature || !continuation || !bindingToken || !transaction || !challenge
         || (connection && (!mode || *mode != "link")) || (!connection && mode.has_value())) {
         co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
@@ -728,48 +736,19 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     idp::AuthenticationResponse authenticationResponse{idp::ChallengeId{*challenge}, clientContext(request)};
     authenticationResponse.setParameter("message", idp::CredentialValue{std::move(*message)});
     authenticationResponse.setParameter("signature", idp::CredentialValue{std::move(*signature)});
-    if (connection) {
-        auto connected = co_await m_authentication->completeConnectionAsync(
-            idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
-            binding.value(), std::move(authenticationResponse));
-        if (!connected) co_return error(connected.error(), request, true);
-        static_cast<void>(m_authentication->updateConnectionPresentation(
-            connected.value(), displayName, preferredUsername, pictureUrl));
-        json::object payload;
-        payload["connected"] = true;
-        payload["provider"] = connected->providerId().value();
-        payload["subject"] = connected->subject().value();
-        gateway::HttpResponse response{
-            200, gateway::Headers{{"content-type", "application/json"}},
-            json::serialize(payload)};
-        secure(response);
-        clearState(response);
-        co_return response;
-    }
     auto verified = co_await m_authentication->completeAsync(
         idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
         binding.value(), std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
-    static_cast<void>(m_authentication->updateConnectionPresentation(
-        identity::core::ExternalIdentityRef{
-            verified->outcome().provider(), verified->outcome().subject()},
-        displayName, preferredUsername, pictureUrl));
-    if (authenticationHandoff) {
-        auto published = m_authentication->publishBrowserAuthenticationHandoff(
-            foundation::SecretString{*authenticationHandoff}, verified.value());
-        if (!published) co_return error(published.error(), request, true);
-        json::object payload;
-        payload["published"] = true;
-        payload["provider"] = verified->outcome().provider().value();
-        gateway::HttpResponse response{
-            200, gateway::Headers{{"content-type", "application/json"}},
-            json::serialize(payload)};
-        secure(response);
-        clearState(response);
-        co_return response;
-    }
-    auto issued = m_sessions->issue(verified.value(), clientContext(request));
+    auto issued = co_await m_asyncSessions->issueAsync(
+        verified.value(), clientContext(request));
     if (!issued) co_return error(issued.error(), request, true);
+    if (!validSessionCredential(issued->id.value())
+        || !validSessionCredential(issued->token.expose())) {
+        // An invalid injected issuer must not construct response headers.
+        co_return error(foundation::Error{foundation::ErrorCode::Internal},
+                        request, true);
+    }
     json::object payload;
     payload["authenticated"] = true;
     payload["identity_id"] = verified->identity().value();

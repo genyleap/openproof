@@ -22,6 +22,11 @@ export namespace openproof::gateway::http {
  */
 class CoroutineHttpHandler : public gateway::HttpHandler {
 public:
+    // A handler may expose the native ABI before its dependencies are ready.
+    // The listener must preserve its original synchronous entry point unless
+    // the handler explicitly opts into native dispatch.
+    [[nodiscard]] virtual bool nativeEnabled() const noexcept { return true; }
+
     [[nodiscard]] virtual boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) = 0;
 protected:
@@ -147,6 +152,9 @@ public:
 
     CoroutineMetricsAdapter(HttpHandler& metricsFacade,
                             CoroutineHttpHandler& fallback, Observer observer);
+    [[nodiscard]] bool nativeEnabled() const noexcept override {
+        return m_fallback->nativeEnabled();
+    }
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse>
     handleAsync(HttpRequest request) override;

@@ -194,6 +194,19 @@ CoroutinePostgresSessionService::CoroutinePostgresSessionService(
       m_policy(std::move(policy)),
       m_authenticator(repository, clock, m_key.clone()) {}
 
+asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>
+CoroutinePostgresSessionService::issueAsync(
+    const authentication::VerifiedAuthentication& verification,
+    identity::provider::ClientContext client)
+{
+    auto issued = co_await issue(verification, client);
+    if (!issued) co_return foundation::fail(issued.error());
+    // Keep the native repository's existing grant ABI for other consumers.
+    // Only a provider-neutral id + bearer pair crosses this service port.
+    co_return session::CoroutineIssuedSession{
+        issued->id(), issued->token().clone()};
+}
+
 asio::awaitable<foundation::Result<CoroutineSessionGrant>>
 CoroutinePostgresSessionService::issue(
     const authentication::VerifiedAuthentication& verification,

@@ -7,3 +7,4 @@ export module openproof.session;
 export import :model;
 export import :repository;
 export import :service;
+export import :coroutine;
