@@ -183,6 +183,22 @@ public:
     finishLoginAsync(const provider::AuthenticationOutcome& outcome,
                      foundation::Instant completedAt) = 0;
 
+    /** An explicit capability: login-only finalizers do not enable linking. */
+    [[nodiscard]] virtual bool nativeConnectionsEnabled() const noexcept {
+        return false;
+    }
+
+    /** Checks tenant-scoped canonical lifecycle before issuing a link challenge. */
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    authorizeConnectionTargetAsync(identity::core::IdentityId target) = 0;
+
+    /** Atomically attach or confirm a verified link; never reassign owners. */
+    [[nodiscard]] virtual boost::asio::awaitable<
+        foundation::Result<identity::core::ExternalIdentityRef>>
+    finishConnectionAsync(const provider::AuthenticationOutcome& outcome,
+                          identity::core::IdentityId target,
+                          foundation::Instant completedAt) = 0;
+
 protected:
     CoroutineCanonicalIdentityFinalizer() = default;
 };
@@ -220,6 +236,11 @@ public:
     /** Native logins must not redeem proofs through blocking canonical storage. */
     [[nodiscard]] bool nativeCanonicalCompletionEnabled() const noexcept {
         return m_asyncCanonical != nullptr;
+    }
+
+    [[nodiscard]] bool nativeConnectionCompletionEnabled() const noexcept {
+        return m_asyncCanonical != nullptr
+            && m_asyncCanonical->nativeConnectionsEnabled();
     }
 
     /** @brief Starts an exchange and atomically records its server-owned state. */

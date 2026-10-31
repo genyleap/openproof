@@ -1382,3 +1382,24 @@ test finalizer is not production capable. Native account connection/handoff
 and other HTTP operations also retain synchronous persistence. This checkpoint
 does not approve a release or any production migration, and its new native
 C++ regression tests require a controlled successful build before closure.
+
+
+#### Native canonical account-connection finalization gate (2026-10-31)
+
+The trusted coordinator no longer calls requireActiveIdentity() from
+beginConnectionAsync(), or finishConnection() from completeConnectionAsync().
+A finalizer that explicitly advertises nativeConnectionsEnabled() must
+authorize the target identity before a link challenge is issued and must
+atomically attach/confirm the verified external subject at completion.
+A login-only finalizer remains insufficient. Missing native capability is
+rejected before redeeming the one-time link transaction; a valid proof stays
+redeemable by a correctly configured coordinator. The coordinator also
+checks that the returned provider/subject matches the authenticated proof,
+rejecting a substituted storage result.
+
+Only the isolated in-memory test finalizer currently implements both
+capabilities; the real PostgreSQL finalizer remains unfinished. Dedicated
+source gates prevent synchronous lifecycle and linking regressions in native
+entry points, and a new negative coroutine test checks pre-consumption
+refusal. No production connection or browser-handoff coroutine path has
+been enabled, and successful C++ compilation/integration is still pending.

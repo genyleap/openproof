@@ -115,6 +115,48 @@ public:
         co_return owner->value();
     }
 
+    [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
+        return true;
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    authorizeConnectionTargetAsync(ids::IdentityId target) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        if (target.empty()) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
+        // No lifecycle repository exists in this test fixture. Production
+        // implementations must validate the active tenant-scoped aggregate.
+        co_return fnd::ok();
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Result<ids::ExternalIdentityRef>>
+    finishConnectionAsync(const idp::AuthenticationOutcome& outcome,
+                          ids::IdentityId target, fnd::Instant now) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        ids::ExternalIdentityRef external{outcome.provider(), outcome.subject()};
+        auto current = m_directory->ownerOf(external);
+        if (!current) co_return fnd::fail(current.error());
+        if (current->has_value() && current->value() != target)
+            co_return fnd::fail(fnd::ErrorCode::Conflict);
+        if (!current->has_value()) {
+            auto link = ids::IdentityLink::request(
+                target, external, now, std::chrono::minutes{5});
+            if (!link) co_return fnd::fail(link.error());
+            auto required = link->requireVerification(now);
+            if (!required) co_return fnd::fail(required.error());
+            auto verified = link->markVerified(now);
+            if (!verified) co_return fnd::fail(verified.error());
+            auto completed = link->complete(now);
+            if (!completed) co_return fnd::fail(completed.error());
+            auto attached = m_directory->attach(link.value());
+            if (!attached) co_return fnd::fail(attached.error());
+        }
+        auto updated = m_directory->updatePresentation(external);
+        if (!updated) co_return fnd::fail(updated.error());
+        co_return external;
+    }
+
     int calls{};
 private:
     ids::InMemoryExternalIdentityDirectory* m_directory;
@@ -564,6 +606,57 @@ TEST(TrustedAuthenticationCoroutineTest, BlockingTransactionStoreCannotRunOnReac
     EXPECT_EQ(native->nativeBeginCalls, 0);
     EXPECT_EQ(native->syncCalls, 0);
 }
+TEST(TrustedAuthenticationCoroutineTest, MissingNativeConnectionFinalizerPreservesProof)
+{
+    Fixture fixture;
+    auto configured = fixture.service();
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"async-test"}, idp::AssuranceLevel::Ial2));
+    auth::AuthenticationService disabled{
+        fixture.providers, fixture.transactions, fixture.identities,
+        fixture.clock, std::move(trust), kLifetime};
+    EXPECT_TRUE(configured.nativeConnectionCompletionEnabled());
+    EXPECT_FALSE(disabled.nativeConnectionCompletionEnabled());
+    bool startDenied = false, completionDenied = false, stillRedeemable = false;
+    asio::io_context io;
+    auto check = [&]() -> asio::awaitable<void> {
+        auto rejected = co_await disabled.beginConnectionAsync(
+            fixture.request(), binding("pinned"),
+            fnd::CorrelationId{"native-connection-disabled"},
+            ids::IdentityId{"canonical-identity"});
+        startDenied = !rejected
+            && rejected.error().code() == fnd::ErrorCode::Unavailable;
+        auto started = co_await configured.beginConnectionAsync(
+            fixture.request(), binding("pinned"),
+            fnd::CorrelationId{"native-connection-enabled"},
+            ids::IdentityId{"canonical-identity"});
+        if (!started) co_return;
+        const auto id = std::string{started->transactionId().value()};
+        const auto challenge = std::string{started->challenge().id().value()};
+        auto refused = co_await disabled.completeConnectionAsync(
+            idp::TransactionId{id}, started->continuationToken().clone(),
+            binding("pinned"), proof(challenge));
+        completionDenied = !refused
+            && refused.error().code() == fnd::ErrorCode::Unavailable;
+        auto completed = co_await configured.completeConnectionAsync(
+            idp::TransactionId{id}, started->continuationToken().clone(),
+            binding("pinned"), proof(challenge));
+        stillRedeemable = completed
+            && completed->subject() == idp::ExternalSubject{"verified-subject"};
+    };
+    auto operation = check();
+    auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(startDenied);
+    EXPECT_TRUE(completionDenied);
+    EXPECT_TRUE(stillRedeemable);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+}
+
 TEST(TrustedAuthenticationCoroutineTest, MissingNativeCanonicalRefusesBeforeProofRedemption)
 {
     Fixture fixture;

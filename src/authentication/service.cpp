@@ -340,7 +340,19 @@ AuthenticationService::beginConnectionAsync(
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                    "A connection ceremony requires a canonical identity.");
     }
-    auto active = requireActiveIdentity(identity);
+    auto* const finalizer = m_asyncCanonical;
+    if (finalizer == nullptr || !finalizer->nativeConnectionsEnabled()) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical connection persistence is not configured.");
+    }
+    foundation::Status active = foundation::fail(
+        foundation::ErrorCode::Unavailable);
+    try {
+        active = co_await finalizer->authorizeConnectionTargetAsync(identity);
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Canonical connection authorization unavailable.");
+    }
     if (!active) co_return foundation::fail(active.error());
     co_return co_await beginInternalAsync(
         std::move(request), std::move(binding), std::move(correlation),
@@ -1066,11 +1078,37 @@ AuthenticationService::completeConnectionAsync(
     provider::BindingDigest binding,
     provider::AuthenticationResponse response)
 {
+    // Reject a non-native directory before consuming single-use link proofs.
+    auto* const finalizer = m_asyncCanonical;
+    if (finalizer == nullptr || !finalizer->nativeConnectionsEnabled()) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical connection persistence is not configured.");
+    }
     auto exchange = co_await completeExchangeAsync(
         std::move(transactionId), std::move(continuationToken),
         std::move(binding), std::move(response), true);
     if (!exchange) co_return foundation::fail(exchange.error());
-    co_return finishConnection(std::move(exchange).value());
+    if (!exchange->connectionTarget || exchange->connectionTarget->empty()) {
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "The connection target is invalid.");
+    }
+    foundation::Result<identity::core::ExternalIdentityRef> linked =
+        foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        linked = co_await finalizer->finishConnectionAsync(
+            exchange->outcome, *exchange->connectionTarget, exchange->completedAt);
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical connection persistence failed.");
+    }
+    if (!linked) co_return foundation::fail(linked.error());
+    // Never accept a substituted account reference from a storage adapter.
+    if (linked->providerId() != exchange->outcome.provider()
+        || linked->subject() != exchange->outcome.subject()) {
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "Canonical connection result does not match verified provider proof.");
+    }
+    co_return std::move(linked).value();
 }
 
 foundation::Result<identity::core::ExternalIdentityRef>

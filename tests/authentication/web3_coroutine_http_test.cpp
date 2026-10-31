@@ -211,6 +211,48 @@ public:
         co_return owner->value();
     }
 
+    [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
+        return true;
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    authorizeConnectionTargetAsync(identity::IdentityId target) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        if (target.empty()) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
+        // No lifecycle repository exists in this test fixture. Production
+        // implementations must validate the active tenant-scoped aggregate.
+        co_return fnd::ok();
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Result<identity::ExternalIdentityRef>>
+    finishConnectionAsync(const idp::AuthenticationOutcome& outcome,
+                          identity::IdentityId target, fnd::Instant now) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        identity::ExternalIdentityRef external{outcome.provider(), outcome.subject()};
+        auto current = m_directory->ownerOf(external);
+        if (!current) co_return fnd::fail(current.error());
+        if (current->has_value() && current->value() != target)
+            co_return fnd::fail(fnd::ErrorCode::Conflict);
+        if (!current->has_value()) {
+            auto link = identity::IdentityLink::request(
+                target, external, now, std::chrono::minutes{5});
+            if (!link) co_return fnd::fail(link.error());
+            auto required = link->requireVerification(now);
+            if (!required) co_return fnd::fail(required.error());
+            auto verified = link->markVerified(now);
+            if (!verified) co_return fnd::fail(verified.error());
+            auto completed = link->complete(now);
+            if (!completed) co_return fnd::fail(completed.error());
+            auto attached = m_directory->attach(link.value());
+            if (!attached) co_return fnd::fail(attached.error());
+        }
+        auto updated = m_directory->updatePresentation(external);
+        if (!updated) co_return fnd::fail(updated.error());
+        co_return external;
+    }
+
     int nativeCalls{};
 private:
     identity::InMemoryExternalIdentityDirectory* m_directory;

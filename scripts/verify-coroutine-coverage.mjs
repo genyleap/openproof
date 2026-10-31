@@ -74,6 +74,25 @@ const checked = segments.map(([name, relative]) => {
        || /\bfinishVerified\s*\(/.test(completion))
       issues.push({line:0,kind:"blocking canonical completion in coroutine",
         expression:"co_await finalizer->finishLoginAsync"});
+    const connectionStart = source.slice(
+      source.indexOf("AuthenticationService::beginConnectionAsync("),
+      source.indexOf("AuthenticationService::beginInternal("));
+    const connectionFinish = source.slice(
+      source.indexOf("AuthenticationService::completeConnectionAsync("),
+      source.indexOf("AuthenticationService::finishConnection("));
+    if(!/co_await\s+finalizer->authorizeConnectionTargetAsync\s*\(/.test(connectionStart)
+       || /\brequireActiveIdentity\s*\(/.test(connectionStart)
+       || !/finalizer->nativeConnectionsEnabled\s*\(\)/.test(connectionStart))
+      issues.push({line:0,kind:"blocking native connection start",
+        expression:"authorizeConnectionTargetAsync"});
+    if(!/co_await\s+finalizer->finishConnectionAsync\s*\(/.test(connectionFinish)
+       || /\bfinishConnection\s*\(/.test(connectionFinish)
+       || !/finalizer->nativeConnectionsEnabled\s*\(\)/.test(connectionFinish)
+       || connectionFinish.indexOf("finalizer->nativeConnectionsEnabled()")
+          > connectionFinish.indexOf("completeExchangeAsync("))
+      issues.push({line:0,kind:"blocking native connection finalization",
+        expression:"finishConnectionAsync before proof redemption"});
+
   }
   if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)
