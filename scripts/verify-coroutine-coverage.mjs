@@ -117,7 +117,7 @@ function auditDirectory(directory) {
       auditDirectory(absolute);
       continue;
     }
-    if (!/\.(?:cpp|cppm|cc|cxx)$/.test(entry.name)) continue;
+    if (!/\.(?:cpp|cppm|cc|cxx|h|hpp|hxx)$/.test(entry.name)) continue;
     const relative = path.relative(root, absolute).split(path.sep).join("/");
     if (namedPaths.has(relative)) continue;
     const source = fs.readFileSync(absolute,"utf8");
