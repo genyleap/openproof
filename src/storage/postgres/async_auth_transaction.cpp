@@ -186,16 +186,22 @@ AsyncAuthenticationTransactionSql::consume(
     auto result = parse(updated.rows.front());
     if (result.id != id)
         throw std::runtime_error{"PostgreSQL transaction identity changed"};
-    const auto values = co_await connection.query(
-        "SELECT key,value FROM " + metadata +
-        " WHERE transaction_id=$1 ORDER BY key",
-        {id}, remaining(deadline));
-    if (values.rows.size() > 64U)
-        throw std::runtime_error{"PostgreSQL transaction metadata exceeds limit"};
-    for (const auto& item : values.rows) {
-        if (item.size() != 2U
-            || !result.metadata.emplace(required(item[0]), required(item[1])).second)
-            throw std::runtime_error{"Invalid PostgreSQL transaction metadata"};
+    // Never retrieve provider-supplied metadata for an invalid or expired
+    // credential. The terminal state must still be COMMITted so a failed
+    // redemption cannot be retried. This also avoids an extra SQL roundtrip
+    // and attacker-triggered metadata allocation on rejected credentials.
+    if (result.state == 1U) {
+        const auto values = co_await connection.query(
+            "SELECT key,value FROM " + metadata +
+            " WHERE transaction_id=$1 ORDER BY key",
+            {id}, remaining(deadline));
+        if (values.rows.size() > 64U)
+            throw std::runtime_error{"PostgreSQL transaction metadata exceeds limit"};
+        for (const auto& item : values.rows) {
+            if (item.size() != 2U
+                || !result.metadata.emplace(required(item[0]), required(item[1])).second)
+                throw std::runtime_error{"Invalid PostgreSQL transaction metadata"};
+        }
     }
     // The burn must commit even for an invalid nonce or expired challenge.
     static_cast<void>(co_await connection.query(

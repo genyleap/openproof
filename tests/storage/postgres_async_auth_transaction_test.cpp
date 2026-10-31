@@ -71,14 +71,16 @@ asio::awaitable<void> verifySqlLifecycle(
         *conn, "invalid", kWrongNonce, kWrongBinding, 1500, 3s);
     auto correctAfterMismatch = co_await sql.consume(
         *conn, "invalid", kNonce, kBinding, 1600, 3s);
-    burned = mismatch && mismatch->state == 2U && !correctAfterMismatch;
+    burned = mismatch && mismatch->state == 2U
+        && mismatch->metadata.empty() && !correctAfterMismatch;
 
     static_cast<void>(co_await sql.begin(*conn, record("deadline"), 3s));
     auto exactlyExpired = co_await sql.consume(
         *conn, "deadline", kNonce, kBinding, 2000, 3s);
     auto afterExpiry = co_await sql.consume(
         *conn, "deadline", kNonce, kBinding, 2001, 3s);
-    expired = exactlyExpired && exactlyExpired->state == 3U && !afterExpiry;
+    expired = exactlyExpired && exactlyExpired->state == 3U
+        && exactlyExpired->metadata.empty() && !afterExpiry;
 
     // All operations, including invalid burns, must end their SQL
     // transaction before this connection can be reused.
