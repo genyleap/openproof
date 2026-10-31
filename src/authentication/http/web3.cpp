@@ -605,7 +605,8 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
-    if (connection || m_asyncSessions == nullptr) {
+    if (connection || m_asyncSessions == nullptr
+        || !m_authentication->nativeCanonicalCompletionEnabled()) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
@@ -699,7 +700,8 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
-    if (connection || m_asyncSessions == nullptr) {
+    if (connection || m_asyncSessions == nullptr
+        || !m_authentication->nativeCanonicalCompletionEnabled()) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }

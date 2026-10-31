@@ -29,7 +29,8 @@ public:
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
-        return m_asyncSessions != nullptr;
+        return m_asyncSessions != nullptr
+            && m_authentication->nativeCanonicalCompletionEnabled();
     }
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) override;

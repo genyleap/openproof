@@ -186,12 +186,43 @@ private:
     sess::SessionService* m_service;
 };
 
+// This explicit fixture implementation is allowed to access the memory
+// repository only. Production must use a native, bounded database adapter.
+class MemoryNativeCanonicalFinalizer final
+    : public auth::CoroutineCanonicalIdentityFinalizer {
+public:
+    explicit MemoryNativeCanonicalFinalizer(
+        identity::InMemoryExternalIdentityDirectory& directory)
+        : m_directory(&directory) {}
+
+    [[nodiscard]] asio::awaitable<fnd::Result<identity::IdentityId>>
+    finishLoginAsync(const idp::AuthenticationOutcome& outcome,
+                     fnd::Instant) override
+    {
+        ++nativeCalls;
+        co_await asio::post(asio::use_awaitable);
+        identity::ExternalIdentityRef external{outcome.provider(), outcome.subject()};
+        auto owner = m_directory->ownerOf(external);
+        if (!owner) co_return fnd::fail(owner.error());
+        if (!owner->has_value())
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        auto updated = m_directory->updatePresentation(external);
+        if (!updated) co_return fnd::fail(updated.error());
+        co_return owner->value();
+    }
+
+    int nativeCalls{};
+private:
+    identity::InMemoryExternalIdentityDirectory* m_directory;
+};
+
 struct Fixture {
     fnd::ManualClockSource clock{
         fnd::Instant{std::chrono::milliseconds{1770000000000LL}}};
     idp::ProviderRegistry providers;
     idp::InMemoryAuthenticationTransactionStore transactions;
     identity::InMemoryExternalIdentityDirectory identities;
+    MemoryNativeCanonicalFinalizer nativeCanonical{identities};
     auth::ProviderTrustPolicy policy = [] {
         auth::ProviderTrustPolicy trust;
         static_cast<void>(trust.trust(
@@ -211,7 +242,7 @@ struct Fixture {
     BlockingFallback fallback;
     auth::AuthenticationService authentication{
         providers, transactions, identities, clock, std::move(policy),
-        std::chrono::minutes{5}};
+        std::chrono::minutes{5}, nullptr, {}, nullptr, &nativeCanonical};
     http::Web3AuthenticationHttpApi api{
         authentication, providers, sessions, limiter, fallback,
         nullptr, &nativeSessions};
@@ -342,6 +373,34 @@ TEST(Web3HttpCoroutineTest, RegisteredLegacyProviderNeverRunsOnAsyncDispatch)
         401);
     EXPECT_EQ(legacy->blockingCalls, 0);
     EXPECT_EQ(fixture.transactions.size(), 0U);
+    EXPECT_EQ(fixture.fallback.calls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, MissingNativeCanonicalCompletionDisablesListener)
+{
+    Fixture fixture;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"ethereum-wallet"}, idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService unconfigured{
+        fixture.providers, fixture.transactions, fixture.identities,
+        fixture.clock, std::move(trust), std::chrono::minutes{5}};
+    http::Web3AuthenticationHttpApi disabled{
+        unconfigured, fixture.providers, fixture.sessions,
+        fixture.limiter, fixture.fallback, nullptr, &fixture.nativeSessions};
+    EXPECT_FALSE(disabled.nativeEnabled());
+    int status = 0;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, check(disabled, request(
+            "/auth/web3/start",
+            R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1"})"),
+            status), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(status, 503);
+    EXPECT_EQ(fixture.transactions.size(), 0U);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
     EXPECT_EQ(fixture.fallback.calls, 0);
 }
 
@@ -522,6 +581,30 @@ void attachWalletIdentity(Fixture& fixture)
     ASSERT_TRUE(link->markVerified(now));
     ASSERT_TRUE(link->complete(now));
     ASSERT_TRUE(fixture.identities.attach(link.value()));
+}
+
+TEST(Web3HttpCoroutineTest, UnlinkedVerifiedWalletCannotIssueSession)
+{
+    Fixture fixture;
+    // No canonical identity was linked to this provider subject. Even a valid
+    // native wallet signature must not create an authenticated session.
+    ASSERT_TRUE(fixture.providers.registerProvider(
+        std::make_unique<NativeWalletProvider>()));
+    int startStatus = 0, completionStatus = 0;
+    bool hasSession = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(io,
+        positiveWalletFlow(
+            fixture.api, startStatus, completionStatus, hasSession),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(startStatus, 200);
+    EXPECT_EQ(completionStatus, 401);
+    EXPECT_FALSE(hasSession);
+    EXPECT_EQ(fixture.nativeCanonical.nativeCalls, 1);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
+    EXPECT_EQ(fixture.sessionsRepository.size(), 0U);
 }
 
 TEST(Web3HttpCoroutineTest, NativeSessionStorageFailureNeverIssuesCookie)

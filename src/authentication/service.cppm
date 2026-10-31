@@ -161,6 +161,33 @@ private:
 };
 
 /**
+ * @brief Trusted, provider-neutral asynchronous canonical identity finalization.
+ *
+ * An implementation must resolve only verified, explicitly linked subjects;
+ * enforce canonical lifecycle/tenant constraints, update required presentation
+ * state, and perform any permitted provisioning with atomic ownership checks.
+ * It must not call a blocking repository on the coroutine executor. A failure
+ * must never return an authenticated identity. The SPI is owned by the
+ * application and must outlive outstanding completions.
+ */
+class CoroutineCanonicalIdentityFinalizer {
+public:
+    CoroutineCanonicalIdentityFinalizer(
+        const CoroutineCanonicalIdentityFinalizer&) = delete;
+    CoroutineCanonicalIdentityFinalizer& operator=(
+        const CoroutineCanonicalIdentityFinalizer&) = delete;
+    virtual ~CoroutineCanonicalIdentityFinalizer() = default;
+
+    [[nodiscard]] virtual boost::asio::awaitable<
+        foundation::Result<identity::core::IdentityId>>
+    finishLoginAsync(const provider::AuthenticationOutcome& outcome,
+                     foundation::Instant completedAt) = 0;
+
+protected:
+    CoroutineCanonicalIdentityFinalizer() = default;
+};
+
+/**
  * @brief Trusted coordinator for every authentication exchange.
  *
  * The service enforces transaction redemption, cross-session binding, challenge
@@ -181,13 +208,19 @@ public:
                           foundation::Duration maximumTransactionLifetime,
                           identity::core::IdentityRepository* lifecycleRepository = nullptr,
                           identity::core::OrganizationId organization = {},
-                          identity::profile::IdentityProfileRepository* profileRepository = nullptr);
+                          identity::profile::IdentityProfileRepository* profileRepository = nullptr,
+                          CoroutineCanonicalIdentityFinalizer* asyncCanonical = nullptr);
 
     AuthenticationService(const AuthenticationService&) = delete;
     AuthenticationService& operator=(const AuthenticationService&) = delete;
     AuthenticationService(AuthenticationService&&) = delete;
     AuthenticationService& operator=(AuthenticationService&&) = delete;
     ~AuthenticationService() = default;
+
+    /** Native logins must not redeem proofs through blocking canonical storage. */
+    [[nodiscard]] bool nativeCanonicalCompletionEnabled() const noexcept {
+        return m_asyncCanonical != nullptr;
+    }
 
     /** @brief Starts an exchange and atomically records its server-owned state. */
     [[nodiscard]] foundation::Result<AuthenticationStart>
@@ -235,8 +268,9 @@ public:
      *
      * Burns the server-side one-time transaction before awaiting a registered
      * coroutine-capable provider. Never falls back to a blocking provider on
-     * the event loop. Canonical identity persistence still uses its existing
-     * synchronous repositories until the storage migration is complete.
+     * the event loop. A separately injected native canonical finalizer is
+     * mandatory; synchronous identity/profile repositories are never invoked
+     * by this entry point, including after a proof is consumed.
      */
     [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
     completeAsync(provider::TransactionId transactionId,
@@ -397,6 +431,7 @@ private:
     identity::core::IdentityRepository* m_lifecycleRepository{};
     identity::core::OrganizationId m_organization;
     identity::profile::IdentityProfileRepository* m_profileRepository{};
+    CoroutineCanonicalIdentityFinalizer* m_asyncCanonical{};
     mutable std::mutex m_connectionMutex;
 };
 

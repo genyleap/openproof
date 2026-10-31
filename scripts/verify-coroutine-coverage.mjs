@@ -15,6 +15,7 @@ const segments = [
   ["X provider", "src/providers/x/x.cpp"],
   ["Wallet + Farcaster RPC", "src/providers/web3/web3.cpp"],
   ["Enterprise LDAP", "src/providers/enterprise/enterprise.cpp"],
+  ["Trusted authentication canonical completion", "src/authentication/service.cpp"],
   ["HTTP authentication API", "src/authentication/http/http.cpp"],
   ["HTTP Web3 coroutine API", "src/authentication/http/web3.cpp"],
   ["PostgreSQL coroutine session issuance", "src/storage/postgres/coroutine_session_service.cpp"],
@@ -54,6 +55,26 @@ const checked = segments.map(([name, relative]) => {
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
       issues.push({line:0,kind:"missing middleware coroutine capability propagation",expression:"m_fallback->nativeEnabled()"});
   }
+  if(relative==="src/authentication/service.cpp"){
+    const begin = source.slice(
+      source.indexOf("AuthenticationService::beginAsync("),
+      source.indexOf("AuthenticationService::beginConnectionAsync("));
+    const completion = source.slice(
+      source.indexOf("AuthenticationService::completeAsync("),
+      source.indexOf("AuthenticationService::finishVerified("));
+    if(!/if\s*\(m_asyncCanonical\s*==\s*nullptr\)/.test(begin))
+      issues.push({line:0,kind:"missing pre-challenge canonical gate",
+        expression:"m_asyncCanonical == nullptr"});
+    if(!/if\s*\(finalizer\s*==\s*nullptr\)/.test(completion)
+       || completion.indexOf("finalizer == nullptr")
+          > completion.indexOf("completeExchangeAsync("))
+      issues.push({line:0,kind:"missing pre-redemption canonical gate",
+        expression:"finalizer == nullptr before completeExchangeAsync"});
+    if(!/\bco_await\s+finalizer->finishLoginAsync\s*\(/.test(completion)
+       || /\bfinishVerified\s*\(/.test(completion))
+      issues.push({line:0,kind:"blocking canonical completion in coroutine",
+        expression:"co_await finalizer->finishLoginAsync"});
+  }
   if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)
         || !/\bco_await\s+issue\s*\(/.test(source))
@@ -77,7 +98,7 @@ const checked = segments.map(([name, relative]) => {
     // default when no native asynchronous session service is configured.
     const interfaceSource=fs.readFileSync(
       path.join(root,"src/authentication/http/web3.cppm"),"utf8");
-    if(!/nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_asyncSessions\s*!=\s*nullptr;/.test(interfaceSource))
+    if(!/nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_asyncSessions\s*!=\s*nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(interfaceSource))
       issues.push({line:0,kind:"missing Web3 compatibility gate",expression:"nativeEnabled()"});
     // Require the actual trusted coordinator awaits, not merely a synthetic
     // coroutine wrapper around the synchronous HTTP handler.
@@ -106,8 +127,8 @@ const checked = segments.map(([name, relative]) => {
       }
       if(!/\bco_await\s+m_asyncSessions->issueAsync\s*\(/.test(nativeSection))
         issues.push({line:0,kind:"missing native session persistence",expression:"m_asyncSessions->issueAsync("});
-      if(!/if\s*\(connection\s*\|\|\s*m_asyncSessions\s*==\s*nullptr\)/.test(nativeSection))
-        issues.push({line:0,kind:"missing fail-closed session/connection gate",expression:"connection || m_asyncSessions == nullptr"});
+      if(!/if\s*\(connection\s*\|\|\s*m_asyncSessions\s*==\s*nullptr\s*\|\|\s*!m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(nativeSection))
+        issues.push({line:0,kind:"missing fail-closed session/connection gate",expression:"connection || m_asyncSessions == nullptr || !nativeCanonicalCompletionEnabled()"});
     }
   }
   return {name,file:relative,coAwaitCount:awaitCount,issues};

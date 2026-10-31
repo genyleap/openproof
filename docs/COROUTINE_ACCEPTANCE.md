@@ -1351,3 +1351,34 @@ An initial targeted GCC16 build was interrupted after module fingerprint
 invalidation forced a dependency rebuild. Newly added C++ tests must be built
 and executed successfully before this integration phase can be marked closed.
 The full coroutine release gate remains NOT APPROVED.
+
+
+#### Provider-neutral canonical login finalization capability (2026-10-31)
+
+The trusted authentication coordinator's login coroutine no longer calls
+the synchronous finishVerified() after redeeming a single-use authentication
+transaction. It now requires a separately injected
+CoroutineCanonicalIdentityFinalizer that resolves and validates an explicitly
+linked canonical identity using native asynchronous persistence. This
+application-owned capability must enforce lifecycle status, tenant separation,
+owner uniqueness, presentation updates and all permitted provisioning
+invariants; it must never bypass the operator's effective provider trust
+and verification checks already performed by the coordinator.
+
+Without the native capability, beginAsync rejects the request before issuing
+a challenge, and completeAsync rejects before redeeming a one-time proof.
+The optional Web3 HTTP native dispatch capability now requires both the
+native session issuer and canonical finalizer; legacy production HTTP
+compatibility dispatch remains available. Focused tests use a deliberately
+test-only memory-backed finalizer, and negative tests assert that a missing
+native finalizer cannot trigger providers, consume proofs, or issue sessions.
+The static gate prevents reintroduction of synchronous finishVerified from
+the trusted login coroutine.
+
+**Still open:** a genuinely nonblocking PostgreSQL canonical finalizer
+(including transactionally correct identity/profile self-provisioning and
+lifecycle checks) must be implemented, integrated and tested; the in-memory
+test finalizer is not production capable. Native account connection/handoff
+and other HTTP operations also retain synchronous persistence. This checkpoint
+does not approve a release or any production migration, and its new native
+C++ regression tests require a controlled successful build before closure.

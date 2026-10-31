@@ -90,6 +90,36 @@ public:
     int nativeCompleteCalls{};
 };
 
+// Test-only implementation: the directory is memory-backed and guarded by
+// its own short critical section. Never use this adapter with PostgreSQL.
+class MemoryNativeCanonicalFinalizer final
+    : public auth::CoroutineCanonicalIdentityFinalizer {
+public:
+    explicit MemoryNativeCanonicalFinalizer(
+        ids::InMemoryExternalIdentityDirectory& directory)
+        : m_directory(&directory) {}
+
+    [[nodiscard]] asio::awaitable<fnd::Result<ids::IdentityId>>
+    finishLoginAsync(const idp::AuthenticationOutcome& outcome,
+                     fnd::Instant) override
+    {
+        ++calls;
+        co_await asio::post(asio::use_awaitable);
+        ids::ExternalIdentityRef external{outcome.provider(), outcome.subject()};
+        auto owner = m_directory->ownerOf(external);
+        if (!owner) co_return fnd::fail(owner.error());
+        if (!owner->has_value())
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        auto updated = m_directory->updatePresentation(external);
+        if (!updated) co_return fnd::fail(updated.error());
+        co_return owner->value();
+    }
+
+    int calls{};
+private:
+    ids::InMemoryExternalIdentityDirectory* m_directory;
+};
+
 struct Fixture {
     explicit Fixture(bool native = true, bool trusted = true)
         : clock(kNow)
@@ -123,7 +153,8 @@ struct Fixture {
     [[nodiscard]] auth::AuthenticationService service()
     {
         return auth::AuthenticationService{
-            providers, transactions, identities, clock, std::move(policy), kLifetime};
+            providers, transactions, identities, clock, std::move(policy),
+            kLifetime, nullptr, {}, nullptr, &nativeCanonical};
     }
 
     [[nodiscard]] idp::AuthenticationRequest request()
@@ -134,6 +165,7 @@ struct Fixture {
     idp::ProviderRegistry providers;
     idp::InMemoryAuthenticationTransactionStore transactions;
     ids::InMemoryExternalIdentityDirectory identities;
+    MemoryNativeCanonicalFinalizer nativeCanonical{identities};
     fnd::ManualClockSource clock;
     auth::ProviderTrustPolicy policy;
     NativeProofProvider* coroutineProvider{};
@@ -532,4 +564,59 @@ TEST(TrustedAuthenticationCoroutineTest, BlockingTransactionStoreCannotRunOnReac
     EXPECT_EQ(native->nativeBeginCalls, 0);
     EXPECT_EQ(native->syncCalls, 0);
 }
+TEST(TrustedAuthenticationCoroutineTest, MissingNativeCanonicalRefusesBeforeProofRedemption)
+{
+    Fixture fixture;
+    // A trusted service creates a legitimate, unconsumed transaction.
+    // An unconfigured service must reject completion without burning it.
+    auto configured = fixture.service();
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(
+        idp::ProviderId{"async-test"}, idp::AssuranceLevel::Ial2));
+    auth::AuthenticationService disabled{
+        fixture.providers, fixture.transactions, fixture.identities,
+        fixture.clock, std::move(trust), kLifetime};
+    EXPECT_FALSE(disabled.nativeCanonicalCompletionEnabled());
+    EXPECT_TRUE(configured.nativeCanonicalCompletionEnabled());
+    int deniedStart = 0, deniedCompletion = 0, canStillComplete = 0;
+    asio::io_context io;
+    auto check = [&]() -> asio::awaitable<void> {
+        auto start = co_await disabled.beginAsync(
+            fixture.request(), binding("pinned"),
+            fnd::CorrelationId{"canonical-guard"});
+        deniedStart = !start
+            && start.error().code() == fnd::ErrorCode::Unavailable;
+        auto validStart = co_await configured.beginAsync(
+            fixture.request(), binding("pinned"),
+            fnd::CorrelationId{"proof-must-survive"});
+        if (!validStart) co_return;
+        const auto challenge = std::string{validStart->challenge().id().value()};
+        const auto transactionId = std::string{validStart->transactionId().value()};
+        auto complete = co_await disabled.completeAsync(
+            idp::TransactionId{transactionId},
+            validStart->continuationToken().clone(), binding("pinned"),
+            proof(challenge));
+        deniedCompletion = !complete
+            && complete.error().code() == fnd::ErrorCode::Unavailable;
+        auto validCompletion = co_await configured.completeAsync(
+            idp::TransactionId{transactionId},
+            validStart->continuationToken().clone(), binding("pinned"),
+            proof(challenge));
+        canStillComplete = validCompletion.has_value();
+    };
+    // Coroutine lambda is only used as a test harness, with its closure
+    // alive for the entire co_spawn execution.
+    auto operation = check();
+    auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(deniedStart);
+    EXPECT_TRUE(deniedCompletion);
+    EXPECT_TRUE(canStillComplete);
+    EXPECT_EQ(fixture.transactions.size(), 1U);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.nativeCanonical.calls, 1);
+}
+
 } // namespace

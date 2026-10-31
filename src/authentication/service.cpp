@@ -262,7 +262,8 @@ AuthenticationService::AuthenticationService(
     foundation::Duration maximumTransactionLifetime,
     identity::core::IdentityRepository* lifecycleRepository,
     identity::core::OrganizationId organization,
-    identity::profile::IdentityProfileRepository* profileRepository)
+    identity::profile::IdentityProfileRepository* profileRepository,
+    CoroutineCanonicalIdentityFinalizer* asyncCanonical)
     : m_providers(providers)
     , m_transactions(transactions)
     , m_identities(identities)
@@ -272,6 +273,7 @@ AuthenticationService::AuthenticationService(
     , m_lifecycleRepository(lifecycleRepository)
     , m_organization(std::move(organization))
     , m_profileRepository(profileRepository)
+    , m_asyncCanonical(asyncCanonical)
 {
     foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
 }
@@ -317,6 +319,12 @@ AuthenticationService::beginAsync(
     provider::BindingDigest binding,
     foundation::CorrelationId correlation)
 {
+    // Do not issue a one-time challenge that cannot be finished without
+    // blocking the reactor on canonical identity/profile persistence.
+    if (m_asyncCanonical == nullptr) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical identity finalization is not configured.");
+    }
     co_return co_await beginInternalAsync(
         std::move(request), std::move(binding), std::move(correlation), std::nullopt);
 }
@@ -840,11 +848,35 @@ AuthenticationService::completeAsync(
     provider::BindingDigest binding,
     provider::AuthenticationResponse response)
 {
+    // Capability check precedes single-use redemption. A partially migrated
+    // production repository must not burn valid proofs and then perform
+    // synchronous canonical/profile operations on the event loop.
+    auto* const finalizer = m_asyncCanonical;
+    if (finalizer == nullptr) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical identity finalization is not configured.");
+    }
     auto exchange = co_await completeExchangeAsync(
         std::move(transactionId), std::move(continuationToken),
         std::move(binding), std::move(response), false);
     if (!exchange) co_return foundation::fail(exchange.error());
-    co_return finishVerified(std::move(exchange).value());
+    auto outcome = std::move(exchange->outcome);
+    foundation::Result<identity::core::IdentityId> identity =
+        foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        identity = co_await finalizer->finishLoginAsync(
+            outcome, exchange->completedAt);
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native canonical identity finalization failed.");
+    }
+    if (!identity || identity->empty()) {
+        if (!identity) co_return foundation::fail(identity.error());
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "Canonical identity finalization returned an empty identity.");
+    }
+    co_return VerifiedAuthentication{
+        std::move(outcome), std::move(identity).value()};
 }
 
 foundation::Result<VerifiedAuthentication>
