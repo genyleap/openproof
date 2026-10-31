@@ -1331,3 +1331,23 @@ Otherwise the listener would have entered async dispatch via the metrics
 middleware despite Web3 being unconfigured. A second loopback regression
 tests this nested legacy path and confirms no asynchronous fallback call.
 The existing metrics authorization/observation implementation is unchanged.
+
+
+#### Native Web3 middleware capability + issuer API regression (2026-10-31)
+
+Native Web3 completion now accesses the token field of CoroutineIssuedSession,
+rather than invoking the token() accessor provided by legacy session grants.
+This corrects a C++ API mismatch in the newly introduced native handler.
+
+When passing through non-Web3 routes, the Web3 middleware now checks the
+downstream CoroutineHttpHandler::nativeEnabled() capability before forwarding
+to handleAsync(). An inactive downstream native path fails closed without
+invoking either the disabled coroutine handler or the synchronous handler
+on the reactor. Focused regression tests cover both disabled and enabled
+native fallbacks. Static gates now require the field access and guard.
+
+**Validation caveat:** this source checkpoint is not yet dynamically approved.
+An initial targeted GCC16 build was interrupted after module fingerprint
+invalidation forced a dependency rebuild. Newly added C++ tests must be built
+and executed successfully before this integration phase can be marked closed.
+The full coroutine release gate remains NOT APPROVED.

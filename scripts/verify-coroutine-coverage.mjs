@@ -60,6 +60,19 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"missing native session issuer adapter",expression:"issueAsync / co_await issue"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
+    // Native session grants expose a token field rather than token().
+    const nativeComplete = source.slice(
+      source.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+    if(!/sessionCookie\s*\(\s*issued->token\.expose\s*\(/.test(nativeComplete)
+       || /issued->token\(\)/.test(nativeComplete))
+      issues.push({line:0,kind:"invalid native session grant access",expression:"issued->token.expose()"});
+    // Disabled downstream coroutine handlers must stay disabled.
+    const nativeEntry = source.slice(
+      source.indexOf("Web3AuthenticationHttpApi::handleAsync("),
+      source.indexOf("Web3AuthenticationHttpApi::startAsync("));
+    if(!/native\s*!=\s*nullptr\s*&&\s*native->nativeEnabled\s*\(\)/.test(nativeEntry))
+      issues.push({line:0,kind:"missing downstream native capability guard",expression:"native->nativeEnabled()"});
+
     // Web3 must leave the listener's compatibility dispatch enabled by
     // default when no native asynchronous session service is configured.
     const interfaceSource=fs.readFileSync(

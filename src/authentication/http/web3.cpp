@@ -584,8 +584,13 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
         co_return error(
             foundation::Error{foundation::ErrorCode::Unavailable}, request, true);
     }
-    if (auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback))
+    // A coroutine-capable downstream handler may have disabled its native
+    // path because its persistence dependencies are not yet asynchronous.
+    // Do not bypass that capability guard when chaining HTTP middleware.
+    if (auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+        native != nullptr && native->nativeEnabled()) {
         co_return co_await native->handleAsync(std::move(request));
+    }
     co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                     request);
 }
@@ -756,7 +761,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
                                    json::serialize(payload)};
     secure(response);
     clearState(response);
-    response.addHeader("set-cookie", sessionCookie(issued->token().expose(), 8 * 60 * 60));
+    response.addHeader("set-cookie", sessionCookie(issued->token.expose(), 8 * 60 * 60));
     co_return response;
 }
 

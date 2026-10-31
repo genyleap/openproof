@@ -36,6 +36,38 @@ struct BlockingFallback final : gateway::HttpHandler {
     int calls{};
 };
 
+// Disabled native support must remain disabled through middleware chaining.
+// Its synchronous API is not safe to run on an Asio reactor either.
+struct DisabledNativeFallback final : gateway::http::CoroutineHttpHandler {
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override {
+        ++blockingCalls;
+        return gateway::HttpResponse{200, {}, "blocking-path"};
+    }
+    [[nodiscard]] asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest) override {
+        ++nativeCalls;
+        co_return gateway::HttpResponse{200, {}, "disabled-native-path"};
+    }
+    int blockingCalls{};
+    int nativeCalls{};
+};
+
+struct EnabledNativeFallback final : gateway::http::CoroutineHttpHandler {
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override {
+        ++blockingCalls;
+        return gateway::HttpResponse{500, {}, "unexpected"};
+    }
+    [[nodiscard]] asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest) override {
+        co_await asio::post(asio::use_awaitable);
+        ++nativeCalls;
+        co_return gateway::HttpResponse{202, {}, "native"};
+    }
+    int blockingCalls{};
+    int nativeCalls{};
+};
+
 // A native wallet provider whose legacy methods are deliberately unusable.
 class NativeWalletProvider final : public idp::AuthenticationProvider,
                                    public idp::CoroutineAuthenticationProvider {
@@ -354,6 +386,42 @@ TEST(Web3HttpCoroutineTest, ConnectionHandoffRejectsBeforeSyncSessionLookup)
     EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
     EXPECT_EQ(fixture.transactions.size(), 0U);
     EXPECT_EQ(fixture.fallback.calls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, DisabledNativeFallbackCannotBypassCapabilityGuard)
+{
+    Fixture fixture;
+    DisabledNativeFallback disabled;
+    http::Web3AuthenticationHttpApi chained{
+        fixture.authentication, fixture.providers, fixture.sessions,
+        fixture.limiter, disabled, nullptr, &fixture.nativeSessions};
+    int status = 0;
+    asio::io_context io;
+    auto future = asio::co_spawn(io,
+        check(chained, request("/some-other-app"), status), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(status, 503);
+    EXPECT_EQ(disabled.nativeCalls, 0);
+    EXPECT_EQ(disabled.blockingCalls, 0);
+}
+
+TEST(Web3HttpCoroutineTest, EnabledNativeFallbackReceivesUnmatchedRoute)
+{
+    Fixture fixture;
+    EnabledNativeFallback enabled;
+    http::Web3AuthenticationHttpApi chained{
+        fixture.authentication, fixture.providers, fixture.sessions,
+        fixture.limiter, enabled, nullptr, &fixture.nativeSessions};
+    int status = 0;
+    asio::io_context io;
+    auto future = asio::co_spawn(io,
+        check(chained, request("/some-other-app"), status), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(status, 202);
+    EXPECT_EQ(enabled.nativeCalls, 1);
+    EXPECT_EQ(enabled.blockingCalls, 0);
 }
 
 TEST(Web3HttpCoroutineTest, UnmatchedRouteCannotInvokeSynchronousFallback)
