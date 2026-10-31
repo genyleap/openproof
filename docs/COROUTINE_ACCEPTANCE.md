@@ -1264,3 +1264,13 @@ checkpoint. They must not be reported as passing until an explicitly
 time-bounded build and test execution succeeds. Real PostgreSQL integration,
 nonblocking session/identity repositories, and production listener wiring
 remain outstanding.
+
+#### Static coverage of native Web3 dispatch (2026-10-31)
+
+The source pre-gate now treats `src/authentication/http/web3.cpp` as a named
+HTTP coroutine boundary, requires direct awaits of the trusted coordinator's
+four Web3 authentication/connection operations, and flags a synchronous HTTP
+fallback appearing in the native handler section. The check passed on the
+current branch, while the complete gate remains **NOT_APPROVED with 36
+blocking findings** in other areas. Static inspection is not a substitute
+for compiling the new target and exercising its negative tests.

@@ -16,6 +16,7 @@ const segments = [
   ["Wallet + Farcaster RPC", "src/providers/web3/web3.cpp"],
   ["Enterprise LDAP", "src/providers/enterprise/enterprise.cpp"],
   ["HTTP authentication API", "src/authentication/http/http.cpp"],
+  ["HTTP Web3 coroutine API", "src/authentication/http/web3.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
   ["HTTP administration API", "src/administration/administration.cpp"],
@@ -44,6 +45,26 @@ const checked = segments.map(([name, relative]) => {
   const awaitCount=[...source.matchAll(/\bco_await\b/g)].length;
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
+  if(relative==="src/authentication/http/web3.cpp"){
+    // Require the actual trusted coordinator awaits, not merely a synthetic
+    // coroutine wrapper around the synchronous HTTP handler.
+    for(const method of ["beginAsync","beginConnectionAsync",
+                         "completeAsync","completeConnectionAsync"]){
+      const call=new RegExp("\\bco_await\\s+m_authentication->"+method+"\\s*\\(");
+      if(!call.test(source))
+        issues.push({line:0,kind:"missing trusted Web3 coroutine flow",expression:method+"("});
+    }
+    const nativeIndex=source.indexOf("Web3AuthenticationHttpApi::handleAsync(");
+    if(nativeIndex<0){
+      issues.push({line:0,kind:"missing native Web3 HTTP entry",expression:"handleAsync("});
+    }else{
+      // The compatibility handler is intentionally still present above the
+      // coroutine implementation. Only the latter must reject blocking fallback.
+      const nativeSection=source.slice(nativeIndex);
+      if(/\bm_fallback->handle\s*\(/.test(nativeSection))
+        issues.push({line:0,kind:"blocking native HTTP fallback",expression:"m_fallback->handle("});
+    }
+  }
   return {name,file:relative,coAwaitCount:awaitCount,issues};
 });
 // Do not silently overlook newly added storage/provider/transport files.
