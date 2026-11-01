@@ -98,8 +98,9 @@ const checked = segments.map(([name, relative]) => {
   if(relative==="src/storage/postgres/coroutine_canonical_finalizer.cpp"){
     const checks=[
       ["tenant-scoped canonical read", /i\.organization_id=\$3\s+AND\s+i\.status=0/],
-      ["active canonical target", /organization_id=\$2\s+AND\s+status=0\s+FOR SHARE/],
-      ["canonical row lifecycle lock", /FOR SHARE OF i/],
+      ["active canonical target", /organization_id=\$2\s+AND\s+status=0/],
+      ["canonical row lifecycle lock", /FOR UPDATE OF i/],
+      ["canonical profile serialization", /mutationLock\s*\?\s*" FOR UPDATE"\s*:\s*""/],
       ["atomic owner-conflict guard", /ON CONFLICT\(provider,external_subject\) DO UPDATE/],
       ["no implicit owner reassignment", /WHERE openproof\.external_identities\.identity_id=EXCLUDED\.identity_id/],
       ["profile domain refresh", /co_await\s+saveProfile\s*\(/],
@@ -109,6 +110,9 @@ const checked = segments.map(([name, relative]) => {
     for(const [kind, regex] of checks)
       if(!regex.test(source))
         issues.push({line:0,kind:"missing "+kind,expression:regex.source});
+    if(/\b(?:telegram|genycaster|genyleap)\b/i.test(source))
+      issues.push({line:0,kind:"provider-specific canonical storage dependency",
+        expression:"native canonical storage must be provider-neutral"});
   }
   if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)

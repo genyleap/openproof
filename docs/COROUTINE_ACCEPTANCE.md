@@ -1459,3 +1459,64 @@ SKIPPED because the required isolated database opt-in is absent.
 Until the disposable SQL scenarios execute against a real migrated test
 schema, the canonical storage phase remains unapproved and must not be
 merged, wired into the live listener or released.
+
+
+#### Disposable canonical PostgreSQL concurrency harness (2026-11-01)
+
+A dedicated `scripts/run-disposable-postgres-canonical-tests.sh`
+creates an ephemeral PostgreSQL 16 data directory via `mktemp`, listens
+**only on a private Unix socket**, creates a fresh `openproof_coroutine_ci`
+database, applies the checked-in canonical/profile migrations and destroys
+the cluster on exit. The canonical integration test accepts only the runner's
+exact socket pathname shape and database role/name, with explicit opt-in.
+Neither a TCP URL nor a production connection string can select this suite's
+mutating fixture. The runner fails when any integration test is skipped.
+
+The SQL test matrix now also includes simultaneous proof completions
+attempting to attach the same external provider/subject to different canonical
+identities; precisely one must become owner. An earlier rollback test mistakenly
+used an oversized email claim, although presentation-only refresh correctly
+ignores email on an existing profile. It now supplies an oversized locale
+claim, which crosses the actual profile-validation path and must roll back
+the preceding link insertion.
+
+The finalizer uses a transactional canonical identity row lock for
+profile/link writes, even before an identity has its first profile row;
+read-only connection preflight does not take a write lock. The async
+external-picture update no longer contains provider-name-specific SQL.
+
+**Execution restriction:** the current remote operations command policy
+rejects `bash` and invocation of this new runner. Therefore its isolated
+real-SQL test is **not yet executed**. Only the focused C++ build and offline
+CTest cases can be confirmed from this environment. Do not mark SQL
+integration green or approve production composition on that basis.
+
+
+#### Canonical SQL isolation and race hardening — follow-up (2026-11-01)
+
+The opt-in isolated-runner script provisions PostgreSQL using a temporary
+socket directory with `listen_addresses=` (no TCP), a new disposable database
+and only the checked-in migrations required for canonical profiles. The test
+binary explicitly rejects all TCP URLs and arbitrary Unix sockets. An
+explicitly requested but invalid disposable DSN causes a failed test, not a
+skip, and the runner also rejects skipped CTest results.
+
+New integration assertions cover both sides of a simultaneous connection
+attempt: two active canonical identities race for one as-yet-unlinked
+provider/subject; exactly one must win, with the winner matching the
+persisted owner. The invalid-profile atomicity assertion uses an oversized
+locale claim on an existing profile, verifying the preceding link insertion
+is rolled back. The native finalizer now locks the canonical identity row
+for mutation, preventing two concurrent first logins from independently
+initializing the same empty profile while still allowing read-only preflight.
+
+The canonical storage SQL no longer has a hard-coded per-provider avatar
+exception. The release pre-gate now rejects provider- or deployment-specific
+branching in this native adapter. Existing legacy storage remains untouched.
+
+**Actual execution status:** the focused C++ target builds under GCC16.
+As last observed, three standalone offline canonical tests passed and the
+real disposable-SQL test was skipped. The server's Remote Operations
+restricted command policy refuses executing the new shell runner, so **real
+SQL integration and concurrency remain unverified**. A green source scan
+must not be interpreted as SQL test acceptance.

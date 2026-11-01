@@ -184,14 +184,18 @@ asio::awaitable<void> rollback(
 
 asio::awaitable<bool> activeTarget(
     async_detail::AsyncConnection& connection,
-    std::string identity, std::string organization, Deadline deadline)
+    std::string identity, std::string organization, Deadline deadline,
+    bool mutationLock)
 {
-    // Lock the canonical row until COMMIT. A concurrent lifecycle transition
-    // cannot make this target inactive in the middle of linking/session issue.
+    // Lock the canonical row during writes, even if there is not yet a
+    // profile row to lock. This serializes concurrent first-time profile
+    // initialization, owner linking and lifecycle transitions per identity.
+    // Preflight authorization is read-only and does not retain this lock.
     Params params{std::move(identity), std::move(organization)};
     const auto rows = co_await connection.query(
-        "SELECT id FROM openproof.identities "
-        "WHERE id=$1 AND organization_id=$2 AND status=0 FOR SHARE",
+        std::string{"SELECT id FROM openproof.identities "
+                    "WHERE id=$1 AND organization_id=$2 AND status=0"}
+            + (mutationLock ? " FOR UPDATE" : ""),
         std::move(params), remaining(deadline));
     if (rows.rows.size() > 1U)
         throw std::runtime_error{"Duplicate canonical identities"};
@@ -214,8 +218,7 @@ asio::awaitable<bool> refreshExternal(
         "UPDATE openproof.external_identities SET "
         "display_name=COALESCE(NULLIF($4,''),display_name),"
         "preferred_username=COALESCE(NULLIF($5,''),preferred_username),"
-        "picture_url=CASE WHEN $1='telegram' THEN NULLIF($6,'') "
-        "ELSE COALESCE(NULLIF($6,''),picture_url) END "
+        "picture_url=COALESCE(NULLIF($6,''),picture_url) "
         "WHERE provider=$1 AND external_subject=$2 AND identity_id=$3 "
         "RETURNING identity_id",
         std::move(params), remaining(deadline));
@@ -281,7 +284,7 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
             "SELECT i.id FROM openproof.external_identities e "
             "JOIN openproof.identities i ON i.id=e.identity_id "
             "WHERE e.provider=$1 AND e.external_subject=$2 "
-            "AND i.organization_id=$3 AND i.status=0 FOR SHARE OF i",
+            "AND i.organization_id=$3 AND i.status=0 FOR UPDATE OF i",
             std::move(ownerParams), remaining(deadline));
         if (owner.rows.empty()) {
             co_await rollback(connection, deadline);
@@ -319,7 +322,7 @@ CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
         auto lease = co_await m_impl->pool.acquire();
         const bool active = co_await activeTarget(
             lease.connection(), std::string{target.value()},
-            std::string{m_impl->organization.value()}, deadline);
+            std::string{m_impl->organization.value()}, deadline, false);
         if (!active)
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                 "This canonical identity cannot link accounts.");
@@ -346,7 +349,7 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
         static_cast<void>(co_await connection.query("BEGIN", {}, remaining(deadline)));
         if (!(co_await activeTarget(
                 connection, std::string{target.value()},
-                std::string{m_impl->organization.value()}, deadline))) {
+                std::string{m_impl->organization.value()}, deadline, true))) {
             co_await rollback(connection, deadline);
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                 "The target canonical identity is not active.");

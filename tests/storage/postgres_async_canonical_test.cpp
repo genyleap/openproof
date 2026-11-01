@@ -33,10 +33,12 @@ namespace ids = openproof::identity::core;
 namespace idp = openproof::identity::provider;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1770000000000LL}};
-constexpr std::string_view kCiDatabase =
-    "postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_coroutine_ci";
-constexpr std::string_view kLocalDatabase =
-    "postgresql://openproof_ci:ci_disposable_only@127.0.0.1:55432/openproof_coroutine_ci";
+// A disposable-only Unix-domain socket. TCP URLs are rejected even when
+// an operator accidentally exports a production database environment.
+constexpr std::string_view kSocketPrefix =
+    "host=/tmp/openproof-canonical-pg.";
+constexpr std::string_view kSocketSuffix =
+    " port=55418 user=postgres dbname=openproof_coroutine_ci";
 
 struct PgConnDeleter final {
     void operator()(PGconn* value) const noexcept { if (value) PQfinish(value); }
@@ -47,22 +49,37 @@ struct PgResultDeleter final {
 using Conn = std::unique_ptr<PGconn, PgConnDeleter>;
 using Result = std::unique_ptr<PGresult, PgResultDeleter>;
 
+[[nodiscard]] bool isolatedSocketDsn(std::string_view value)
+{
+    if (!value.starts_with(kSocketPrefix)
+        || !value.ends_with(kSocketSuffix)
+        || value.size() != kSocketPrefix.size() + 8U + kSocketSuffix.size())
+        return false;
+    const auto random = value.substr(kSocketPrefix.size(), 8U);
+    for (const char symbol : random) {
+        if (!((symbol >= 'A' && symbol <= 'Z')
+            || (symbol >= 'a' && symbol <= 'z')
+            || (symbol >= '0' && symbol <= '9')))
+            return false;
+    }
+    return true;
+}
+
 [[nodiscard]] std::optional<std::string> disposableDsn()
 {
     const char* dsn = std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN");
     if (dsn == nullptr) return std::nullopt;
     const char* acknowledged =
         std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK");
-    // A deliberately strict allow-list: never use arbitrary credentials
-    // supplied by an environment or a URL pointing to the live database.
+    // The runner creates one private socket directory with an mktemp
+    // eight-character suffix; never connect to TCP or an arbitrary DB host.
+    const std::string_view value{dsn};
     if (acknowledged == nullptr
         || std::string_view{acknowledged}
             != "YES_EXCLUSIVE_DISPOSABLE_DATABASE"
-        || (std::string_view{dsn} != kCiDatabase
-            && std::string_view{dsn} != kLocalDatabase)) {
+        || !isolatedSocketDsn(value))
         return std::nullopt;
-    }
-    return std::string{dsn};
+    return std::string{value};
 }
 
 [[nodiscard]] Result execute(PGconn* connection, std::string_view sql,
@@ -109,6 +126,7 @@ struct Seed final {
     std::string lockedSubject = "nc-locked-external-" + suffix;
     std::string foreignSubject = "nc-foreign-external-" + suffix;
     std::string newSubject = "nc-new-" + suffix;
+    std::string racingSubject = "nc-race-" + suffix;
     std::string invalidSubject = "nc-rollback-" + suffix;
 
     void install(PGconn* connection) const
@@ -207,10 +225,12 @@ asio::awaitable<void> checkRealDatabase(
     checks.ownerConflictDenied = !stolen
         && stolen.error().code() == fnd::ErrorCode::Conflict;
 
-    // SQL INSERT of the external link succeeds first, but canonical domain
-    // validation of this oversized email must abort the whole transaction.
+    // SQL INSERT of the external link succeeds first, but the existing
+    // profile has no locale. The domain refresh accepts the new claim and
+    // then rejects its oversized value, forcing the whole transaction
+    // (including the successfully inserted link) to roll back.
     idp::VerifiedClaims invalidClaims;
-    invalidClaims.set(idp::ClaimName::Email, std::string(321U, 'x'));
+    invalidClaims.set(idp::ClaimName::Locale, std::string(65U, 'x'));
     auto invalidProof = idp::AuthenticationOutcome::create(
         idp::ProviderId{"native-canonical-provider"},
         idp::ExternalSubject{seed.invalidSubject},
@@ -223,6 +243,33 @@ asio::awaitable<void> checkRealDatabase(
         invalidProof.value(), ids::IdentityId{seed.secondOwner}, kNow);
     checks.invalidProfileDenied = !refused
         && refused.error().code() == fnd::ErrorCode::Unavailable;
+}
+
+asio::awaitable<void> raceForSameExternalIdentity(
+    pg::CoroutinePostgresCanonicalFinalizer& canonical,
+    std::string subject, ids::IdentityId target,
+    bool& accepted, bool& conflicted)
+{
+    auto linked = co_await canonical.finishConnectionAsync(
+        verified(std::move(subject)), std::move(target), kNow);
+    accepted = linked.has_value();
+    conflicted = !linked && linked.error().code() == fnd::ErrorCode::Conflict;
+}
+
+TEST(PostgresCanonicalCoroutineTest, RejectsProductionOrUntrustedSqlEndpoints)
+{
+    EXPECT_FALSE(isolatedSocketDsn(
+        "postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_coroutine_ci"));
+    EXPECT_FALSE(isolatedSocketDsn(
+        "host=127.0.0.1 port=55418 user=postgres dbname=openproof_coroutine_ci"));
+    EXPECT_FALSE(isolatedSocketDsn(
+        "host=/var/run/postgresql port=55418 user=postgres dbname=openproof_coroutine_ci"));
+    EXPECT_FALSE(isolatedSocketDsn(
+        "host=/tmp/openproof-canonical-pg.BAD-X000 port=55418 user=postgres dbname=openproof_coroutine_ci"));
+    EXPECT_FALSE(isolatedSocketDsn(
+        "host=/tmp/openproof-canonical-pg.ABcd1234 port=5432 user=postgres dbname=openproof_coroutine_ci"));
+    EXPECT_TRUE(isolatedSocketDsn(
+        "host=/tmp/openproof-canonical-pg.ABcd1234 port=55418 user=postgres dbname=openproof_coroutine_ci"));
 }
 
 TEST(PostgresCanonicalCoroutineTest, SqlFailureReturnsUnavailable)
@@ -278,7 +325,11 @@ TEST(PostgresCanonicalCoroutineTest, InvalidTenantConfigurationIsRejected)
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
 {
     const auto dsn = disposableDsn();
-    if (!dsn) GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
 
     Conn fixture{PQconnectdb(dsn->c_str())};
     ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK)
@@ -334,5 +385,32 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
         {seed.newSubject});
     ASSERT_EQ(PQntuples(link.get()), 1);
     EXPECT_STREQ(PQgetvalue(link.get(), 0, 0), seed.secondOwner.c_str());
+
+    // Concurrent proof completions for the same provider subject must never
+    // let two independently verified targets take ownership of one link.
+    bool firstAccepted = false, secondAccepted = false;
+    bool firstConflict = false, secondConflict = false;
+    io.restart();
+    auto first = asio::co_spawn(io, raceForSameExternalIdentity(
+        canonical, seed.racingSubject, ids::IdentityId{seed.owner},
+        firstAccepted, firstConflict), asio::use_future);
+    auto second = asio::co_spawn(io, raceForSameExternalIdentity(
+        canonical, seed.racingSubject, ids::IdentityId{seed.secondOwner},
+        secondAccepted, secondConflict), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(first.get());
+    ASSERT_NO_THROW(second.get());
+    EXPECT_NE(firstAccepted, secondAccepted);
+    EXPECT_NE(firstConflict, secondConflict);
+    EXPECT_EQ(firstAccepted, secondConflict);
+    EXPECT_EQ(secondAccepted, firstConflict);
+
+    const auto raced = execute(fixture.get(),
+        "SELECT identity_id FROM openproof.external_identities "
+        "WHERE provider='native-canonical-provider' AND external_subject=$1",
+        {seed.racingSubject});
+    ASSERT_EQ(PQntuples(raced.get()), 1);
+    EXPECT_STREQ(PQgetvalue(raced.get(), 0, 0),
+        firstAccepted ? seed.owner.c_str() : seed.secondOwner.c_str());
 }
 } // namespace
