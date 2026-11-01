@@ -1654,3 +1654,30 @@ module-dependency rebuild; this command was cancelled promptly at step
 15 rather than allowing an expensive build. Its HTTP test target therefore
 remains **unbuilt and unverified**. Production deployment and release
 approval remain blocked.
+
+
+#### PostgreSQL lease fault-injection and fractional deadline (2026-11-01)
+
+Native PostgreSQL pool admission now **refuses an operation with less than
+one whole millisecond left** instead of rounding it *up* to a fresh 1 ms
+connect or query timeout. This is intentionally conservative: millisecond
+libpq adapter interfaces cannot preserve a shorter remaining budget. The
+offline pool test checks three 100-microsecond deadlines, then verifies
+that two deliberate libpq connection failures still acquire and return
+the sole pool permit. The coroutine source gate now requires this refusal.
+
+Two new **explicitly disposable PostgreSQL-only** cases were added:
+
+- `RealDatabaseTimeoutDropsPoisonedConnection`: obtain the backend PID,
+  run a read-only `pg_sleep(0.4)` with a 25 ms query deadline, require a
+  non-reusable lease, and check that the next checkout returns a *different*
+  healthy backend connection without leaking the single pool permit.
+- `RealDatabaseRecycledLeaseResetsSession`: set a custom
+  `application_name` outside any transaction, return the reusable lease,
+  and require the next checkout to have cleared it using `DISCARD ALL`.
+
+Neither test has been permitted to connect to the production PostgreSQL
+service. Like the earlier canonical SQL cases, they only run with the
+private-socket `OPENPROOF_TEST_POSTGRES_DOMAIN` and explicit ephemeral
+database acknowledgement; absent that opt-in they correctly **skip**.
+These scenarios extend test coverage, not dynamic acceptance evidence.

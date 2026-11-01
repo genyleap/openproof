@@ -125,6 +125,7 @@ const checked = segments.map(([name, relative]) => {
       ["pool uses a caller deadline", /AsyncConnectionPool::acquire\(\s*std::chrono::steady_clock::time_point deadline/],
       ["deadline bounds pool wait", /bounded\(state->acquireTimeout\)/],
       ["deadline bounds connect", /bounded\(state->connectTimeout\)/],
+      ["sub-millisecond deadline fails closed", /if\s*\(remaining\s*<=\s*std::chrono::milliseconds::zero\(\)\)/],
       ["post-acquisition expiry gate", /static_cast<void>\(bounded\(state->connectTimeout\)\)/]
     ])
       if(!regex.test(source))

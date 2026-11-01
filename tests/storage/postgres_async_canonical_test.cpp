@@ -366,6 +366,7 @@ TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
         1U, std::chrono::milliseconds{150},
         std::chrono::milliseconds{150}};
     std::size_t expiredCount = 0U;
+    std::size_t subMillisecondCount = 0U;
     std::size_t physicalConnectAttempts = 0U;
     auto check = [&]() -> asio::awaitable<void> {
         for (int attempt = 0; attempt < 3; ++attempt) {
@@ -377,6 +378,23 @@ TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
                 if (std::string_view{error.what()}.contains(
                     "operation deadline expired")) {
                     ++expiredCount;
+                }
+            }
+        }
+        // The libpq connector uses millisecond deadlines. Remaining time
+        // below 1 ms must be refused rather than rounded up to 1 ms: even
+        // an immediately available permit cannot authorize network I/O
+        // outside the caller's actual deadline.
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            try {
+                auto lease = co_await pool.acquire(
+                    std::chrono::steady_clock::now()
+                    + std::chrono::microseconds{100});
+                static_cast<void>(lease);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view{error.what()}.contains(
+                    "operation deadline expired")) {
+                    ++subMillisecondCount;
                 }
             }
         }
@@ -402,6 +420,7 @@ TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_EQ(expiredCount, 3U);
+    EXPECT_EQ(subMillisecondCount, 3U);
     EXPECT_EQ(physicalConnectAttempts, 2U);
     EXPECT_EQ(pool.capacity(), 1U);
 }
@@ -470,6 +489,95 @@ TEST(PostgresCanonicalCoroutineTest, InvalidTenantConfigurationIsRejected)
             std::chrono::milliseconds{100},
             std::chrono::milliseconds{100}}),
         std::invalid_argument);
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseTimeoutDropsPoisonedConnection)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "A disposable SQL database was requested with an invalid DSN.";
+        GTEST_SKIP() << "No explicitly acknowledged disposable PostgreSQL cluster.";
+    }
+    asio::io_context io;
+    pg::async_detail::AsyncConnectionPool pool{
+        io.get_executor(), *dsn, 1U, std::chrono::milliseconds{500},
+        std::chrono::milliseconds{1000}};
+    bool timedOut = false;
+    bool recovered = false;
+    auto run = [&]() -> asio::awaitable<void> {
+        std::string firstBackend;
+        {
+            auto lease = co_await pool.acquire(
+                std::chrono::steady_clock::now() + std::chrono::seconds{3});
+            const auto original = co_await lease.connection().query(
+                "SELECT pg_backend_pid()::text", {}, std::chrono::seconds{1});
+            if (original.rows.size() != 1U
+                || original.rows.front().size() != 1U
+                || !original.rows.front().front()) co_return;
+            firstBackend = *original.rows.front().front();
+            try {
+                // No SQL write: the only effect is holding this PGconn busy
+                // beyond the same 25 ms query deadline.
+                static_cast<void>(co_await lease.connection().query(
+                    "SELECT pg_sleep(0.4)", {}, std::chrono::milliseconds{25}));
+            } catch (const std::runtime_error&) {
+                timedOut = !lease.connection().reusable();
+            }
+        }
+        // The timed-out server query must never be returned to another
+        // tenant. With one permit the next acquisition can only succeed
+        // if the poisoned lease was returned as a fresh-connection slot.
+        auto fresh = co_await pool.acquire(
+            std::chrono::steady_clock::now() + std::chrono::seconds{3});
+        const auto newBackend = co_await fresh.connection().query(
+            "SELECT pg_backend_pid()::text", {}, std::chrono::seconds{1});
+        recovered = newBackend.rows.size() == 1U
+            && newBackend.rows.front().size() == 1U
+            && newBackend.rows.front().front().has_value()
+            && *newBackend.rows.front().front() != firstBackend;
+    };
+    auto future = asio::co_spawn(io, run(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(timedOut);
+    EXPECT_TRUE(recovered);
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "A disposable SQL database was requested with an invalid DSN.";
+        GTEST_SKIP() << "No explicitly acknowledged disposable PostgreSQL cluster.";
+    }
+    asio::io_context io;
+    pg::async_detail::AsyncConnectionPool pool{
+        io.get_executor(), *dsn, 1U, std::chrono::milliseconds{500},
+        std::chrono::milliseconds{1000}};
+    bool cleaned = false;
+    auto run = [&]() -> asio::awaitable<void> {
+        {
+            auto first = co_await pool.acquire(
+                std::chrono::steady_clock::now() + std::chrono::seconds{3});
+            static_cast<void>(co_await first.connection().query(
+                "SET application_name TO 'canonical_private_prior_tenant'",
+                {}, std::chrono::seconds{1}));
+        }
+        auto recycled = co_await pool.acquire(
+            std::chrono::steady_clock::now() + std::chrono::seconds{3});
+        const auto current = co_await recycled.connection().query(
+            "SHOW application_name", {}, std::chrono::seconds{1});
+        cleaned = current.rows.size() == 1U
+            && current.rows.front().size() == 1U
+            && current.rows.front().front().has_value()
+            && *current.rows.front().front() != "canonical_private_prior_tenant";
+    };
+    auto future = asio::co_spawn(io, run(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(cleaned);
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)

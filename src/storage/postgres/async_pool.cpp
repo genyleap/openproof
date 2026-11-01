@@ -127,7 +127,13 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
-        return std::min(configured, std::max(remaining, std::chrono::milliseconds{1}));
+        // Millisecond-based libpq connection APIs cannot enforce a smaller
+        // positive remainder. Fail closed instead of extending an absolute
+        // deadline by rounding a sub-millisecond budget up to 1 ms.
+        if (remaining <= std::chrono::milliseconds::zero()) {
+            throw std::runtime_error{"Async PostgreSQL operation deadline expired"};
+        }
+        return std::min(configured, remaining);
     };
 
     boost::system::error_code error;
