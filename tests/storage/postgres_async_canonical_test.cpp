@@ -18,6 +18,7 @@
 #include <utility>
 #include <unistd.h>
 
+#include "async_pool.hpp"
 #include "coroutine_canonical_finalizer.hpp"
 
 import openproof.authentication;
@@ -354,6 +355,36 @@ TEST(PostgresCanonicalCoroutineTest, ConnectionPresentationCannotClaimVerifiedCo
     ASSERT_TRUE(loggedIn->phoneNumber().has_value());
     EXPECT_EQ(*loggedIn->phoneNumber(), "+12025550123");
     EXPECT_TRUE(loggedIn->phoneNumberVerified());
+}
+
+TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
+{
+    asio::io_context io;
+    openproof::storage::postgres::async_detail::AsyncConnectionPool pool{
+        io.get_executor(),
+        "host=/tmp/nonexistent-native-canonical.sock dbname=nonexistent",
+        1U, std::chrono::seconds{5}, std::chrono::seconds{5}};
+    std::size_t expiredCount = 0U;
+    auto check = [&]() -> asio::awaitable<void> {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            try {
+                auto lease = co_await pool.acquire(
+                    std::chrono::steady_clock::now() - std::chrono::milliseconds{1});
+                static_cast<void>(lease);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view{error.what()}.contains(
+                    "operation deadline expired")) {
+                    ++expiredCount;
+                }
+            }
+        }
+    };
+    auto operation = check();
+    auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_EQ(expiredCount, 3U);
+    EXPECT_EQ(pool.capacity(), 1U);
 }
 
 TEST(PostgresCanonicalCoroutineTest, RejectsProductionOrUntrustedSqlEndpoints)

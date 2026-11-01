@@ -1575,3 +1575,52 @@ to remain unchanged. This checks absence of a heap rewrite; it is **not**
 a throughput or latency benchmark. The new C++ implementation has no
 production wiring. The SQL assertion remains unexecuted while the remote
 command policy blocks the private-cluster runner.
+
+
+#### Native canonical PostgreSQL operation-wide deadline (2026-11-01)
+
+The original native canonical finalizer computed an absolute SQL deadline, but
+the bounded PostgreSQL connection pool independently waited for a free slot,
+opened a connection and reset an existing session using full, fresh pool
+timeouts. A saturated pool or slow connect could consequently exceed the
+caller's total operation budget before the first SQL statement ran.
+
+The internal pool now offers an opt-in `acquire(deadline)` overload. It caps
+**queue acquisition, new nonblocking libpq connection establishment and
+`DISCARD ALL` session reset** against the caller's same monotonic deadline,
+checking expiry both before attempting acquisition and before releasing the
+lease to its caller. Expiration returns the slot safely through the normal
+lease destructor, without lending a potentially poisoned transaction.
+Existing `acquire()` callers retain their compatibility semantics.
+
+All three native canonical endpoints now use that overload with the already
+computed transaction deadline; subsequent SQL statements continue to use
+the same absolute deadline. An offline coroutine test repeatedly requests
+an already-expired lease against a pool with one slot and a long configured
+timeout, asserting immediate rejection and intact configured capacity.
+The static acceptance gate inventories this pool and requires each bounded
+acquisition step.
+
+This is **not** proof of end-to-end cancellation under slow DNS/TCP, full
+pool saturation or PostgreSQL lock contention. The temporary real-SQL
+fault-injection tests are still required, and libpq DNS resolution may be
+blocking on some supported systems. The production route remains unchanged.
+
+
+#### Build evidence status for deadline-aware pool (2026-11-01)
+
+The targeted GCC 16.2 C++26 build for
+`openproof_postgres_async_canonical_tests` was **not completed** at
+this checkpoint. Recompiling the shared `async_pool` dependency forced
+additional module work; after several minutes without new Ninja output
+and degraded server command responsiveness, its managed build process
+was explicitly stopped with SIGTERM. Do not interpret the previously
+built test executable or static source checks as validation of these
+newly edited C++ files.
+
+The source acceptance gate and independent tenant-neutrality audit pass
+for the added pool adapter; 36 unrelated blocking findings still remain.
+The new C++ target must compile, link and pass its offline cases before
+the deadline-aware pool phase is approved. A disposable PostgreSQL
+fault-injection run must additionally prove queue saturation, connect/
+reset deadlines, cancellation and pooled-slot recovery.

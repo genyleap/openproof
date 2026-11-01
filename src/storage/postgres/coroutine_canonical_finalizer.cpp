@@ -304,7 +304,7 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
     }
     try {
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
-        auto lease = co_await m_impl->pool.acquire();
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto& connection = lease.connection();
         static_cast<void>(co_await connection.query("BEGIN", {}, remaining(deadline)));
         Params ownerParams{
@@ -354,7 +354,7 @@ CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
     try {
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
-        auto lease = co_await m_impl->pool.acquire();
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const bool active = co_await activeTarget(
             lease.connection(), std::string{target.value()},
             std::string{m_impl->organization.value()}, deadline, false);
@@ -379,7 +379,7 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
     }
     try {
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
-        auto lease = co_await m_impl->pool.acquire();
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto& connection = lease.connection();
         static_cast<void>(co_await connection.query("BEGIN", {}, remaining(deadline)));
         if (!(co_await activeTarget(

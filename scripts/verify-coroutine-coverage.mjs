@@ -20,6 +20,7 @@ const segments = [
   ["HTTP Web3 coroutine API", "src/authentication/http/web3.cpp"],
   ["PostgreSQL coroutine session issuance", "src/storage/postgres/coroutine_session_service.cpp"],
   ["PostgreSQL coroutine canonical finalization", "src/storage/postgres/coroutine_canonical_finalizer.cpp"],
+  ["PostgreSQL bounded coroutine connection pool", "src/storage/postgres/async_pool.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
   ["HTTP administration API", "src/administration/administration.cpp"],
@@ -110,7 +111,7 @@ const checked = segments.map(([name, relative]) => {
       ["profile domain refresh", /co_await\s+saveProfile\s*\(/],
       ["no-op profile WAL suppression", /IS DISTINCT FROM ROW\(EXCLUDED\.display_name/],
       ["SQL commit", /co_await\s+connection\.query\s*\(\s*"COMMIT"/],
-      ["bounded coroutine pool", /co_await\s+m_impl->pool\.acquire\s*\(/]
+      ["bounded coroutine pool", /co_await\s+m_impl->pool\.acquire\s*\(deadline\)/]
     ];
     for(const [kind, regex] of checks)
       if(!regex.test(source))
@@ -118,6 +119,16 @@ const checked = segments.map(([name, relative]) => {
     if(/\b(?:telegram|genycaster|genyleap)\b/i.test(source))
       issues.push({line:0,kind:"provider-specific canonical storage dependency",
         expression:"native canonical storage must be provider-neutral"});
+  }
+  if(relative==="src/storage/postgres/async_pool.cpp"){
+    for(const [kind, regex] of [
+      ["pool uses a caller deadline", /AsyncConnectionPool::acquire\(\s*std::chrono::steady_clock::time_point deadline/],
+      ["deadline bounds pool wait", /bounded\(state->acquireTimeout\)/],
+      ["deadline bounds connect", /bounded\(state->connectTimeout\)/],
+      ["post-acquisition expiry gate", /static_cast<void>\(bounded\(state->connectTimeout\)\)/]
+    ])
+      if(!regex.test(source))
+        issues.push({line:0,kind:"missing "+kind,expression:regex.source});
   }
   if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)

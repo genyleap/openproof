@@ -7,7 +7,9 @@
 
 #include <boost/system/error_code.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <optional>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -101,10 +103,36 @@ AsyncConnectionPool::AsyncConnectionPool(
 
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
 {
+    co_return co_await acquireImpl(std::nullopt);
+}
+
+asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire(
+    std::chrono::steady_clock::time_point deadline)
+{
+    co_return co_await acquireImpl(deadline);
+}
+
+asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
+    std::optional<std::chrono::steady_clock::time_point> deadline)
+{
     auto state = m_state;
+    // A caller-level deadline must never be restarted between different
+    // stages of acquiring a reusable connection. Reject an expired deadline
+    // before touching the channel or initiating any network operation.
+    const auto bounded = [deadline](std::chrono::milliseconds configured) {
+        if (!deadline) return configured;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= *deadline) {
+            throw std::runtime_error{"Async PostgreSQL operation deadline expired"};
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
+        return std::min(configured, std::max(remaining, std::chrono::milliseconds{1}));
+    };
+
     boost::system::error_code error;
     std::unique_ptr<AsyncConnection> connection = co_await state->slots.async_receive(
-        asio::cancel_after(state->acquireTimeout,
+        asio::cancel_after(bounded(state->acquireTimeout),
             asio::redirect_error(asio::use_awaitable, error)));
     if (error) {
         throw std::runtime_error{"Async PostgreSQL pool acquisition timed out or cancelled"};
@@ -115,7 +143,7 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
         // A failed or cancelled connection attempt is also slot-safe:
         // the local lease reissues a null permit from its noexcept destructor.
         lease.m_connection = co_await AsyncConnection::connect(
-            state->connectionString, state->connectTimeout);
+            state->connectionString, bounded(state->connectTimeout));
     } else {
         // PQTRANS_IDLE does not prove session isolation: SET ROLE, session
         // GUCs, temporary objects and advisory locks can outlive COMMIT.
@@ -123,12 +151,16 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
         // tenant, using the same nonblocking SQL transport and a deadline.
         try {
             static_cast<void>(co_await lease.m_connection->query(
-                "DISCARD ALL", {}, state->connectTimeout));
+                "DISCARD ALL", {}, bounded(state->connectTimeout)));
         } catch (...) {
             lease.m_connection.reset();
             throw std::runtime_error{"Async PostgreSQL session reset failed"};
         }
     }
+    // Avoid handing a connection to the caller after its total budget has
+    // expired. The lease destructor returns the permit (or drops a poisoned
+    // PGconn), so a timeout cannot leak pool capacity.
+    static_cast<void>(bounded(state->connectTimeout));
     co_return std::move(lease);
 }
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace openproof::storage::postgres::async_detail {
@@ -44,9 +45,18 @@ public:
     ~AsyncConnectionPool() = default;
 
     [[nodiscard]] boost::asio::awaitable<Lease> acquire();
+
+    // Operation-wide monotonic deadline: cap queue admission, connection
+    // establishment and session reset against the SAME caller budget.
+    // Existing callers retain acquire() compatibility behavior.
+    [[nodiscard]] boost::asio::awaitable<Lease> acquire(
+        std::chrono::steady_clock::time_point deadline);
+
     [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<Lease> acquireImpl(
+        std::optional<std::chrono::steady_clock::time_point> deadline);
     std::shared_ptr<State> m_state;
 };
 
