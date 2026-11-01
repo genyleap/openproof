@@ -1624,3 +1624,33 @@ The new C++ target must compile, link and pass its offline cases before
 the deadline-aware pool phase is approved. A disposable PostgreSQL
 fault-injection run must additionally prove queue saturation, connect/
 reset deadlines, cancellation and pooled-slot recovery.
+
+
+#### Verified targeted GCC16 deadline build and pool-permit recovery (2026-11-01)
+
+The previously interrupted `openproof_postgres_async_canonical_tests`
+target was rebuilt from the current `bd3e58a` source under GCC 16.2.
+Both edited native C++ implementation units, `async_pool.cpp` and
+`coroutine_canonical_finalizer.cpp`, compiled and linked successfully.
+The test executable compiled and linked, and **five offline CTest cases
+passed; one opt-in disposable PostgreSQL integration case was skipped**.
+The independent protocol-neutrality checker also passed.
+
+The expired-deadline pool test was strengthened after reviewing its
+original capacity assertion. `capacity()` only reports the configured
+limit; it cannot prove a permit was returned. The test now makes three
+acquisitions with already-expired deadlines and then performs **two
+sequential acquisitions** with deliberately malformed libpq connection
+parameters. Both must reach the physical libpq connection attempt and
+fail there, rather than timing out waiting on the pool's single channel
+slot. This validates real permit recycling in the local failure path.
+It does not replace the still-pending real-PostgreSQL concurrency and
+disposable-cluster fault-injection suite.
+
+The existing `TrustedAsyncAuth` (11 cases) and `NativeWeb3` (6 cases)
+CTest suites passed (17/17). An independent attempt to build the
+previously unbuilt native Web3 HTTP test target revealed a 116-step
+module-dependency rebuild; this command was cancelled promptly at step
+15 rather than allowing an expensive build. Its HTTP test target therefore
+remains **unbuilt and unverified**. Production deployment and release
+approval remain blocked.

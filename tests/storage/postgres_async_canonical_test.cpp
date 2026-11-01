@@ -362,9 +362,11 @@ TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
     asio::io_context io;
     openproof::storage::postgres::async_detail::AsyncConnectionPool pool{
         io.get_executor(),
-        "host=/tmp/nonexistent-native-canonical.sock dbname=nonexistent",
-        1U, std::chrono::seconds{5}, std::chrono::seconds{5}};
+        "openproof_invalid_connection_keyword=invalid",
+        1U, std::chrono::milliseconds{150},
+        std::chrono::milliseconds{150}};
     std::size_t expiredCount = 0U;
+    std::size_t physicalConnectAttempts = 0U;
     auto check = [&]() -> asio::awaitable<void> {
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
@@ -378,12 +380,29 @@ TEST(PostgresCanonicalCoroutineTest, ExpiredPoolDeadlineDoesNotConsumeSlots)
                 }
             }
         }
+        // Capacity() reports the *configured* limit, not the state of the
+        // channel. Prove each slot token was returned by reaching libpq
+        // twice after the expired operations. If permits leaked, acquire
+        // would fail with a pool acquisition timeout instead.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            try {
+                auto lease = co_await pool.acquire(
+                    std::chrono::steady_clock::now() + std::chrono::seconds{1});
+                static_cast<void>(lease);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view{error.what()}.contains(
+                    "PostgreSQL connection failed")) {
+                    ++physicalConnectAttempts;
+                }
+            }
+        }
     };
     auto operation = check();
     auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_EQ(expiredCount, 3U);
+    EXPECT_EQ(physicalConnectAttempts, 2U);
     EXPECT_EQ(pool.capacity(), 1U);
 }
 
