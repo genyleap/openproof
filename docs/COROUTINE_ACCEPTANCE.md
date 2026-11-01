@@ -1403,3 +1403,38 @@ source gates prevent synchronous lifecycle and linking regressions in native
 entry points, and a new negative coroutine test checks pre-consumption
 refusal. No production connection or browser-handoff coroutine path has
 been enabled, and successful C++ compilation/integration is still pending.
+
+
+#### Native PostgreSQL canonical finalizer — linked-account subset (2026-11-01)
+
+A new opt-in CoroutinePostgresCanonicalFinalizer now implements the
+application-owned canonical identity completion SPI with the shared
+nonblocking libpq pool, bounded lease acquisition and one operation-wide
+monotonic SQL deadline. Login resolves an existing explicit provider/subject
+link only when its canonical owner is active and belongs to the configured
+organization. No unknown provider subject is auto-provisioned, nor may
+authentication follow a linked subject across tenant boundaries.
+
+The finalizer holds a PostgreSQL lifecycle row lock while refreshing external
+presentation and the canonical identity profile within the same transaction.
+The existing IdentityProfile domain model validates saved/updated claims and
+preserves previously chosen display name, username and other profile fields.
+Link completion first locks the target canonical lifecycle row, then uses
+PostgreSQL's unique (provider, external_subject) constraint plus an owner-
+matching ON CONFLICT predicate; conflict must not reassign an existing link.
+A denial issues ROLLBACK and cannot commit partial presentation changes.
+Unknown or poisoned database state does not produce a verified identity.
+
+The isolated target openproof_postgres_async_canonical_tests includes an
+offline connection failure test and a real SQL scenario for tenant isolation,
+locked identities, unlinked users, presentation precedence and cross-owner
+link conflict. Real SQL execution is gated by an explicitly acknowledged
+allow-listed disposable database URL. The source pre-gate checks the native
+SQL boundary for its key tenant/lifecycle/owner invariants.
+
+**Validation caveat:** source and static controls do not establish working
+C++ linkage or actual SQL semantics. The new target has not been proven built
+and its SQL scenario has not been run in this checkpoint. Self-provisioning,
+canonical profile convergence across email identities, async transaction
+retries, production composition and complete storage/HTTP migration remain
+open. This is NOT release or deployment approval.

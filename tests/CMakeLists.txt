@@ -517,3 +517,35 @@ gtest_discover_tests(openproof_web3_coroutine_http_tests
     TEST_PREFIX "Web3HttpAsync."
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "authentication;async;http;web3")
+
+
+# Isolated canonical async persistence tests. Any SQL fixture must opt in with
+# an exact disposable DB URL and acknowledgement; never touch the live server.
+add_executable(openproof_postgres_async_canonical_tests
+    storage/postgres_async_canonical_test.cpp)
+target_compile_features(openproof_postgres_async_canonical_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_postgres_async_canonical_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_postgres_async_canonical_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include"
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres")
+target_compile_definitions(openproof_postgres_async_canonical_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
+    openproof_postgres_async_canonical openproof_postgres_async_io
+    openproof_authentication openproof_identity_core
+    openproof_identity_provider openproof_identity_profile
+    openproof_security openproof_foundation Boost::headers OpenProof::libpq
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_canonical_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_canonical_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_canonical_tests
+    TEST_PREFIX "NativePgCanonical."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;security")
