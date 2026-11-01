@@ -98,7 +98,7 @@ const checked = segments.map(([name, relative]) => {
   if(relative==="src/storage/postgres/coroutine_canonical_finalizer.cpp"){
     const checks=[
       ["tenant-scoped canonical read", /i\.organization_id=\$3\s+AND\s+i\.status=0/],
-      ["active canonical target", /i\.organization_id=\$2\s+AND\s+i\.status=0/],
+      ["active canonical target", /i\.organization_id=\$2\s*"\s*"AND i\.status=0/],
       ["active tenant lifecycle", /o\.state=0/],
       ["tenant-row lifecycle lock", /FOR SHARE OF o/],
       ["canonical row lifecycle lock", /FOR UPDATE OF i/],
