@@ -1438,3 +1438,24 @@ and its SQL scenario has not been run in this checkpoint. Self-provisioning,
 canonical profile convergence across email identities, async transaction
 retries, production composition and complete storage/HTTP migration remain
 open. This is NOT release or deployment approval.
+
+
+#### Canonical PostgreSQL GCC16 compile + offline test evidence (2026-11-01)
+
+The opt-in canonical finalizer target and its focused GoogleTest executable
+**compiled and linked** under the verified GCC 16.2 C++26 configuration with
+strict -Werror. The compiler caught an awaitable-lifetime warning caused by
+unnamed SQL argument temporaries. These are now fully owned parameter vectors
+which are moved into each query coroutine before the first suspension.
+
+The isolated CTest run confirmed the unavailable-DSN fail-closed scenario
+**PASSED**; the SQL integration scenario **SKIPPED**, because its disposable
+database opt-in was not configured. The extended native target was rebuilt and linked after fixing the argument
+lifetime warning. CTest now reports **two passed, one skipped**: the invalid
+SQL connection test covers all three native entry points, invalid tenant
+configuration is rejected, and the disposable real-SQL scenario remains
+SKIPPED because the required isolated database opt-in is absent.
+
+Until the disposable SQL scenarios execute against a real migrated test
+schema, the canonical storage phase remains unapproved and must not be
+merged, wired into the live listener or released.

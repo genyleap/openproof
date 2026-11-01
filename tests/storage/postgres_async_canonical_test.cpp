@@ -235,17 +235,44 @@ TEST(PostgresCanonicalCoroutineTest, SqlFailureReturnsUnavailable)
         1U, std::chrono::milliseconds{100},
         std::chrono::milliseconds{100},
         std::chrono::milliseconds{100}};
-    bool denied = false;
+    bool loginDenied = false;
+    bool targetDenied = false;
+    bool linkDenied = false;
     auto run = [&]() -> asio::awaitable<void> {
         auto result = co_await finalizer.finishLoginAsync(
             verified("never-linked"), kNow);
-        denied = !result && result.error().code() == fnd::ErrorCode::Unavailable;
+        loginDenied = !result
+            && result.error().code() == fnd::ErrorCode::Unavailable;
+        auto target = co_await finalizer.authorizeConnectionTargetAsync(
+            ids::IdentityId{"existing-id"});
+        targetDenied = !target
+            && target.error().code() == fnd::ErrorCode::Unavailable;
+        auto link = co_await finalizer.finishConnectionAsync(
+            verified("never-linked"), ids::IdentityId{"existing-id"}, kNow);
+        linkDenied = !link
+            && link.error().code() == fnd::ErrorCode::Unavailable;
     };
     auto operation = run();
     auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
     io.run();
     ASSERT_NO_THROW(future.get());
-    EXPECT_TRUE(denied);
+    EXPECT_TRUE(loginDenied);
+    EXPECT_TRUE(targetDenied);
+    EXPECT_TRUE(linkDenied);
+}
+
+TEST(PostgresCanonicalCoroutineTest, InvalidTenantConfigurationIsRejected)
+{
+    asio::io_context io;
+    EXPECT_THROW(
+        (pg::CoroutinePostgresCanonicalFinalizer{
+            io.get_executor(),
+            fnd::SecretString{"openproof_invalid_connection_keyword=invalid"},
+            ids::OrganizationId{}, 1U,
+            std::chrono::milliseconds{100},
+            std::chrono::milliseconds{100},
+            std::chrono::milliseconds{100}}),
+        std::invalid_argument);
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)

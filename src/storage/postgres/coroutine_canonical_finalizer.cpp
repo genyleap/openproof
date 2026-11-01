@@ -34,6 +34,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
 using Row = std::vector<std::optional<std::string>>;
+using Params = std::vector<std::optional<std::string>>;
 
 [[nodiscard]] std::chrono::milliseconds remaining(Deadline deadline)
 {
@@ -107,12 +108,13 @@ asio::awaitable<void> saveProfile(
 {
     // Lock a profile across read, domain validation and write. The same
     // physical lease also holds the identity lifecycle lock until COMMIT.
+    Params readParams{std::string{identity.value()}};
     const auto rows = co_await connection.query(
         "SELECT display_name,preferred_username,email,email_verified,"
         "phone_number,phone_number_verified,locale,picture_url,avatar_source,"
         "created_at_ms,updated_at_ms "
         "FROM openproof.identity_profiles WHERE identity_id=$1 FOR UPDATE",
-        {std::string{identity.value()}}, remaining(deadline));
+        std::move(readParams), remaining(deadline));
     if (rows.rows.size() > 1U)
         throw std::runtime_error{"Duplicate canonical profile rows"};
 
@@ -142,6 +144,16 @@ asio::awaitable<void> saveProfile(
 
     // All updates are committed together with the owner/lifecycle check.
     // The upsert is needed for the first sign-in of a pre-linked identity.
+    Params writeParams{
+        std::string{identity.value()}, optionalText(value->displayName()),
+        optionalText(value->preferredUsername()), optionalText(value->email()),
+        value->emailVerified() ? "true" : "false",
+        optionalText(value->phoneNumber()),
+        value->phoneNumberVerified() ? "true" : "false",
+        optionalText(value->locale()), optionalText(value->pictureUrl()),
+        std::string{value->avatarSource()},
+        std::to_string(value->createdAt().time_since_epoch().count()),
+        std::to_string(value->updatedAt().time_since_epoch().count())};
     static_cast<void>(co_await connection.query(
         "INSERT INTO openproof.identity_profiles("
         "identity_id,display_name,preferred_username,email,email_verified,"
@@ -158,16 +170,7 @@ asio::awaitable<void> saveProfile(
         "locale=EXCLUDED.locale,picture_url=EXCLUDED.picture_url,"
         "avatar_source=EXCLUDED.avatar_source,"
         "updated_at_ms=EXCLUDED.updated_at_ms",
-        {std::string{identity.value()}, optionalText(value->displayName()),
-         optionalText(value->preferredUsername()), optionalText(value->email()),
-         value->emailVerified() ? "true" : "false",
-         optionalText(value->phoneNumber()),
-         value->phoneNumberVerified() ? "true" : "false",
-         optionalText(value->locale()), optionalText(value->pictureUrl()),
-         std::string{value->avatarSource()},
-         std::to_string(value->createdAt().time_since_epoch().count()),
-         std::to_string(value->updatedAt().time_since_epoch().count())},
-        remaining(deadline)));
+        std::move(writeParams), remaining(deadline)));
 }
 
 asio::awaitable<void> rollback(
@@ -185,10 +188,11 @@ asio::awaitable<bool> activeTarget(
 {
     // Lock the canonical row until COMMIT. A concurrent lifecycle transition
     // cannot make this target inactive in the middle of linking/session issue.
+    Params params{std::move(identity), std::move(organization)};
     const auto rows = co_await connection.query(
         "SELECT id FROM openproof.identities "
         "WHERE id=$1 AND organization_id=$2 AND status=0 FOR SHARE",
-        {std::move(identity), std::move(organization)}, remaining(deadline));
+        std::move(params), remaining(deadline));
     if (rows.rows.size() > 1U)
         throw std::runtime_error{"Duplicate canonical identities"};
     co_return !rows.rows.empty();
@@ -200,6 +204,12 @@ asio::awaitable<bool> refreshExternal(
     std::string owner,
     Deadline deadline)
 {
+    Params params{
+        std::string{external.providerId().value()},
+        std::string{external.subject().value()}, std::move(owner),
+        optionalText(external.displayName()),
+        optionalText(external.preferredUsername()),
+        optionalText(external.pictureUrl())};
     const auto rows = co_await connection.query(
         "UPDATE openproof.external_identities SET "
         "display_name=COALESCE(NULLIF($4,''),display_name),"
@@ -208,11 +218,7 @@ asio::awaitable<bool> refreshExternal(
         "ELSE COALESCE(NULLIF($6,''),picture_url) END "
         "WHERE provider=$1 AND external_subject=$2 AND identity_id=$3 "
         "RETURNING identity_id",
-        {std::string{external.providerId().value()},
-         std::string{external.subject().value()}, std::move(owner),
-         optionalText(external.displayName()),
-         optionalText(external.preferredUsername()),
-         optionalText(external.pictureUrl())}, remaining(deadline));
+        std::move(params), remaining(deadline));
     if (rows.rows.size() > 1U)
         throw std::runtime_error{"Duplicate external account ownership"};
     co_return rows.rows.size() == 1U;
@@ -267,14 +273,16 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
         auto lease = co_await m_impl->pool.acquire();
         auto& connection = lease.connection();
         static_cast<void>(co_await connection.query("BEGIN", {}, remaining(deadline)));
+        Params ownerParams{
+            std::string{outcome.provider().value()},
+            std::string{outcome.subject().value()},
+            std::string{m_impl->organization.value()}};
         const auto owner = co_await connection.query(
             "SELECT i.id FROM openproof.external_identities e "
             "JOIN openproof.identities i ON i.id=e.identity_id "
             "WHERE e.provider=$1 AND e.external_subject=$2 "
             "AND i.organization_id=$3 AND i.status=0 FOR SHARE OF i",
-            {std::string{outcome.provider().value()},
-             std::string{outcome.subject().value()},
-             std::string{m_impl->organization.value()}}, remaining(deadline));
+            std::move(ownerParams), remaining(deadline));
         if (owner.rows.empty()) {
             co_await rollback(connection, deadline);
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
@@ -344,6 +352,13 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
                 "The target canonical identity is not active.");
         }
         const auto external = externalRef(outcome);
+        Params linkParams{
+            std::string{outcome.provider().value()},
+            std::string{outcome.subject().value()}, std::string{target.value()},
+            std::to_string(completedAt.time_since_epoch().count()),
+            optionalText(external.displayName()),
+            optionalText(external.preferredUsername()),
+            optionalText(external.pictureUrl())};
         const auto linked = co_await connection.query(
             "INSERT INTO openproof.external_identities("
             "provider,external_subject,identity_id,linked_at_ms,"
@@ -356,12 +371,7 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
             "picture_url=COALESCE(EXCLUDED.picture_url,openproof.external_identities.picture_url) "
             "WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id "
             "RETURNING identity_id",
-            {std::string{outcome.provider().value()},
-             std::string{outcome.subject().value()}, std::string{target.value()},
-             std::to_string(completedAt.time_since_epoch().count()),
-             optionalText(external.displayName()),
-             optionalText(external.preferredUsername()),
-             optionalText(external.pictureUrl())}, remaining(deadline));
+            std::move(linkParams), remaining(deadline));
         if (linked.rows.empty()) {
             co_await rollback(connection, deadline);
             co_return foundation::fail(foundation::ErrorCode::Conflict,
