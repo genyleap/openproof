@@ -566,5 +566,33 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     ASSERT_EQ(PQntuples(raced.get()), 1);
     EXPECT_STREQ(PQgetvalue(raced.get(), 0, 0),
         firstAccepted ? seed.owner.c_str() : seed.secondOwner.c_str());
+
+    // Repeating an already verified login with exactly the same trusted
+    // presentation must not allocate a new canonical profile row version.
+    // PostgreSQL's ctid/xmin pair observes the physical row and transaction.
+    const auto beforeNoop = execute(fixture.get(),
+        "SELECT ctid::text,xmin::text FROM openproof.identity_profiles "
+        "WHERE identity_id=$1", {seed.owner});
+    ASSERT_EQ(PQntuples(beforeNoop.get()), 1);
+    const std::string beforeCtid{PQgetvalue(beforeNoop.get(), 0, 0)};
+    const std::string beforeXmin{PQgetvalue(beforeNoop.get(), 0, 1)};
+
+    io.restart();
+    // The outcome must outlive the coroutine frame: finishLoginAsync takes
+    // a const reference and co_spawn can suspend before reading the proof.
+    auto stableOutcome = verified(seed.subject, "provider-proposed");
+    auto noChangeFuture = asio::co_spawn(io, canonical.finishLoginAsync(
+        stableOutcome, kNow), asio::use_future);
+    io.run();
+    auto noChange = noChangeFuture.get();
+    ASSERT_TRUE(noChange);
+    EXPECT_EQ(noChange->value(), seed.owner);
+
+    const auto afterNoop = execute(fixture.get(),
+        "SELECT ctid::text,xmin::text FROM openproof.identity_profiles "
+        "WHERE identity_id=$1", {seed.owner});
+    ASSERT_EQ(PQntuples(afterNoop.get()), 1);
+    EXPECT_STREQ(PQgetvalue(afterNoop.get(), 0, 0), beforeCtid.c_str());
+    EXPECT_STREQ(PQgetvalue(afterNoop.get(), 0, 1), beforeXmin.c_str());
 }
 } // namespace

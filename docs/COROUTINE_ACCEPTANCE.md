@@ -1557,3 +1557,21 @@ ephemeral SQL runner. SQL transaction, concurrent access and organization
 status behavior remain *unverified dynamically* until they are executed
 against the isolated temporary PostgreSQL cluster. No production binding
 or release approval is granted by compilation and offline tests alone.
+
+
+#### Canonical no-op profile persistence optimization (2026-11-01)
+
+The new native PostgreSQL profile upsert now includes a null-safe
+`IS DISTINCT FROM` predicate over every field actually updated. Repeated
+logins whose trusted presentation and contact attributes have not changed
+therefore do not perform a physical profile UPDATE or generate another row
+version/WAL record. This preserves existing profile claim precedence,
+timestamp behavior and transactional lifecycle locks; it does not skip
+the ownership or active-tenant checks.
+
+The isolated real-SQL acceptance case records the profile's PostgreSQL
+`ctid` and `xmin`, repeats an unchanged login, and requires both markers
+to remain unchanged. This checks absence of a heap rewrite; it is **not**
+a throughput or latency benchmark. The new C++ implementation has no
+production wiring. The SQL assertion remains unexecuted while the remote
+command policy blocks the private-cluster runner.

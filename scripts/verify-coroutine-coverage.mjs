@@ -108,6 +108,7 @@ const checked = segments.map(([name, relative]) => {
       ["connection presentation-only claims", /ProfilePurpose::Connection/],
       ["login verified-contact claims", /ProfilePurpose::Login/],
       ["profile domain refresh", /co_await\s+saveProfile\s*\(/],
+      ["no-op profile WAL suppression", /IS DISTINCT FROM ROW\(EXCLUDED\.display_name/],
       ["SQL commit", /co_await\s+connection\.query\s*\(\s*"COMMIT"/],
       ["bounded coroutine pool", /co_await\s+m_impl->pool\.acquire\s*\(/]
     ];

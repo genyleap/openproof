@@ -181,7 +181,24 @@ asio::awaitable<void> saveProfile(
         "phone_number_verified=EXCLUDED.phone_number_verified,"
         "locale=EXCLUDED.locale,picture_url=EXCLUDED.picture_url,"
         "avatar_source=EXCLUDED.avatar_source,"
-        "updated_at_ms=EXCLUDED.updated_at_ms",
+        "updated_at_ms=EXCLUDED.updated_at_ms "
+        // An unchanged login profile should not allocate another heap tuple
+        // or generate unnecessary WAL/replication churn on every login.
+        "WHERE ROW(openproof.identity_profiles.display_name,"
+        "openproof.identity_profiles.preferred_username,"
+        "openproof.identity_profiles.email,"
+        "openproof.identity_profiles.email_verified,"
+        "openproof.identity_profiles.phone_number,"
+        "openproof.identity_profiles.phone_number_verified,"
+        "openproof.identity_profiles.locale,"
+        "openproof.identity_profiles.picture_url,"
+        "openproof.identity_profiles.avatar_source,"
+        "openproof.identity_profiles.updated_at_ms) "
+        "IS DISTINCT FROM ROW(EXCLUDED.display_name,"
+        "EXCLUDED.preferred_username,EXCLUDED.email,EXCLUDED.email_verified,"
+        "EXCLUDED.phone_number,EXCLUDED.phone_number_verified,"
+        "EXCLUDED.locale,EXCLUDED.picture_url,EXCLUDED.avatar_source,"
+        "EXCLUDED.updated_at_ms)",
         std::move(writeParams), remaining(deadline)));
 }
 
