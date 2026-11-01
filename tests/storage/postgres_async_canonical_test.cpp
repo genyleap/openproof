@@ -23,6 +23,7 @@
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.profile;
 import openproof.identity.provider;
 
 namespace {
@@ -99,10 +100,15 @@ using Result = std::unique_ptr<PGresult, PgResultDeleter>;
 }
 
 [[nodiscard]] idp::AuthenticationOutcome verified(
-    std::string subject, std::string preferredUsername = "native-user")
+    std::string subject, std::string preferredUsername = "native-user",
+    std::optional<std::string> verifiedEmail = std::nullopt)
 {
     idp::VerifiedClaims claims;
     claims.set(idp::ClaimName::PreferredUsername, std::move(preferredUsername));
+    if (verifiedEmail) {
+        claims.set(idp::ClaimName::Email, std::move(*verifiedEmail));
+        claims.set(idp::ClaimName::EmailVerified, "true");
+    }
     auto result = idp::AuthenticationOutcome::create(
         idp::ProviderId{"native-canonical-provider"},
         idp::ExternalSubject{std::move(subject)},
@@ -118,30 +124,41 @@ struct Seed final {
         + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     std::string org = "nc-org-" + suffix;
     std::string foreignOrg = "nc-foreign-org-" + suffix;
+    std::string suspendedOrg = "nc-suspended-org-" + suffix;
     std::string owner = "nc-owner-" + suffix;
     std::string secondOwner = "nc-second-" + suffix;
+    std::string freshLoginOwner = "nc-fresh-login-" + suffix;
+    std::string simultaneousOwner = "nc-simultaneous-" + suffix;
     std::string lockedOwner = "nc-locked-" + suffix;
     std::string foreignOwner = "nc-foreign-owner-" + suffix;
+    std::string suspendedOwner = "nc-suspended-owner-" + suffix;
     std::string subject = "nc-existing-" + suffix;
+    std::string freshLoginSubject = "nc-fresh-provider-" + suffix;
+    std::string simultaneousSubjectA = "nc-sim-a-" + suffix;
+    std::string simultaneousSubjectB = "nc-sim-b-" + suffix;
     std::string lockedSubject = "nc-locked-external-" + suffix;
     std::string foreignSubject = "nc-foreign-external-" + suffix;
+    std::string suspendedSubject = "nc-suspended-external-" + suffix;
     std::string newSubject = "nc-new-" + suffix;
     std::string racingSubject = "nc-race-" + suffix;
     std::string invalidSubject = "nc-rollback-" + suffix;
 
     void install(PGconn* connection) const
     {
-        for (const auto& id : {org, foreignOrg}) {
+        for (const auto& id : {org, foreignOrg, suspendedOrg}) {
             static_cast<void>(execute(connection,
                 "INSERT INTO openproof.organizations("
-                "id,name,state,created_at_ms) VALUES($1,'Isolated Coroutine Test',0,$2)",
-                {id, "1770000000000"}));
+                "id,name,state,created_at_ms) VALUES($1,'Isolated Coroutine Test',$2,$3)",
+                {id, id == suspendedOrg ? "1" : "0", "1770000000000"}));
         }
         for (const auto& [id, tenant, status] :
             {std::tuple{owner, org, "0"},
              std::tuple{secondOwner, org, "0"},
+             std::tuple{freshLoginOwner, org, "0"},
+             std::tuple{simultaneousOwner, org, "0"},
              std::tuple{lockedOwner, org, "2"},
-             std::tuple{foreignOwner, foreignOrg, "0"}}) {
+             std::tuple{foreignOwner, foreignOrg, "0"},
+             std::tuple{suspendedOwner, suspendedOrg, "0"}}) {
             static_cast<void>(execute(connection,
                 "INSERT INTO openproof.identities("
                 "id,organization_id,kind,status,created_at_ms) "
@@ -150,8 +167,12 @@ struct Seed final {
         }
         for (const auto& [subjectValue, linked] :
             {std::pair{subject, owner},
+             std::pair{freshLoginSubject, freshLoginOwner},
+             std::pair{simultaneousSubjectA, simultaneousOwner},
+             std::pair{simultaneousSubjectB, simultaneousOwner},
              std::pair{lockedSubject, lockedOwner},
-             std::pair{foreignSubject, foreignOwner}}) {
+             std::pair{foreignSubject, foreignOwner},
+             std::pair{suspendedSubject, suspendedOwner}}) {
             static_cast<void>(execute(connection,
                 "INSERT INTO openproof.external_identities("
                 "provider,external_subject,identity_id,linked_at_ms) "
@@ -168,12 +189,17 @@ struct Seed final {
 
 struct IntegrationResult {
     bool login{};
+    bool freshLogin{};
+    bool repeatedLogin{};
     bool wrongTenantDenied{};
     bool inactiveDenied{};
     bool unlinkedDenied{};
     bool targetAuthorized{};
     bool inactiveTargetDenied{};
     bool foreignTargetDenied{};
+    bool suspendedTenantLoginDenied{};
+    bool suspendedTenantTargetDenied{};
+    bool suspendedTenantLinkDenied{};
     bool connectionAttached{};
     bool ownerConflictDenied{};
     bool invalidProfileDenied{};
@@ -182,11 +208,21 @@ struct IntegrationResult {
 asio::awaitable<void> checkRealDatabase(
     pg::CoroutinePostgresCanonicalFinalizer& canonical,
     pg::CoroutinePostgresCanonicalFinalizer& wrongTenant,
+    pg::CoroutinePostgresCanonicalFinalizer& suspendedTenant,
     const Seed& seed, IntegrationResult& checks)
 {
     const auto owner = co_await canonical.finishLoginAsync(
         verified(seed.subject, "provider-proposed"), kNow);
     checks.login = owner && owner->value() == seed.owner;
+
+    // The first login to a previously linked, profile-less identity may
+    // persist provider-verified email. Subsequent logins must NOT replace it.
+    auto fresh = co_await canonical.finishLoginAsync(
+        verified(seed.freshLoginSubject, "initial-user", "first@example.test"), kNow);
+    checks.freshLogin = fresh && fresh->value() == seed.freshLoginOwner;
+    auto repeated = co_await canonical.finishLoginAsync(
+        verified(seed.freshLoginSubject, "later-user", "second@example.test"), kNow);
+    checks.repeatedLogin = repeated && repeated->value() == seed.freshLoginOwner;
 
     auto wrong = co_await wrongTenant.finishLoginAsync(
         verified(seed.subject), kNow);
@@ -215,8 +251,26 @@ asio::awaitable<void> checkRealDatabase(
     checks.foreignTargetDenied = !foreign
         && foreign.error().code() == fnd::ErrorCode::AuthenticationFailed;
 
+    // An active identity inside a suspended organization cannot complete
+    // authentication or linking. Test the three native entry points, not
+    // just the read-only preflight.
+    auto suspendedLogin = co_await suspendedTenant.finishLoginAsync(
+        verified(seed.suspendedSubject), kNow);
+    checks.suspendedTenantLoginDenied = !suspendedLogin
+        && suspendedLogin.error().code() == fnd::ErrorCode::AuthenticationFailed;
+    auto suspendedTarget = co_await suspendedTenant.authorizeConnectionTargetAsync(
+        ids::IdentityId{seed.suspendedOwner});
+    checks.suspendedTenantTargetDenied = !suspendedTarget
+        && suspendedTarget.error().code() == fnd::ErrorCode::AuthenticationFailed;
+    auto suspendedLink = co_await suspendedTenant.finishConnectionAsync(
+        verified("nc-new-in-suspended-org"), ids::IdentityId{seed.suspendedOwner},
+        kNow);
+    checks.suspendedTenantLinkDenied = !suspendedLink
+        && suspendedLink.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
     auto connected = co_await canonical.finishConnectionAsync(
-        verified(seed.newSubject), ids::IdentityId{seed.secondOwner}, kNow);
+        verified(seed.newSubject, "linked-user", "untrusted-link@example.test"),
+        ids::IdentityId{seed.secondOwner}, kNow);
     checks.connectionAttached = connected
         && connected->subject().value() == seed.newSubject;
 
@@ -245,6 +299,15 @@ asio::awaitable<void> checkRealDatabase(
         && refused.error().code() == fnd::ErrorCode::Unavailable;
 }
 
+asio::awaitable<void> raceFirstCanonicalProfile(
+    pg::CoroutinePostgresCanonicalFinalizer& canonical,
+    std::string subject, std::string identity, bool& accepted)
+{
+    auto result = co_await canonical.finishLoginAsync(
+        verified(std::move(subject)), kNow);
+    accepted = result && result->value() == identity;
+}
+
 asio::awaitable<void> raceForSameExternalIdentity(
     pg::CoroutinePostgresCanonicalFinalizer& canonical,
     std::string subject, ids::IdentityId target,
@@ -254,6 +317,43 @@ asio::awaitable<void> raceForSameExternalIdentity(
         verified(std::move(subject)), std::move(target), kNow);
     accepted = linked.has_value();
     conflicted = !linked && linked.error().code() == fnd::ErrorCode::Conflict;
+}
+
+TEST(PostgresCanonicalCoroutineTest, ConnectionPresentationCannotClaimVerifiedContactData)
+{
+    // This domain invariant must be exercised even when disposable SQL is
+    // unavailable. The finalizer chooses the presentation-only operation
+    // when a connection creates its first profile.
+    idp::VerifiedClaims claims;
+    claims.set(idp::ClaimName::PreferredUsername, "display-only");
+    claims.set(idp::ClaimName::Email, "external-provider@example.test");
+    claims.set(idp::ClaimName::EmailVerified, "true");
+    claims.set(idp::ClaimName::PhoneNumber, "+12025550123");
+    claims.set(idp::ClaimName::PhoneNumberVerified, "true");
+
+    auto connected = openproof::identity::profile::IdentityProfile::create(
+        ids::IdentityId{"connected-profile-test"}, kNow);
+    ASSERT_TRUE(connected);
+    ASSERT_TRUE(connected->refreshPresentationClaims(claims, kNow));
+    ASSERT_TRUE(connected->preferredUsername().has_value());
+    EXPECT_EQ(*connected->preferredUsername(), "display-only");
+    EXPECT_FALSE(connected->email().has_value());
+    EXPECT_FALSE(connected->emailVerified());
+    EXPECT_FALSE(connected->phoneNumber().has_value());
+    EXPECT_FALSE(connected->phoneNumberVerified());
+
+    // A genuine first login on a pre-linked identity uses the distinct
+    // verified-claims path, and may establish a verified contact credential.
+    auto loggedIn = openproof::identity::profile::IdentityProfile::create(
+        ids::IdentityId{"login-profile-test"}, kNow);
+    ASSERT_TRUE(loggedIn);
+    ASSERT_TRUE(loggedIn->applyVerifiedClaims(claims, kNow));
+    ASSERT_TRUE(loggedIn->email().has_value());
+    EXPECT_EQ(*loggedIn->email(), "external-provider@example.test");
+    EXPECT_TRUE(loggedIn->emailVerified());
+    ASSERT_TRUE(loggedIn->phoneNumber().has_value());
+    EXPECT_EQ(*loggedIn->phoneNumber(), "+12025550123");
+    EXPECT_TRUE(loggedIn->phoneNumberVerified());
 }
 
 TEST(PostgresCanonicalCoroutineTest, RejectsProductionOrUntrustedSqlEndpoints)
@@ -349,18 +449,30 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
         std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
         std::chrono::milliseconds{2000}};
 
+    pg::CoroutinePostgresCanonicalFinalizer suspendedTenant{
+        io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.suspendedOrg}, 1U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+
     IntegrationResult checks;
     auto future = asio::co_spawn(io,
-        checkRealDatabase(canonical, wrongTenant, seed, checks), asio::use_future);
+        checkRealDatabase(canonical, wrongTenant, suspendedTenant, seed, checks),
+        asio::use_future);
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(checks.login);
+    EXPECT_TRUE(checks.freshLogin);
+    EXPECT_TRUE(checks.repeatedLogin);
     EXPECT_TRUE(checks.wrongTenantDenied);
     EXPECT_TRUE(checks.inactiveDenied);
     EXPECT_TRUE(checks.unlinkedDenied);
     EXPECT_TRUE(checks.targetAuthorized);
     EXPECT_TRUE(checks.inactiveTargetDenied);
     EXPECT_TRUE(checks.foreignTargetDenied);
+    EXPECT_TRUE(checks.suspendedTenantLoginDenied);
+    EXPECT_TRUE(checks.suspendedTenantTargetDenied);
+    EXPECT_TRUE(checks.suspendedTenantLinkDenied);
     EXPECT_TRUE(checks.connectionAttached);
     EXPECT_TRUE(checks.ownerConflictDenied);
     EXPECT_TRUE(checks.invalidProfileDenied);
@@ -371,6 +483,25 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
         {seed.invalidSubject});
     ASSERT_EQ(PQntuples(notCommitted.get()), 1);
     EXPECT_STREQ(PQgetvalue(notCommitted.get(), 0, 0), "0");
+
+    // Connecting a new provider is a presentation-only operation. It must
+    // never seed a second provider's email verification into a canonical
+    // identity which had no profile before linking.
+    const auto linkedProfile = execute(fixture.get(),
+        "SELECT email IS NULL,email_verified,preferred_username "
+        "FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.secondOwner});
+    ASSERT_EQ(PQntuples(linkedProfile.get()), 1);
+    EXPECT_STREQ(PQgetvalue(linkedProfile.get(), 0, 0), "t");
+    EXPECT_STREQ(PQgetvalue(linkedProfile.get(), 0, 1), "f");
+    EXPECT_STREQ(PQgetvalue(linkedProfile.get(), 0, 2), "linked-user");
+
+    const auto loginProfile = execute(fixture.get(),
+        "SELECT email,email_verified FROM openproof.identity_profiles "
+        "WHERE identity_id=$1", {seed.freshLoginOwner});
+    ASSERT_EQ(PQntuples(loginProfile.get()), 1);
+    EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 0), "first@example.test");
+    EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 1), "t");
 
     const auto profile = execute(fixture.get(),
         "SELECT display_name,preferred_username FROM openproof.identity_profiles "
@@ -404,6 +535,29 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_NE(firstConflict, secondConflict);
     EXPECT_EQ(firstAccepted, secondConflict);
     EXPECT_EQ(secondAccepted, firstConflict);
+
+    // Two distinct external accounts linked to the same profile-less
+    // canonical identity must both authenticate, while exactly one initial
+    // profile row is created under the canonical row's transaction lock.
+    bool bothLoginA = false;
+    bool bothLoginB = false;
+    io.restart();
+    auto loginA = asio::co_spawn(io, raceFirstCanonicalProfile(
+        canonical, seed.simultaneousSubjectA, seed.simultaneousOwner, bothLoginA),
+        asio::use_future);
+    auto loginB = asio::co_spawn(io, raceFirstCanonicalProfile(
+        canonical, seed.simultaneousSubjectB, seed.simultaneousOwner, bothLoginB),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(loginA.get());
+    ASSERT_NO_THROW(loginB.get());
+    EXPECT_TRUE(bothLoginA);
+    EXPECT_TRUE(bothLoginB);
+    const auto profiles = execute(fixture.get(),
+        "SELECT COUNT(*)::text FROM openproof.identity_profiles "
+        "WHERE identity_id=$1", {seed.simultaneousOwner});
+    ASSERT_EQ(PQntuples(profiles.get()), 1);
+    EXPECT_STREQ(PQgetvalue(profiles.get(), 0, 0), "1");
 
     const auto raced = execute(fixture.get(),
         "SELECT identity_id FROM openproof.external_identities "

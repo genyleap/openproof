@@ -89,6 +89,11 @@ using Params = std::vector<std::optional<std::string>>;
     return value.value_or(std::string{});
 }
 
+enum class ProfilePurpose {
+    Login,
+    Connection
+};
+
 [[nodiscard]] core::ExternalIdentityRef externalRef(
     const idp::AuthenticationOutcome& outcome)
 {
@@ -104,7 +109,8 @@ asio::awaitable<void> saveProfile(
     core::IdentityId identity,
     const idp::VerifiedClaims& claims,
     foundation::Instant completedAt,
-    Deadline deadline)
+    Deadline deadline,
+    ProfilePurpose purpose)
 {
     // Lock a profile across read, domain validation and write. The same
     // physical lease also holds the identity lifecycle lock until COMMIT.
@@ -123,7 +129,13 @@ asio::awaitable<void> saveProfile(
     if (rows.rows.empty()) {
         value = profile::IdentityProfile::create(identity, completedAt);
         if (!value) throw std::runtime_error{"Cannot create canonical profile"};
-        const auto applied = value->applyVerifiedClaims(claims, completedAt);
+        // A new pre-linked login can seed verified contact data, matching
+        // the synchronous login flow. Adding a second login method must
+        // NEVER transfer that provider's contact claims into a previously
+        // profile-less canonical identity: connection is presentation-only.
+        const auto applied = purpose == ProfilePurpose::Login
+            ? value->applyVerifiedClaims(claims, completedAt)
+            : value->refreshPresentationClaims(claims, completedAt);
         if (!applied) throw std::runtime_error{"Invalid verified profile claims"};
     } else {
         const auto& fields = rows.rows.front();
@@ -193,9 +205,11 @@ asio::awaitable<bool> activeTarget(
     // Preflight authorization is read-only and does not retain this lock.
     Params params{std::move(identity), std::move(organization)};
     const auto rows = co_await connection.query(
-        std::string{"SELECT id FROM openproof.identities "
-                    "WHERE id=$1 AND organization_id=$2 AND status=0"}
-            + (mutationLock ? " FOR UPDATE" : ""),
+        std::string{"SELECT i.id FROM openproof.identities i "
+                    "JOIN openproof.organizations o ON o.id=i.organization_id "
+                    "WHERE i.id=$1 AND i.organization_id=$2 "
+                    "AND i.status=0 AND o.state=0"}
+            + (mutationLock ? " FOR UPDATE OF i FOR SHARE OF o" : ""),
         std::move(params), remaining(deadline));
     if (rows.rows.size() > 1U)
         throw std::runtime_error{"Duplicate canonical identities"};
@@ -283,8 +297,10 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
         const auto owner = co_await connection.query(
             "SELECT i.id FROM openproof.external_identities e "
             "JOIN openproof.identities i ON i.id=e.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
             "WHERE e.provider=$1 AND e.external_subject=$2 "
-            "AND i.organization_id=$3 AND i.status=0 FOR UPDATE OF i",
+            "AND i.organization_id=$3 AND i.status=0 AND o.state=0 "
+            "FOR UPDATE OF i FOR SHARE OF o",
             std::move(ownerParams), remaining(deadline));
         if (owner.rows.empty()) {
             co_await rollback(connection, deadline);
@@ -301,7 +317,9 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                 "Canonical identity ownership changed.");
         }
-        co_await saveProfile(connection, identity, outcome.claims(), completedAt, deadline);
+        co_await saveProfile(
+            connection, identity, outcome.claims(), completedAt,
+            deadline, ProfilePurpose::Login);
         static_cast<void>(co_await connection.query(
             "COMMIT", {}, remaining(deadline)));
         co_return identity;
@@ -383,7 +401,9 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
         if (linked.rows.size() != 1U || linked.rows.front().size() != 1U
             || required(linked.rows.front().front()) != target.value())
             throw std::runtime_error{"Invalid canonical ownership write result"};
-        co_await saveProfile(connection, target, outcome.claims(), completedAt, deadline);
+        co_await saveProfile(
+            connection, target, outcome.claims(), completedAt,
+            deadline, ProfilePurpose::Connection);
         static_cast<void>(co_await connection.query(
             "COMMIT", {}, remaining(deadline)));
         co_return external;

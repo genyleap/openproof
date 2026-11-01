@@ -98,11 +98,15 @@ const checked = segments.map(([name, relative]) => {
   if(relative==="src/storage/postgres/coroutine_canonical_finalizer.cpp"){
     const checks=[
       ["tenant-scoped canonical read", /i\.organization_id=\$3\s+AND\s+i\.status=0/],
-      ["active canonical target", /organization_id=\$2\s+AND\s+status=0/],
+      ["active canonical target", /i\.organization_id=\$2\s+AND\s+i\.status=0/],
+      ["active tenant lifecycle", /o\.state=0/],
+      ["tenant-row lifecycle lock", /FOR SHARE OF o/],
       ["canonical row lifecycle lock", /FOR UPDATE OF i/],
-      ["canonical profile serialization", /mutationLock\s*\?\s*" FOR UPDATE"\s*:\s*""/],
+      ["canonical profile serialization", /mutationLock\s*\?\s*" FOR UPDATE OF i FOR SHARE OF o"/],
       ["atomic owner-conflict guard", /ON CONFLICT\(provider,external_subject\) DO UPDATE/],
       ["no implicit owner reassignment", /WHERE openproof\.external_identities\.identity_id=EXCLUDED\.identity_id/],
+      ["connection presentation-only claims", /ProfilePurpose::Connection/],
+      ["login verified-contact claims", /ProfilePurpose::Login/],
       ["profile domain refresh", /co_await\s+saveProfile\s*\(/],
       ["SQL commit", /co_await\s+connection\.query\s*\(\s*"COMMIT"/],
       ["bounded coroutine pool", /co_await\s+m_impl->pool\.acquire\s*\(/]

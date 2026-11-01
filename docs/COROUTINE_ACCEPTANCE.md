@@ -1520,3 +1520,40 @@ real disposable-SQL test was skipped. The server's Remote Operations
 restricted command policy refuses executing the new shell runner, so **real
 SQL integration and concurrency remain unverified**. A green source scan
 must not be interpreted as SQL test acceptance.
+
+
+#### Canonical claim-purpose and tenant lifecycle hardening (2026-11-01)
+
+Review against the existing synchronous AuthenticationService found a
+security-significant parity error: when connecting a second provider to a
+canonical identity without an existing profile, the new PostgreSQL adapter
+called `applyVerifiedClaims` and incorrectly persisted contact/email
+verification claims. The legacy *connection* flow deliberately seeds only
+presentation attributes. The native adapter now distinguishes two purposes:
+a first *login* on an already linked identity may initialize verified
+contacts, while a *connection* may initialize only non-security presentation
+data. Subsequent logins preserve preexisting contact claims rather than
+silently replacing them with provider assertions.
+
+An offline domain-model regression test checks verified email/phone are
+never established by the connection presentation path, whereas an actual
+first-login `applyVerifiedClaims` can establish both. The disposable SQL
+scenario additionally verifies first login and re-login email precedence,
+and connecting a provider to an empty profile without transferring its
+email. Two different linked providers concurrently creating the same
+canonical profile are now covered by an atomic single-row assertion.
+
+The native SQL paths also join `openproof.organizations` and require
+`state=0` in addition to an active canonical identity and matching
+organization key; mutation transactions hold a SHARE lock on the active
+organization row until COMMIT, preventing a concurrent suspension from
+slipping through finalization. The existing canonical-identity row lock
+continues to serialize first-profile initialization. SQL integration
+includes an active identity under a suspended tenant and requires all
+three native login/link entry points to fail closed.
+
+**Still blocked:** the remote execution policy prevents launching the
+ephemeral SQL runner. SQL transaction, concurrent access and organization
+status behavior remain *unverified dynamically* until they are executed
+against the isolated temporary PostgreSQL cluster. No production binding
+or release approval is granted by compilation and offline tests alone.
