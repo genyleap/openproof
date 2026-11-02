@@ -21,6 +21,7 @@ const segments = [
   ["PostgreSQL coroutine session issuance", "src/storage/postgres/coroutine_session_service.cpp"],
   ["PostgreSQL coroutine canonical finalization", "src/storage/postgres/coroutine_canonical_finalizer.cpp"],
   ["PostgreSQL bounded coroutine connection pool", "src/storage/postgres/async_pool.cpp"],
+  ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
   ["HTTP administration API", "src/administration/administration.cpp"],
@@ -161,6 +162,20 @@ const checked = segments.map(([name, relative]) => {
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)
         || !/\bco_await\s+issue\s*\(/.test(source))
       issues.push({line:0,kind:"missing native session issuer adapter",expression:"issueAsync / co_await issue"});
+  }
+  if(relative==="src/storage/postgres/coroutine_session_listener.cpp"){
+    if(!/if\s*\(\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
+      issues.push({line:0,kind:"coroutine session listener accepts disabled native fallback",
+        expression:"!fallback.nativeEnabled()"});
+    if(!/throw\s+std::invalid_argument/.test(source))
+      issues.push({line:0,kind:"listener composition must reject inactive fallback",
+        expression:"throw std::invalid_argument"});
+    if(!/co_return\s+co_await\s+fallback\.handleAsync\s*\(/.test(source))
+      issues.push({line:0,kind:"listener fallback must use native awaitable dispatch",
+        expression:"co_await fallback.handleAsync"});
+    if(/\bfallback\.handle\s*\(/.test(source))
+      issues.push({line:0,kind:"listener fallback may not call synchronous handler",
+        expression:"fallback.handle("});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().

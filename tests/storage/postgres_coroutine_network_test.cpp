@@ -59,10 +59,16 @@ using namespace std::chrono_literals;
 struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     std::atomic<int>* observed;
     std::atomic<bool> throwAfterSuspend{false};
+    std::atomic<bool> enabled{true};
+    std::atomic<int> blockingCalls{0};
     explicit NativeFallback(std::atomic<int>& counter) : observed(&counter) {}
+    [[nodiscard]] bool nativeEnabled() const noexcept override {
+        return enabled.load(std::memory_order_acquire);
+    }
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
-        return gw::HttpResponse{503, {}, ""};
+        blockingCalls.fetch_add(1, std::memory_order_relaxed);
+        return gw::HttpResponse{503, {}, "blocking fallback must not execute"};
     }
     [[nodiscard]] asio::awaitable<gw::HttpResponse>
     handleAsync(gw::HttpRequest) override
@@ -108,6 +114,32 @@ struct Fixture {
         databaseIo.stop();
     }
 };
+
+TEST(PostgresCoroutineNetworkTest, DisabledFallbackIsRejectedAtComposition)
+{
+    Fixture f;
+    f.fallback.enabled.store(false, std::memory_order_release);
+    EXPECT_THROW(
+        (pg::CoroutineSessionListenerStack{f.service, f.limiter, f.fallback}),
+        std::invalid_argument);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
+}
+
+TEST(PostgresCoroutineNetworkTest, DisabledFallbackFailsClosedOnLiveSocket)
+{
+    Fixture f;
+    ASSERT_TRUE(f.listener.start());
+    // Dynamic capabilities can be withdrawn after listener construction.
+    f.fallback.enabled.store(false, std::memory_order_release);
+    const auto result = send(
+        f.listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(result.result_int(), 503);
+    EXPECT_EQ(result.base()[wire::field::cache_control], "no-store");
+    EXPECT_NE(result.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
+}
 
 TEST(PostgresCoroutineNetworkTest, SocketRoutesThroughAwaitableForNonSession)
 {

@@ -1,4 +1,5 @@
 #include <boost/asio/awaitable.hpp>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -45,11 +46,30 @@ CoroutineSessionListenerStack::CoroutineSessionListenerStack(
           sessions, limiter,
           [&fallback](gateway::HttpRequest request)
               -> asio::awaitable<gateway::HttpResponse> {
-              // Do not call the fallback's synchronous handle() method.
+              // Native support may be revoked by a downstream capability
+              // (for example, its async session issuer becoming unavailable).
+              // Never call a disabled coroutine or its synchronous handler.
+              if (!fallback.nativeEnabled()) {
+                  gateway::HttpResponse unavailable{
+                      foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
+                      gateway::Headers{{"content-type", "application/json"}},
+                      foundation::toClientJson(
+                          foundation::Error{foundation::ErrorCode::Unavailable},
+                          request.correlation().value())};
+                  unavailable.setHeader("cache-control", "no-store");
+                  unavailable.setHeader("x-content-type-options", "nosniff");
+                  co_return unavailable;
+              }
               co_return co_await fallback.handleAsync(std::move(request));
           }),
       m_network(m_application)
 {
+    // The listener's native route must never silently drive a fallback
+    // that advertises only its synchronous compatibility implementation.
+    if (!fallback.nativeEnabled()) {
+        throw std::invalid_argument{
+            "The coroutine session listener requires an enabled async fallback"};
+    }
 }
 
 gateway::http::CoroutineHttpHandler&

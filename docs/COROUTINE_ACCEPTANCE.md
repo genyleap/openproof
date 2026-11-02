@@ -1844,3 +1844,29 @@ not merely wrapping them in an isolated Asio event loop. The normal
 native entry points and their 16 targeted passing C++ tests remain valid;
 production wiring, real-service E2E, SQL integration, and comparative
 benchmarks are still required.
+
+#### Fail-closed native session listener composition (2026-11-03)
+
+The PostgreSQL coroutine-session listener previously assumed its fallback
+handler's native capability remained enabled, and directly awaited that
+handler even if the downstream `nativeEnabled()` capability was disabled.
+The listener stack now refuses construction with a disabled fallback.
+For live requests it rechecks the capability before dispatch, returns a
+sanitized HTTP 503 (with `no-store`/nosniff), and never invokes the
+downstream synchronous `handle()` implementation or its disabled coroutine.
+
+Two loopback C++ regressions have been added: rejecting disabled fallback
+at composition, and rejecting a fallback disabled after listener startup,
+with counters verifying neither synchronous nor async fallback ran.
+The strict migration inventory now names the listener implementation and
+requires both guards and explicit awaitable forwarding. A two-case
+source-only regression script passes.
+
+**C++ acceptance remains open:** a targeted build of
+`openproof_postgres_async_listener` revealed **208** dependent GCC16 C++
+module steps, and the managed build was cancelled immediately rather than
+saturating the production host. No modified listener or new C++ test binary
+has been compiled or executed in this checkpoint. The separately attempted
+Gateway target likewise stalled on the heavyweight `http.cpp` translation
+unit and was cancelled without a passing build. No CI, release, or deployment
+was triggered.
