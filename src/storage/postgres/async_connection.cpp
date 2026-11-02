@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <string_view>
 #include <cstddef>
 #include <cstdint>
@@ -186,8 +187,20 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         }
         return {};
     };
-    const std::string_view host = optionValue("host");
-    const std::string_view hostaddr = optionValue("hostaddr");
+    // libpq can inherit connection location from PGHOST/PGHOSTADDR/PGPORT
+    // when conninfo leaves these fields unspecified. Copy environment
+    // values before suspension instead of holding process-env pointers.
+    const auto effective = [&](std::string_view key, const char* envKey) {
+        const std::string_view explicitValue = optionValue(key);
+        if (!explicitValue.empty()) return std::string{explicitValue};
+        const char* inherited = std::getenv(envKey);
+        return inherited == nullptr ? std::string{} : std::string{inherited};
+    };
+    const std::string hostStorage = effective("host", "PGHOST");
+    const std::string hostaddrStorage = effective("hostaddr", "PGHOSTADDR");
+    const std::string portStorage = effective("port", "PGPORT");
+    const std::string_view host{hostStorage};
+    const std::string_view hostaddr{hostaddrStorage};
     const auto csv = [](std::string_view value) {
         std::vector<std::string_view> parts;
         do {
@@ -199,7 +212,7 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         return parts;
     };
     const auto hosts = csv(host);
-    const auto ports = csv(optionValue("port"));
+    const auto ports = csv(portStorage);
     const auto pinnedAddresses = csv(hostaddr);
     const auto numeric = [](std::string_view value) {
         boost::system::error_code error;
@@ -297,12 +310,16 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         for (const auto* option = options.get(); option->keyword; ++option) {
             if (option->val == nullptr || option->val[0] == '\0') continue;
             const std::string_view key{option->keyword};
-            if (key == "hostaddr") continue;
+            if (key == "host" || key == "hostaddr" || key == "port") continue;
             ownedKeys.emplace_back(option->keyword);
-            if (key == "host") ownedValues.emplace_back(resolvedHosts);
-            else if (key == "port" && ports.size() > 1U) {
-                ownedValues.emplace_back(resolvedPorts);
-            } else ownedValues.emplace_back(option->val);
+            ownedValues.emplace_back(option->val);
+        }
+        ownedKeys.emplace_back("host");
+        ownedValues.emplace_back(std::move(resolvedHosts));
+        if (!portStorage.empty()) {
+            ownedKeys.emplace_back("port");
+            ownedValues.emplace_back(ports.size() > 1U ? std::move(resolvedPorts)
+                                                       : portStorage);
         }
         ownedKeys.emplace_back("hostaddr");
         ownedValues.emplace_back(std::move(resolvedAddresses));

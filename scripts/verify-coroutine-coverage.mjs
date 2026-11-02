@@ -179,7 +179,10 @@ const checked = segments.map(([name, relative]) => {
       ["failed DNS hostname cannot suppress HA fallback", /if\s*\(error\s*\|\|\s*endpoints\.empty\s*\(\s*\)\)/],
       ["empty DNS result fails closed", /if\s*\(addressCount\s*==\s*0U\)/],
       ["partial hostaddr still resolves asynchronously", /const\s+auto\s+pinnedAddresses\s*=\s*csv\s*\(hostaddr\)/],
-      ["pinned hostaddr selection is explicit", /if\s*\(\s*!pinned\.empty\s*\(\s*\)\s*\)/]
+      ["pinned hostaddr selection is explicit", /if\s*\(\s*!pinned\.empty\s*\(\s*\)\s*\)/],
+      ["inherited hostname is explicit", /effective\s*\(\s*"host"\s*,\s*"PGHOST"\s*\)/],
+      ["inherited pinned address is explicit", /effective\s*\(\s*"hostaddr"\s*,\s*"PGHOSTADDR"\s*\)/],
+      ["inherited port list is explicit", /effective\s*\(\s*"port"\s*,\s*"PGPORT"\s*\)/]
     ]){
       if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
     }

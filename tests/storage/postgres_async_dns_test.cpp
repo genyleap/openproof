@@ -2,7 +2,9 @@
 
 #include <boost/asio.hpp>
 #include <chrono>
+#include <cstdlib>
 #include <future>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,6 +15,29 @@ namespace {
 namespace asio = boost::asio;
 namespace pg = openproof::storage::postgres::async_detail;
 using namespace std::chrono_literals;
+
+class ScopedEnv final {
+public:
+    ScopedEnv(const char* name, const char* replacement) : m_name(name)
+    {
+        if (const char* original = std::getenv(name)) {
+            m_previous = std::string{original};
+        }
+        const int status = replacement == nullptr
+            ? ::unsetenv(name) : ::setenv(name, replacement, 1);
+        if (status != 0) throw std::runtime_error{"Unable to set test environment"};
+    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+    ~ScopedEnv()
+    {
+        if (m_previous) (void)::setenv(m_name.c_str(), m_previous->c_str(), 1);
+        else (void)::unsetenv(m_name.c_str());
+    }
+private:
+    std::string m_name;
+    std::optional<std::string> m_previous;
+};
 
 void expectConnectionDenied(const std::string& dsn)
 {
@@ -103,6 +128,33 @@ TEST(PostgresAsyncDnsTest, ExplicitHostaddrAvoidsHostnameResolution)
 {
     expectConnectionDenied(
         "host=unresolvable.invalid hostaddr=127.0.0.1 port=1 "
+        "user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, InheritedPgHostUsesNativeDns)
+{
+    ScopedEnv pinned{"PGHOSTADDR", nullptr};
+    ScopedEnv host{"PGHOST", "localhost"};
+    ScopedEnv port{"PGPORT", "1"};
+    expectConnectionDenied(
+        "user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, InheritedPgHostAndPortListsPreserveFailover)
+{
+    ScopedEnv pinned{"PGHOSTADDR", nullptr};
+    ScopedEnv host{"PGHOST", "localhost,127.0.0.1"};
+    ScopedEnv port{"PGPORT", "1,1"};
+    expectConnectionDenied(
+        "user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, InheritedPgHostaddrDoesNotTriggerDns)
+{
+    ScopedEnv pinned{"PGHOSTADDR", "127.0.0.1"};
+    ScopedEnv host{"PGHOST", "unresolvable.invalid"};
+    ScopedEnv port{"PGPORT", "1"};
+    expectConnectionDenied(
         "user=openproof_test dbname=openproof_disposable_test");
 }
 

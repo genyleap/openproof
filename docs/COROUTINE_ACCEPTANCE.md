@@ -1939,9 +1939,9 @@ Parsed password options and the original DSN are wiped on every exit
 path and disposed of before libpq socket polling; C library internal
 copies are explicitly not claimed to be erased. Explicit `hostaddr`,
 Unix sockets, numeric hosts and fully pinned hostaddr lists use
-libpq's original path. Partial hostaddr lists are now resolved via Asio
-(see the following test record); implicit environment-dependent DNS
-remains a separate full-migration case.
+libpq's original path. Partial hostaddr lists and inherited PGHOST
+hostname defaults are now resolved via Asio (see following test records);
+PGSERVICE/service-file overrides require separate integration coverage.
 
 GCC 16.2 compiled and linked the modified `openproof_postgres_async_io`
 library with `-Werror` unchanged. A narrowly scoped `-fno-inline`
@@ -2009,3 +2009,26 @@ The release gate still counts 19 known blocking findings. Native
 environment-dependent hostname defaults, legacy synchronous storage,
 enterprise LDAP and HTTP API paths, successful live TLS/database HA,
 and comparative benchmarks remain outstanding.
+
+#### libpq inherited DNS host and port defaults (2026-11-03)
+
+The native libpq coroutine connector now explicitly reads the
+`PGHOST`, `PGHOSTADDR` and `PGPORT` environment defaults when a DSN
+does not specify those options. Environment values are copied before
+any coroutine suspension. Unpinned inherited hostnames resolve via
+Asio under the original connection deadline; inherited multi-host
+and multi-port lists preserve their HA pairing, while inherited pinned
+hostaddr values bypass DNS. The expanded libpq parameters explicitly
+override environment-based host/port selection after resolution, so
+libpq does not silently restart a synchronous hostname lookup.
+
+Three loopback-only regression cases temporarily set and restore these
+environment variables within the test process. The modified
+`openproof_postgres_async_io` library and independent DNS test binary
+compiled and linked successfully under GCC 16.2. **14/14 NativePgDns
+tests passed, 0 failed**, with no real database connections or
+production environment changes.
+
+This does not prove the behavior of PostgreSQL PGSERVICE files,
+kerberos/GSS negotiation, live TLS HA failover or the full legacy
+repository migration. Full coroutine acceptance is still NOT_APPROVED.
