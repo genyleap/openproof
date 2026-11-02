@@ -20,7 +20,9 @@ module;
 #include <vector>
 
 #include "../http/async_https.hpp"
-#include <boost/asio/connect.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
@@ -318,60 +320,35 @@ struct HttpResponse final {
     std::string body;
 };
 
+// The legacy API is synchronous, but its outbound network transport is
+// exclusively the same policy-enforcing coroutine HTTPS implementation used
+// by native X OAuth. It must run on an ordinary worker, not the socket reactor.
+[[nodiscard]] asio::awaitable<foundation::Result<HttpResponse>> httpsRequestAsync(
+    openproof::provider::http::async_detail::AsyncHttpsClient& client,
+    std::string_view target, std::string authorization,
+    std::chrono::steady_clock::time_point deadline);
+
 [[nodiscard]] foundation::Result<HttpResponse> httpsRequest(
     std::string_view target, http::verb method,
     std::string_view authorization, std::string_view caFile)
 {
+    if (method != http::verb::post) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The X OAuth transport only accepts POST.");
+    }
     try {
         asio::io_context io;
-        asio::ssl::context context{asio::ssl::context::tls_client};
-        context.set_verify_mode(asio::ssl::verify_peer);
-        if (caFile.empty()) context.set_default_verify_paths();
-        else context.load_verify_file(std::string{caFile});
-
-        Tcp::resolver resolver{io};
-        beast::ssl_stream<beast::tcp_stream> stream{io, context};
-        std::string hostname{kApiHost};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     static_cast<long>(TLSEXT_NAMETYPE_host_name),
-                     hostname.data()) <= 0L) {
-            return foundation::fail(
-                foundation::ErrorCode::Unavailable,
-                "The X TLS peer could not be configured.");
-        }
-        stream.set_verify_callback(asio::ssl::host_name_verification(hostname));
-        auto endpoints = resolver.resolve(hostname, "443");
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds{10});
-        beast::get_lowest_layer(stream).connect(endpoints);
-        stream.handshake(asio::ssl::stream_base::client);
-
-        http::request<http::string_body> request{
-            method, std::string{target}, 11};
-        request.set(http::field::host, hostname);
-        request.set(http::field::user_agent, "OpenProof/1");
-        request.set(http::field::accept, "application/x-www-form-urlencoded");
-        request.set(http::field::cache_control, "no-store");
-        request.set(http::field::authorization, authorization);
-        if (method == http::verb::post) {
-            request.set(http::field::content_type,
-                        "application/x-www-form-urlencoded");
-            request.body().clear();
-            request.prepare_payload();
-        }
-
-        http::write(stream, request);
-        beast::flat_buffer buffer;
-        http::response_parser<http::string_body> parser;
-        parser.body_limit(kMaximumResponseBytes);
-        http::read(stream, buffer, parser);
-        auto response = parser.release();
-        beast::error_code ignored;
-        stream.shutdown(ignored);
-        return HttpResponse{response.result_int(), std::move(response.body())};
+        openproof::provider::http::async_detail::AsyncHttpsClient client{
+            std::string{caFile}, kMaximumResponseBytes};
+        auto completion = asio::co_spawn(
+            io, httpsRequestAsync(client, target, std::string{authorization},
+                std::chrono::steady_clock::now() + std::chrono::seconds{10}),
+            asio::use_future);
+        io.run();
+        return completion.get();
     } catch (...) {
-        return foundation::fail(
-            foundation::ErrorCode::Unavailable,
-            "The X HTTPS request failed.");
+        return foundation::fail(foundation::ErrorCode::Unavailable,
+                                "The X HTTPS request failed.");
     }
 }
 

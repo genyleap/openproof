@@ -1716,3 +1716,37 @@ The source gate and provider-neutrality checker pass, but this is not
 sufficient for merge, release, deployment or coroutine migration
 acceptance. Rebuild and execute `FocusedGateway.*` in an isolated,
 appropriately provisioned runner before accepting this area.
+
+#### Provider legacy-network deduplication (2026-11-02)
+
+GitHub OAuth, OIDC federation, X OAuth 1.0a and Web3 wallet/Farcaster
+RPC previously duplicated synchronous resolver, TCP, TLS handshake and HTTP
+read/write inside their compatibility APIs. Each now invokes its already
+existing `httpsRequestAsync` or `rpcAsync` helper using `asio::co_spawn`
+and a caller-local `io_context`, rather than its own blocking socket client.
+The native authentication path continues to await the same shared
+`AsyncHttpsClient` directly. Legacy methods preserve their synchronous
+return contract and are **not safe to dispatch on the network reactor**;
+the native provider methods remain the nonblocking entry points.
+
+The compatibility bridges retain provider-configured CA bundles and
+response bounds. The shared HTTPS client provides a common absolute
+deadline, host verification, no redirect following and public-address
+DNS policy. This intentionally makes the legacy outbound path more
+restrictive against private/special-use DNS answers; integrations that
+previously depended on private endpoints must be reviewed, not silently
+granted SSRF policy exceptions. The X bridge admits only the POST method
+used by both OAuth 1.0a exchanges.
+
+The source gate now requires `co_spawn` bridging for these four providers,
+and `scripts/test-coroutine-provider-transports.mjs` asserts that each
+legacy bridge invokes the bounded native client and contains no direct
+blocking DNS, TLS or Beast I/O. Four source-level test cases pass.
+This changes the static migration count from 31 to 15 blocking findings.
+
+**Acceptance limit:** these C++ provider changes have not yet been compiled
+or executed against real external OAuth/RPC endpoints. Source-level tests
+and the migration gate alone do not establish ABI compatibility, provider
+response correctness, OAuth signature equivalence, TLS/security behavior,
+or performance gains. All focused provider tests and a comparative
+throughput/latency benchmark must pass before merging or release.

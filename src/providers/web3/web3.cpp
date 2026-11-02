@@ -22,7 +22,9 @@ module;
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/awaitable.hpp>
-#include <boost/asio/connect.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
@@ -495,81 +497,32 @@ using PointPtr = std::unique_ptr<EC_POINT, PointDeleter>;
 
 struct RpcResponse final { json::value result; };
 
+// Legacy wallet verification remains synchronous at its public boundary,
+// but both its RPC network transport and the native verifier use the same
+// bounded, private-address-rejecting coroutine HTTPS client.
+using NativeRpcClient = openproof::provider::http::async_detail::AsyncHttpsClient;
+using NativeRpcRequest = openproof::provider::http::async_detail::HttpsRequest;
+using RpcDeadline = std::chrono::steady_clock::time_point;
+
+[[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
+    NativeRpcClient& client, std::string_view endpoint,
+    std::string_view method, json::array parameters,
+    const foundation::SecretString& authorization, RpcDeadline deadline);
+
 [[nodiscard]] foundation::Result<RpcResponse> rpc(
     std::string_view endpoint, std::string_view method, json::array parameters,
     std::string_view caFile, const foundation::SecretString& authorization)
 {
-    auto parsed = parseHttpsUrl(endpoint);
-    if (!parsed) return foundation::fail(parsed.error());
-    json::object body;
-    body["jsonrpc"] = "2.0";
-    body["id"] = 1;
-    body["method"] = method;
-    body["params"] = std::move(parameters);
     try {
         asio::io_context io;
-        asio::ssl::context tls{asio::ssl::context::tls_client};
-        tls.set_verify_mode(asio::ssl::verify_peer);
-        if (caFile.empty()) tls.set_default_verify_paths();
-        else tls.load_verify_file(std::string{caFile});
-        Tcp::resolver resolver{io};
-        beast::ssl_stream<beast::tcp_stream> stream{io, tls};
-        std::string hostname{parsed->host};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     static_cast<long>(TLSEXT_NAMETYPE_host_name), hostname.data()) <= 0L) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The Web3 RPC TLS peer could not be configured.");
-        }
-        stream.set_verify_callback(asio::ssl::host_name_verification(parsed->host));
-        auto endpoints = resolver.resolve(parsed->host, parsed->port);
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds{10});
-        beast::get_lowest_layer(stream).connect(endpoints);
-        stream.handshake(asio::ssl::stream_base::client);
-        http::request<http::string_body> request{http::verb::post, parsed->target, 11};
-        std::string hostHeader{parsed->host};
-        if (parsed->port != "443") {
-            hostHeader.push_back(':');
-            hostHeader.append(parsed->port);
-        }
-        request.set(http::field::host, hostHeader);
-        request.set(http::field::user_agent, "OpenProof/1");
-        request.set(http::field::accept, "application/json");
-        request.set(http::field::content_type, "application/json");
-        request.set(http::field::cache_control, "no-store");
-        if (!authorization.expose().empty()) {
-            request.set(http::field::authorization, authorization.expose());
-        }
-        request.body() = json::serialize(body);
-        request.prepare_payload();
-        http::write(stream, request);
-        beast::flat_buffer buffer;
-        http::response_parser<http::string_body> parser;
-        parser.body_limit(kMaximumRpcResponse);
-        http::read(stream, buffer, parser);
-        auto response = parser.release();
-        beast::error_code ignored;
-        stream.shutdown(ignored);
-        if (response.result_int() != 200U) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The Web3 RPC endpoint returned a non-success status.");
-        }
-        boost::system::error_code parseError;
-        auto decoded = json::parse(response.body(), parseError);
-        if (parseError || !decoded.is_object()) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The Web3 RPC response is malformed.");
-        }
-        const auto& object = decoded.as_object();
-        if (object.if_contains("error") != nullptr) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The Web3 RPC endpoint reported an error.");
-        }
-        const auto* result = object.if_contains("result");
-        if (result == nullptr) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The Web3 RPC response has no result.");
-        }
-        return RpcResponse{*result};
+        NativeRpcClient client{std::string{caFile}, kMaximumRpcResponse};
+        auto completion = asio::co_spawn(io,
+            rpcAsync(client, endpoint, method, std::move(parameters),
+                authorization, std::chrono::steady_clock::now()
+                    + std::chrono::seconds{10}),
+            asio::use_future);
+        io.run();
+        return completion.get();
     } catch (...) {
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The Web3 RPC HTTPS request failed.");
@@ -592,10 +545,6 @@ struct RpcResponse final { json::value result; };
 // provider state, and all redirects/private DNS answers are rejected by the
 // shared transport. A single monotonic deadline bounds all RPC probes in one
 // signature verification; retries never reset that budget.
-using NativeRpcClient = openproof::provider::http::async_detail::AsyncHttpsClient;
-using NativeRpcRequest = openproof::provider::http::async_detail::HttpsRequest;
-using RpcDeadline = std::chrono::steady_clock::time_point;
-
 [[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
     NativeRpcClient& client, std::string_view endpoint,
     std::string_view method, json::array parameters,

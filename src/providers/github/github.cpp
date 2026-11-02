@@ -18,7 +18,9 @@ module;
 
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
-#include <boost/asio/connect.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
@@ -159,6 +161,15 @@ struct HttpResponse final {
     std::string body;
 };
 
+// Legacy OAuth entry points retain a synchronous completion contract, but
+// always use the same native coroutine HTTPS transport as async providers.
+[[nodiscard]] asio::awaitable<foundation::Result<HttpResponse>> httpsRequestAsync(
+    openproof::provider::http::async_detail::AsyncHttpsClient& client,
+    std::string_view host, std::string_view target, http::verb method,
+    std::string body, std::string_view contentType,
+    std::optional<std::string_view> bearer,
+    std::chrono::steady_clock::time_point absoluteDeadline);
+
 [[nodiscard]] foundation::Result<HttpResponse> httpsRequest(
     std::string_view host, std::string_view target, http::verb method,
     std::string body, std::string_view contentType,
@@ -166,62 +177,17 @@ struct HttpResponse final {
 {
     try {
         asio::io_context io;
-        asio::ssl::context context{asio::ssl::context::tls_client};
-        context.set_verify_mode(asio::ssl::verify_peer);
-        if (caFile.empty()) context.set_default_verify_paths();
-        else context.load_verify_file(std::string{caFile});
-        Tcp::resolver resolver{io};
-        beast::ssl_stream<beast::tcp_stream> stream{io, context};
-        std::string hostname{host};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     static_cast<long>(TLSEXT_NAMETYPE_host_name), hostname.data()) <= 0L) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The GitHub TLS peer could not be configured.");
-        }
-        stream.set_verify_callback(asio::ssl::host_name_verification(hostname));
-        auto endpoints = resolver.resolve(hostname, "443");
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds{10});
-        beast::get_lowest_layer(stream).connect(endpoints);
-        stream.handshake(asio::ssl::stream_base::client);
-
-        http::request<http::string_body> request{method, std::string{target}, 11};
-        request.set(http::field::host, hostname);
-        request.set(http::field::user_agent, "OpenProof/1");
-        request.set(http::field::accept,
-                    host == kTokenHost ? "application/json" : "application/vnd.github+json");
-        request.set(http::field::cache_control, "no-store");
-        request.set("X-GitHub-Api-Version", kApiVersion);
-        if (bearer) request.set(http::field::authorization, "Bearer " + std::string{*bearer});
-        if (!body.empty()) {
-            request.set(http::field::content_type, contentType);
-            request.body() = std::move(body);
-            request.prepare_payload();
-        }
-        http::write(stream, request);
-        beast::flat_buffer buffer;
-        http::response_parser<http::string_body> parser;
-        parser.body_limit(kMaximumResponseBytes);
-        // GitHub's OAuth responses may carry >8 KiB of security/cache headers.
-        // Beast defaults to an 8 KiB header limit, causing a header_limit error
-        // before the token JSON can be read. Keep a bounded 32 KiB ceiling.
-        parser.header_limit(32U * 1024U);
-        http::read(stream, buffer, parser);
-        auto response = parser.release();
-        beast::error_code ignored;
-        stream.shutdown(ignored);
-        return HttpResponse{response.result_int(), std::move(response.body())};
-    } catch (const boost::system::system_error& failure) {
-        // The hostname is fixed by this provider. Only emit a numeric library
-        // error identifier, not OAuth codes, headers, or response bodies.
-        std::cerr << "openproof github outbound HTTPS error"
-                  << " host=" << host
-                  << " error_code=" << failure.code().value()
-                  << " error_category=" << failure.code().category().name() << '\n';
-        return foundation::fail(foundation::ErrorCode::Unavailable,
-                                "The GitHub HTTPS request failed.");
+        openproof::provider::http::async_detail::AsyncHttpsClient client{
+            std::string{caFile}, kMaximumResponseBytes, 32768U};
+        auto completion = asio::co_spawn(io,
+            httpsRequestAsync(client, host, target, method, std::move(body),
+                contentType, bearer,
+                std::chrono::steady_clock::now() + std::chrono::seconds{10}),
+            asio::use_future);
+        io.run();
+        return completion.get();
     } catch (...) {
-        std::cerr << "openproof github outbound HTTPS unexpected failure"
-                  << " host=" << host << '\n';
+        // Never return OAuth credentials, token URLs or TLS internals.
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The GitHub HTTPS request failed.");
     }

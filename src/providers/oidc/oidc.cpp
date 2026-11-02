@@ -19,7 +19,9 @@ module;
 
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
-#include <boost/asio/connect.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/error.hpp>
@@ -192,6 +194,15 @@ struct HttpResult final {
     std::string body;
 };
 
+// Synchronous compatibility is permitted only on a bounded legacy worker.
+// All outbound DNS/TLS/HTTP operations are delegated to the native
+// policy-enforcing coroutine HTTPS transport, with the same URL validation.
+[[nodiscard]] asio::awaitable<foundation::Result<HttpResult>> httpsRequestAsync(
+    openproof::provider::http::async_detail::AsyncHttpsClient& client,
+    const HttpsUrl& endpoint, http::verb method, std::string body,
+    std::string_view contentType, std::chrono::steady_clock::time_point deadline,
+    std::string_view authorization);
+
 [[nodiscard]] foundation::Result<HttpResult> httpsRequest(
     const HttpsUrl& endpoint, http::verb method, std::string body,
     std::string_view contentType, std::string_view caFile,
@@ -199,46 +210,15 @@ struct HttpResult final {
 {
     try {
         asio::io_context io;
-        asio::ssl::context context{asio::ssl::context::tls_client};
-        context.set_verify_mode(asio::ssl::verify_peer);
-        if (caFile.empty()) context.set_default_verify_paths();
-        else context.load_verify_file(std::string{caFile});
-        Tcp::resolver resolver{io};
-        beast::ssl_stream<beast::tcp_stream> stream{io, context};
-        std::string hostname{endpoint.host};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     static_cast<long>(TLSEXT_NAMETYPE_host_name), hostname.data()) <= 0L) {
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The OIDC TLS peer could not be configured.");
-        }
-        stream.set_verify_callback(asio::ssl::host_name_verification(endpoint.host));
-        auto endpoints = resolver.resolve(endpoint.host, endpoint.port);
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds{10});
-        beast::get_lowest_layer(stream).connect(endpoints);
-        stream.handshake(asio::ssl::stream_base::client);
-
-        http::request<http::string_body> request{method, endpoint.target, 11};
-        request.set(http::field::host, endpoint.host);
-        request.set(http::field::user_agent, "OpenProof/1");
-        request.set(http::field::accept, "application/json");
-        request.set(http::field::cache_control, "no-store");
-        if (!authorization.empty()) {
-            request.set(http::field::authorization, authorization);
-        }
-        if (!body.empty()) {
-            request.set(http::field::content_type, contentType);
-            request.body() = std::move(body);
-            request.prepare_payload();
-        }
-        http::write(stream, request);
-        beast::flat_buffer buffer;
-        http::response_parser<http::string_body> parser;
-        parser.body_limit(kMaximumResponseBytes);
-        http::read(stream, buffer, parser);
-        auto response = parser.release();
-        beast::error_code ignored;
-        stream.shutdown(ignored);
-        return HttpResult{response.result_int(), std::move(response.body())};
+        openproof::provider::http::async_detail::AsyncHttpsClient client{
+            std::string{caFile}, kMaximumResponseBytes, 8192U};
+        auto completion = asio::co_spawn(io,
+            httpsRequestAsync(client, endpoint, method, std::move(body),
+                contentType, std::chrono::steady_clock::now()
+                    + std::chrono::seconds{10}, authorization),
+            asio::use_future);
+        io.run();
+        return completion.get();
     } catch (...) {
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The OIDC HTTPS request failed.");

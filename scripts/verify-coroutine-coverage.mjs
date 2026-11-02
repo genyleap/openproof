@@ -60,6 +60,18 @@ const checked = segments.map(([name, relative]) => {
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
       issues.push({line:0,kind:"missing middleware coroutine capability propagation",expression:"m_fallback->nativeEnabled()"});
   }
+  if([
+    "src/providers/github/github.cpp",
+    "src/providers/oidc/oidc.cpp",
+    "src/providers/x/x.cpp",
+    "src/providers/web3/web3.cpp"
+  ].includes(relative)){
+    const target = relative.endsWith("/web3.cpp") ? "rpcAsync" : "httpsRequestAsync";
+    const legacyBridge = /asio::co_spawn\s*\(\s*io\s*,\s*(?:httpsRequestAsync|rpcAsync)\s*\(/;
+    if(!legacyBridge.test(source))
+      issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
+        expression:"co_spawn(io, "+target+"(...))"});
+  }
   if(relative==="src/authentication/service.cpp"){
     const begin = source.slice(
       source.indexOf("AuthenticationService::beginAsync("),
