@@ -1750,3 +1750,51 @@ and the migration gate alone do not establish ABI compatibility, provider
 response correctness, OAuth signature equivalence, TLS/security behavior,
 or performance gains. All focused provider tests and a comparative
 throughput/latency benchmark must pass before merging or release.
+
+#### Follow-up GCC 16.2 provider build evidence (2026-11-02)
+
+The previously source-only provider transport refactor in commit
+`cfe42e1` has now compiled and linked successfully, including the
+updated provider module implementation and independent test executable
+for **each** of: X OAuth 1.0a, GitHub OAuth, OIDC federation and Web3
+wallet/Farcaster. Each target was compiled at `-j 1` on the isolated
+development checkout, never against the running production process.
+
+`ctest -R '^(NativeGitHub|NativeOIDC|NativeX|NativeWeb3)\\.'`
+reported **16/16 passed, 0 failed, 0 skipped**. The four provider
+source invariants passed, and the protocol-neutrality script reported
+the runtime and schema as provider- and tenant-neutral.
+
+These tests exercise invalid/forged native authentication paths and
+coroutine dispatch. They do **not** perform real external OAuth exchanges
+or comparative latency/throughput benchmarks. Legacy facade behavior
+with real TLS endpoints still requires staging/E2E verification. The
+repository migration gate remains NOT_APPROVED due to unrelated blocking
+storage, LDAP and HTTP API paths.
+
+#### Gateway Boost.Asio co_spawn result-type compatibility (2026-11-02)
+
+A targeted GCC16.2 build of `openproof_gateway_http` compiled its
+core dependencies and module interfaces, then revealed an actual
+compile-time failure in the new synchronous-to-coroutine bridge:
+Boost.Asio 1.88's `co_spawn(..., use_future)` internally
+default-constructs the awaitable's completion value on an exception
+path; `foundation::Result<HttpResponse>` is a `std::expected` whose
+`HttpResponse` is not default-constructible.
+
+The bridge now uses a dedicated `sendResultAsync` coroutine returning
+`std::optional<foundation::Result<HttpResponse>>`, whose outer
+`optional` can be default-constructed without fabricating an HTTP
+response. This method owns its request arguments across suspension,
+then awaits the original `sendAsync`. The compatibility facade
+unwraps the optional only after `co_spawn` completion; an empty
+completion throws and is redacted as an Unavailable upstream failure.
+
+A second targeted build completed module scanning and reached the
+single GCC16 `http.cpp` implementation TU, but remained CPU-bound
+after five minutes; the managed build was explicitly stopped. The
+**corrected gateway C++ source and new HTTP loopback tests are still
+uncompiled/unexecuted**. Keep the Gateway phase release-blocked until
+they compile/link and the full `FocusedGateway` regression suite runs.
+The source gate's five fewer findings are a static result, not proof
+of runtime acceptance.

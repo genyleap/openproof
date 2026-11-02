@@ -576,15 +576,29 @@ public:
         // in this transport. New callers must use sendAsync() directly.
         try {
             asio::io_context context;
+            // Boost.Asio 1.88's co_spawn requires a default-constructible
+            // coroutine result for its exception path. HttpResponse is not
+            // default-constructible; an optional around the Result makes the
+            // completion ABI safe without fabricating an HTTP response.
             auto completion = asio::co_spawn(
-                context, sendAsync(endpoint, request, timeout), asio::use_future);
+                context, sendResultAsync(endpoint, request, timeout),
+                asio::use_future);
             context.run();
-            return completion.get();
+            return std::move(completion.get()).value();
         } catch (...) {
             // Keep network/credential details out of client-visible errors.
             return foundation::fail(foundation::ErrorCode::Unavailable,
                                     "The upstream request failed.");
         }
+    }
+
+    // Awaitable with a default-constructible completion envelope for Boost
+    // co_spawn's exception handling. The public Result remains unchanged.
+    asio::awaitable<std::optional<foundation::Result<HttpResponse>>> sendResultAsync(
+        Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
+    {
+        co_return std::optional<foundation::Result<HttpResponse>>{
+            co_await sendAsync(std::move(endpoint), std::move(request), timeout)};
     }
 
     asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
