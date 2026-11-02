@@ -166,16 +166,19 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     SecretBufferScrub scrubConnectionString{connectionString};
     auto executor = co_await asio::this_coro::executor;
 
-    // PQconnectStart is nonblocking *after* DNS, but libpq may resolve a
-    // hostname synchronously before it returns the PGconn. For ordinary
-    // single-host DSNs resolve first on Asio and pin the selected address
-    // through libpq's hostaddr option, preserving host for TLS verify-full.
-    // Unix sockets, explicit hostaddr and multi-host DSNs keep their existing
-    // libpq behavior until those cases receive a separately verified
-    // coroutine-native resolver implementation.
+    // PQconnectStart can resolve DNS synchronously before the PGconn exists.
+    // Handle every hostname in keyword/URI multi-host connection lists on
+    // Asio first, preserving per-host port and TLS hostname associations.
+    // Numeric addresses, Unix sockets and explicitly pinned hostaddr lists
+    // do not need a separate hostname resolver.
     char* parseError = nullptr;
     ConnInfoPointer options{PQconninfoParse(connectionString.c_str(), &parseError)};
-    if (parseError) PQfreemem(parseError);
+    if (parseError) {
+        volatile char* bytes = parseError;
+        const auto length = std::strlen(parseError);
+        for (std::size_t i = 0; i < length; ++i) bytes[i] = '\0';
+        PQfreemem(parseError);
+    }
     auto optionValue = [&](std::string_view key) -> std::string_view {
         if (!options) return {};
         for (const auto* option = options.get(); option->keyword; ++option) {
@@ -185,45 +188,96 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     };
     const std::string_view host = optionValue("host");
     const std::string_view hostaddr = optionValue("hostaddr");
-    boost::system::error_code ipError;
-    const bool numericHost = !host.empty()
-        && !asio::ip::make_address(std::string{host}, ipError).is_unspecified()
-        && !ipError;
-    const bool resolveWithAsio = !host.empty() && !host.starts_with("/")
-        && !host.contains(',') && hostaddr.empty() && !numericHost;
+    const auto csv = [](std::string_view value) {
+        std::vector<std::string_view> parts;
+        do {
+            const auto comma = value.find(',');
+            parts.push_back(value.substr(0, comma));
+            if (comma == std::string_view::npos) break;
+            value.remove_prefix(comma + 1U);
+        } while (true);
+        return parts;
+    };
+    const auto hosts = csv(host);
+    const auto ports = csv(optionValue("port"));
+    const auto numeric = [](std::string_view value) {
+        boost::system::error_code error;
+        static_cast<void>(asio::ip::make_address(std::string{value}, error));
+        return !error;
+    };
+    bool resolveWithAsio = false;
+    if (hostaddr.empty()) {
+        for (const auto item : hosts) {
+            if (!item.empty() && !item.starts_with("/") && !numeric(item)) {
+                resolveWithAsio = true;
+                break;
+            }
+        }
+    }
 
     PGconn* rawConnection = nullptr;
     if (resolveWithAsio) {
+        if (ports.size() != 1U && ports.size() != hosts.size()) {
+            throw std::runtime_error{"Invalid PostgreSQL host/port configuration"};
+        }
         asio::ip::tcp::resolver resolver{executor};
-        boost::system::error_code error;
-        if (Clock::now() >= deadline) {
-            throw std::runtime_error{"PostgreSQL DNS resolution timed out"};
-        }
-        const std::string service = optionValue("port").empty()
-            ? "5432" : std::string{optionValue("port")};
-        auto endpoints = co_await resolver.async_resolve(
-            std::string{host}, service,
-            asio::cancel_after(deadline - Clock::now(),
-                asio::redirect_error(asio::use_awaitable, error)));
-        if (error || endpoints.empty() || Clock::now() >= deadline) {
-            throw std::runtime_error{"PostgreSQL DNS resolution failed or timed out"};
-        }
-        // Preserve libpq's IPv4/IPv6 failover semantics: one DNS name may
-        // resolve to multiple addresses. Repeat the TLS hostname for each
-        // pinned address; libpq matches host[i] to hostaddr[i] while a single
-        // port setting applies to every address.
         std::string resolvedHosts;
         std::string resolvedAddresses;
+        std::string resolvedPorts;
         std::size_t addressCount = 0U;
-        for (const auto& endpoint : endpoints) {
-            const std::string address = endpoint.endpoint().address().to_string();
-            if (addressCount > 0U) {
+        const auto append = [&](std::string_view name, std::string_view address,
+                                std::string_view port) {
+            if (addressCount == 64U) {
+                throw std::runtime_error{"PostgreSQL DNS address limit exceeded"};
+            }
+            if (addressCount++ > 0U) {
                 resolvedHosts.push_back(',');
                 resolvedAddresses.push_back(',');
+                resolvedPorts.push_back(',');
             }
-            resolvedHosts.append(host);
+            resolvedHosts.append(name);
             resolvedAddresses.append(address);
-            if (++addressCount == 16U) break;
+            resolvedPorts.append(port);
+        };
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            const std::string_view name = hosts[i];
+            const std::string_view port =
+                ports.size() == 1U ? ports.front() : ports[i];
+            if (name.empty() || name.starts_with("/")) {
+                // An empty hostaddr element retains libpq's Unix socket
+                // semantics for this slot in a mixed multi-host list.
+                append(name, "", port);
+                continue;
+            }
+            if (numeric(name)) {
+                append(name, name, port);
+                continue;
+            }
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL DNS resolution timed out"};
+            }
+            boost::system::error_code error;
+            const std::string service =
+                port.empty() ? "5432" : std::string{port};
+            auto endpoints = co_await resolver.async_resolve(
+                std::string{name}, service,
+                asio::cancel_after(deadline - Clock::now(),
+                    asio::redirect_error(asio::use_awaitable, error)));
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL DNS resolution timed out"};
+            }
+            if (error || endpoints.empty()) {
+                // A dead HA hostname must not prevent trying a healthy
+                // later host. Skip the unresolvable entry instead of handing
+                // it to libpq for a synchronous fallback DNS lookup.
+                continue;
+            }
+            for (const auto& endpoint : endpoints) {
+                append(name, endpoint.endpoint().address().to_string(), port);
+            }
+        }
+        if (addressCount == 0U) {
+            throw std::runtime_error{"PostgreSQL DNS resolved no usable hosts"};
         }
         // Passing parsed parameters instead of appending to a DSN supports
         // both keyword/value and postgres:// URI connection strings.
@@ -233,8 +287,11 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         for (const auto* option = options.get(); option->keyword; ++option) {
             if (option->val == nullptr || option->val[0] == '\0') continue;
             ownedKeys.emplace_back(option->keyword);
-            ownedValues.emplace_back(std::string_view{option->keyword} == "host"
-                ? resolvedHosts : std::string{option->val});
+            const std::string_view key{option->keyword};
+            if (key == "host") ownedValues.emplace_back(resolvedHosts);
+            else if (key == "port" && ports.size() > 1U) {
+                ownedValues.emplace_back(resolvedPorts);
+            } else ownedValues.emplace_back(option->val);
         }
         ownedKeys.emplace_back("hostaddr");
         ownedValues.emplace_back(std::move(resolvedAddresses));

@@ -1938,9 +1938,10 @@ to maintain libpq multi-address failover semantics. The remaining
 Parsed password options and the original DSN are wiped on every exit
 path and disposed of before libpq socket polling; C library internal
 copies are explicitly not claimed to be erased. Explicit `hostaddr`,
-Unix sockets, numeric hosts and multi-host DSNs currently use libpq's
-original path; the latter and implicit environment-dependent DNS are
-**still outstanding full-migration cases**.
+Unix sockets, numeric hosts and explicitly supplied hostaddr lists use
+libpq's original path. Mixed or empty explicit hostaddr lists and
+implicit environment-dependent DNS are **still outstanding
+full-migration cases**.
 
 GCC 16.2 compiled and linked the modified `openproof_postgres_async_io`
 library with `-Werror` unchanged. A narrowly scoped `-fno-inline`
@@ -1957,3 +1958,30 @@ This does not verify a successful TLS PostgreSQL session, external DNS
 failure modes, all multi-host cases, Unix socket disposable canonical
 SQL tests, or an end-to-end C++26 coroutine migration. Production
 wiring and comparative benchmarks remain separate release blockers.
+
+#### Multi-host and HA-aware PostgreSQL DNS completion (2026-11-03)
+
+The Asio-based native libpq connector now handles **explicit comma-separated
+PostgreSQL host lists**, including URI authority lists and both common and
+per-host ports. Each hostname resolves under the same absolute deadline.
+The expanded `host`, `hostaddr` and `port` options maintain the original
+host-to-address TLS verification association and port pairing. A single
+hostname's multiple A/AAAA addresses are all retained for libpq failover.
+An unresolvable HA hostname is skipped without reintroducing synchronous
+DNS; no usable addresses or mismatched port-list sizes fail closed.
+The expanded address list is capped at 64 candidates to prevent unbounded
+memory and connection attempts.
+
+The modified native libpq library and standalone DNS test binary both
+compiled and linked under GCC 16.2 with `-Werror` intact. The targeted
+`NativePgDns` suite now reports **8/8 passed, 0 failed**, testing
+keyword/value and URI multi-host parsing, single and per-host ports,
+malformed port count, explicit hostaddr, and negative loopback connectivity.
+These tests do not establish successful TLS authentication against a
+real PostgreSQL server, nor do they test every mixed Unix-socket and
+environment-configured hostaddr option. The strict source gate tracks
+native DNS enumeration, port pairing and no-host failure.
+
+The legacy production PostgreSQL pool remains synchronous, and the
+complete protocol still has separate PostgreSQL/LDAP/HTTP migration
+blockers. **No acceptance or deployment approval follows.**

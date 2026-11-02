@@ -50,6 +50,34 @@ TEST(PostgresAsyncDnsTest, HostnameUriConnectionUsesBoundedNativeDns)
         "openproof_disposable_test");
 }
 
+TEST(PostgresAsyncDnsTest, MultipleHostsKeepPerHostPorts)
+{
+    expectConnectionDenied(
+        "host=localhost,127.0.0.1 port=1,1 user=openproof_test "
+        "dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, MultipleHostsAcceptOneSharedPort)
+{
+    expectConnectionDenied(
+        "host=localhost,localhost port=1 user=openproof_test "
+        "dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, MultiHostUriKeepsPortAssociations)
+{
+    expectConnectionDenied(
+        "postgresql://openproof_test@localhost:1,127.0.0.1:1/"
+        "openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, InvalidPortListFailsClosed)
+{
+    expectConnectionDenied(
+        "host=localhost,localhost port=1,1,1 user=openproof_test "
+        "dbname=openproof_disposable_test");
+}
+
 TEST(PostgresAsyncDnsTest, ExplicitHostaddrAvoidsHostnameResolution)
 {
     expectConnectionDenied(

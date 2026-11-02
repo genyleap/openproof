@@ -173,7 +173,11 @@ const checked = segments.map(([name, relative]) => {
       ["libpq hostname preserved for TLS", /ownedKeys\.emplace_back\s*\(\s*"hostaddr"\s*\)/],
       ["libpq numeric address connection", /PQconnectStartParams\s*\(/],
       ["nonblocking libpq connection polling", /PQconnectPoll\s*\(/],
-      ["scrub parsed credentials before polling", /options\.reset\s*\(\s*\)/]
+      ["scrub parsed credentials before polling", /options\.reset\s*\(\s*\)/],
+      ["multi-host native enumeration", /for\s*\(std::size_t\s+i\s*=\s*0;\s*i\s*<\s*hosts\.size\s*\(\s*\)/],
+      ["multi-host port association", /ports\.size\s*\(\s*\)\s*!=\s*hosts\.size\s*\(\s*\)/],
+      ["failed DNS hostname cannot suppress HA fallback", /if\s*\(error\s*\|\|\s*endpoints\.empty\s*\(\s*\)\)/],
+      ["empty DNS result fails closed", /if\s*\(addressCount\s*==\s*0U\)/]
     ]){
       if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
     }
