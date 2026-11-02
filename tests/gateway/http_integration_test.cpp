@@ -557,6 +557,60 @@ asio::awaitable<void> collectAsyncProxyResponse(
         std::move(endpoint), std::move(request), timeout));
 }
 
+TEST(BeastHttpIntegrationTest, LegacyProxySendUsesCoroutineTransport)
+{
+    // The synchronous gateway API must keep working for handlers that
+    // cannot yet opt into native dispatch. Its underlying socket, DNS,
+    // TLS and HTTP operations now use the same coroutine transport.
+    ClientIpHandler upstreamHandler;
+    httpAdapter::BeastHttpServer upstream{upstreamHandler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"legacy-coroutine-upstream"}, "127.0.0.1",
+        upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint);
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/legacy-compat", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"legacy-coroutine-test"});
+    ASSERT_TRUE(request);
+
+    const auto response = proxy.value()->send(
+        endpoint.value(), request.value(), std::chrono::seconds{2});
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status(), 200);
+    EXPECT_EQ(response->body(), "127.0.0.1");
+    upstream.stop();
+}
+
+TEST(BeastHttpIntegrationTest, LegacyProxySendPreservesNativeDeadline)
+{
+    WaitingHandler upstreamHandler;
+    httpAdapter::BeastHttpServer upstream{upstreamHandler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"legacy-slow-upstream"}, "127.0.0.1",
+        upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint);
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/legacy-slow", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"legacy-coroutine-timeout"});
+    ASSERT_TRUE(request);
+
+    const auto response = proxy.value()->send(
+        endpoint.value(), request.value(), std::chrono::milliseconds{5});
+    ASSERT_FALSE(response);
+    EXPECT_EQ(response.error().code(), fnd::ErrorCode::Timeout);
+    upstream.stop();
+}
+
 TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
 {
     ClientIpHandler handler;

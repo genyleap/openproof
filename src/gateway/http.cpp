@@ -569,8 +569,22 @@ public:
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                     "The upstream timeout must be positive.");
         }
-        return endpoint.tls() ? sendTls(endpoint, request, timeout)
-                              : sendPlain(endpoint, request, timeout);
+        // Retain the legacy synchronous facade for compatibility, but run
+        // the very same native coroutine as the nonblocking gateway path.
+        // The waiting thread is a legacy handler worker, never an Asio
+        // socket-reactor task; no blocking DNS, TCP, TLS or HTTP I/O remains
+        // in this transport. New callers must use sendAsync() directly.
+        try {
+            asio::io_context context;
+            auto completion = asio::co_spawn(
+                context, sendAsync(endpoint, request, timeout), asio::use_future);
+            context.run();
+            return completion.get();
+        } catch (...) {
+            // Keep network/credential details out of client-visible errors.
+            return foundation::fail(foundation::ErrorCode::Unavailable,
+                                    "The upstream request failed.");
+        }
     }
 
     asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
@@ -644,17 +658,6 @@ public:
     }
 
 private:
-    foundation::Result<Tcp::resolver::results_type> resolve(
-        asio::io_context& context, const Endpoint& endpoint)
-    {
-        boost::system::error_code error;
-        Tcp::resolver resolver{context};
-        auto results = resolver.resolve(std::string{endpoint.host()},
-                                        std::to_string(endpoint.port()), error);
-        if (error) return foundation::fail(networkError("resolve upstream", error));
-        return results;
-    }
-
     template <typename Stream>
     asio::awaitable<foundation::Result<HttpResponse>> exchangeAsync(
         Stream& stream, const Endpoint& endpoint, const HttpRequest& request,
@@ -677,77 +680,6 @@ private:
             stream, buffer, parser, asio::redirect_error(asio::use_awaitable, error)));
         if (error) co_return foundation::fail(networkError("read upstream response", error));
         co_return fromBeast(parser.release());
-    }
-
-    template <typename Stream>
-    foundation::Result<HttpResponse> exchange(
-        Stream& stream, const Endpoint& endpoint, const HttpRequest& request,
-        foundation::Duration timeout)
-    {
-        boost::system::error_code error;
-        auto outgoing = toBeast(endpoint, request);
-        beast::get_lowest_layer(stream).expires_after(timeout);
-        beastHttp::write(stream, outgoing, error);
-        if (error) return foundation::fail(networkError("write upstream request", error));
-        beastHttp::response_parser<beastHttp::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(
-            m_config.responseHeaderLimitBytes()));
-        parser.body_limit(m_config.responseBodyLimitBytes());
-        beast::flat_buffer buffer;
-        beast::get_lowest_layer(stream).expires_after(timeout);
-        beastHttp::read(stream, buffer, parser, error);
-        if (error) return foundation::fail(networkError("read upstream response", error));
-        return fromBeast(parser.release());
-    }
-
-    foundation::Result<HttpResponse> sendPlain(
-        const Endpoint& endpoint, const HttpRequest& request,
-        foundation::Duration timeout)
-    {
-        asio::io_context context;
-        auto endpoints = resolve(context, endpoint);
-        if (!endpoints.has_value()) return foundation::fail(endpoints.error());
-        beast::tcp_stream stream{context};
-        stream.expires_after(timeout);
-        boost::system::error_code error;
-        stream.connect(endpoints.value(), error);
-        if (error) return foundation::fail(networkError("connect upstream", error));
-        auto response = exchange(stream, endpoint, request, timeout);
-        stream.socket().shutdown(Tcp::socket::shutdown_both, error);
-        return response;
-    }
-
-    foundation::Result<HttpResponse> sendTls(
-        const Endpoint& endpoint, const HttpRequest& request,
-        foundation::Duration timeout)
-    {
-        asio::io_context context;
-        auto endpoints = resolve(context, endpoint);
-        if (!endpoints.has_value()) return foundation::fail(endpoints.error());
-        beast::ssl_stream<beast::tcp_stream> stream{context, m_tlsContext};
-        const std::string host{endpoint.host()};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     TLSEXT_NAMETYPE_host_name,
-                     const_cast<char*>(host.c_str())) != 1) {
-            return foundation::fail(foundation::ErrorCode::Internal,
-                                    "TLS SNI configuration failed.");
-        }
-        stream.set_verify_callback(ssl::host_name_verification{host});
-        beast::get_lowest_layer(stream).expires_after(timeout);
-        boost::system::error_code error;
-        beast::get_lowest_layer(stream).connect(endpoints.value(), error);
-        if (error) return foundation::fail(networkError("connect TLS upstream", error));
-        beast::get_lowest_layer(stream).expires_after(timeout);
-        stream.handshake(ssl::stream_base::client, error);
-        if (error) return foundation::fail(networkError("verify TLS upstream", error));
-        auto response = exchange(stream, endpoint, request, timeout);
-        beast::get_lowest_layer(stream).expires_after(timeout);
-        stream.shutdown(error);
-        if (error == asio::error::eof || error == ssl::error::stream_truncated) error.clear();
-        if (error && response.has_value()) {
-            return foundation::fail(networkError("shutdown TLS upstream", error));
-        }
-        return response;
     }
 
     ProxyConfig m_config;

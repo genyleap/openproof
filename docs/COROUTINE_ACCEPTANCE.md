@@ -1681,3 +1681,38 @@ service. Like the earlier canonical SQL cases, they only run with the
 private-socket `OPENPROOF_TEST_POSTGRES_DOMAIN` and explicit ephemeral
 database acknowledgement; absent that opt-in they correctly **skip**.
 These scenarios extend test coverage, not dynamic acceptance evidence.
+
+#### Gateway upstream compatibility transport deduplication (2026-11-02)
+
+Previously the gateway used two independent upstream network clients:
+`BeastProxyTransport::sendAsync` used coroutine DNS, TCP, TLS and HTTP,
+but the legacy `ProxyTransport::send` duplicated these operations using
+synchronous socket calls. The duplicate implementation has now been
+removed from `src/gateway/http.cpp`. Legacy `send` uses the same
+`sendAsync` coroutine through a private Asio `io_context` driven on
+the existing synchronous caller's thread; this preserves the legacy
+transport-neutral API while eliminating the duplicate blocking network
+operations. The native gateway route still directly `co_await`s
+`sendAsync` without a compatibility fallback.
+
+**Important limitation:** the legacy facade still waits on its
+synchronous calling thread and is not a nonblocking handler; it must
+continue running on a bounded handler worker until fully replaced.
+Focused gateway tests cover the facade's HTTP loopback round trip
+and its upstream deadline against a delayed response. The source
+acceptance gate checks that the compatibility facade actually invokes
+the coroutine client. Removing the five direct synchronous network
+primitives reduces the *source* migration gate from 36 to 31 findings,
+but compile/tests, real SQL integration, protocol acceptance and
+benchmarks remain separate release blockers.
+
+**Build evidence for this checkpoint:** Two attempts to compile
+`openproof_gateway_http_tests` were deliberately interrupted after
+the cache revealed a broad C++ Modules dependency rebuild (the second
+reported 51 Ninja steps). The server was also contending with an
+independent CPU-intensive process. The new Gateway C++ change and its
+two new loopback tests are therefore **NOT YET BUILD- OR RUNTIME-VERIFIED**.
+The source gate and provider-neutrality checker pass, but this is not
+sufficient for merge, release, deployment or coroutine migration
+acceptance. Rebuild and execute `FocusedGateway.*` in an isolated,
+appropriately provisioned runner before accepting this area.

@@ -52,6 +52,9 @@ const checked = segments.map(([name, relative]) => {
   if(relative==="src/gateway/http.cpp"){
     if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabled\s*\(/.test(source))
       issues.push({line:0,kind:"missing opt-in coroutine dispatch guard",expression:"asyncHandler->nativeEnabled("});
+    if(!/asio::co_spawn\s*\(\s*context\s*,\s*sendAsync\s*\(/.test(source))
+      issues.push({line:0,kind:"synchronous proxy compatibility bypasses native transport",
+        expression:"co_spawn(context, sendAsync(...))"});
     const interfaceSource=fs.readFileSync(
       path.join(root,"src/gateway/http.cppm"),"utf8");
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
