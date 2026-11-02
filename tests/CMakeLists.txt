@@ -340,6 +340,33 @@ gtest_discover_tests(openproof_postgres_async_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async")
 
+# Loopback-only native libpq DNS/conninfo tests. Exercises the real Asio
+# resolver and libpq URI/keyword transport without any database credentials
+# from the environment, migrations, or production services.
+add_executable(openproof_postgres_async_dns_tests
+    storage/postgres_async_dns_test.cpp)
+target_compile_features(openproof_postgres_async_dns_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_postgres_async_dns_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_dns_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_dns_tests PRIVATE
+    openproof_postgres_async_io GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_dns_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_dns_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_dns_tests
+    TEST_PREFIX "NativePgDns."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;dns;loopback" TIMEOUT 12)
+
 # Explicit opt-in socket-level verification for the coroutine session listener
 # bridge. Unlike the lightweight handler suite, this exercises real Beast
 # HTTP/1.1 framing and the CoroutineHttpHandler dynamic-dispatch boundary.

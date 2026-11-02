@@ -1919,3 +1919,41 @@ invariants are checked against their SQL string literals separately.
 The strict source migration status remains `NOT_APPROVED`, with 19
 known findings after lexical filtering. This is measurement hardening,
 not a reduction in unfinished migration work.
+
+#### Native libpq hostname resolution and deadline propagation (2026-11-03)
+
+The native `AsyncConnection::connect` previously called
+`PQconnectStart` directly; although subsequent libpq connect polling
+is socket-driven, the initial libpq hostname resolution can block the
+calling Asio executor before the first suspension. For a single explicit
+DNS host without an explicit `hostaddr`, the adapter now parses
+libpq keyword/URI connection options, resolves the DNS name via
+`asio::ip::tcp::resolver::async_resolve` under the original absolute
+connection deadline, and passes the pinned IPv4/IPv6 addresses to
+`PQconnectStartParams`. It preserves the original TLS hostname in
+`host` for authentication/verify-full and repeats it for each address
+to maintain libpq multi-address failover semantics. The remaining
+`PQconnectPoll` and socket readiness waits share that deadline.
+
+Parsed password options and the original DSN are wiped on every exit
+path and disposed of before libpq socket polling; C library internal
+copies are explicitly not claimed to be erased. Explicit `hostaddr`,
+Unix sockets, numeric hosts and multi-host DSNs currently use libpq's
+original path; the latter and implicit environment-dependent DNS are
+**still outstanding full-migration cases**.
+
+GCC 16.2 compiled and linked the modified `openproof_postgres_async_io`
+library with `-Werror` unchanged. A narrowly scoped `-fno-inline`
+option for its `async_connection.cpp` translation unit avoids a
+confirmed GCC16/Boost.Asio aligned coroutine-frame allocator false
+positive, consistent with existing source-local workarounds. The new
+standalone loopback-only `openproof_postgres_async_dns_tests` executable
+compiled/linked; **4/4 tests passed**, exercising hostname keyword
+conninfo, `postgresql://` URI, explicit numeric hostaddr and malformed
+conninfo without accessing any production database. The strict source
+gate now includes the native DNS boundary.
+
+This does not verify a successful TLS PostgreSQL session, external DNS
+failure modes, all multi-host cases, Unix socket disposable canonical
+SQL tests, or an end-to-end C++26 coroutine migration. Production
+wiring and comparative benchmarks remain separate release blockers.

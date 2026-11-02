@@ -22,7 +22,11 @@ set_target_properties(openproof_postgres_async_io PROPERTIES
 # adapter. Preserve -Werror (including mismatched-new-delete) instead of
 # suppressing any diagnostic. No application or protocol module is affected.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(async_session.cpp
+    # The native async connection coroutine also allocates a GCC16 frame
+    # through Boost.Asio aligned_new. Inlining causes GCC 16.2 to diagnose
+    # Boost's matching aligned allocator/deallocator as mismatched. Keep
+    # -Werror intact; only these affected implementation TUs skip inlining.
+    set_source_files_properties(async_connection.cpp async_session.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 

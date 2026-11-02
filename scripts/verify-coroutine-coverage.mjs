@@ -22,6 +22,7 @@ const segments = [
   ["PostgreSQL coroutine session issuance", "src/storage/postgres/coroutine_session_service.cpp"],
   ["PostgreSQL coroutine canonical finalization", "src/storage/postgres/coroutine_canonical_finalizer.cpp"],
   ["PostgreSQL bounded coroutine connection pool", "src/storage/postgres/async_pool.cpp"],
+  ["PostgreSQL native asynchronous hostname resolution", "src/storage/postgres/async_connection.cpp"],
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
@@ -164,6 +165,18 @@ const checked = segments.map(([name, relative]) => {
     ])
       if(!regex.test(source))
         issues.push({line:0,kind:"missing "+kind,expression:regex.source});
+  }
+  if(relative==="src/storage/postgres/async_connection.cpp"){
+    for(const [kind, regex] of [
+      ["bounded Asio DNS", /co_await\s+resolver\.async_resolve\s*\(/],
+      ["DNS consumes shared deadline", /asio::cancel_after\s*\(\s*deadline\s*-\s*Clock::now\s*\(\)/],
+      ["libpq hostname preserved for TLS", /ownedKeys\.emplace_back\s*\(\s*"hostaddr"\s*\)/],
+      ["libpq numeric address connection", /PQconnectStartParams\s*\(/],
+      ["nonblocking libpq connection polling", /PQconnectPoll\s*\(/],
+      ["scrub parsed credentials before polling", /options\.reset\s*\(\s*\)/]
+    ]){
+      if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
+    }
   }
   if(relative==="src/storage/postgres/coroutine_session_service.cpp"){
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)

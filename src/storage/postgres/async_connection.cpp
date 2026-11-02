@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <string_view>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -39,6 +41,44 @@ struct PgDeleter final {
     }
 };
 using PgPointer = std::unique_ptr<PGconn, PgDeleter>;
+
+// libpq's parsed options may contain the complete database password.
+// Erase every owned copy before PQconninfoFree; malloc/libpq/OpenSSL
+// internal buffers are not covered by this best-effort scrubbing.
+struct ConnInfoDeleter final {
+    void operator()(PQconninfoOption* options) const noexcept
+    {
+        if (!options) return;
+        for (auto* option = options; option->keyword != nullptr; ++option) {
+            if (option->val == nullptr) continue;
+            volatile char* value = option->val;
+            const auto size = std::strlen(option->val);
+            for (std::size_t i = 0; i < size; ++i) value[i] = '\0';
+        }
+        PQconninfoFree(options);
+    }
+};
+using ConnInfoPointer = std::unique_ptr<PQconninfoOption, ConnInfoDeleter>;
+
+struct SecretBufferScrub final {
+    std::string& value;
+    ~SecretBufferScrub() noexcept
+    {
+        volatile char* bytes = value.data();
+        for (std::size_t i = 0; i < value.size(); ++i) bytes[i] = '\0';
+    }
+};
+
+struct SecretVectorScrub final {
+    std::vector<std::string>& values;
+    ~SecretVectorScrub() noexcept
+    {
+        for (auto& value : values) {
+            volatile char* bytes = value.data();
+            for (std::size_t i = 0; i < value.size(); ++i) bytes[i] = '\0';
+        }
+    }
+};
 
 struct ResultDeleter final {
     void operator()(PGresult* result) const noexcept
@@ -121,17 +161,107 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     std::string connectionString, std::chrono::milliseconds timeout)
 {
     const Deadline deadline = makeDeadline(timeout);
+    // The original conninfo may contain credentials. Preserve it across
+    // asynchronous DNS resolution, then wipe on success, timeout or cancel.
+    SecretBufferScrub scrubConnectionString{connectionString};
     auto executor = co_await asio::this_coro::executor;
-    PGconn* rawConnection = PQconnectStart(connectionString.c_str());
-    // Libpq retains its own configuration; erase the caller-owned credential
-    // buffer before the first suspension point. This does not erase copies
-    // held by libc, libpq or the allocator.
-    volatile char* secret = connectionString.data();
-    for (std::size_t index = 0; index < connectionString.size(); ++index) {
-        secret[index] = '\0';
+
+    // PQconnectStart is nonblocking *after* DNS, but libpq may resolve a
+    // hostname synchronously before it returns the PGconn. For ordinary
+    // single-host DSNs resolve first on Asio and pin the selected address
+    // through libpq's hostaddr option, preserving host for TLS verify-full.
+    // Unix sockets, explicit hostaddr and multi-host DSNs keep their existing
+    // libpq behavior until those cases receive a separately verified
+    // coroutine-native resolver implementation.
+    char* parseError = nullptr;
+    ConnInfoPointer options{PQconninfoParse(connectionString.c_str(), &parseError)};
+    if (parseError) PQfreemem(parseError);
+    auto optionValue = [&](std::string_view key) -> std::string_view {
+        if (!options) return {};
+        for (const auto* option = options.get(); option->keyword; ++option) {
+            if (key == option->keyword && option->val) return option->val;
+        }
+        return {};
+    };
+    const std::string_view host = optionValue("host");
+    const std::string_view hostaddr = optionValue("hostaddr");
+    boost::system::error_code ipError;
+    const bool numericHost = !host.empty()
+        && !asio::ip::make_address(std::string{host}, ipError).is_unspecified()
+        && !ipError;
+    const bool resolveWithAsio = !host.empty() && !host.starts_with("/")
+        && !host.contains(',') && hostaddr.empty() && !numericHost;
+
+    PGconn* rawConnection = nullptr;
+    if (resolveWithAsio) {
+        asio::ip::tcp::resolver resolver{executor};
+        boost::system::error_code error;
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL DNS resolution timed out"};
+        }
+        const std::string service = optionValue("port").empty()
+            ? "5432" : std::string{optionValue("port")};
+        auto endpoints = co_await resolver.async_resolve(
+            std::string{host}, service,
+            asio::cancel_after(deadline - Clock::now(),
+                asio::redirect_error(asio::use_awaitable, error)));
+        if (error || endpoints.empty() || Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL DNS resolution failed or timed out"};
+        }
+        // Preserve libpq's IPv4/IPv6 failover semantics: one DNS name may
+        // resolve to multiple addresses. Repeat the TLS hostname for each
+        // pinned address; libpq matches host[i] to hostaddr[i] while a single
+        // port setting applies to every address.
+        std::string resolvedHosts;
+        std::string resolvedAddresses;
+        std::size_t addressCount = 0U;
+        for (const auto& endpoint : endpoints) {
+            const std::string address = endpoint.endpoint().address().to_string();
+            if (addressCount > 0U) {
+                resolvedHosts.push_back(',');
+                resolvedAddresses.push_back(',');
+            }
+            resolvedHosts.append(host);
+            resolvedAddresses.append(address);
+            if (++addressCount == 16U) break;
+        }
+        // Passing parsed parameters instead of appending to a DSN supports
+        // both keyword/value and postgres:// URI connection strings.
+        std::vector<std::string> ownedKeys;
+        std::vector<std::string> ownedValues;
+        SecretVectorScrub scrubValues{ownedValues};
+        for (const auto* option = options.get(); option->keyword; ++option) {
+            if (option->val == nullptr || option->val[0] == '\0') continue;
+            ownedKeys.emplace_back(option->keyword);
+            ownedValues.emplace_back(std::string_view{option->keyword} == "host"
+                ? resolvedHosts : std::string{option->val});
+        }
+        ownedKeys.emplace_back("hostaddr");
+        ownedValues.emplace_back(std::move(resolvedAddresses));
+        std::vector<const char*> keys;
+        std::vector<const char*> values;
+        for (std::size_t i = 0; i < ownedKeys.size(); ++i) {
+            keys.push_back(ownedKeys[i].c_str());
+            values.push_back(ownedValues[i].c_str());
+        }
+        keys.push_back(nullptr);
+        values.push_back(nullptr);
+        rawConnection = PQconnectStartParams(keys.data(), values.data(), 0);
+        // scrubValues runs on both normal completion and exceptions.
+    } else {
+        rawConnection = PQconnectStart(connectionString.c_str());
     }
-    connectionString.clear();
     PgPointer connection{rawConnection};
+    // libpq has copied all necessary options. Drop and wipe the parsed
+    // credential copies and caller-owned DSN *before* any socket polling.
+    options.reset();
+    {
+        volatile char* bytes = connectionString.data();
+        for (std::size_t i = 0; i < connectionString.size(); ++i) {
+            bytes[i] = '\0';
+        }
+        connectionString.clear();
+    }
     if (!connection) {
         throw std::runtime_error{"Unable to create PostgreSQL connection"};
     }
