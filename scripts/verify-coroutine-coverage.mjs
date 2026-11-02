@@ -56,6 +56,11 @@ const checked = segments.map(([name, relative]) => {
        || !/co_await\s+sendAsync\s*\(\s*std::move\(endpoint\)/.test(source))
       issues.push({line:0,kind:"synchronous proxy compatibility bypasses native transport",
         expression:"co_spawn(context, sendResultAsync(...)) -> co_await sendAsync"});
+    // Private io_context.run() still occupies a legacy handler thread.
+    // A coroutine-only migration cannot approve this compatibility facade.
+    if(/\bcontext\.run\s*\(\s*\)/.test(source))
+      issues.push({line:0,kind:"legacy proxy facade still blocks a calling thread",
+        expression:"context.run()"});
     const interfaceSource=fs.readFileSync(
       path.join(root,"src/gateway/http.cppm"),"utf8");
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
@@ -72,6 +77,11 @@ const checked = segments.map(([name, relative]) => {
     if(!legacyBridge.test(source))
       issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
         expression:"co_spawn(io, "+target+"(...))"});
+    // Even with native transport, this legacy facade waits synchronously
+    // for the future; do not mark its caller nonblocking until retired.
+    if(/\bio\.run\s*\(\s*\)/.test(source))
+      issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
+        expression:"io.run()"});
   }
   if(relative==="src/authentication/service.cpp"){
     const begin = source.slice(

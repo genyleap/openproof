@@ -1817,3 +1817,30 @@ the Enterprise LDAP provider. These remain mandatory native-library
 I/O migration and integration-test work, including asynchronous
 LDAPS connection establishment, TLS peer verification, polling,
 cancellation, credentials lifetime and result parsing.
+
+#### Strict coroutine acceptance: synchronous bridge accounting (2026-11-02)
+
+A follow-up audit found the source migration scanner was still too
+permissive: removing direct blocking DNS, TLS and HTTP functions made
+the Gateway and four provider files appear PASS, although each of their
+legacy compatibility facades still calls `io_context::run()` and
+therefore **blocks the caller's thread**. The shared native transport
+eliminates duplicated synchronous network implementations and strengthens
+DNS/TLS policy, but cannot make the enclosing legacy interface a
+coroutine without changing its caller and return contract.
+
+The acceptance gate now explicitly flags the private `context.run()`
+in Gateway's legacy `send` and `io.run()` in GitHub, OIDC, X and Web3
+legacy OAuth/RPC adapters. It still separately verifies that the
+native transport and `co_spawn` delegation are present, so it cannot be
+made green by reintroducing blocking socket calls. This **reclassifies
+five previously hidden legacy-interface blockers**: the current strict
+gate reports **19 findings**, rather than the earlier 14. The count
+change reflects a more complete audit, not a regression of the
+four successful provider builds or the asynchronous network clients.
+
+Full approval requires retiring or replacing synchronous calling paths,
+not merely wrapping them in an isolated Asio event loop. The normal
+native entry points and their 16 targeted passing C++ tests remain valid;
+production wiring, real-service E2E, SQL integration, and comparative
+benchmarks are still required.
