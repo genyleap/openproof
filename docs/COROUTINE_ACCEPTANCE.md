@@ -1899,3 +1899,23 @@ triggered CMake module fingerprint invalidation and an **89-step**
 dependency rebuild; it was cancelled before consuming more server
 resources. Previously built test binaries cannot validate changed
 module interfaces. This checkpoint is **NOT APPROVED** for deployment.
+
+#### Lexically grounded static coroutine inventory (2026-11-03)
+
+The source pre-gate now removes C++ comments, character literals,
+ordinary strings and raw string literals from its blocking-I/O scan and
+`co_await` occurrence count, while retaining source offsets and line
+numbers. It no longer accepts a claimed coroutine implementation merely
+because `co_await` appears in a comment, SQL literal or diagnostic
+string. The broad inventory also ignores strings containing innocent
+names like `PQexec`. C++ digit separators and escaped literals have
+dedicated regression coverage. Four lexical-scanner tests passed.
+
+The scanner is **not** a C++ parser: macro expansion, preprocessor
+branches, dynamically dispatched synchronous calls, external library
+implementation details, full type semantics and runtime behavior require
+the C++ compiler and dynamic regression suites. Existing SQL security
+invariants are checked against their SQL string literals separately.
+The strict source migration status remains `NOT_APPROVED`, with 19
+known findings after lexical filtering. This is measurement hardening,
+not a reduction in unfinished migration work.

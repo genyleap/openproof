@@ -5,6 +5,7 @@
 // are independent mandatory gates documented in COROUTINE_ACCEPTANCE.md.
 import fs from "node:fs";
 import path from "node:path";
+import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const segments = [
@@ -39,15 +40,15 @@ const forbidden = [
 ];
 const checked = segments.map(([name, relative]) => {
   const source = fs.readFileSync(path.join(root,relative),"utf8");
-  const lines = source.split("\n");
+  const executable = cppExecutableText(source);
   const issues=[];
   for (const [label,regex] of forbidden) {
-    for (const match of source.matchAll(regex)) {
-      const line = source.slice(0,match.index).split("\n").length;
+    for (const match of executable.matchAll(regex)) {
+      const line = executable.slice(0,match.index).split("\n").length;
       issues.push({line, kind:label, expression:match[0]});
     }
   }
-  const awaitCount=[...source.matchAll(/\bco_await\b/g)].length;
+  const awaitCount=[...executable.matchAll(/\bco_await\b/g)].length;
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
   if(relative==="src/gateway/http.cpp"){
@@ -59,7 +60,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"co_spawn(context, sendResultAsync(...)) -> co_await sendAsync"});
     // Private io_context.run() still occupies a legacy handler thread.
     // A coroutine-only migration cannot approve this compatibility facade.
-    if(/\bcontext\.run\s*\(\s*\)/.test(source))
+    if(/\bcontext\.run\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"legacy proxy facade still blocks a calling thread",
         expression:"context.run()"});
     const interfaceSource=fs.readFileSync(
@@ -86,7 +87,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"co_spawn(io, "+target+"(...))"});
     // Even with native transport, this legacy facade waits synchronously
     // for the future; do not mark its caller nonblocking until retired.
-    if(/\bio\.run\s*\(\s*\)/.test(source))
+    if(/\bio\.run\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
   }
@@ -263,11 +264,12 @@ function auditDirectory(directory) {
     const relative = path.relative(root, absolute).split(path.sep).join("/");
     if (namedPaths.has(relative)) continue;
     const source = fs.readFileSync(absolute,"utf8");
+    const executable = cppExecutableText(source);
     const issues = [];
     for (const [kind, regex] of globalForbidden) {
-      for (const match of source.matchAll(regex)) {
+      for (const match of executable.matchAll(regex)) {
         issues.push({
-          line: source.slice(0,match.index).split("\n").length,
+          line: executable.slice(0,match.index).split("\n").length,
           kind, expression: match[0],
         });
       }
