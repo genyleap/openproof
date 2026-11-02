@@ -177,7 +177,9 @@ const checked = segments.map(([name, relative]) => {
       ["multi-host native enumeration", /for\s*\(std::size_t\s+i\s*=\s*0;\s*i\s*<\s*hosts\.size\s*\(\s*\)/],
       ["multi-host port association", /ports\.size\s*\(\s*\)\s*!=\s*hosts\.size\s*\(\s*\)/],
       ["failed DNS hostname cannot suppress HA fallback", /if\s*\(error\s*\|\|\s*endpoints\.empty\s*\(\s*\)\)/],
-      ["empty DNS result fails closed", /if\s*\(addressCount\s*==\s*0U\)/]
+      ["empty DNS result fails closed", /if\s*\(addressCount\s*==\s*0U\)/],
+      ["partial hostaddr still resolves asynchronously", /const\s+auto\s+pinnedAddresses\s*=\s*csv\s*\(hostaddr\)/],
+      ["pinned hostaddr selection is explicit", /if\s*\(\s*!pinned\.empty\s*\(\s*\)\s*\)/]
     ]){
       if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
     }

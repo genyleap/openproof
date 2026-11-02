@@ -200,24 +200,28 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     };
     const auto hosts = csv(host);
     const auto ports = csv(optionValue("port"));
+    const auto pinnedAddresses = csv(hostaddr);
     const auto numeric = [](std::string_view value) {
         boost::system::error_code error;
         static_cast<void>(asio::ip::make_address(std::string{value}, error));
         return !error;
     };
     bool resolveWithAsio = false;
-    if (hostaddr.empty()) {
-        for (const auto item : hosts) {
-            if (!item.empty() && !item.starts_with("/") && !numeric(item)) {
-                resolveWithAsio = true;
-                break;
-            }
+    for (std::size_t i = 0; i < hosts.size(); ++i) {
+        const auto name = hosts[i];
+        const auto address = hostaddr.empty() ? std::string_view{}
+            : i < pinnedAddresses.size() ? pinnedAddresses[i] : std::string_view{};
+        if (address.empty() && !name.empty() && !name.starts_with("/")
+            && !numeric(name)) {
+            resolveWithAsio = true;
+            break;
         }
     }
 
     PGconn* rawConnection = nullptr;
     if (resolveWithAsio) {
-        if (ports.size() != 1U && ports.size() != hosts.size()) {
+        if ((ports.size() != 1U && ports.size() != hosts.size())
+            || (!hostaddr.empty() && pinnedAddresses.size() != hosts.size())) {
             throw std::runtime_error{"Invalid PostgreSQL host/port configuration"};
         }
         asio::ip::tcp::resolver resolver{executor};
@@ -243,6 +247,12 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
             const std::string_view name = hosts[i];
             const std::string_view port =
                 ports.size() == 1U ? ports.front() : ports[i];
+            const std::string_view pinned = hostaddr.empty()
+                ? std::string_view{} : pinnedAddresses[i];
+            if (!pinned.empty()) {
+                append(name, pinned, port);
+                continue;
+            }
             if (name.empty() || name.starts_with("/")) {
                 // An empty hostaddr element retains libpq's Unix socket
                 // semantics for this slot in a mixed multi-host list.
@@ -286,8 +296,9 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         SecretVectorScrub scrubValues{ownedValues};
         for (const auto* option = options.get(); option->keyword; ++option) {
             if (option->val == nullptr || option->val[0] == '\0') continue;
-            ownedKeys.emplace_back(option->keyword);
             const std::string_view key{option->keyword};
+            if (key == "hostaddr") continue;
+            ownedKeys.emplace_back(option->keyword);
             if (key == "host") ownedValues.emplace_back(resolvedHosts);
             else if (key == "port" && ports.size() > 1U) {
                 ownedValues.emplace_back(resolvedPorts);

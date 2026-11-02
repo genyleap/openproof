@@ -71,6 +71,27 @@ TEST(PostgresAsyncDnsTest, MultiHostUriKeepsPortAssociations)
         "openproof_disposable_test");
 }
 
+TEST(PostgresAsyncDnsTest, MixedPinnedAndResolvedHostaddrKeepsAssociations)
+{
+    expectConnectionDenied(
+        "host=localhost,127.0.0.1 hostaddr=,127.0.0.1 "
+        "port=1,1 user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, PinnedFirstHostDoesNotForceDnsLookup)
+{
+    expectConnectionDenied(
+        "host=unresolvable.invalid,localhost hostaddr=127.0.0.1, "
+        "port=1,1 user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, MixedUnixSocketAndHostnamePreservesFailover)
+{
+    expectConnectionDenied(
+        "host=/tmp/openproof-no-such-pg-socket,localhost port=1,1 "
+        "user=openproof_test dbname=openproof_disposable_test");
+}
+
 TEST(PostgresAsyncDnsTest, InvalidPortListFailsClosed)
 {
     expectConnectionDenied(

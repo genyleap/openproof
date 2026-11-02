@@ -1938,10 +1938,10 @@ to maintain libpq multi-address failover semantics. The remaining
 Parsed password options and the original DSN are wiped on every exit
 path and disposed of before libpq socket polling; C library internal
 copies are explicitly not claimed to be erased. Explicit `hostaddr`,
-Unix sockets, numeric hosts and explicitly supplied hostaddr lists use
-libpq's original path. Mixed or empty explicit hostaddr lists and
-implicit environment-dependent DNS are **still outstanding
-full-migration cases**.
+Unix sockets, numeric hosts and fully pinned hostaddr lists use
+libpq's original path. Partial hostaddr lists are now resolved via Asio
+(see the following test record); implicit environment-dependent DNS
+remains a separate full-migration case.
 
 GCC 16.2 compiled and linked the modified `openproof_postgres_async_io`
 library with `-Werror` unchanged. A narrowly scoped `-fno-inline`
@@ -1985,3 +1985,27 @@ native DNS enumeration, port pairing and no-host failure.
 The legacy production PostgreSQL pool remains synchronous, and the
 complete protocol still has separate PostgreSQL/LDAP/HTTP migration
 blockers. **No acceptance or deployment approval follows.**
+
+#### Mixed hostaddr / Unix-socket failover (2026-11-03)
+
+The native resolver also handles partially pinned `hostaddr` host lists.
+It trusts non-empty pinned IP entries, resolves only the corresponding
+missing hostname entries on Asio, and preserves Unix-socket directory
+slots in mixed HA lists. The original host-to-port and TLS-hostname
+associations remain intact. This closes the explicit partial-hostaddr
+DNS fallback left in the previous checkpoint.
+
+Three additional **loopback-only** C++ tests were added for mixed
+pinned/unpinned hosts, a pinned first hostname that is deliberately
+unresolvable through DNS, and mixed Unix-socket/hostname failover.
+GCC 16.2 compiled and linked the changed native libpq library and
+test executable successfully. The targeted DNS suite now reports
+**11/11 passed**. The existing native connection/pool/session suite
+was separately rebuilt and ran 34 registered tests, of which 11 ran
+and passed while 23 SQL cases skipped due to absence of an acknowledged
+disposable PostgreSQL instance. No test accessed the live database.
+
+The release gate still counts 19 known blocking findings. Native
+environment-dependent hostname defaults, legacy synchronous storage,
+enterprise LDAP and HTTP API paths, successful live TLS/database HA,
+and comparative benchmarks remain outstanding.
