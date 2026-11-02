@@ -25,7 +25,10 @@ public:
     // A handler may expose the native ABI before its dependencies are ready.
     // The listener must preserve its original synchronous entry point unless
     // the handler explicitly opts into native dispatch.
-    [[nodiscard]] virtual bool nativeEnabled() const noexcept { return true; }
+    // Fail closed by default. A coroutine ABI alone does not prove that
+    // downstream databases, providers, or other dependencies are native.
+    // Each ready implementation must deliberately opt into native dispatch.
+    [[nodiscard]] virtual bool nativeEnabled() const noexcept { return false; }
 
     [[nodiscard]] virtual boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) = 0;
@@ -168,6 +171,7 @@ private:
 class CoroutineGatewayAdapter final : public CoroutineHttpHandler {
 public:
     CoroutineGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport);
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse>
     handleAsync(HttpRequest request) override;

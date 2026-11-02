@@ -54,6 +54,7 @@ struct DisabledNativeFallback final : gateway::http::CoroutineHttpHandler {
 };
 
 struct EnabledNativeFallback final : gateway::http::CoroutineHttpHandler {
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override {
         ++blockingCalls;
         return gateway::HttpResponse{500, {}, "unexpected"};

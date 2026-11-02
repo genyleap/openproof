@@ -1311,7 +1311,7 @@ coroutine-source checks are only pre-gates, not release evidence.
 
 The Beast listener no longer selects coroutine dispatch solely because a
 handler implements `CoroutineHttpHandler`. The transport interface exposes
-`nativeEnabled()` (true by default for existing native handlers); Web3
+`nativeEnabled()` (now false by default; explicitly ready native handlers opt in); Web3
 overrides it to return true **only when an asynchronous session issuer is
 explicitly injected**. Without that issuer, the listener invokes Web3's
 unchanged synchronous `handle()` compatibility path on the bounded handler
@@ -1870,3 +1870,32 @@ has been compiled or executed in this checkpoint. The separately attempted
 Gateway target likewise stalled on the heavyweight `http.cpp` translation
 unit and was cancelled without a passing build. No CI, release, or deployment
 was triggered.
+
+#### Explicit native HTTP dispatch opt-in (2026-11-03)
+
+The `CoroutineHttpHandler` capability previously returned `true`
+by default, even for newly constructed handlers whose native storage,
+provider and session dependencies had never been declared ready. This
+contradicted the interface's explicit opt-in contract and risked
+dispatching a merely coroutine-shaped handler when its downstream
+capabilities were missing.
+
+The default is now **`nativeEnabled() == false`**. The intended
+`CoroutineGatewayAdapter` and already-validated, fail-closed
+`CoroutineSessionListenerAdapter` explicitly opt in. Web3 retains its
+existing conditional opt-in requiring both native session issuance and
+trusted canonical completion; the Metrics adapter still propagates its
+downstream capability. Three existing intentionally native Gateway test
+handlers and the enabled Web3 test fallback now declare their capability
+explicitly. A new real-HTTP loopback regression confirms an unconfigured
+CoroutineHttpHandler is dispatched through its synchronous compatibility
+handler and its `handleAsync` method is not invoked.
+
+Three new source-contract checks pass and the coroutine acceptance
+inventory checks the default-off contract plus explicit production
+capabilities. **Native C++ runtime evidence is still outstanding.**
+A minimal attempt to compile just the Gateway interface object
+triggered CMake module fingerprint invalidation and an **89-step**
+dependency rebuild; it was cancelled before consuming more server
+resources. Previously built test binaries cannot validate changed
+module interfaces. This checkpoint is **NOT APPROVED** for deployment.

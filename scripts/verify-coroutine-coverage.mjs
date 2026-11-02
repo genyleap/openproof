@@ -66,6 +66,12 @@ const checked = segments.map(([name, relative]) => {
       path.join(root,"src/gateway/http.cppm"),"utf8");
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
       issues.push({line:0,kind:"missing middleware coroutine capability propagation",expression:"m_fallback->nativeEnabled()"});
+    if(!/virtual\s+bool\s+nativeEnabled\s*\(\)\s*const\s*noexcept\s*\{\s*return\s+false;\s*\}/.test(interfaceSource))
+      issues.push({line:0,kind:"unsafe default-enabled coroutine handler capability",
+        expression:"CoroutineHttpHandler::nativeEnabled() default false"});
+    if(!/class\s+CoroutineGatewayAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(interfaceSource))
+      issues.push({line:0,kind:"missing explicit native gateway opt-in",
+        expression:"CoroutineGatewayAdapter::nativeEnabled() true"});
   }
   if([
     "src/providers/github/github.cpp",
@@ -176,6 +182,11 @@ const checked = segments.map(([name, relative]) => {
     if(/\bfallback\.handle\s*\(/.test(source))
       issues.push({line:0,kind:"listener fallback may not call synchronous handler",
         expression:"fallback.handle("});
+    const listenerInterface = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_listener.hpp"),"utf8");
+    if(!/class\s+CoroutineSessionListenerAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(listenerInterface))
+      issues.push({line:0,kind:"native PostgreSQL listener lacks explicit opt-in",
+        expression:"CoroutineSessionListenerAdapter::nativeEnabled() true"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().

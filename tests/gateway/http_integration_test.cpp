@@ -110,8 +110,30 @@ public:
     std::atomic<int> asynchronousCalls{0};
 };
 
+// An implementation that exposes handleAsync() but never opts in must
+// remain on the legacy bounded handler path, not the native dispatcher.
+class UnconfiguredCoroutineHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        synchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        return gw::HttpResponse{200, {}, "default-denied-native"};
+    }
+
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest) override
+    {
+        asynchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        co_return gw::HttpResponse{503, {}, "native-opt-in-was-not-configured"};
+    }
+
+    std::atomic<int> synchronousCalls{0};
+    std::atomic<int> asynchronousCalls{0};
+};
+
 class CoroutineWaitingHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
         // This route must never fall back to the synchronous handler.
@@ -171,6 +193,7 @@ class CoroutineProxyHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
     CoroutineProxyHandler(httpAdapter::BeastProxyTransport& proxy, gw::Endpoint endpoint)
         : m_proxy(&proxy), m_endpoint(std::move(endpoint)) {}
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
 
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -195,6 +218,7 @@ private:
 
 class CoroutineThrowingHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
         throw std::runtime_error{"wrong handler method"};
@@ -316,6 +340,22 @@ TEST(BeastHttpIntegrationTest, BlockingHandlersDoNotOccupySocketEventLoop)
     for (auto& client : clients) client.join();
     EXPECT_EQ(success.load(), 12);
     EXPECT_GE(handler.peak(), 3);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, NativeDispatchRequiresExplicitOptIn)
+{
+    UnconfiguredCoroutineHandler handler;
+    EXPECT_FALSE(handler.nativeEnabled());
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto response = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native-unconfigured");
+    EXPECT_EQ(response.result(), beastHttp::status::ok);
+    EXPECT_EQ(response.body(), "default-denied-native");
+    EXPECT_EQ(handler.synchronousCalls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(handler.asynchronousCalls.load(std::memory_order_relaxed), 0);
     server.stop();
 }
 

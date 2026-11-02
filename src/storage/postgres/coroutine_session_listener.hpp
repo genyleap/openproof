@@ -24,6 +24,7 @@ class CoroutineSessionListenerAdapter final
     : public gateway::http::CoroutineHttpHandler {
 public:
     explicit CoroutineSessionListenerAdapter(CoroutineSessionHttpHandler& handler);
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
 
     [[nodiscard]] gateway::HttpResponse
     handle(gateway::HttpRequest request) override;
