@@ -1798,3 +1798,22 @@ uncompiled/unexecuted**. Keep the Gateway phase release-blocked until
 they compile/link and the full `FocusedGateway` regression suite runs.
 The source gate's five fewer findings are a static result, not proof
 of runtime acceptance.
+
+#### Enterprise LDAP unbind cleanup (2026-11-02)
+
+The LDAP connection RAII deleter now uses `ldap_unbind_ext` in place
+of `ldap_unbind_ext_s`. LDAP Unbind does not have an application-level
+response, so the non-`_s` OpenLDAP operation avoids the synchronous
+unbind API during connection destruction. The installed OpenLDAP
+headers explicitly declare both forms. The modified
+`openproof_provider_enterprise` target compiled and linked under
+GCC 16.2.
+
+This removes one synchronous-shutdown source finding, reducing the
+static migration count from 15 to 14. It **does not** make Enterprise
+LDAP coroutine-native: `ldap_sasl_bind_s` and `ldap_search_ext_s`
+still block, and there is no end-to-end coroutine completion method in
+the Enterprise LDAP provider. These remain mandatory native-library
+I/O migration and integration-test work, including asynchronous
+LDAPS connection establishment, TLS peer verification, polling,
+cancellation, credentials lifetime and result parsing.

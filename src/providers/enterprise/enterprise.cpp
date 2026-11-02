@@ -228,7 +228,10 @@ struct LdapDeleter final {
     void operator()(LDAP* handle) const noexcept
     {
         if (handle != nullptr) {
-            (void)ldap_unbind_ext_s(handle, nullptr, nullptr);
+            // LDAP Unbind has no application-level response. Use the
+            // non-synchronous API during RAII cleanup; never wait for a
+            // network reply while destroying a provider connection.
+            (void)ldap_unbind_ext(handle, nullptr, nullptr);
         }
     }
 };
