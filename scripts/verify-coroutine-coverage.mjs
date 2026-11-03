@@ -235,6 +235,12 @@ const checked = segments.map(([name, relative]) => {
     if(!/m_network\s*\(\s*m_application\s*,\s*fallback\s*,\s*allowCompatibilityFallback\s*\)/.test(source))
       issues.push({line:0,kind:"listener does not propagate explicit compatibility opt-in",
         expression:"m_network(m_application, fallback, allowCompatibilityFallback)"});
+    // Hybrid dispatch is useful to stage modules without breaking legacy
+    // routes, but occupying a bounded worker is still synchronous work.
+    // Full-native acceptance must never treat this adapter as completed.
+    if(/\bm_fallback->handle\s*\(/.test(executable))
+      issues.push({line:0,kind:"hybrid session listener still permits synchronous compatibility work",
+        expression:"m_fallback->handle(...)"});
     if(!/co_return\s+co_await\s+fallback\.handleAsync\s*\(/.test(source))
       issues.push({line:0,kind:"listener fallback must use native awaitable dispatch",
         expression:"co_await fallback.handleAsync"});

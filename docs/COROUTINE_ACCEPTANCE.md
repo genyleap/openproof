@@ -2231,3 +2231,21 @@ inventory continues to flag the unresolved synchronous provider, LDAP,
 legacy storage, and API boundaries. The changed listener C++ unit and
 new loopback tests have **not** been compiled; C++/SQL/HTTP acceptance
 is still outstanding. The operator's Production wiring has not changed.
+
+#### Strict acceptance clarification: optional hybrid routes are still blocking (2026-11-03)
+
+The request-selective PostgreSQL session listener is safe to compose
+in explicitly authorized compatibility mode, but its delegated
+`m_fallback->handle()` still consumes a bounded worker thread. This is
+not equivalent to end-to-end coroutine-native service completion.
+The static migration gate now counts that explicit synchronous call
+as an unresolved finding even though the listener's session routes
+remain fully native. The overall strict inventory rises from **19 to
+20 findings** by exposing this previously uncounted compatibility
+operation; no completed native capability was regressed.
+
+Approval requires either retiring the legacy adapter on every route
+or replacing it with a genuinely nonblocking native implementation and
+passing the isolation, replay, cancellation and performance suites.
+Keeping the compatibility path opt-in protects existing deployments
+without falsely certifying complete migration.
