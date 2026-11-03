@@ -225,6 +225,9 @@ const checked = segments.map(([name, relative]) => {
     if(!/throw\s+std::invalid_argument/.test(source))
       issues.push({line:0,kind:"listener composition must reject inactive fallback",
         expression:"throw std::invalid_argument"});
+    if(!/\!fallback\.nativeEnabledFor\s*\(\s*request\s*\)/.test(source))
+      issues.push({line:0,kind:"coroutine listener ignores per-request native fallback capability",
+        expression:"!fallback.nativeEnabledFor(request)"});
     if(!/co_return\s+co_await\s+fallback\.handleAsync\s*\(/.test(source))
       issues.push({line:0,kind:"listener fallback must use native awaitable dispatch",
         expression:"co_await fallback.handleAsync"});

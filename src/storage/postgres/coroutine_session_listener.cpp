@@ -49,7 +49,8 @@ CoroutineSessionListenerStack::CoroutineSessionListenerStack(
               // Native support may be revoked by a downstream capability
               // (for example, its async session issuer becoming unavailable).
               // Never call a disabled coroutine or its synchronous handler.
-              if (!fallback.nativeEnabled()) {
+              if (!fallback.nativeEnabled()
+                  || !fallback.nativeEnabledFor(request)) {
                   gateway::HttpResponse unavailable{
                       foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
                       gateway::Headers{{"content-type", "application/json"}},

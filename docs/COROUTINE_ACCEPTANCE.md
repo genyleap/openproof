@@ -2173,3 +2173,26 @@ change has not yet been compiled or run through the new Beast test**:
 a previous attempt to rebuild the authentication module involved 228
 module steps and was deliberately stopped. No release or production
 deployment is authorized on this source-level evidence.
+
+#### Native listener respects request-scoped downstream capability (2026-11-03)
+
+After adding `nativeEnabledFor(request)` to the Gateway, a composing
+listener still checked only the downstream handler's global
+`nativeEnabled()` flag. That was insufficient: a partially migrated
+fallback could advertise overall native support while declaring an
+individual route unsuitable for its awaitable entry point. The
+PostgreSQL session listener now **fails closed** unless *both* the
+global and request-specific downstream capabilities are enabled before
+calling `fallback.handleAsync`. Session routes continue using the
+native PostgreSQL coroutine service; non-session routes never invoke
+a blocked downstream coroutine or the synchronous fallback.
+
+A new loopback C++ regression disables only `/disabled/native`
+while keeping `/other/api` enabled. It checks that the disabled
+route yields a sanitized, uncached 503 without calling either fallback,
+while the enabled route still receives the normal native response.
+The static coverage gate and its source-boundary test now require this
+guard; 19 source-only tests pass. The newly added socket test remains
+**uncompiled and unexecuted** until an isolated, bounded C++ module
+build can run. Migration approval and Production deployment remain
+blocked.

@@ -23,10 +23,12 @@ test("session listener rechecks dynamic capability and never invokes sync fallba
   const end = source.indexOf("m_network(m_application)", start);
   assert.ok(start >= 0 && end > start);
   const coroutine = source.slice(start, end);
-  assert.match(coroutine, /if\s*\(\s*!fallback\.nativeEnabled\(\)\s*\)/);
+  assert.match(coroutine, /if\s*\(\s*!fallback\.nativeEnabled\(\)\s*\|\|\s*!fallback\.nativeEnabledFor\(request\)\s*\)/);
   assert.match(coroutine, /foundation::ErrorCode::Unavailable/);
   assert.match(coroutine, /co_return\s+co_await\s+fallback\.handleAsync\s*\(/);
   assert.doesNotMatch(coroutine, /\bfallback\.handle\s*\(/);
   assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, DisabledFallbackFailsClosedOnLiveSocket\)/);
+  assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, DisabledRequestSpecificFallbackFailsClosed\)/);
+  assert.match(tests, /denySelectedRoute\.store\(true/);
   assert.match(tests, /EXPECT_EQ\(f\.fallback\.blockingCalls\.load\(\), 0\)/);
 });

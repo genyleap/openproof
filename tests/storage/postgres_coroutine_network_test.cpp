@@ -60,10 +60,18 @@ struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     std::atomic<int>* observed;
     std::atomic<bool> throwAfterSuspend{false};
     std::atomic<bool> enabled{true};
+    std::atomic<bool> denySelectedRoute{false};
     std::atomic<int> blockingCalls{0};
     explicit NativeFallback(std::atomic<int>& counter) : observed(&counter) {}
     [[nodiscard]] bool nativeEnabled() const noexcept override {
         return enabled.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool nativeEnabledFor(
+        const gw::HttpRequest& request) const noexcept override
+    {
+        return nativeEnabled() &&
+            !(denySelectedRoute.load(std::memory_order_acquire)
+              && request.path() == "/disabled/native");
     }
     [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -138,6 +146,28 @@ TEST(PostgresCoroutineNetworkTest, DisabledFallbackFailsClosedOnLiveSocket)
     EXPECT_EQ(result.base()[wire::field::cache_control], "no-store");
     EXPECT_NE(result.body().find("UNAVAILABLE"), std::string::npos);
     EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
+}
+
+TEST(PostgresCoroutineNetworkTest, DisabledRequestSpecificFallbackFailsClosed)
+{
+    Fixture f;
+    ASSERT_TRUE(f.listener.start());
+    f.fallback.denySelectedRoute.store(true, std::memory_order_release);
+
+    const auto denied = send(
+        f.listener.boundPort(), wire::verb::get, "/disabled/native");
+    EXPECT_EQ(denied.result_int(), 503);
+    EXPECT_EQ(denied.base()[wire::field::cache_control], "no-store");
+    EXPECT_NE(denied.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
+
+    const auto accepted = send(
+        f.listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(accepted.result_int(), 209);
+    EXPECT_EQ(accepted.body(), "async-route");
+    EXPECT_EQ(f.forwarded.load(), 1);
     EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 }
 
