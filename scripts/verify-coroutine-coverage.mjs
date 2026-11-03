@@ -76,6 +76,16 @@ const checked = segments.map(([name, relative]) => {
     if(!/class\s+CoroutineMetricsAdapter[\s\S]*?nativeEnabledFor\s*\([\s\S]*?request\.path\s*\(\s*\)\s*!=\s*"\/metrics"[\s\S]*?m_fallback->nativeEnabledFor\s*\(request\)/.test(interfaceSource))
       issues.push({line:0,kind:"metrics wrapper does not preserve request-specific native routing",
         expression:"/metrics stays compatibility and other requests delegate"});
+    const metricsAsync = executable.slice(
+      executable.indexOf("CoroutineMetricsAdapter::handleAsync("),
+      executable.indexOf("CoroutineGatewayAdapter::CoroutineGatewayAdapter("));
+    if(!/request\.path\s*\(\s*\)\s*==\s*"\/metrics"/.test(source.slice(
+      source.indexOf("CoroutineMetricsAdapter::handleAsync("),
+      source.indexOf("CoroutineGatewayAdapter::CoroutineGatewayAdapter(")))
+       || !/!m_fallback->nativeEnabledFor\s*\(\s*request\s*\)/.test(metricsAsync)
+       || /m_metricsFacade->handle\s*\(/.test(metricsAsync))
+      issues.push({line:0,kind:"metrics coroutine entry can execute synchronous or disabled downstream work",
+        expression:"handleAsync /metrics and disabled native fallback must fail closed"});
     if(!/class\s+CoroutineGatewayAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(interfaceSource))
       issues.push({line:0,kind:"missing explicit native gateway opt-in",
         expression:"CoroutineGatewayAdapter::nativeEnabled() true"});

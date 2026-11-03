@@ -750,11 +750,22 @@ HttpResponse CoroutineMetricsAdapter::handle(HttpRequest request)
 boost::asio::awaitable<HttpResponse>
 CoroutineMetricsAdapter::handleAsync(HttpRequest request)
 {
-    if (request.path() == "/metrics") {
-        // The security-sensitive constant-time bearer verification and the
-        // Prometheus response are still owned by MetricsHttpApi. Never bypass
-        // that facade or synthesize a metrics response in the transport.
-        co_return m_metricsFacade->handle(std::move(request));
+    if (request.path() == "/metrics"
+        || !m_fallback->nativeEnabledFor(request)) {
+        // The listener routes /metrics to the authenticated synchronous
+        // facade. A direct native call must not run that facade, disclose
+        // metrics or bypass a revoked per-request downstream capability.
+        // Even a miscomposed middleware chain therefore fails closed rather
+        // than executing a synchronous service on a coroutine executor.
+        HttpResponse denied{
+            foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
+            Headers{{"content-type", "application/json"}},
+            foundation::toClientJson(
+                foundation::Error{foundation::ErrorCode::Unavailable},
+                request.correlation().value())};
+        denied.setHeader("cache-control", "no-store");
+        denied.setHeader("x-content-type-options", "nosniff");
+        co_return denied;
     }
     const HttpMethod method = request.method();
     const auto started = std::chrono::steady_clock::now();

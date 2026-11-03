@@ -32,6 +32,9 @@ test("session listener rechecks dynamic capability and never invokes sync fallba
   assert.match(tests, /denySelectedRoute\.store\(true/);
   assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely\)/);
   assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, ExplicitCompatibilityCanComposePartialFallback\)/);
+  assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, HybridCanRunSelectedNativeRouteWithGlobalNativeDisabled\)/);
+  assert.match(tests, /TEST\(PostgresCoroutineNetworkTest, RevokedCapabilityBetweenChecksFailsClosed\)/);
+  assert.match(tests, /revokeCapabilityAfterFirstCheck\.exchange\(/);
   assert.match(source, /m_allowCompatibilityFallback\s*&&\s*!CoroutineSessionHttpHandler::isSessionRoute\(request\.path\(\)\)/);
   assert.match(source, /return\s+m_fallback->handle\(std::move\(request\)\)/);
   assert.match(source, /CoroutineSessionHttpHandler::isSessionRoute\(request\.path\(\)\)/);

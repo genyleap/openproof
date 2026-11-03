@@ -60,8 +60,10 @@ using namespace std::chrono_literals;
 struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     std::atomic<int>* observed;
     std::atomic<bool> throwAfterSuspend{false};
-    std::atomic<bool> enabled{true};
+    mutable std::atomic<bool> enabled{true};
     std::atomic<bool> denySelectedRoute{false};
+    std::atomic<bool> allowNativeRouteWithoutGlobalCapability{false};
+    mutable std::atomic<bool> revokeCapabilityAfterFirstCheck{false};
     std::atomic<int> blockingCalls{0};
     explicit NativeFallback(std::atomic<int>& counter) : observed(&counter) {}
     [[nodiscard]] bool nativeEnabled() const noexcept override {
@@ -70,6 +72,16 @@ struct NativeFallback final : gwHttp::CoroutineHttpHandler {
     [[nodiscard]] bool nativeEnabledFor(
         const gw::HttpRequest& request) const noexcept override
     {
+        if (revokeCapabilityAfterFirstCheck.exchange(
+                false, std::memory_order_acq_rel)) {
+            // Simulate a dependency withdrawing native support after the
+            // transport's first capability check but before coroutine entry.
+            enabled.store(false, std::memory_order_release);
+            return true;
+        }
+        if (allowNativeRouteWithoutGlobalCapability.load(
+                std::memory_order_acquire)
+            && request.path() == "/other/api") return true;
         return nativeEnabled() &&
             !(denySelectedRoute.load(std::memory_order_acquire)
               && request.path() == "/disabled/native");
@@ -237,6 +249,51 @@ TEST(PostgresCoroutineNetworkTest, ExplicitCompatibilityCanComposePartialFallbac
     EXPECT_EQ(rotate.result_int(), 401);
     EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
     listener.stop();
+}
+
+TEST(PostgresCoroutineNetworkTest, HybridCanRunSelectedNativeRouteWithGlobalNativeDisabled)
+{
+    Fixture f;
+    f.fallback.enabled.store(false, std::memory_order_release);
+    f.fallback.allowNativeRouteWithoutGlobalCapability.store(
+        true, std::memory_order_release);
+    pg::CoroutineSessionListenerStack hybrid{
+        f.service, f.limiter, f.fallback, true};
+    gwHttp::BeastHttpServer listener{
+        hybrid.handler(), gwHttp::ServerConfig::create(
+            "127.0.0.1", 0U, 8192U, 4096U, 2s, 2s, 16U, 2U).value()};
+    ASSERT_TRUE(listener.start());
+
+    const auto native = send(
+        listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(native.result_int(), 209);
+    EXPECT_EQ(native.body(), "async-route");
+    EXPECT_EQ(f.forwarded.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
+
+    const auto legacy = send(
+        listener.boundPort(), wire::verb::get, "/legacy");
+    EXPECT_EQ(legacy.result_int(), 503);
+    EXPECT_EQ(legacy.body(), "blocking fallback must not execute");
+    EXPECT_EQ(f.forwarded.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    listener.stop();
+}
+
+TEST(PostgresCoroutineNetworkTest, RevokedCapabilityBetweenChecksFailsClosed)
+{
+    Fixture f;
+    f.fallback.revokeCapabilityAfterFirstCheck.store(
+        true, std::memory_order_release);
+    ASSERT_TRUE(f.listener.start());
+
+    const auto response = send(
+        f.listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(response.result_int(), 503);
+    EXPECT_EQ(response.base()[wire::field::cache_control], "no-store");
+    EXPECT_NE(response.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 }
 
 TEST(PostgresCoroutineNetworkTest, SocketRoutesThroughAwaitableForNonSession)

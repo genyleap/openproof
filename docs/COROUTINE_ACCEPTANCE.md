@@ -2266,3 +2266,39 @@ The source acceptance gate now reads the single shared
 requires their coverage in the hybrid socket test. Source tests:
 **19/19 passed**. The new C++ socket assertions have not yet been built,
 so runtime acceptance remains open. No deployment or release occurred.
+
+#### Direct coroutine middleware capability enforcement (2026-11-04)
+
+A focused audit found that `CoroutineMetricsAdapter::handleAsync`
+still directly invoked the synchronous authenticated metrics facade
+on `/metrics`, despite the Beast request dispatcher normally routing
+that path to the bounded synchronous handler through
+`nativeEnabledFor(request)==false`. A direct async entry (for example
+through another adapter) could therefore block the coroutine execution
+context or bypass the intended per-request readiness check.
+
+The async middleware now **fails closed** with sanitized HTTP 503,
+`cache-control: no-store` and `x-content-type-options: nosniff`
+for either `/metrics` or any request whose downstream handler does
+not advertise request-specific native readiness. It never calls
+`m_metricsFacade->handle` or the blocked downstream `handleAsync`
+on these paths. The regular Beast `/metrics` route is unchanged:
+its authenticated metrics facade still runs on the bounded
+compatibility worker, preserving existing access controls and response.
+
+A new direct-`handleAsync` C++ regression covers both denied routes,
+requires no synchronous/asynchronous fallback invocation, and checks
+that no telemetry payload is returned. Existing socket tests still
+cover authorized and unauthorized metrics on the normal HTTP path.
+The strict source gate now checks this direct-call boundary, and a
+new source-level test covers the same invariant.
+
+Two further (uncompiled) PostgreSQL hybrid loopback regressions check:
+(1) per-request native success even when the fallback's *global*
+native capability is disabled, and (2) revocation between outer
+dispatch and inner native callback causing a sanitized 503, without
+executing either fallback. **20/20 source-contract tests pass**.
+The changed heavy Gateway translation unit and new C++ tests are
+not yet compiled/executed; this checkpoint is NOT an integration,
+performance, release or deployment approval. The strict repository
+migration inventory continues to report 20 blocking findings.

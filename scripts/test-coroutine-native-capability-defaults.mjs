@@ -34,6 +34,25 @@ test("known native handlers explicitly opt in; conditional Web3 remains gated", 
     /Web3AuthenticationHttpApi::nativeEnabledFor\([\s\S]*?m_asyncSessions != nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\(\)/);
 });
 
+test("metrics asynchronous entry rejects direct sync and revoked fallback calls", () => {
+  const implementation = read("src/gateway/http.cpp");
+  const start = implementation.indexOf("CoroutineMetricsAdapter::handleAsync(");
+  const end = implementation.indexOf("CoroutineGatewayAdapter::CoroutineGatewayAdapter(", start);
+  assert.ok(start >= 0 && end > start);
+  const native = implementation.slice(start, end);
+  assert.match(native, /request\.path\(\) == "\/metrics"/);
+  assert.match(native, /!m_fallback->nativeEnabledFor\(request\)/);
+  assert.doesNotMatch(native, /m_metricsFacade->handle\s*\(/);
+  assert.match(native, /ErrorCode::Unavailable/);
+  assert.match(native, /cache-control", "no-store"/);
+  assert.match(gatewayTests,
+    /TEST\(BeastHttpIntegrationTest, DirectMetricsCoroutineCallFailsClosed\)/);
+  assert.match(gatewayTests,
+    /EXPECT_EQ\(disabled\.synchronousCalls\.load\(\), 0\)/);
+  assert.match(gatewayTests,
+    /EXPECT_EQ\(disabled\.asynchronousCalls\.load\(\), 0\)/);
+});
+
 test("loopback-native test implementations explicitly opt in", () => {
   for (const name of ["CoroutineWaitingHandler", "CoroutineProxyHandler", "CoroutineThrowingHandler"]) {
     const start = gatewayTests.indexOf("class " + name + " final");

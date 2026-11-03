@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -466,6 +467,41 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     // allow more than 8 outstanding handler coroutines simultaneously.
     EXPECT_GT(handler.peak(), 8);
     server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, DirectMetricsCoroutineCallFailsClosed)
+{
+    DisabledCoroutineHandler disabled;
+    DelegatingMetricsFacadeStub facade{disabled};
+    httpAdapter::CoroutineMetricsAdapter wrapper{
+        facade, disabled, [](gw::HttpMethod, int, double) {}};
+
+    // A direct coroutine caller must never bypass the listener's native
+    // capability check and execute a synchronous service. This is distinct
+    // from the normal /metrics socket route, which remains authorized via
+    // the metrics facade on the bounded compatibility worker.
+    for (const std::string_view path : {"/metrics", "/api/disabled"}) {
+        asio::io_context io;
+        std::optional<gw::HttpResponse> result;
+        auto task = [&]() -> asio::awaitable<void> {
+            auto request = gw::HttpRequest::create(
+                gw::HttpMethod::Get, std::string{path}, {}, {},
+                "127.0.0.1", fnd::CorrelationId{"metrics-native-fail-closed"});
+            if (!request) throw std::runtime_error{"invalid test request"};
+            result.emplace(co_await wrapper.handleAsync(
+                std::move(request).value()));
+        };
+        auto future = asio::co_spawn(io, task(), asio::use_future);
+        io.run();
+        ASSERT_NO_THROW(future.get());
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->status(), 503);
+        ASSERT_TRUE(result->headers().contains("cache-control"));
+        EXPECT_EQ(result->headers().at("cache-control"), "no-store");
+        EXPECT_EQ(result->body().find("counter"), std::string_view::npos);
+    }
+    EXPECT_EQ(disabled.synchronousCalls.load(), 0);
+    EXPECT_EQ(disabled.asynchronousCalls.load(), 0);
 }
 
 TEST(BeastHttpIntegrationTest, CoroutineMetricsWrapperKeepsGuardAndAsyncFallback)
