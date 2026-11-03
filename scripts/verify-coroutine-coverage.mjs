@@ -235,6 +235,16 @@ const checked = segments.map(([name, relative]) => {
     if(!/m_network\s*\(\s*m_application\s*,\s*fallback\s*,\s*allowCompatibilityFallback\s*\)/.test(source))
       issues.push({line:0,kind:"listener does not propagate explicit compatibility opt-in",
         expression:"m_network(m_application, fallback, allowCompatibilityFallback)"});
+    const sessionRoutes = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_http.cpp"),"utf8");
+    const sessionRoutePredicate = sessionRoutes.slice(
+      sessionRoutes.indexOf("bool CoroutineSessionHttpHandler::isSessionRoute("),
+      sessionRoutes.indexOf("CoroutineSessionHttpHandler::handleAsync("));
+    for (const route of ["/auth/session/rotate", "/auth/logout", "/auth/logout-all"]) {
+      if(!sessionRoutePredicate.includes('"' + route + '"'))
+        issues.push({line:0,kind:"native session mutation may reach legacy compatibility",
+          expression:route});
+    }
     // Hybrid dispatch is useful to stage modules without breaking legacy
     // routes, but occupying a bounded worker is still synchronous work.
     // Full-native acceptance must never treat this adapter as completed.

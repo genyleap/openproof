@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -202,6 +203,17 @@ TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
         listener.boundPort(), wire::verb::post, "/auth/session/rotate");
     EXPECT_EQ(rotate.result_int(), 401);
     EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+
+    for (const std::string_view route : {"/auth/logout", "/auth/logout-all"}) {
+        const auto logout = send(
+            listener.boundPort(), wire::verb::post, std::string{route});
+        EXPECT_EQ(logout.result_int(), 204);
+        const auto header = logout.base()[wire::field::set_cookie];
+        const std::string_view cookie{header.data(), header.size()};
+        EXPECT_NE(cookie.find("__Host-openproof-session="),
+                  std::string_view::npos);
+        EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    }
     listener.stop();
 }
 

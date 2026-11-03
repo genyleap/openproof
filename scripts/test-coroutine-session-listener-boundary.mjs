@@ -35,5 +35,14 @@ test("session listener rechecks dynamic capability and never invokes sync fallba
   assert.match(source, /m_allowCompatibilityFallback\s*&&\s*!CoroutineSessionHttpHandler::isSessionRoute\(request\.path\(\)\)/);
   assert.match(source, /return\s+m_fallback->handle\(std::move\(request\)\)/);
   assert.match(source, /CoroutineSessionHttpHandler::isSessionRoute\(request\.path\(\)\)/);
+  const nativeRoutes = fs.readFileSync(
+    path.join(root, "src/storage/postgres/coroutine_session_http.cpp"), "utf8");
+  const predicate = nativeRoutes.slice(
+    nativeRoutes.indexOf("bool CoroutineSessionHttpHandler::isSessionRoute("),
+    nativeRoutes.indexOf("CoroutineSessionHttpHandler::handleAsync("));
+  for (const pathValue of ["/auth/session/rotate", "/auth/logout", "/auth/logout-all"]) {
+    assert.ok(predicate.includes('"' + pathValue + '"'));
+  }
+  assert.match(tests, /for \(const std::string_view route : \{"\/auth\/logout", "\/auth\/logout-all"\}\)/);
   assert.match(tests, /EXPECT_EQ\(f\.fallback\.blockingCalls\.load\(\), 0\)/);
 });

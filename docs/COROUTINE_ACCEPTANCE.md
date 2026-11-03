@@ -2249,3 +2249,20 @@ or replacing it with a genuinely nonblocking native implementation and
 passing the isolation, replay, cancellation and performance suites.
 Keeping the compatibility path opt-in protects existing deployments
 without falsely certifying complete migration.
+
+#### Hybrid session-route parity is now an audited invariant (2026-11-03)
+
+An additional hybrid socket regression covers anonymous `POST /auth/logout`
+and `POST /auth/logout-all` alongside the existing rotation test.
+Both logout routes must return HTTP 204 with the clearing session cookie
+without incrementing the synchronous fallback's invocation counter.
+This prevents an otherwise subtle compatibility-dispatch regression
+where the native session HTTP application knows a route but the outer
+transport incorrectly sends it to a legacy repository.
+
+The source acceptance gate now reads the single shared
+`CoroutineSessionHttpHandler::isSessionRoute` predicate and requires
+**all three** sensitive mutation routes; the dedicated boundary test
+requires their coverage in the hybrid socket test. Source tests:
+**19/19 passed**. The new C++ socket assertions have not yet been built,
+so runtime acceptance remains open. No deployment or release occurred.
