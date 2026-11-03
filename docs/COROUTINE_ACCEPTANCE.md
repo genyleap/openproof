@@ -2063,12 +2063,17 @@ the transaction store implements the native coroutine transaction SPI,
 a canonical identity finalizer exists, and an operator trust policy
 allows that provider. This check is exception-safe and fails closed.
 The currently synchronous local provider cannot accidentally become a
-native reactor handler.
+native reactor handler. Furthermore, Gateway's native capability is
+handler-wide, not route-specific: `kAllAuthRoutesNative` is deliberately
+hard-disabled until session rotation, logout and recovery-code routes
+are fully asynchronous. Even injecting a replacing session issuer
+cannot silently turn the entire first-party authentication API on.
 
-With the full capability explicitly supplied, the native POST
-`/auth/login` route validates the original subject/rate-limit/binding
-requirements and awaits `beginAsync` to persist the one-time
-challenge. The native `/auth/mfa/verify` route validates its existing
+The staged native POST `/auth/login` route validates the original
+subject/rate-limit/binding requirements and awaits `beginAsync` to
+persist the one-time challenge. It must not be enabled until every
+exposed /auth endpoint has native persistence and passes end-to-end
+runtime tests. The native `/auth/mfa/verify` route validates its existing
 cookie-bound proof, awaits `completeAsync`, then awaits a new
 optional provider-neutral `CoroutineReplacingSessionIssuer::issueReplacingAsync` port.
 The native PostgreSQL session service implements that port using its

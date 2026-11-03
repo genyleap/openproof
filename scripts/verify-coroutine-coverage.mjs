@@ -234,6 +234,14 @@ const checked = segments.map(([name, relative]) => {
     // co_await on login/verify does not migrate logout, rotation, recovery
     // issuance, or the legacy public handler. Keep this entire HTTP boundary
     // blocking until every route and production caller has a native port.
+    // Native capability is per-handler, so partial route migrations must
+    // not be activated for all /auth requests.
+    const nativeInterface = fs.readFileSync(
+      path.join(root,"src/authentication/http/http.cppm"),"utf8");
+    if(!/static\s+constexpr\s+bool\s+kAllAuthRoutesNative\s*=\s*false/.test(nativeInterface)
+       || !/return\s+kAllAuthRoutesNative\s*&&\s*m_asyncSessions\s*!=\s*nullptr/.test(nativeInterface))
+      issues.push({line:0,kind:"partially native authentication handler enabled before all routes migrate",
+        expression:"kAllAuthRoutesNative=false"});
     if(/\bm_sessions->(?:issueReplacing|authenticate|rotate|revoke|revokeAll)\s*\(/.test(legacy)
        || /\bm_recoveryCodes->issue\s*\(/.test(legacy)
        || /\bm_authentication->(?:begin|complete)\s*\(/.test(legacy))

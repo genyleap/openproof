@@ -27,6 +27,8 @@ const method = (source, startToken, nextToken) => {
 
 test("native authentication requires the provider and every durable dependency", () => {
   assert.match(api, /nativeProviderAuthenticationEnabled\(m_provider\)/);
+  assert.match(api, /static constexpr bool kAllAuthRoutesNative = false/);
+  assert.match(api, /return kAllAuthRoutesNative && m_asyncSessions != nullptr/);
   const native = method(coordinator,
     "bool AuthenticationService::nativeProviderAuthenticationEnabled",
     "foundation::Result<AuthenticationStart> AuthenticationService::begin");

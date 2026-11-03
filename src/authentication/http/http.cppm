@@ -32,13 +32,19 @@ public:
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
-        return m_asyncSessions != nullptr
+        // Native capability is per handler, not per endpoint. Until rotation,
+        // logout and recovery-code APIs also have async persistence, enabling
+        // only login/verify would break existing production routes.
+        return kAllAuthRoutesNative && m_asyncSessions != nullptr
             && m_authentication->nativeProviderAuthenticationEnabled(m_provider);
     }
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) override;
 
 private:
+    // Must remain false until every exposed /auth endpoint can run natively.
+    // The opt-in flag is intentionally not runtime-configurable.
+    static constexpr bool kAllAuthRoutesNative = false;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     loginAsync(gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
