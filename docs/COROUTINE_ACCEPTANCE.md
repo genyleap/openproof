@@ -2196,3 +2196,38 @@ guard; 19 source-only tests pass. The newly added socket test remains
 **uncompiled and unexecuted** until an isolated, bounded C++ module
 build can run. Migration approval and Production deployment remain
 blocked.
+
+#### Hybrid session-listener composition with explicitly bounded compatibility (2026-11-03)
+
+The PostgreSQL session listener previously required its entire downstream
+handler to report `nativeEnabled()==true`. That prevented composition
+with the new request-selective Authentication/Web3 HTTP handlers: their
+whole-handler capability is deliberately disabled while some routes are
+still synchronous. The listener stack now exposes an **explicit optional**
+`allowCompatibilityFallback` constructor flag, defaulting to `false`.
+
+With the default flag, the original fail-closed behavior is unchanged:
+a globally disabled fallback cannot be composed; any subsequently
+disabled request-specific fallback is rejected by the native callback
+with an uncached 503. With the explicit hybrid opt-in, the listener's
+`nativeEnabledFor(request)` delegates to the downstream handler for
+non-session paths, and its synchronous `handle()` forwards those
+non-native requests to the downstream compatibility handler on the
+**bounded Beast handler pool**, not on the socket reactor. The shared
+`CoroutineSessionHttpHandler::isSessionRoute` predicate prevents
+`/auth/session/rotate`, `/auth/logout`, and `/auth/logout-all`
+from reaching any synchronous fallback: these routes always take the
+native session path, even in hybrid mode.
+
+Two additional loopback C++ regressions verify that an explicitly
+hybrid listener selects a synchronous non-session fallback, continues
+native delivery for an enabled non-session route, and keeps session
+mutation routes native; one case also composes a downstream handler
+without whole-handler native readiness. Source tests require both the
+default rejection guard and the explicitly authorized hybrid route,
+including the identical route predicate for transport and session
+application. **19/19 source tests passed** and the strict migration
+inventory continues to flag the unresolved synchronous provider, LDAP,
+legacy storage, and API boundaries. The changed listener C++ unit and
+new loopback tests have **not** been compiled; C++/SQL/HTTP acceptance
+is still outstanding. The operator's Production wiring has not changed.

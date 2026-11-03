@@ -15,12 +15,6 @@ namespace openproof::storage::postgres {
 namespace asio = boost::asio;
 namespace {
 
-[[nodiscard]] bool isSessionRoute(std::string_view path) noexcept
-{
-    return path == "/auth/session/rotate" || path == "/auth/logout"
-        || path == "/auth/logout-all";
-}
-
 [[nodiscard]] gateway::HttpResponse safeResponse(int status, std::string body = {})
 {
     gateway::HttpResponse response{
@@ -145,6 +139,13 @@ CoroutineSessionHttpHandler::CoroutineSessionHttpHandler(
     if (!m_fallback) {
         throw std::invalid_argument{"An async fallback is required"};
     }
+}
+
+bool CoroutineSessionHttpHandler::isSessionRoute(
+    std::string_view path) noexcept
+{
+    return path == "/auth/session/rotate" || path == "/auth/logout"
+        || path == "/auth/logout-all";
 }
 
 asio::awaitable<gateway::HttpResponse>

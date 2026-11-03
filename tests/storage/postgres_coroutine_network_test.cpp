@@ -171,6 +171,62 @@ TEST(PostgresCoroutineNetworkTest, DisabledRequestSpecificFallbackFailsClosed)
     EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 }
 
+TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
+{
+    Fixture f;
+    f.fallback.denySelectedRoute.store(true, std::memory_order_release);
+    pg::CoroutineSessionListenerStack hybrid{
+        f.service, f.limiter, f.fallback, true};
+    gwHttp::BeastHttpServer listener{
+        hybrid.handler(), gwHttp::ServerConfig::create(
+            "127.0.0.1", 0U, 8192U, 4096U, 2s, 2s, 16U, 2U).value()};
+    ASSERT_TRUE(listener.start());
+
+    const auto legacy = send(
+        listener.boundPort(), wire::verb::get, "/disabled/native");
+    EXPECT_EQ(legacy.result_int(), 503);
+    EXPECT_EQ(legacy.body(), "blocking fallback must not execute");
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.forwarded.load(), 0);
+
+    const auto native = send(
+        listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(native.result_int(), 209);
+    EXPECT_EQ(native.body(), "async-route");
+    EXPECT_EQ(f.forwarded.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+
+    // Even an explicitly hybrid listener may never send a native session
+    // mutation to the synchronous compatibility fallback.
+    const auto rotate = send(
+        listener.boundPort(), wire::verb::post, "/auth/session/rotate");
+    EXPECT_EQ(rotate.result_int(), 401);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    listener.stop();
+}
+
+TEST(PostgresCoroutineNetworkTest, ExplicitCompatibilityCanComposePartialFallback)
+{
+    Fixture f;
+    f.fallback.enabled.store(false, std::memory_order_release);
+    pg::CoroutineSessionListenerStack hybrid{
+        f.service, f.limiter, f.fallback, true};
+    gwHttp::BeastHttpServer listener{
+        hybrid.handler(), gwHttp::ServerConfig::create(
+            "127.0.0.1", 0U, 8192U, 4096U, 2s, 2s, 16U, 2U).value()};
+    ASSERT_TRUE(listener.start());
+    const auto legacy = send(
+        listener.boundPort(), wire::verb::get, "/other/api");
+    EXPECT_EQ(legacy.result_int(), 503);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    const auto rotate = send(
+        listener.boundPort(), wire::verb::post, "/auth/session/rotate");
+    EXPECT_EQ(rotate.result_int(), 401);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    listener.stop();
+}
+
 TEST(PostgresCoroutineNetworkTest, SocketRoutesThroughAwaitableForNonSession)
 {
     Fixture f;

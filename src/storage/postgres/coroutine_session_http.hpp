@@ -1,6 +1,7 @@
 #pragma once
 #include <boost/asio/awaitable.hpp>
 #include <functional>
+#include <string_view>
 #include <utility>
 
 #include "coroutine_session_service.hpp"
@@ -25,6 +26,11 @@ public:
 
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request);
+
+    /** Shared route predicate for both native dispatch and compatibility.
+     * Never let a synchronous handler receive one of these session mutations.
+     */
+    [[nodiscard]] static bool isSessionRoute(std::string_view path) noexcept;
 
 private:
     CoroutinePostgresSessionService* m_sessions;

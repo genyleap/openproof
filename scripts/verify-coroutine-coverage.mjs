@@ -219,15 +219,22 @@ const checked = segments.map(([name, relative]) => {
         expression:"issueReplacingAsync / co_await issueReplacing"});
   }
   if(relative==="src/storage/postgres/coroutine_session_listener.cpp"){
-    if(!/if\s*\(\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
-      issues.push({line:0,kind:"coroutine session listener accepts disabled native fallback",
-        expression:"!fallback.nativeEnabled()"});
+    if(!/if\s*\(\s*!allowCompatibilityFallback\s*&&\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
+      issues.push({line:0,kind:"coroutine session listener accepts disabled native fallback without opt-in",
+        expression:"!allowCompatibilityFallback && !fallback.nativeEnabled()"});
     if(!/throw\s+std::invalid_argument/.test(source))
       issues.push({line:0,kind:"listener composition must reject inactive fallback",
         expression:"throw std::invalid_argument"});
     if(!/\!fallback\.nativeEnabledFor\s*\(\s*request\s*\)/.test(source))
       issues.push({line:0,kind:"coroutine listener ignores per-request native fallback capability",
         expression:"!fallback.nativeEnabledFor(request)"});
+    if(!/m_allowCompatibilityFallback\s*&&\s*!CoroutineSessionHttpHandler::isSessionRoute\s*\(\s*request\.path\s*\(\s*\)\s*\)/.test(source)
+       || !/return\s+m_fallback->handle\s*\(\s*std::move\s*\(request\)\s*\)/.test(source))
+      issues.push({line:0,kind:"hybrid listener lacks explicit bounded legacy dispatch",
+        expression:"opt-in non-session fallback on handler pool"});
+    if(!/m_network\s*\(\s*m_application\s*,\s*fallback\s*,\s*allowCompatibilityFallback\s*\)/.test(source))
+      issues.push({line:0,kind:"listener does not propagate explicit compatibility opt-in",
+        expression:"m_network(m_application, fallback, allowCompatibilityFallback)"});
     if(!/co_return\s+co_await\s+fallback\.handleAsync\s*\(/.test(source))
       issues.push({line:0,kind:"listener fallback must use native awaitable dispatch",
         expression:"co_await fallback.handleAsync"});
