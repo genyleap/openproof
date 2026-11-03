@@ -53,8 +53,9 @@ const checked = segments.map(([name, relative]) => {
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
   if(relative==="src/gateway/http.cpp"){
-    if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabled\s*\(/.test(source))
-      issues.push({line:0,kind:"missing opt-in coroutine dispatch guard",expression:"asyncHandler->nativeEnabled("});
+    if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabledFor\s*\(\s*operation\s*\)/.test(source))
+      issues.push({line:0,kind:"missing request-scoped coroutine dispatch guard",
+        expression:"asyncHandler->nativeEnabledFor(operation)"});
     if(!/asio::co_spawn\s*\(\s*context\s*,\s*sendResultAsync\s*\(/.test(source)
        || !/co_await\s+sendAsync\s*\(\s*std::move\(endpoint\)/.test(source))
       issues.push({line:0,kind:"synchronous proxy compatibility bypasses native transport",
@@ -68,9 +69,13 @@ const checked = segments.map(([name, relative]) => {
       path.join(root,"src/gateway/http.cppm"),"utf8");
     if(!/CoroutineMetricsAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_fallback->nativeEnabled\s*\(\);/.test(interfaceSource))
       issues.push({line:0,kind:"missing middleware coroutine capability propagation",expression:"m_fallback->nativeEnabled()"});
-    if(!/virtual\s+bool\s+nativeEnabled\s*\(\)\s*const\s*noexcept\s*\{\s*return\s+false;\s*\}/.test(interfaceSource))
+    if(!/virtual\s+bool\s+nativeEnabled\s*\(\)\s*const\s*noexcept\s*\{\s*return\s+false;\s*\}/.test(interfaceSource)
+       || !/nativeEnabledFor\s*\([\s\S]*?return\s+nativeEnabled\s*\(\s*\);/.test(interfaceSource))
       issues.push({line:0,kind:"unsafe default-enabled coroutine handler capability",
-        expression:"CoroutineHttpHandler::nativeEnabled() default false"});
+        expression:"CoroutineHttpHandler::nativeEnabledFor(request) defaults to nativeEnabled()"});
+    if(!/class\s+CoroutineMetricsAdapter[\s\S]*?nativeEnabledFor\s*\([\s\S]*?request\.path\s*\(\s*\)\s*!=\s*"\/metrics"[\s\S]*?m_fallback->nativeEnabledFor\s*\(request\)/.test(interfaceSource))
+      issues.push({line:0,kind:"metrics wrapper does not preserve request-specific native routing",
+        expression:"/metrics stays compatibility and other requests delegate"});
     if(!/class\s+CoroutineGatewayAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(interfaceSource))
       issues.push({line:0,kind:"missing explicit native gateway opt-in",
         expression:"CoroutineGatewayAdapter::nativeEnabled() true"});
@@ -254,7 +259,7 @@ const checked = segments.map(([name, relative]) => {
       source.indexOf("AuthenticationHttpApi::handleAsync("),
       source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
     for(const [kind,regex] of [
-      ["native provider capability guard", /nativeEnabled\s*\(\)/],
+      ["native provider capability guard", /nativeEnabledFor\s*\(request\)/],
       ["native challenge start", /co_await\s+m_authentication->beginAsync\s*\(/],
       ["native proof completion", /co_await\s+m_authentication->completeAsync\s*\(/],
       ["atomic native session replacement", /co_await\s+m_asyncSessions->issueReplacingAsync\s*\(/]
@@ -275,15 +280,20 @@ const checked = segments.map(([name, relative]) => {
     const nativeEntry = source.slice(
       source.indexOf("Web3AuthenticationHttpApi::handleAsync("),
       source.indexOf("Web3AuthenticationHttpApi::startAsync("));
-    if(!/native\s*!=\s*nullptr\s*&&\s*native->nativeEnabled\s*\(\)/.test(nativeEntry))
-      issues.push({line:0,kind:"missing downstream native capability guard",expression:"native->nativeEnabled()"});
+    if(!/native\s*!=\s*nullptr\s*&&\s*native->nativeEnabledFor\s*\(request\)/.test(nativeEntry))
+      issues.push({line:0,kind:"missing request-specific downstream native capability guard",
+        expression:"native->nativeEnabledFor(request)"});
 
     // Web3 must leave the listener's compatibility dispatch enabled by
     // default when no native asynchronous session service is configured.
     const interfaceSource=fs.readFileSync(
       path.join(root,"src/authentication/http/web3.cppm"),"utf8");
-    if(!/nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+m_asyncSessions\s*!=\s*nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(interfaceSource))
-      issues.push({line:0,kind:"missing Web3 compatibility gate",expression:"nativeEnabled()"});
+    if(!/nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{[\s\S]*?return\s+false\s*;/.test(interfaceSource)
+       || !/nativeEnabledFor\s*\(/.test(interfaceSource)
+       || !/Web3AuthenticationHttpApi::nativeEnabledFor\s*\(/.test(source)
+       || !/m_asyncSessions\s*!=\s*nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(source))
+      issues.push({line:0,kind:"missing Web3 request-scoped compatibility gate",
+        expression:"nativeEnabled() false; nativeEnabledFor(request) checks sessions and canonical"});
     // Require the actual trusted coordinator awaits, not merely a synthetic
     // coroutine wrapper around the synchronous HTTP handler.
     // Connection/handoff paths are intentionally fail-closed until their

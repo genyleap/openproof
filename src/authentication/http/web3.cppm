@@ -29,9 +29,13 @@ public:
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
-        return m_asyncSessions != nullptr
-            && m_authentication->nativeCanonicalCompletionEnabled();
+        // The legacy browser-handoff and connection routes are not yet native.
+        // Whole-handler capability therefore remains false; request-specific
+        // dispatch selects only completed login routes.
+        return false;
     }
+    [[nodiscard]] bool nativeEnabledFor(
+        const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) override;
 

@@ -29,6 +29,14 @@ test("native authentication requires the provider and every durable dependency",
   assert.match(api, /nativeProviderAuthenticationEnabled\(m_provider\)/);
   assert.match(api, /static constexpr bool kAllAuthRoutesNative = false/);
   assert.match(api, /return kAllAuthRoutesNative && m_asyncSessions != nullptr/);
+  const nativeRoute = method(http,
+    "AuthenticationHttpApi::nativeEnabledFor(", "AuthenticationHttpApi::handleAsync(");
+  const raw = read("src/authentication/http/http.cpp");
+  assert.match(raw, /path == "\/auth\/login" \|\| path == "\/auth\/mfa\/verify"/);
+  assert.match(nativeRoute, /m_asyncSessions != nullptr/);
+  assert.match(nativeRoute, /nativeProviderAuthenticationEnabled\(m_provider\)/);
+  assert.match(raw, /path == "\/auth" \|\| path\.starts_with\("\/auth\/"\)\) return false/);
+  assert.match(nativeRoute, /native->nativeEnabledFor\(request\)/);
   const native = method(coordinator,
     "bool AuthenticationService::nativeProviderAuthenticationEnabled",
     "foundation::Result<AuthenticationStart> AuthenticationService::begin");
@@ -42,7 +50,7 @@ test("native authentication requires the provider and every durable dependency",
 test("native HTTP dispatch cannot invoke legacy fallback or session APIs", () => {
   const native = method(http,
     "AuthenticationHttpApi::handleAsync(", "AuthenticationHttpApi::loginAsync(");
-  assert.match(native, /native->nativeEnabled\(\)/);
+  assert.match(native, /native->nativeEnabledFor\(request\)/);
   assert.match(native, /co_await\s+native->handleAsync\(/);
   assert.match(native, /co_await\s+loginAsync\(/);
   assert.match(native, /co_await\s+verifyAsync\(/);

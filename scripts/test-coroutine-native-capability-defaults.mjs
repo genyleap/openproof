@@ -18,13 +18,20 @@ test("native gateway capability defaults to fail closed", () => {
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, NativeDispatchRequiresExplicitOptIn\)/);
   assert.match(gatewayTests, /EXPECT_FALSE\(handler\.nativeEnabled\(\)\)/);
   assert.match(gatewayTests, /EXPECT_EQ\(handler\.asynchronousCalls\.load\(std::memory_order_relaxed\), 0\)/);
+  assert.match(gateway, /nativeEnabledFor\([\s\S]*?return nativeEnabled\(\);/);
+  assert.match(read("src/gateway/http.cpp"), /asyncHandler->nativeEnabledFor\(operation\)/);
+  assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, SelectiveNativeDispatchPreservesLegacyRoutes\)/);
 });
 
 test("known native handlers explicitly opt in; conditional Web3 remains gated", () => {
   assert.match(gateway, /class CoroutineGatewayAdapter[\s\S]*?nativeEnabled\(\) const noexcept override \{ return true; \}/);
   assert.match(listener, /class CoroutineSessionListenerAdapter[\s\S]*?nativeEnabled\(\) const noexcept override \{ return true; \}/);
   assert.match(gateway, /return m_fallback->nativeEnabled\(\);/);
-  assert.match(web3, /return m_asyncSessions != nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\(\);/);
+  assert.match(gateway, /request\.path\(\) != "\/metrics"\s*&& m_fallback->nativeEnabledFor\(request\)/);
+  assert.match(web3, /nativeEnabled\(\) const noexcept override \{[\s\S]*?return false;/);
+  assert.match(web3, /bool nativeEnabledFor\(/);
+  assert.match(read("src/authentication/http/web3.cpp"),
+    /Web3AuthenticationHttpApi::nativeEnabledFor\([\s\S]*?m_asyncSessions != nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\(\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {

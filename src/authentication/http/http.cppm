@@ -38,6 +38,8 @@ public:
         return kAllAuthRoutesNative && m_asyncSessions != nullptr
             && m_authentication->nativeProviderAuthenticationEnabled(m_provider);
     }
+    [[nodiscard]] bool nativeEnabledFor(
+        const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) override;
 

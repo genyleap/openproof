@@ -276,21 +276,35 @@ gateway::HttpResponse AuthenticationHttpApi::handle(gateway::HttpRequest request
     return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
 }
 
-// Explicitly opt-in native routes. The production constructor still defaults
-// to a null native session issuer, keeping the original synchronous handler
-// on its bounded compatibility workers until the full dependency chain is wired.
+// Only /auth/login and /auth/mfa/verify are ready for native dispatch.
+// Other auth routes continue on the bounded compatibility worker. Native
+// readiness always requires a trusted provider, native transactions, canonical
+// finalizer and a replacing session issuer, not merely a coroutine-shaped API.
+bool AuthenticationHttpApi::nativeEnabledFor(
+    const gateway::HttpRequest& request) const noexcept
+{
+    const auto path = request.path();
+    if (path == "/auth/login" || path == "/auth/mfa/verify") {
+        return m_asyncSessions != nullptr
+            && m_authentication->nativeProviderAuthenticationEnabled(m_provider);
+    }
+    if (path == "/auth" || path.starts_with("/auth/")) return false;
+    auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+    return native != nullptr && native->nativeEnabledFor(request);
+}
+
 boost::asio::awaitable<gateway::HttpResponse>
 AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
     if (request.path() != "/auth" && !request.path().starts_with("/auth/")) {
         auto* native =
             dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
-        if (native != nullptr && native->nativeEnabled()) {
+        if (native != nullptr && native->nativeEnabledFor(request)) {
             co_return co_await native->handleAsync(std::move(request));
         }
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
-    if (!nativeEnabled()) {
+    if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
     if (!m_rateLimiter->allow(
@@ -355,7 +369,7 @@ AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse>
 AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
 {
-    if (!nativeEnabled()) {
+    if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }

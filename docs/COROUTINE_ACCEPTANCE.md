@@ -2136,3 +2136,40 @@ modified GCC16.2 native libpq library and executable compiled and
 linked; **16/16 NativePgDns tests passed** after this correction.
 The strict migration source gate now checks these fail-closed guards.
 No database server, Production settings, or CI pipeline was touched.
+
+#### Request-scoped native HTTP dispatch (2026-11-03)
+
+The Beast HTTP listener now asks each opt-in `CoroutineHttpHandler`
+`nativeEnabledFor(const HttpRequest&)` when dispatching a request, rather
+than making a single native-versus-legacy decision for the whole handler.
+The backward-compatible default defers to the existing `nativeEnabled()`
+flag. Handlers with all routes ready therefore keep their previous behavior,
+while handlers with mixed readiness may declare exactly which requests have
+fully asynchronous dependency chains.
+
+The first-party auth handler selects native `POST /auth/login` and
+`POST /auth/mfa/verify` only if the provider-neutral coroutine transaction
+store, registered native provider, canonical finalizer and atomic replacing
+session issuer are all available. Existing rotate/logout/recovery-code
+routes remain on the bounded compatibility workers. Web3 selects native
+`POST /auth/web3/start` and `POST /auth/web3/complete` only when native
+authentication and session capabilities are injected; its connection and
+browser-handoff routes retain their original compatibility behavior.
+Non-auth requests may chain to a downstream native handler only when
+the downstream handler independently accepts that same request.
+
+The metrics middleware keeps `/metrics` on the original authentication
+facade while forwarding non-metrics request-specific native readiness
+through the middleware. The whole-handler Web3 capability remains false
+to avoid pretending the entire HTTP API has migrated.
+
+A new Beast loopback C++ integration test exercises a single handler
+serving one coroutine route and one synchronous compatibility route.
+Additional Web3 test assertions cover route-specific availability.
+Nineteen source-only invariant tests passed; the migration gate remains
+NOT_APPROVED with existing synchronous storage, LDAP, OAuth, account,
+administration, HTTP compatibility and provider facades. **This C++ module
+change has not yet been compiled or run through the new Beast test**:
+a previous attempt to rebuild the authentication module involved 228
+module steps and was deliberately stopped. No release or production
+deployment is authorized on this source-level evidence.

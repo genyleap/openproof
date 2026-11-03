@@ -131,6 +131,29 @@ public:
     std::atomic<int> asynchronousCalls{0};
 };
 
+class SelectiveCoroutineHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
+    [[nodiscard]] bool nativeEnabledFor(
+        const gw::HttpRequest& request) const noexcept override
+    {
+        return request.path() == "/native";
+    }
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        synchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        return gw::HttpResponse{200, {}, "legacy"};
+    }
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest) override
+    {
+        asynchronousCalls.fetch_add(1, std::memory_order_relaxed);
+        co_return gw::HttpResponse{200, {}, "native"};
+    }
+    std::atomic<int> synchronousCalls{0};
+    std::atomic<int> asynchronousCalls{0};
+};
+
 class CoroutineWaitingHandler final : public httpAdapter::CoroutineHttpHandler {
 public:
     [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
@@ -356,6 +379,25 @@ TEST(BeastHttpIntegrationTest, NativeDispatchRequiresExplicitOptIn)
     EXPECT_EQ(response.body(), "default-denied-native");
     EXPECT_EQ(handler.synchronousCalls.load(std::memory_order_relaxed), 1);
     EXPECT_EQ(handler.asynchronousCalls.load(std::memory_order_relaxed), 0);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, SelectiveNativeDispatchPreservesLegacyRoutes)
+{
+    SelectiveCoroutineHandler handler;
+    EXPECT_FALSE(handler.nativeEnabled());
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto native = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native");
+    const auto legacy = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/legacy");
+    EXPECT_EQ(native.result(), beastHttp::status::ok);
+    EXPECT_EQ(native.body(), "native");
+    EXPECT_EQ(legacy.result(), beastHttp::status::ok);
+    EXPECT_EQ(legacy.body(), "legacy");
+    EXPECT_EQ(handler.asynchronousCalls.load(), 1);
+    EXPECT_EQ(handler.synchronousCalls.load(), 1);
     server.stop();
 }
 

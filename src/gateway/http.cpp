@@ -339,7 +339,8 @@ public:
                     dynamic_cast<CoroutineHttpHandler*>(m_owner->m_handler);
                 // Keep legacy routing unchanged for a coroutine-capable
                 // adapter whose native storage dependencies are not enabled.
-                auto response = asyncHandler && asyncHandler->nativeEnabled()
+                auto response = asyncHandler
+                        && asyncHandler->nativeEnabledFor(operation)
                     ? co_await asyncHandler->handleAsync(std::move(operation))
                     : m_owner->m_handler->handle(std::move(operation));
                 wire = wireResponse(std::move(response), version, headRequest);

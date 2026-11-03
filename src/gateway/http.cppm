@@ -30,6 +30,18 @@ public:
     // Each ready implementation must deliberately opt into native dispatch.
     [[nodiscard]] virtual bool nativeEnabled() const noexcept { return false; }
 
+    /** Decide native dispatch for each request, without changing the
+     * default behavior of existing handler implementations. A handler may
+     * expose both native and compatibility routes during migration.
+     * This must never inspect or log credentials or request bodies.
+     */
+    [[nodiscard]] virtual bool nativeEnabledFor(
+        const gateway::HttpRequest& request) const noexcept
+    {
+        (void)request;
+        return nativeEnabled();
+    }
+
     [[nodiscard]] virtual boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) = 0;
 protected:
@@ -157,6 +169,12 @@ public:
                             CoroutineHttpHandler& fallback, Observer observer);
     [[nodiscard]] bool nativeEnabled() const noexcept override {
         return m_fallback->nativeEnabled();
+    }
+    [[nodiscard]] bool nativeEnabledFor(
+        const HttpRequest& request) const noexcept override {
+        // Metrics verification still belongs to the synchronous facade.
+        return request.path() != "/metrics"
+            && m_fallback->nativeEnabledFor(request);
     }
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse>

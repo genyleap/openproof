@@ -560,8 +560,25 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
     return response;
 }
 
-// Native HTTP handler is opt-in; its blocking compatibility API remains
-// unchanged for production until all downstream repositories are coroutine.
+// Request-scoped native capability preserves the legacy browser-handoff and
+// connection routes while allowing native wallet login with async persistence.
+// An unrelated downstream request is native only when the next handler also
+// explicitly advertises native support for that same request.
+bool Web3AuthenticationHttpApi::nativeEnabledFor(
+    const gateway::HttpRequest& request) const noexcept
+{
+    const auto path = request.path();
+    if (path == "/auth/web3/start" || path == "/auth/web3/complete") {
+        return request.method() == gateway::HttpMethod::Post
+            && m_asyncSessions != nullptr
+            && m_authentication->nativeCanonicalCompletionEnabled();
+    }
+    if (path.starts_with("/auth/web3/")
+        || path.starts_with("/account/connections/web3/")) return false;
+    auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+    return native != nullptr && native->nativeEnabledFor(request);
+}
+
 boost::asio::awaitable<gateway::HttpResponse>
 Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
@@ -588,7 +605,7 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
     // path because its persistence dependencies are not yet asynchronous.
     // Do not bypass that capability guard when chaining HTTP middleware.
     if (auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
-        native != nullptr && native->nativeEnabled()) {
+        native != nullptr && native->nativeEnabledFor(request)) {
         co_return co_await native->handleAsync(std::move(request));
     }
     co_return error(foundation::Error{foundation::ErrorCode::Unavailable},

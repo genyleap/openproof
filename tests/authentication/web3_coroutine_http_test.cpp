@@ -456,7 +456,15 @@ TEST(Web3HttpCoroutineTest, NativeStartRequiresAsyncSessionIssuerBeforeStartingP
     // On the actual Beast listener, this instance must dispatch through the
     // unchanged synchronous handler instead of selecting native HTTP.
     EXPECT_FALSE(withoutNativeSessions.nativeEnabled());
-    EXPECT_TRUE(fixture.api.nativeEnabled());
+    EXPECT_FALSE(withoutNativeSessions.nativeEnabledFor(
+        request("/auth/web3/start")));
+    EXPECT_FALSE(fixture.api.nativeEnabled());
+    EXPECT_TRUE(fixture.api.nativeEnabledFor(request("/auth/web3/start")));
+    EXPECT_TRUE(fixture.api.nativeEnabledFor(request("/auth/web3/complete")));
+    EXPECT_FALSE(fixture.api.nativeEnabledFor(
+        request("/account/connections/web3/start")));
+    EXPECT_FALSE(fixture.api.nativeEnabledFor(
+        request("/auth/web3/authentication-handoff")));
     auto owned = std::make_unique<NativeWalletProvider>();
     auto* provider = owned.get();
     ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
