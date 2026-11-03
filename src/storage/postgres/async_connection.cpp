@@ -110,11 +110,22 @@ asio::awaitable<void> waitForSocket(
     if (originalFd < 0) {
         throw std::runtime_error{"PostgreSQL socket is unavailable"};
     }
+    // Construct the Asio wrapper before duplicating the libpq descriptor.
+    // If its executor/service allocation throws, no extra OS fd exists.
+    asio::posix::stream_descriptor descriptor{executor};
     const int fd = ::dup(originalFd);
     if (fd < 0) {
         throw std::runtime_error{"Unable to duplicate PostgreSQL socket"};
     }
-    asio::posix::stream_descriptor descriptor{executor, fd};
+    // assign() takes ownership only on success. Its error_code overload
+    // lets us close the duplicate explicitly on failure; the original
+    // libpq-owned socket is never closed by this coroutine.
+    boost::system::error_code assignmentError;
+    descriptor.assign(fd, assignmentError);
+    if (assignmentError) {
+        (void)::close(fd);
+        throw std::runtime_error{"Unable to adopt PostgreSQL socket"};
+    }
     boost::system::error_code error;
     // Cancellation and timeout are scoped to this one readiness wait.
     // A single absolute deadline is shared across all flush/read cycles.

@@ -201,6 +201,8 @@ const checked = segments.map(([name, relative]) => {
       ["libpq numeric address connection", /PQconnectStartParams\s*\(/],
       ["nonblocking libpq connection polling", /PQconnectPoll\s*\(/],
       ["scrub parsed credentials before polling", /options\.reset\s*\(\s*\)/],
+      ["descriptor constructed before fd duplication", /asio::posix::stream_descriptor\s+descriptor\s*\{\s*executor\s*\};[\s\S]*?::dup\s*\(\s*originalFd\s*\)/],
+      ["duplicated fd is closed on Asio adoption failure", /descriptor\.assign\s*\(\s*fd\s*,\s*assignmentError\s*\);[\s\S]*?if\s*\(\s*assignmentError\s*\)\s*\{\s*\(void\)::close\s*\(\s*fd\s*\)/],
       ["multi-host native enumeration", /for\s*\(std::size_t\s+i\s*=\s*0;\s*i\s*<\s*hosts\.size\s*\(\s*\)/],
       ["multi-host port association", /ports\.size\s*\(\s*\)\s*!=\s*hosts\.size\s*\(\s*\)/],
       ["failed DNS hostname cannot suppress HA fallback", /if\s*\(error\s*\|\|\s*endpoints\.empty\s*\(\s*\)\)/],

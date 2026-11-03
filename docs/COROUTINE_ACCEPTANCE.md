@@ -2302,3 +2302,32 @@ The changed heavy Gateway translation unit and new C++ tests are
 not yet compiled/executed; this checkpoint is NOT an integration,
 performance, release or deployment approval. The strict repository
 migration inventory continues to report 20 blocking findings.
+
+#### Exception-safe ownership transfer of native libpq readiness descriptors (2026-11-04)
+
+The native `AsyncConnection::waitForSocket` formerly duplicated the
+libpq-owned socket with `dup` before constructing an Asio
+`posix::stream_descriptor`. If Asio descriptor construction threw
+while allocating its service/executor state, the duplicated descriptor
+had no RAII owner and could leak. The wrapper is now constructed
+**before** `dup`. The duplicate is subsequently transferred using
+Asio's `assign(fd, error_code)` overload. A failed adoption explicitly
+closes only the duplicate and throws a sanitized error; successful
+adoption leaves ownership with the Asio descriptor, whose destructor
+closes it on normal completion, timeout, cancellation, or exception.
+The original libpq fd remains owned solely by libpq.
+
+The change preserves the existing absolute deadline and scoped
+`cancel_after` readiness waits. Three new source-level regression
+checks cover construction order, failed-adoption cleanup, and deadline
+invariants. The source acceptance gate also requires explicit ownership
+transfer and cleanup. **23/23 source-contract tests passed** together
+with protocol-neutrality verification; the strict coroutine migration
+gate remains NOT_APPROVED.
+
+The target-local GCC16 compilation and native `NativePgDns` runtime
+regression for this change were **not run**: the Remote Operations
+managed process-session capacity was occupied by other unrelated
+workloads, and interrupting those workloads or launching an
+uncontrolled build was not authorized. Do not treat this as compiled
+or runtime-accepted evidence, and do not deploy it to Production.
