@@ -289,10 +289,16 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
             if (Clock::now() >= deadline) {
                 throw std::runtime_error{"PostgreSQL DNS resolution timed out"};
             }
+            if (error == asio::error::operation_aborted
+                || error == asio::error::timed_out) {
+                // Cancellation is an operation-wide boundary. It must
+                // never turn into another HA network attempt.
+                throw std::runtime_error{"PostgreSQL DNS resolution cancelled"};
+            }
             if (error || endpoints.empty()) {
-                // A dead HA hostname must not prevent trying a healthy
-                // later host. Skip the unresolvable entry instead of handing
-                // it to libpq for a synchronous fallback DNS lookup.
+                // A genuinely unresolvable HA hostname must not prevent
+                // trying later hosts, but a cancelled operation must stop.
+                // Never fall back to synchronous libpq DNS resolution.
                 continue;
             }
             for (const auto& endpoint : endpoints) {

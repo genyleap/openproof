@@ -2032,3 +2032,20 @@ production environment changes.
 This does not prove the behavior of PostgreSQL PGSERVICE files,
 kerberos/GSS negotiation, live TLS HA failover or the full legacy
 repository migration. Full coroutine acceptance is still NOT_APPROVED.
+
+#### DNS cancellation is not a high-availability failover event (2026-11-03)
+
+After each native Asio PostgreSQL hostname lookup, an expired absolute
+deadline or Asio `operation_aborted`/`timed_out` result now throws
+immediately. Only ordinary DNS resolution failures skip to the next
+configured host. A cancelled request must not trigger further outbound
+connections, even when the DSN lists multiple hosts; no synchronous
+libpq hostname-resolution fallback is permitted. The strict coroutine
+source gate checks that cancelled DNS is handled explicitly.
+
+The changed native libpq library and the standalone DNS executable both
+recompiled and linked with GCC 16.2. The `NativePgDns` and
+`NativePostgres` suites reported no failures; tests requiring a real
+acknowledged disposable database skipped, so this is not successful
+HA/TLS SQL integration evidence. A live cancellation-fault-injection
+test remains a separate acceptance requirement.

@@ -182,7 +182,9 @@ const checked = segments.map(([name, relative]) => {
       ["pinned hostaddr selection is explicit", /if\s*\(\s*!pinned\.empty\s*\(\s*\)\s*\)/],
       ["inherited hostname is explicit", /effective\s*\(\s*"host"\s*,\s*"PGHOST"\s*\)/],
       ["inherited pinned address is explicit", /effective\s*\(\s*"hostaddr"\s*,\s*"PGHOSTADDR"\s*\)/],
-      ["inherited port list is explicit", /effective\s*\(\s*"port"\s*,\s*"PGPORT"\s*\)/]
+      ["inherited port list is explicit", /effective\s*\(\s*"port"\s*,\s*"PGPORT"\s*\)/],
+      ["cancelled DNS must not silently retry HA hosts", /error\s*==\s*asio::error::operation_aborted\s*\|\|\s*error\s*==\s*asio::error::timed_out/],
+      ["cancelled DNS throws before HA skip", /throw\s+std::runtime_error\s*\{\s*"PostgreSQL DNS resolution cancelled"\s*\}/]
     ]){
       if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
     }
