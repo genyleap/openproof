@@ -243,6 +243,12 @@ public:
             && m_asyncCanonical->nativeConnectionsEnabled();
     }
 
+    /** All runtime dependencies must be native, not only the canonical finalizer.
+     * A synchronous local provider must never enable the reactor route.
+     */
+    [[nodiscard]] bool nativeProviderAuthenticationEnabled(
+        const provider::ProviderId& id) const noexcept;
+
     /** @brief Starts an exchange and atomically records its server-owned state. */
     [[nodiscard]] foundation::Result<AuthenticationStart>
     begin(const provider::AuthenticationRequest& request,

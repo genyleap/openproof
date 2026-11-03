@@ -207,6 +207,19 @@ CoroutinePostgresSessionService::issueAsync(
         issued->id(), issued->token().clone()};
 }
 
+asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>
+CoroutinePostgresSessionService::issueReplacingAsync(
+    const authentication::VerifiedAuthentication& verification,
+    identity::provider::ClientContext client,
+    std::optional<foundation::SecretString> previousToken)
+{
+    auto issued = co_await issueReplacing(
+        verification, client, previousToken ? &*previousToken : nullptr);
+    if (!issued) co_return foundation::fail(issued.error());
+    co_return session::CoroutineIssuedSession{
+        issued->id(), issued->token().clone()};
+}
+
 asio::awaitable<foundation::Result<CoroutineSessionGrant>>
 CoroutinePostgresSessionService::issue(
     const authentication::VerifiedAuthentication& verification,

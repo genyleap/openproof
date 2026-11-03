@@ -5,6 +5,7 @@ module;
 #include <boost/asio/detail/call_stack.hpp>
 #include "../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/awaitable.hpp>
+#include <optional>
 
 export module openproof.session:coroutine;
 
@@ -42,6 +43,32 @@ public:
 
 protected:
     CoroutineSessionIssuer() = default;
+};
+
+/** Additional optional capability: atomic session replacement.
+ *
+ * Keeping this separate from CoroutineSessionIssuer preserves the original
+ * SPI vtable and existing native issuers (e.g. wallet handoff). A handler
+ * that requires browser re-login replacement must explicitly request this
+ * stronger capability rather than assuming any issuer is sufficient.
+ */
+class CoroutineReplacingSessionIssuer : public CoroutineSessionIssuer {
+public:
+    CoroutineReplacingSessionIssuer(const CoroutineReplacingSessionIssuer&) = delete;
+    CoroutineReplacingSessionIssuer& operator=(const CoroutineReplacingSessionIssuer&) = delete;
+    ~CoroutineReplacingSessionIssuer() override = default;
+
+    /** Commits the new grant and retirement of an authenticated old session
+     * atomically, or creates a fresh grant if the previous bearer is invalid.
+     */
+    [[nodiscard]] virtual boost::asio::awaitable<
+        foundation::Result<CoroutineIssuedSession>>
+    issueReplacingAsync(const authentication::VerifiedAuthentication& verification,
+                        identity::provider::ClientContext client,
+                        std::optional<foundation::SecretString> previousToken) = 0;
+
+protected:
+    CoroutineReplacingSessionIssuer() = default;
 };
 
 } // namespace openproof::session

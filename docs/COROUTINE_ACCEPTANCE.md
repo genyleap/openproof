@@ -2049,3 +2049,61 @@ recompiled and linked with GCC 16.2. The `NativePgDns` and
 acknowledged disposable database skipped, so this is not successful
 HA/TLS SQL integration evidence. A live cancellation-fault-injection
 test remains a separate acceptance requirement.
+
+#### Opt-in native first-party authentication HTTP and atomic session replacement (2026-11-03)
+
+The first-party `AuthenticationHttpApi` now implements the coroutine
+HTTP handler ABI while retaining its existing synchronous compatibility
+entry point for the active production composition. Native dispatch is
+explicitly disabled until an asynchronous session issuer is injected
+**and** `AuthenticationService::nativeProviderAuthenticationEnabled()`
+confirms all of the following at runtime: the named registered
+provider implements the provider-neutral coroutine authentication SPI,
+the transaction store implements the native coroutine transaction SPI,
+a canonical identity finalizer exists, and an operator trust policy
+allows that provider. This check is exception-safe and fails closed.
+The currently synchronous local provider cannot accidentally become a
+native reactor handler.
+
+With the full capability explicitly supplied, the native POST
+`/auth/login` route validates the original subject/rate-limit/binding
+requirements and awaits `beginAsync` to persist the one-time
+challenge. The native `/auth/mfa/verify` route validates its existing
+cookie-bound proof, awaits `completeAsync`, then awaits a new
+optional provider-neutral `CoroutineReplacingSessionIssuer::issueReplacingAsync` port.
+The native PostgreSQL session service implements that port using its
+existing SQL-atomic session issuance/replacement operation. This
+preserves the browser re-login invariant that the old bearer cannot be
+replaced by a second active grant through a non-atomic revoke/insert.
+The issuer's bearer is checked before being written to a Set-Cookie
+response. Unsupported synchronous rotate/logout/recovery-code routes
+fail closed on the native executor and do not call the legacy session
+repository or fallback. Requests outside `/auth` only pass through a
+fallback explicitly advertising a native HTTP capability.
+
+The subject-binding preauth cookie reader also now accepts a
+**512-byte base64url encoding** rather than incorrectly limiting that
+cookie to 128 bytes, which could make the previously allowed 320-byte
+username unverifiable. Other credential cookie bounds remain 128 bytes.
+An end-to-end legacy HTTP test using a 180-byte valid subject (which
+produces a subject cookie longer than 128 bytes) was added and awaits
+compilation and execution alongside the native HTTP changes.
+
+Six source-contract tests pass for capability gating, native forwarding,
+async login, atomic async verification, independent session SPI
+implementation, and the extended subject cookie bound. The atomic
+replacement capability is a distinct derived interface, **not a new
+pure virtual on the existing CoroutineSessionIssuer ABI**; pre-existing
+wallet/Web3 issuer implementations remain unchanged.
+
+**C++ validation is explicitly NOT DONE:** the targeted
+`openproof_authentication_http` build required a 228-step GCC16 module
+rebuild because both public authentication and session interface
+fingerprints changed. It was stopped after 21 early dependency steps,
+before the new HTTP C++ units compiled. These additions must not be
+deployed, merged, or treated as a completed Native Auth HTTP migration
+until an isolated build and real transport/session regression pass.
+The strict gate intentionally continues reporting this area as blocking:
+legacy synchronous login, verification, session rotation/logout, and
+recovery-code issuance still exist, and the Native local-account
+provider and session-only endpoints are not fully migrated.

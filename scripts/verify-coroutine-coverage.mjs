@@ -93,6 +93,18 @@ const checked = segments.map(([name, relative]) => {
         expression:"io.run()"});
   }
   if(relative==="src/authentication/service.cpp"){
+    const nativeReady = source.slice(
+      source.indexOf("AuthenticationService::nativeProviderAuthenticationEnabled("),
+      source.indexOf("foundation::Result<AuthenticationStart> AuthenticationService::begin("));
+    for (const [kind, expression] of [
+      ["native provider capability", /CoroutineAuthenticationProvider/],
+      ["native transaction capability", /CoroutineAuthenticationTransactionStore/],
+      ["canonical finalizer capability", /m_asyncCanonical\s*==\s*nullptr/],
+      ["operator trust policy", /effectiveMaximum\s*\(/]
+    ]) {
+      if (!expression.test(nativeReady))
+        issues.push({line:0,kind:"missing "+kind,expression:expression.source});
+    }
     const begin = source.slice(
       source.indexOf("AuthenticationService::beginAsync("),
       source.indexOf("AuthenticationService::beginConnectionAsync("));
@@ -193,6 +205,10 @@ const checked = segments.map(([name, relative]) => {
     if(!/CoroutinePostgresSessionService::issueAsync\s*\(/.test(source)
         || !/\bco_await\s+issue\s*\(/.test(source))
       issues.push({line:0,kind:"missing native session issuer adapter",expression:"issueAsync / co_await issue"});
+    if(!/CoroutinePostgresSessionService::issueReplacingAsync\s*\(/.test(source)
+       || !/co_await\s+issueReplacing\s*\(/.test(source))
+      issues.push({line:0,kind:"missing atomic native session replacement",
+        expression:"issueReplacingAsync / co_await issueReplacing"});
   }
   if(relative==="src/storage/postgres/coroutine_session_listener.cpp"){
     if(!/if\s*\(\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
@@ -212,6 +228,30 @@ const checked = segments.map(([name, relative]) => {
     if(!/class\s+CoroutineSessionListenerAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(listenerInterface))
       issues.push({line:0,kind:"native PostgreSQL listener lacks explicit opt-in",
         expression:"CoroutineSessionListenerAdapter::nativeEnabled() true"});
+  }
+  if(relative==="src/authentication/http/http.cpp"){
+    const legacy = source.slice(source.indexOf("AuthenticationHttpApi::login("));
+    // co_await on login/verify does not migrate logout, rotation, recovery
+    // issuance, or the legacy public handler. Keep this entire HTTP boundary
+    // blocking until every route and production caller has a native port.
+    if(/\bm_sessions->(?:issueReplacing|authenticate|rotate|revoke|revokeAll)\s*\(/.test(legacy)
+       || /\bm_recoveryCodes->issue\s*\(/.test(legacy)
+       || /\bm_authentication->(?:begin|complete)\s*\(/.test(legacy))
+      issues.push({line:0,kind:"legacy HTTP authentication routes still use synchronous services",
+        expression:"AuthenticationHttpApi::login/verify/rotate/logout/recoveryCodes"});
+    const nativeSection = source.slice(
+      source.indexOf("AuthenticationHttpApi::handleAsync("),
+      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+    for(const [kind,regex] of [
+      ["native provider capability guard", /nativeEnabled\s*\(\)/],
+      ["native challenge start", /co_await\s+m_authentication->beginAsync\s*\(/],
+      ["native proof completion", /co_await\s+m_authentication->completeAsync\s*\(/],
+      ["atomic native session replacement", /co_await\s+m_asyncSessions->issueReplacingAsync\s*\(/]
+    ]) if(!regex.test(nativeSection))
+      issues.push({line:0,kind:"missing "+kind,expression:regex.source});
+    if(/\bm_sessions->/.test(nativeSection))
+      issues.push({line:0,kind:"native HTTP authentication uses legacy session service",
+        expression:"m_sessions->"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().

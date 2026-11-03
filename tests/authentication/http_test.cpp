@@ -396,7 +396,7 @@ void expectHostCookie(const gw::HttpResponse& response, std::string_view name)
 }
 
 struct Fixture {
-    Fixture()
+    explicit Fixture(std::string subject = "alice")
         : clock(kNow),
           sessionService(sessionRepository, clock,
               sess::SessionKey::create(fnd::SecretString{
@@ -419,7 +419,7 @@ struct Fixture {
             fnd::SecretString{"12345678901234567890"}).value();
         totpCode = cred::totpAt(totp, cred::TotpPolicy::recommended(), kNow).value();
         EXPECT_TRUE(accounts->enroll(
-            idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
+            idp::ExternalSubject{subject}, fnd::SecretString{"correct-password"},
             std::optional<cred::TotpSecret>{std::move(totp)}));
         auto provider = std::make_unique<local::LocalAuthenticationProvider>(
             idp::ProviderId{"local"}, *accounts, clock, std::chrono::minutes{5},
@@ -429,7 +429,7 @@ struct Fixture {
         auto link = core::IdentityLink::request(
             core::IdentityId{"identity-1"},
             core::ExternalIdentityRef{idp::ProviderId{"local"},
-                                      idp::ExternalSubject{"alice"}},
+                                      idp::ExternalSubject{subject}},
             kNow, std::chrono::minutes{5}).value();
         EXPECT_TRUE(link.requireVerification(kNow));
         EXPECT_TRUE(link.markVerified(kNow));
@@ -573,6 +573,34 @@ TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
     auto remaining = fixture.recoveryRepository.remaining(core::IdentityId{"identity-1"});
     ASSERT_TRUE(remaining);
     EXPECT_EQ(remaining.value(), 0U);
+}
+
+TEST(AuthenticationHttpApiTest, LongValidSubjectCookieSurvivesLoginVerification)
+{
+    // The 320-byte allowed subject can have a base64url cookie above 128
+    // characters. Rejected cookies previously made valid logins impossible.
+    const std::string subject(180U, 'x');
+    Fixture fixture{subject};
+    json::object input;
+    input["subject"] = subject;
+    const auto started = fixture.api->handle(
+        request("/auth/login", json::serialize(input)));
+    ASSERT_EQ(started.status(), 202) << started.body();
+    const std::string subjectCookie =
+        cookieValue(started, "__Host-openproof-preauth-subject");
+    ASSERT_GT(subjectCookie.size(), 128U);
+    ASSERT_LE(subjectCookie.size(), 512U);
+
+    const auto body = json::parse(started.body()).as_object();
+    json::object proof;
+    proof["transaction_id"] = body.at("transaction_id");
+    proof["challenge_id"] = body.at("challenge_id");
+    proof["password"] = "correct-password";
+    proof["totp"] = fixture.totpCode;
+    const auto completed = fixture.api->handle(request(
+        "/auth/mfa/verify", json::serialize(proof), preauthCookieHeader(started)));
+    ASSERT_EQ(completed.status(), 200) << completed.body();
+    EXPECT_FALSE(cookieValue(completed, "__Host-openproof-session").empty());
 }
 
 TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession)

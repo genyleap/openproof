@@ -290,6 +290,27 @@ std::optional<provider::AssuranceLevel> AuthenticationService::effectiveMaximum(
     return std::min(*configured, implementation.maximumClaimableAssurance());
 }
 
+bool AuthenticationService::nativeProviderAuthenticationEnabled(
+    const provider::ProviderId& providerId) const noexcept
+{
+    try {
+        if (m_asyncCanonical == nullptr
+            || dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(
+                &m_transactions) == nullptr) {
+            return false;
+        }
+        auto* implementation = m_providers.find(providerId);
+        return implementation != nullptr
+            && dynamic_cast<provider::CoroutineAuthenticationProvider*>(
+                implementation) != nullptr
+            && effectiveMaximum(*implementation, providerId).has_value();
+    } catch (...) {
+        // Handler capability queries may run on reactor threads. A failed
+        // registry lookup must disable native dispatch, not terminate the server.
+        return false;
+    }
+}
+
 foundation::Result<AuthenticationStart> AuthenticationService::begin(
     const provider::AuthenticationRequest& request,
     const provider::BindingDigest& binding,

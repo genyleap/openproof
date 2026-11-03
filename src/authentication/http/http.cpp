@@ -11,6 +11,9 @@ module;
 #include <string_view>
 #include <utility>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <boost/json.hpp>
 
 module openproof.authentication.http;
@@ -173,7 +176,8 @@ optionalString(const json::object& object, std::string_view name, std::size_t ma
 }
 
 [[nodiscard]] std::optional<std::string>
-cookieValue(const gateway::HttpRequest& request, std::string_view wanted)
+cookieValue(const gateway::HttpRequest& request, std::string_view wanted,
+            std::size_t maximumLength = 128U)
 {
     const auto header = request.header("cookie");
     if (!header.has_value()) return std::nullopt;
@@ -188,7 +192,7 @@ cookieValue(const gateway::HttpRequest& request, std::string_view wanted)
         const std::size_t equals = item.find('=');
         if (equals != std::string_view::npos && item.substr(0U, equals) == wanted) {
             const std::string_view value = item.substr(equals + 1U);
-            if (found.has_value() || value.empty() || value.size() > 128U
+            if (found.has_value() || value.empty() || value.size() > maximumLength
                 || !std::ranges::all_of(value, [](char symbol) {
                        return (symbol >= 'A' && symbol <= 'Z')
                            || (symbol >= 'a' && symbol <= 'z')
@@ -223,8 +227,9 @@ AuthenticationHttpApi::AuthenticationHttpApi(
     credentials::RecoveryCodeService& recoveryCodes,
     ::openproof::provider::local::LocalAccountDirectory& localAccounts,
     gateway::TokenBucketRateLimiter& rateLimiter, idp::ProviderId provider,
-    gateway::HttpHandler& fallback)
+    gateway::HttpHandler& fallback, session::CoroutineReplacingSessionIssuer* asyncSessions)
     : m_authentication(&authentication), m_sessions(&sessions),
+      m_asyncSessions(asyncSessions),
       m_recoveryCodes(&recoveryCodes), m_localAccounts(&localAccounts),
       m_rateLimiter(&rateLimiter), m_provider(std::move(provider)), m_fallback(&fallback)
 {
@@ -269,6 +274,162 @@ gateway::HttpResponse AuthenticationHttpApi::handle(gateway::HttpRequest request
         return issueRecoveryCodes(std::move(request));
     }
     return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
+}
+
+// Explicitly opt-in native routes. The production constructor still defaults
+// to a null native session issuer, keeping the original synchronous handler
+// on its bounded compatibility workers until the full dependency chain is wired.
+boost::asio::awaitable<gateway::HttpResponse>
+AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
+{
+    if (request.path() != "/auth" && !request.path().starts_with("/auth/")) {
+        auto* native =
+            dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+        if (native != nullptr && native->nativeEnabled()) {
+            co_return co_await native->handleAsync(std::move(request));
+        }
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    }
+    if (!nativeEnabled()) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    }
+    if (!m_rateLimiter->allow(
+            std::string{"auth-ip:"} + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    if (request.method() != gateway::HttpMethod::Post) {
+        co_return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
+    }
+    if (request.path() == "/auth/login") {
+        co_return co_await loginAsync(std::move(request));
+    }
+    if (request.path() == "/auth/mfa/verify") {
+        co_return co_await verifyAsync(std::move(request));
+    }
+    // Rotation/logout/recovery-code routes still use synchronous repository
+    // contracts. Never invoke them indirectly on the native I/O executor.
+    co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
+{
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(), {"subject"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                             : body.error(), request);
+    }
+    auto subject = requiredString(body.value(), "subject", 320U);
+    if (!subject) co_return error(subject.error(), request);
+    if (!m_rateLimiter->allow(std::string{"auth-subject:"} + subject.value())) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto bindingToken = security::randomTokenBase64Url(32U);
+    if (!bindingToken) co_return error(bindingToken.error(), request);
+    const std::string subjectValue = subject.value();
+    auto binding = preauthBinding(bindingToken.value(), subjectValue);
+    if (!binding) co_return error(binding.error(), request);
+    const std::string encodedSubject = foundation::toBase64Url(
+        std::as_bytes(std::span{subjectValue.data(), subjectValue.size()}));
+    idp::AuthenticationRequest authRequest{m_provider, clientContext(request)};
+    authRequest.setParameter("subject", subjectValue);
+    authRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
+    auto started = co_await m_authentication->beginAsync(
+        std::move(authRequest), binding.value(), request.correlation());
+    if (!started) co_return error(started.error(), request);
+
+    json::object payload;
+    payload["transaction_id"] = started->transactionId().value();
+    payload["challenge_id"] = started->challenge().id().value();
+    payload["expires_at_ms"] = started->challenge().expiresAt().time_since_epoch().count();
+    auto output = response(202, std::move(payload));
+    output.addHeader("set-cookie", cookie(
+        kPreauthCookie, started->continuationToken().expose(), "/", 300));
+    output.addHeader("set-cookie", cookie(
+        kBindingCookie, bindingToken.value(), "/", 300));
+    output.addHeader("set-cookie", cookie(
+        kSubjectCookie, encodedSubject, "/", 300));
+    co_return output;
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
+{
+    if (!nativeEnabled()) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
+    auto body = parseObject(request);
+    if (!body || !onlyFields(body.value(),
+                    {"transaction_id", "challenge_id", "password", "totp", "recovery_code"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
+                             : body.error(), request, true);
+    }
+    auto transaction = requiredString(body.value(), "transaction_id", 128U);
+    auto challenge = requiredString(body.value(), "challenge_id", 128U);
+    auto knowledgeSecret = requiredString(body.value(), "password", 1024U);
+    auto totp = optionalString(body.value(), "totp", 8U);
+    auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
+    const auto continuation = cookieValue(request, kPreauthCookie);
+    const auto bindingToken = cookieValue(request, kBindingCookie);
+    const auto encodedSubject = cookieValue(request, kSubjectCookie, 512U);
+    if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
+        || (totp->has_value() && recoveryCode->has_value())
+        || !continuation || !bindingToken || !encodedSubject) {
+        co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},
+                        request, true);
+    }
+    auto subject = decodePreauthSubject(*encodedSubject);
+    if (!subject) co_return error(subject.error(), request, true);
+    auto binding = preauthBinding(*bindingToken, subject.value());
+    if (!binding) co_return error(binding.error(), request, true);
+    idp::AuthenticationResponse authResponse{
+        idp::ChallengeId{std::move(challenge).value()}, clientContext(request)};
+    authResponse.setParameter("subject", idp::CredentialValue{subject.value()});
+    authResponse.setParameter("password",
+        idp::CredentialValue{std::move(knowledgeSecret).value()});
+    if (totp->has_value()) {
+        authResponse.setParameter("totp",
+            idp::CredentialValue{std::move(totp).value().value()});
+    }
+    if (recoveryCode->has_value()) {
+        authResponse.setParameter("recovery_code",
+            idp::CredentialValue{std::move(recoveryCode).value().value()});
+    }
+
+    // Keep the legacy browser replay invariant: the new grant and revocation
+    // of an authenticated old browser session must be a single SQL mutation.
+    const auto previous = cookieValue(request, "__Host-openproof-session");
+    std::optional<foundation::SecretString> oldToken;
+    if (previous) oldToken.emplace(std::string{*previous});
+    auto verified = co_await m_authentication->completeAsync(
+        idp::TransactionId{std::move(transaction).value()},
+        foundation::SecretString{*continuation}, binding.value(),
+        std::move(authResponse));
+    if (!verified) co_return error(verified.error(), request, true);
+    auto issued = co_await m_asyncSessions->issueReplacingAsync(
+        verified.value(), clientContext(request), std::move(oldToken));
+    if (!issued) co_return error(issued.error(), request, true);
+
+    const auto bearer = issued->token.expose();
+    if (bearer.empty() || bearer.size() > 128U
+        || !std::ranges::all_of(bearer, [](char value) {
+            return (value >= 'A' && value <= 'Z')
+                || (value >= 'a' && value <= 'z')
+                || (value >= '0' && value <= '9')
+                || value == '-' || value == '_';
+        })) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
+    json::object payload;
+    payload["session_id"] = issued->id.value();
+    payload["assurance"] = idp::assuranceLevelName(
+        verified->outcome().claimedAssurance());
+    auto output = response(200, std::move(payload));
+    clearPreauth(output);
+    setSessionCookie(output, issued->token);
+    co_return output;
 }
 
 gateway::HttpResponse AuthenticationHttpApi::login(gateway::HttpRequest request)
@@ -327,7 +488,7 @@ gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request
     auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
     const auto continuation = cookieValue(request, kPreauthCookie);
     const auto bindingToken = cookieValue(request, kBindingCookie);
-    const auto encodedSubject = cookieValue(request, kSubjectCookie);
+    const auto encodedSubject = cookieValue(request, kSubjectCookie, 512U);
     if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
         || (totp->has_value() && recoveryCode->has_value())
         || !continuation.has_value() || !bindingToken.has_value()
