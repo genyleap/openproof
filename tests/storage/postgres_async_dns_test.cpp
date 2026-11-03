@@ -1,13 +1,18 @@
 #include <gtest/gtest.h>
 
 #include <boost/asio.hpp>
+#include <libpq-fe.h>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
+
+#include <unistd.h>
 
 #include "async_connection.hpp"
 
@@ -39,7 +44,52 @@ private:
     std::optional<std::string> m_previous;
 };
 
-void expectConnectionDenied(const std::string& dsn)
+// A real libpq service file, owned only by this test and never read from
+// system or production configuration.
+class TemporaryServiceFile final {
+public:
+    TemporaryServiceFile()
+    {
+        char pattern[] = "/tmp/openproof-pg-service-XXXXXX";
+        const int fd = ::mkstemp(pattern);
+        if (fd < 0) throw std::runtime_error{"Unable to create test service file"};
+        m_path = pattern;
+        (void)::close(fd);
+        std::ofstream output{m_path};
+        output << "[openproof_async_loopback]\n"
+                  "host=localhost\n"
+                  "port=1\n";
+        if (!output) throw std::runtime_error{"Unable to write test service file"};
+    }
+    TemporaryServiceFile(const TemporaryServiceFile&) = delete;
+    TemporaryServiceFile& operator=(const TemporaryServiceFile&) = delete;
+    ~TemporaryServiceFile() { (void)::unlink(m_path.c_str()); }
+    [[nodiscard]] const std::string& path() const noexcept { return m_path; }
+private:
+    std::string m_path;
+};
+
+[[nodiscard]] std::string parsedConnectionOption(
+    const std::string& dsn, std::string_view wanted)
+{
+    char* parseError = nullptr;
+    PQconninfoOption* options = PQconninfoParse(dsn.c_str(), &parseError);
+    if (parseError != nullptr) PQfreemem(parseError);
+    if (!options) return {};
+    std::string result;
+    for (const PQconninfoOption* option = options;
+         option->keyword != nullptr; ++option) {
+        if (std::string_view{option->keyword} == wanted && option->val) {
+            result = option->val;
+            break;
+        }
+    }
+    PQconninfoFree(options);
+    return result;
+}
+
+void expectConnectionDenied(
+    const std::string& dsn, std::string_view expectedFailure = {})
 {
     asio::io_context io;
     bool refused = false;
@@ -53,6 +103,9 @@ void expectConnectionDenied(const std::string& dsn)
             refused = true;
             const std::string message{failure.what()};
             EXPECT_EQ(message.find("openproof-test-secret"), std::string::npos);
+            if (!expectedFailure.empty()) {
+                EXPECT_NE(message.find(expectedFailure), std::string::npos);
+            }
         }
     };
     auto future = asio::co_spawn(io, scenario(), asio::use_future);
@@ -156,6 +209,37 @@ TEST(PostgresAsyncDnsTest, InheritedPgHostaddrDoesNotTriggerDns)
     ScopedEnv port{"PGPORT", "1"};
     expectConnectionDenied(
         "user=openproof_test dbname=openproof_disposable_test");
+}
+
+TEST(PostgresAsyncDnsTest, ExplicitServiceFileRejectedBeforeNetwork)
+{
+    TemporaryServiceFile serviceFile;
+    ScopedEnv file{"PGSERVICEFILE", serviceFile.path().c_str()};
+    ScopedEnv service{"PGSERVICE", nullptr};
+    ScopedEnv host{"PGHOST", nullptr};
+    ScopedEnv hostaddr{"PGHOSTADDR", nullptr};
+    ScopedEnv port{"PGPORT", nullptr};
+    const std::string dsn =
+        "service=openproof_async_loopback user=openproof_test "
+        "dbname=openproof_disposable_test";
+    EXPECT_TRUE(parsedConnectionOption(dsn, "host").empty());
+    EXPECT_TRUE(parsedConnectionOption(dsn, "port").empty());
+    expectConnectionDenied(dsn, "service files");
+}
+
+TEST(PostgresAsyncDnsTest, InheritedServiceFileRejectedBeforeNetwork)
+{
+    TemporaryServiceFile serviceFile;
+    ScopedEnv file{"PGSERVICEFILE", serviceFile.path().c_str()};
+    ScopedEnv service{"PGSERVICE", "openproof_async_loopback"};
+    ScopedEnv host{"PGHOST", nullptr};
+    ScopedEnv hostaddr{"PGHOSTADDR", nullptr};
+    ScopedEnv port{"PGPORT", nullptr};
+    const std::string dsn =
+        "user=openproof_test dbname=openproof_disposable_test";
+    EXPECT_TRUE(parsedConnectionOption(dsn, "host").empty());
+    EXPECT_TRUE(parsedConnectionOption(dsn, "port").empty());
+    expectConnectionDenied(dsn, "service files");
 }
 
 TEST(PostgresAsyncDnsTest, InvalidConninfoFailsWithoutReactorConnection)

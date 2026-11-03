@@ -2112,3 +2112,27 @@ The strict gate intentionally continues reporting this area as blocking:
 legacy synchronous login, verification, session rotation/logout, and
 recovery-code issuance still exist, and the Native local-account
 provider and session-only endpoints are not fully migrated.
+
+#### Native libpq service-file indirection is rejected until safe resolution (2026-11-03)
+
+A targeted regression exposed a correctness hole in the previous DNS
+work: `PQconninfoParse` does **not** expand `service=...` / `PGSERVICE`
+service-file host and port options. The previous `PQconnectStart` path
+could therefore resolve a service-sourced hostname synchronously on
+the native Asio reactor despite our explicit DSN/PGHOST resolver. The
+native connector now checks both explicit service options and inherited
+`PGSERVICE` and **fails closed before starting libpq networking** with
+a sanitized exception. The active synchronous application/production
+configuration is not modified. Native service-file support is blocked
+until all effective connection options can be expanded and validated
+without synchronous DNS, and successful TLS/HA behavior is tested.
+
+Two loopback-only tests create an isolated temporary service file and
+use scoped test-process environment variables, verify that libpq's
+`PQconninfoParse` leaves service-sourced host/port unavailable, and
+assert that both explicit and inherited service selection are rejected
+with the expected error rather than attempting a connection. The
+modified GCC16.2 native libpq library and executable compiled and
+linked; **16/16 NativePgDns tests passed** after this correction.
+The strict migration source gate now checks these fail-closed guards.
+No database server, Production settings, or CI pipeline was touched.

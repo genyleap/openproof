@@ -196,7 +196,10 @@ const checked = segments.map(([name, relative]) => {
       ["inherited pinned address is explicit", /effective\s*\(\s*"hostaddr"\s*,\s*"PGHOSTADDR"\s*\)/],
       ["inherited port list is explicit", /effective\s*\(\s*"port"\s*,\s*"PGPORT"\s*\)/],
       ["cancelled DNS must not silently retry HA hosts", /error\s*==\s*asio::error::operation_aborted\s*\|\|\s*error\s*==\s*asio::error::timed_out/],
-      ["cancelled DNS throws before HA skip", /throw\s+std::runtime_error\s*\{\s*"PostgreSQL DNS resolution cancelled"\s*\}/]
+      ["cancelled DNS throws before HA skip", /throw\s+std::runtime_error\s*\{\s*"PostgreSQL DNS resolution cancelled"\s*\}/],
+      ["service-file indirection must not restart blocking DNS", /optionValue\s*\(\s*"service"\s*\)\.empty\s*\(\s*\)/],
+      ["inherited PGSERVICE must be checked", /std::getenv\s*\(\s*"PGSERVICE"\s*\)/],
+      ["unsupported service files fail closed", /PostgreSQL service files are unsupported by the native connector/]
     ]){
       if(!regex.test(source)) issues.push({line:0,kind:"missing "+kind,expression:regex.source});
     }

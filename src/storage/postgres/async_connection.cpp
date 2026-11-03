@@ -196,6 +196,17 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         const char* inherited = std::getenv(envKey);
         return inherited == nullptr ? std::string{} : std::string{inherited};
     };
+    // PQconninfoParse does not expand host/port values from service files.
+    // Letting PQconnectStart process a service implicitly could therefore
+    // restart synchronous DNS on the coroutine reactor. Reject the service
+    // indirection until the resolved host/port/TLS options can be obtained
+    // without allowing libpq to connect or resolve names on this executor.
+    const char* inheritedService = std::getenv("PGSERVICE");
+    if (!optionValue("service").empty()
+        || (inheritedService != nullptr && inheritedService[0] != '\0')) {
+        throw std::runtime_error{
+            "PostgreSQL service files are unsupported by the native connector"};
+    }
     const std::string hostStorage = effective("host", "PGHOST");
     const std::string hostaddrStorage = effective("hostaddr", "PGHOSTADDR");
     const std::string portStorage = effective("port", "PGPORT");
