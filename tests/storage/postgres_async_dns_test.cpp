@@ -2,7 +2,9 @@
 
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <fstream>
 #include <future>
@@ -10,8 +12,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
+#include <dirent.h>
 #include <unistd.h>
 
 #include "async_connection.hpp"
@@ -88,6 +92,23 @@ private:
     return result;
 }
 
+[[nodiscard]] std::optional<std::size_t> openDescriptorCount()
+{
+    DIR* directory = ::opendir("/proc/self/fd");
+    if (directory == nullptr) return std::nullopt;
+    std::size_t total = 0U;
+    while (const struct dirent* entry = ::readdir(directory)) {
+        if (entry->d_name[0] == '.'
+            && (entry->d_name[1] == '\0'
+                || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
+            continue;
+        }
+        ++total;
+    }
+    (void)::closedir(directory);
+    return total;
+}
+
 void expectConnectionDenied(
     const std::string& dsn, std::string_view expectedFailure = {})
 {
@@ -112,6 +133,74 @@ void expectConnectionDenied(
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(refused);
+}
+
+TEST(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline)
+{
+    // A real local TCP acceptor holds the accepted socket open but never
+    // responds with the PostgreSQL protocol. This exercises libpq's socket
+    // readiness suspension and absolute deadline without any database,
+    // credentials, or contact with a production endpoint.
+    ScopedEnv service{"PGSERVICE", nullptr};
+    asio::io_context serverIo;
+    asio::ip::tcp::acceptor acceptor{
+        serverIo,
+        asio::ip::tcp::endpoint{asio::ip::make_address("127.0.0.1"), 0U}};
+    asio::ip::tcp::socket stalled{serverIo};
+    std::atomic<bool> accepted{false};
+    acceptor.async_accept(stalled, [&](const boost::system::error_code& error) {
+        if (!error) accepted.store(true, std::memory_order_release);
+    });
+    std::jthread server([&serverIo] { serverIo.run(); });
+
+    const std::string dsn =
+        "host=localhost hostaddr=127.0.0.1 port="
+        + std::to_string(acceptor.local_endpoint().port())
+        + " user=openproof_test dbname=openproof_disposable_test sslmode=disable";
+    asio::io_context clientIo;
+    bool timedOut = false;
+    const auto started = std::chrono::steady_clock::now();
+    auto scenario = [&]() -> asio::awaitable<void> {
+        try {
+            auto connection = co_await pg::AsyncConnection::connect(dsn, 250ms);
+            static_cast<void>(connection);
+        } catch (const std::runtime_error& failure) {
+            timedOut = std::string_view{failure.what()}.find("timed out")
+                != std::string_view::npos;
+        }
+    };
+    auto future = asio::co_spawn(clientIo, scenario(), asio::use_future);
+    clientIo.run();
+    EXPECT_NO_THROW(future.get());
+
+    boost::system::error_code ignored;
+    acceptor.cancel(ignored);
+    serverIo.stop();
+    server.join();
+    EXPECT_TRUE(accepted.load(std::memory_order_acquire));
+    EXPECT_TRUE(timedOut) << "Stalled libpq negotiation escaped its deadline";
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+}
+
+TEST(PostgresAsyncDnsTest, FailedNativeConnectionsDoNotLeakSocketDescriptors)
+{
+    // Each unsuccessful libpq connect may duplicate its socket for an Asio
+    // readiness wait. Neither the duplicate nor the libpq original may
+    // remain open after the awaitable and io_context have been destroyed.
+    // Linux-only /proc introspection is deliberately skipped elsewhere.
+    const auto before = openDescriptorCount();
+    if (!before) GTEST_SKIP() << "/proc/self/fd is unavailable";
+
+    const std::string dsn =
+        "host=localhost hostaddr=127.0.0.1 port=1 user=openproof_test "
+        "dbname=openproof_disposable_test";
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        expectConnectionDenied(dsn);
+    }
+    const auto after = openDescriptorCount();
+    ASSERT_TRUE(after.has_value());
+    EXPECT_LE(*after, *before + 1U)
+        << "Failed native connections retained socket descriptors";
 }
 
 TEST(PostgresAsyncDnsTest, HostnameKeywordConnectionUsesBoundedNativeDns)

@@ -30,6 +30,18 @@ test("failed Asio descriptor adoption closes only the duplicated fd", () => {
   assert.match(body, /co_await descriptor\.async_wait\(/);
 });
 
+test("real loopback regression exercises stalled PostgreSQL handshake and fd cleanup", () => {
+  const tests = fs.readFileSync(
+    path.join(root, "tests/storage/postgres_async_dns_test.cpp"), "utf8");
+  assert.match(tests, /TEST\(PostgresAsyncDnsTest, FailedNativeConnectionsDoNotLeakSocketDescriptors\)/);
+  assert.match(tests, /TEST\(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline\)/);
+  assert.match(tests, /asio::ip::tcp::acceptor/);
+  assert.match(tests, /std::jthread server/);
+  assert.match(tests, /acceptor\.async_accept\(/);
+  assert.match(tests, /AsyncConnection::connect\(dsn, 250ms\)/);
+  assert.match(tests, /EXPECT_TRUE\(timedOut\)/);
+});
+
 test("socket readiness remains cancellation- and deadline-bound", () => {
   assert.match(body, /if\s*\(Clock::now\(\)\s*>=\s*deadline\)/);
   assert.match(body, /asio::cancel_after\(remaining/);

@@ -2331,3 +2331,35 @@ managed process-session capacity was occupied by other unrelated
 workloads, and interrupting those workloads or launching an
 uncontrolled build was not authorized. Do not treat this as compiled
 or runtime-accepted evidence, and do not deploy it to Production.
+
+#### Native libpq socket ownership and stalled TCP deadline — compiled verification (2026-11-04)
+
+The previously uncompiled socket-descriptor ownership fix (`a12b289`)
+is now **compiled and linked under GCC 16.2** in the isolated
+`openproof_postgres_async_io` target and the dedicated
+`openproof_postgres_async_dns_tests` binary, with the project's
+warnings-as-errors policy intact. The targeted 14-step incremental
+build completed successfully. All 16 pre-existing NativePgDns tests
+passed after this change.
+
+Two new Linux-loopback C++ regressions extend the runtime evidence:
+
+* `FailedNativeConnectionsDoNotLeakSocketDescriptors` repeats twelve
+  explicitly pinned loopback connection failures, then compares the
+  process's `/proc/self/fd` descriptor count (skipping on operating
+  systems without this interface). The test passed.
+* `StalledLoopbackDatabaseHonorsConnectDeadline` creates a short-lived
+  in-process TCP acceptor on `127.0.0.1` with an ephemeral port. It
+  intentionally accepts a client but never responds to the PostgreSQL
+  startup negotiation, and verifies that the real libpq/Asio readiness
+  wait ends with a timeout under its 250-millisecond deadline, without
+  touching any external database. The test passed.
+
+The extended test binary was rebuilt and linked after each source
+change; **18/18 NativePgDns tests passed, 0 failed**, in approximately
+0.5 seconds of test execution. This closes the earlier compilation
+and loopback-runtime evidence gap **for the native libpq connector
+and descriptor handling only**. The successful PostgreSQL TLS/SQL
+integration suite remains separate, and the 20 overall coroutine
+migration blockers are not reduced. No production service, CI
+action or release was touched.
