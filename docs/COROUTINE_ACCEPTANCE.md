@@ -2478,3 +2478,67 @@ repository remains necessary for the final administration migration.
 Do not treat this security patch as full coroutine acceptance.
 The strict blocker count remains 20, with the administration blocker
 now attached to the correct source file.
+
+#### Verified native libpq loopback concurrency benchmark (2026-11-04)
+
+The independent `openproof_postgres_async_benchmark_tests` executable
+built and linked successfully with GCC 16.2. Its real TCP loopback
+test passed on three consecutive CTest runs:
+
+| Run | Sequential six 180-ms stalled connections | Concurrent six on one io_context |
+| --- | --- | --- |
+| 1 | 1082 ms | 181 ms |
+| 2 | 1083 ms | 181 ms |
+| 3 | 1083 ms | 181 ms |
+
+The measured sequential/concurrent wall-clock ratios were approximately
+5.98x for this deadline-wait workload. This does **not** benchmark legacy
+SQL performance, successful database operations, or entire OpenProof
+request latency. The same native libpq `AsyncConnection::connect` code
+was used in both conditions, only the scheduling differed.
+The 19 existing NativePgDns C++ tests also passed again. These
+results are repeatable microbenchmark evidence, not an overall
+migration acceptance signal.
+
+#### First native account session HTTP routes (2026-11-04)
+
+A new provider-neutral, optional `CoroutineAccountSessionAdapter` in
+`src/account/http/coroutine_session_http.*` implements native
+`GET /account/sessions` and `POST /account/sessions/revoke` using
+three separately injected awaitable capabilities: authenticate a
+session bearer, enumerate sessions for the authenticated identity, and
+revoke another session *owned by that same identity*. These callbacks
+can be bound to the existing native PostgreSQL session service or
+another truly nonblocking repository without importing PostgreSQL
+into the Account API.
+
+The adapter retains the existing JSON response structure, session
+ID/current-session fields, rate keys, bearer extraction semantics,
+strict JSON input bounds, no-store security headers and self-revoke
+protection. It exposes `nativeEnabledFor` only for those exact
+method/path pairs, reports whole-handler `nativeEnabled()==false`
+because other Account routes remain synchronous, and fails closed
+when directly invoked asynchronously on a disabled route. Other
+non-Account native requests may delegate only to a downstream
+`CoroutineHttpHandler` that explicitly advertises their native
+capability. A native execution path cannot call the synchronous
+`AccountHttpApi`.
+
+Four dedicated C++ test cases cover request-specific dispatch,
+session enumeration response parity, bearer validation, malformed
+revocation requests, self-revoke refusal and identity-bound revocation.
+Three source-contract tests guard the same invariants, and the strict
+coroutine gate recognizes the new native component while retaining
+the original HTTP Account API blocker. The adapter is opt-in, is
+**not** wired to the live listener, and the callback owner must
+outlive outstanding coroutine executions.
+
+The module-heavy `openproof_account_async_http` compilation currently
+requires **165 incremental GCC16 C++ module steps** in this isolated
+worktree. The build was interrupted immediately after that count
+was confirmed, respecting the prohibition on expensive broad builds.
+Thus the newly added Account C++ tests have **not** compiled or run.
+This is partial migration only: Account signup, profile, email, MFA,
+connection and other routes still use synchronous services.
+The strict release gate remains NOT_APPROVED and no Production
+deployment or release occurred.

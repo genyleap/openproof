@@ -26,6 +26,7 @@ const segments = [
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
+  ["Native account session HTTP adapter", "src/account/http/coroutine_session_http.cpp"],
   ["HTTP administration API", "src/authentication/http/admin.cpp"],
 ];
 
@@ -317,6 +318,28 @@ const checked = segments.map(([name, relative]) => {
     if(/\bm_sessions->/.test(nativeSection))
       issues.push({line:0,kind:"native HTTP authentication uses legacy session service",
         expression:"m_sessions->"});
+  }
+  if(relative==="src/account/http/coroutine_session_http.cpp"){
+    const native = executable.slice(
+      executable.indexOf("CoroutineAccountSessionAdapter::handleAsync("),
+      executable.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+    if(!/if\s*\(\s*!nativeEnabledFor\s*\(\s*request\s*\)\s*\)/.test(native)
+       || /m_legacyAccount->handle\s*\(/.test(native)
+       || !/co_await\s+m_asyncFallback->handleAsync/.test(native))
+      issues.push({line:0,kind:"native account session dispatch can bypass request capability or execute legacy service",
+        expression:"nativeEnabledFor guard, no synchronous account fallback"});
+    if(!/co_await\s+m_authenticate\s*\(\s*std::move\s*\(\s*credential->value\s*\(\s*\)\s*\)\s*\)/.test(executable)
+       || !/co_await\s+m_list\s*\(/.test(executable)
+       || !/co_await\s+m_revokeOwned\s*\(/.test(executable)
+       || !/target\.value\s*\(\s*\)\s*==\s*authenticated->id\s*\(\s*\)/.test(executable))
+      issues.push({line:0,kind:"native account session services missing authenticated or self-revoke-safe persistence",
+        expression:"await authenticate, list, revokeOwned and deny self-revoke"});
+    const header = fs.readFileSync(
+      path.join(root,"src/account/http/coroutine_session_http.hpp"),"utf8");
+    if(!/nativeEnabled\s*\(\s*\)\s*const\s*noexcept\s*override\s*\{\s*return\s+false\s*;/.test(header)
+       || !/nativeEnabledFor\s*\(/.test(header))
+      issues.push({line:0,kind:"partial account session migration enabled for all routes",
+        expression:"nativeEnabled false; nativeEnabledFor per request"});
   }
   if(relative==="src/authentication/http/admin.cpp"){
     // The actual HTTP implementation is under authentication/http/admin.cpp.
