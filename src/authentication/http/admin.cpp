@@ -201,7 +201,21 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
     if (!m_rateLimiter->allow("admin-identity:" + std::string{actor.value()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
-    if (list) return listLocalMembers(std::move(request));
+    if (list) {
+        // IAL2 proves authentication strength, not authority to enumerate a
+        // tenant's members. The mutations below each enforce owner rights
+        // inside their repository transaction; the read endpoint must also
+        // refuse non-owners *before* touching membership/identity listings.
+        auto membership = m_memberships->find(m_organization, actor);
+        if (!membership) return error(membership.error(), request);
+        if (!membership->has_value()
+            || !membership->value().hasRole(organization::Role{"owner"})) {
+            return error(
+                foundation::Error{foundation::ErrorCode::PermissionDenied},
+                request);
+        }
+        return listLocalMembers(std::move(request));
+    }
     if (create) return createLocalMember(std::move(request), actor);
     if (roles) return replaceRoles(std::move(request), actor);
     if (suspend) {

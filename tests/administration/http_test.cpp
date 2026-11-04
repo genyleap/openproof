@@ -189,6 +189,68 @@ struct Fixture {
 constexpr std::string_view kValidBody =
     R"({"identity_id":"identity-2","subject":"bob@example.test","roles":["viewer","member"]})";
 
+TEST(AdministrationHttpApiTest, MemberEnumerationRequiresActiveOwner)
+{
+    Fixture anonymousOwner;
+    anonymousOwner.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    const auto missing = anonymousOwner.api.handle(request(
+        "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
+    EXPECT_EQ(missing.status(), 403);
+    EXPECT_EQ(missing.body().find("identity_id"), std::string::npos);
+
+    Fixture viewer;
+    viewer.addSession("viewer-token", idp::AssuranceLevel::Ial2, "viewer");
+    auto viewerMembership = org::Membership::invite(
+        core::OrganizationId{"org"}, core::IdentityId{"viewer"}, kNow).value();
+    ASSERT_TRUE(viewerMembership.grantRole(org::Role{"viewer"}));
+    ASSERT_TRUE(viewerMembership.accept());
+    ASSERT_TRUE(viewer.memberships.add(std::move(viewerMembership)));
+    const auto denied = viewer.api.handle(request(
+        "/admin/local-members", {}, "viewer-token", gw::HttpMethod::Get));
+    EXPECT_EQ(denied.status(), 403);
+    EXPECT_EQ(denied.body().find("identity_id"), std::string::npos);
+
+    Fixture suspended;
+    suspended.addSession("suspended-token", idp::AssuranceLevel::Ial2);
+    auto suspendedOwner = org::Membership::invite(
+        core::OrganizationId{"org"}, core::IdentityId{"owner"}, kNow).value();
+    ASSERT_TRUE(suspendedOwner.grantRole(org::Role{"owner"}));
+    ASSERT_TRUE(suspendedOwner.accept());
+    ASSERT_TRUE(suspendedOwner.suspend());
+    ASSERT_TRUE(suspended.memberships.add(std::move(suspendedOwner)));
+    const auto inactive = suspended.api.handle(request(
+        "/admin/local-members", {}, "suspended-token", gw::HttpMethod::Get));
+    EXPECT_EQ(inactive.status(), 403);
+}
+
+TEST(AdministrationHttpApiTest, MemberEnumerationIsTenantScopedToActiveOwner)
+{
+    Fixture foreignOwner;
+    foreignOwner.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    auto foreign = org::Membership::invite(
+        core::OrganizationId{"different-org"}, core::IdentityId{"owner"}, kNow).value();
+    ASSERT_TRUE(foreign.grantRole(org::Role{"owner"}));
+    ASSERT_TRUE(foreign.accept());
+    ASSERT_TRUE(foreignOwner.memberships.add(std::move(foreign)));
+    const auto denied = foreignOwner.api.handle(request(
+        "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
+    EXPECT_EQ(denied.status(), 403);
+
+    Fixture owner;
+    owner.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    auto membership = org::Membership::invite(
+        core::OrganizationId{"org"}, core::IdentityId{"owner"}, kNow).value();
+    ASSERT_TRUE(membership.grantRole(org::Role{"owner"}));
+    ASSERT_TRUE(membership.accept());
+    ASSERT_TRUE(owner.memberships.add(std::move(membership)));
+    const auto permitted = owner.api.handle(request(
+        "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
+    ASSERT_EQ(permitted.status(), 200) << permitted.body();
+    EXPECT_EQ(permitted.headers().at("cache-control"), "no-store");
+    const auto payload = json::parse(permitted.body()).as_object();
+    ASSERT_TRUE(payload.at("members").is_array());
+}
+
 TEST(AdministrationHttpApiTest, RequiresAnIal2SessionBeforeProvisioning)
 {
     Fixture fixture;

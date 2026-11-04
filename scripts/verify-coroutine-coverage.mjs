@@ -26,7 +26,7 @@ const segments = [
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
-  ["HTTP administration API", "src/administration/administration.cpp"],
+  ["HTTP administration API", "src/authentication/http/admin.cpp"],
 ];
 
 const forbidden = [
@@ -317,6 +317,21 @@ const checked = segments.map(([name, relative]) => {
     if(/\bm_sessions->/.test(nativeSection))
       issues.push({line:0,kind:"native HTTP authentication uses legacy session service",
         expression:"m_sessions->"});
+  }
+  if(relative==="src/authentication/http/admin.cpp"){
+    // The actual HTTP implementation is under authentication/http/admin.cpp.
+    // administration/administration.cpp is pure command validation and should
+    // not be mistaken for the synchronous administrative HTTP service.
+    const handle = source.slice(
+      source.indexOf("AdministrationHttpApi::handle("),
+      source.indexOf("AdministrationHttpApi::listLocalMembers("));
+    if(!/m_memberships->find\s*\(\s*m_organization\s*,\s*actor\s*\)/.test(handle)
+       || !/membership->value\s*\(\s*\)\.hasRole\s*\(/.test(handle)
+       || !/organization::Role\s*\{\s*"owner"\s*\}/.test(handle)
+       || !/ErrorCode::PermissionDenied/.test(handle)
+       || handle.indexOf("m_memberships->find") > handle.indexOf("listLocalMembers(std::move(request))"))
+      issues.push({line:0,kind:"admin member listing lacks tenant-scoped active owner authorization",
+        expression:"m_memberships->find(m_organization, actor) / hasRole(owner) before listing"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().

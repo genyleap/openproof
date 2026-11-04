@@ -2444,3 +2444,37 @@ production end-to-end throughput or latency for OpenProof.
 The strict migration inventory remains NOT_APPROVED with 20 blockers,
 including the legacy PostgreSQL storage path and LDAP. Production,
 releases and GitHub Actions remain unchanged.
+
+#### Administration HTTP owner authorization and audited implementation path (2026-11-04)
+
+The strict coroutine gate previously labelled
+`src/administration/administration.cpp` as the `HTTP administration API`
+and treated its absence of `co_await` as the blocker. That file is
+pure in-memory administration command validation and has no transport
+or persistence operations; requiring a suspension in that pure domain
+model would be incorrect. The actual synchronous HTTP entry point is
+`src/authentication/http/admin.cpp`. The gate now audits that real
+implementation, retains its native-migration finding, and additionally
+guards a newly identified access-control vulnerability.
+
+Previously `GET /admin/local-members` required a valid IAL2 session,
+but did **not** check that the caller actively held the tenant-scoped
+`owner` role, unlike the mutation endpoints backed by owner-authorized
+repository transactions. An authenticated non-owner could enumerate
+membership and identity metadata. The handler now loads the calling
+identity's membership in the configured organization, requires
+`Membership::hasRole(Role{"owner"})`, and returns a sanitized 403
+before `membersOf()` or `findById()` can reveal any member data.
+That predicate also rejects suspended and foreign-organization owners.
+Repository errors fail closed.
+
+Two C++ tests were added for missing membership, viewer membership,
+suspended owner, foreign-tenant owner and valid active owner; three
+source-contract tests passed. **These C++ cases remain uncompiled and
+unexecuted**, and production is unchanged. The existing synchronous
+membership authorization and enumeration queries are not transactionally
+unified; a fully native, single-snapshot, authorization-aware read
+repository remains necessary for the final administration migration.
+Do not treat this security patch as full coroutine acceptance.
+The strict blocker count remains 20, with the administration blocker
+now attached to the correct source file.
