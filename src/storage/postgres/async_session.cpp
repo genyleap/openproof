@@ -345,6 +345,57 @@ asio::awaitable<AsyncSessionSql::RevokeStatus> AsyncSessionSql::revoke(
     throw std::runtime_error{"PostgreSQL session state changed unexpectedly"};
 }
 
+asio::awaitable<AsyncSessionSql::RevokeStatus> AsyncSessionSql::revokeOwned(
+    AsyncConnection& connection, std::string identityId,
+    std::string sessionId, std::int64_t nowMilliseconds,
+    std::chrono::milliseconds deadline)
+{
+    if (!validId(identityId) || !validId(sessionId) || nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid owned session revocation arguments"};
+    }
+    if (deadline <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument{"Invalid owned session revocation deadline"};
+    }
+    const auto expiresAt = std::chrono::steady_clock::now() + deadline;
+
+    // A separate SELECT owner check followed by UPDATE id=$1 is a TOCTOU
+    // boundary. The database must enforce ownership in the same atomic
+    // statement that changes state, even when multiple requests race.
+    const std::string update =
+        "UPDATE " + tableName(m_table)
+        + " SET state=1,revoked_at_ms=$3"
+          " WHERE id=$1 AND identity_id=$2 AND state=0 RETURNING id";
+    auto rows = co_await connection.query(update,
+        {sessionId, identityId, std::to_string(nowMilliseconds)}, deadline);
+    if (rows.rows.size() > 1U
+        || (!rows.rows.empty() && rows.rows.front().size() != 1U)) {
+        throw std::runtime_error{"Owned session revocation returned invalid shape"};
+    }
+    if (rows.rows.size() == 1U) co_return RevokeStatus::Revoked;
+
+    // Preserve legacy idempotence without revealing whether an unrelated
+    // user's session exists. This read cannot mutate anything, and its owner
+    // constraint is as strict as the write above.
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        expiresAt - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error{"Owned session revocation deadline exceeded"};
+    }
+    const std::string query =
+        "SELECT state FROM " + tableName(m_table)
+        + " WHERE id=$1 AND identity_id=$2";
+    auto state = co_await connection.query(
+        query, {std::move(sessionId), std::move(identityId)}, remaining);
+    if (state.rows.empty()) co_return RevokeStatus::NotFound;
+    if (state.rows.size() != 1U || state.rows.front().size() != 1U
+        || !state.rows.front().front().has_value()) {
+        throw std::runtime_error{"Owned session state returned invalid shape"};
+    }
+    if (state.rows.front().front() == "1") co_return RevokeStatus::AlreadyRevoked;
+    if (state.rows.front().front() == "2") co_return RevokeStatus::Expired;
+    throw std::runtime_error{"Owned session state changed unexpectedly"};
+}
+
 asio::awaitable<std::size_t> AsyncSessionSql::revokeAll(
     AsyncConnection& connection, std::string identityId,
     std::int64_t nowMilliseconds, std::chrono::milliseconds deadline)

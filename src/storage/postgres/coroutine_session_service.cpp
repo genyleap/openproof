@@ -155,21 +155,6 @@ listActiveSessions(
     co_return values;
 }
 
-asio::awaitable<foundation::Status> revokeOwnedSession(
-    CoroutinePostgresSessionRepository& repo,
-    const foundation::ClockSource& clock,
-    identity::core::IdentityId identity,
-    session::SessionId id)
-{
-    auto found = co_await repo.find(id);
-    if (!found) co_return foundation::fail(found.error());
-    if (!found->has_value() || found->value().identity() != identity) {
-        // Do not disclose the existence of another identity's session.
-        co_return foundation::fail(
-            foundation::ErrorCode::NotFound, "That session was not found.");
-    }
-    co_return co_await repo.revoke(std::move(id), clock.now());
-}
 } // namespace
 
 CoroutineSessionGrant::CoroutineSessionGrant(
@@ -296,8 +281,10 @@ asio::awaitable<foundation::Status>
 CoroutinePostgresSessionService::revokeOwned(
     identity::core::IdentityId identity, session::SessionId id)
 {
-    return revokeOwnedSession(
-        *m_repository, *m_clock, std::move(identity), std::move(id));
+    // Ownership must be enforced atomically by the SQL UPDATE. A separate
+    // SELECT then revoke-by-id exposes a check/use race under concurrency.
+    return m_repository->revokeOwned(
+        std::move(identity), std::move(id), m_clock->now());
 }
 
 } // namespace openproof::storage::postgres

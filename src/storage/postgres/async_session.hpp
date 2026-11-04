@@ -99,6 +99,16 @@ public:
         AsyncConnection& connection, std::string sessionId,
         std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
 
+    // The owner predicate is part of the UPDATE itself, not a preliminary
+    // SELECT followed by an unrestricted revocation. A denied or wrong-owner
+    // request never modifies the row, even if concurrent changes occur.
+    // A follow-up SELECT (if necessary) is also owner-scoped and only
+    // distinguishes AlreadyRevoked from Expired/NotFound.
+    [[nodiscard]] boost::asio::awaitable<RevokeStatus> revokeOwned(
+        AsyncConnection& connection, std::string identityId,
+        std::string sessionId, std::int64_t nowMilliseconds,
+        std::chrono::milliseconds deadline);
+
     // Atomically revoke all still-active sessions for an identity. No caller
     // can observe a partially revoked batch; result is the affected count.
     [[nodiscard]] boost::asio::awaitable<std::size_t> revokeAll(

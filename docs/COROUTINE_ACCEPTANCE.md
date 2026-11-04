@@ -2571,3 +2571,56 @@ on the broad C++26 module rebuild previously observed for Account
 (165 incremental steps); it has not been compiled or executed.
 The legacy Account and unrelated HTTP/provider migration blockers
 remain open. The strict migration gate remains NOT_APPROVED.
+
+#### Native PostgreSQL owned-session revocation: atomic authorization (2026-11-05)
+
+The native account session service previously implemented
+`CoroutinePostgresSessionService::revokeOwned` with two distinct awaited
+database operations: `repo.find(id)` to check `identity_id`, followed
+by `repo.revoke(id, now)`. This is a check/use gap: the mutation itself
+did not enforce ownership, and concurrent identity changes could
+invalidate the earlier authorization decision.
+
+The new `AsyncSessionSql::revokeOwned` enforces **both**
+`id=$1` and `identity_id=$2` directly in the same parameterized
+`UPDATE ... SET state=1, revoked_at_ms=$3 WHERE ... AND state=0
+RETURNING id`. A failed update cannot revoke a foreign-identity row.
+Its follow-up `SELECT state` is also scoped by both identifiers and
+uses only the remaining portion of the original monotonic SQL deadline.
+It retains `Revoked`, `AlreadyRevoked`, `NotFound` (including wrong
+owner), and `Expired` outcomes without disclosing another identity's
+session. The native repository now owns this operation and the service
+directly delegates to it; the insecure `find`/unscoped-`revoke`
+sequence was removed.
+
+A disposable `pg_temp.sessions` C++ regression exercises wrong-owner
+denial, a deliberate owner change before revocation, successful
+authorized revocation, idempotent retry, non-disclosure of unknown and
+foreign session IDs, and expired-session denial. Three additional
+source-level checks enforce atomic SQL ownership and verify the service
+and repository no longer reintroduce a preliminary owner lookup.
+The strict acceptance gate now explicitly audits this native SQL
+boundary, retaining the separate legacy PostgreSQL blocker.
+
+**Evidence:** `openproof_postgres_async_io` built and linked with
+the Release GCC 16.2 toolchain. The native PostgreSQL test executable
+also built and linked successfully, including the new C++ case. CTest
+reported **27 tests without failures: 3 actually passed and 24 skipped**
+because `OPENPROOF_TEST_POSTGRES` is not configured on this audit
+host. In particular, **the new SQL owner-revocation regression was
+SKIPPED**, not passed. Do not count this as PostgreSQL integration
+acceptance or an end-to-end migration. The change is not installed
+in Production, and the strict global coroutine gate stays
+`NOT_APPROVED` with 20 remaining blockers.
+
+The follow-up target-local attempt to compile the C++26 native
+`openproof_postgres_async_repository` facade requested **349**
+transitive module compilation steps; the run was deliberately stopped
+immediately, before heavy rebuilding, to respect the isolated worktree
+build-cost policy. The changed C++ repository and session-service
+translation units remain *uncompiled*, distinct from the successfully
+compiled `openproof_postgres_async_io` SQL implementation and the
+native PostgreSQL test executable. The complete C++ ownership
+regression remains skipped until a disposable test instance is
+configured; do not deploy or mark this boundary approved on the
+strength of source tests alone.

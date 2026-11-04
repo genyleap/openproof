@@ -23,6 +23,7 @@ const segments = [
   ["PostgreSQL coroutine canonical finalization", "src/storage/postgres/coroutine_canonical_finalizer.cpp"],
   ["PostgreSQL bounded coroutine connection pool", "src/storage/postgres/async_pool.cpp"],
   ["PostgreSQL native asynchronous hostname resolution", "src/storage/postgres/async_connection.cpp"],
+  ["PostgreSQL atomic native owned revocation", "src/storage/postgres/async_session.cpp"],
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
@@ -340,6 +341,33 @@ const checked = segments.map(([name, relative]) => {
        || !/nativeEnabledFor\s*\(/.test(header))
       issues.push({line:0,kind:"partial account session migration enabled for all routes",
         expression:"nativeEnabled false; nativeEnabledFor per request"});
+  }
+  if(relative==="src/storage/postgres/async_session.cpp"){
+    // An owner check before an unrestricted UPDATE is a TOCTOU security
+    // bug: require ownership in the SQL mutation itself, and in the
+    // follow-up state inspection that preserves NotFound privacy.
+    const start = source.indexOf("AsyncSessionSql::revokeOwned(");
+    const end = source.indexOf("AsyncSessionSql::revokeAll(", start);
+    const body = source.slice(start, end);
+    const statements = body.match(/WHERE id=\$1 AND identity_id=\$2/g) || [];
+    if(start<0 || end<=start || statements.length<2
+       || !/WHERE id=\$1 AND identity_id=\$2 AND state=0 RETURNING id/.test(body)
+       || !/co_await connection\.query\(update/.test(body)
+       || !/co_await connection\.query\(\s*query/.test(body))
+      issues.push({line:0,kind:"native owned session revocation lacks atomic owner-scoped SQL",
+        expression:"UPDATE id+identity_id, SELECT id+identity_id"});
+    const repository = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_repository.cpp"),"utf8");
+    const owned = repository.slice(
+      repository.indexOf("CoroutinePostgresSessionRepository::revokeOwned("),
+      repository.indexOf("CoroutinePostgresSessionRepository::revokeAll("));
+    const service = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_service.cpp"),"utf8");
+    if(!/co_await m_impl->sql\.revokeOwned\s*\(/.test(owned)
+       || !/return m_repository->revokeOwned\s*\(/.test(service)
+       || /revokeOwnedSession\s*\(/.test(service))
+      issues.push({line:0,kind:"native owned revocation still checks then revokes across await",
+        expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
   }
   if(relative==="src/authentication/http/admin.cpp"){
     // The actual HTTP implementation is under authentication/http/admin.cpp.

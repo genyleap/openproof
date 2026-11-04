@@ -68,6 +68,13 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     revoke(session::SessionId id, foundation::Instant now);
 
+    /** Identity-scoped revocation performed atomically in the native SQL
+     * UPDATE. Never look up the owner in a separate suspended operation.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    revokeOwned(identity::core::IdentityId identity, session::SessionId id,
+                foundation::Instant now);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
     revokeAll(identity::core::IdentityId identity, foundation::Instant now);
 

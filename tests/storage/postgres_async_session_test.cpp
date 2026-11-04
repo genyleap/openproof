@@ -132,6 +132,67 @@ asio::awaitable<void> revokeAndBulkRevoke(
         && (*revokedSecond)[6] == "1";
 }
 
+asio::awaitable<void> ownedRevocationIsAtomic(
+    std::string connectionString, bool& unrelatedUnchanged,
+    bool& originalOwnerDenied, bool& currentOwnerRevoked,
+    bool& idempotent, bool& missingHidden, bool& expiredDenied)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+
+    // The mutation must filter on both the session and the owner, so a
+    // foreign identity cannot revoke or discover an unrelated session.
+    auto wrongOwner = co_await sql.revokeOwned(
+        *conn, "another-identity", "test-session-1", 1600, 3s);
+    auto unchanged = co_await sql.find(*conn, "test-session-1", 3s);
+    unrelatedUnchanged =
+        wrongOwner == pg::AsyncSessionSql::RevokeStatus::NotFound
+        && unchanged.has_value() && (*unchanged)[6] == "0"
+        && !(*unchanged)[13].has_value();
+
+    // Simulate reassignment between operations: unlike a SELECT-then-UPDATE
+    // implementation, the old owner must not gain authority over the new row.
+    static_cast<void>(co_await conn->query(
+        "UPDATE pg_temp.sessions SET identity_id='another-identity' "
+        "WHERE id='test-session-1'", {}, 3s));
+    auto formerOwner = co_await sql.revokeOwned(
+        *conn, "test-identity", "test-session-1", 1700, 3s);
+    auto afterTransfer = co_await sql.find(*conn, "test-session-1", 3s);
+    originalOwnerDenied =
+        formerOwner == pg::AsyncSessionSql::RevokeStatus::NotFound
+        && afterTransfer.has_value() && (*afterTransfer)[6] == "0";
+
+    const auto revoked = co_await sql.revokeOwned(
+        *conn, "another-identity", "test-session-1", 1800, 3s);
+    auto state = co_await sql.find(*conn, "test-session-1", 3s);
+    currentOwnerRevoked =
+        revoked == pg::AsyncSessionSql::RevokeStatus::Revoked
+        && state.has_value() && (*state)[6] == "1"
+        && (*state)[13] == "1800";
+
+    const auto repeat = co_await sql.revokeOwned(
+        *conn, "another-identity", "test-session-1", 1900, 3s);
+    idempotent = repeat == pg::AsyncSessionSql::RevokeStatus::AlreadyRevoked;
+
+    const auto missing = co_await sql.revokeOwned(
+        *conn, "another-identity", "not-a-session", 1900, 3s);
+    const auto hidden = co_await sql.revokeOwned(
+        *conn, "test-identity", "test-session-1", 1900, 3s);
+    missingHidden =
+        missing == pg::AsyncSessionSql::RevokeStatus::NotFound
+        && hidden == pg::AsyncSessionSql::RevokeStatus::NotFound;
+
+    // Expired, owned sessions keep their distinct precondition status.
+    static_cast<void>(co_await conn->query(
+        "UPDATE pg_temp.sessions SET state=2 WHERE id='test-session-1'",
+        {}, 3s));
+    const auto expired = co_await sql.revokeOwned(
+        *conn, "another-identity", "test-session-1", 2000, 3s);
+    expiredDenied = expired == pg::AsyncSessionSql::RevokeStatus::Expired
+        && conn->reusable();
+}
+
 asio::awaitable<void> bulkRevocationReturnsScalarCount(
     std::string connectionString, bool& exactCount, bool& noCrossIdentity)
 {
@@ -414,6 +475,33 @@ TEST(PostgresAsyncSessionSqlTest, RevocationIsIdempotentAndIdentityScoped)
     EXPECT_TRUE(idempotent);
     EXPECT_TRUE(absentDenied);
     EXPECT_TRUE(bulkIsolated);
+}
+
+TEST(PostgresAsyncSessionSqlTest, OwnedRevokeNeverMutatesOrDisclosesForeignSession)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool unrelatedUnchanged = false, originalOwnerDenied = false;
+    bool currentOwnerRevoked = false, idempotent = false;
+    bool missingHidden = false, expiredDenied = false;
+    auto done = asio::co_spawn(io,
+        ownedRevocationIsAtomic(uri, unrelatedUnchanged, originalOwnerDenied,
+            currentOwnerRevoked, idempotent, missingHidden, expiredDenied),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(unrelatedUnchanged);
+    EXPECT_TRUE(originalOwnerDenied);
+    EXPECT_TRUE(currentOwnerRevoked);
+    EXPECT_TRUE(idempotent);
+    EXPECT_TRUE(missingHidden);
+    EXPECT_TRUE(expiredDenied);
 }
 
 TEST(PostgresAsyncSessionSqlTest, BulkRevocationReturnsBoundedCountForThousands)

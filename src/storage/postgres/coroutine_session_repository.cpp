@@ -233,6 +233,39 @@ CoroutinePostgresSessionRepository::revoke(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresSessionRepository::revokeOwned(
+    identity::core::IdentityId identity, session::SessionId id,
+    foundation::Instant now)
+{
+    try {
+        auto lease = co_await m_impl->pool.acquire();
+        const auto status = co_await m_impl->sql.revokeOwned(
+            lease.connection(), std::string{identity.value()},
+            std::string{id.value()}, now.time_since_epoch().count(),
+            m_impl->queryTimeout);
+        switch (status) {
+        case async_detail::AsyncSessionSql::RevokeStatus::Revoked:
+        case async_detail::AsyncSessionSql::RevokeStatus::AlreadyRevoked:
+            co_return foundation::ok();
+        case async_detail::AsyncSessionSql::RevokeStatus::NotFound:
+            co_return foundation::fail(
+                foundation::ErrorCode::NotFound,
+                "That session was not found.");
+        case async_detail::AsyncSessionSql::RevokeStatus::Expired:
+            co_return foundation::fail(
+                foundation::ErrorCode::FailedPrecondition,
+                "An expired session cannot be revoked.");
+        }
+        co_return foundation::fail(
+            foundation::ErrorCode::Internal, "Unknown session state.");
+    } catch (const std::exception&) {
+        co_return foundation::fail(
+            foundation::ErrorCode::Unavailable,
+            "The session could not be revoked.");
+    }
+}
+
 asio::awaitable<foundation::Result<std::size_t>>
 CoroutinePostgresSessionRepository::revokeAll(
     identity::core::IdentityId identity, foundation::Instant now)
