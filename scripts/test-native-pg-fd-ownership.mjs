@@ -35,6 +35,8 @@ test("real loopback regression exercises stalled PostgreSQL handshake and fd cle
     path.join(root, "tests/storage/postgres_async_dns_test.cpp"), "utf8");
   assert.match(tests, /TEST\(PostgresAsyncDnsTest, FailedNativeConnectionsDoNotLeakSocketDescriptors\)/);
   assert.match(tests, /TEST\(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline\)/);
+  assert.match(tests, /TEST\(PostgresAsyncDnsTest, StalledTlsNegotiationHonorsConnectDeadline\)/);
+  assert.match(tests, /expectStalledLoopbackDeadline\("require"\)/);
   assert.match(tests, /asio::ip::tcp::acceptor/);
   assert.match(tests, /std::jthread server/);
   assert.match(tests, /acceptor\.async_accept\(/);

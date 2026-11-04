@@ -2388,3 +2388,23 @@ The enterprise C++ translation unit has not been rebuilt after this
 edit; the public-module dependency graph currently requires a large
 rebuild. Runtime LDAP/TLS/password-memory analysis is still required
 before acceptance or deployment. No production LDAP server was used.
+
+#### Stalled PostgreSQL SSLRequest deadline regression (2026-11-04)
+
+The standalone loopback C++ fixture now has a second variant using
+`sslmode=require`. It accepts a real TCP connection on an ephemeral
+`127.0.0.1` port but intentionally never replies to libpq's initial
+PostgreSQL SSLRequest. Its purpose is to verify that the *same*
+250-millisecond native connection deadline bounds TLS negotiation,
+rather than testing only the plain-text startup variant. The common
+fixture retains the earlier plaintext stall test and checks that no
+server beyond the in-process loopback acceptor is contacted.
+
+The source-only ownership/transport tests now require this TLS variant.
+**Its C++ build and execution are still outstanding**: the managed
+remote build-session quota was occupied by unrelated active workloads.
+The existing 18/18 successfully executed NativePgDns suite refers
+to the prior binary, *without* this newly added TLS case. Do not count
+the new case among passing C++ tests until an isolated rebuild and
+CTest run succeed. No Production service or external database was
+changed.

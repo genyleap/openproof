@@ -135,7 +135,7 @@ void expectConnectionDenied(
     EXPECT_TRUE(refused);
 }
 
-TEST(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline)
+void expectStalledLoopbackDeadline(std::string_view sslMode)
 {
     // A real local TCP acceptor holds the accepted socket open but never
     // responds with the PostgreSQL protocol. This exercises libpq's socket
@@ -156,7 +156,8 @@ TEST(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline)
     const std::string dsn =
         "host=localhost hostaddr=127.0.0.1 port="
         + std::to_string(acceptor.local_endpoint().port())
-        + " user=openproof_test dbname=openproof_disposable_test sslmode=disable";
+        + " user=openproof_test dbname=openproof_disposable_test sslmode="
+        + std::string{sslMode};
     asio::io_context clientIo;
     bool timedOut = false;
     const auto started = std::chrono::steady_clock::now();
@@ -180,6 +181,19 @@ TEST(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline)
     EXPECT_TRUE(accepted.load(std::memory_order_acquire));
     EXPECT_TRUE(timedOut) << "Stalled libpq negotiation escaped its deadline";
     EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+}
+
+TEST(PostgresAsyncDnsTest, StalledLoopbackDatabaseHonorsConnectDeadline)
+{
+    expectStalledLoopbackDeadline("disable");
+}
+
+TEST(PostgresAsyncDnsTest, StalledTlsNegotiationHonorsConnectDeadline)
+{
+    // libpq sends a PostgreSQL SSLRequest on this same ephemeral loopback
+    // socket. The server never responds with 'S' or 'N'; the native
+    // readiness wait must still respect its original absolute deadline.
+    expectStalledLoopbackDeadline("require");
 }
 
 TEST(PostgresAsyncDnsTest, FailedNativeConnectionsDoNotLeakSocketDescriptors)
