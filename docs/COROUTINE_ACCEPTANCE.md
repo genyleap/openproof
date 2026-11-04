@@ -2363,3 +2363,28 @@ and descriptor handling only**. The successful PostgreSQL TLS/SQL
 integration suite remains separate, and the 20 overall coroutine
 migration blockers are not reduced. No production service, CI
 action or release was touched.
+
+#### Legacy enterprise LDAP bind credential hygiene (2026-11-04)
+
+A security-focused pass found that the existing synchronous OpenLDAP
+`simpleBind` built an ordinary heap-allocated
+`std::string passwordStorage` as the backing storage for the
+`berval` sent to `ldap_sasl_bind_s`, then freed that string without
+explicitly clearing its plaintext bytes. The method now constructs a
+scoped, nonthrowing `PasswordScrub` RAII guard immediately after
+making this copy. The destructor overwrites the buffer through a
+volatile pointer on success, LDAP rejection, and stack unwinding,
+before the allocation is released. The original provider credentials
+remain owned by their existing secret-value class.
+
+Two source-level tests verify guard placement, volatile wiping,
+and retention of the strict migration blockers for synchronous LDAP
+bind/search. This is a credential-memory hygiene fix **only**:
+`ldap_sasl_bind_s` and `ldap_search_ext_s` continue to block
+caller threads, and the enterprise provider still lacks a true native
+coroutine implementation. Do not claim migration completion.
+
+The enterprise C++ translation unit has not been rebuilt after this
+edit; the public-module dependency graph currently requires a large
+rebuild. Runtime LDAP/TLS/password-memory analysis is still required
+before acceptance or deployment. No production LDAP server was used.

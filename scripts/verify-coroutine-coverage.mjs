@@ -107,6 +107,17 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
   }
+  if(relative==="src/providers/enterprise/enterprise.cpp"){
+    const bind = source.slice(
+      source.indexOf("foundation::Status simpleBind("),
+      source.indexOf("std::optional<std::string> ldapValue("));
+    if(!/struct\s+PasswordScrub\s+final/.test(bind)
+       || !/~PasswordScrub\s*\(\s*\)\s*noexcept/.test(bind)
+       || !/volatile\s+char\s*\*\s*bytes\s*=\s*value\.data\s*\(\s*\)/.test(bind)
+       || !/scrub\s*\{\s*passwordStorage\s*\}/.test(bind))
+      issues.push({line:0,kind:"LDAP plaintext bind buffer is not scrubbed on every exit",
+        expression:"PasswordScrub RAII on passwordStorage"});
+  }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(
       source.indexOf("AuthenticationService::nativeProviderAuthenticationEnabled("),

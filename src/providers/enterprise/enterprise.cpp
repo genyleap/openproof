@@ -311,6 +311,16 @@ struct LdapResolvedEntry final {
 {
     std::string dnStorage{dn};
     std::string passwordStorage{password};
+    // libldap's berval points at this temporary plaintext password.
+    // Overwrite it after the bind, including failed binds and exceptions,
+    // rather than leaving a freed heap allocation full of credentials.
+    struct PasswordScrub final {
+        std::string& value;
+        ~PasswordScrub() noexcept {
+            volatile char* bytes = value.data();
+            for (std::size_t i = 0; i < value.size(); ++i) bytes[i] = '\0';
+        }
+    } scrub{passwordStorage};
     berval credential{passwordStorage.size(), passwordStorage.data()};
     const char* bindDn = dnStorage.empty() ? nullptr : dnStorage.c_str();
     const int result = ldap_sasl_bind_s(handle, bindDn, LDAP_SASL_SIMPLE,
