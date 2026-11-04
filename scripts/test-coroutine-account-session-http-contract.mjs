@@ -43,6 +43,18 @@ test("native session routes preserve bearer and operation authorization", () => 
   assert.match(implementation, /"revoked"/);
 });
 
+test("storage-specific bridge binds real native PostgreSQL session operations", () => {
+  const source = read("src/storage/postgres/coroutine_account_session_bridge.cpp");
+  assert.match(source, /makeCoroutinePostgresAccountSessionAdapter\s*\(/);
+  assert.match(source, /sessions\.authenticate\(std::move\(bearer\)\)/);
+  assert.match(source, /sessions\.list\(std::move\(identity\)\)/);
+  assert.match(source, /sessions\.revokeOwned\(std::move\(identity\), std::move\(id\)\)/);
+  assert.doesNotMatch(source, /io\.run\s*\(|m_sessions->|PQexec\s*\(/);
+  const cmake = read("src/storage/postgres/CMakeLists.txt");
+  assert.match(cmake, /add_library\(openproof_postgres_async_account_bridge STATIC/);
+  assert.match(cmake, /openproof_postgres_async_repository openproof_account_async_http/);
+});
+
 test("native path has independent C++ security regression and strict acceptance guard", () => {
   const tests = read("tests/account/session_coroutine_http_test.cpp");
   for (const name of [

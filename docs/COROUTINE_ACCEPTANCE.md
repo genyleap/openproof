@@ -2542,3 +2542,32 @@ This is partial migration only: Account signup, profile, email, MFA,
 connection and other routes still use synchronous services.
 The strict release gate remains NOT_APPROVED and no Production
 deployment or release occurred.
+
+#### Concrete native PostgreSQL binding for account session HTTP (2026-11-04)
+
+The provider-neutral Account session adapter is now backed by an
+**explicit, storage-specific composition factory** named
+`makeCoroutinePostgresAccountSessionAdapter`. It binds the adapter's
+three awaitable callbacks to the real
+`CoroutinePostgresSessionService::authenticate`,
+`::list`, and `::revokeOwned` methods. No `io_context::run`,
+`PQexec`, synchronous `SessionService`, or thread-offloaded SQL
+is involved in this native callback chain. The opt-in bridge is
+compiled as a distinct `openproof_postgres_async_account_bridge`
+target that links the already independent Account and PostgreSQL
+native libraries. The Account HTTP code remains provider-neutral;
+no PostgreSQL symbol or configuration is introduced into it.
+
+This is a composition capability, **not** a live deployment: the
+production HTTP listener remains wired to its existing synchronous
+routes, while the new adapter requires explicit application
+construction and lifecycle management. All referenced objects must
+outlive their in-flight coroutine operations. Source contract tests
+now verify that the binding uses each native method and that CMake
+does not couple Account directly to the storage provider.
+
+The CMake configuration succeeds, but the new target still depends
+on the broad C++26 module rebuild previously observed for Account
+(165 incremental steps); it has not been compiled or executed.
+The legacy Account and unrelated HTTP/provider migration blockers
+remain open. The strict migration gate remains NOT_APPROVED.
