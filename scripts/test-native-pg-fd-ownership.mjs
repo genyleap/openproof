@@ -44,6 +44,23 @@ test("real loopback regression exercises stalled PostgreSQL handshake and fd cle
   assert.match(tests, /EXPECT_TRUE\(timedOut\)/);
 });
 
+test("benchmark compares serial vs concurrent native libpq stalls on one reactor", () => {
+  const fixture = fs.readFileSync(
+    path.join(root, "tests/storage/postgres_native_benchmark_test.cpp"), "utf8");
+  const start = fixture.indexOf(
+    "TEST(PostgresAsyncDnsTest, ParallelStalledConnectionsDoNotSerializeReactor)");
+  const end = fixture.indexOf("} // namespace", start);
+  assert.ok(start >= 0 && end > start);
+  const benchmark = fixture.slice(start, end);
+  assert.match(benchmark, /constexpr int attempts = 6/);
+  assert.match(benchmark, /asio::co_spawn\(serverIo, acceptAll\(\), asio::detached\)/);
+  assert.match(benchmark, /const auto serialStart/);
+  assert.match(benchmark, /const auto concurrentStart/);
+  assert.match(benchmark, /concurrentClient\.run\(\)/);
+  assert.match(benchmark, /EXPECT_EQ\(expired\.load/);
+  assert.match(benchmark, /NativePgLoopbackBench attempts=/);
+});
+
 test("socket readiness remains cancellation- and deadline-bound", () => {
   assert.match(body, /if\s*\(Clock::now\(\)\s*>=\s*deadline\)/);
   assert.match(body, /asio::cancel_after\(remaining/);

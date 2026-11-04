@@ -355,8 +355,12 @@ target_link_libraries(openproof_postgres_async_dns_tests PRIVATE
     openproof_postgres_async_io GTest::gtest_main
     openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Boost.Asio coroutine-heavy GoogleTest bodies cause GCC16 -O2/-g
+    # to spend minutes optimizing a test-only translation unit. Keep all
+    # production libraries optimized and warnings-as-errors intact; only
+    # this loopback test fixture uses unoptimized, debug-info-free code.
     set_source_files_properties(storage/postgres_async_dns_test.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_async_dns_tests PRIVATE
@@ -366,6 +370,33 @@ gtest_discover_tests(openproof_postgres_async_dns_tests
     TEST_PREFIX "NativePgDns."
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;dns;loopback" TIMEOUT 12)
+
+# Lightweight, isolated loopback concurrency benchmark for the native libpq
+# coroutine transport. The control and concurrent cases use identical
+# non-responding TCP servers, no database or production credentials. Keep
+# only this test source unoptimized: production libpq remains Release/-Werror.
+add_executable(openproof_postgres_async_benchmark_tests
+    storage/postgres_native_benchmark_test.cpp)
+target_compile_features(openproof_postgres_async_benchmark_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_postgres_async_benchmark_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_benchmark_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_benchmark_tests PRIVATE
+    openproof_postgres_async_io GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_native_benchmark_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_benchmark_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_benchmark_tests
+    TEST_PREFIX "NativePgBench."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;benchmark;loopback" TIMEOUT 20)
 
 # Explicit opt-in socket-level verification for the coroutine session listener
 # bridge. Unlike the lightweight handler suite, this exercises real Beast

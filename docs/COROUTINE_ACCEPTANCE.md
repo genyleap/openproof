@@ -2408,3 +2408,39 @@ to the prior binary, *without* this newly added TLS case. Do not count
 the new case among passing C++ tests until an isolated rebuild and
 CTest run succeed. No Production service or external database was
 changed.
+
+#### Isolated native PostgreSQL coroutine concurrency benchmark (2026-11-04)
+
+The existing native libpq loopback suite has now compiled and passed
+**19/19 tests**, including real stalled non-TLS and TLS pre-negotiation
+deadlines. To avoid compiling Boost.Asio-heavy test suites for every
+performance experiment, a separate
+`openproof_postgres_async_benchmark_tests` target has been added,
+configured and given its own lightweight C++ translation unit. The
+existing production connector remains optimized with GCC16 `-O2`,
+`-Werror`, and the verified native toolchain; the two test-only
+translation units compile with `-O0 -g0 -fno-inline` for practical
+iteration without suppressing compiler warnings as errors.
+
+The bench sets up an in-process loopback TCP acceptor that holds
+connections but never replies to PostgreSQL protocol negotiation. It
+measures six **sequential** native coroutine connection deadlines
+versus six **concurrent** awaitables on one Asio `io_context`,
+with identical 180 ms deadlines and the same production
+`AsyncConnection::connect` implementation. It requires all twelve
+connections to be accepted and time out, and verifies that overlapping
+waits are meaningfully faster than serial waits. Measurements are
+printed as `NativePgLoopbackBench` fields for an auditable result.
+
+**Benchmark executable and runtime numbers remain unverified.**
+CMake configuration succeeded and the source invariants passed, but
+the isolated benchmark translation unit could not be compiled within
+the remote direct-command time budget, while managed process-session
+capacity was occupied by unrelated workloads. In particular, no
+claimed speedup is inferred from code or scheduling theory.
+This is only an I/O scheduling microbenchmark, not comparative
+production end-to-end throughput or latency for OpenProof.
+
+The strict migration inventory remains NOT_APPROVED with 20 blockers,
+including the legacy PostgreSQL storage path and LDAP. Production,
+releases and GitHub Actions remain unchanged.
