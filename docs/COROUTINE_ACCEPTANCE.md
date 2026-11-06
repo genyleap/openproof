@@ -2653,3 +2653,41 @@ claimed for this checkpoint. The host's `/opt` filesystem was 96% utilized.
 The strict coroutine acceptance gate still reports **20 blocking findings**;
 this change is **NOT_APPROVED** for release or deployment. The production
 service and live database were not modified.
+
+#### Monotonic session activity under reordered coroutine completion (2026-11-07)
+
+Both native AsyncSessionSql and legacy PostgresSessionRepository previously
+assigned request-captured timestamps directly to last_seen_at_ms. A request
+captured earlier but completed later could decrease durable activity time and
+prematurely expire a session. Both token-use and rotation SQL now use
+GREATEST(last_seen_at_ms, request_timestamp), retaining atomic digest,
+state and expiry predicates. A disposable-PostgreSQL C++ regression exercises
+out-of-order use (1800, then 1300), stale rotation (1200) and idle expiry.
+The strict migration gate checks both implementations, and the additional
+source-contract test suite passed 5/5. The C++ regression remains contingent
+on a disposable PostgreSQL execution. No production cutover is authorized.
+
+#### Local disk pressure mitigation (2026-11-07)
+
+The isolated development host improved from 95% (4.5 GiB free) to 89%
+(9.2 GiB free). Removed only the verified ignored, idle 4.1 GiB
+GenyCaster block-QA CMake build directory and the 680 MiB temporary npm
+cache content directory. Source worktrees, all OpenProof build artifacts,
+production binaries, live databases and running services were preserved.
+
+#### Target-local compiler and test evidence (2026-11-07)
+
+With disk pressure reduced, a single-worker GCC 16.2 / C++26 build of
+openproof_postgres_async_tests completed successfully. It compiled the native
+async_session.cpp library implementation and the new C++ stale-clock test,
+then linked the test executable (exit 0). GCC emitted its pre-existing
+Boost.Asio mismatched-new-delete warning from the test translation unit;
+that one test file already has a targeted non-fatal warning exception.
+
+The focused CTest run discovered 10 PostgresAsyncSessionSqlTest cases:
+**1 passed; 9 skipped**, including the new stale-clock SQL regression.
+An isolated PostgreSQL cluster could not start under the restricted remote
+command environment (pg_virtualenv failed to change user ID). No test was
+performed against the live PostgreSQL cluster or production credentials.
+The synchronous legacy module source was not rebuilt. No C++ E2E acceptance
+or release approval follows from this target-local checkpoint.

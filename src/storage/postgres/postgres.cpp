@@ -1137,7 +1137,8 @@ foundation::Result<session::Session> PostgresSessionRepository::use(
         "state=CASE WHEN $2::bigint>=absolute_expires_at_ms OR "
         "$2::bigint>=last_seen_at_ms+idle_timeout_ms THEN 2 ELSE state END, "
         "last_seen_at_ms=CASE WHEN $2::bigint<absolute_expires_at_ms AND "
-        "$2::bigint<last_seen_at_ms+idle_timeout_ms THEN $2::bigint ELSE last_seen_at_ms END "
+        "$2::bigint<last_seen_at_ms+idle_timeout_ms THEN "
+        "GREATEST(last_seen_at_ms,$2::bigint) ELSE last_seen_at_ms END "
         "WHERE token_digest=decode($1,'hex') AND state=0 RETURNING " + std::string{kSessionColumns};
     ResultPointer result = execParams(lease->get(), sql,
         {foundation::toHex(token.bytes()), instant(now)});
@@ -1158,7 +1159,8 @@ foundation::Status PostgresSessionRepository::rotate(
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     ResultPointer result = execParams(lease->get(),
-        "UPDATE openproof.sessions SET token_digest=decode($3,'hex'),last_seen_at_ms=$4 "
+        "UPDATE openproof.sessions SET token_digest=decode($3,'hex'),"
+        "last_seen_at_ms=GREATEST(last_seen_at_ms,$4::bigint) "
         "WHERE id=$1 AND token_digest=decode($2,'hex') AND state=0 "
         "AND $4::bigint<absolute_expires_at_ms AND $4::bigint<last_seen_at_ms+idle_timeout_ms "
         "RETURNING id", {std::string{id.value()}, foundation::toHex(expected.bytes()),

@@ -70,6 +70,39 @@ asio::awaitable<void> atomicSessionLifecycle(
         && (*final)[10] == "1600";
 }
 
+asio::awaitable<void> staleRequestClocksNeverRegressActivity(
+    std::string connectionString, bool& usePreserved,
+    bool& rotatePreserved, bool& idleDeadlinePreserved)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+
+    // Concurrent HTTP operations may enter SQL in a different order from
+    // the wall-clock timestamps captured at request start.
+    auto latest = co_await sql.useToken(*conn, kDigestA, 1800, 3s);
+    auto stale = co_await sql.useToken(*conn, kDigestA, 1300, 3s);
+    auto afterUse = co_await sql.find(*conn, "test-session-1", 3s);
+    usePreserved = latest.has_value() && stale.has_value()
+        && afterUse.has_value() && (*afterUse)[10] == "1800";
+
+    const bool rotated = co_await sql.rotateToken(
+        *conn, "test-session-1", kDigestA, kDigestB, 1200, 3s);
+    auto afterRotation = co_await sql.find(*conn, "test-session-1", 3s);
+    rotatePreserved = rotated && afterRotation.has_value()
+        && (*afterRotation)[10] == "1800"
+        && (*afterRotation)[7] == kDigestB;
+
+    // The activity window is based on the maximum committed timestamp,
+    // not the last (possibly stale) coroutine to finish.
+    auto withinIdle = co_await sql.useToken(*conn, kDigestB, 2500, 3s);
+    auto expired = co_await sql.useToken(*conn, kDigestB, 3500, 3s);
+    auto final = co_await sql.find(*conn, "test-session-1", 3s);
+    idleDeadlinePreserved = withinIdle.has_value() && !expired.has_value()
+        && final.has_value() && (*final)[6] == "2"
+        && (*final)[10] == "2500" && conn->reusable();
+}
+
 asio::awaitable<void> boundaryAndInvalidDigest(
     std::string connectionString, bool& exactDeadlineDenied,
     bool& invalidRejected, bool& untouched)
@@ -431,6 +464,28 @@ TEST(PostgresAsyncSessionSqlTest, AtomicUseRotationReplayAndIdleExpiry)
     EXPECT_TRUE(replayDenied);
     EXPECT_TRUE(expired);
     EXPECT_TRUE(unchanged);
+}
+
+TEST(PostgresAsyncSessionSqlTest, StaleConcurrentClocksNeverRegressLastSeen)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool usePreserved = false, rotatePreserved = false, idlePreserved = false;
+    auto done = asio::co_spawn(io,
+        staleRequestClocksNeverRegressActivity(
+            uri, usePreserved, rotatePreserved, idlePreserved),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(usePreserved);
+    EXPECT_TRUE(rotatePreserved);
+    EXPECT_TRUE(idlePreserved);
 }
 
 TEST(PostgresAsyncSessionSqlTest, InclusiveBoundaryAndBadDigestFailClosed)

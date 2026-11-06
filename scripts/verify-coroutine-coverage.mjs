@@ -335,6 +335,16 @@ const checked = segments.map(([name, relative]) => {
        || !/target\.value\s*\(\s*\)\s*==\s*authenticated->id\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"native account session services missing authenticated or self-revoke-safe persistence",
         expression:"await authenticate, list, revokeOwned and deny self-revoke"});
+    // A storage bug must not expose another identity's session metadata.
+    // Validate every row before JSON serialization, never stream partial data.
+    const listing = executable.slice(
+      executable.indexOf("CoroutineAccountSessionAdapter::sessionList("),
+      executable.indexOf("CoroutineAccountSessionAdapter::sessionRevoke("));
+    if (!/std::ranges::any_of\s*\(\s*values\.value\s*\(/.test(listing)
+        || !/value\.identity\s*\(\s*\)\s*!=\s*current->identity\s*\(\s*\)/.test(listing)
+        || listing.indexOf("value.identity()") > listing.indexOf("json::array sessions;"))
+      issues.push({line:0,kind:"native account session list can disclose cross-identity rows",
+        expression:"validate all session identities before serializing any row"});
     const header = fs.readFileSync(
       path.join(root,"src/account/http/coroutine_session_http.hpp"),"utf8");
     if(!/nativeEnabled\s*\(\s*\)\s*const\s*noexcept\s*override\s*\{\s*return\s+false\s*;/.test(header)
@@ -343,6 +353,29 @@ const checked = segments.map(([name, relative]) => {
         expression:"nativeEnabled false; nativeEnabledFor per request"});
   }
   if(relative==="src/storage/postgres/async_session.cpp"){
+    // Concurrency can reorder requests after they capture timestamps. Both
+    // native and compatibility SQL must preserve a monotonic idle clock.
+    const legacySessions = fs.readFileSync(
+      path.join(root,"src/storage/postgres/postgres.cpp"),"utf8");
+    for (const [implementationName,sql] of [
+      ["native",source],["compatibility",legacySessions]
+    ]) {
+      const current = sql.slice(
+        sql.indexOf(implementationName==="native"
+          ? "AsyncSessionSql::useToken(" : "PostgresSessionRepository::use("),
+        sql.indexOf(implementationName==="native"
+          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("));
+      const rotation = sql.slice(
+        sql.indexOf(implementationName==="native"
+          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("),
+        sql.indexOf(implementationName==="native"
+          ? "AsyncSessionSql::revoke(" : "PostgresSessionRepository::revoke("));
+      if (!current.includes("GREATEST(last_seen_at_ms,$2::bigint)")
+          || !rotation.includes("GREATEST(last_seen_at_ms,$4::bigint)")) {
+        issues.push({line:0,kind:implementationName+" session idle clock can regress",
+          expression:"GREATEST(last_seen_at_ms, request timestamp) on use and rotate"});
+      }
+    }
     // An owner check before an unrestricted UPDATE is a TOCTOU security
     // bug: require ownership in the SQL mutation itself, and in the
     // follow-up state inspection that preserves NotFound privacy.

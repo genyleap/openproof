@@ -252,14 +252,16 @@ AsyncSessionSql::useToken(AsyncConnection& connection, std::string digestHex,
     if (!validDigest(digestHex) || nowMilliseconds < 0) {
         throw std::invalid_argument{"Invalid async session token lookup arguments"};
     }
-    // Exactly the current synchronous production SQL semantics: one atomic
-    // UPDATE protects both the single-use clock check and last-seen update.
+    // One atomic UPDATE protects the expiry check and last-seen update.
+    // A concurrent request can carry an earlier captured timestamp: never
+    // roll the durable activity clock backward or shorten the idle window.
     const std::string sql =
         "UPDATE " + tableName(m_table) + " SET "
         "state=CASE WHEN $2::bigint>=absolute_expires_at_ms OR "
         "$2::bigint>=last_seen_at_ms+idle_timeout_ms THEN 2 ELSE state END, "
         "last_seen_at_ms=CASE WHEN $2::bigint<absolute_expires_at_ms AND "
-        "$2::bigint<last_seen_at_ms+idle_timeout_ms THEN $2::bigint ELSE last_seen_at_ms END "
+        "$2::bigint<last_seen_at_ms+idle_timeout_ms THEN "
+        "GREATEST(last_seen_at_ms,$2::bigint) ELSE last_seen_at_ms END "
         "WHERE token_digest=decode($1,'hex') AND state=0 RETURNING "
         + std::string{kSessionFields};
     auto rows = co_await connection.query(
@@ -285,7 +287,8 @@ asio::awaitable<bool> AsyncSessionSql::rotateToken(
     }
     const std::string sql =
         "UPDATE " + tableName(m_table) +
-        " SET token_digest=decode($3,'hex'),last_seen_at_ms=$4 "
+        " SET token_digest=decode($3,'hex'),"
+        "last_seen_at_ms=GREATEST(last_seen_at_ms,$4::bigint) "
         "WHERE id=$1 AND token_digest=decode($2,'hex') AND state=0 "
         "AND $4::bigint<absolute_expires_at_ms AND $4::bigint<last_seen_at_ms+idle_timeout_ms "
         "RETURNING id";
