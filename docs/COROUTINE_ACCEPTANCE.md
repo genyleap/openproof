@@ -2624,3 +2624,32 @@ native PostgreSQL test executable. The complete C++ ownership
 regression remains skipped until a disposable test instance is
 configured; do not deploy or mark this boundary approved on the
 strength of source tests alone.
+
+#### Fail-closed native account session listing boundary (2026-11-06)
+
+The optional, provider-neutral `CoroutineAccountSessionAdapter` previously
+serialized every row returned by its injected async `List(identity)` callback.
+If a storage adapter accidentally returned a session belonging to another
+identity, this could disclose that session's identifier, provider, timestamps,
+and user-agent metadata. The native HTTP adapter now validates **the entire
+result set's identity ownership before serializing any row**, and returns a
+sanitized unavailable response without partial disclosure if any row fails.
+This is a defense-in-depth boundary independent of the storage provider;
+the PostgreSQL repository must still enforce its own identity predicate.
+
+Added a native C++ regression that injects an unrelated identity's session
+alongside the caller's session and verifies HTTP 503, no session identifiers
+or foreign identity in the response, and no synchronous fallback. Added a
+source-contract regression for validation-before-serialization. The local
+source-contract suite passed **5/5** and relevant native capability,
+listener, administration, provider, LDAP, ownership and authentication source
+checks passed. The new Account C++ regression was **not built or run** because
+this isolated host's C++26 module dependency graph requires a broad rebuild.
+An attempt to start a separate, disposable PostgreSQL cluster using
+`pg_virtualenv -t` failed at `initdb` with `Could not change user id` under
+the remote command sandbox, so no PostgreSQL SQL integration result is
+claimed for this checkpoint. The host's `/opt` filesystem was 96% utilized.
+
+The strict coroutine acceptance gate still reports **20 blocking findings**;
+this change is **NOT_APPROVED** for release or deployment. The production
+service and live database were not modified.

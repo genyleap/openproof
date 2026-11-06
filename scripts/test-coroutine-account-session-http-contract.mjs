@@ -43,6 +43,20 @@ test("native session routes preserve bearer and operation authorization", () => 
   assert.match(implementation, /"revoked"/);
 });
 
+test("native Account listing checks all returned session identities before disclosure", () => {
+  const start = executable.indexOf("CoroutineAccountSessionAdapter::sessionList(");
+  const end = executable.indexOf("CoroutineAccountSessionAdapter::sessionRevoke(", start);
+  assert.ok(start > 0 && end > start);
+  const listing = executable.slice(start, end);
+  assert.match(listing, /std::ranges::any_of\(values\.value\(\)/);
+  assert.match(listing, /value\.identity\(\)\s*!=\s*current->identity\(\)/);
+  assert.match(listing, /ErrorCode::Unavailable/);
+  assert.ok(listing.indexOf("value.identity()") < listing.indexOf("json::array sessions;"));
+  const cppTests = read("tests/account/session_coroutine_http_test.cpp");
+  assert.match(cppTests, /TEST\(AccountCoroutineSessionHttpTest, ForeignIdentityRowsFailClosedBeforeSerialization\)/);
+  assert.match(cppTests, /validSession\("foreign-session-internal", "identity-foreign"\)/);
+});
+
 test("storage-specific bridge binds real native PostgreSQL session operations", () => {
   const source = read("src/storage/postgres/coroutine_account_session_bridge.cpp");
   assert.match(source, /makeCoroutinePostgresAccountSessionAdapter\s*\(/);

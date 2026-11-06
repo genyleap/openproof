@@ -65,11 +65,12 @@ public:
     }
 };
 
-[[nodiscard]] sess::Session validSession(std::string id)
+[[nodiscard]] sess::Session validSession(
+    std::string id, std::string identity = "identity-current")
 {
     return sess::Session::create(
         sess::SessionId{std::move(id)},
-        core::IdentityId{"identity-current"}, idp::ProviderId{"local"},
+        core::IdentityId{std::move(identity)}, idp::ProviderId{"local"},
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge, false},
         kNow, sess::TokenDigest{
@@ -115,6 +116,11 @@ struct Fixture final {
                   if (identity.value() != "identity-current") {
                       co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
                   }
+                  if (includeForeignSession) {
+                      co_return std::vector<sess::Session>{
+                          validSession("current"),
+                          validSession("foreign-session-internal", "identity-foreign")};
+                  }
                   co_return std::vector<sess::Session>{
                       validSession("current"), validSession("other")};
               },
@@ -143,6 +149,7 @@ struct Fixture final {
     gw::TokenBucketRateLimiter limiter;
     int authenticationCalls{};
     int listCalls{};
+    bool includeForeignSession{};
     int revokeCalls{};
     std::string lastIdentity;
     std::string lastTarget;
@@ -192,6 +199,20 @@ TEST(AccountCoroutineSessionHttpTest, ListNativeSessionsPreservesExistingJson)
     EXPECT_EQ(f.legacy.invoked, 0);
     EXPECT_EQ(response.headers().at("cache-control"), "no-store");
     EXPECT_EQ(response.body().find("valid-token"), std::string::npos);
+}
+
+TEST(AccountCoroutineSessionHttpTest, ForeignIdentityRowsFailClosedBeforeSerialization)
+{
+    Fixture f;
+    f.includeForeignSession = true;
+    const auto response = f.run(request(
+        gw::HttpMethod::Get, "/account/sessions", "valid-token"));
+    EXPECT_EQ(response.status(), 503);
+    EXPECT_EQ(response.body().find("foreign-session-internal"), std::string::npos);
+    EXPECT_EQ(response.body().find("identity-foreign"), std::string::npos);
+    EXPECT_EQ(response.headers().at("cache-control"), "no-store");
+    EXPECT_EQ(f.listCalls, 1);
+    EXPECT_EQ(f.legacy.invoked, 0);
 }
 
 TEST(AccountCoroutineSessionHttpTest, MissingAndInvalidBearerNeverEnumerate)

@@ -167,6 +167,15 @@ CoroutineAccountSessionAdapter::sessionList(gateway::HttpRequest request)
     auto values = co_await m_list(current->identity());
     if (!values) co_return fail(values.error(), request);
 
+    // Repository callbacks are replaceable by any asynchronous storage adapter.
+    // Validate the entire result before serializing a single session: a faulty
+    // tenant filter must never disclose another identity's session metadata.
+    if (std::ranges::any_of(values.value(), [&current](const session::Session& value) {
+            return value.identity() != current->identity();
+        })) {
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    }
+
     json::array sessions;
     for (const auto& value : values.value()) {
         json::object item;
