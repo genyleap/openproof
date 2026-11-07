@@ -30,7 +30,9 @@ public:
 /**
  * Async PostgreSQL session repository, independent of the legacy blocking
  * SessionRepository SPI. The owner must outlive all in-flight awaitables.
- * The handler-to-service coroutine migration is still pending.
+ * Each operation consumes one monotonic queryTimeout budget across pool
+ * admission, physical connection/session reset and SQL; overload does not
+ * silently restart its query clock after waiting for a lease.
  */
 class CoroutinePostgresSessionRepository final {
 public:

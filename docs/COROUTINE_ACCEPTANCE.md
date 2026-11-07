@@ -2762,3 +2762,130 @@ after 63 steps to avoid replicating a known host build outage. The
 nonblocking implementation is not an authorization to merge or deploy.
 The earlier November 3 hybrid-listener notes are historical and
 superseded by this design in this development branch.
+
+#### Native session repository single-budget deadline (2026-11-07)
+
+Before this checkpoint the coroutine Session Repository acquired its bounded
+PostgreSQL pool lease using only the pool's own queue/connect/reset timeouts,
+then restarted the entire configured query timeout when executing SQL. Under
+pool saturation or slow connection creation, one logical request could exceed
+its intended time budget. The canonical finalizer already used an absolute
+deadline; session issuance/authentication, rotation, listing and revocation
+did not consistently follow that model.
+
+All ten coroutine Session Repository SQL operations (use, find, replace,
+rotate, revoke, revokeOwned, revokeAll, list, purgeExpired, size), plus
+the session insertion helper, now establish a single steady-clock deadline
+before pool admission. They call pool.acquire(deadline), and pass only the
+positive remaining time to AsyncSessionSql, accounting for the asynchronous
+connection attempt and DISCARD ALL reset. Sub-millisecond leftovers fail
+closed before initiating another SQL query. The existing sanitized
+Unavailable error handling remains unchanged; no borrowed request body,
+token, identity, or password is copied to a diagnostic. The legacy
+synchronous repository continues unchanged until the full-storage migration
+gate is closed.
+
+Source-contract regression script
+scripts/test-coroutine-session-deadline.mjs covers every repository method,
+the add helper, and the canonical path's independent existing deadline
+pattern (13 checks). The strict migration verifier now rejects a future
+native session repository regression that restarts its SQL timer after pool
+admission. C++ module build verification and any disposable PostgreSQL
+integration results must be reported separately; source checks alone are
+never sufficient to authorize rollout.
+
+#### Native authentication-transaction end-to-end deadline (2026-11-07)
+
+The coroutine authentication transaction store had the same timeout-reset
+defect as the session repository. beginAsync and consumeAsync could wait for
+pool admission or connection/session reset, then pass the *entire* configured
+queryTimeout to the SQL adapter. Because that SQL adapter itself executes a
+transaction with BEGIN, INSERT/UPDATE, metadata operations, and COMMIT, the
+outer wait could extend a sensitive authentication path significantly.
+
+Both entry points now carry one monotonic deadline through pool.acquire(deadline)
+and pass remaining(deadline) to the already multi-statement-bounded
+AsyncAuthenticationTransactionSql adapter. Positive sub-millisecond remainders
+fail closed before another network operation. Existing invalid/replayed proof
+burn semantics, metadata limits, token hashing, and generic client errors
+are unchanged. Synchronous SPI entry points still refuse native-store use.
+
+scripts/test-coroutine-auth-transaction-deadline.mjs adds five source-contract
+checks. The strict migration checker also verifies this bound for both native
+authentication transaction methods; it does not remove a legacy PostgreSQL
+blocker until the synchronous production SPI has actually been replaced.
+C++ modules and disposable PostgreSQL integration remain independent gates.
+
+#### Remaining release blockers after the deadline hardening (2026-11-07)
+
+The strict gate remains NOT_APPROVED. Exactly 19 legacy blocking findings
+remain, grouped by *actual execution boundary* (do not hide legacy sources
+or rewrite the checker simply to lower this number):
+
+- Legacy synchronous PostgreSQL repositories/pool/migration procedures: 7
+  findings. The native session, authentication-transaction, and canonical
+  components do not yet replace every persistent domain SPI.
+- Legacy HTTPS provider facades (GitHub, OIDC, X, Web3): 4 findings. Their
+  native request coroutines exist, but the public synchronous providers still
+  run a private Asio event loop for compatibility.
+- Legacy HTTP surfaces (authentication, OAuth/OIDC, account, administration):
+  4 findings. Full replacement must preserve session revocation, authorization,
+  account recovery, CSRF, sender constraints, and tenant-isolation rules.
+- Enterprise LDAP synchronous bind/search and missing native flow: 3 findings.
+  A genuine asynchronous LDAP transport must preserve pinned TLS CA/hostname
+  verification, unique-subject resolution and password-memory scrubbing.
+- Legacy synchronous gateway proxy facade: 1 finding. Only the
+  CoroutineGatewayAdapter currently awaits nonblocking upstream networking.
+
+Dependency order for finishing this branch: complete native persistence SPIs
+and transactional integrity first, then every HTTP route and native provider
+composition, then LDAP, then remove compatibility-only proxy/provider entry
+points. Re-run actual C++ builds, isolated PostgreSQL tests, request-level
+security tests, and matched E2E benchmarks before permitting any cutover.
+Do not infer approval from reduced static findings alone.
+
+#### Bounded native authentication metadata batch (2026-11-07)
+
+The native authentication transaction's begin() validated up to 64 metadata
+entries before opening BEGIN, but issued a separate INSERT for every pair.
+At high network latency, those serial awaitable round trips could consume the
+entire authentication budget. It now constructs one SQL INSERT with generated
+numeric placeholders for all key/value triples and passes every metadata
+key, value and transaction identifier exclusively as libpq bound parameters.
+The existing bound of 64 entries, at most 200 bytes per key and 8192 per
+value, still applies *before* opening the transaction. Only approved fixed
+table identifiers are appended to SQL. The single INSERT and the challenge's
+original INSERT still share the same PostgreSQL transaction and
+remaining(deadline) budget; COMMIT remains atomic. Empty metadata avoids
+issuing a redundant INSERT.
+
+A disposable-PostgreSQL GTest was added for 64 maximum-size values, complete
+readback and reusable connection after COMMIT. Without an explicit
+OPENPROOF_TEST_POSTGRES test database this GTest is skipped, not passed.
+The four source-contract tests in
+scripts/test-coroutine-auth-transaction-metadata-batch.mjs passed. The
+strict migration gate now additionally rejects a regression to repeated
+metadata INSERT round trips. No live database was accessed or mutated.
+
+#### Build and validation boundary for this checkpoint (2026-11-07)
+
+The native openproof_postgres_async_repository and
+openproof_postgres_async_auth_repository libraries successfully compiled
+with GCC 16.2/C++26 AFTER the deadline changes. These successes do not
+validate the subsequent async_auth_transaction.cpp metadata batch change.
+That later async I/O + C++ GTest build was deliberately SIGTERM-stopped
+after approximately 151 seconds of constrained low-priority compilation
+with no compilation diagnostic, to protect the shared server from prolonged
+resource contention. Therefore the batched SQL C++ source and associated
+GTest are not marked as compiled or executed in this checkpoint. A full
+network-listener test build from the prior checkpoint was also deliberately
+stopped during a slow gateway/http.cpp compile. A disposable PostgreSQL
+test cluster has not been provisioned, so no test assertions requiring
+OPENPROOF_TEST_POSTGRES have been exercised.
+
+The source-level coroutine regression suite ran 64/64 assertions, protocol
+neutrality passed, and the strict gate correctly remains NOT_APPROVED
+with 19 real blocking findings. No production database, schema or service
+was modified. Real database integration, C++ compilation for the metadata
+batch and TCP listener regressions, and matched E2E benchmarking remain
+mandatory before this development branch can be merged or deployed.

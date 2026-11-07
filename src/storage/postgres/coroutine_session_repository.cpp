@@ -24,6 +24,21 @@ namespace openproof::storage::postgres {
 namespace asio = boost::asio;
 
 namespace {
+using Clock = std::chrono::steady_clock;
+using Deadline = Clock::time_point;
+
+// An operation must consume the same budget for pool admission, connection
+// (including DISCARD ALL) and SQL. An expired budget may not start new I/O.
+[[nodiscard]] std::chrono::milliseconds remaining(Deadline deadline)
+{
+    const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - Clock::now());
+    if (budget <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error{"Native session operation deadline exceeded"};
+    }
+    return budget;
+}
+
 [[nodiscard]] async_detail::AsyncSessionSql::NewSession
 captureSessionRecord(const session::Session& value)
 {
@@ -55,8 +70,9 @@ asio::awaitable<foundation::Status> insertCapturedSession(
                                    "Only active sessions can be added.");
     }
     try {
-        auto lease = co_await pool.acquire();
-        co_await sql.add(lease.connection(), std::move(*row), timeout);
+        const Deadline deadline = Clock::now() + timeout;
+        auto lease = co_await pool.acquire(deadline);
+        co_await sql.add(lease.connection(), std::move(*row), remaining(deadline));
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
@@ -100,10 +116,11 @@ CoroutinePostgresSessionRepository::use(
     session::TokenDigest token, foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto fields = co_await m_impl->sql.useToken(
             lease.connection(), foundation::toHex(token.bytes()),
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
         if (!fields) {
             co_return foundation::fail(
                 foundation::ErrorCode::AuthenticationFailed,
@@ -121,9 +138,10 @@ asio::awaitable<foundation::Result<std::optional<session::Session>>>
 CoroutinePostgresSessionRepository::find(session::SessionId id)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto fields = co_await m_impl->sql.find(
-            lease.connection(), std::string{id.value()}, m_impl->queryTimeout);
+            lease.connection(), std::string{id.value()}, remaining(deadline));
         if (!fields) co_return std::optional<session::Session>{};
         auto restored = PostgresSessionDomainAdapter::restore(*fields);
         if (!restored) co_return foundation::fail(restored.error());
@@ -158,12 +176,13 @@ CoroutinePostgresSessionRepository::replace(
             "The replacement session must be new and active.");
     }
     try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
         auto row = captureSessionRecord(value);
-        auto lease = co_await m_impl->pool.acquire();
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const bool replaced = co_await m_impl->sql.replace(
             lease.connection(), std::move(row), std::string{previousId.value()},
             foundation::toHex(previousDigest.bytes()),
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
         if (!replaced) {
             co_return foundation::fail(
                 foundation::ErrorCode::FailedPrecondition,
@@ -183,12 +202,13 @@ CoroutinePostgresSessionRepository::rotate(
     session::TokenDigest replacement, foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const bool changed = co_await m_impl->sql.rotateToken(
             lease.connection(), std::string{id.value()},
             foundation::toHex(expected.bytes()),
             foundation::toHex(replacement.bytes()),
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
         if (!changed) {
             co_return foundation::fail(
                 foundation::ErrorCode::AuthenticationFailed,
@@ -207,10 +227,11 @@ CoroutinePostgresSessionRepository::revoke(
     session::SessionId id, foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const auto status = co_await m_impl->sql.revoke(
             lease.connection(), std::string{id.value()},
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
         switch (status) {
         case async_detail::AsyncSessionSql::RevokeStatus::Revoked:
         case async_detail::AsyncSessionSql::RevokeStatus::AlreadyRevoked:
@@ -239,11 +260,12 @@ CoroutinePostgresSessionRepository::revokeOwned(
     foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const auto status = co_await m_impl->sql.revokeOwned(
             lease.connection(), std::string{identity.value()},
             std::string{id.value()}, now.time_since_epoch().count(),
-            m_impl->queryTimeout);
+            remaining(deadline));
         switch (status) {
         case async_detail::AsyncSessionSql::RevokeStatus::Revoked:
         case async_detail::AsyncSessionSql::RevokeStatus::AlreadyRevoked:
@@ -271,10 +293,11 @@ CoroutinePostgresSessionRepository::revokeAll(
     identity::core::IdentityId identity, foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         co_return co_await m_impl->sql.revokeAll(
             lease.connection(), std::string{identity.value()},
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
     } catch (const std::exception&) {
         co_return foundation::fail(
             foundation::ErrorCode::Unavailable,
@@ -286,10 +309,11 @@ asio::awaitable<foundation::Result<std::vector<session::Session>>>
 CoroutinePostgresSessionRepository::list(identity::core::IdentityId identity)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto rows = co_await m_impl->sql.list(
             lease.connection(), std::string{identity.value()},
-            m_impl->queryTimeout);
+            remaining(deadline));
         std::vector<session::Session> result;
         result.reserve(rows.size());
         for (const auto& fields : rows) {
@@ -309,10 +333,11 @@ asio::awaitable<foundation::Result<std::size_t>>
 CoroutinePostgresSessionRepository::purgeExpired(foundation::Instant now)
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         co_return co_await m_impl->sql.purgeExpired(
             lease.connection(), now.time_since_epoch().count(),
-            m_impl->queryTimeout);
+            remaining(deadline));
     } catch (const std::exception&) {
         co_return foundation::fail(
             foundation::ErrorCode::Unavailable,
@@ -324,9 +349,10 @@ asio::awaitable<foundation::Result<std::size_t>>
 CoroutinePostgresSessionRepository::size()
 {
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         co_return co_await m_impl->sql.size(
-            lease.connection(), m_impl->queryTimeout);
+            lease.connection(), remaining(deadline));
     } catch (const std::exception&) {
         co_return foundation::fail(
             foundation::ErrorCode::Unavailable,

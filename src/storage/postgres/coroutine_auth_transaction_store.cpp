@@ -25,6 +25,21 @@ namespace asio = boost::asio;
 namespace idp = identity::provider;
 
 namespace {
+using Clock = std::chrono::steady_clock;
+using Deadline = Clock::time_point;
+
+// Enforce one end-to-end budget through pool admission, reconnection,
+// session reset and all SQL statements in a single authentication operation.
+[[nodiscard]] std::chrono::milliseconds remaining(Deadline deadline)
+{
+    const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - Clock::now());
+    if (budget <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error{"Native authentication transaction deadline exceeded"};
+    }
+    return budget;
+}
+
 using Snapshot = async_detail::AsyncAuthenticationTransactionSql::Record;
 
 [[nodiscard]] Snapshot capture(const idp::AuthenticationTransaction& transaction)
@@ -107,9 +122,10 @@ CoroutinePostgresAuthenticationTransactionStore::beginAsync(
 {
     const auto captured = capture(transaction);
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         const bool inserted = co_await m_impl->sql.begin(
-            lease.connection(), captured, m_impl->queryTimeout);
+            lease.connection(), captured, remaining(deadline));
         if (!inserted) {
             co_return foundation::fail(
                 foundation::ErrorCode::AlreadyExists,
@@ -134,11 +150,12 @@ CoroutinePostgresAuthenticationTransactionStore::consumeAsync(
     const std::string nonceHex = foundation::toHex(nonceDigest.value());
     nonce = foundation::SecretString{};
     try {
-        auto lease = co_await m_impl->pool.acquire();
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
         auto consumed = co_await m_impl->sql.consume(
             lease.connection(), std::string{id.value()},
             nonceHex, foundation::toHex(binding),
-            now.time_since_epoch().count(), m_impl->queryTimeout);
+            now.time_since_epoch().count(), remaining(deadline));
         if (!consumed) {
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                 "The authentication transaction is unknown or already consumed.");

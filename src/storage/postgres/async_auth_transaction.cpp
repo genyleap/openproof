@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -137,11 +138,26 @@ boost::asio::awaitable<bool> AsyncAuthenticationTransactionSql::begin(
             "ROLLBACK", {}, remaining(deadline)));
         co_return false;
     }
-    for (const auto& [key, value] : row.metadata) {
+    if (!row.metadata.empty()) {
+        // One bounded, parameterized statement replaces up to 64 sequential
+        // metadata round trips. Keys and values are NEVER interpolated into
+        // SQL; only their generated placeholder indexes are appended.
+        std::string insert =
+            "INSERT INTO " + metadata + " (transaction_id,key,value) VALUES ";
+        std::vector<std::optional<std::string>> parameters;
+        parameters.reserve(row.metadata.size() * 3U);
+        for (auto& [key, value] : row.metadata) {
+            if (!parameters.empty()) insert.push_back(',');
+            const std::size_t index = parameters.size();
+            insert += "($" + std::to_string(index + 1U)
+                + ",$" + std::to_string(index + 2U)
+                + ",$" + std::to_string(index + 3U) + ")";
+            parameters.emplace_back(row.id);
+            parameters.emplace_back(key);
+            parameters.emplace_back(std::move(value));
+        }
         static_cast<void>(co_await connection.query(
-            "INSERT INTO " + metadata +
-            " (transaction_id,key,value) VALUES($1,$2,$3)",
-            {row.id, key, value}, remaining(deadline)));
+            std::move(insert), std::move(parameters), remaining(deadline)));
     }
     static_cast<void>(co_await connection.query(
         "COMMIT", {}, remaining(deadline)));

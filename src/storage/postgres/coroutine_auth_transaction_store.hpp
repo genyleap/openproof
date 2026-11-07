@@ -18,6 +18,8 @@ namespace openproof::storage::postgres {
 // authentication coordination. The legacy sync API fails closed; it MUST NOT
 // be used by synchronous HTTP routes. Own this object until all pending
 // coroutine frames complete and connect it only to a dedicated async stack.
+// The configured SQL deadline includes waiting for a lease, connection/reset
+// and the complete multi-statement transaction, without restarting clocks.
 class CoroutinePostgresAuthenticationTransactionStore final
     : public identity::provider::AuthenticationTransactionStore,
       public identity::provider::CoroutineAuthenticationTransactionStore {

@@ -169,6 +169,43 @@ const checked = segments.map(([name, relative]) => {
           > connectionFinish.indexOf("completeExchangeAsync("))
       issues.push({line:0,kind:"blocking native connection finalization",
         expression:"finishConnectionAsync before proof redemption"});
+    const nativeTransactions = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_auth_transaction_store.cpp"),"utf8");
+    const beginAt = nativeTransactions.indexOf(
+      "CoroutinePostgresAuthenticationTransactionStore::beginAsync(");
+    const consumeAt = nativeTransactions.indexOf(
+      "CoroutinePostgresAuthenticationTransactionStore::consumeAsync(");
+    const syncBeginAt = nativeTransactions.indexOf(
+      "CoroutinePostgresAuthenticationTransactionStore::begin(");
+    const beginNative = nativeTransactions.slice(beginAt,consumeAt);
+    const consumeNative = nativeTransactions.slice(consumeAt,syncBeginAt);
+    for (const [kind, method] of [
+        ["begin",beginNative],["consume",consumeNative]]) {
+      if(!/const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/.test(method)
+         || !/m_impl->pool\.acquire\(deadline\)/.test(method)
+         || !/remaining\(deadline\)/.test(method)
+         || /m_impl->pool\.acquire\(\)/.test(method))
+        issues.push({line:0,kind:"native authentication transaction "+kind+" restarts its SQL timeout after pool admission",
+          expression:"one absolute deadline across pool and atomic transaction"});
+    }
+    // A proof challenge can carry up to 64 metadata pairs. Inserting one
+    // SQL statement per pair burns the single request deadline on latency.
+    // Keep user strings in libpq parameters, never interpolate them into SQL.
+    const transactionSql = fs.readFileSync(
+      path.join(root,"src/storage/postgres/async_auth_transaction.cpp"),"utf8");
+    const transactionBegin = transactionSql.slice(
+      transactionSql.indexOf("AsyncAuthenticationTransactionSql::begin("),
+      transactionSql.indexOf("AsyncAuthenticationTransactionSql::consume("));
+    const batchStart = transactionBegin.indexOf("if (!row.metadata.empty())");
+    const batch = transactionBegin.slice(batchStart,transactionBegin.indexOf("co_return true;"));
+    if(batchStart < 0
+       || !/parameters\.reserve\(row\.metadata\.size\(\) \* 3U\)/.test(batch)
+       || !/parameters\.emplace_back\(key\)/.test(batch)
+       || !/parameters\.emplace_back\(std::move\(value\)\)/.test(batch)
+       || !/std::move\(insert\), std::move\(parameters\), remaining\(deadline\)/.test(batch)
+       || (batch.match(/\bco_await\b/g) || []).length !== 2)
+      issues.push({line:0,kind:"native authentication metadata still uses repeated SQL insert roundtrips",
+        expression:"one bounded parameterized multi-value INSERT before COMMIT"});
 
   }
   if(relative==="src/storage/postgres/coroutine_canonical_finalizer.cpp"){
@@ -242,6 +279,29 @@ const checked = segments.map(([name, relative]) => {
        || !/co_await\s+issueReplacing\s*\(/.test(source))
       issues.push({line:0,kind:"missing atomic native session replacement",
         expression:"issueReplacingAsync / co_await issueReplacing"});
+    // Session storage cannot restart its SQL budget after waiting on the pool.
+    // This catches a class of reactor saturation/response-time regressions
+    // without falsely approving the still-blocking legacy PostgreSQL SPI.
+    const repo = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_repository.cpp"),"utf8");
+    const methods = ["use","find","replace","rotate","revoke",
+      "revokeOwned","revokeAll","list","purgeExpired","size"];
+    const allBounded = methods.every((name) => {
+      const start = repo.indexOf("CoroutinePostgresSessionRepository::"+name+"(");
+      if(start < 0) return false;
+      const end = repo.indexOf("CoroutinePostgresSessionRepository::",start+30);
+      const method = repo.slice(start,end<0 ? undefined : end);
+      return /const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/.test(method)
+        && /m_impl->pool\.acquire\(deadline\)/.test(method)
+        && /remaining\(deadline\)/.test(method)
+        && !/m_impl->pool\.acquire\(\)/.test(method);
+    });
+    if(!allBounded
+        || !/pool\.acquire\(deadline\)/.test(repo.slice(
+             repo.indexOf("insertCapturedSession("),
+             repo.indexOf("class CoroutinePostgresSessionRepository::Impl"))))
+      issues.push({line:0,kind:"native session operations restart their budget after pool acquisition",
+        expression:"shared monotonic deadline for pool, DISCARD ALL and SQL"});
   }
   if(relative==="src/storage/postgres/coroutine_session_listener.cpp"){
     if(!/if\s*\(\s*!allowPartialNativeFallback\s*&&\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))

@@ -5,6 +5,7 @@
 #include "async_connection.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <future>
 #include <optional>
@@ -122,6 +123,46 @@ asio::awaitable<void> invalidMetadataNeverOpensTransaction(
         rejected = true;
     }
     reusable = conn->reusable();
+}
+
+asio::awaitable<void> maximumMetadataUsesOneAtomicInsert(
+    std::string dsn, bool& persisted, bool& complete, bool& reusable)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(dsn), 5s);
+    co_await setup(*conn);
+    pg::AsyncAuthenticationTransactionSql sql{
+        pg::AsyncAuthenticationTransactionSql::Table::TemporaryTest};
+    auto row = record("batch-64");
+    row.metadata.clear();
+    for (std::size_t index = 0U; index < 64U; ++index) {
+        row.metadata.emplace(
+            "key-" + std::to_string(index), std::string(8192U, 'x'));
+    }
+    persisted = co_await sql.begin(*conn, std::move(row), 5s);
+    auto consumed = co_await sql.consume(
+        *conn, "batch-64", kNonce, kBinding, 1500, 5s);
+    complete = consumed.has_value() && consumed->state == 1U
+        && consumed->metadata.size() == 64U
+        && consumed->metadata.at("key-0").size() == 8192U
+        && consumed->metadata.at("key-63").size() == 8192U;
+    reusable = conn->reusable();
+}
+
+TEST(AsyncAuthenticationTransactionSqlTest, BatchedMaximumMetadataIsAtomicOnDisposablePg)
+{
+    const char* dsn = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (dsn == nullptr || *dsn == '\0')
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    asio::io_context io;
+    bool persisted = false, complete = false, reusable = false;
+    auto future = asio::co_spawn(io,
+        maximumMetadataUsesOneAtomicInsert(
+            dsn, persisted, complete, reusable), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(persisted);
+    EXPECT_TRUE(complete);
+    EXPECT_TRUE(reusable);
 }
 
 TEST(AsyncAuthenticationTransactionSqlTest, InvalidMetadataIsRejectedBeforePgBegin)
