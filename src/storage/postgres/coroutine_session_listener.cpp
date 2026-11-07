@@ -13,35 +13,25 @@ namespace openproof::storage::postgres {
 namespace asio = boost::asio;
 
 CoroutineSessionListenerAdapter::CoroutineSessionListenerAdapter(
-    CoroutineSessionHttpHandler& handler,
-    gateway::http::CoroutineHttpHandler& fallback,
-    bool allowCompatibilityFallback)
-    : m_handler(&handler), m_fallback(&fallback),
-      m_allowCompatibilityFallback(allowCompatibilityFallback) {}
+    CoroutineSessionHttpHandler& handler)
+    : m_handler(&handler) {}
 
 bool CoroutineSessionListenerAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
-    // Without explicit compatibility opt-in, retain fail-closed semantics:
-    // even a disabled downstream route is handled by the native rejection
-    // guard rather than silently invoking a synchronous repository.
-    if (!m_allowCompatibilityFallback
-        || CoroutineSessionHttpHandler::isSessionRoute(request.path())) {
-        return true;
-    }
-    return m_fallback->nativeEnabledFor(request);
+    // Force the listener down the coroutine entry even when a downstream
+    // dependency's native capability is unavailable. The application-level
+    // guard returns a sanitized 503; a disabled route must never fall back
+    // to the Beast listener's bounded synchronous handler pool.
+    (void)request;
+    return true;
 }
 
 gateway::HttpResponse CoroutineSessionListenerAdapter::handle(
     gateway::HttpRequest request)
 {
-    // Only an operator-explicit compatibility stack may delegate ordinary
-    // non-session routes to the bounded handler pool. Session mutations
-    // always remain native and can never fall through to legacy SQL.
-    if (m_allowCompatibilityFallback
-        && !CoroutineSessionHttpHandler::isSessionRoute(request.path())) {
-        return m_fallback->handle(std::move(request));
-    }
+    // Never dispatch through a synchronous compatibility handler: not for
+    // unknown paths, temporarily disabled providers, or session mutations.
     gateway::HttpResponse rejected{
         foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
         gateway::Headers{{"content-type", "application/json"}},
@@ -63,7 +53,7 @@ CoroutineSessionListenerStack::CoroutineSessionListenerStack(
     CoroutinePostgresSessionService& sessions,
     gateway::TokenBucketRateLimiter& limiter,
     gateway::http::CoroutineHttpHandler& fallback,
-    bool allowCompatibilityFallback)
+    bool allowPartialNativeFallback)
     : m_application(
           sessions, limiter,
           [&fallback](gateway::HttpRequest request)
@@ -84,12 +74,11 @@ CoroutineSessionListenerStack::CoroutineSessionListenerStack(
               }
               co_return co_await fallback.handleAsync(std::move(request));
           }),
-      m_network(m_application, fallback, allowCompatibilityFallback)
+      m_network(m_application)
 {
-    // Keep the original fail-closed composition by default; only a caller
-    // explicitly choosing a hybrid listener may provide a handler without
-    // whole-handler native readiness.
-    if (!allowCompatibilityFallback && !fallback.nativeEnabled()) {
+    // Partial-native composition is permitted only by explicit opt-in, but
+    // it never authorizes synchronous compatibility dispatch.
+    if (!allowPartialNativeFallback && !fallback.nativeEnabled()) {
         throw std::invalid_argument{
             "The coroutine session listener requires an enabled async fallback"};
     }

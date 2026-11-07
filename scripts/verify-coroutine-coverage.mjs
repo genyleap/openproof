@@ -244,22 +244,30 @@ const checked = segments.map(([name, relative]) => {
         expression:"issueReplacingAsync / co_await issueReplacing"});
   }
   if(relative==="src/storage/postgres/coroutine_session_listener.cpp"){
-    if(!/if\s*\(\s*!allowCompatibilityFallback\s*&&\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
-      issues.push({line:0,kind:"coroutine session listener accepts disabled native fallback without opt-in",
-        expression:"!allowCompatibilityFallback && !fallback.nativeEnabled()"});
+    if(!/if\s*\(\s*!allowPartialNativeFallback\s*&&\s*!fallback\.nativeEnabled\s*\(\s*\)\s*\)/.test(source))
+      issues.push({line:0,kind:"coroutine session listener accepts disabled native fallback without explicit partial-native opt-in",
+        expression:"!allowPartialNativeFallback && !fallback.nativeEnabled()"});
     if(!/throw\s+std::invalid_argument/.test(source))
       issues.push({line:0,kind:"listener composition must reject inactive fallback",
         expression:"throw std::invalid_argument"});
     if(!/\!fallback\.nativeEnabledFor\s*\(\s*request\s*\)/.test(source))
       issues.push({line:0,kind:"coroutine listener ignores per-request native fallback capability",
         expression:"!fallback.nativeEnabledFor(request)"});
-    if(!/m_allowCompatibilityFallback\s*&&\s*!CoroutineSessionHttpHandler::isSessionRoute\s*\(\s*request\.path\s*\(\s*\)\s*\)/.test(source)
-       || !/return\s+m_fallback->handle\s*\(\s*std::move\s*\(request\)\s*\)/.test(source))
-      issues.push({line:0,kind:"hybrid listener lacks explicit bounded legacy dispatch",
-        expression:"opt-in non-session fallback on handler pool"});
-    if(!/m_network\s*\(\s*m_application\s*,\s*fallback\s*,\s*allowCompatibilityFallback\s*\)/.test(source))
-      issues.push({line:0,kind:"listener does not propagate explicit compatibility opt-in",
-        expression:"m_network(m_application, fallback, allowCompatibilityFallback)"});
+    const nativeGuard = executable.slice(
+      executable.indexOf("CoroutineSessionListenerAdapter::nativeEnabledFor("),
+      executable.indexOf("CoroutineSessionListenerAdapter::handle("));
+    const syncEntry = executable.slice(
+      executable.indexOf("CoroutineSessionListenerAdapter::handle("),
+      executable.indexOf("CoroutineSessionListenerAdapter::handleAsync("));
+    if (!/return\s+true\s*;/.test(nativeGuard)
+        || /m_fallback|allowCompatibilityFallback|m_allowCompatibilityFallback/.test(nativeGuard)
+        || !/foundation::ErrorCode::Unavailable/.test(syncEntry)
+        || /(?:m_fallback|fallback)\s*(?:->|\.)\s*handle\s*\(/.test(syncEntry))
+      issues.push({line:0,kind:"native listener can enter blocking compatibility dispatch",
+        expression:"nativeEnabledFor always true; sync handle fails closed"});
+    if(!/m_network\s*\(\s*m_application\s*\)/.test(source))
+      issues.push({line:0,kind:"native listener is not composed without a synchronous delegate",
+        expression:"m_network(m_application)"});
     const sessionRoutes = fs.readFileSync(
       path.join(root,"src/storage/postgres/coroutine_session_http.cpp"),"utf8");
     const sessionRoutePredicate = sessionRoutes.slice(
@@ -270,12 +278,12 @@ const checked = segments.map(([name, relative]) => {
         issues.push({line:0,kind:"native session mutation may reach legacy compatibility",
           expression:route});
     }
-    // Hybrid dispatch is useful to stage modules without breaking legacy
-    // routes, but occupying a bounded worker is still synchronous work.
-    // Full-native acceptance must never treat this adapter as completed.
-    if(/\bm_fallback->handle\s*\(/.test(executable))
-      issues.push({line:0,kind:"hybrid session listener still permits synchronous compatibility work",
-        expression:"m_fallback->handle(...)"});
+    // Partial-native composition cannot bypass the awaitable entry for any
+    // route, including unknown routes and provider capability revocation.
+    if(/\bm_fallback->handle\s*\(/.test(executable)
+       || /\ballowCompatibilityFallback\b/.test(executable))
+      issues.push({line:0,kind:"coroutine listener still exposes synchronous compatibility work",
+        expression:"no blocking fallback and no compatibility opt-in"});
     if(!/co_return\s+co_await\s+fallback\.handleAsync\s*\(/.test(source))
       issues.push({line:0,kind:"listener fallback must use native awaitable dispatch",
         expression:"co_await fallback.handleAsync"});

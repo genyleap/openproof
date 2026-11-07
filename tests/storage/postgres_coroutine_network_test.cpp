@@ -92,8 +92,21 @@ struct NativeFallback final : gwHttp::CoroutineHttpHandler {
         return gw::HttpResponse{503, {}, "blocking fallback must not execute"};
     }
     [[nodiscard]] asio::awaitable<gw::HttpResponse>
-    handleAsync(gw::HttpRequest) override
+    handleAsync(gw::HttpRequest request) override
     {
+        // A real downstream native handler must also reject capabilities
+        // revoked after its caller's final readiness check. The listener
+        // guarantees only that it never selects a synchronous fallback.
+        if (!nativeEnabledFor(request)) {
+            gw::HttpResponse rejected{
+                fnd::errorHttpStatus(fnd::ErrorCode::Unavailable),
+                gw::Headers{{"content-type", "application/json"}},
+                fnd::toClientJson(
+                    fnd::Error{fnd::ErrorCode::Unavailable},
+                    request.correlation().value())};
+            rejected.setHeader("cache-control", "no-store");
+            co_return rejected;
+        }
         ++(*observed);
         if (throwAfterSuspend.load()) {
             // Exercise the post-suspension exception boundary on real TCP.
@@ -184,7 +197,7 @@ TEST(PostgresCoroutineNetworkTest, DisabledRequestSpecificFallbackFailsClosed)
     EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 }
 
-TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
+TEST(PostgresCoroutineNetworkTest, ExplicitPartialNativeRefusesBlockingCompatibility)
 {
     Fixture f;
     f.fallback.denySelectedRoute.store(true, std::memory_order_release);
@@ -198,8 +211,9 @@ TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
     const auto legacy = send(
         listener.boundPort(), wire::verb::get, "/disabled/native");
     EXPECT_EQ(legacy.result_int(), 503);
-    EXPECT_EQ(legacy.body(), "blocking fallback must not execute");
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_NE(legacy.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(legacy.base()[wire::field::cache_control], "no-store");
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
     EXPECT_EQ(f.forwarded.load(), 0);
 
     const auto native = send(
@@ -207,14 +221,14 @@ TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
     EXPECT_EQ(native.result_int(), 209);
     EXPECT_EQ(native.body(), "async-route");
     EXPECT_EQ(f.forwarded.load(), 1);
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 
-    // Even an explicitly hybrid listener may never send a native session
+    // Even explicitly partial-native composition never sends a session
     // mutation to the synchronous compatibility fallback.
     const auto rotate = send(
         listener.boundPort(), wire::verb::post, "/auth/session/rotate");
     EXPECT_EQ(rotate.result_int(), 401);
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 
     for (const std::string_view route : {"/auth/logout", "/auth/logout-all"}) {
         const auto logout = send(
@@ -224,12 +238,12 @@ TEST(PostgresCoroutineNetworkTest, ExplicitHybridCompatibilityRoutesSafely)
         const std::string_view cookie{header.data(), header.size()};
         EXPECT_NE(cookie.find("__Host-openproof-session="),
                   std::string_view::npos);
-        EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+        EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
     }
     listener.stop();
 }
 
-TEST(PostgresCoroutineNetworkTest, ExplicitCompatibilityCanComposePartialFallback)
+TEST(PostgresCoroutineNetworkTest, ExplicitPartialNativeCanComposeDisabledGlobalFallback)
 {
     Fixture f;
     f.fallback.enabled.store(false, std::memory_order_release);
@@ -242,16 +256,16 @@ TEST(PostgresCoroutineNetworkTest, ExplicitCompatibilityCanComposePartialFallbac
     const auto legacy = send(
         listener.boundPort(), wire::verb::get, "/other/api");
     EXPECT_EQ(legacy.result_int(), 503);
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
     EXPECT_EQ(f.forwarded.load(), 0);
     const auto rotate = send(
         listener.boundPort(), wire::verb::post, "/auth/session/rotate");
     EXPECT_EQ(rotate.result_int(), 401);
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
     listener.stop();
 }
 
-TEST(PostgresCoroutineNetworkTest, HybridCanRunSelectedNativeRouteWithGlobalNativeDisabled)
+TEST(PostgresCoroutineNetworkTest, PartialNativeRunsSelectedRouteWithGlobalNativeDisabled)
 {
     Fixture f;
     f.fallback.enabled.store(false, std::memory_order_release);
@@ -274,9 +288,10 @@ TEST(PostgresCoroutineNetworkTest, HybridCanRunSelectedNativeRouteWithGlobalNati
     const auto legacy = send(
         listener.boundPort(), wire::verb::get, "/legacy");
     EXPECT_EQ(legacy.result_int(), 503);
-    EXPECT_EQ(legacy.body(), "blocking fallback must not execute");
+    EXPECT_NE(legacy.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(legacy.base()[wire::field::cache_control], "no-store");
     EXPECT_EQ(f.forwarded.load(), 1);
-    EXPECT_EQ(f.fallback.blockingCalls.load(), 1);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
     listener.stop();
 }
 
@@ -427,7 +442,19 @@ TEST(PostgresCoroutineNetworkTest, SynchronousCompatibilityEntryFailsClosed)
     ASSERT_TRUE(original);
     const auto denied = f.stack.handler().handle(std::move(original).value());
     EXPECT_EQ(denied.status(), 503);
+    EXPECT_EQ(denied.headers().at("cache-control"), "no-store");
     EXPECT_FALSE(denied.headers().contains("set-cookie"));
+
+    auto unsupported = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/legacy", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"listener-sync-unsupported"});
+    ASSERT_TRUE(unsupported);
+    const auto rejected = f.stack.handler().handle(std::move(unsupported).value());
+    EXPECT_EQ(rejected.status(), 503);
+    EXPECT_EQ(rejected.headers().at("cache-control"), "no-store");
+    EXPECT_NE(rejected.body().find("UNAVAILABLE"), std::string::npos);
+    EXPECT_EQ(f.forwarded.load(), 0);
+    EXPECT_EQ(f.fallback.blockingCalls.load(), 0);
 }
 
 } // namespace

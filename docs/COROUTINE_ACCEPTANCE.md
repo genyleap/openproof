@@ -2725,3 +2725,40 @@ regression. The 256-row ceiling is intentionally duplicated at the independent
 transport and SQL boundaries and is verified by the strict migration gate.
 A configurable paginated domain contract would be preferable for a subsequent
 full migration, but must not silently alter the existing endpoint response.
+
+#### Fully native coroutine session-listener routing (2026-11-07)
+
+The previously operator-opted hybrid session listener could dispatch a
+non-session route to the synchronous handler pool through
+m_fallback->handle(). This is incompatible with an end-to-end coroutine
+listener, even though native session mutation routes never used that path.
+
+The isolated CoroutineSessionListenerAdapter now ALWAYS selects the native
+Beast coroutine entry and its synchronous handle() always fails closed with
+a sanitized no-store 503. The listener no longer stores or invokes a
+synchronous fallback. CoroutineSessionListenerStack retains an explicit
+partial-native composition option, now named allowPartialNativeFallback,
+which only relaxes the global nativeEnabled() constructor prerequisite;
+it never opts into blocking dispatch. For each non-session request the
+application coroutine rechecks fallback.nativeEnabledFor(request) and
+returns sanitized 503 when unavailable. The downstream coroutine remains
+responsible for rechecking its own capability at entry, as exercised by
+the test double when capability changes between checks. Native session
+rotation and anonymous logout continue through the dedicated coroutine
+handler regardless of non-session fallback readiness.
+
+Updated socket-level GTests describe full-native and partial-native
+routing, deny disabled non-session routes without touching the blocking
+mock, verify that only request-ready routes dispatch, and check direct
+synchronous entry rejection for both native mutation and unknown paths.
+The source-level contract and strict migration gate explicitly forbid
+blocking compatibility dispatch. The static gate reports 19 blockers
+instead of 20, reflecting this one real eliminated synchronous path.
+
+The network C++ test executable was NOT validated in this checkpoint:
+its isolated build target requires a 364-step dependency rebuild in the
+current worktree; that resource-heavy build was deliberately stopped
+after 63 steps to avoid replicating a known host build outage. The
+nonblocking implementation is not an authorization to merge or deploy.
+The earlier November 3 hybrid-listener notes are historical and
+superseded by this design in this development branch.
