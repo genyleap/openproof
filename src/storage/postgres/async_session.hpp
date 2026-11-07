@@ -129,6 +129,14 @@ public:
         AsyncConnection& connection, std::string identityId,
         std::chrono::milliseconds deadline);
 
+    // The account API enumerates ACTIVE, unexpired sessions, not historical
+    // revoked/expired rows. Filter in SQL BEFORE the 256+1 cardinality bound:
+    // years of revoked sessions must not lock an identity out of its active
+    // session list. Preserve the all-state list() for audit/legacy callers.
+    [[nodiscard]] boost::asio::awaitable<std::vector<SessionFields>> listActive(
+        AsyncConnection& connection, std::string identityId,
+        std::int64_t nowMilliseconds, std::chrono::milliseconds deadline);
+
     [[nodiscard]] boost::asio::awaitable<std::size_t> purgeExpired(
         AsyncConnection& connection, std::int64_t nowMilliseconds,
         std::chrono::milliseconds deadline);

@@ -84,6 +84,12 @@ public:
         foundation::Result<std::vector<session::Session>>>
     list(identity::core::IdentityId identity);
 
+    // Native account listing must not count an identity's inactive history
+    // against its bounded ACTIVE session response.
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<std::vector<session::Session>>>
+    listActive(identity::core::IdentityId identity, foundation::Instant now);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
     purgeExpired(foundation::Instant now);
 

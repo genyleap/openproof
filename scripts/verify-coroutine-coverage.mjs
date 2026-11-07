@@ -285,7 +285,7 @@ const checked = segments.map(([name, relative]) => {
     const repo = fs.readFileSync(
       path.join(root,"src/storage/postgres/coroutine_session_repository.cpp"),"utf8");
     const methods = ["use","find","replace","rotate","revoke",
-      "revokeOwned","revokeAll","list","purgeExpired","size"];
+      "revokeOwned","revokeAll","list","listActive","purgeExpired","size"];
     const allBounded = methods.every((name) => {
       const start = repo.indexOf("CoroutinePostgresSessionRepository::"+name+"(");
       if(start < 0) return false;
@@ -429,6 +429,9 @@ const checked = segments.map(([name, relative]) => {
       path.join(root,"src/storage/postgres/async_session.hpp"),"utf8");
     const listMethod = source.slice(
       source.indexOf("AsyncSessionSql::list("),
+      source.indexOf("AsyncSessionSql::listActive("));
+    const activeListMethod = source.slice(
+      source.indexOf("AsyncSessionSql::listActive("),
       source.indexOf("AsyncSessionSql::purgeExpired("));
     if (!/kMaximumListedSessions\s*=\s*256U/.test(sessionHeader)
         || !/LIMIT\s*"/.test(listMethod)
@@ -438,6 +441,26 @@ const checked = segments.map(([name, relative]) => {
         || !/WHERE identity_id=\$1/.test(listMethod))
       issues.push({line:0,kind:"native session list lacks scoped SQL bound and overflow rejection",
         expression:"identity_id parameter + LIMIT max+1 + reject overflow"});
+    const sessionService = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_service.cpp"),"utf8");
+    const sessionRepository = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_repository.cpp"),"utf8");
+    const nativeActive = sessionRepository.slice(
+      sessionRepository.indexOf("CoroutinePostgresSessionRepository::listActive("),
+      sessionRepository.indexOf("CoroutinePostgresSessionRepository::purgeExpired("));
+    if (!/WHERE identity_id=\$1 AND state=0/.test(activeListMethod)
+        || !/absolute_expires_at_ms>\$2::bigint/.test(activeListMethod)
+        || !/last_seen_at_ms\+idle_timeout_ms>\$2::bigint/.test(activeListMethod)
+        || !/ORDER BY last_seen_at_ms DESC, id ASC LIMIT/.test(activeListMethod)
+        || !/kMaximumListedSessions \+ 1U/.test(activeListMethod)
+        || !/rows\.rows\.size\(\) > kMaximumListedSessions/.test(activeListMethod)
+        || !/throw std::length_error/.test(activeListMethod)
+        || !/m_impl->sql\.listActive\(/.test(nativeActive)
+        || !/restored->identity\(\) != identity/.test(nativeActive)
+        || !/restored->isExpiredAt\(now\)/.test(nativeActive)
+        || !/repo\.listActive\(std::move\(identity\), now\)/.test(sessionService))
+      issues.push({line:0,kind:"native account session listing counts revoked/expired history or bypasses scoped active SQL",
+        expression:"active+unexpired identity predicate before SQL LIMIT, repository check and service dispatch"});
     // Concurrency can reorder requests after they capture timestamps. Both
     // native and compatibility SQL must preserve a monotonic idle clock.
     const legacySessions = fs.readFileSync(

@@ -2889,3 +2889,49 @@ with 19 real blocking findings. No production database, schema or service
 was modified. Real database integration, C++ compilation for the metadata
 batch and TCP listener regressions, and matched E2E benchmarking remain
 mandatory before this development branch can be merged or deployed.
+
+#### Native active-session enumeration excludes historical rows (2026-11-07)
+
+Audit identified a correctness regression in the earlier 256-row SQL list
+bound: the account HTTP service only displays active/unexpired sessions, but
+the native repository first queried all historical sessions with LIMIT 257.
+An identity with hundreds of revoked or expired sessions could therefore
+receive a sanitized 503 even when only one active session remained, while
+the corresponding legacy service could still enumerate it.
+
+A separate AsyncSessionSql::listActive now restricts its parameterized SQL
+to the authenticated identity, state=0, unexpired absolute lifetime and
+unexpired idle lifetime *before* deterministic ordering and LIMIT 257.
+The original all-state list remains unchanged for callers needing historical
+records and continues to reject 257-row overflow rather than returning a
+misleading partial audit result. CoroutinePostgresSessionRepository::listActive
+keeps the operation-wide steady-clock deadline and independently checks
+identity, state and expiration for every restored row before returning.
+CoroutinePostgresSessionService::list uses only that scoped method and
+preserves an in-memory expiration guard. Equal activity timestamps now have
+a stable session-ID tie breaker. The account HTTP JSON guard still rejects
+responses over 256 sessions.
+
+Disposable PostgreSQL regression HistoricalSessionsCannotEvictActiveListing
+loads 300 revoked and 300 expired sessions, verifies that a single current
+session remains visible, then checks that exactly 256 active records succeed
+and 257 fail closed. It also checks foreign identity isolation, inclusive idle
+expiration and connection reuse. The source contract
+scripts/test-native-active-session-enumeration.mjs and strict coroutine gate
+verify that the active filter is applied at SQL level before the LIMIT,
+rather than merely filtering the 257 rows after transfer. These source
+tests do not substitute for actually executing PostgreSQL integration.
+
+Existing production index sessions_by_identity_state already supports the
+state-filtered lookup. No migration or production SQL mutation is required.
+
+Build scope at this checkpoint: the low-priority CMake target
+openproof_postgres_async_tests compiled the updated async_session.cpp
+translation unit successfully, then began rebuilding the prior checkpoint's
+async_auth_transaction.cpp dependency and stalled under shared-host load.
+It was intentionally SIGTERM-stopped to avoid another prolonged build.
+Consequently this checkpoint does NOT claim compilation of the new
+CoroutinePostgresSessionRepository::listActive or the newly added native
+GTest, and does NOT claim PostgreSQL-backed execution. The native full
+repository, network-loopback and disposable database acceptance gates
+remain open even though the source-contract suite passes.

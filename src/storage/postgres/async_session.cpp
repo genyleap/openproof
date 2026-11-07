@@ -460,6 +460,38 @@ AsyncSessionSql::list(AsyncConnection& connection, std::string identityId,
     co_return std::move(rows.rows);
 }
 
+asio::awaitable<std::vector<AsyncSessionSql::SessionFields>>
+AsyncSessionSql::listActive(
+    AsyncConnection& connection, std::string identityId,
+    std::int64_t nowMilliseconds, std::chrono::milliseconds deadline)
+{
+    if (!validId(identityId) || nowMilliseconds < 0) {
+        throw std::invalid_argument{"Invalid active session list parameters"};
+    }
+    // The WHERE predicates precede LIMIT: revoked/expired history cannot
+    // displace current sessions or cause an unnecessary overflow. An extra
+    // matching row still causes fail-closed rejection, not silent truncation.
+    const std::string sql =
+        "SELECT " + std::string{kSessionFields} + " FROM "
+        + tableName(m_table)
+        + " WHERE identity_id=$1 AND state=0 "
+          "AND absolute_expires_at_ms>$2::bigint "
+          "AND last_seen_at_ms+idle_timeout_ms>$2::bigint "
+          "ORDER BY last_seen_at_ms DESC, id ASC LIMIT "
+        + std::to_string(kMaximumListedSessions + 1U);
+    auto rows = co_await connection.query(
+        sql, {std::move(identityId), std::to_string(nowMilliseconds)}, deadline);
+    if (rows.rows.size() > kMaximumListedSessions) {
+        throw std::length_error{"PostgreSQL active session list requires pagination"};
+    }
+    for (const auto& row : rows.rows) {
+        if (row.size() != 16U) {
+            throw std::runtime_error{"PostgreSQL active session list returned invalid shape"};
+        }
+    }
+    co_return std::move(rows.rows);
+}
+
 asio::awaitable<std::size_t> AsyncSessionSql::purgeExpired(
     AsyncConnection& connection, std::int64_t nowMilliseconds,
     std::chrono::milliseconds deadline)

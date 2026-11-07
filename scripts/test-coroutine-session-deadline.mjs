@@ -12,7 +12,7 @@ const raw = fs.readFileSync(path.join(root,
 const code = cppExecutableText(raw);
 const methods = [
   "use", "find", "replace", "rotate", "revoke", "revokeOwned",
-  "revokeAll", "list", "purgeExpired", "size",
+  "revokeAll", "list", "listActive", "purgeExpired", "size",
 ];
 
 test("native session repository enforces an operation-wide steady-clock deadline", () => {

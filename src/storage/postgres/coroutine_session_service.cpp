@@ -141,16 +141,20 @@ listActiveSessions(
     const foundation::ClockSource& clock,
     identity::core::IdentityId identity)
 {
-    auto values = co_await repo.list(std::move(identity));
-    if (!values) co_return foundation::fail(values.error());
     const auto now = clock.now();
+    auto values = co_await repo.listActive(std::move(identity), now);
+    if (!values) co_return foundation::fail(values.error());
+    // Defense in depth: if a new repository implementation ever returns a
+    // stale row, this layer will not present it as an active session.
     std::erase_if(values.value(), [now](const session::Session& value) {
         return value.state() != session::SessionState::Active
             || value.isExpiredAt(now);
     });
     std::ranges::sort(values.value(),
                       [](const session::Session& left, const session::Session& right) {
-        return left.lastSeenAt() > right.lastSeenAt();
+        if (left.lastSeenAt() != right.lastSeenAt())
+            return left.lastSeenAt() > right.lastSeenAt();
+        return left.id().value() < right.id().value();
     });
     co_return values;
 }

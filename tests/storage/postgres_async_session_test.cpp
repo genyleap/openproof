@@ -349,6 +349,90 @@ asio::awaitable<void> boundedSessionListingRejectsOverflow(
     overflowRejected = overflowRejected && present.has_value() && conn->reusable();
 }
 
+asio::awaitable<void> inactiveHistoryDoesNotExhaustActiveList(
+    std::string dsn, bool& historyExcluded, bool& boundEnforced,
+    bool& expiryApplied, bool& identityScoped, bool& connectionReusable)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(dsn), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+
+    // More historical rows than the whole-list ceiling must not deny a
+    // legitimate account its remaining active sessions. Revoked and expired
+    // sessions have distinct token digests and are never displayed.
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'revoked-' || n::text,identity_id,provider,assurance,factors,"
+        "phishing_resistant,1,"
+        "decode(md5('revoked-'||n::text)||md5('revoked-'||n::text),'hex'),"
+        "authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "absolute_expires_at_ms,idle_timeout_ms,1100,user_agent,remote_address "
+        "FROM pg_temp.sessions CROSS JOIN generate_series(1,300) n "
+        "WHERE id='test-session-1'", {}, 3s));
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'expired-' || n::text,identity_id,provider,assurance,factors,"
+        "phishing_resistant,0,"
+        "decode(md5('expired-'||n::text)||md5('expired-'||n::text),'hex'),"
+        "authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "1400,idle_timeout_ms,NULL,user_agent,remote_address "
+        "FROM pg_temp.sessions CROSS JOIN generate_series(1,300) n "
+        "WHERE id='test-session-1'", {}, 3s));
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'foreign-history','foreign-identity',provider,assurance,factors,"
+        "phishing_resistant,0,"
+        "decode(md5('foreign-history')||md5('foreign-history'),'hex'),"
+        "authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+        "absolute_expires_at_ms,idle_timeout_ms,NULL,user_agent,remote_address "
+        "FROM pg_temp.sessions WHERE id='test-session-1'", {}, 3s));
+
+    const auto active = co_await sql.listActive(*conn, "test-identity", 1500, 3s);
+    historyExcluded = active.size() == 1U && active[0][0] == "test-session-1"
+        && active[0][6] == "0";
+    identityScoped = historyExcluded;
+    auto historicalOverflow = false;
+    try {
+        static_cast<void>(co_await sql.list(*conn, "test-identity", 3s));
+    } catch (const std::length_error&) {
+        historicalOverflow = true;
+    }
+    historyExcluded = historyExcluded && historicalOverflow;
+
+    const auto addActive = [&conn](std::size_t begin, std::size_t end)
+        -> asio::awaitable<void> {
+        static_cast<void>(co_await conn->query(
+            "INSERT INTO pg_temp.sessions "
+            "SELECT 'active-' || n::text,identity_id,provider,assurance,factors,"
+            "phishing_resistant,0,"
+            "decode(md5('active-'||n::text)||md5('active-'||n::text),'hex'),"
+            "authenticated_at_ms,issued_at_ms,last_seen_at_ms,"
+            "absolute_expires_at_ms,idle_timeout_ms,NULL,user_agent,remote_address "
+            "FROM pg_temp.sessions CROSS JOIN generate_series($1::int,$2::int) n "
+            "WHERE id='test-session-1'",
+            {std::to_string(begin), std::to_string(end)}, 3s));
+    };
+    co_await addActive(1U, pg::AsyncSessionSql::kMaximumListedSessions - 1U);
+    const auto exact = co_await sql.listActive(*conn, "test-identity", 1500, 3s);
+    const auto again = co_await sql.listActive(*conn, "test-identity", 1500, 3s);
+    identityScoped = identityScoped && exact.size() == 256U && exact == again;
+    for (const auto& item : exact) {
+        identityScoped = identityScoped && item.size() == 16U
+            && item[1] == "test-identity" && item[6] == "0";
+    }
+    co_await addActive(pg::AsyncSessionSql::kMaximumListedSessions,
+                       pg::AsyncSessionSql::kMaximumListedSessions);
+    try {
+        static_cast<void>(
+            co_await sql.listActive(*conn, "test-identity", 1500, 3s));
+    } catch (const std::length_error&) {
+        boundEnforced = true;
+    }
+    const auto expired = co_await sql.listActive(*conn, "test-identity", 2000, 3s);
+    expiryApplied = expired.empty();
+    connectionReusable = conn->reusable();
+}
+
 asio::awaitable<void> atomicReplacement(
     std::string connectionString, bool& staleRejected, bool& replaced,
     bool& replayRejected, bool& unchangedOther)
@@ -654,6 +738,31 @@ TEST(PostgresAsyncSessionSqlTest, BoundedIdentityListingRejectsOverflow)
     EXPECT_TRUE(tenantIsolated);
     EXPECT_TRUE(deterministic);
     EXPECT_TRUE(overflowRejected);
+}
+
+TEST(PostgresAsyncSessionSqlTest, HistoricalSessionsCannotEvictActiveListing)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool historyExcluded = false, boundEnforced = false;
+    bool expiryApplied = false, identityScoped = false, reusable = false;
+    auto future = asio::co_spawn(io,
+        inactiveHistoryDoesNotExhaustActiveList(
+            uri, historyExcluded, boundEnforced, expiryApplied,
+            identityScoped, reusable), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(historyExcluded);
+    EXPECT_TRUE(boundEnforced);
+    EXPECT_TRUE(expiryApplied);
+    EXPECT_TRUE(identityScoped);
+    EXPECT_TRUE(reusable);
 }
 
 TEST(PostgresAsyncSessionSqlTest, CreateListAndPurgePreserveSessionBoundaries)

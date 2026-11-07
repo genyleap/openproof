@@ -329,6 +329,39 @@ CoroutinePostgresSessionRepository::list(identity::core::IdentityId identity)
     }
 }
 
+asio::awaitable<foundation::Result<std::vector<session::Session>>>
+CoroutinePostgresSessionRepository::listActive(
+    identity::core::IdentityId identity, foundation::Instant now)
+{
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        auto rows = co_await m_impl->sql.listActive(
+            lease.connection(), std::string{identity.value()},
+            now.time_since_epoch().count(), remaining(deadline));
+        std::vector<session::Session> result;
+        result.reserve(rows.size());
+        for (const auto& fields : rows) {
+            auto restored = PostgresSessionDomainAdapter::restore(fields);
+            if (!restored) co_return foundation::fail(restored.error());
+            // Fail closed if SQL changes its scope or active-state predicate.
+            if (restored->identity() != identity
+                || restored->state() != session::SessionState::Active
+                || restored->isExpiredAt(now)) {
+                co_return foundation::fail(
+                    foundation::ErrorCode::Unavailable,
+                    "An invalid active session row was returned.");
+            }
+            result.emplace_back(std::move(restored).value());
+        }
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(
+            foundation::ErrorCode::Unavailable,
+            "The active sessions could not be listed.");
+    }
+}
+
 asio::awaitable<foundation::Result<std::size_t>>
 CoroutinePostgresSessionRepository::purgeExpired(foundation::Instant now)
 {
