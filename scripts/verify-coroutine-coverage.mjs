@@ -340,7 +340,9 @@ const checked = segments.map(([name, relative]) => {
     const listing = executable.slice(
       executable.indexOf("CoroutineAccountSessionAdapter::sessionList("),
       executable.indexOf("CoroutineAccountSessionAdapter::sessionRevoke("));
-    if (!/std::ranges::any_of\s*\(\s*values\.value\s*\(/.test(listing)
+    if (!/kMaximumSessionResponseRows\s*=\s*256U/.test(executable)
+        || !/values->size\s*\(\s*\)\s*>\s*kMaximumSessionResponseRows/.test(listing)
+        || !/std::ranges::any_of\s*\(\s*values\.value\s*\(/.test(listing)
         || !/value\.identity\s*\(\s*\)\s*!=\s*current->identity\s*\(\s*\)/.test(listing)
         || listing.indexOf("value.identity()") > listing.indexOf("json::array sessions;"))
       issues.push({line:0,kind:"native account session list can disclose cross-identity rows",
@@ -353,6 +355,21 @@ const checked = segments.map(([name, relative]) => {
         expression:"nativeEnabled false; nativeEnabledFor per request"});
   }
   if(relative==="src/storage/postgres/async_session.cpp"){
+    // List cardinality is a security and latency bound: an authenticated
+    // identity can accumulate historical sessions indefinitely.
+    const sessionHeader = fs.readFileSync(
+      path.join(root,"src/storage/postgres/async_session.hpp"),"utf8");
+    const listMethod = source.slice(
+      source.indexOf("AsyncSessionSql::list("),
+      source.indexOf("AsyncSessionSql::purgeExpired("));
+    if (!/kMaximumListedSessions\s*=\s*256U/.test(sessionHeader)
+        || !/LIMIT\s*"/.test(listMethod)
+        || !/kMaximumListedSessions\s*\+\s*1U/.test(listMethod)
+        || !/rows\.rows\.size\s*\(\s*\)\s*>\s*kMaximumListedSessions/.test(listMethod)
+        || !/throw\s+std::length_error/.test(listMethod)
+        || !/WHERE identity_id=\$1/.test(listMethod))
+      issues.push({line:0,kind:"native session list lacks scoped SQL bound and overflow rejection",
+        expression:"identity_id parameter + LIMIT max+1 + reject overflow"});
     // Concurrency can reorder requests after they capture timestamps. Both
     // native and compatibility SQL must preserve a monotonic idle clock.
     const legacySessions = fs.readFileSync(

@@ -120,9 +120,11 @@ public:
         AsyncConnection& connection, std::string sessionId,
         std::chrono::milliseconds deadline);
 
-    // Returns all available rows, ordered by descending last-seen. The
-    // transport's explicit result bound rejects oversized sets; pagination
-    // must be added to the public session listing API prior to deployment.
+    // Bound identity-scoped listing *inside* PostgreSQL: never fetch an
+    // unbounded result into a coroutine, or silently return a truncated list.
+    // A full pagination contract is required before deployment to identities
+    // with more than this many historical sessions.
+    static constexpr std::size_t kMaximumListedSessions = 256U;
     [[nodiscard]] boost::asio::awaitable<std::vector<SessionFields>> list(
         AsyncConnection& connection, std::string identityId,
         std::chrono::milliseconds deadline);

@@ -2691,3 +2691,37 @@ command environment (pg_virtualenv failed to change user ID). No test was
 performed against the live PostgreSQL cluster or production credentials.
 The synchronous legacy module source was not rebuilt. No C++ E2E acceptance
 or release approval follows from this target-local checkpoint.
+
+#### Bounded identity-scoped native session listing (2026-11-07)
+
+The native PostgreSQL session list previously queried every historical session
+for a supplied identity with no SQL-side row ceiling. This allowed one account
+to induce unbounded result materialization and large JSON responses. The
+native AsyncSessionSql list now orders by last_seen_at_ms DESC, id ASC and
+requests at most 257 rows (256 + one overflow sentinel) directly from the
+database. At 257 rows it throws a controlled length_error before restoring
+or serializing a partial list. The coroutine repository maps that exception to
+the existing sanitized Unavailable response. Identity filtering remains a
+parameterized WHERE identity_id=$1, and the SQL session list does not export
+raw session tokens. The legacy synchronous repository was not changed.
+
+A dedicated disposable-PostgreSQL GTest covers the exact 256-row boundary,
+stable ordering, isolation from a different identity, 257-row fail-closed
+overflow and connection reuse. The source-contract suite
+scripts/test-native-bounded-session-list.mjs passed 5/5 checks, and the strict
+coroutine coverage gate now requires a bounded native query. The GTest requires
+OPENPROOF_TEST_POSTGRES and must not be interpreted as executed when skipped.
+Production pagination and a matching index for large historical session tables
+remain necessary before complete coroutine release acceptance. No deployment
+or schema migration was performed as part of this change.
+
+The provider-neutral CoroutineAccountSessionAdapter now applies the same
+256-row upper bound before it materializes the HTTP JSON array, even when the
+injected asynchronous storage callback is not PostgreSQL. It fails closed with
+the standard sanitized Unavailable response rather than leaking or truncating
+session metadata. Its independent C++ regression checks a malicious/buggy
+257-row callback; source-level contract checks require both the guard and
+regression. The 256-row ceiling is intentionally duplicated at the independent
+transport and SQL boundaries and is verified by the strict migration gate.
+A configurable paginated domain contract would be preferable for a subsequent
+full migration, but must not silently alter the existing endpoint response.

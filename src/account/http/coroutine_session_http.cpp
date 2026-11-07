@@ -17,6 +17,10 @@ namespace asio = boost::asio;
 namespace json = boost::json;
 namespace {
 
+// Match the native SQL list ceiling without introducing a PostgreSQL
+// dependency into the provider-neutral Account HTTP adapter.
+constexpr std::size_t kMaximumSessionResponseRows = 256U;
+
 [[nodiscard]] bool sessionListRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
@@ -170,7 +174,8 @@ CoroutineAccountSessionAdapter::sessionList(gateway::HttpRequest request)
     // Repository callbacks are replaceable by any asynchronous storage adapter.
     // Validate the entire result before serializing a single session: a faulty
     // tenant filter must never disclose another identity's session metadata.
-    if (std::ranges::any_of(values.value(), [&current](const session::Session& value) {
+    if (values->size() > kMaximumSessionResponseRows
+        || std::ranges::any_of(values.value(), [&current](const session::Session& value) {
             return value.identity() != current->identity();
         })) {
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);

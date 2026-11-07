@@ -296,6 +296,59 @@ asio::awaitable<void> sessionCreationListingAndPurge(
     rejectedBadInput = rejectedBadInput && final == 1U && conn->reusable();
 }
 
+asio::awaitable<void> boundedSessionListingRejectsOverflow(
+    std::string connectionString, bool& exactLimit,
+    bool& tenantIsolated, bool& deterministic, bool& overflowRejected)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(connectionString), 3s);
+    co_await createDisposableSessionTable(*conn);
+    pg::AsyncSessionSql sql{pg::AsyncSessionSql::Table::TemporaryTest};
+
+    // A foreign identity must not consume our bounded row budget.
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.sessions "
+        "SELECT 'foreign-session','foreign-identity',provider,assurance,factors,"
+        "phishing_resistant,0,decode($1,'hex'),authenticated_at_ms,"
+        "issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,"
+        "NULL,user_agent,remote_address "
+        "FROM pg_temp.sessions WHERE id='test-session-1'",
+        {kDigestB}, 3s));
+    const auto addStressSessions = [&conn](std::size_t from, std::size_t to)
+        -> asio::awaitable<void> {
+        static_cast<void>(co_await conn->query(
+            "INSERT INTO pg_temp.sessions "
+            "SELECT 'bounded-' || n::text,'test-identity',provider,assurance,"
+            "factors,phishing_resistant,0,"
+            "decode(md5(n::text) || md5(n::text),'hex'),authenticated_at_ms,"
+            "issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms,"
+            "NULL,user_agent,remote_address "
+            "FROM pg_temp.sessions CROSS JOIN generate_series($1::int,$2::int) n "
+            "WHERE id='test-session-1'",
+            {std::to_string(from), std::to_string(to)}, 3s));
+    };
+    co_await addStressSessions(1U, pg::AsyncSessionSql::kMaximumListedSessions - 1U);
+
+    const auto first = co_await sql.list(*conn, "test-identity", 3s);
+    const auto second = co_await sql.list(*conn, "test-identity", 3s);
+    exactLimit = first.size() == pg::AsyncSessionSql::kMaximumListedSessions;
+    deterministic = first == second;
+    tenantIsolated = exactLimit;
+    for (const auto& fields : first) {
+        tenantIsolated = tenantIsolated && fields.size() == 16U
+            && fields[1] == "test-identity" && fields[0] != "foreign-session";
+    }
+
+    co_await addStressSessions(pg::AsyncSessionSql::kMaximumListedSessions,
+                               pg::AsyncSessionSql::kMaximumListedSessions);
+    try {
+        static_cast<void>(co_await sql.list(*conn, "test-identity", 3s));
+    } catch (const std::length_error&) {
+        overflowRejected = true;
+    }
+    const auto present = co_await sql.find(*conn, "test-session-1", 3s);
+    overflowRejected = overflowRejected && present.has_value() && conn->reusable();
+}
+
 asio::awaitable<void> atomicReplacement(
     std::string connectionString, bool& staleRejected, bool& replaced,
     bool& replayRejected, bool& unchangedOther)
@@ -577,6 +630,30 @@ TEST(PostgresAsyncSessionSqlTest, BulkRevocationReturnsBoundedCountForThousands)
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(exactCount);
     EXPECT_TRUE(noCrossIdentity);
+}
+
+TEST(PostgresAsyncSessionSqlTest, BoundedIdentityListingRejectsOverflow)
+{
+    const char* uri = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!uri || !*uri) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI must provide an isolated PostgreSQL test database";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    }
+    asio::io_context io;
+    bool exactLimit = false, tenantIsolated = false;
+    bool deterministic = false, overflowRejected = false;
+    auto future = asio::co_spawn(io,
+        boundedSessionListingRejectsOverflow(
+            uri, exactLimit, tenantIsolated, deterministic, overflowRejected),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(exactLimit);
+    EXPECT_TRUE(tenantIsolated);
+    EXPECT_TRUE(deterministic);
+    EXPECT_TRUE(overflowRejected);
 }
 
 TEST(PostgresAsyncSessionSqlTest, CreateListAndPurgePreserveSessionBoundaries)

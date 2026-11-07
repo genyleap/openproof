@@ -116,6 +116,15 @@ struct Fixture final {
                   if (identity.value() != "identity-current") {
                       co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
                   }
+                  if (generatedSessionCount != 0U) {
+                      std::vector<sess::Session> rows;
+                      rows.reserve(generatedSessionCount);
+                      for (std::size_t index = 0; index < generatedSessionCount; ++index) {
+                          rows.emplace_back(validSession(
+                              "oversize-session-" + std::to_string(index)));
+                      }
+                      co_return rows;
+                  }
                   if (includeForeignSession) {
                       co_return std::vector<sess::Session>{
                           validSession("current"),
@@ -150,6 +159,7 @@ struct Fixture final {
     int authenticationCalls{};
     int listCalls{};
     bool includeForeignSession{};
+    std::size_t generatedSessionCount{};
     int revokeCalls{};
     std::string lastIdentity;
     std::string lastTarget;
@@ -213,6 +223,29 @@ TEST(AccountCoroutineSessionHttpTest, ForeignIdentityRowsFailClosedBeforeSeriali
     EXPECT_EQ(response.headers().at("cache-control"), "no-store");
     EXPECT_EQ(f.listCalls, 1);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, SessionListExactLimitAndOverflow)
+{
+    Fixture exact;
+    exact.generatedSessionCount = 256U;
+    const auto withinLimit = exact.run(request(
+        gw::HttpMethod::Get, "/account/sessions", "valid-token"));
+    ASSERT_EQ(withinLimit.status(), 200);
+    EXPECT_EQ(json::parse(withinLimit.body()).as_object()
+        .at("sessions").as_array().size(), 256U);
+    EXPECT_EQ(exact.listCalls, 1);
+    EXPECT_EQ(exact.legacy.invoked, 0);
+
+    Fixture overflow;
+    overflow.generatedSessionCount = 257U;
+    const auto denied = overflow.run(request(
+        gw::HttpMethod::Get, "/account/sessions", "valid-token"));
+    EXPECT_EQ(denied.status(), 503);
+    EXPECT_EQ(denied.body().find("oversize-session-"), std::string::npos);
+    EXPECT_EQ(denied.headers().at("cache-control"), "no-store");
+    EXPECT_EQ(overflow.listCalls, 1);
+    EXPECT_EQ(overflow.legacy.invoked, 0);
 }
 
 TEST(AccountCoroutineSessionHttpTest, MissingAndInvalidBearerNeverEnumerate)

@@ -443,8 +443,15 @@ AsyncSessionSql::list(AsyncConnection& connection, std::string identityId,
     const std::string sql =
         "SELECT " + std::string{kSessionFields} + " FROM "
         + tableName(m_table)
-        + " WHERE identity_id=$1 ORDER BY last_seen_at_ms DESC";
+        + " WHERE identity_id=$1 ORDER BY last_seen_at_ms DESC, id ASC LIMIT "
+        + std::to_string(kMaximumListedSessions + 1U);
     auto rows = co_await connection.query(sql, {std::move(identityId)}, deadline);
+    // Fetch one overflow row so callers cannot mistake a partial list for a
+    // complete audit/revocation view. Query-level LIMIT bounds transferred
+    // data before AsyncConnection copies any result columns into memory.
+    if (rows.rows.size() > kMaximumListedSessions) {
+        throw std::length_error{"PostgreSQL session list requires pagination"};
+    }
     for (const auto& row : rows.rows) {
         if (row.size() != 16U) {
             throw std::runtime_error{"PostgreSQL session list returned invalid shape"};

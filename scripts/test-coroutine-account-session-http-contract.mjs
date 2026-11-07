@@ -57,6 +57,19 @@ test("native Account listing checks all returned session identities before discl
   assert.match(cppTests, /validSession\("foreign-session-internal", "identity-foreign"\)/);
 });
 
+test("native Account list refuses oversized provider results before JSON", () => {
+  const begin = executable.indexOf("CoroutineAccountSessionAdapter::sessionList(");
+  const end = executable.indexOf("CoroutineAccountSessionAdapter::sessionRevoke(", begin);
+  const listing = executable.slice(begin, end);
+  assert.match(executable, /kMaximumSessionResponseRows\s*=\s*256U/);
+  assert.match(listing, /values->size\(\)\s*>\s*kMaximumSessionResponseRows/);
+  assert.ok(listing.indexOf("values->size()") < listing.indexOf("json::array sessions;"));
+  const cpp = read("tests/account/session_coroutine_http_test.cpp");
+  assert.match(cpp, /TEST\(AccountCoroutineSessionHttpTest, SessionListExactLimitAndOverflow\)/);
+  assert.match(cpp, /exact\.generatedSessionCount\s*=\s*256U/);
+  assert.match(cpp, /overflow\.generatedSessionCount\s*=\s*257U/);
+});
+
 test("storage-specific bridge binds real native PostgreSQL session operations", () => {
   const source = read("src/storage/postgres/coroutine_account_session_bridge.cpp");
   assert.match(source, /makeCoroutinePostgresAccountSessionAdapter\s*\(/);
