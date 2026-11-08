@@ -3057,3 +3057,28 @@ NOT_APPROVED with 18 blockers, including two reachable LDAP synchronous
 compatibility bind/search call sites. The GCC16 named-module build and
 transport compilation under the full release flags are in progress and
 must NOT be inferred from the Clang standalone test results.
+
+#### Gateway native TLS response completion (2026-11-08)
+
+The existing BeastProxyTransport::sendAsync shared a verified, bounded
+Beast/Asio coroutine transport with the HTTP proxy gateway, but waited
+for server TLS close_notify after completing the HTTP response read.
+As in the first-party native OAuth transport, a slow upstream could
+hold an otherwise finished authenticated response until the request's
+remaining total deadline expired. The one-shot HTTPS proxy now closes
+the socket immediately after exchangeAsync has completed the framed,
+header- and body-limited response; truncated bodies remain errors.
+TLS hostname verification, trust roots, deadline propagation, sanitized
+error paths, retries and request sealing are unchanged.
+
+tests/gateway/http_integration_test.cpp now includes a local ephemeral
+X509/Ed25519 TLS peer that writes a complete Content-Length response
+then deliberately holds the socket open for 750ms. The native Gateway
+coroutine proxy must return the complete response in less than 500ms,
+independent of peer close_notify. The strict release verifier rejects a
+regression to the post-response async_shutdown wait. Four new source
+contract checks passed. A full GCC16 named-module gateway C++ build and
+the new real network GTest have not been executed for this checkpoint
+because the recent named-module fingerprint invalidated ~87 module BMIs.
+They remain mandatory acceptance gates, separate from the already
+passing native provider TLS and LDAP test suites.

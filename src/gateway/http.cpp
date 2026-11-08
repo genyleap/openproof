@@ -663,12 +663,16 @@ public:
             ssl::stream_base::client, asio::redirect_error(asio::use_awaitable, error));
         if (error) co_return foundation::fail(networkError("verify TLS upstream", error));
         auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
-        beast::get_lowest_layer(stream).expires_at(deadline);
-        co_await stream.async_shutdown(asio::redirect_error(asio::use_awaitable, error));
-        if (error == asio::error::eof || error == ssl::error::stream_truncated) error.clear();
-        if (error && response.has_value()) {
-            co_return foundation::fail(networkError("shutdown TLS upstream", error));
-        }
+        // Beast completed and validated the entire HTTP message under an
+        // authenticated TLS session. Awaiting peer close_notify after this
+        // point lets a slow/half-closed upstream consume the gateway's retry
+        // deadline even when the response body is already complete.
+        // This transport is one-shot and explicitly uses Connection: close;
+        // discard the socket without reading/trusting additional peer bytes.
+        // Any truncated framing or oversized body was already rejected in
+        // exchangeAsync before reaching this point.
+        boost::system::error_code ignored;
+        beast::get_lowest_layer(stream).socket().close(ignored);
         co_return response;
     }
 

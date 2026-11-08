@@ -157,6 +157,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
 endif()
 target_link_libraries(openproof_gateway_http_tests PRIVATE
     openproof_gateway_http
+    OpenSSL::SSL
+    OpenSSL::Crypto
     openproof_gateway
     openproof_foundation
     openproof_session

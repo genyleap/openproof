@@ -91,6 +91,20 @@ const checked = segments.map(([name, relative]) => {
     if(!/class\s+CoroutineGatewayAdapter[\s\S]*?nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+true;\s*\}/.test(interfaceSource))
       issues.push({line:0,kind:"missing explicit native gateway opt-in",
         expression:"CoroutineGatewayAdapter::nativeEnabled() true"});
+    // A complete TLS response must not be held hostage by a peer that
+    // keeps its connection open after a fully-framed HTTPS message.
+    const nativeProxy = executable.slice(
+      executable.indexOf("asio::awaitable<foundation::Result<HttpResponse>> sendAsync("),
+      executable.indexOf("BeastProxyTransport::BeastProxyTransport("));
+    const tlsResponse = nativeProxy.slice(
+      nativeProxy.indexOf("auto response = co_await exchangeAsync(stream, endpoint, request, deadline);"));
+    if(!/beast::get_lowest_layer\(stream\)\.socket\(\)\.close\(ignored\)/.test(tlsResponse)
+       || /co_await\s+stream\.async_shutdown\s*\(/.test(tlsResponse)
+       || !/beastHttp::async_read\s*\(/.test(nativeProxy)
+       || !/parser\.body_limit\(/.test(nativeProxy)
+       || !/parser\.header_limit\(/.test(nativeProxy))
+      issues.push({line:0,kind:"native gateway TLS response waits for peer shutdown or skips bounded framing",
+        expression:"complete bounded response then close one-shot TLS socket"});
   }
   if([
     "src/providers/github/github.cpp",

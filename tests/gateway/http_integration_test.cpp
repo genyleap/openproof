@@ -18,6 +18,15 @@
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/ssl.hpp>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <unistd.h>
 
 import openproof.foundation;
 import openproof.gateway;
@@ -273,6 +282,127 @@ public:
         return gw::HttpResponse{
             forwardingHeaderRemoved ? 200 : 500, {},
             std::string{request.remoteAddress()}};
+    }
+};
+
+template <typename T, void (*Deleter)(T*)>
+struct ProxyTlsOwned final {
+    explicit ProxyTlsOwned(T* value) : ptr(value) {}
+    ~ProxyTlsOwned() noexcept { if (ptr) Deleter(ptr); }
+    ProxyTlsOwned(const ProxyTlsOwned&) = delete;
+    ProxyTlsOwned& operator=(const ProxyTlsOwned&) = delete;
+    T* get() const noexcept { return ptr; }
+    T* ptr;
+};
+
+void freeProxyTlsBio(BIO* value) { BIO_free(value); }
+
+struct DelayedCloseTlsProxyPeer final {
+    asio::io_context io;
+    asio::ssl::context tls{asio::ssl::context::tls_server};
+    Tcp::acceptor acceptor{io, Tcp::endpoint{
+        asio::ip::address_v4::loopback(), 0U}};
+    std::thread peer;
+    std::string caFile;
+    bool observedRequest{false};
+
+    DelayedCloseTlsProxyPeer()
+    {
+        // A fresh temporary self-signed CA is used only for this localhost
+        // test. No production private key or certificate enters the repo.
+        ProxyTlsOwned<EVP_PKEY, EVP_PKEY_free> key{
+            EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519")};
+        ProxyTlsOwned<X509, X509_free> cert{X509_new()};
+        if (!key.get() || !cert.get()
+            || X509_set_version(cert.get(), 2) != 1
+            || ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 61) != 1
+            || !X509_gmtime_adj(X509_getm_notBefore(cert.get()), -30)
+            || !X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600)
+            || X509_set_pubkey(cert.get(), key.get()) != 1) {
+            throw std::runtime_error{"Gateway TLS test certificate generation failed"};
+        }
+        X509_NAME* name = X509_get_subject_name(cert.get());
+        if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                reinterpret_cast<const unsigned char*>("localhost"),
+                -1, -1, 0) != 1
+            || X509_set_issuer_name(cert.get(), name) != 1) {
+            throw std::runtime_error{"Gateway TLS test certificate subject failed"};
+        }
+        X509V3_CTX context;
+        X509V3_set_ctx(&context, cert.get(), cert.get(), nullptr, nullptr, 0);
+        ProxyTlsOwned<X509_EXTENSION, X509_EXTENSION_free> san{
+            X509V3_EXT_conf_nid(nullptr, &context, NID_subject_alt_name,
+                                const_cast<char*>("DNS:localhost"))};
+        if (!san.get() || X509_add_ext(cert.get(), san.get(), -1) != 1
+            || X509_sign(cert.get(), key.get(), nullptr) <= 0
+            || SSL_CTX_use_certificate(tls.native_handle(), cert.get()) != 1
+            || SSL_CTX_use_PrivateKey(tls.native_handle(), key.get()) != 1) {
+            throw std::runtime_error{"Gateway TLS fixture identity failed"};
+        }
+        ProxyTlsOwned<BIO, freeProxyTlsBio> encoded{BIO_new(BIO_s_mem())};
+        if (!encoded.get() || PEM_write_bio_X509(
+                encoded.get(), cert.get()) != 1) {
+            throw std::runtime_error{"Gateway TLS fixture CA encoding failed"};
+        }
+        BUF_MEM* data = nullptr;
+        BIO_get_mem_ptr(encoded.get(), &data);
+        if (!data || !data->data || data->length == 0U) {
+            throw std::runtime_error{"Gateway TLS fixture CA is empty"};
+        }
+        char templatePath[] = "/tmp/openproof-gateway-tls-ca-XXXXXX";
+        const int fd = mkstemp(templatePath);
+        if (fd < 0) throw std::runtime_error{"Gateway TLS fixture CA file failed"};
+        close(fd);
+        caFile.assign(templatePath);
+        std::ofstream ca{caFile, std::ios::binary};
+        ca.write(data->data, static_cast<std::streamsize>(data->length));
+        ca.close();
+        if (!ca.good()) throw std::runtime_error{"Gateway TLS fixture CA save failed"};
+    }
+
+    ~DelayedCloseTlsProxyPeer()
+    {
+        boost::system::error_code ignored;
+        acceptor.close(ignored);
+        if (peer.joinable()) peer.join();
+        if (!caFile.empty()) std::filesystem::remove(caFile);
+    }
+
+    [[nodiscard]] std::uint16_t port() const
+    {
+        return acceptor.local_endpoint().port();
+    }
+
+    void start()
+    {
+        peer = std::thread{[this] {
+            try {
+                Tcp::socket socket{io};
+                acceptor.accept(socket);
+                asio::ssl::stream<Tcp::socket> stream{
+                    std::move(socket), tls};
+                stream.handshake(asio::ssl::stream_base::server);
+                beast::flat_buffer buffer;
+                beastHttp::request<beastHttp::string_body> request;
+                beastHttp::read(stream, buffer, request);
+                observedRequest = request.target() == "/native-tls-proxy";
+
+                beastHttp::response<beastHttp::string_body> response{
+                    beastHttp::status::ok, request.version()};
+                response.set(beastHttp::field::content_type, "text/plain");
+                response.body() = "gateway-tls-complete";
+                response.keep_alive(false);
+                response.prepare_payload();
+                beastHttp::write(stream, response);
+                // Intentionally do not send TLS close_notify yet. The
+                // client must not wait after completing HTTP response framing.
+                std::this_thread::sleep_for(std::chrono::milliseconds{750});
+                boost::system::error_code ignored;
+                stream.shutdown(ignored);
+            } catch (const std::exception&) {
+                // A one-shot client closing before shutdown is expected.
+            }
+        }};
     }
 };
 
@@ -762,6 +892,46 @@ TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
     EXPECT_EQ(result->value().status(), 200);
     EXPECT_EQ(result->value().body(), "127.0.0.1");
     upstream.stop();
+}
+
+TEST(BeastHttpIntegrationTest, NativeTlsProxyDoesNotWaitForPeerCloseNotify)
+{
+    DelayedCloseTlsProxyPeer upstream;
+    upstream.start();
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(
+            8192U, 4096U, upstream.caFile).value());
+    ASSERT_TRUE(proxy.has_value());
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"tls-held-open-upstream"}, "localhost",
+        upstream.port(), true, 1U);
+    ASSERT_TRUE(endpoint.has_value());
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/native-tls-proxy",
+        {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"native-tls-close-test"});
+    ASSERT_TRUE(request.has_value());
+
+    asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> response;
+    const auto started = std::chrono::steady_clock::now();
+    auto completion = asio::co_spawn(
+        io, collectAsyncProxyResponse(
+            *proxy.value(), std::move(endpoint).value(),
+            std::move(request).value(), std::chrono::seconds{2}, response),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(completion.get());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_TRUE(response.has_value());
+    ASSERT_TRUE(response->has_value());
+    EXPECT_EQ(response->value().status(), 200);
+    EXPECT_EQ(response->value().body(), "gateway-tls-complete");
+    // The peer keeps the TLS socket open for 750ms after sending a complete
+    // Content-Length response. Gateway should already have completed.
+    EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    if (upstream.peer.joinable()) upstream.peer.join();
+    EXPECT_TRUE(upstream.observedRequest);
 }
 
 TEST(BeastHttpIntegrationTest, NativeCoroutineProxyEnforcesUpstreamDeadline)
