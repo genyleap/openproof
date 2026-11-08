@@ -21,6 +21,10 @@ module;
 #include <utility>
 #include <vector>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
+
 #if OPENPROOF_PLATFORM_APPLE
 #include <LDAP/ldap.h>
 #else
@@ -37,6 +41,7 @@ module;
 #include <zlib.h>
 
 #include "presentation.hpp"
+#include "async_ldaps.hpp"
 
 module openproof.provider.enterprise;
 
@@ -901,6 +906,92 @@ foundation::Result<idp::AuthenticationOutcome> LdapAuthenticationProvider::compl
     evidence.add("transport", "ldaps");
     evidence.add("subject_attribute", config.m_subjectAttribute);
     return idp::AuthenticationOutcome::create(id(), idp::ExternalSubject{*subject}, std::move(claims),
+        idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge, false},
+        std::move(evidence), m_implementation->clock->now());
+}
+
+boost::asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+LdapAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    // Challenge creation is local CPU/CSPRNG work. Only directory I/O must
+    // suspend; preserve the same challenge binding and policy as the legacy API.
+    co_return beginAuthentication(request);
+}
+
+boost::asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+LdapAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    const auto usernameIt = response.parameters().find("username");
+    const auto passwordIt = response.parameters().find("password");
+    const auto bindingIt = response.parameters().find("username_binding");
+    if (usernameIt == response.parameters().end()
+        || passwordIt == response.parameters().end()
+        || bindingIt == response.parameters().end()
+        || !safeToken(usernameIt->second.expose(), 320U)
+        || passwordIt->second.empty()
+        || passwordIt->second.expose().size() > 1024U
+        || bindingIt->second.empty()) {
+        co_return foundation::fail(authenticationFailure(
+            "LDAP credentials are incomplete."));
+    }
+    const auto& config = m_implementation->config;
+    const auto expectedBinding = hmacToken(config.m_derivationKey, "ldap-username",
+        response.challengeId().value(), usernameIt->second.expose());
+    if (expectedBinding.empty()
+        || !security::constantTimeEquals(
+               expectedBinding, bindingIt->second.expose())) {
+        co_return foundation::fail(authenticationFailure(
+            "The LDAP username is not bound to this challenge."));
+    }
+
+    // Native Asio DNS/TCP/TLS + bounded LDAPv3 BER; no libldap bind/search,
+    // no detached worker or futures blocking the HTTP reactor. Credential
+    // copies are heap-owned, RAII-scrubbed and never appear in diagnostics.
+    auto directory = co_await async_detail::AsyncLdapsClient::authenticate(
+        async_detail::LdapsRequest{
+            std::string{config.m_uri},
+            std::string{config.m_baseDn},
+            std::string{config.m_usernameAttribute},
+            std::string{config.m_subjectAttribute},
+            std::string{config.m_displayNameAttribute},
+            std::string{config.m_emailAttribute},
+            std::string{config.m_serviceBindDn},
+            async_detail::SensitiveString{config.m_serviceBindPassword.expose()},
+            std::string{usernameIt->second.expose()},
+            async_detail::SensitiveString{passwordIt->second.expose()},
+            std::string{config.m_caFile}
+        });
+    if (!directory.success()) {
+        if (directory.failure == async_detail::LdapsFailure::Timeout
+            || directory.failure == async_detail::LdapsFailure::Connection
+            || directory.failure == async_detail::LdapsFailure::Certificate) {
+            co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                       "The LDAP directory is unavailable.");
+        }
+        co_return foundation::fail(authenticationFailure(
+            "The LDAP identity could not be verified."));
+    }
+    if (!safeToken(directory.subject, 1024U)) {
+        co_return foundation::fail(authenticationFailure(
+            "The LDAP entry is missing a stable subject identifier."));
+    }
+
+    idp::VerifiedClaims claims;
+    if (directory.displayName && !config.m_displayNameAttribute.empty()
+        && detail::safePresentationText(*directory.displayName)) {
+        claims.set(idp::ClaimName::DisplayName, *directory.displayName);
+    }
+    if (directory.email && !config.m_emailAttribute.empty()
+        && safeToken(*directory.email, 320U)) {
+        claims.set(idp::ClaimName::Email, *directory.email);
+    }
+    idp::ProviderEvidence evidence;
+    evidence.add("protocol", "ldap");
+    evidence.add("transport", "ldaps");
+    evidence.add("subject_attribute", config.m_subjectAttribute);
+    co_return idp::AuthenticationOutcome::create(
+        id(), idp::ExternalSubject{directory.subject}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge, false},
         std::move(evidence), m_implementation->clock->now());

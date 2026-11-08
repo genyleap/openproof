@@ -55,6 +55,25 @@ else()
     )
 endif()
 
+# Direct native LDAPv3 simple bind/search over Asio TLS. No libldap
+# synchronous connect, DNS, TLS handshake, bind or search on its executor.
+# Keep the transport separate from named C++ modules for GCC 16 ABI hygiene.
+add_library(openproof_provider_async_ldaps STATIC async_ldaps.cpp)
+target_compile_features(openproof_provider_async_ldaps PUBLIC cxx_std_26)
+target_include_directories(openproof_provider_async_ldaps PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(openproof_provider_async_ldaps PUBLIC
+    Boost::headers OpenSSL::SSL OpenSSL::Crypto
+    PRIVATE openproof_compile_options)
+target_compile_definitions(openproof_provider_async_ldaps PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_provider_async_ldaps PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(async_ldaps.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
 openproof_add_module(openproof_provider_enterprise
     MODULES
         enterprise.cppm
@@ -65,6 +84,8 @@ openproof_add_module(openproof_provider_enterprise
         openproof_identity_provider
     LINK_PRIVATE
         openproof_security
+        openproof_provider_async_ldaps
+        OpenSSL::SSL
         OpenSSL::Crypto
         ${OPENPROOF_ENTERPRISE_NATIVE_LIBRARIES}
 )

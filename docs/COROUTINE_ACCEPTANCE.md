@@ -2996,3 +2996,64 @@ Do not treat a CTest zero exit status with skipped cases as a passed
 PostgreSQL behavioral test. Neither a production database nor an unrelated
 application workload was used for validation, and no release, merge or
 deployment is authorized by these results.
+
+#### Native LDAPv3 Asio transport work in progress (2026-11-08)
+
+A separate, provider-neutral asynchronous LDAPv3 implementation was added
+under src/providers/enterprise/async_ldaps.{hpp,cpp}. It does not call
+OpenLDAP's synchronous LDAP bind/search/result functions, and it does not
+offload blocking directory operations to a thread pool. Instead it uses one
+Boost.Asio executor and an operation-wide 10-second monotonic deadline for
+asynchronous DNS, TCP connect, TLS handshake and bounded LDAPv3 BER
+bind/search response framing. The configured CA trust roots and TLS server
+hostname are verified before issuing any directory credential. This
+is a restricted client for certificate-verified ldaps://, not a general
+referral-following LDAP engine or plaintext ldap:// downgrade mechanism.
+
+The request first binds a configured service identity (or performs an
+anonymous bind), then executes a BER-encoded equalityMatch filter, requiring
+exactly one directory entry. It rejects duplicate entries, unexpected
+protocol messages, referrals, missing stable subjects, oversize wire frames
+and malformed/multi-value attributes. A successful unique lookup is followed
+by a user-password bind on the same verified TLS connection, without
+subsequent directory reads. Heap-owned plaintext password copies and the
+encoded bind request are overwritten by scoped destructors on all exits.
+
+The enterprise LDAP provider now advertises the genuine
+CoroutineAuthenticationProvider SPI and has a native completion path that
+preserves the existing username-binding HMAC, proof policy, IAL1 claim
+validation, account evidence and sanitized failure responses. Existing
+synchronous LDAP functionality remains for compatibility and is still
+explicitly detected by the strict migration gate; it is not quietly
+exempted as an acceptable long-term coroutine migration. The gate fell
+from 19 to 18 blockers because actual co_await native LDAP code now exists,
+not because the remaining blocking APIs were hidden.
+
+A standalone local TLS/LDAPv3 fixture and GTests cover successful two-bind
+authentication, rejected user credentials, duplicate search matches,
+missing stable subjects, certificate rejection, invalid message identifiers,
+malformed BER frame length, tight operation timeouts and invalid LDAPS
+configuration. Source-contract checks test coroutine transport, strict
+framing, TLS hostname validation, one shared deadline, plaintext scrubbing
+and the provider SPI. At the time of writing, 85/85 overall static
+coroutine-related checks passed, but real LDAP fixture GTests and full
+GCC C++26 module linkage still require separate runtime/compiler results.
+The production deployment is unchanged and remains blocked by the
+remaining unconverted entry points.
+
+#### Isolated LDAPS implementation validation (2026-11-08)
+
+With Clang 23 in C++26 mode, the standalone native LDAPS transport passes
+syntax checking and links together with its real loopback TLS/BER GTests
+against the test-only OpenSSL/GTest libraries. All nine network GTests passed
+on the isolated 127.0.0.1 fixture, including an authenticated two-bind
+flow, untrusted certificate rejection, wrong user credentials, ambiguous
+directory search, missing stable subject, malformed BER size, wrong LDAP
+message ID, short deadline and invalid transport configuration.
+
+Five dedicated source-contract checks passed and the full coroutine
+source regression suite completed 85/85. Release migration gate remains
+NOT_APPROVED with 18 blockers, including two reachable LDAP synchronous
+compatibility bind/search call sites. The GCC16 named-module build and
+transport compilation under the full release flags are in progress and
+must NOT be inferred from the Clang standalone test results.

@@ -1,6 +1,9 @@
 module;
 
 #include <memory>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <string>
 #include <string_view>
 
@@ -60,7 +63,8 @@ private:
 };
 
 /** @brief Enterprise LDAP authentication over certificate-verified LDAPS. */
-class LdapAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class LdapAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+                                         public identity::provider::CoroutineAuthenticationProvider {
 public:
     LdapAuthenticationProvider(LdapProviderConfig config,
                                const foundation::ClockSource& clock);
@@ -73,6 +77,15 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    // Native LDAPv3 bind/search on one Asio-managed certificate-pinned LDAPS
+    // connection. The original ABI remains available only for compatibility.
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

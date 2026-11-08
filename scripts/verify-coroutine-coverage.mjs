@@ -137,6 +137,28 @@ const checked = segments.map(([name, relative]) => {
        || !/scrub\s*\{\s*passwordStorage\s*\}/.test(bind))
       issues.push({line:0,kind:"LDAP plaintext bind buffer is not scrubbed on every exit",
         expression:"PasswordScrub RAII on passwordStorage"});
+    const iface = fs.readFileSync(
+      path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");
+    const native = cppExecutableText(fs.readFileSync(
+      path.join(root,"src/providers/enterprise/async_ldaps.cpp"),"utf8"));
+    const nativeCompletion = executable.slice(
+      executable.indexOf("LdapAuthenticationProvider::completeAuthenticationAsync("),
+      executable.indexOf("SamlProviderConfig::SamlProviderConfig("));
+    if(!/class\s+LdapAuthenticationProvider\s+final\s*:\s*public\s+identity::provider::AuthenticationProvider,\s*public\s+identity::provider::CoroutineAuthenticationProvider/.test(iface)
+       || !/co_await\s+async_detail::AsyncLdapsClient::authenticate\s*\(/.test(nativeCompletion)
+       || !/security::constantTimeEquals/.test(nativeCompletion)
+       || !/resolver\.async_resolve\s*\(/.test(native)
+       || !/async_connect\s*\(/.test(native)
+       || !/stream\.async_handshake\s*\(/.test(native)
+       || !/asio::async_read\s*\(/.test(native)
+       || !/asio::async_write\s*\(/.test(native)
+       || !/ssl::host_name_verification\s*\(/.test(native)
+       || !/kMaximumLdapFrame\s*=\s*65536U/.test(native)
+       || !/kTotalDeadline/.test(native)
+       || /\bldap_\w+\s*\(/.test(native)
+       || /\b(?:io|context)\.run\s*\(/.test(native))
+      issues.push({line:0,kind:"LDAP native provider lacks bounded nonblocking TLS transport",
+        expression:"native CoroutineAuthenticationProvider -> Asio TLS/BER bind/search"});
   }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(

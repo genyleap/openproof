@@ -287,6 +287,33 @@ gtest_discover_tests(openproof_github_coroutine_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "provider;async;oauth")
 
+# Strict, completely offline LDAPS native coroutine regression. The fixture
+# generates an ephemeral TLS identity and serves bounded LDAPv3 frames on
+# 127.0.0.1; no LDAP production server or external DNS is contacted.
+add_executable(openproof_provider_async_ldaps_tests
+    providers/async_ldaps_test.cpp)
+target_compile_features(openproof_provider_async_ldaps_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_provider_async_ldaps_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/providers/enterprise"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_provider_async_ldaps_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_provider_async_ldaps_tests PRIVATE
+    openproof_provider_async_ldaps GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(providers/async_ldaps_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_provider_async_ldaps_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_provider_async_ldaps_tests
+    TEST_PREFIX "EnterpriseLdaps."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "provider;async;ldap;security")
+
 # Standalone provider outbound HTTPS coroutine test. Does not load legacy
 # provider modules or launch real external OAuth calls.
 add_executable(openproof_provider_async_https_tests
