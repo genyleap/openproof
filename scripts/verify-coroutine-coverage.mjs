@@ -24,6 +24,9 @@ const segments = [
   ["PostgreSQL bounded coroutine connection pool", "src/storage/postgres/async_pool.cpp"],
   ["PostgreSQL native asynchronous hostname resolution", "src/storage/postgres/async_connection.cpp"],
   ["PostgreSQL atomic native owned revocation", "src/storage/postgres/async_session.cpp"],
+  ["PostgreSQL native bounded recovery-code SQL", "src/storage/postgres/async_recovery_code.cpp"],
+  ["Native recovery-code domain service", "src/credentials/coroutine_recovery_codes.cpp"],
+  ["PostgreSQL native recovery-code adapter", "src/storage/postgres/coroutine_recovery_code_repository.cpp"],
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
@@ -484,6 +487,75 @@ const checked = segments.map(([name, relative]) => {
        || !/nativeEnabledFor\s*\(/.test(header))
       issues.push({line:0,kind:"partial account session migration enabled for all routes",
         expression:"nativeEnabled false; nativeEnabledFor per request"});
+  }
+  if(relative==="src/credentials/coroutine_recovery_codes.cpp"){
+    const issue = source.slice(
+      source.indexOf("CoroutineRecoveryCodeService::issue("),
+      source.indexOf("CoroutineRecoveryCodeService::consume("));
+    const consume = source.slice(
+      source.indexOf("CoroutineRecoveryCodeService::consume("),
+      source.indexOf("CoroutineRecoveryCodeService::revoke("));
+    const replaceAt = issue.indexOf("co_await m_repository->replaceAsync(");
+    const returnCodesAt = issue.indexOf(
+      "co_return foundation::Result<std::vector<foundation::SecretString>>");
+    if(!/security::randomTokenBase64Url\(20U\)/.test(issue)
+       || !/security::hmacSha256\(m_pepper, code\.expose\(\)\)/.test(issue)
+       || !/count > 32U/.test(issue)
+       || replaceAt < 0 || returnCodesAt < replaceAt
+       || !/if \(!saved\) co_return foundation::fail\(saved\.error\(\)\)/.test(issue)
+       || !/security::hmacSha256\(m_pepper, presented\.expose\(\)\)/.test(consume)
+       || !/co_await m_repository->consumeAsync\(/.test(consume)
+       || /m_repository->(?:replace|consume)\s*\(/.test(executable))
+      issues.push({line:0,kind:"native recovery-code service exposes uncommitted plaintext or synchronous store",
+        expression:"CSPRNG + keyed digest + await atomic persistence before returning secrets"});
+  }
+  if(relative==="src/storage/postgres/coroutine_recovery_code_repository.cpp"){
+    const entryPoints=["replaceAsync","consumeAsync","remainingAsync"];
+    const bounded = entryPoints.every(name=>{
+      const start = source.indexOf(
+        "CoroutinePostgresRecoveryCodeRepository::"+name+"(");
+      const end = source.indexOf("CoroutinePostgresRecoveryCodeRepository::",
+        start+name.length+3);
+      const part=source.slice(start,end < 0 ? undefined:end);
+      return start>=0
+        && /const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/.test(part)
+        && /co_await m_impl->pool\.acquire\(deadline\)/.test(part)
+        && /remaining\(deadline\)/.test(part)
+        && !/m_impl->pool\.acquire\(\)/.test(part);
+    });
+    if(!bounded || !/foundation::ErrorCode::AuthenticationFailed/.test(source)
+        || /\bPQ(?:exec|execParams|connectdb|reset)\s*\(/.test(executable))
+      issues.push({line:0,kind:"native recovery-code adapter bypasses the shared SQL deadline or owner-scoped one-time consumption",
+        expression:"bounded async pool/SQL + generic failed/replayed redemption"});
+  }
+  if(relative==="src/storage/postgres/async_recovery_code.cpp"){
+    // Recovery-code replay prevention is one identity-scoped DELETE, while
+    // replacement must validate the entire batch before atomic BEGIN and
+    // must never reintroduce a per-code SQL round trip.
+    const header = fs.readFileSync(
+      path.join(root,"src/storage/postgres/async_recovery_code.hpp"),"utf8");
+    const replace = source.slice(
+      source.indexOf("AsyncRecoveryCodeSql::replace("),
+      source.indexOf("AsyncRecoveryCodeSql::consume("));
+    const consume = source.slice(
+      source.indexOf("AsyncRecoveryCodeSql::consume("),
+      source.indexOf("AsyncRecoveryCodeSql::remaining("));
+    if(!/kMaximumRecoveryCodes\s*=\s*64U/.test(header)
+       || !/digestsHex\.size\(\) > kMaximumRecoveryCodes/.test(replace)
+       || !/canonicalDigest\(std::move\(digest\)\)/.test(replace)
+       || !/std::adjacent_find/.test(replace)
+       || !/const Deadline deadline = Clock::now\(\) \+ timeout/.test(replace)
+       || !/co_await conn\.query\(\s*"BEGIN", \{\}, remainingBudget\(deadline\)\)/.test(replace)
+       || !/pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/.test(replace)
+       || replace.indexOf("pg_advisory_xact_lock") > replace.indexOf('"DELETE FROM "')
+       || !/co_await conn\.query\(\s*"COMMIT", \{\}, remainingBudget\(deadline\)\)/.test(replace)
+       || !/std::move\(sql\), std::move\(parameters\), remainingBudget\(deadline\)/.test(replace)
+       || (replace.match(/\bco_await\b/g) || []).length !== 5
+       || !/WHERE identity_id=\$1 AND code_digest=decode\(\$2,'hex'\)/.test(consume)
+       || !/RETURNING identity_id/.test(consume)
+       || !/co_return !rows\.rows\.empty\(\)/.test(consume))
+      issues.push({line:0,kind:"native recovery-code SQL can disclose or replay credentials",
+        expression:"identity-scoped single-use DELETE and atomic bounded replacement"});
   }
   if(relative==="src/storage/postgres/async_session.cpp"){
     // List cardinality is a security and latency bound: an authenticated

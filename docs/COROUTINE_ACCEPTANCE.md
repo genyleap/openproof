@@ -3082,3 +3082,47 @@ the new real network GTest have not been executed for this checkpoint
 because the recent named-module fingerprint invalidated ~87 module BMIs.
 They remain mandatory acceptance gates, separate from the already
 passing native provider TLS and LDAP test suites.
+
+#### Native recovery-code coroutine domain and PostgreSQL implementation (2026-11-08)
+
+The RecoveryCodeRepository compatibility API still performs synchronous SQL.
+A separate vendor-neutral CoroutineRecoveryCodeRepository SPI and
+CoroutineRecoveryCodeService now support issue/consume/revoke/remaining
+without dispatching synchronous repositories onto an Asio reactor. Issuance
+preserves the domain policy of up to 32 fresh 20-byte CSPRNG tokens,
+pepper-keyed HMAC-SHA256 digests and never returns the plaintext batch
+before the asynchronous replacement has completed. Consumption hashes the
+presented scoped SecretString and awaits a one-statement identity-scoped
+atomic DELETE ... RETURNING; a used, unknown or foreign digest is denied.
+
+The PostgreSQL CoroutinePostgresRecoveryCodeRepository owns a
+capacity-limited asynchronous libpq pool. Its monotonic SQL budget includes
+queue admission, connection establishment and all statements. The
+underlying AsyncRecoveryCodeSql supports bounded atomic replacement of up
+to 64 canonical SHA-256 hex digests, rejects malformed/duplicate values
+before BEGIN, uses only server-bound SQL parameters and one batched INSERT,
+and holds a transaction-scoped, per-identity PostgreSQL advisory lock before
+DELETE to serialize concurrent rotations without schema changes. Failed
+queries discard the connection, preventing reuse of a transaction with
+uncertain commit state.
+
+GCC16/C++26 built the native SQL library, recovery-code repository,
+credential coroutine service, and both focused GTest executables successfully.
+Five credential-service tests passed against an asynchronous in-memory
+repository, including failure-before-plaintext, one-time redemption and
+revocation. One SQL test independent of the database passed. Three SQL
+tests for real transaction semantics are present, but were *skipped* because
+the disposable PostgreSQL test URL was not available in this execution
+environment. A private Unix-socket-only fixture runner was added as
+scripts/run-disposable-postgres-recovery-tests.sh; the remote execution
+policy did not allow launching the bash script, and this is explicitly an
+outstanding integration acceptance requirement.
+
+Six SQL and five service source checks plus the existing strict coverage gate
+prevent regression to synchronous/unsafe persistence. This implementation
+has *not* yet been connected to live /auth/recovery-codes. That endpoint
+still relies on synchronous authentication, external identity listing and
+TOTP confirmation; routing only the final recovery-code insert through a
+coroutine would not make the endpoint nonblocking or preserve the full
+authorization/race boundary. Migration acceptance remains NOT_APPROVED with
+18 blockers. Production service remains unchanged.

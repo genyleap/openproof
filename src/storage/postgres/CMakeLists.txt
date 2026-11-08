@@ -6,7 +6,8 @@ add_library(openproof_postgres_async_io STATIC
     async_connection.cpp
     async_pool.cpp
     async_session.cpp
-    async_auth_transaction.cpp)
+    async_auth_transaction.cpp
+    async_recovery_code.cpp)
 target_compile_features(openproof_postgres_async_io PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_io PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -26,7 +27,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # through Boost.Asio aligned_new. Inlining causes GCC 16.2 to diagnose
     # Boost's matching aligned allocator/deallocator as mismatched. Keep
     # -Werror intact; only these affected implementation TUs skip inlining.
-    set_source_files_properties(async_connection.cpp async_session.cpp
+    set_source_files_properties(
+        async_connection.cpp async_session.cpp async_recovery_code.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 
@@ -94,6 +96,28 @@ target_link_libraries(openproof_postgres_async_repository
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(
         coroutine_session_repository.cpp coroutine_session_service.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
+# Native RecoveryCodeRepository bridge. The exported credential SPI does
+# not import a database vendor; PostgreSQL is only one implementation.
+add_library(openproof_postgres_async_recovery_repository STATIC
+    coroutine_recovery_code_repository.cpp)
+target_compile_features(openproof_postgres_async_recovery_repository PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_recovery_repository PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${PROJECT_SOURCE_DIR}/src/credentials")
+set_target_properties(openproof_postgres_async_recovery_repository PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_recovery_repository PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_recovery_repository
+    PUBLIC openproof_credentials_async openproof_postgres_async_io
+        openproof_foundation openproof_identity_core Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_recovery_code_repository.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 

@@ -571,6 +571,63 @@ gtest_discover_tests(openproof_postgres_async_auth_transaction_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;security")
 
+# Storage-independent recovery-code coroutine service. Tests issue and
+# consume real CSPRNG/HMAC digests through an in-memory fake async repository,
+# checking fail-closed output without requiring production PostgreSQL.
+add_executable(openproof_coroutine_recovery_code_service_tests
+    credentials/coroutine_recovery_code_service_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/gateway/asio_thread_context.cpp)
+target_compile_features(openproof_coroutine_recovery_code_service_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_coroutine_recovery_code_service_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/credentials"
+    "${googletest_SOURCE_DIR}/googletest/include")
+set_target_properties(openproof_coroutine_recovery_code_service_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_compile_definitions(openproof_coroutine_recovery_code_service_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_coroutine_recovery_code_service_tests PRIVATE
+    openproof_credentials_async openproof_credentials openproof_security
+    openproof_identity_core openproof_foundation Boost::headers
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(credentials/coroutine_recovery_code_service_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_coroutine_recovery_code_service_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_coroutine_recovery_code_service_tests
+    TEST_PREFIX "NativeRecoveryService."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "credentials;async;security")
+
+# Native bounded recovery-code replacement / one-time redemption. PG TEMP
+# tables ensure no production identity's codes are read or overwritten.
+add_executable(openproof_postgres_async_recovery_code_tests
+    storage/postgres_async_recovery_code_test.cpp)
+target_compile_features(openproof_postgres_async_recovery_code_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_postgres_async_recovery_code_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/storage/postgres"
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_postgres_async_recovery_code_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_recovery_code_tests PRIVATE
+    openproof_postgres_async_io GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(storage/postgres_async_recovery_code_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_async_recovery_code_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_postgres_async_recovery_code_tests
+    TEST_PREFIX "NativePgRecovery."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "postgres;async;security")
+
 # Offline security gate: the native transaction repository cannot silently
 # invoke the legacy synchronous SPI even when its database is unreachable.
 add_executable(openproof_postgres_async_auth_store_tests
