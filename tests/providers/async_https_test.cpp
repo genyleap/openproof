@@ -55,6 +55,7 @@ struct LocalTlsServer final {
     unsigned int replyStatus{200U};
     std::string replyBody{"{\"provider\":\"isolated\"}"};
     std::chrono::milliseconds replyDelay{0};
+    std::chrono::milliseconds holdOpenAfterResponse{0};
 
     LocalTlsServer()
     {
@@ -159,6 +160,8 @@ struct LocalTlsServer final {
                 response.keep_alive(false);
                 response.prepare_payload();
                 wire::write(stream, response, error);
+                if (holdOpenAfterResponse > 0ms)
+                    std::this_thread::sleep_for(holdOpenAfterResponse);
                 stream.shutdown(error);
             } catch (const std::exception&) {
                 // The client assertion captures the sanitized network failure.
@@ -260,6 +263,28 @@ TEST(AsyncProviderHttpsTest, NativeLoopbackTlsWithPinnedTestCa)
     // only against the DNS hostname (without a port suffix).
     EXPECT_EQ(server.observedHost,
               "localhost:" + std::to_string(server.port()));
+}
+
+TEST(AsyncProviderHttpsTest, CompleteResponseDoesNotWaitForPeerTlsCloseNotify)
+{
+    LocalTlsServer server;
+    server.holdOpenAfterResponse = 500ms;
+    server.start();
+    pghttp::AsyncHttpsClient client{server.caFile};
+    auto request = loopback(server.port());
+    request.timeout = 1500ms;
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = execute(client, std::move(request));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.failure, pghttp::HttpsFailure::None);
+    EXPECT_EQ(result.response.status, 200U);
+    EXPECT_EQ(result.response.body, "{\"provider\":\"isolated\"}");
+    // A complete content-length-delimited response is not held hostage by
+    // a peer that omits TLS close_notify or holds the connection open.
+    EXPECT_LT(elapsed, 350ms);
+    if (server.thread.joinable()) server.thread.join();
+    EXPECT_TRUE(server.observedRequest);
 }
 
 TEST(AsyncProviderHttpsTest, UntrustedLoopbackCertificateCannotBeAccepted)

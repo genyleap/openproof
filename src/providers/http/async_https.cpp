@@ -293,12 +293,16 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
         // Security policy is evaluated by the caller: redirects and 4xx/5xx
         // are returned without following a new DNS endpoint or exposing data.
         HttpsResponse response{received.result_int(), std::move(received.body())};
+        // The entire HTTP/1.1 message has already passed Beast's framing,
+        // length, header and body-limit checks inside the verified TLS stream.
+        // Waiting for peer TLS close_notify here grants a server that keeps
+        // its socket open control over the OAuth response completion time,
+        // even after all authenticated response bytes have arrived.
+        // The request is Connection: close and the stream is not reusable.
+        // Closing the underlying socket does not read or trust additional
+        // peer bytes; incomplete/truncated HTTP bodies were already rejected.
         boost::system::error_code ignored;
-        beast::get_lowest_layer(stream).expires_at(deadline);
-        co_await stream.async_shutdown(
-            asio::redirect_error(asio::use_awaitable, ignored));
-        // Once a complete bounded HTTP body is authenticated by TLS, a peer
-        // omitting close_notify cannot invalidate the parsed response.
+        beast::get_lowest_layer(stream).socket().close(ignored);
         co_return HttpsResult{HttpsFailure::None, std::move(response), true};
     } catch (const std::exception&) {
         // No URL, credentials, response text or OpenSSL details enter logs or

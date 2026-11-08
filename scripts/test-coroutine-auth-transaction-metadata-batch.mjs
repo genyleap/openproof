@@ -17,7 +17,8 @@ const metadataEnd = begin.indexOf("connection.query(", metadataStart);
 const section = begin.slice(metadataStart, metadataEnd);
 
 test("metadata transaction enforces row and field bounds before BEGIN", () => {
-  assert.match(begin, /row\.metadata\.size\(\) > 64U/);
+  assert.match(native, /kMaximumTransactionMetadataRows = 64U/);
+  assert.match(begin, /row\.metadata\.size\(\) > kMaximumTransactionMetadataRows/);
   assert.match(begin, /key\.size\(\) > 200U/);
   assert.match(begin, /value\.size\(\) > 8192U/);
   assert.ok(begin.indexOf("row.metadata.size()") < begin.indexOf('connection.query('));
@@ -41,6 +42,24 @@ test("the parameterized metadata insert awaits exactly once before COMMIT", () =
     "one metadata INSERT and one COMMIT, not one await per metadata item");
   assert.match(body, /connection\.query\(\s*std::move\(insert\), std::move\(parameters\), remaining\(deadline\)\)/);
   assert.match(body, /connection\.query\(\s*[^,]+,\s*\{\},\s*remaining\(deadline\)\)/);
+});
+
+test("metadata redemption is SQL-limited to one overflow sentinel before materialization", () => {
+  const consume = raw.slice(raw.indexOf("AsyncAuthenticationTransactionSql::consume("));
+  assert.match(consume, /" WHERE transaction_id=\$1 ORDER BY key LIMIT "/);
+  assert.match(consume, /std::to_string\(kMaximumTransactionMetadataRows \+ 1U\)/);
+  assert.match(consume, /values\.rows\.size\(\) > kMaximumTransactionMetadataRows/);
+  assert.match(consume, /throw std::runtime_error\{"PostgreSQL transaction metadata exceeds limit"\}/);
+  assert.ok(consume.indexOf("LIMIT ") < consume.indexOf("if (values.rows.size()"));
+});
+
+test("malformed persisted metadata cannot be returned or reused after overflow", () => {
+  const cpp = fs.readFileSync(path.join(root,
+    "tests/storage/postgres_async_auth_transaction_test.cpp"), "utf8");
+  assert.match(cpp, /OversizedPersistedMetadataFailsClosed/);
+  assert.match(cpp, /generate_series\(1,63\)/);
+  assert.match(cpp, /catch \(const std::runtime_error&\)/);
+  assert.match(cpp, /nonReusable = !conn->reusable\(\)/);
 });
 
 test("the regression exercises 64 maximum-length metadata values on a temp table", () => {

@@ -2935,3 +2935,64 @@ CoroutinePostgresSessionRepository::listActive or the newly added native
 GTest, and does NOT claim PostgreSQL-backed execution. The native full
 repository, network-loopback and disposable database acceptance gates
 remain open even though the source-contract suite passes.
+
+#### Native HTTPS completion and bounded authentication metadata (2026-11-08)
+
+The shared native outbound HTTPS adapter for GitHub/OIDC/X/Web3 previously
+awaited peer TLS close_notify AFTER Beast had already received and parsed a
+complete, bounded HTTP/1.1 response. A TLS peer that left its socket open
+could therefore keep an otherwise successful OAuth exchange suspended for
+the remaining operation deadline. After the verified TLS handshake and the
+successful length/header/body-limited HTTP read, the one-shot transport now
+closes the non-reusable socket directly. Incomplete HTTP bodies continue to
+fail in Beast's async_read, and redirect handling, certificate/hostname
+verification, PublicInternet SSRF protections and shared deadlines remain
+unchanged. No extra peer data is consumed or accepted after the complete
+response. A new disposable loopback TLS fixture deliberately holds its
+connection open for 500 ms after a valid response and asserts that the native
+caller returns the body independently of peer close_notify. The GCC16/C++26
+library and test binary build succeeded; all 11 actual loopback HTTPS CTests
+passed. The source-contract test also explicitly forbids a regression to a
+post-response co_await stream.async_shutdown.
+
+The native PostgreSQL authentication-transaction SQL adapter could also
+retrieve unlimited metadata rows for a successfully redeemed challenge
+before checking the 64-pair bound. The SELECT now includes ORDER BY key
+LIMIT 65 (one overflow sentinel), and the adapter rejects more than 64
+without returning a partial challenge. Write-time metadata validation uses
+the same named 64-row constant. This preserves atomic UPDATE/metadata/COMMIT
+behavior, and a failed metadata validation leaves the connection
+non-reusable so the pool cannot lend a half-completed transaction.
+The disposable PostgreSQL test now injects 65 persisted metadata rows
+directly into an isolated temporary table and checks rejection plus
+connection invalidation. No live database schema was changed.
+
+The strict migration gate has been strengthened for both shared HTTPS
+response completion and bounded authentication metadata retrieval. It still
+correctly rejects this branch: 19 independent legacy blocking findings
+remain. Source-contract regression suite: 75/75 passed; tenant-neutrality
+audit passed. C++ execution of the 65-row PostgreSQL regression requires
+an explicit disposable OPENPROOF_TEST_POSTGRES URI and is not claimed by
+source-contract checks.
+
+#### Verification results for the November 8 changes
+
+- GCC 16.2/C++26 compiled and linked the shared native HTTPS library
+  and its updated local-TLS GTest binary. CTest ProviderHttps: 11 passed,
+  0 failed, 0 skipped, including the held-open TLS response regression.
+- GCC 16.2/C++26 compiled the updated async authentication-transaction SQL
+  library and both modified native PostgreSQL GTest binaries.
+- NativePostgres session CTest: 1 passed (pure domain decoder), 11 skipped
+  because OPENPROOF_TEST_POSTGRES is unset.
+- NativePgAuthTransaction CTest: 0 passed, 4 skipped (all require an
+  independently provisioned disposable PostgreSQL instance). One of these
+  skipped tests is the new metadata-overflow/poisoned-transaction regression.
+  NativePgAuthStore offline fail-closed CTest: 1 passed.
+- Node-based coroutine/security contract suite: 75/75 passed; protocol
+  neutrality audit passed. The strict release verifier still reports
+  NOT_APPROVED with 19 blocking findings and no uncovered blocking sources.
+
+Do not treat a CTest zero exit status with skipped cases as a passed
+PostgreSQL behavioral test. Neither a production database nor an unrelated
+application workload was used for validation, and no release, merge or
+deployment is authorized by these results.

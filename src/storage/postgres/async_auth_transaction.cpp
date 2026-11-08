@@ -15,6 +15,7 @@
 namespace openproof::storage::postgres::async_detail {
 namespace {
 using Clock = std::chrono::steady_clock;
+constexpr std::size_t kMaximumTransactionMetadataRows = 64U;
 
 [[nodiscard]] bool validDigest(std::string_view digest)
 {
@@ -103,7 +104,8 @@ boost::asio::awaitable<bool> AsyncAuthenticationTransactionSql::begin(
         || !validDigest(row.nonceDigestHex)
         || !validDigest(row.bindingDigestHex)
         || row.interaction > 4U || row.state != 0U
-        || row.expiresMs <= row.createdMs || row.metadata.size() > 64U)
+        || row.expiresMs <= row.createdMs
+        || row.metadata.size() > kMaximumTransactionMetadataRows)
         throw std::invalid_argument{"Invalid authentication transaction arguments"};
 
     // Invalid input must not open an SQL transaction on a pooled lease.
@@ -209,9 +211,14 @@ AsyncAuthenticationTransactionSql::consume(
     if (result.state == 1U) {
         const auto values = co_await connection.query(
             "SELECT key,value FROM " + metadata +
-            " WHERE transaction_id=$1 ORDER BY key",
+            " WHERE transaction_id=$1 ORDER BY key LIMIT "
+                + std::to_string(kMaximumTransactionMetadataRows + 1U),
             {id}, remaining(deadline));
-        if (values.rows.size() > 64U)
+        // A malformed or migrated store can contain more than 64 metadata
+        // fields despite write-time validation. Transfer at most one extra
+        // sentinel row before rejecting; never materialize an unbounded
+        // provider-controlled result set on an authentication coroutine.
+        if (values.rows.size() > kMaximumTransactionMetadataRows)
             throw std::runtime_error{"PostgreSQL transaction metadata exceeds limit"};
         for (const auto& item : values.rows) {
             if (item.size() != 2U

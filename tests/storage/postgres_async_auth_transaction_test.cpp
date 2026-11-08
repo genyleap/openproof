@@ -165,6 +165,49 @@ TEST(AsyncAuthenticationTransactionSqlTest, BatchedMaximumMetadataIsAtomicOnDisp
     EXPECT_TRUE(reusable);
 }
 
+asio::awaitable<void> malformedMetadataOverflowFailsBeforeBulkTransfer(
+    std::string dsn, bool& overflowDenied, bool& nonReusable)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(dsn), 3s);
+    co_await setup(*conn);
+    pg::AsyncAuthenticationTransactionSql sql{
+        pg::AsyncAuthenticationTransactionSql::Table::TemporaryTest};
+    static_cast<void>(co_await sql.begin(*conn, record("overflow"), 3s));
+    // Write directly to disposable SQL fixtures to simulate a preexisting
+    // malformed/migrated store, bypassing normal 64-pair issuance checks.
+    // 2 original pairs + 63 new = 65 rows, one over the native cap.
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.auth_transaction_metadata (transaction_id,key,value) "
+        "SELECT 'overflow', 'extra-' || n::text, repeat('x',8192) "
+        "FROM generate_series(1,63) n",
+        {}, 3s));
+    try {
+        static_cast<void>(co_await sql.consume(
+            *conn, "overflow", kNonce, kBinding, 1500, 3s));
+    } catch (const std::runtime_error&) {
+        overflowDenied = true;
+    }
+    // An interrupted transaction may not be placed back into the pool:
+    // the UPDATE must roll back instead of committing a half-read proof.
+    nonReusable = !conn->reusable();
+}
+
+TEST(AsyncAuthenticationTransactionSqlTest, OversizedPersistedMetadataFailsClosed)
+{
+    const char* dsn = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (dsn == nullptr || *dsn == '\0')
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    asio::io_context io;
+    bool overflowDenied = false, nonReusable = false;
+    auto future = asio::co_spawn(
+        io, malformedMetadataOverflowFailsBeforeBulkTransfer(
+            dsn, overflowDenied, nonReusable), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(overflowDenied);
+    EXPECT_TRUE(nonReusable);
+}
+
 TEST(AsyncAuthenticationTransactionSqlTest, InvalidMetadataIsRejectedBeforePgBegin)
 {
     const char* dsn = std::getenv("OPENPROOF_TEST_POSTGRES");

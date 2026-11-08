@@ -109,6 +109,24 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
   }
+  if(relative==="src/providers/github/github.cpp"){
+    // All four native OAuth providers share one awaitable HTTPS transport.
+    // Completing a verified and framed HTTP response must not wait for the
+    // peer's optional TLS close_notify before returning the result.
+    const tlsSource = cppExecutableText(fs.readFileSync(
+      path.join(root,"src/providers/http/async_https.cpp"),"utf8"));
+    const exchange = tlsSource.slice(
+      tlsSource.indexOf("AsyncHttpsClient::exchange("));
+    const afterResponse = exchange.slice(
+      exchange.indexOf("auto received = parser.release();"));
+    if (!/co_await\s+wire::async_read\s*\(/.test(exchange)
+        || !/parser\.body_limit\(m_maxBodyBytes\)/.test(exchange)
+        || !/parser\.header_limit\(/.test(exchange)
+        || !/beast::get_lowest_layer\(stream\)\.socket\(\)\.close\(ignored\)/.test(afterResponse)
+        || /co_await\s+stream\.async_shutdown\s*\(/.test(afterResponse))
+      issues.push({line:0,kind:"native OAuth HTTPS completion still waits for TLS peer close or skips framing checks",
+        expression:"bounded async HTTP read then immediate socket close, never async_shutdown"});
+  }
   if(relative==="src/providers/enterprise/enterprise.cpp"){
     const bind = source.slice(
       source.indexOf("foundation::Status simpleBind("),
@@ -206,6 +224,15 @@ const checked = segments.map(([name, relative]) => {
        || (batch.match(/\bco_await\b/g) || []).length !== 2)
       issues.push({line:0,kind:"native authentication metadata still uses repeated SQL insert roundtrips",
         expression:"one bounded parameterized multi-value INSERT before COMMIT"});
+    const transactionConsume = transactionSql.slice(
+      transactionSql.indexOf("AsyncAuthenticationTransactionSql::consume("));
+    if(!/kMaximumTransactionMetadataRows\s*=\s*64U/.test(transactionSql)
+       || !/row\.metadata\.size\(\)\s*>\s*kMaximumTransactionMetadataRows/.test(transactionBegin)
+       || !/WHERE transaction_id=\$1 ORDER BY key LIMIT/.test(transactionConsume)
+       || !/kMaximumTransactionMetadataRows \+ 1U/.test(transactionConsume)
+       || !/values\.rows\.size\(\) > kMaximumTransactionMetadataRows/.test(transactionConsume))
+      issues.push({line:0,kind:"native authentication redemption fetches unbounded metadata",
+        expression:"SQL LIMIT 65 before materializing up to 64 metadata rows"});
 
   }
   if(relative==="src/storage/postgres/coroutine_canonical_finalizer.cpp"){
