@@ -5,6 +5,9 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { cppExecutableText } from "./cpp-lexical-scan.mjs";
+// Existing native SQL contract runs also enforce the disposable DB's
+// privilege/authentication boundary without creating another CI workflow.
+import "./test-disposable-postgres-recovery-security.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const raw = fs.readFileSync(path.join(root,

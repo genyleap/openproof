@@ -3217,3 +3217,43 @@ GTests nor the full listener regression have yet passed this build.
 No live routing, merge, release or deployment is authorized.
 
 The 2026-11-11 opt-in native HTTP compile was stopped after more than six minutes in GCC's gateway HTTP named-module dependency; that timeout is a compile-resource limitation, not a passing C++ route test. The opt-in flag in the isolated CMake cache was restored to OFF. No test bundle or production service was replaced. All 109 coroutine source contracts pass; the overall migration gate remains NOT_APPROVED at 18 blocking findings.
+
+#### Security review of disposable PostgreSQL recovery-code fixture (2026-11-11)
+
+A GitGuardian "Generic Password" alert pointed at the OS account lookup in
+scripts/run-disposable-postgres-recovery-tests.py (commit 5ea62d4, line 28).
+The flagged call used Python's Unix-account metadata lookup to select
+the unprivileged database test identity; it did not read an
+application/database password or any pw_passwd field. Reviewing all 1,075
+added lines of that GitHub commit against common private-key, provider-token,
+credential-assignment and credential-bearing URI patterns found no such
+patterns; the sole matching pattern was the flagged Unix account lookup.
+This limited scan is not an exhaustive repository-wide secret audit. The
+alert is assessed as a detector false positive, not automatically marked
+resolved in the external GitGuardian incident dashboard. No credential
+rotation is indicated by that line alone.
+
+The fixture nevertheless received a security hardening pass: it no longer
+imports or calls the Python pwd module; the unprivileged PostgreSQL OS
+account is selected by shutil.chown, with mandatory privilege dropping
+when invoked as root. PostgreSQL is initialized with local peer
+authentication and reject for host authentication (not trust); it has
+no TCP listener and its Unix socket lives under a private temporary
+directory. The test process uses the matching Unix identity. All inherited
+PG* and pre-existing OPENPROOF_TEST_POSTGRES environment variables are
+discarded before a fresh socket-only test URI is supplied, preventing an
+inherited production connection or secret from influencing the fixture.
+
+Because the isolated development worktree and executable are permission
+0700, the test binary is copied into the temporary directory and made
+accessible only to its selected OS owner. No production directory
+permissions are widened. The previous Bash entrypoint now delegates
+directly to this single audited Python runner, so it cannot resurrect
+a less restrictive PostgreSQL authentication mode.
+
+Five JavaScript structural security checks and three isolated Python tests
+(mocking every subprocess, including privilege dropping and cluster startup)
+validate these controls and fail-closed behavior. Actual disposable
+PostgreSQL integration remains blocked by the remote execution
+sandbox's runuser: cannot set user id: Operation not permitted. Do not
+substitute the production database or report skipped SQL tests as passed.

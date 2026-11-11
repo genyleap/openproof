@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,16 +25,29 @@ def main() -> int:
     if not (ROOT / "cmake-build-gcc-release/tests/openproof_postgres_async_recovery_code_tests").is_file():
         raise SystemExit("Compile the native recovery-code SQL tests before running this fixture")
 
-    postgres = pwd.getpwnam("postgres") if os.geteuid() == 0 else None
-    username = postgres.pw_name if postgres is not None else pwd.getpwuid(os.geteuid()).pw_name
+    # This is an operating-system account name, never a database password.
+    # A non-root caller's OS identity is resolved directly by libpq.
+    must_drop_privileges = os.geteuid() == 0
 
     with tempfile.TemporaryDirectory(prefix="openproof-recovery-pg-", dir="/tmp") as root:
         work = Path(root)
-        if postgres is not None:
-            os.chown(work, postgres.pw_uid, postgres.pw_gid)
+        # The developer worktree/build may be mode 0700. Never make either
+        # world-readable just to run tests as a restricted OS account.
+        # Copy only the compiled test binary into this private directory.
+        executable = work / "recovery-code-sql-tests"
+        shutil.copyfile(
+            ROOT / "cmake-build-gcc-release/tests/"
+                   "openproof_postgres_async_recovery_code_tests",
+            executable)
+        executable.chmod(0o700)
+        if must_drop_privileges:
+            shutil.chown(executable, user="postgres", group="postgres")
+            shutil.chown(work, user="postgres", group="postgres")
 
         def pg(command: list[str]) -> subprocess.CompletedProcess[str]:
-            if postgres is not None:
+            if must_drop_privileges:
+                # Root-owned PostgreSQL clusters are forbidden. Abort on any
+                # failed privilege drop rather than retrying as root.
                 command = ["/usr/sbin/runuser", "-u", "postgres", "--", *command]
             result = subprocess.run(command, check=False, text=True, capture_output=True)
             if result.returncode:
@@ -46,7 +59,8 @@ def main() -> int:
         started = False
         try:
             pg([str(PGBIN / "initdb"), "-D", str(datadir), "--no-sync",
-                "-A", "trust", "--no-instructions"])
+                "--auth-local=peer", "--auth-host=reject",
+                "--no-instructions"])
             pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
                 "-l", str(log), "-o",
                 f"-c listen_addresses= -c unix_socket_directories={work} -p {PORT}",
@@ -54,15 +68,23 @@ def main() -> int:
             started = True
 
             # Only the just-created private Unix socket is used.
-            env = dict(os.environ)
-            env["OPENPROOF_TEST_POSTGRES"] = (
-                f"host={work} port={PORT} user={username} dbname=postgres"
-            )
-            result = subprocess.run(
-                ["ctest", "--test-dir", str(ROOT / "cmake-build-gcc-release"),
-                 "-R", r"^NativePgRecovery\.", "--output-on-failure", "-V", "-j", "1"],
-                env=env, text=True, check=False,
-            )
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("PG") and key != "OPENPROOF_TEST_POSTGRES"}
+            # Do not inherit any production PGHOST/PGSERVICE/PGPASSWORD.
+            # The URI contains NO credential and points only to this
+            # freshly initialized, private Unix-domain socket.
+            uri = f"host={work} port={PORT} dbname=postgres"
+            if must_drop_privileges:
+                uri += " user=postgres"
+            env["OPENPROOF_TEST_POSTGRES"] = uri
+            # libpq peer authentication requires that the test process
+            # itself runs under the matching OS account. Running the GTest
+            # binary directly avoids needing writable CTest state under the
+            # root-owned build directory after dropping privileges.
+            command = [str(executable)]
+            if must_drop_privileges:
+                command = ["/usr/sbin/runuser", "-u", "postgres", "--", *command]
+            result = subprocess.run(command, env=env, text=True, check=False)
             return result.returncode
         finally:
             if started:
