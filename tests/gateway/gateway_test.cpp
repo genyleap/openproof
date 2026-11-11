@@ -319,6 +319,22 @@ TEST(HttpRequestTest, RejectsAbsoluteFormControlCharactersAndAmbiguousFraming)
                                          "192.0.2.1", fnd::CorrelationId{}));
 }
 
+TEST(HttpRequestTest, SensitivePayloadCanBeWipedWithoutChangingRouting)
+{
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Post, "/auth/ldap/complete",
+        {{"content-type", "application/json"}},
+        std::string(96U, 'S'), "192.0.2.1", fnd::CorrelationId{"secret-wipe"}).value();
+    ASSERT_EQ(request.body().size(), 96U);
+    request.wipeBody();
+    EXPECT_TRUE(request.body().empty());
+    EXPECT_EQ(request.path(), "/auth/ldap/complete");
+    EXPECT_EQ(request.header("content-type"), "application/json");
+    EXPECT_EQ(request.remoteAddress(), "192.0.2.1");
+    request.wipeBody();
+    EXPECT_TRUE(request.body().empty());
+}
+
 TEST(RouterTest, ChoosesLongestSegmentBoundaryPrefix)
 {
     gw::Router router;

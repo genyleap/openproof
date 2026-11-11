@@ -235,6 +235,11 @@ HttpMethod HttpRequest::method() const noexcept { return m_method; }
 std::string_view HttpRequest::target() const noexcept { return m_target; }
 std::string_view HttpRequest::path() const noexcept { return m_path; }
 std::string_view HttpRequest::body() const noexcept { return m_body; }
+void HttpRequest::wipeBody() noexcept
+{
+    foundation::secureWipe(m_body.data(), m_body.size());
+    m_body.clear();
+}
 std::string_view HttpRequest::remoteAddress() const noexcept { return m_remoteAddress; }
 const foundation::CorrelationId& HttpRequest::correlation() const noexcept { return m_correlation; }
 const Headers& HttpRequest::headers() const noexcept { return m_headers; }

@@ -118,6 +118,19 @@ void clearState(gateway::HttpResponse& response)
     return client;
 }
 
+// Ensure early-error paths do not release an un-erased LDAP password
+// buffer. Native completion also wipes it explicitly before the first await.
+class SensitiveRequestBodyGuard final {
+public:
+    explicit SensitiveRequestBodyGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveRequestBodyGuard(const SensitiveRequestBodyGuard&) = delete;
+    SensitiveRequestBodyGuard& operator=(const SensitiveRequestBodyGuard&) = delete;
+    ~SensitiveRequestBodyGuard() { m_request.wipeBody(); }
+private:
+    gateway::HttpRequest& m_request;
+};
+
 [[nodiscard]] gateway::HttpResponse jsonResponse(int status, json::object body)
 {
     gateway::HttpResponse response{status, gateway::Headers{{"content-type", "application/json"}},
@@ -170,6 +183,7 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::startLdap(
 gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(
     gateway::HttpRequest request)
 {
+    SensitiveRequestBodyGuard wipeOnExit{request};
     // No synchronous LDAP directory bind, transaction redemption, or
     // session repository is allowed from this compatibility handler.
     return error(foundation::Error{foundation::ErrorCode::Unavailable},
@@ -205,6 +219,7 @@ boost::asio::awaitable<gateway::HttpResponse>
 EnterpriseAuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
     if (!nativeEnabledFor(request)) {
+        if (request.path() == "/auth/ldap/complete") request.wipeBody();
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
@@ -262,6 +277,7 @@ EnterpriseAuthenticationHttpApi::startLdapAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse>
 EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
 {
+    SensitiveRequestBodyGuard wipeOnExit{request};
     // Refuse unavailable native storage before consuming a one-time proof.
     if (!nativeEnabledFor(request) || m_asyncSessions == nullptr) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
@@ -301,6 +317,7 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     // Gateway and must be scrubbed at the listener's body lifecycle.
     auto& parsedPassword = body->at("password").as_string();
     foundation::secureWipe(parsedPassword.data(), parsedPassword.size());
+    request.wipeBody();
     auto verified = co_await m_authentication->completeAsync(
         idp::TransactionId{std::move(transaction).value()},
         foundation::SecretString{*continuation}, binding.value(),

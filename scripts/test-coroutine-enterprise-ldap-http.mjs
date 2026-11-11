@@ -23,6 +23,16 @@ const start=block("EnterpriseAuthenticationHttpApi::startLdapAsync(",
 const completion=block("EnterpriseAuthenticationHttpApi::completeLdapAsync(");
 const allNative=dispatch+start+completion;
 
+test("LDAP request payload is scrubbed before asynchronous proof verification and on failure",()=>{
+  const requestType=read("src/gateway/gateway.cppm");
+  const gatewayImpl=read("src/gateway/gateway.cpp");
+  assert.match(requestType,/void wipeBody\(\) noexcept/);
+  assert.match(gatewayImpl,/void HttpRequest::wipeBody\(\) noexcept[\s\S]*?foundation::secureWipe\(m_body\.data\(\), m_body\.size\(\)\)/);
+  assert.match(compatibility,/SensitiveRequestBodyGuard wipeOnExit\{request\}/);
+  assert.match(completion,/SensitiveRequestBodyGuard wipeOnExit\{request\}/);
+  assert.match(dispatch,/request\.wipeBody\(\)/);
+  assert.ok(completion.indexOf("request.wipeBody();") < completion.indexOf("co_await m_authentication->completeAsync("));
+});
 test("LDAP JSON input rejects MIME prefix confusion",()=>{
   const parser=block("parseObject(const gateway::HttpRequest& request)", "[[nodiscard]] foundation::Result<std::string> required(");
   assert.match(parser,/\*contentType == "application\/json"/);

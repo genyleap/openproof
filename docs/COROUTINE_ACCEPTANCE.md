@@ -3413,3 +3413,23 @@ runtime acceptance blocker**, not a source-test success. The
 transaction, canonical finalizer, session issuer wiring in
 `apps/opp/main.cpp`, native C++ HTTP GTests and end-to-end LDAP login.
 No live service, production database or public API release was updated.
+
+#### LDAP completion HTTP-body credential lifetime (2026-11-11)
+
+The native LDAP proof route now calls `HttpRequest::wipeBody()` immediately
+before the first asynchronous proof-verification suspension. This erases the
+bytes in the request-owned string in place and clears its logical body.
+`SensitiveRequestBodyGuard` also wipes on early returns, including invalid
+JSON and rate-limited native completion. The synchronous compatibility
+completion and the native-unavailable dispatch path wipe before refusal.
+The separately parsed password buffer is wiped before suspension as well.
+These are best-effort reductions of credential lifetime: they do **not** erase
+allocator history, copies in the transport stack, or OS paging/core dumps.
+
+New source contracts and a Gateway HTTP-request GTest cover the erasure
+API, route identity preservation, and scrub-before-suspend ordering. The
+relevant 14 JavaScript source tests pass. CMake configuration succeeded, but
+a refreshed GCC16 C++ compilation and runtime LDAP network E2E have not
+passed in this change. Because the exported Gateway module interface was
+modified and GCC16 modules require rebuilding dependents, this branch
+remains `NOT_APPROVED`; no production wiring or listener deployment follows.

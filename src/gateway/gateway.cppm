@@ -41,6 +41,10 @@ public:
     [[nodiscard]] std::string_view target() const noexcept;
     [[nodiscard]] std::string_view path() const noexcept;
     [[nodiscard]] std::string_view body() const noexcept;
+    /** Best-effort in-place erasure of sensitive HTTP payload bytes. Call
+     * before suspending a coroutine that has extracted a credential. This
+     * does not erase historical allocator, transport, or kernel copies. */
+    void wipeBody() noexcept;
     [[nodiscard]] std::string_view remoteAddress() const noexcept;
     [[nodiscard]] const foundation::CorrelationId& correlation() const noexcept;
     [[nodiscard]] const Headers& headers() const noexcept;
