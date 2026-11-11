@@ -160,26 +160,39 @@ const checked = segments.map(([name, relative]) => {
     // LDAP is a ChallengeResponse provider: /auth/ldap/start and
     // /auth/ldap/complete live in enterprise.cpp, not in the federated
     // redirect callback. Never count unrelated OAuth work as LDAP coverage.
-    // The dev HTTP module now has native endpoints, but the live app has
-    // not created a native issuer/canonical transaction stack to drive them.
+    // The dev HTTP and composition now contain an opt-in native stack.
+    // Do not confuse source-level dependency wiring with build/E2E acceptance
+    // or automatic production enablement. A default-disabled experimental
+    // feature is still a migration blocker until explicitly certified.
     const enterpriseHttp = cppExecutableText(fs.readFileSync(
       path.join(root,"src/authentication/http/enterprise.cpp"),"utf8"));
     const ldapNative = enterpriseHttp.slice(
       enterpriseHttp.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
-    const app = cppExecutableText(fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8"));
-    if(!/co_await\s+m_authentication->beginAsync\s*\(/.test(ldapNative)
-       || !/co_await\s+m_authentication->completeAsync\s*\(/.test(ldapNative)
-       || !/co_await\s+m_asyncSessions->issueAsync\s*\(/.test(ldapNative)
-       || /m_sessions->issue\s*\(/.test(ldapNative)
-       || !/CoroutinePostgresSessionService/.test(app)
-       || !/CoroutinePostgresCanonicalFinalizer/.test(app)
-       || !/CoroutineAuthenticationTransactionStore/.test(app)
-       || !/CoroutineRouteOverlay nativeRoutes/.test(app)
-       || !/runListener\(platform, nativeRoutes, logger\)/.test(app)
-       || !/runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
-       || !/\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/.test(app))
+    const appSource = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const app = cppExecutableText(appSource);
+    const nativeWiring = /co_await\s+m_authentication->beginAsync\s*\(/.test(ldapNative)
+      && /co_await\s+m_authentication->completeAsync\s*\(/.test(ldapNative)
+      && /co_await\s+m_asyncSessions->issueAsync\s*\(/.test(ldapNative)
+      && !/m_sessions->issue\s*\(/.test(ldapNative)
+      && /std::make_unique<\s*postgres::CoroutinePostgresAuthenticationTransactionStore>/.test(app)
+      && /std::make_unique<\s*postgres::CoroutinePostgresCanonicalFinalizer>/.test(app)
+      && /std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/.test(app)
+      && /std::make_unique<\s*postgres::CoroutinePostgresSessionService>/.test(app)
+      && /std::make_unique<auth::AuthenticationService>/.test(app)
+      && /nativeCanonical.get\(\)/.test(app)
+      && /nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/.test(app)
+      && /fallback, nativeSessions.get\(\)/.test(app)
+      && /auto nativeTrust = trust;/.test(app)
+      && /CoroutineRouteOverlay nativeRoutes/.test(app)
+      && /runListener\(platform, nativeRoutes, logger\)/.test(app)
+      && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
+      && /\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/.test(appSource);
+    if (!nativeWiring)
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
         expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
+    else if (/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/.test(appSource))
+      issues.push({line:0,kind:"LDAP native runtime remains experimental and disabled by default",
+        expression:"complete GCC16 build, real LDAP/PostgreSQL HTTP E2E and security acceptance before production enablement"});
 
     const iface = fs.readFileSync(
       path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");

@@ -58,6 +58,9 @@ target_link_libraries(opp
         openproof_enterprise_scim
         openproof_enterprise_scim_http
         openproof_storage_postgres
+        openproof_postgres_async_auth_repository
+        openproof_postgres_async_canonical
+        openproof_postgres_async_repository
         openproof_operations_http
         openproof_organization
         openproof_session
@@ -67,6 +70,7 @@ target_link_libraries(opp
         openproof_oidc
         openproof_gateway
         openproof_gateway_http
+        Boost::headers
         openproof_security
         openproof_policy
         openproof_compile_options

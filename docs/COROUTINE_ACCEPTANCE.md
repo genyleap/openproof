@@ -3459,3 +3459,41 @@ and PostgreSQL session issuer remain **unconstructed and unbound** in
 `apps/opp/main.cpp`. No GCC C++ build or HTTP network E2E has passed for
 this change, so `NOT_APPROVED` remains mandatory. The existing running
 OpenProof service and production database have not been modified.
+
+#### Dedicated PostgreSQL coroutine LDAP runtime composition (2026-11-11)
+
+`apps/opp/main.cpp` now stages a separate, opt-in native LDAP authentication
+coordinator rather than replacing the synchronous coordinator used by OAuth,
+local accounts, SCIM, SAML, Web3 or administration. The native coordinator
+shares the provider registry, original operator trust policy and configured
+organization, but consumes a dedicated `CoroutinePostgresAuthenticationTransactionStore`
+and awaits `CoroutinePostgresCanonicalFinalizer`. It issues persisted
+sessions through `CoroutinePostgresSessionService` backed by
+`CoroutinePostgresSessionRepository`. The native and compatibility session
+services derive the *same* pre-existing session HMAC key; no separate bearer
+namespace is introduced. Each native SQL repository has a bounded two-slot
+maximum (or smaller configured database pool limit), 2s admission / 3s
+connection / 5s operation deadlines, and receives an independent Asio executor
+with bounded workers. The native repositories and authentication service are
+destroyed before their executor.
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_LDAP` is **absent/disabled by default**; only
+the exact string `1` opts in. The exact value `0` disables it and every
+other explicit value fails startup rather than being silently interpreted.
+These checks happen **before** database connection and schema migration.
+An opt-in with no configured LDAP URI or disabled authentication also fails
+startup. An extra copy of the session HMAC secret is created only while
+native LDAP is explicitly enabled. Without opt-in,
+`/auth/ldap/start` and `/auth/ldap/complete` still fail closed and preserve
+the existing compatibility stack. Native canonical finalization intentionally
+rejects automatic identity self-provisioning: only explicitly linked,
+tenant-active canonical identities can log in. No change is made to the public
+protocol's provider abstraction.
+
+**Acceptance remains blocked**: CMake configuration and source-level wiring
+tests do not prove compiler/linker success, live HTTP/LDAP behavior, DB
+transaction correctness or nonblocking handler lifetime. Do not turn on the
+experimental flag in Production, deploy, merge to `main`, or report this
+phase complete without a verified GCC16 C++ build, disposable PostgreSQL +
+TLS LDAP HTTP challenge/completion E2E, failed-auth/replay tests, and
+comparative performance evidence.

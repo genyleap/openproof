@@ -38,7 +38,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-
+// Native LDAP's bounded libpq connection channels use a dedicated executor.
+// Keep Asio's TLS instantiation in its existing non-module translation unit.
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/thread_pool.hpp>
+#include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
+#include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/storage/postgres/coroutine_session_repository.hpp"
+#include "../../src/storage/postgres/coroutine_session_service.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1361,6 +1369,28 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    // Validate the experimental flag before opening any database connection
+    // or applying migrations. An invalid opt-in must be side-effect-free.
+    const auto nativeLdapFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP");
+    if (nativeLdapFlag && *nativeLdapFlag != "0" && *nativeLdapFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_LDAP must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeLdapEnabled =
+        nativeLdapFlag && *nativeLdapFlag == "1";
+    if (nativeLdapEnabled) {
+        const auto ldapUri = environment.get("OPENPROOF_LDAP_URI");
+        if (!platform.auth().enabled() || !ldapUri || ldapUri->empty()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "Native LDAP requires enabled authentication and a registered LDAP provider."});
+            return ExitCode::ConfigurationError;
+        }
+    }
+
     auto sessionSecret = deriveSecret(
         platform.security().tokenSigningKey(), "openproof/session-key/v1");
     auto contextSecret = deriveSecret(
@@ -1369,6 +1399,10 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
+    // Native issuance must use the legacy session HMAC key. Never create
+    // another copy of that key for a disabled feature.
+    std::optional<fnd::SecretString> nativeSessionSecret;
+    if (nativeLdapEnabled) nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
     auto contextKey = gateway::TrustedContextKey::create(
@@ -2061,6 +2095,10 @@ addProtectedRoutes(gateway::Router& router,
     }
 
     postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
+    // Retain the original synchronous AuthenticationService for the existing
+    // OAuth, account, SAML and other compatibility handlers. LDAP's native
+    // coordinator receives its own identical operator trust policy.
+    auto nativeTrust = trust;
     auth::AuthenticationService authentication{
         providers, transactions, externalIdentities, clock, std::move(trust),
         std::chrono::minutes{5}, &identities,
@@ -2068,6 +2106,58 @@ addProtectedRoutes(gateway::Router& router,
         &identityProviderStore};
     session::SessionService sessions{
         sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
+
+    // Native LDAP is deliberately opt-in until the complete compiler
+    // and real-login E2E acceptance criteria have passed.
+    // The pool owns only its executor and is destroyed *after* the native
+    // repositories. runListener() first stops/joins all handler workers, so
+    // no request may outlive this composition root. Three separate bounded
+    // pools avoid borrowing a synchronous libpq session onto the reactor.
+    std::unique_ptr<boost::asio::thread_pool> nativeIo;
+    std::unique_ptr<postgres::CoroutinePostgresAuthenticationTransactionStore>
+        nativeTransactions;
+    std::unique_ptr<postgres::CoroutinePostgresCanonicalFinalizer>
+        nativeCanonical;
+    std::unique_ptr<postgres::CoroutinePostgresSessionRepository>
+        nativeSessionRepository;
+    std::unique_ptr<postgres::CoroutinePostgresSessionService>
+        nativeSessions;
+    std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
+    if (nativeLdapEnabled) {
+        nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
+        const auto executor = nativeIo->get_executor();
+        const std::size_t nativeConnections =
+            std::min<std::size_t>(2U, platform.database().poolSize());
+        constexpr auto acquireDeadline = std::chrono::seconds{2};
+        constexpr auto connectDeadline = std::chrono::seconds{3};
+        constexpr auto queryDeadline = std::chrono::seconds{5};
+        nativeTransactions = std::make_unique<
+            postgres::CoroutinePostgresAuthenticationTransactionStore>(
+                executor, platform.database().connectionString().clone(),
+                nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+        nativeCanonical = std::make_unique<
+            postgres::CoroutinePostgresCanonicalFinalizer>(
+                executor, platform.database().connectionString().clone(),
+                identity::OrganizationId{
+                    std::string{platform.auth().organizationId()}},
+                nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+        nativeSessionRepository = std::make_unique<
+            postgres::CoroutinePostgresSessionRepository>(
+                executor, platform.database().connectionString().clone(),
+                nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+        nativeSessions = std::make_unique<
+            postgres::CoroutinePostgresSessionService>(
+                *nativeSessionRepository, clock,
+                std::move(*nativeSessionSecret), sessionPolicy);
+        nativeAuthentication = std::make_unique<auth::AuthenticationService>(
+            providers, *nativeTransactions, externalIdentities, clock,
+            std::move(nativeTrust), std::chrono::minutes{5},
+            &identities,
+            identity::OrganizationId{
+                std::string{platform.auth().organizationId()}},
+            &identityProviderStore, nativeCanonical.get());
+    }
+
     std::optional<passkey::PasskeyService> passkeyService;
     if (passkeyConfig) {
         passkeyService.emplace(passkeyRepository, externalIdentities, clock, *passkeyConfig);
@@ -2185,7 +2275,8 @@ addProtectedRoutes(gateway::Router& router,
 
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
-            authentication, sessions, limiter.value(), fallback};
+            nativeAuthentication ? *nativeAuthentication : authentication,
+            sessions, limiter.value(), fallback, nativeSessions.get()};
         return runWithScim(enterpriseApi, enterpriseApi);
     };
 

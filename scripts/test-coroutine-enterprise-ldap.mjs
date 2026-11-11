@@ -43,11 +43,30 @@ test("native LDAP still awaits certificate-verified bounded Asio DNS TCP TLS BER
   assert.doesNotMatch(native,/\bldap_\w+\s*\(/);
 });
 
-test("enterprise LDAP native HTTP awaits auth and issuance but runtime remains unwired",()=>{
+test("native LDAP runtime has a separate, explicitly gated transactional stack",()=>{
   assert.match(enterpriseHttp,/co_await\s+m_authentication->beginAsync\s*\(/);
   assert.match(enterpriseHttp,/co_await\s+m_authentication->completeAsync\s*\(/);
   assert.match(enterpriseHttp,/co_await\s+m_asyncSessions->issueAsync\s*\(/);
-  assert.doesNotMatch(app,/CoroutinePostgresSessionService/);
+  assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP"\)/);
+  assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/);
+  assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*!=\s*"0"/);
+  assert.match(app,/if\s*\(nativeLdapEnabled\)\s*\{/);
+  assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresAuthenticationTransactionStore>/);
+  assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresCanonicalFinalizer>/);
+  assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/);
+  assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionService>/);
+  assert.match(app,/std::make_unique<auth::AuthenticationService>/);
+  assert.match(app,/nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/);
+  assert.match(app,/fallback, nativeSessions\.get\(\)/);
+  assert.match(app,/auto nativeTrust = trust;/);
+  assert.match(app,/if\s*\(nativeLdapEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app,/std::move\(\*nativeSessionSecret\), sessionPolicy/);
+  const server = app.slice(app.indexOf("[[nodiscard]] ExitCode runGatewayServer("));
+  assert.ok(server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP") >= 0
+       && server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP")
+          < server.indexOf("postgres::Migrator migrator{*pool.value()}"),
+    "invalid native flags must fail before any schema migration");
+  assert.match(app,/!platform\.auth\(\)\.enabled\(\)\s*\|\|\s*!ldapUri/);
   assert.match(gate,/LDAP native HTTP login not connected to runtime transaction\/canonical\/session stack/);
   assert.match(gate,/src\/authentication\/http\/enterprise\.cpp/);
 });
