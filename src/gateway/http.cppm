@@ -6,6 +6,7 @@ module;
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <boost/asio/awaitable.hpp>
 
@@ -161,6 +162,34 @@ private:
  * preserves response status and latency accounting without blocking the
  * network reactor or importing operations code into the gateway transport.
  */
+/**
+ * Request-scoped, explicit native-route overlay for partially migrated HTTP
+ * applications. The synchronous application chain remains authoritative for
+ * all other paths; listed paths cannot reach legacy compatibility handlers
+ * when their native dependencies are unavailable. This is a transport adapter,
+ * not part of the OpenProof protocol or a provider-specific implementation.
+ *
+ * Both handlers and this overlay must outlive the listener's request workers.
+ */
+class CoroutineRouteOverlay final : public CoroutineHttpHandler {
+public:
+    CoroutineRouteOverlay(HttpHandler& compatibility,
+                          CoroutineHttpHandler& native,
+                          std::vector<std::string> exactNativePaths);
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
+    [[nodiscard]] bool nativeEnabledFor(
+        const HttpRequest& request) const noexcept override;
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<HttpResponse>
+    handleAsync(HttpRequest request) override;
+private:
+    [[nodiscard]] bool overlays(std::string_view path) const noexcept;
+    [[nodiscard]] static HttpResponse unavailable(const HttpRequest& request);
+    HttpHandler* m_compatibility;
+    CoroutineHttpHandler* m_native;
+    std::vector<std::string> m_exactNativePaths;
+};
+
 class CoroutineMetricsAdapter final : public CoroutineHttpHandler {
 public:
     using Observer = std::function<void(HttpMethod, int, double)>;

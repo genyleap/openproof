@@ -738,6 +738,68 @@ BeastProxyTransport::sendAsync(
         std::move(endpoint), std::move(request), timeout);
 }
 
+CoroutineRouteOverlay::CoroutineRouteOverlay(
+    HttpHandler& compatibility, CoroutineHttpHandler& native,
+    std::vector<std::string> exactNativePaths)
+    : m_compatibility(&compatibility), m_native(&native),
+      m_exactNativePaths(std::move(exactNativePaths))
+{
+}
+
+bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
+{
+    for (const auto& exact : m_exactNativePaths) {
+        if (std::string_view{exact} == path) return true;
+    }
+    return false;
+}
+
+bool CoroutineRouteOverlay::nativeEnabledFor(const HttpRequest& request) const noexcept
+{
+    if (!overlays(request.path())) return false;
+    try {
+        return m_native->nativeEnabledFor(request);
+    } catch (...) {
+        return false;
+    }
+}
+
+HttpResponse CoroutineRouteOverlay::unavailable(const HttpRequest& request)
+{
+    HttpResponse denied{
+        foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
+        Headers{{"content-type", "application/json"}},
+        foundation::toClientJson(
+            foundation::Error{foundation::ErrorCode::Unavailable},
+            request.correlation().value())};
+    denied.setHeader("cache-control", "no-store");
+    denied.setHeader("x-content-type-options", "nosniff");
+    return denied;
+}
+
+HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
+{
+    if (overlays(request.path())) {
+        // An unready native login must never fall back to a blocking or
+        // differently configured compatibility credential handler.
+        request.wipeBody();
+        return unavailable(request);
+    }
+    return m_compatibility->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineRouteOverlay::handleAsync(HttpRequest request)
+{
+    if (!nativeEnabledFor(request)) {
+        // Defense in depth for callers bypassing the listener's capability
+        // dispatch. Never invoke synchronous middleware on an Asio worker.
+        request.wipeBody();
+        co_return unavailable(request);
+    }
+    co_return co_await m_native->handleAsync(std::move(request));
+}
+
 CoroutineMetricsAdapter::CoroutineMetricsAdapter(
     HttpHandler& metricsFacade, CoroutineHttpHandler& fallback, Observer observer)
     : m_metricsFacade(&metricsFacade), m_fallback(&fallback),

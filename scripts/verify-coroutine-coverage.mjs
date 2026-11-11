@@ -166,14 +166,18 @@ const checked = segments.map(([name, relative]) => {
       path.join(root,"src/authentication/http/enterprise.cpp"),"utf8"));
     const ldapNative = enterpriseHttp.slice(
       enterpriseHttp.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
-    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const app = cppExecutableText(fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8"));
     if(!/co_await\s+m_authentication->beginAsync\s*\(/.test(ldapNative)
        || !/co_await\s+m_authentication->completeAsync\s*\(/.test(ldapNative)
        || !/co_await\s+m_asyncSessions->issueAsync\s*\(/.test(ldapNative)
        || /m_sessions->issue\s*\(/.test(ldapNative)
        || !/CoroutinePostgresSessionService/.test(app)
        || !/CoroutinePostgresCanonicalFinalizer/.test(app)
-       || !/CoroutineAuthenticationTransactionStore/.test(app))
+       || !/CoroutineAuthenticationTransactionStore/.test(app)
+       || !/CoroutineRouteOverlay nativeRoutes/.test(app)
+       || !/runListener\(platform, nativeRoutes, logger\)/.test(app)
+       || !/runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
+       || !/\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/.test(app))
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
         expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
 

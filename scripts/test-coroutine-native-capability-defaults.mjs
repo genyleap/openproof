@@ -53,6 +53,28 @@ test("metrics asynchronous entry rejects direct sync and revoked fallback calls"
     /EXPECT_EQ\(disabled\.asynchronousCalls\.load\(\), 0\)/);
 });
 
+test("partially migrated runtime overlays only LDAP with fail-closed native readiness", () => {
+  const app=read("apps/opp/main.cpp");
+  const implementation=read("src/gateway/http.cpp");
+  const overlayStart=implementation.indexOf("CoroutineRouteOverlay::CoroutineRouteOverlay(");
+  const overlayEnd=implementation.indexOf("CoroutineMetricsAdapter::CoroutineMetricsAdapter(", overlayStart);
+  assert.ok(overlayStart >= 0 && overlayEnd > overlayStart);
+  const overlay=implementation.slice(overlayStart, overlayEnd);
+  assert.match(gateway, /class CoroutineRouteOverlay final : public CoroutineHttpHandler/);
+  assert.match(gateway, /m_exactNativePaths/);
+  assert.match(overlay, /m_native->nativeEnabledFor\(request\)/);
+  assert.match(overlay, /m_native->handleAsync\(std::move\(request\)\)/);
+  assert.match(overlay, /if \(overlays\(request.path\(\)\)\)/);
+  assert.match(overlay, /request.wipeBody\(\)/);
+  assert.match(overlay, /return unavailable\(request\)/);
+  assert.doesNotMatch(overlay.slice(overlay.indexOf("CoroutineRouteOverlay::handleAsync(")), /m_compatibility->handle\(/);
+  assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, nativeEnterprise/);
+  assert.match(app, /\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/);
+  assert.match(app, /runListener\(platform, nativeRoutes, logger\)/);
+  assert.match(app, /runWithScim\(enterpriseApi, enterpriseApi\)/);
+  assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets\)/);
+  assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler\)/);
+});
 test("loopback-native test implementations explicitly opt in", () => {
   for (const name of ["CoroutineWaitingHandler", "CoroutineProxyHandler", "CoroutineThrowingHandler"]) {
     const start = gatewayTests.indexOf("class " + name + " final");

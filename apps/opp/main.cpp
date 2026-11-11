@@ -2158,25 +2158,35 @@ addProtectedRoutes(gateway::Router& router,
 
     operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
 
-    const auto runWithEvidence = [&](gateway::HttpHandler& fallback) -> ExitCode {
+    const auto runWithEvidence = [&](
+        gateway::HttpHandler& fallback,
+        gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
         evidenceHttp::Api evidenceApi{
             evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
             sessions, evidenceProviders, limiter.value(), fallback};
         operationsHttp::HealthHttpApi healthApi{readiness, evidenceApi};
-        return runListener(platform, healthApi, logger);
+        // Legacy health, evidence and SCIM middleware remain the authoritative
+        // compatibility chain. Only the two explicit LDAP routes may bypass
+        // that chain, and only if their full native dependency graph is ready.
+        gatewayHttp::CoroutineRouteOverlay nativeRoutes{
+            healthApi, nativeEnterprise,
+            {"/auth/ldap/start", "/auth/ldap/complete"}};
+        return runListener(platform, nativeRoutes, logger);
     };
 
-    const auto runWithScim = [&](gateway::HttpHandler& fallback) -> ExitCode {
-        if (!scimBearerToken) return runWithEvidence(fallback);
+    const auto runWithScim = [&](
+        gateway::HttpHandler& fallback,
+        gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
+        if (!scimBearerToken) return runWithEvidence(fallback, nativeEnterprise);
         scimHttp::Api scimApi{
             scimService, scimBearerToken->clone(), limiter.value(), fallback};
-        return runWithEvidence(scimApi);
+        return runWithEvidence(scimApi, nativeEnterprise);
     };
 
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             authentication, sessions, limiter.value(), fallback};
-        return runWithScim(enterpriseApi);
+        return runWithScim(enterpriseApi, enterpriseApi);
     };
 
     const auto runWithWeb3 = [&](gateway::HttpHandler& fallback,

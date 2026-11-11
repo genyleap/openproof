@@ -532,6 +532,65 @@ TEST(BeastHttpIntegrationTest, SelectiveNativeDispatchPreservesLegacyRoutes)
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native;
+    httpAdapter::CoroutineRouteOverlay overlay{
+        compatibility, native, {"/native", "/native-unavailable"}};
+    EXPECT_FALSE(overlay.nativeEnabled());
+    httpAdapter::BeastHttpServer server{overlay, serverConfig()};
+    ASSERT_TRUE(server.start());
+
+    const auto permitted = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native");
+    const auto normal = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/legacy");
+    const auto nearMatch = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native-other");
+    const auto denied = sendRequest(
+        server.boundPort(), beastHttp::verb::post, "/native-unavailable",
+        R"({"password":"redacted-test-credential"})");
+
+    EXPECT_EQ(permitted.result(), beastHttp::status::ok);
+    EXPECT_EQ(permitted.body(), "native");
+    EXPECT_EQ(normal.result(), beastHttp::status::ok);
+    EXPECT_EQ(normal.body(), "fast");
+    EXPECT_EQ(nearMatch.result(), beastHttp::status::ok);
+    EXPECT_EQ(nearMatch.body(), "fast");
+    EXPECT_EQ(denied.result(), beastHttp::status::service_unavailable);
+    EXPECT_EQ(denied.at("cache-control"), "no-store");
+    EXPECT_EQ(denied.body().find("redacted-test-credential"), std::string::npos);
+    EXPECT_EQ(native.asynchronousCalls.load(), 1);
+    EXPECT_EQ(native.synchronousCalls.load(), 0);
+    EXPECT_EQ(compatibility.received.load(), 2);
+    server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native;
+    httpAdapter::CoroutineRouteOverlay overlay{compatibility, native, {"/native"}};
+    asio::io_context io;
+    std::optional<gw::HttpResponse> result;
+    auto call = [&]() -> asio::awaitable<void> {
+        auto request = gw::HttpRequest::create(
+            gw::HttpMethod::Post, "/legacy", {},
+            "sensitive-test-body", "127.0.0.1",
+            fnd::CorrelationId{"overlay-direct-deny"}).value();
+        result.emplace(co_await overlay.handleAsync(std::move(request)));
+    };
+    auto future = asio::co_spawn(io, call(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->status(), 503);
+    EXPECT_EQ(result->headers().at("cache-control"), "no-store");
+    EXPECT_EQ(compatibility.received.load(), 0);
+    EXPECT_EQ(native.asynchronousCalls.load(), 0);
+}
+
 TEST(BeastHttpIntegrationTest, DisabledCoroutineCapabilityUsesOriginalWireHandler)
 {
     DisabledCoroutineHandler handler;

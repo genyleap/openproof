@@ -3433,3 +3433,29 @@ a refreshed GCC16 C++ compilation and runtime LDAP network E2E have not
 passed in this change. Because the exported Gateway module interface was
 modified and GCC16 modules require rebuilding dependents, this branch
 remains `NOT_APPROVED`; no production wiring or listener deployment follows.
+
+#### Explicit native LDAP overlay at the HTTP listener (2026-11-11)
+
+The live application composition now constructs a transport-neutral
+`gateway::http::CoroutineRouteOverlay` above the existing synchronous
+Health/Evidence/SCIM handlers. Only the exact paths
+`/auth/ldap/start` and `/auth/ldap/complete` can select the
+EnterpriseAuthenticationHttpApi coroutine implementation, and only if that
+handler explicitly reports request-scoped native readiness. Every other
+request follows the unchanged compatibility chain. On listed paths whose
+native service is unavailable, the overlay wipes the inbound body and
+returns a sanitized no-store 503 **without** executing a synchronous
+credential handler. Calling `handleAsync` directly for a non-native
+request likewise fails closed rather than executing compatibility code.
+
+Two real-loopback HTTP GTests were added to cover the permitted native
+route, disabled credential route, exact-path boundaries, original
+compatibility routing, and direct async rejection. The JavaScript
+source gate was extended to verify the production composition passes the
+Enterprise handler through the overlay to `runListener`. This closes
+only the listener-dispatch architecture gap; it does not turn on LDAP
+login. The native auth transaction store, canonical identity finalizer
+and PostgreSQL session issuer remain **unconstructed and unbound** in
+`apps/opp/main.cpp`. No GCC C++ build or HTTP network E2E has passed for
+this change, so `NOT_APPROVED` remains mandatory. The existing running
+OpenProof service and production database have not been modified.
