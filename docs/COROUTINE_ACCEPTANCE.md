@@ -3643,3 +3643,30 @@ the Authorization header is assembled. The source tests in
 scanner prevent regression. Three **prebuilt** X OAuth C++ tests passed; they
 do not certify compilation of the newly modified signer. No network,
 Production service, release or main-branch change was made.
+
+#### Single-owner native persisted bearer handoff (2026-11-12)
+
+The coroutine PostgreSQL session service had an unnecessary protected-bearer
+copy on each return from `issueAsync` and `issueReplacingAsync`. Both
+methods called `issued->token().clone()` after durable persistence, allocating
+a second sensitive buffer inside the coroutine frame. The native
+`CoroutineSessionGrant` now exposes an rvalue-only
+`takeToken() && noexcept` method that transfers the same `SecretString`
+owner into the provider-neutral `CoroutineIssuedSession`, retaining the
+existing ID and public issuer SPI. Both variants invoke
+`std::move(*issued).takeToken()` after successful persistence; error paths
+remain fail-closed and transfer no token. This avoids one secret allocation
+and copy per successful issuance/replacement, but no throughput or latency
+improvement is claimed without actual benchmark measurements.
+
+A new C++ GTest `PostgresCoroutineDomainTest.
+NativeSessionGrantTransfersBearerWithoutCloning` checks moved-from emptiness,
+retained identifier, bearer contents and buffer ownership for a 64-byte token;
+the JS source contract `scripts/test-coroutine-session-token-transfer.mjs`
+and the strict acceptance scanner reject a future return to cloning.
+The new GTest has **not yet been compiled** because of GCC module rebuild
+requirements. A previous CTest filter found no registered
+`PostgresCoroutineDomainTest` tests in the current build directory; that
+result is not a test pass. The remote command allowlist also declined direct
+execution of the prebuilt `openproof_postgres_domain_tests` executable.
+Do not claim E2E SQL acceptance or a completed coroutine migration.

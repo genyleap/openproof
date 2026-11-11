@@ -484,6 +484,16 @@ const checked = segments.map(([name, relative]) => {
        || !/co_await\s+issueReplacing\s*\(/.test(source))
       issues.push({line:0,kind:"missing atomic native session replacement",
         expression:"issueReplacingAsync / co_await issueReplacing"});
+    // Once a durable bearer exists, the native HTTP grant must receive
+    // ownership, not clone a second sensitive allocation inside the frame.
+    const serviceHeader = fs.readFileSync(
+      path.join(root,"src/storage/postgres/coroutine_session_service.hpp"),"utf8");
+    if (!serviceHeader.includes("foundation::SecretString takeToken() && noexcept")
+        || !source.includes("CoroutineSessionGrant::takeToken() && noexcept")
+        || (source.match(/std::move\(\*issued\)\.takeToken\(\)/g) || []).length !== 2
+        || source.includes("issued->token().clone()"))
+      issues.push({line:0,kind:"native session grant duplicates persisted bearer on coroutine return",
+        expression:"rvalue-only takeToken transfers SecretString for both issuer variants"});
     // Session storage cannot restart its SQL budget after waiting on the pool.
     // This catches a class of reactor saturation/response-time regressions
     // without falsely approving the still-blocking legacy PostgreSQL SPI.

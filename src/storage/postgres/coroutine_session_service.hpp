@@ -30,6 +30,9 @@ public:
 
     [[nodiscard]] const session::SessionId& id() const noexcept;
     [[nodiscard]] const foundation::SecretString& token() const noexcept;
+    /** Transfers the persisted bearer exactly once into the native HTTP
+     * grant without cloning secret bytes into another allocation. */
+    [[nodiscard]] foundation::SecretString takeToken() && noexcept;
 
 private:
     session::SessionId m_id;

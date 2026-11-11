@@ -173,6 +173,10 @@ const foundation::SecretString& CoroutineSessionGrant::token() const noexcept
 {
     return m_bearer;
 }
+foundation::SecretString CoroutineSessionGrant::takeToken() && noexcept
+{
+    return std::move(m_bearer);
+}
 
 CoroutinePostgresSessionService::CoroutinePostgresSessionService(
     CoroutinePostgresSessionRepository& repository,
@@ -190,10 +194,11 @@ CoroutinePostgresSessionService::issueAsync(
 {
     auto issued = co_await issue(verification, client);
     if (!issued) co_return foundation::fail(issued.error());
-    // Keep the native repository's existing grant ABI for other consumers.
-    // Only a provider-neutral id + bearer pair crosses this service port.
+    // Keep the repository grant ABI for other consumers while transferring
+    // this newly persisted bearer into its provider-neutral HTTP result.
+    // Cloning here leaves a redundant sensitive allocation in the frame.
     co_return session::CoroutineIssuedSession{
-        issued->id(), issued->token().clone()};
+        issued->id(), std::move(*issued).takeToken()};
 }
 
 asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>
@@ -206,7 +211,7 @@ CoroutinePostgresSessionService::issueReplacingAsync(
         verification, client, previousToken ? &*previousToken : nullptr);
     if (!issued) co_return foundation::fail(issued.error());
     co_return session::CoroutineIssuedSession{
-        issued->id(), issued->token().clone()};
+        issued->id(), std::move(*issued).takeToken()};
 }
 
 asio::awaitable<foundation::Result<CoroutineSessionGrant>>

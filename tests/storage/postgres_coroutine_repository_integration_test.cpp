@@ -408,6 +408,24 @@ asio::awaitable<void> verifyReplacementRefusesDatabaseOutage(
         && issued.error().code() == fnd::ErrorCode::Unavailable;
 }
 
+TEST(PostgresCoroutineDomainTest, NativeSessionGrantTransfersBearerWithoutCloning)
+{
+    const std::string material(64U, 's');
+    pg::CoroutineSessionGrant grant{
+        ses::SessionId{"transfer-session"}, fnd::SecretString{material}};
+    ASSERT_EQ(grant.token().expose(), material);
+    const auto* originalBytes = grant.token().expose().data();
+    const ses::SessionId expectedId = grant.id();
+
+    auto transferred = std::move(grant).takeToken();
+    EXPECT_EQ(transferred.expose(), material);
+    // std::string move ownership is retained instead of cloning 64 bytes;
+    // the original SecretString is now empty and cannot issue again.
+    EXPECT_EQ(transferred.expose().data(), originalBytes);
+    EXPECT_TRUE(grant.token().empty());
+    EXPECT_EQ(grant.id(), expectedId);
+}
+
 TEST(PostgresCoroutineDomainTest, DatabaseOutageNeverIssuesOrReplacesBearer)
 {
     asio::io_context io;
