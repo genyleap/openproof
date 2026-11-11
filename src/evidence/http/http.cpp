@@ -154,7 +154,10 @@ gateway::HttpResponse Api::issueChallenge(gateway::HttpRequest request)
     const identity::provider::ProviderId providerId{*provider};
     auto challenge = m_challenges->issue(identity.value(), providerId);
     if (!challenge) return error(challenge.error(), request);
-    const auto token = challenge->token.expose();
+    // The response must contain the challenge, but this local validation /
+    // serialization path must not make an extra plain std::string copy of
+    // the auto-wiping SecretString-owned token.
+    const auto& token = challenge->token.expose();
     json::object output{
         {"provider", *provider},
         {"challenge", token},

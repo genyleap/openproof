@@ -298,6 +298,11 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,
         kind:"LDAP native re-login does not atomically replace the prior browser session",
         expression:"CoroutineReplacingSessionIssuer, scrubbed old cookie, issueReplacingAsync and native SQL replace"});
+    if (!completion.includes("const auto& bearer = grant->token.expose();")
+        || completion.includes("const auto bearer = grant->token.expose();"))
+      issues.push({line:0,
+        kind:"LDAP issuer copies an unprotected bearer token after native persistence",
+        expression:"reference returned SecretString::expose(), never copy into plain std::string"});
   }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(
@@ -575,6 +580,11 @@ const checked = segments.map(([name, relative]) => {
     if(/\bm_sessions->/.test(nativeSection))
       issues.push({line:0,kind:"native HTTP authentication uses legacy session service",
         expression:"m_sessions->"});
+    if (!nativeSection.includes("const auto& bearer = issued->token.expose();")
+        || nativeSection.includes("const auto bearer = issued->token.expose();"))
+      issues.push({line:0,
+        kind:"native HTTP authentication copies an unprotected bearer token",
+        expression:"reference returned SecretString::expose(), never copy into plain std::string"});
   }
   if(relative==="src/account/http/coroutine_session_http.cpp"){
     const native = executable.slice(

@@ -84,6 +84,8 @@ test("LDAP re-login atomically replaces the prior browser session on native Post
   assert.match(completion,/m_asyncSessions->issueReplacingAsync\(\s*verified\.value\(\), clientContext\(request\), std::move\(previousSessionToken\)\)/);
   assert.doesNotMatch(completion,/m_asyncSessions->issueAsync\s*\(/);
   assert.match(completion,/bearer\.empty\(\) \|\| bearer\.size\(\) > 128U/);
+  assert.match(completion,/const auto& bearer = grant->token\.expose\(\)/);
+  assert.doesNotMatch(completion,/const auto bearer = grant->token\.expose\(\)/);
   assert.match(nativeSessions,/CoroutinePostgresSessionService::issueReplacingAsync\(/);
   assert.match(nativeSessions,/co_await repo\.replace\(/);
   assert.match(nativeSessions,/co_await repo\.use\(/);

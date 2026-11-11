@@ -414,7 +414,9 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     auto grant = co_await m_asyncSessions->issueReplacingAsync(
         verified.value(), clientContext(request), std::move(previousSessionToken));
     if (!grant) co_return error(grant.error(), request, true);
-    const auto bearer = grant->token.expose();
+    // SecretString::expose() returns a reference; copying it to plain auto
+    // would allocate an unprotected bearer that is not scrubbed at destruction.
+    const auto& bearer = grant->token.expose();
     if (bearer.empty() || bearer.size() > 128U
         || !std::ranges::all_of(bearer, [](char symbol) {
             return (symbol >= 'A' && symbol <= 'Z')

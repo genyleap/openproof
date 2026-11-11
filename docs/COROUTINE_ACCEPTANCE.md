@@ -3577,3 +3577,49 @@ replacement rollback, stale cookies, replay and independent sessions; those
 C++ tests have **not** been executed on the current branch in this change.
 Production remains unchanged and the full coroutine release gate remains
 `NOT_APPROVED` pending compiled native HTTP/LDAP/PostgreSQL E2E.
+
+#### No unprotected token copies in HTTP issue responses (2026-11-11)
+
+Three response handlers copied a bearer or one-time challenge with
+`const auto token = secret.expose()`: native enterprise LDAP completion,
+native first-party authentication completion, and Evidence challenge
+issuance. Since `SecretString::expose()` returns `const std::string&`,
+plain `auto` constructs an additional ordinary `std::string` not covered
+by the secret destructor's secure wiping. All three inspection paths now use
+`const auto&`. HTTP response serialization still necessarily contains the
+issued value; the change avoids a redundant local copy, not all transport
+or serializer copies. Source regressions in
+`scripts/test-secret-reference-http.mjs`,
+`scripts/test-coroutine-auth-http-contract.mjs`, and
+`scripts/test-coroutine-enterprise-ldap-http.mjs` protect the corrected
+borrow semantics. The strict coroutine scanner also rejects reintroduced
+plain copies in both native login handlers.
+
+#### Targeted C++ and disposable PostgreSQL validation status (2026-11-11)
+
+**22 existing compiled C++ tests passed** on the isolated server: nine native
+TLS/BER LDAP loopback checks, eleven native authentication service tests,
+one native PostgreSQL deadline test and one synchronous-API rejection test.
+These are **prebuilt binaries**, not a compilation of the latest source
+changes, so they cannot qualify the experimental runtime or certify the
+new security fixes.
+
+A secure disposable PostgreSQL recovery fixture was attempted via
+`python3 scripts/run-disposable-postgres-recovery-tests.py`. It correctly
+refused to run the temporary PostgreSQL instance with root privileges, but
+the remote command environment denied its OS identity switch with
+`runuser: cannot set user id: Operation not permitted`. No PostgreSQL
+instance was started and no production connection was attempted. A separate
+33-case CTest selection included **27 skipped database-dependent cases**.
+CTest can show "100% passed" while counting these skips as nonfailures;
+**the skipped tests are explicitly NOT accepted as SQL validation**.
+No disposable PostgreSQL SQL regression was certified by these attempts.
+
+`cmake -S . -B cmake-build-gcc-release` succeeded with GCC 16.2.
+Configuration invalidated sixteen stale GCC module BMI files. Full native
+C++ recompilation and linking were deliberately not started because this
+rebuild fans out through module dependencies and the previous attempt
+required hundreds of translation units. Keep `NOT_APPROVED` and 17 strict
+blocking findings until isolated DB runner permissions, a bounded
+module-build environment, live HTTP/TLS LDAP/SQL E2E, and benchmark
+acceptance are genuinely resolved.

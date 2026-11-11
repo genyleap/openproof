@@ -80,6 +80,10 @@ test("native verification atomically replaces prior session after the proof", ()
   assert.doesNotMatch(verify, /\bm_sessions->/);
   assert.doesNotMatch(verify, /m_authentication->complete\s*\(/);
   assert.doesNotMatch(verify, /m_asyncSessions->issueAsync\s*\(/);
+  // SecretString::expose returns const std::string&. Plain auto would copy
+  // the bearer into unprotected, non-wiping std::string storage.
+  assert.match(verify, /const auto& bearer = issued->token\.expose\(\)/);
+  assert.doesNotMatch(verify, /const auto bearer = issued->token\.expose\(\)/);
 });
 
 test("provider-neutral native session port is backed by atomic SQL repository", () => {

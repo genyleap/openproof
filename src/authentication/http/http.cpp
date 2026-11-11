@@ -425,7 +425,9 @@ AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
         verified.value(), clientContext(request), std::move(oldToken));
     if (!issued) co_return error(issued.error(), request, true);
 
-    const auto bearer = issued->token.expose();
+    // SecretString::expose() returns a reference; copying it to plain auto
+    // would allocate an unprotected bearer that is not scrubbed at destruction.
+    const auto& bearer = issued->token.expose();
     if (bearer.empty() || bearer.size() > 128U
         || !std::ranges::all_of(bearer, [](char value) {
             return (value >= 'A' && value <= 'Z')
