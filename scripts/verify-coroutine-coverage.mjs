@@ -16,6 +16,7 @@ const segments = [
   ["X provider", "src/providers/x/x.cpp"],
   ["Wallet + Farcaster RPC", "src/providers/web3/web3.cpp"],
   ["Enterprise LDAP", "src/providers/enterprise/enterprise.cpp"],
+  ["Enterprise LDAP native HTTP boundary", "src/authentication/http/enterprise.cpp"],
   ["Trusted authentication canonical completion", "src/authentication/service.cpp"],
   ["HTTP authentication API", "src/authentication/http/http.cpp"],
   ["HTTP Web3 coroutine API", "src/authentication/http/web3.cpp"],
@@ -156,14 +157,26 @@ const checked = segments.map(([name, relative]) => {
        || /\b(?:openLdap|simpleBind|ldap_search|ldap_sasl_bind|co_spawn|context\.run)\s*\(/.test(legacy))
       issues.push({line:0,kind:"LDAP synchronous compatibility can still execute network I/O",
         expression:"sync LDAP completion must deny; native LDAPS verifier is async-only"});
-    // Keep the integration gate RED: disabling old sync LDAP completion
-    // breaks LDAP sign-in until the real federated HTTP path calls the
-    // native authentication service. A blocked feature is not a release.
-    const federatedHttp = cppExecutableText(fs.readFileSync(
-      path.join(root,"src/authentication/http/federated.cpp"),"utf8"));
-    if(!/co_await\s+m_authentication->completeAsync\s*\(/.test(federatedHttp))
-      issues.push({line:0,kind:"LDAP federation HTTP still lacks native authentication completion",
-        expression:"federated HTTP must co_await AuthenticationService::completeAsync"});
+    // LDAP is a ChallengeResponse provider: /auth/ldap/start and
+    // /auth/ldap/complete live in enterprise.cpp, not in the federated
+    // redirect callback. Never count unrelated OAuth work as LDAP coverage.
+    // The dev HTTP module now has native endpoints, but the live app has
+    // not created a native issuer/canonical transaction stack to drive them.
+    const enterpriseHttp = cppExecutableText(fs.readFileSync(
+      path.join(root,"src/authentication/http/enterprise.cpp"),"utf8"));
+    const ldapNative = enterpriseHttp.slice(
+      enterpriseHttp.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
+    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    if(!/co_await\s+m_authentication->beginAsync\s*\(/.test(ldapNative)
+       || !/co_await\s+m_authentication->completeAsync\s*\(/.test(ldapNative)
+       || !/co_await\s+m_asyncSessions->issueAsync\s*\(/.test(ldapNative)
+       || /m_sessions->issue\s*\(/.test(ldapNative)
+       || !/CoroutinePostgresSessionService/.test(app)
+       || !/CoroutinePostgresCanonicalFinalizer/.test(app)
+       || !/CoroutineAuthenticationTransactionStore/.test(app))
+      issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
+        expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
+
     const iface = fs.readFileSync(
       path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");
     const native = cppExecutableText(fs.readFileSync(
@@ -186,6 +199,36 @@ const checked = segments.map(([name, relative]) => {
        || /\b(?:io|context)\.run\s*\(/.test(native))
       issues.push({line:0,kind:"LDAP native provider lacks bounded nonblocking TLS transport",
         expression:"native CoroutineAuthenticationProvider -> Asio TLS/BER bind/search"});
+  }
+  if(relative==="src/authentication/http/enterprise.cpp"){
+    const iface=fs.readFileSync(
+      path.join(root,"src/authentication/http/enterprise.cppm"),"utf8");
+    const compatibility=executable.slice(
+      executable.indexOf("EnterpriseAuthenticationHttpApi::startLdap("),
+      executable.indexOf("EnterpriseAuthenticationHttpApi::nativeEnabledFor("));
+    const native=executable.slice(
+      executable.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
+    const cap=executable.slice(
+      executable.indexOf("EnterpriseAuthenticationHttpApi::nativeEnabledFor("),
+      executable.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
+    if(!/public gateway::http::CoroutineHttpHandler/.test(iface)
+       || !/nativeEnabled\(\) const noexcept override \{ return false; \}/.test(iface)
+       || !/session::CoroutineSessionIssuer\* asyncSessions = nullptr/.test(iface)
+       || !/m_asyncSessions == nullptr/.test(cap)
+       || !/m_authentication->nativeProviderAuthenticationEnabled/.test(cap)
+       || !/if \(!nativeEnabledFor\(request\)\)/.test(native)
+       || !/co_await m_authentication->beginAsync\(/.test(native)
+       || !/co_await m_authentication->completeAsync\(/.test(native)
+       || !/co_await m_asyncSessions->issueAsync\(/.test(native)
+       || !/co_await native->handleAsync\(/.test(native)
+       || !/foundation::ErrorCode::Unavailable/.test(compatibility)
+       || /m_authentication->(?:begin|complete)\s*\(/.test(compatibility)
+       || /m_sessions->(?:issue|authenticate)\s*\(/.test(compatibility)
+       || /m_sessions->/.test(native)
+       || /m_fallback->handle\s*\(/.test(native))
+      issues.push({line:0,
+        kind:"enterprise LDAP HTTP coroutine can bypass async readiness or execute blocking credentials/session",
+        expression:"native provider+issuer readiness, awaited proof and persisted session, denied compatibility"});
   }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(

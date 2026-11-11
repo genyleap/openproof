@@ -3345,3 +3345,71 @@ search, missing subject, untrusted certificate, BER framing, timeout
 and invalid URI. Together with the focused legacy fail-closed test,
 CTest reports **10/10 successful**. No external directory or
 production database was contacted by these isolated tests.
+
+#### Enterprise LDAP HTTP route ownership and coroutine boundary (2026-11-11)
+
+The LDAP provider is a ChallengeResponse provider. Its real network-facing
+endpoints are POST /auth/ldap/start and POST /auth/ldap/complete in
+src/authentication/http/enterprise.cpp. These are NOT the federated
+OAuth Redirect callback endpoints. The previous acceptance-check reference
+to federated.cpp as the owner of LDAP completion was incorrect; the
+coverage gate and source regression checks now inspect the correct endpoint.
+
+The development EnterpriseAuthenticationHttpApi now has request-scoped native
+capability checks and awaited startLdapAsync / completeLdapAsync paths:
+native challenge persistence via AuthenticationService::beginAsync,
+single-use proof redemption and canonical identity finalization via
+completeAsync, and awaited persisted bearer issuance via
+session::CoroutineSessionIssuer::issueAsync. The native route preserves strict
+JSON fields, binding/continuation cookies, username challenge binding,
+SameSite=Strict, rate limiting and redacted no-store failure responses.
+The compatibility LDAP start/complete methods now return Unavailable before
+creating a challenge or consuming a proof; they never call the synchronous
+AuthenticationService or SessionService.
+
+CRITICAL: The production entrypoint apps/opp/main.cpp still does not construct
+and inject CoroutinePostgresSessionService, the required native
+transaction store, or CoroutinePostgresCanonicalFinalizer. The native
+session-issuer parameter therefore defaults to null, and the new route
+is not currently usable from the production listener. Deploying this
+development branch would make LDAP login unavailable; absolutely no merge
+or production rollout is allowed until that dependency stack and end-to-end
+challenge/login tests are complete. The strict migration gate retains one
+LDAP integration blocker and is still NOT_APPROVED at 17 findings.
+
+Eight targeted LDAP HTTP + native provider source tests pass, but static
+tests alone are not acceptance: GCC16 named-module compilation and genuine
+HTTP/LDAP network tests are separate required verification steps.
+
+#### Native LDAP HTTP security verification and build limitation (2026-11-11)
+
+The native LDAP completion also applies a dedicated
+`ldap-complete-ip:` rate limit before parsing passwords, and wipes the
+separately parsed Boost.JSON password buffer before suspending for
+native provider proof verification. The resulting CredentialValue is
+move-only and has its own best-effort secret scrubber. The original
+Gateway-owned HTTP request body remains separately allocated and is
+NOT claimed to be wiped at this boundary. A follow-up audit of request
+buffer lifetime is still necessary.
+
+Four new executable-source contracts in
+`scripts/test-coroutine-enterprise-ldap-http.mjs` cover strict JSON
+input, callback/session cookies, issuer capability checks, direct
+coroutine fail-closed behavior, async proof/issuance ordering and no
+synchronous fallback. The legacy provider + native LDAP contracts also
+verify that the real Enterprise HTTP endpoints are the authoritative
+LDAP challenge routes. CMake configuration succeeds and registers a
+new standalone `openproof_enterprise_coroutine_http_tests` GTest
+target. That C++ target and the modified Enterprise HTTP implementation
+have NOT yet been successfully compiled in GCC.
+
+The initial GCC16 `openproof_authentication_http` attempt required
+228 named-module dependency steps after the global source fingerprint
+was invalidated by the interface change. It was stopped near 23/228
+after several minutes rather than continuing an expensive server-wide
+rebuild while other workloads were active. This is a **build and
+runtime acceptance blocker**, not a source-test success. The
+`NOT_APPROVED` gate remains at 17 findings pending actual native
+transaction, canonical finalizer, session issuer wiring in
+`apps/opp/main.cpp`, native C++ HTTP GTests and end-to-end LDAP login.
+No live service, production database or public API release was updated.

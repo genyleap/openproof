@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Legacy LDAP socket operations are retired. A native Asio LDAPS service
-// remains, but federated HTTP integration is an explicit release blocker.
+// remains, but LDAP enterprise HTTP runtime integration is a release blocker.
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
@@ -12,7 +12,8 @@ const read=p=>fs.readFileSync(path.join(root,p),"utf8");
 const enterprise=cppExecutableText(read("src/providers/enterprise/enterprise.cpp"));
 const native=cppExecutableText(read("src/providers/enterprise/async_ldaps.cpp"));
 const gate=read("scripts/verify-coroutine-coverage.mjs");
-const federated=cppExecutableText(read("src/authentication/http/federated.cpp"));
+const enterpriseHttp=cppExecutableText(read("src/authentication/http/enterprise.cpp"));
+const app=read("apps/opp/main.cpp");
 const sync=enterprise.slice(enterprise.indexOf(
   "LdapAuthenticationProvider::completeAuthentication("),
   enterprise.indexOf("LdapAuthenticationProvider::beginAuthenticationAsync("));
@@ -42,11 +43,13 @@ test("native LDAP still awaits certificate-verified bounded Asio DNS TCP TLS BER
   assert.doesNotMatch(native,/\bldap_\w+\s*\(/);
 });
 
-test("federated HTTP still blocks release until native completion is wired",()=>{
-  assert.match(federated,/m_authentication->complete\s*\(/);
-  assert.doesNotMatch(federated,/co_await\s+m_authentication->completeAsync\s*\(/);
-  assert.match(gate,/LDAP federation HTTP still lacks native authentication completion/);
-  assert.match(gate,/federatedHttp/);
+test("enterprise LDAP native HTTP awaits auth and issuance but runtime remains unwired",()=>{
+  assert.match(enterpriseHttp,/co_await\s+m_authentication->beginAsync\s*\(/);
+  assert.match(enterpriseHttp,/co_await\s+m_authentication->completeAsync\s*\(/);
+  assert.match(enterpriseHttp,/co_await\s+m_asyncSessions->issueAsync\s*\(/);
+  assert.doesNotMatch(app,/CoroutinePostgresSessionService/);
+  assert.match(gate,/LDAP native HTTP login not connected to runtime transaction\/canonical\/session stack/);
+  assert.match(gate,/src\/authentication\/http\/enterprise\.cpp/);
 });
 
 test("LDAP parser validation remains local-only and does not disable SAML",()=>{

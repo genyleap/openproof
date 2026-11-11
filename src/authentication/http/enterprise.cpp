@@ -10,6 +10,9 @@ module;
 #include <string_view>
 #include <utility>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <boost/json.hpp>
 
 module openproof.authentication.enterprise.http;
@@ -124,8 +127,10 @@ void clearState(gateway::HttpResponse& response)
 
 EnterpriseAuthenticationHttpApi::EnterpriseAuthenticationHttpApi(
     AuthenticationService& authentication, session::SessionService& sessions,
-    gateway::TokenBucketRateLimiter& rateLimiter, gateway::HttpHandler& fallback)
+    gateway::TokenBucketRateLimiter& rateLimiter, gateway::HttpHandler& fallback,
+    session::CoroutineSessionIssuer* asyncSessions)
     : m_authentication(&authentication), m_sessions(&sessions),
+      m_asyncSessions(asyncSessions),
       m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
 
 gateway::HttpResponse EnterpriseAuthenticationHttpApi::error(
@@ -150,26 +155,95 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::handle(gateway::HttpReque
     return m_fallback->handle(std::move(request));
 }
 
-gateway::HttpResponse EnterpriseAuthenticationHttpApi::startLdap(gateway::HttpRequest request)
+gateway::HttpResponse EnterpriseAuthenticationHttpApi::startLdap(
+    gateway::HttpRequest request)
 {
+    // Synchronous compatibility cannot create an LDAP challenge whose
+    // completion now requires native Asio. Never mint an unusable state.
+    return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                 request, true);
+}
+
+gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(
+    gateway::HttpRequest request)
+{
+    // No synchronous LDAP directory bind, transaction redemption, or
+    // session repository is allowed from this compatibility handler.
+    return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                 request, true);
+}
+
+bool EnterpriseAuthenticationHttpApi::nativeEnabledFor(
+    const gateway::HttpRequest& request) const noexcept
+{
+    const auto path = request.path();
+    if (path == "/auth/ldap/start" || path == "/auth/ldap/complete") {
+        if (request.method() != gateway::HttpMethod::Post
+            || m_asyncSessions == nullptr) return false;
+        try {
+            return m_authentication->nativeProviderAuthenticationEnabled(
+                idp::ProviderId{"ldap"});
+        } catch (...) {
+            // Capability lookups are noexcept from the listener's point of
+            // view, including OOM during provider-id construction.
+            return false;
+        }
+    }
+    if (path.starts_with("/auth/ldap/")) return false;
+    try {
+        auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+        return native != nullptr && native->nativeEnabledFor(request);
+    } catch (...) {
+        return false;
+    }
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+EnterpriseAuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
+{
+    if (!nativeEnabledFor(request)) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
+    if (request.path() == "/auth/ldap/start"
+        && request.method() == gateway::HttpMethod::Post)
+        co_return co_await startLdapAsync(std::move(request));
+    if (request.path() == "/auth/ldap/complete"
+        && request.method() == gateway::HttpMethod::Post)
+        co_return co_await completeLdapAsync(std::move(request));
+    auto* native = dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
+    if (!native || !native->nativeEnabledFor(request)) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request);
+    }
+    co_return co_await native->handleAsync(std::move(request));
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+EnterpriseAuthenticationHttpApi::startLdapAsync(gateway::HttpRequest request)
+{
+    if (!nativeEnabledFor(request)) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request, true);
+    }
     if (!m_rateLimiter->allow(std::string{"ldap-ip:"} + std::string{request.remoteAddress()})) {
-        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
     auto body = parseObject(request);
-    if (!body || !onlyFields(body.value(), {"username"})) return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
+    if (!body || !onlyFields(body.value(), {"username"})) co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request);
     auto username = required(body.value(), "username", 320U);
-    if (!username) return error(username.error(), request);
+    if (!username) co_return error(username.error(), request);
     auto bindingToken = security::randomTokenBase64Url(32U);
-    if (!bindingToken) return error(bindingToken.error(), request);
+    if (!bindingToken) co_return error(bindingToken.error(), request);
     auto binding = security::sha256(bindingToken.value());
-    if (!binding) return error(binding.error(), request);
+    if (!binding) co_return error(binding.error(), request);
     idp::AuthenticationRequest authenticationRequest{idp::ProviderId{"ldap"}, clientContext(request)};
     authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
     authenticationRequest.setParameter("username", username.value());
-    auto started = m_authentication->begin(authenticationRequest, binding.value(), request.correlation());
-    if (!started) return error(started.error(), request);
+    auto started = co_await m_authentication->beginAsync(
+        std::move(authenticationRequest), binding.value(), request.correlation());
+    if (!started) co_return error(started.error(), request);
     const auto bindingParameter = started->challenge().parameters().find("username_binding");
-    if (bindingParameter == started->challenge().parameters().end()) return error(foundation::Error{foundation::ErrorCode::Internal}, request);
+    if (bindingParameter == started->challenge().parameters().end()) co_return error(foundation::Error{foundation::ErrorCode::Internal}, request);
     json::object output;
     output["transaction_id"] = started->transactionId().value();
     output["challenge_id"] = started->challenge().id().value();
@@ -179,14 +253,27 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::startLdap(gateway::HttpRe
     auto response = jsonResponse(202, std::move(output));
     response.addHeader("set-cookie", cookie(kContinuationCookie, started->continuationToken().expose(), 600));
     response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
-    return response;
+    co_return response;
 }
 
-gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(gateway::HttpRequest request)
+boost::asio::awaitable<gateway::HttpResponse>
+EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
 {
+    // Refuse unavailable native storage before consuming a one-time proof.
+    if (!nativeEnabledFor(request) || m_asyncSessions == nullptr) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
+    // A failed/rapid password attempt must not avoid per-IP completion
+    // throttling by skipping challenge creation.
+    if (!m_rateLimiter->allow(
+            std::string{"ldap-complete-ip:"} + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited},
+                        request, true);
+    }
     auto body = parseObject(request);
     if (!body || !onlyFields(body.value(), {"transaction_id", "challenge_id", "username", "username_binding", "password"})) {
-        return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request, true);
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request, true);
     }
     auto transaction = required(body.value(), "transaction_id", 256U);
     auto challenge = required(body.value(), "challenge_id", 256U);
@@ -196,26 +283,35 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(gateway::Htt
     auto continuation = cookieValue(request, kContinuationCookie);
     auto bindingToken = cookieValue(request, kBindingCookie);
     if (!transaction || !challenge || !username || !usernameBinding || !password || !continuation || !bindingToken) {
-        return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
+        co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
     }
     auto binding = security::sha256(*bindingToken);
-    if (!binding) return error(binding.error(), request, true);
+    if (!binding) co_return error(binding.error(), request, true);
     idp::AuthenticationResponse authenticationResponse{idp::ChallengeId{challenge.value()}, clientContext(request)};
     authenticationResponse.setParameter("username", idp::CredentialValue{username.value()});
     authenticationResponse.setParameter("username_binding", idp::CredentialValue{usernameBinding.value()});
-    authenticationResponse.setParameter("password", idp::CredentialValue{password.value()});
-    auto verified = m_authentication->complete(idp::TransactionId{transaction.value()},
-        foundation::SecretString{*continuation}, binding.value(), authenticationResponse);
-    if (!verified) return error(verified.error(), request, true);
-    auto grant = m_sessions->issue(verified.value(), clientContext(request));
-    if (!grant) return error(grant.error(), request, true);
+    authenticationResponse.setParameter(
+        "password", idp::CredentialValue{std::move(password).value()});
+    // The CredentialValue destructor scrubs the moved password. Also wipe
+    // the separately parsed JSON string before the coroutine suspends.
+    // The inbound HTTP request body remains independently owned by the
+    // Gateway and must be scrubbed at the listener's body lifecycle.
+    auto& parsedPassword = body->at("password").as_string();
+    foundation::secureWipe(parsedPassword.data(), parsedPassword.size());
+    auto verified = co_await m_authentication->completeAsync(
+        idp::TransactionId{std::move(transaction).value()},
+        foundation::SecretString{*continuation}, binding.value(),
+        std::move(authenticationResponse));
+    if (!verified) co_return error(verified.error(), request, true);
+    auto grant = co_await m_asyncSessions->issueAsync(verified.value(), clientContext(request));
+    if (!grant) co_return error(grant.error(), request, true);
     json::object output;
-    output["session_id"] = grant->id().value();
+    output["session_id"] = grant->id.value();
     output["assurance"] = idp::assuranceLevelName(verified->outcome().claimedAssurance());
     auto response = jsonResponse(200, std::move(output));
     clearState(response);
-    response.addHeader("set-cookie", cookie("__Host-openproof-session", grant->token().expose(), 8 * 60 * 60));
-    return response;
+    response.addHeader("set-cookie", cookie("__Host-openproof-session", grant->token.expose(), 8 * 60 * 60));
+    co_return response;
 }
 
 } // namespace openproof::authentication::http

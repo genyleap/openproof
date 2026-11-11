@@ -531,6 +531,39 @@ gtest_discover_tests(openproof_postgres_network_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;network")
 
+# Focused Enterprise LDAP HTTP security regression. It verifies that
+# a missing native transaction/canonical/session stack cannot mint a challenge
+# or redeem a proof, and direct coroutine calls never reach sync handlers.
+# This remains a GCC HTTP named-module compile target until its prerequisites
+# are built; source-contract checks do NOT replace this C++ executable.
+add_executable(openproof_enterprise_coroutine_http_tests
+    authentication/enterprise_coroutine_http_test.cpp)
+target_compile_features(openproof_enterprise_coroutine_http_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_enterprise_coroutine_http_tests PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+set_target_properties(openproof_enterprise_coroutine_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_compile_definitions(openproof_enterprise_coroutine_http_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_enterprise_coroutine_http_tests PRIVATE
+    openproof_authentication_http openproof_authentication
+    openproof_identity_provider openproof_identity_core
+    openproof_session openproof_gateway_http openproof_gateway
+    openproof_foundation openproof_security
+    Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(authentication/enterprise_coroutine_http_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_enterprise_coroutine_http_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_enterprise_coroutine_http_tests
+    TEST_PREFIX "NativeEnterpriseLdapHttp."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "enterprise;ldap;http;async;security")
+
 # Isolated coroutine authentication-coordinator tests. Exercise the same
 # provider-neutral SPI and trusted transaction/identity gates as production,
 # without pulling in the complete legacy HTTP/OAuth umbrella suite.
