@@ -3257,3 +3257,22 @@ validate these controls and fail-closed behavior. Actual disposable
 PostgreSQL integration remains blocked by the remote execution
 sandbox's runuser: cannot set user id: Operation not permitted. Do not
 substitute the production database or report skipped SQL tests as passed.
+
+#### Docs MCP npm dependency security fix (2026-11-11)
+
+An on-host `npm audit --json --package-lock-only --audit-level=moderate`
+initially reported one real transitive moderate-severity vulnerability:
+`@hono/node-server` 2.1.1, GHSA-rmxm-3fg6-px4f
+(CWE-174 double-decoding of static paths, potentially bypassing middleware).
+The remediation is a targeted package-lock-only upgrade of that transitive
+dependency to 2.1.6, above the fixed minimum 2.1.3. The direct MCP SDK
+remains pinned to 1.32.2 and no other lockfile dependencies were modified.
+
+`tools/docs-mcp/test.mjs` now asserts the lockfile never resolves
+`@hono/node-server` below 2.1.3. A clean `npm ci --ignore-scripts`
+succeeded (94 installed packages); `npm run check` and the real local HTTP
+Docs MCP integration `npm test` both passed. The repeated online `npm audit`
+reported 0 vulnerabilities (0 low, moderate, high or critical).
+This targets the GitHub Dependabot moderate alert's matching dependency;
+the precise alert ID and whether GitHub has closed it must be verified
+separately. No production binaries or live service configuration changed.

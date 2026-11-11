@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -7,6 +8,15 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const cwd = dirname(fileURLToPath(import.meta.url));
+// Prevent regression to GHSA-rmxm-3fg6-px4f (CWE-174): the affected
+// transitive Hono adapter could decode a static path twice.
+const lock = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8'));
+const honoVersion = lock.packages?.['node_modules/@hono/node-server']?.version;
+assert.match(honoVersion, /^\d+\.\d+\.\d+$/, 'Hono server must be locked to a concrete release');
+const [honoMajor, honoMinor, honoPatch] = honoVersion.split('.').map(Number);
+assert.ok(honoMajor > 2 || (honoMajor === 2
+  && (honoMinor > 1 || (honoMinor === 1 && honoPatch >= 3))),
+  'GHSA-rmxm-3fg6-px4f: @hono/node-server must be >= 2.1.3');
 const port = 26000 + (process.pid % 17000);
 const endpoint = `http://127.0.0.1:${port}`;
 const server = spawn(process.execPath, [join(cwd, 'server.mjs')], {
