@@ -90,7 +90,10 @@ void clearState(gateway::HttpResponse& response)
 {
     const auto header = request.header("cookie");
     if (!header) return std::nullopt;
-    std::optional<std::string> found;
+    // Keep a view into the request-owned header until the entire cookie
+    // list has passed duplicate and character checks. Otherwise the first
+    // credential is copied before a later duplicate makes us reject it.
+    std::optional<std::string_view> found;
     std::size_t begin = 0U;
     while (begin <= header->size()) {
         const auto end = header->find(';', begin);
@@ -102,12 +105,13 @@ void clearState(gateway::HttpResponse& response)
             if (found || value.empty() || value.size() > 512U || !std::ranges::all_of(value, [](char symbol) {
                     return std::isalnum(static_cast<unsigned char>(symbol)) != 0 || symbol == '-' || symbol == '_';
                 })) return std::nullopt;
-            found = std::string{value};
+            found = value;
         }
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
-    return found;
+    if (!found) return std::nullopt;
+    return std::optional<std::string>{std::in_place, *found};
 }
 
 [[nodiscard]] idp::ClientContext clientContext(const gateway::HttpRequest& request)
@@ -129,6 +133,59 @@ public:
     ~SensitiveRequestBodyGuard() { m_request.wipeBody(); }
 private:
     gateway::HttpRequest& m_request;
+};
+
+// A parsed JSON value and the separate validated std::string each hold
+// independently allocated copies of a password. Wiping only HttpRequest
+// does not cover errors after parsing (missing cookies, invalid fields, etc.).
+class SensitiveRequestCookieGuard final {
+public:
+    explicit SensitiveRequestCookieGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveRequestCookieGuard(const SensitiveRequestCookieGuard&) = delete;
+    SensitiveRequestCookieGuard& operator=(const SensitiveRequestCookieGuard&) = delete;
+    ~SensitiveRequestCookieGuard() { m_request.wipeCookieHeader(); }
+private:
+    gateway::HttpRequest& m_request;
+};
+
+class SensitiveParsedPasswordGuard final {
+public:
+    explicit SensitiveParsedPasswordGuard(json::object* object) noexcept
+        : m_object(object) {}
+    SensitiveParsedPasswordGuard(const SensitiveParsedPasswordGuard&) = delete;
+    SensitiveParsedPasswordGuard& operator=(const SensitiveParsedPasswordGuard&) = delete;
+    ~SensitiveParsedPasswordGuard() { wipe(); }
+
+    void wipe() noexcept
+    {
+        if (m_object == nullptr) return;
+        if (auto* field = m_object->if_contains("password");
+            field != nullptr && field->is_string()) {
+            auto& value = field->as_string();
+            foundation::secureWipe(value.data(), value.size());
+            value.clear();
+        }
+    }
+
+private:
+    json::object* m_object;
+};
+
+class SensitiveCredentialCopyGuard final {
+public:
+    explicit SensitiveCredentialCopyGuard(std::string* value) noexcept
+        : m_value(value) {}
+    SensitiveCredentialCopyGuard(const SensitiveCredentialCopyGuard&) = delete;
+    SensitiveCredentialCopyGuard& operator=(const SensitiveCredentialCopyGuard&) = delete;
+    ~SensitiveCredentialCopyGuard()
+    {
+        if (m_value == nullptr) return;
+        foundation::secureWipe(m_value->data(), m_value->size());
+        m_value->clear();
+    }
+private:
+    std::string* m_value;
 };
 
 [[nodiscard]] gateway::HttpResponse jsonResponse(int status, json::object body)
@@ -174,6 +231,7 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::handle(gateway::HttpReque
 gateway::HttpResponse EnterpriseAuthenticationHttpApi::startLdap(
     gateway::HttpRequest request)
 {
+    SensitiveRequestCookieGuard wipeCookieOnExit{request};
     // Synchronous compatibility cannot create an LDAP challenge whose
     // completion now requires native Asio. Never mint an unusable state.
     return error(foundation::Error{foundation::ErrorCode::Unavailable},
@@ -184,6 +242,7 @@ gateway::HttpResponse EnterpriseAuthenticationHttpApi::completeLdap(
     gateway::HttpRequest request)
 {
     SensitiveRequestBodyGuard wipeOnExit{request};
+    SensitiveRequestCookieGuard wipeCookieOnExit{request};
     // No synchronous LDAP directory bind, transaction redemption, or
     // session repository is allowed from this compatibility handler.
     return error(foundation::Error{foundation::ErrorCode::Unavailable},
@@ -219,7 +278,10 @@ boost::asio::awaitable<gateway::HttpResponse>
 EnterpriseAuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
     if (!nativeEnabledFor(request)) {
-        if (request.path() == "/auth/ldap/complete") request.wipeBody();
+        if (request.path().starts_with("/auth/ldap/")) {
+            request.wipeBody();
+            request.wipeCookieHeader();
+        }
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
@@ -240,6 +302,7 @@ EnterpriseAuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse>
 EnterpriseAuthenticationHttpApi::startLdapAsync(gateway::HttpRequest request)
 {
+    SensitiveRequestCookieGuard wipeCookieOnExit{request};
     if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request, true);
     }
@@ -257,6 +320,7 @@ EnterpriseAuthenticationHttpApi::startLdapAsync(gateway::HttpRequest request)
     idp::AuthenticationRequest authenticationRequest{idp::ProviderId{"ldap"}, clientContext(request)};
     authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
     authenticationRequest.setParameter("username", username.value());
+    request.wipeCookieHeader();
     auto started = co_await m_authentication->beginAsync(
         std::move(authenticationRequest), binding.value(), request.correlation());
     if (!started) co_return error(started.error(), request);
@@ -278,6 +342,7 @@ boost::asio::awaitable<gateway::HttpResponse>
 EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
 {
     SensitiveRequestBodyGuard wipeOnExit{request};
+    SensitiveRequestCookieGuard wipeCookieOnExit{request};
     // Refuse unavailable native storage before consuming a one-time proof.
     if (!nativeEnabledFor(request) || m_asyncSessions == nullptr) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
@@ -291,6 +356,7 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
                         request, true);
     }
     auto body = parseObject(request);
+    SensitiveParsedPasswordGuard wipeParsedOnExit{body ? &body.value() : nullptr};
     if (!body || !onlyFields(body.value(), {"transaction_id", "challenge_id", "username", "username_binding", "password"})) {
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(), request, true);
     }
@@ -299,8 +365,11 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     auto username = required(body.value(), "username", 320U);
     auto usernameBinding = required(body.value(), "username_binding", 256U);
     auto password = required(body.value(), "password", 4096U);
+    SensitiveCredentialCopyGuard wipePasswordCopyOnExit{password ? &password.value() : nullptr};
     auto continuation = cookieValue(request, kContinuationCookie);
+    SensitiveCredentialCopyGuard wipeContinuationOnExit{continuation ? &*continuation : nullptr};
     auto bindingToken = cookieValue(request, kBindingCookie);
+    SensitiveCredentialCopyGuard wipeBindingOnExit{bindingToken ? &*bindingToken : nullptr};
     if (!transaction || !challenge || !username || !usernameBinding || !password || !continuation || !bindingToken) {
         co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
     }
@@ -311,16 +380,22 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     authenticationResponse.setParameter("username_binding", idp::CredentialValue{usernameBinding.value()});
     authenticationResponse.setParameter(
         "password", idp::CredentialValue{std::move(password).value()});
-    // The CredentialValue destructor scrubs the moved password. Also wipe
-    // the separately parsed JSON string before the coroutine suspends.
-    // The inbound HTTP request body remains independently owned by the
-    // Gateway and must be scrubbed at the listener's body lifecycle.
+    // The CredentialValue destructor scrubs the moved password. In addition,
+    // wipe the JSON-owned copy and the request-owned bytes before suspension.
+    // Guards cover all earlier returns and exception unwinding as well.
     auto& parsedPassword = body->at("password").as_string();
     foundation::secureWipe(parsedPassword.data(), parsedPassword.size());
+    parsedPassword.clear();
     request.wipeBody();
+    // Transfer the one-time continuation to an auto-wiping Secret. The
+    // binding cookie is needed only for its digest, not across suspension.
+    foundation::SecretString continuationSecret{std::move(*continuation)};
+    foundation::secureWipe(bindingToken->data(), bindingToken->size());
+    bindingToken->clear();
+    request.wipeCookieHeader();
     auto verified = co_await m_authentication->completeAsync(
         idp::TransactionId{std::move(transaction).value()},
-        foundation::SecretString{*continuation}, binding.value(),
+        std::move(continuationSecret), binding.value(),
         std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
     auto grant = co_await m_asyncSessions->issueAsync(verified.value(), clientContext(request));

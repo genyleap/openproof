@@ -335,6 +335,23 @@ TEST(HttpRequestTest, SensitivePayloadCanBeWipedWithoutChangingRouting)
     EXPECT_TRUE(request.body().empty());
 }
 
+TEST(HttpRequestTest, WipesPreAuthenticationCookiesWithoutDroppingOtherHeaders)
+{
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Post, "/auth/ldap/complete",
+        {{"Cookie", "__Host-openproof-enterprise-continuation=opaque-secret"},
+         {"Content-Type", "application/json"}},
+        "{}", "192.0.2.1", fnd::CorrelationId{"cookie-wipe"}).value();
+    ASSERT_TRUE(request.header("cookie").has_value());
+    request.wipeCookieHeader();
+    EXPECT_FALSE(request.header("cookie").has_value());
+    EXPECT_EQ(request.header("content-type"), "application/json");
+    EXPECT_EQ(request.body(), "{}");
+    EXPECT_EQ(request.path(), "/auth/ldap/complete");
+    request.wipeCookieHeader();
+    EXPECT_FALSE(request.header("cookie").has_value());
+}
+
 TEST(RouterTest, ChoosesLongestSegmentBoundaryPrefix)
 {
     gw::Router router;

@@ -3497,3 +3497,29 @@ experimental flag in Production, deploy, merge to `main`, or report this
 phase complete without a verified GCC16 C++ build, disposable PostgreSQL +
 TLS LDAP HTTP challenge/completion E2E, failed-auth/replay tests, and
 comparative performance evidence.
+
+#### Scrub all LDAP HTTP credential copies (2026-11-11)
+
+LDAP completion receives sensitive material in multiple distinct allocations:
+the original HTTP request body, its parsed Boost.JSON `password` value, a
+separate validated `std::string`, and the browser continuation/binding cookie
+values. Wiping only the inbound body does **not** erase the other allocations.
+The native completion now uses separate RAII guards for the parsed password,
+the extracted password copy, each extracted cookie value, the request body,
+and the cookie header. The guards cover invalid/missing fields, missing or
+duplicated cookies, rate-limited/early failures, and exception unwinding.
+The parsed password and owned header/body are explicitly scrubbed **before**
+the first asynchronous proof-verification suspension. The continuation is
+moved into an auto-wiping `SecretString`; the binding token is wiped after
+hashing. Both synchronous compatibility and fail-closed overlay paths also
+erase cookies before refusing authentication.
+
+The gateway provides `HttpRequest::wipeCookieHeader()`, which erases the
+normalized cookie header in place and removes it without creating another
+copy, while keeping unrelated headers and route information intact. A Gateway
+GTest checks this request behavior and JavaScript contracts verify guard
+presence and ordering; the strict coroutine scan now flags removal of these
+protections. This is best-effort in-process hygiene, **not** guaranteed
+erasure of historical heap reallocations, malformed-parser intermediates,
+transport buffers, swap, or core dumps. Native C++ build and disposable LDAP
+network tests remain unverified; release approval is still blocked.

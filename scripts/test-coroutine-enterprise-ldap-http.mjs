@@ -33,6 +33,47 @@ test("LDAP request payload is scrubbed before asynchronous proof verification an
   assert.match(dispatch,/request\.wipeBody\(\)/);
   assert.ok(completion.indexOf("request.wipeBody();") < completion.indexOf("co_await m_authentication->completeAsync("));
 });
+test("LDAP invalid completion always scrubs parsed password, extracted copy and cookie secrets",()=>{
+  const gatewayType=read("src/gateway/gateway.cppm");
+  const gatewayImpl=read("src/gateway/gateway.cpp");
+  const guards=block("class SensitiveRequestBodyGuard final",
+    "[[nodiscard]] gateway::HttpResponse jsonResponse");
+  assert.match(gatewayType,/void wipeCookieHeader\(\) noexcept/);
+  assert.match(gatewayImpl,/HttpRequest::wipeCookieHeader\(\) noexcept[\s\S]*?foundation::secureWipe\(found->second\.data\(\), found->second\.size\(\)\)/);
+  assert.match(guards,/class SensitiveParsedPasswordGuard final/);
+  assert.match(guards,/~SensitiveParsedPasswordGuard\(\) \{ wipe\(\); \}/);
+  assert.match(guards,/m_object->if_contains\("password"\)/);
+  assert.match(guards,/foundation::secureWipe\(value\.data\(\), value\.size\(\)\)/);
+  assert.match(guards,/class SensitiveCredentialCopyGuard final/);
+  assert.match(guards,/~SensitiveCredentialCopyGuard\(\)/);
+  assert.match(guards,/foundation::secureWipe\(m_value->data\(\), m_value->size\(\)\)/);
+  assert.match(compatibility,/SensitiveRequestCookieGuard wipeCookieOnExit\{request\}/);
+  assert.match(completion,/SensitiveRequestCookieGuard wipeCookieOnExit\{request\}/);
+  assert.match(start,/SensitiveRequestCookieGuard wipeCookieOnExit\{request\}/);
+  const parsedGuard=completion.indexOf("SensitiveParsedPasswordGuard wipeParsedOnExit");
+  const invalidFields=completion.indexOf("!onlyFields(body.value()");
+  const copyGuard=completion.indexOf("SensitiveCredentialCopyGuard wipePasswordCopyOnExit");
+  const missingSecrets=completion.indexOf("if (!transaction || !challenge");
+  assert.ok(parsedGuard >= 0 && parsedGuard < invalidFields);
+  assert.ok(copyGuard >= 0 && copyGuard < missingSecrets);
+  assert.match(completion,/SensitiveCredentialCopyGuard wipeContinuationOnExit/);
+  assert.match(completion,/SensitiveCredentialCopyGuard wipeBindingOnExit/);
+  assert.match(completion,/foundation::SecretString continuationSecret\{std::move\(\*continuation\)\}/);
+  assert.match(completion,/request\.wipeCookieHeader\(\)/);
+  assert.match(dispatch,/request\.wipeCookieHeader\(\)/);
+  const awaitVerification=completion.indexOf("co_await m_authentication->completeAsync(");
+  assert.ok(completion.indexOf("request.wipeCookieHeader();") < awaitVerification);
+  assert.ok(completion.indexOf("request.wipeBody();") < awaitVerification);
+  const cookieParser=block("cookieValue(const gateway::HttpRequest& request,",
+    "[[nodiscard]] idp::ClientContext clientContext(");
+  assert.match(cookieParser,/std::optional<std::string_view> found/);
+  assert.match(cookieParser,/if \(found \|\| value\.empty\(\)/);
+  assert.match(cookieParser,/found = value;/);
+  assert.match(cookieParser,/return std::optional<std::string>\{std::in_place, \*found\}/);
+  assert.doesNotMatch(cookieParser,/found = std::string\{value\}/);
+  const gatewayTest=read("tests/gateway/gateway_test.cpp");
+  assert.match(gatewayTest,/TEST\(HttpRequestTest, WipesPreAuthenticationCookiesWithoutDroppingOtherHeaders\)/);
+});
 test("LDAP JSON input rejects MIME prefix confusion",()=>{
   const parser=block("parseObject(const gateway::HttpRequest& request)", "[[nodiscard]] foundation::Result<std::string> required(");
   assert.match(parser,/\*contentType == "application\/json"/);

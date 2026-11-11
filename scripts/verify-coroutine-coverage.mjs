@@ -246,6 +246,35 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,
         kind:"enterprise LDAP HTTP coroutine can bypass async readiness or execute blocking credentials/session",
         expression:"native provider+issuer readiness, awaited proof and persisted session, denied compatibility"});
+    const completion=executable.slice(
+      executable.indexOf("EnterpriseAuthenticationHttpApi::completeLdapAsync("));
+    const parsedGuard=completion.indexOf("SensitiveParsedPasswordGuard wipeParsedOnExit");
+    const fieldValidation=completion.indexOf("!onlyFields(body.value()");
+    const copiedGuard=completion.indexOf("SensitiveCredentialCopyGuard wipePasswordCopyOnExit");
+    const earlyReturn=completion.indexOf("if (!transaction || !challenge");
+    const beforeVerify=completion.indexOf("co_await m_authentication->completeAsync(");
+    const requestType=fs.readFileSync(path.join(root,"src/gateway/gateway.cppm"),"utf8");
+    const requestImpl=cppExecutableText(fs.readFileSync(
+      path.join(root,"src/gateway/gateway.cpp"),"utf8"));
+    if(!/class SensitiveParsedPasswordGuard final/.test(executable)
+       || !/class SensitiveCredentialCopyGuard final/.test(executable)
+       || !/class SensitiveRequestCookieGuard final/.test(executable)
+       || !/void wipeCookieHeader\(\) noexcept/.test(requestType)
+       || !/void HttpRequest::wipeCookieHeader\(\) noexcept/.test(requestImpl)
+       || !/foundation::secureWipe\(found->second.data\(\), found->second.size\(\)\)/.test(requestImpl)
+       || parsedGuard < 0 || fieldValidation < 0 || parsedGuard > fieldValidation
+       || copiedGuard < 0 || earlyReturn < 0 || copiedGuard > earlyReturn
+       || !/SensitiveCredentialCopyGuard wipeContinuationOnExit/.test(completion)
+       || !/SensitiveCredentialCopyGuard wipeBindingOnExit/.test(completion)
+       || beforeVerify < 0
+       || completion.indexOf("request.wipeBody();") < 0
+       || completion.indexOf("request.wipeBody();") > beforeVerify
+       || completion.indexOf("request.wipeCookieHeader();") < 0
+       || completion.indexOf("request.wipeCookieHeader();") > beforeVerify
+       || !/foundation::SecretString continuationSecret\{std::move\(\*continuation\)\}/.test(completion))
+      issues.push({line:0,
+        kind:"LDAP HTTP credential copies or cookies are retained on early error or coroutine suspension",
+        expression:"RAII scrub parsed JSON, extracted password, cookie copies, and request-owned credential buffers"});
   }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(

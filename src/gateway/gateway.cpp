@@ -240,6 +240,13 @@ void HttpRequest::wipeBody() noexcept
     foundation::secureWipe(m_body.data(), m_body.size());
     m_body.clear();
 }
+void HttpRequest::wipeCookieHeader() noexcept
+{
+    const auto found = m_headers.find("cookie");
+    if (found == m_headers.end()) return;
+    foundation::secureWipe(found->second.data(), found->second.size());
+    m_headers.erase(found);
+}
 std::string_view HttpRequest::remoteAddress() const noexcept { return m_remoteAddress; }
 const foundation::CorrelationId& HttpRequest::correlation() const noexcept { return m_correlation; }
 const Headers& HttpRequest::headers() const noexcept { return m_headers; }

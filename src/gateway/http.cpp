@@ -783,6 +783,7 @@ HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
         // An unready native login must never fall back to a blocking or
         // differently configured compatibility credential handler.
         request.wipeBody();
+        request.wipeCookieHeader();
         return unavailable(request);
     }
     return m_compatibility->handle(std::move(request));
@@ -795,6 +796,7 @@ CoroutineRouteOverlay::handleAsync(HttpRequest request)
         // Defense in depth for callers bypassing the listener's capability
         // dispatch. Never invoke synchronous middleware on an Asio worker.
         request.wipeBody();
+        request.wipeCookieHeader();
         co_return unavailable(request);
     }
     co_return co_await m_native->handleAsync(std::move(request));

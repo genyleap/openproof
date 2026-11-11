@@ -45,6 +45,10 @@ public:
      * before suspending a coroutine that has extracted a credential. This
      * does not erase historical allocator, transport, or kernel copies. */
     void wipeBody() noexcept;
+    /** Erase and remove the pre-authentication cookie header without making
+     * an additional copy of its credentials. Header names are normalized
+     * during construction, so this operation needs no allocation. */
+    void wipeCookieHeader() noexcept;
     [[nodiscard]] std::string_view remoteAddress() const noexcept;
     [[nodiscard]] const foundation::CorrelationId& correlation() const noexcept;
     [[nodiscard]] const Headers& headers() const noexcept;
