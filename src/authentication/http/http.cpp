@@ -30,6 +30,23 @@ constexpr std::string_view kPreauthCookie = "__Host-openproof-preauth";
 constexpr std::string_view kBindingCookie = "__Host-openproof-preauth-binding";
 constexpr std::string_view kSubjectCookie = "__Host-openproof-preauth-subject";
 
+// HMAC input contains a browser-bound secret. Explicit RAII wiping covers
+// exceptions and any early return, not only the successful digest path.
+class SensitiveBindingMaterialGuard final {
+public:
+    explicit SensitiveBindingMaterialGuard(std::string& value) noexcept
+        : m_value(value) {}
+    SensitiveBindingMaterialGuard(const SensitiveBindingMaterialGuard&) = delete;
+    SensitiveBindingMaterialGuard& operator=(const SensitiveBindingMaterialGuard&) = delete;
+    ~SensitiveBindingMaterialGuard()
+    {
+        foundation::secureWipe(m_value.data(), m_value.size());
+        m_value.clear();
+    }
+private:
+    std::string& m_value;
+};
+
 [[nodiscard]] gateway::HttpResponse response(int status, json::object body)
 {
     gateway::HttpResponse output{
@@ -66,6 +83,7 @@ constexpr std::string_view kSubjectCookie = "__Host-openproof-preauth-subject";
         return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     }
     std::string material;
+    SensitiveBindingMaterialGuard wipeMaterialOnExit{material};
     material.reserve(bindingToken.size() + 1U + subject.size());
     material.append(bindingToken);
     material.push_back('\0');

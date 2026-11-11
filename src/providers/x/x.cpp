@@ -61,6 +61,24 @@ constexpr std::size_t kMaximumResponseBytes = 512U * 1024U;
 using Parameter = std::pair<std::string, std::string>;
 using Parameters = std::vector<Parameter>;
 
+// OAuth 1 HMAC signing keys contain percent-encoded shared secrets. A normal
+// string destructor does not wipe them; ranges::fill may be optimized away.
+// Erase on both success and exception unwinding.
+class SensitiveSigningKeyGuard final {
+public:
+    explicit SensitiveSigningKeyGuard(std::string& value) noexcept : m_value(value) {}
+    SensitiveSigningKeyGuard(const SensitiveSigningKeyGuard&) = delete;
+    SensitiveSigningKeyGuard& operator=(const SensitiveSigningKeyGuard&) = delete;
+    ~SensitiveSigningKeyGuard() { wipe(); }
+    void wipe() noexcept
+    {
+        foundation::secureWipe(m_value.data(), m_value.size());
+        m_value.clear();
+    }
+private:
+    std::string& m_value;
+};
+
 [[nodiscard]] foundation::Error authFailure(std::string detail)
 {
     return foundation::Error{
@@ -293,10 +311,11 @@ hmacSha1Base64(std::string_view key, std::string_view data)
     signatureBase.append(percentEncode(normalized));
 
     std::string signingKey = percentEncode(consumerSecret.expose());
+    SensitiveSigningKeyGuard wipeSigningKeyOnExit{signingKey};
     signingKey.push_back('&');
     signingKey.append(percentEncode(tokenSecret));
     auto signature = hmacSha1Base64(signingKey, signatureBase);
-    std::ranges::fill(signingKey, '\0');
+    wipeSigningKeyOnExit.wipe();
     if (!signature) return foundation::fail(signature.error());
 
     parameters.emplace_back("oauth_signature", std::move(signature).value());

@@ -128,6 +128,18 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
   }
+  if(relative==="src/providers/x/x.cpp"){
+    const signing=source.slice(source.indexOf("oauthAuthorization("),
+      source.indexOf("struct HttpResponse final",source.indexOf("oauthAuthorization(")));
+    if(!source.includes("class SensitiveSigningKeyGuard final")
+       || !source.includes("foundation::secureWipe(m_value.data(), m_value.size())")
+       || !signing.includes("SensitiveSigningKeyGuard wipeSigningKeyOnExit{signingKey}")
+       || !signing.includes("wipeSigningKeyOnExit.wipe();")
+       || signing.includes("std::ranges::fill(signingKey"))
+      issues.push({line:0,
+        kind:"X OAuth1 signing key can outlive the HMAC exchange without guaranteed scrubbing",
+        expression:"RAII volatile secret scrub on normal and exceptional exits"});
+  }
   if(relative==="src/providers/github/github.cpp"){
     // All four native OAuth providers share one awaitable HTTPS transport.
     // Completing a verified and framed HTTP response must not wait for the
@@ -567,6 +579,14 @@ const checked = segments.map(([name, relative]) => {
        || /\bm_authentication->(?:begin|complete)\s*\(/.test(legacy))
       issues.push({line:0,kind:"legacy HTTP authentication routes still use synchronous services",
         expression:"AuthenticationHttpApi::login/verify/rotate/logout/recoveryCodes"});
+    const preauth=source.slice(source.indexOf("preauthBinding("),
+      source.indexOf("decodePreauthSubject(",source.indexOf("preauthBinding(")));
+    if(!source.includes("class SensitiveBindingMaterialGuard final")
+       || !source.includes("foundation::secureWipe(m_value.data(), m_value.size())")
+       || !preauth.includes("SensitiveBindingMaterialGuard wipeMaterialOnExit{material}")
+       || preauth.indexOf("wipeMaterialOnExit{material}") > preauth.indexOf("material.append(bindingToken)"))
+      issues.push({line:0,kind:"preauthentication HMAC secret input is not scrubbed on all exits",
+        expression:"RAII secureWipe of browser-bound binding HMAC material"});
     const nativeSection = source.slice(
       source.indexOf("AuthenticationHttpApi::handleAsync("),
       source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));

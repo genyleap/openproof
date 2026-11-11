@@ -3623,3 +3623,23 @@ required hundreds of translation units. Keep `NOT_APPROVED` and 17 strict
 blocking findings until isolated DB runner permissions, a bounded
 module-build environment, live HTTP/TLS LDAP/SQL E2E, and benchmark
 acceptance are genuinely resolved.
+
+#### RAII erase of temporary authentication HMAC material (2026-11-11)
+
+Two existing signing/binding operations retained browser- or provider-secret
+bytes in normal `std::string` buffers. `AuthenticationHttpApi::preauthBinding`
+constructed `bindingToken || NUL || subject` for SHA-256, then returned
+without erasing that temporary. The X OAuth 1.0a HMAC-SHA1 signer kept the
+percent-encoded consumer/token signing key in a plain string and used
+`std::ranges::fill` after signing. A compiler may eliminate a dead-store
+wipe, and an exception could skip it entirely.
+
+Both operations now install noncopyable RAII guards as soon as the sensitive
+buffer is constructed. Their destructors call `foundation::secureWipe`,
+covering normal return and exception unwinding. X OAuth additionally erases
+the key immediately after HMAC computation, rather than retaining it while
+the Authorization header is assembled. The source tests in
+`scripts/test-preauth-signing-material-scrub.mjs` and the strict coroutine
+scanner prevent regression. Three **prebuilt** X OAuth C++ tests passed; they
+do not certify compilation of the newly modified signer. No network,
+Production service, release or main-branch change was made.
