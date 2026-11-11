@@ -201,7 +201,7 @@ private:
 EnterpriseAuthenticationHttpApi::EnterpriseAuthenticationHttpApi(
     AuthenticationService& authentication, session::SessionService& sessions,
     gateway::TokenBucketRateLimiter& rateLimiter, gateway::HttpHandler& fallback,
-    session::CoroutineSessionIssuer* asyncSessions)
+    session::CoroutineReplacingSessionIssuer* asyncSessions)
     : m_authentication(&authentication), m_sessions(&sessions),
       m_asyncSessions(asyncSessions),
       m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
@@ -364,12 +364,18 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     auto challenge = required(body.value(), "challenge_id", 256U);
     auto username = required(body.value(), "username", 320U);
     auto usernameBinding = required(body.value(), "username_binding", 256U);
-    auto password = required(body.value(), "password", 4096U);
+    // Match the native LDAPS provider's 1024-byte limit *before* consuming
+    // a one-time transaction. A larger password is invalid input, not an
+    // LDAP proof attempt that should burn a valid challenge.
+    auto password = required(body.value(), "password", 1024U);
     SensitiveCredentialCopyGuard wipePasswordCopyOnExit{password ? &password.value() : nullptr};
     auto continuation = cookieValue(request, kContinuationCookie);
     SensitiveCredentialCopyGuard wipeContinuationOnExit{continuation ? &*continuation : nullptr};
     auto bindingToken = cookieValue(request, kBindingCookie);
     SensitiveCredentialCopyGuard wipeBindingOnExit{bindingToken ? &*bindingToken : nullptr};
+    auto previousSession = cookieValue(request, "__Host-openproof-session");
+    SensitiveCredentialCopyGuard wipePreviousSessionOnExit{
+        previousSession ? &*previousSession : nullptr};
     if (!transaction || !challenge || !username || !usernameBinding || !password || !continuation || !bindingToken) {
         co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request, true);
     }
@@ -390,6 +396,13 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
     // Transfer the one-time continuation to an auto-wiping Secret. The
     // binding cookie is needed only for its digest, not across suspension.
     foundation::SecretString continuationSecret{std::move(*continuation)};
+    // Preserve the first-party re-login invariant: if the browser presents
+    // a previous authenticated session, its retirement and the new grant
+    // must be one atomic native SQL mutation, never two separate requests.
+    std::optional<foundation::SecretString> previousSessionToken;
+    if (previousSession) {
+        previousSessionToken.emplace(std::move(*previousSession));
+    }
     foundation::secureWipe(bindingToken->data(), bindingToken->size());
     bindingToken->clear();
     request.wipeCookieHeader();
@@ -398,8 +411,20 @@ EnterpriseAuthenticationHttpApi::completeLdapAsync(gateway::HttpRequest request)
         std::move(continuationSecret), binding.value(),
         std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
-    auto grant = co_await m_asyncSessions->issueAsync(verified.value(), clientContext(request));
+    auto grant = co_await m_asyncSessions->issueReplacingAsync(
+        verified.value(), clientContext(request), std::move(previousSessionToken));
     if (!grant) co_return error(grant.error(), request, true);
+    const auto bearer = grant->token.expose();
+    if (bearer.empty() || bearer.size() > 128U
+        || !std::ranges::all_of(bearer, [](char symbol) {
+            return (symbol >= 'A' && symbol <= 'Z')
+                || (symbol >= 'a' && symbol <= 'z')
+                || (symbol >= '0' && symbol <= '9')
+                || symbol == '-' || symbol == '_';
+        })) {
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
+                        request, true);
+    }
     json::object output;
     output["session_id"] = grant->id.value();
     output["assurance"] = idp::assuranceLevelName(verified->outcome().claimedAssurance());

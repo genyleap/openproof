@@ -3548,3 +3548,32 @@ source regression `scripts/test-gateway-credential-scrub.mjs` guards the
 copy-before-validation and scrub-before-erase invariants. C++ compilation and
 end-to-end validation of this change are still outstanding. This does not
 grant coroutine release approval or modify the deployed runtime.
+
+#### Atomic native LDAP browser re-login (2026-11-11)
+
+The opt-in LDAP HTTP completion previously called
+`CoroutineSessionIssuer::issueAsync()`, which always added a new persisted
+session and did not retire the browser's existing authenticated session. The
+first-party login and OAuth callbacks instead implement re-login replacement.
+The enterprise HTTP adapter now explicitly requires
+`CoroutineReplacingSessionIssuer`; native readiness cannot be advertised
+with a basic issuer lacking atomic replacement. On successful LDAP proof
+verification, the endpoint passes an auto-wiping `SecretString` containing
+the previously presented `__Host-openproof-session` cookie (when present)
+to `issueReplacingAsync()`. The bound PostgreSQL session service verifies
+the old digest and issues/revokes in a single native SQL replacement; an
+unknown or expired old cookie is treated as a fresh login. A database error
+fails closed and does not return a new bearer. Cookie, password and JSON
+copies are scrubbed before the verification suspension, and returned bearer
+characters are validated before being placed in a session cookie.
+
+LDAP HTTP now rejects passwords over the provider's **1024-byte** maximum
+before redeeming the one-time challenge, rather than accepting up to 4096
+bytes at the transport layer only to fail inside proof verification. The
+source acceptance tests check replacement invocation, old-token ownership,
+operation ordering and the matching provider bound. Existing native session
+repository integration tests exercise old-session revocation, failed
+replacement rollback, stale cookies, replay and independent sessions; those
+C++ tests have **not** been executed on the current branch in this change.
+Production remains unchanged and the full coroutine release gate remains
+`NOT_APPROVED` pending compiled native HTTP/LDAP/PostgreSQL E2E.

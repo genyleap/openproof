@@ -46,7 +46,7 @@ test("native LDAP still awaits certificate-verified bounded Asio DNS TCP TLS BER
 test("native LDAP runtime has a separate, explicitly gated transactional stack",()=>{
   assert.match(enterpriseHttp,/co_await\s+m_authentication->beginAsync\s*\(/);
   assert.match(enterpriseHttp,/co_await\s+m_authentication->completeAsync\s*\(/);
-  assert.match(enterpriseHttp,/co_await\s+m_asyncSessions->issueAsync\s*\(/);
+  assert.match(enterpriseHttp,/co_await\s+m_asyncSessions->issueReplacingAsync\s*\(/);
   assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP"\)/);
   assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/);
   assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*!=\s*"0"/);

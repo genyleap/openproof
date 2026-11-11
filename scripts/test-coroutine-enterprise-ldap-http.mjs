@@ -74,6 +74,24 @@ test("LDAP invalid completion always scrubs parsed password, extracted copy and 
   const gatewayTest=read("tests/gateway/gateway_test.cpp");
   assert.match(gatewayTest,/TEST\(HttpRequestTest, WipesPreAuthenticationCookiesWithoutDroppingOtherHeaders\)/);
 });
+test("LDAP re-login atomically replaces the prior browser session on native PostgreSQL",()=>{
+  const nativeSessions=read("src/storage/postgres/coroutine_session_service.cpp");
+  assert.match(header,/session::CoroutineReplacingSessionIssuer\* asyncSessions = nullptr/);
+  assert.match(completion,/cookieValue\(request, "__Host-openproof-session"\)/);
+  assert.match(completion,/SensitiveCredentialCopyGuard wipePreviousSessionOnExit/);
+  assert.match(completion,/std::optional<foundation::SecretString> previousSessionToken/);
+  assert.match(completion,/previousSessionToken\.emplace\(std::move\(\*previousSession\)\)/);
+  assert.match(completion,/m_asyncSessions->issueReplacingAsync\(\s*verified\.value\(\), clientContext\(request\), std::move\(previousSessionToken\)\)/);
+  assert.doesNotMatch(completion,/m_asyncSessions->issueAsync\s*\(/);
+  assert.match(completion,/bearer\.empty\(\) \|\| bearer\.size\(\) > 128U/);
+  assert.match(nativeSessions,/CoroutinePostgresSessionService::issueReplacingAsync\(/);
+  assert.match(nativeSessions,/co_await repo\.replace\(/);
+  assert.match(nativeSessions,/co_await repo\.use\(/);
+  assert.ok(completion.indexOf("SensitiveCredentialCopyGuard wipePreviousSessionOnExit")
+      < completion.indexOf("co_await m_authentication->completeAsync("));
+  assert.ok(completion.indexOf("co_await m_authentication->completeAsync(")
+      < completion.indexOf("co_await m_asyncSessions->issueReplacingAsync("));
+});
 test("LDAP JSON input rejects MIME prefix confusion",()=>{
   const parser=block("parseObject(const gateway::HttpRequest& request)", "[[nodiscard]] foundation::Result<std::string> required(");
   assert.match(parser,/\*contentType == "application\/json"/);
@@ -89,7 +107,7 @@ test("legacy LDAP HTTP cannot issue an unredeemable challenge or use blocking se
 test("LDAP routes are request-gated on native transaction, identity and issuer readiness",()=>{
   assert.match(header,/public gateway::http::CoroutineHttpHandler/);
   assert.match(header,/nativeEnabled\(\) const noexcept override \{ return false; \}/);
-  assert.match(header,/session::CoroutineSessionIssuer\* asyncSessions = nullptr/);
+  assert.match(header,/session::CoroutineReplacingSessionIssuer\* asyncSessions = nullptr/);
   const cap=block("EnterpriseAuthenticationHttpApi::nativeEnabledFor(",
     "EnterpriseAuthenticationHttpApi::handleAsync(");
   assert.match(cap,/m_asyncSessions == nullptr/);
@@ -119,7 +137,7 @@ test("native LDAP completion awaits proof redemption and persisted bearer before
   const rules=[
     /onlyFields\(body\.value\(\),/,
     /"transaction_id"/,/"challenge_id"/,/"username"/,/"username_binding"/,/"password"/,
-    /required\(body\.value\(\), "password", 4096U\)/,
+    /required\(body\.value\(\), "password", 1024U\)/,
     /cookieValue\(request, kContinuationCookie\)/,
     /cookieValue\(request, kBindingCookie\)/,
     /security::sha256\(\*bindingToken\)/,
@@ -128,7 +146,7 @@ test("native LDAP completion awaits proof redemption and persisted bearer before
     /std::string\{"ldap-complete-ip:"\}/,
     /foundation::secureWipe\(parsedPassword\.data\(\), parsedPassword\.size\(\)\)/,
     /co_await m_authentication->completeAsync\(/,
-    /co_await m_asyncSessions->issueAsync\(/,
+    /co_await m_asyncSessions->issueReplacingAsync\(/,
     /if \(!grant\)/,
     /clearState\(response\)/,
     /cookie\("__Host-openproof-session", grant->token\.expose\(\)/,
@@ -139,8 +157,8 @@ test("native LDAP completion awaits proof redemption and persisted bearer before
   assert.ok(completion.indexOf("foundation::secureWipe(parsedPassword.data()")
        < completion.indexOf("co_await m_authentication->completeAsync("));
   assert.ok(completion.indexOf("co_await m_authentication->completeAsync(")
-       < completion.indexOf("co_await m_asyncSessions->issueAsync("));
-  assert.ok(completion.indexOf("co_await m_asyncSessions->issueAsync(")
+       < completion.indexOf("co_await m_asyncSessions->issueReplacingAsync("));
+  assert.ok(completion.indexOf("co_await m_asyncSessions->issueReplacingAsync(")
        <completion.indexOf('cookie("__Host-openproof-session"'));
   assert.doesNotMatch(allNative,/m_sessions->|m_authentication->(?:begin|complete)\s*\(/);
   assert.match(source,/SameSite=Strict/);

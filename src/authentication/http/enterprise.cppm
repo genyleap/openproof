@@ -22,7 +22,7 @@ public:
                                     session::SessionService& sessions,
                                     gateway::TokenBucketRateLimiter& rateLimiter,
                                     gateway::HttpHandler& fallback,
-                                    session::CoroutineSessionIssuer* asyncSessions = nullptr);
+                                    session::CoroutineReplacingSessionIssuer* asyncSessions = nullptr);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
@@ -44,7 +44,7 @@ private:
 
     AuthenticationService* m_authentication;
     session::SessionService* m_sessions;
-    session::CoroutineSessionIssuer* m_asyncSessions;
+    session::CoroutineReplacingSessionIssuer* m_asyncSessions;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;
 };

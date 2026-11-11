@@ -172,7 +172,7 @@ const checked = segments.map(([name, relative]) => {
     const app = cppExecutableText(appSource);
     const nativeWiring = /co_await\s+m_authentication->beginAsync\s*\(/.test(ldapNative)
       && /co_await\s+m_authentication->completeAsync\s*\(/.test(ldapNative)
-      && /co_await\s+m_asyncSessions->issueAsync\s*\(/.test(ldapNative)
+      && /co_await\s+m_asyncSessions->issueReplacingAsync\s*\(/.test(ldapNative)
       && !/m_sessions->issue\s*\(/.test(ldapNative)
       && /std::make_unique<\s*postgres::CoroutinePostgresAuthenticationTransactionStore>/.test(app)
       && /std::make_unique<\s*postgres::CoroutinePostgresCanonicalFinalizer>/.test(app)
@@ -230,13 +230,13 @@ const checked = segments.map(([name, relative]) => {
       executable.indexOf("EnterpriseAuthenticationHttpApi::handleAsync("));
     if(!/public gateway::http::CoroutineHttpHandler/.test(iface)
        || !/nativeEnabled\(\) const noexcept override \{ return false; \}/.test(iface)
-       || !/session::CoroutineSessionIssuer\* asyncSessions = nullptr/.test(iface)
+       || !/session::CoroutineReplacingSessionIssuer\* asyncSessions = nullptr/.test(iface)
        || !/m_asyncSessions == nullptr/.test(cap)
        || !/m_authentication->nativeProviderAuthenticationEnabled/.test(cap)
        || !/if \(!nativeEnabledFor\(request\)\)/.test(native)
        || !/co_await m_authentication->beginAsync\(/.test(native)
        || !/co_await m_authentication->completeAsync\(/.test(native)
-       || !/co_await m_asyncSessions->issueAsync\(/.test(native)
+       || !/co_await m_asyncSessions->issueReplacingAsync\(/.test(native)
        || !/co_await native->handleAsync\(/.test(native)
        || !/foundation::ErrorCode::Unavailable/.test(compatibility)
        || /m_authentication->(?:begin|complete)\s*\(/.test(compatibility)
@@ -275,6 +275,29 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,
         kind:"LDAP HTTP credential copies or cookies are retained on early error or coroutine suspension",
         expression:"RAII scrub parsed JSON, extracted password, cookie copies, and request-owned credential buffers"});
+    // A native LDAP login must not leave an authenticated prior browser
+    // session active. Require the stronger atomic replacement capability,
+    // a scrubbed owned token before suspension, and SQL issuer integration.
+    const replacement=completion.indexOf(
+      "co_await m_asyncSessions->issueReplacingAsync(");
+    const previousOwner=completion.indexOf(
+      "std::optional<foundation::SecretString> previousSessionToken");
+    const previousGuard=completion.indexOf(
+      "SensitiveCredentialCopyGuard wipePreviousSessionOnExit");
+    const cookieRead=source.includes(
+      'cookieValue(request, "__Host-openproof-session")');
+    if(!cookieRead
+       || !iface.includes("session::CoroutineReplacingSessionIssuer* m_asyncSessions")
+       || previousGuard < 0 || previousOwner < 0
+       || previousGuard > beforeVerify || previousOwner > beforeVerify
+       || replacement < 0 || replacement < beforeVerify
+       || !completion.includes("std::move(previousSessionToken)")
+       || completion.includes("m_asyncSessions->issueAsync(")
+       || !source.includes('required(body.value(), "password", 1024U)')
+       || !completion.includes("bearer.empty() || bearer.size() > 128U"))
+      issues.push({line:0,
+        kind:"LDAP native re-login does not atomically replace the prior browser session",
+        expression:"CoroutineReplacingSessionIssuer, scrubbed old cookie, issueReplacingAsync and native SQL replace"});
   }
   if(relative==="src/authentication/service.cpp"){
     const nativeReady = source.slice(
