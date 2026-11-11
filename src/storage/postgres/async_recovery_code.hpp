@@ -42,6 +42,14 @@ public:
         AsyncConnection& conn, std::string identityId,
         std::chrono::milliseconds timeout);
 
+    // Native TOTP recovery eligibility: one parameterized SELECT EXISTS
+    // checks that an active canonical identity owns a configured local
+    // authentication connection plus password and enabled TOTP records.
+    // No sensitive credential columns are selected or returned.
+    [[nodiscard]] boost::asio::awaitable<bool> eligible(
+        AsyncConnection& conn, std::string identityId,
+        std::string localProviderId, std::chrono::milliseconds timeout);
+
 private:
     Table m_table;
 };

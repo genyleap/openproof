@@ -3126,3 +3126,94 @@ TOTP confirmation; routing only the final recovery-code insert through a
 coroutine would not make the endpoint nonblocking or preserve the full
 authorization/race boundary. Migration acceptance remains NOT_APPROVED with
 18 blockers. Production service remains unchanged.
+
+#### Bounded active-session index and native recovery-code HTTP boundary (2026-11-08)
+
+Migration 0020 adds the additive partial B-tree index
+`sessions_active_identity_recency` on
+`(identity_id, last_seen_at_ms DESC, id ASC) WHERE state = 0`.
+It matches the native account active-session query's identity scope,
+state predicate and deterministic ORDER BY, keeping inactive history
+outside this pagination index. Three source/SQL-contract tests pass.
+This migration has NOT been applied to any production database or benchmarked
+with representative cardinality. Its regular CREATE INDEX is run within the
+checksum-verifying Migrator's SQL transaction, which can block writes while
+the index is built; it requires a separately reviewed maintenance/online
+rollout strategy before production deployment. It intentionally does not
+change existing schema checksums or the independent OpenProof protocol.
+
+The experimental `CoroutineRecoveryCodeHttpAdapter` is a fail-closed,
+per-request native POST /auth/recovery-codes handler. The compatibility
+`handle()` never invokes a blocking service or fallback. Its
+`handleAsync()` rechecks native capability, rate limits by source IP,
+authenticates a real session through an injected awaitable callback,
+requires IAL2, awaits configured local-provider/TOTP eligibility, awaits
+atomic native recovery issuance and checks eligibility again. If TOTP is no
+longer enabled, all newly generated codes are invalidated before any raw
+code is returned. Success yields the existing 201 JSON codes payload;
+all responses set no-store/no-cache and sanitizer headers. An invalid
+or failing eligibility callback returns a sanitized error, not a success.
+
+`AsyncRecoveryCodeSql::eligible()` implements the nonblocking, parameterized
+`SELECT EXISTS` across active canonical identities, attached configured
+local-provider external identities, password and TOTP credentials. It selects
+no secret columns and permits private TEMP-table testing. The PostgreSQL
+repository exposes `eligibleAsync(identity, configuredProvider)`, with one
+monotonic pool/query budget and sanitized failures. The SQL and native
+HTTP fixture tests include wrong provider, foreign identity, disabled TOTP,
+suspended account, low IAL, missing bearer, failed persistence and final
+eligibility revocation. Five native HTTP source-contract tests have passed.
+**The new HTTP handler is not installed on the production listener.** Its
+GCC C++26 build and real C++ GTests are not yet approved. The migration gate
+must remain NOT_APPROVED until all synchronous HTTP/provider/storage
+compatibility paths and end-to-end tests are resolved.
+
+#### Verified and deferred compiler boundaries (2026-11-08)
+
+The complete GCC 16.2 C++26 `openproof_provider_enterprise` static
+library **built successfully** after the native LDAPS addition. This
+confirms the actual named-module class and its native awaitable provider
+methods compile under the supported GCC toolchain, in addition to the
+standalone Clang 23 local TLS/LDAP test suite (9/9).
+
+A separate targeted GCC build of the Gateway HTTP C++ tests was stopped
+during the expensive `http.cppm` module stage after extended inactivity.
+The new delayed-peer-close-notify C++ GTest is **not yet compiled/run**.
+
+The experimental native recovery-code HTTP library and its C++ GTest are
+now gated behind the CMake option
+`OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=ON`, **OFF by default**.
+The source contracts pass; activation, compilation of the opt-in target,
+end-to-end PostgreSQL authorization checks and production listener
+integration remain outstanding and require explicit approval. The static
+coverage gate still reports all 18 synchronous release blockers.
+
+#### Recovery-code implementation checkpoint (2026-11-11)
+
+The storage-neutral coroutine RecoveryCodeService and new PostgreSQL
+RecoveryCodeRepository still pass their GCC 16/C++26 focused builds.
+The additional PostgreSQL native TOTP/local-provider eligibility query
+and its expanded C++ test executable now also compile and link
+successfully with the production project flags. CTest for recovery
+currently reports **6 actually passed and 4 skipped**: all 5 service
+GTests and the static maximum-size GTest passed; four SQL integration
+scenarios are skipped because OPENPROOF_TEST_POSTGRES is unset.
+
+A private Unix-socket-only PostgreSQL-16 test runner is provided in
+scripts/run-disposable-postgres-recovery-tests.py, which refuses to use
+any production database. Remote Ops' sandbox reports
+`runuser: cannot set user id: Operation not permitted`, even when
+`id` reports root. PostgreSQL refuses to initialize a cluster as root,
+so the isolated SQL scenarios cannot run on this remote sandbox.
+Do not replace this with a connection to the active production cluster.
+Four real SQL integration tests remain outstanding.
+
+The experimental native HTTP Recovery Code handler has 5 passing
+source-contract tests. The default configuration excludes it behind
+OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=OFF. An opt-in GCC build was
+attempted on the isolated development worktree; it has a substantial
+`openproof_gateway_http` C++ module dependency. Neither the handler
+GTests nor the full listener regression have yet passed this build.
+No live routing, merge, release or deployment is authorized.
+
+The 2026-11-11 opt-in native HTTP compile was stopped after more than six minutes in GCC's gateway HTTP named-module dependency; that timeout is a compile-resource limitation, not a passing C++ route test. The opt-in flag in the isolated CMake cache was restored to OFF. No test bundle or production service was replaced. All 109 coroutine source contracts pass; the overall migration gate remains NOT_APPROVED at 18 blocking findings.

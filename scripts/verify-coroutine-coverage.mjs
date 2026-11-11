@@ -27,6 +27,7 @@ const segments = [
   ["PostgreSQL native bounded recovery-code SQL", "src/storage/postgres/async_recovery_code.cpp"],
   ["Native recovery-code domain service", "src/credentials/coroutine_recovery_codes.cpp"],
   ["PostgreSQL native recovery-code adapter", "src/storage/postgres/coroutine_recovery_code_repository.cpp"],
+  ["Native HTTP recovery-code issuance", "src/authentication/http/coroutine_recovery_code_http.cpp"],
   ["PostgreSQL fail-closed coroutine listener", "src/storage/postgres/coroutine_session_listener.cpp"],
   ["HTTP OAuth API", "src/oauth/http/http.cpp"],
   ["HTTP account API", "src/account/http/http.cpp"],
@@ -488,6 +489,41 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"partial account session migration enabled for all routes",
         expression:"nativeEnabled false; nativeEnabledFor per request"});
   }
+  if(relative==="src/authentication/http/coroutine_recovery_code_http.cpp"){
+    const header=fs.readFileSync(
+      path.join(root,"src/authentication/http/coroutine_recovery_code_http.hpp"),"utf8");
+    const handle=executable.slice(
+      executable.indexOf("CoroutineRecoveryCodeHttpAdapter::handle("),
+      executable.indexOf("CoroutineRecoveryCodeHttpAdapter::handleAsync("));
+    const native=executable.slice(
+      executable.indexOf("CoroutineRecoveryCodeHttpAdapter::handleAsync("),
+      executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
+    const issue=executable.slice(
+      executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
+    const firstCheck=issue.indexOf("co_await m_eligible(");
+    const issuance=issue.indexOf("co_await m_recoveryCodes->issue(");
+    const secondCheck=issue.lastIndexOf("co_await m_eligible(");
+    const revocation=issue.indexOf("co_await m_recoveryCodes->revoke(");
+    const response=issue.indexOf("co_return jsonResponse(201");
+    if(!/CoroutineRecoveryCodeHttpAdapter final/.test(header)
+       || !/nativeEnabled\(\) const noexcept override \{ return false; \}/.test(header)
+       || !/boost::asio::awaitable</.test(header)
+       || !/return fail\(foundation::Error\{foundation::ErrorCode::Unavailable\}, request\)/.test(handle)
+       || /m_nativeFallback->handle\(/.test(native)
+       || !/co_return co_await m_nativeFallback->handleAsync\(/.test(native)
+       || !/if \(!nativeEnabledFor\(request\)\)/.test(native)
+       || !/m_rateLimiter->allow\(limitKey\)/.test(issue)
+       || !/gateway::takeSessionCredential\(request\)/.test(issue)
+       || !/co_await m_authenticate\(/.test(issue)
+       || !/idp::AssuranceLevel::Ial2/.test(issue)
+       || firstCheck<0 || issuance<firstCheck || secondCheck<issuance
+       || revocation<secondCheck || response<revocation
+       || !/co_return fail\(/.test(issue)
+       || !/cache-control/.test(source)
+       || !/no-store/.test(source))
+      issues.push({line:0,kind:"native recovery HTTP permits synchronous fallback or unverified plaintext issuance",
+        expression:"native bearer + IAL2 + dual eligibility + atomic recovery issue/revoke before JSON"});
+  }
   if(relative==="src/credentials/coroutine_recovery_codes.cpp"){
     const issue = source.slice(
       source.indexOf("CoroutineRecoveryCodeService::issue("),
@@ -510,7 +546,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"CSPRNG + keyed digest + await atomic persistence before returning secrets"});
   }
   if(relative==="src/storage/postgres/coroutine_recovery_code_repository.cpp"){
-    const entryPoints=["replaceAsync","consumeAsync","remainingAsync"];
+    const entryPoints=["replaceAsync","consumeAsync","remainingAsync","eligibleAsync"];
     const bounded = entryPoints.every(name=>{
       const start = source.indexOf(
         "CoroutinePostgresRecoveryCodeRepository::"+name+"(");
@@ -524,11 +560,24 @@ const checked = segments.map(([name, relative]) => {
         && !/m_impl->pool\.acquire\(\)/.test(part);
     });
     if(!bounded || !/foundation::ErrorCode::AuthenticationFailed/.test(source)
+        || !/m_impl->sql\.eligible\(/.test(source)
+        || !/configuredLocalProvider\.value\(\)/.test(source)
         || /\bPQ(?:exec|execParams|connectdb|reset)\s*\(/.test(executable))
       issues.push({line:0,kind:"native recovery-code adapter bypasses the shared SQL deadline or owner-scoped one-time consumption",
         expression:"bounded async pool/SQL + generic failed/replayed redemption"});
   }
   if(relative==="src/storage/postgres/async_recovery_code.cpp"){
+    const eligible=source.slice(source.indexOf("AsyncRecoveryCodeSql::eligible("));
+    if(!/SELECT EXISTS/.test(eligible)
+       || !/external_identities e/.test(eligible)
+       || !/i.status=0/.test(eligible)
+       || !/password_credentials p/.test(eligible)
+       || !/totp_credentials t/.test(eligible)
+       || !/e.identity_id=\$1 AND e.provider=\$2/.test(eligible)
+       || !/co_await conn.query\(/.test(eligible)
+       || !/result != "true" && result != "false"/.test(eligible))
+      issues.push({line:0,kind:"native recovery eligibility bypasses active identity, local link or TOTP",
+        expression:"one bounded parameterized SELECT EXISTS across active identity, link, password, TOTP"});
     // Recovery-code replay prevention is one identity-scoped DELETE, while
     // replacement must validate the entire batch before atomic BEGIN and
     // must never reintroduce a per-code SQL round trip.
@@ -596,6 +645,13 @@ const checked = segments.map(([name, relative]) => {
         || !/repo\.listActive\(std::move\(identity\), now\)/.test(sessionService))
       issues.push({line:0,kind:"native account session listing counts revoked/expired history or bypasses scoped active SQL",
         expression:"active+unexpired identity predicate before SQL LIMIT, repository check and service dispatch"});
+    const activeSessionIndex = fs.readFileSync(
+      path.join(root,"migrations/0020_active_session_recency.sql"),"utf8")
+      .replace(/--[^\n]*\n/g,"\n").trim();
+    if(!/CREATE INDEX IF NOT EXISTS sessions_active_identity_recency\s+ON openproof\.sessions\s*\(\s*identity_id,\s*last_seen_at_ms DESC,\s*id ASC\s*\)\s*WHERE state = 0;/.test(activeSessionIndex)
+       || /\b(?:DROP|TRUNCATE|DELETE|UPDATE|INSERT|CONCURRENTLY)\b/i.test(activeSessionIndex))
+      issues.push({line:0,kind:"active session pagination lacks a matching partial index",
+        expression:"additive identity+recency index WHERE state=0, no table rewrites"});
     // Concurrency can reorder requests after they capture timestamps. Both
     // native and compatibility SQL must preserve a monotonic idle clock.
     const legacySessions = fs.readFileSync(

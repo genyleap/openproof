@@ -177,4 +177,40 @@ boost::asio::awaitable<std::size_t> AsyncRecoveryCodeSql::remaining(
     co_return countRows(rows);
 }
 
+boost::asio::awaitable<bool> AsyncRecoveryCodeSql::eligible(
+    AsyncConnection& conn, std::string identityId, std::string localProviderId,
+    std::chrono::milliseconds timeout)
+{
+    if (!validIdentity(identityId) || !validIdentity(localProviderId)
+        || timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument{"Invalid recovery-code eligibility parameters"};
+    }
+    // The only identifiers are selected by a compile-time, trusted table
+    // enum. Parameter values never appear in SQL text. Negative results
+    // expose no information about which prerequisite was missing.
+    const std::string prefix = m_table == Table::Production
+        ? "openproof." : "pg_temp.";
+    const std::string sql =
+        "SELECT EXISTS ("
+        "SELECT 1 FROM " + prefix + "external_identities e "
+        "JOIN " + prefix + "identities i "
+        "ON i.id=e.identity_id AND i.status=0 "
+        "JOIN " + prefix + "password_credentials p "
+        "ON p.identity_id=e.identity_id "
+        "JOIN " + prefix + "totp_credentials t "
+        "ON t.identity_id=e.identity_id "
+        "WHERE e.identity_id=$1 AND e.provider=$2)::text";
+    auto rows = co_await conn.query(
+        sql, {std::move(identityId), std::move(localProviderId)}, timeout);
+    if (rows.rows.size() != 1U || rows.rows.front().size() != 1U
+        || !rows.rows.front().front()) {
+        throw std::runtime_error{"Recovery-code eligibility result is invalid"};
+    }
+    const std::string& result = *rows.rows.front().front();
+    if (result != "true" && result != "false") {
+        throw std::runtime_error{"Recovery-code eligibility result is malformed"};
+    }
+    co_return result == "true";
+}
+
 } // namespace openproof::storage::postgres::async_detail

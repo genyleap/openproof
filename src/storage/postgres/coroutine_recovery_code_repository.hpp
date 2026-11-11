@@ -13,6 +13,7 @@
 
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.provider;
 
 namespace openproof::storage::postgres {
 
@@ -42,6 +43,12 @@ public:
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
     remainingAsync(identity::core::IdentityId identity) override;
+
+    // Vendor-specific eligibility query; exposed only as an awaitable so the
+    // HTTP layer can inject a provider-neutral Eligible callback.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<bool>>
+    eligibleAsync(identity::core::IdentityId identity,
+                  identity::provider::ProviderId configuredLocalProvider);
 
 private:
     class Impl;

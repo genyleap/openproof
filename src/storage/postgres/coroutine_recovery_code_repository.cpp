@@ -150,4 +150,29 @@ CoroutinePostgresRecoveryCodeRepository::remainingAsync(
     }
 }
 
+asio::awaitable<foundation::Result<bool>>
+CoroutinePostgresRecoveryCodeRepository::eligibleAsync(
+    identity::core::IdentityId identity,
+    identity::provider::ProviderId configuredLocalProvider)
+{
+    if (identity.empty() || configuredLocalProvider.empty()) {
+        co_return foundation::fail(
+            foundation::ErrorCode::InvalidArgument,
+            "Recovery-code eligibility requires a local provider and identity.");
+    }
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        co_return co_await m_impl->sql.eligible(
+            lease.connection(), std::string{identity.value()},
+            std::string{configuredLocalProvider.value()}, remaining(deadline));
+    } catch (const std::exception&) {
+        // SQL failures must not be mistaken for ineligible users (412), nor
+        // may database diagnostic strings leak through public HTTP responses.
+        co_return foundation::fail(
+            foundation::ErrorCode::Unavailable,
+            "Recovery-code eligibility cannot be verified.");
+    }
+}
+
 } // namespace openproof::storage::postgres

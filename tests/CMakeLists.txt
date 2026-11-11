@@ -602,6 +602,42 @@ gtest_discover_tests(openproof_coroutine_recovery_code_service_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "credentials;async;security")
 
+if(TARGET openproof_authentication_async_recovery_http)
+# Native recovery-code HTTP boundary and TOTP eligibility recheck. A fake
+# asynchronous session/eligibility pair and a real CSPRNG/HMAC recovery-code
+# service exercise 401/403/412, credential withholding and rollback paths.
+add_executable(openproof_coroutine_recovery_code_http_tests
+    authentication/coroutine_recovery_code_http_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
+target_compile_features(openproof_coroutine_recovery_code_http_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_coroutine_recovery_code_http_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src/authentication/http"
+    "${PROJECT_SOURCE_DIR}/src/credentials"
+    "${googletest_SOURCE_DIR}/googletest/include")
+set_target_properties(openproof_coroutine_recovery_code_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_compile_definitions(openproof_coroutine_recovery_code_http_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_coroutine_recovery_code_http_tests PRIVATE
+    openproof_authentication_async_recovery_http
+    openproof_credentials_async openproof_gateway_http openproof_gateway
+    openproof_session openproof_foundation openproof_identity_core
+    openproof_identity_provider openproof_security Boost::headers
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(authentication/coroutine_recovery_code_http_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_coroutine_recovery_code_http_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_coroutine_recovery_code_http_tests
+    TEST_PREFIX "NativeRecoveryHttp."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "authentication;async;security")
+endif()
+
 # Native bounded recovery-code replacement / one-time redemption. PG TEMP
 # tables ensure no production identity's codes are read or overwritten.
 add_executable(openproof_postgres_async_recovery_code_tests

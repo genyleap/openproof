@@ -89,3 +89,26 @@ test("disposable PostgreSQL regressions cover replay, tenant scope, bound and fa
     /poisonedBeforeRollback = !conn->reusable\(\)/,
   ]) assert.match(cppTest,item);
 });
+
+
+test("local recovery eligibility is one active-identity and TOTP query",()=>{
+  assert.match(header,/boost::asio::awaitable<bool> eligible\(/);
+  const eligible=raw.slice(raw.indexOf("AsyncRecoveryCodeSql::eligible("));
+  for(const re of [
+    /SELECT EXISTS/,
+    /external_identities e/,
+    /identities i/,
+    /i\.status=0/,
+    /password_credentials p/,
+    /totp_credentials t/,
+    /e\.identity_id=\$1 AND e\.provider=\$2/,
+    /co_await conn\.query\(/,
+    /result != "true" && result != "false"/,
+    /co_return result == "true"/,
+  ]) assert.match(eligible,re);
+  assert.doesNotMatch(eligible,/\b(?:PQexec|PQexecParams|PQconnectdb|io\.run)\s*\(/);
+  assert.match(cppTest,/NativeEligibilityRequiresLocalConnectionTotpAndActiveIdentity/);
+  assert.match(cppTest,/wrongProvider/);
+  assert.match(cppTest,/totpDisabled/);
+  assert.match(cppTest,/suspended/);
+});

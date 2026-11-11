@@ -130,6 +130,41 @@ asio::awaitable<void> failedInsertPoisonsLease(
     // The pool must never reuse this lease or return partially changed data.
 }
 
+asio::awaitable<void> eligibilityLifecycle(
+    std::string dsn, bool& allowed, bool& wrongProvider,
+    bool& wrongIdentity, bool& totpDisabled, bool& suspended)
+{
+    auto conn = co_await pg::AsyncConnection::connect(std::move(dsn), 3s);
+    // Only these four disposable PG TEMP tables exist on this connection;
+    // never create or modify canonical OpenProof identity/credential rows.
+    for (const auto& sql : {
+        "CREATE TEMP TABLE identities (id text PRIMARY KEY,status smallint NOT NULL)",
+        "CREATE TEMP TABLE external_identities (identity_id text NOT NULL,provider text NOT NULL)",
+        "CREATE TEMP TABLE password_credentials (identity_id text PRIMARY KEY)",
+        "CREATE TEMP TABLE totp_credentials (identity_id text PRIMARY KEY)",
+        "INSERT INTO pg_temp.identities VALUES ('identity-A',0)",
+        "INSERT INTO pg_temp.external_identities VALUES ('identity-A','local')",
+        "INSERT INTO pg_temp.password_credentials VALUES ('identity-A')",
+        "INSERT INTO pg_temp.totp_credentials VALUES ('identity-A')"
+    }) {
+        static_cast<void>(co_await conn->query(sql, {}, 3s));
+    }
+    pg::AsyncRecoveryCodeSql sql{pg::AsyncRecoveryCodeSql::Table::TemporaryTest};
+    allowed = co_await sql.eligible(*conn, "identity-A", "local", 3s);
+    wrongProvider = !(co_await sql.eligible(*conn, "identity-A", "github", 3s));
+    wrongIdentity = !(co_await sql.eligible(*conn, "identity-B", "local", 3s));
+    static_cast<void>(co_await conn->query(
+        "DELETE FROM pg_temp.totp_credentials WHERE identity_id='identity-A'",
+        {}, 3s));
+    totpDisabled = !(co_await sql.eligible(*conn, "identity-A", "local", 3s));
+    static_cast<void>(co_await conn->query(
+        "INSERT INTO pg_temp.totp_credentials VALUES ('identity-A')", {}, 3s));
+    static_cast<void>(co_await conn->query(
+        "UPDATE pg_temp.identities SET status=1 WHERE id='identity-A'",
+        {}, 3s));
+    suspended = !(co_await sql.eligible(*conn, "identity-A", "local", 3s));
+}
+
 } // namespace
 
 TEST(AsyncRecoveryCodeSqlTest, MaximumSetIsDeclaredOnce)
@@ -191,4 +226,25 @@ TEST(AsyncRecoveryCodeSqlTest, FailedInsertPoisonsLeaseInsteadOfCommitting)
     io.run();
     ASSERT_NO_THROW(done.get());
     EXPECT_TRUE(poisoned);
+}
+
+
+TEST(AsyncRecoveryCodeSqlTest, NativeEligibilityRequiresLocalConnectionTotpAndActiveIdentity)
+{
+    const char* dsn = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!dsn || !*dsn)
+        GTEST_SKIP() << "No disposable PostgreSQL URI configured";
+    asio::io_context io;
+    bool allowed = false, wrongProvider = false, wrongIdentity = false;
+    bool totpDisabled = false, suspended = false;
+    auto done = asio::co_spawn(io,
+        eligibilityLifecycle(dsn, allowed, wrongProvider, wrongIdentity,
+                             totpDisabled, suspended), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(allowed);
+    EXPECT_TRUE(wrongProvider);
+    EXPECT_TRUE(wrongIdentity);
+    EXPECT_TRUE(totpDisabled);
+    EXPECT_TRUE(suspended);
 }
