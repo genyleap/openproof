@@ -5,6 +5,13 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pgbin="${OPENPROOF_TEST_PGBIN:-/usr/lib/postgresql/16/bin}"
+# Fail before allocating any test directory if a restricted root runner
+# cannot switch to postgres. Never attempt to run postgres as root.
+if [[ "$(id -u)" == 0 ]] &&
+   ! runuser -u postgres -- /usr/bin/true; then
+    echo "Disposable canonical PostgreSQL requires a postgres-capable runner; no database started." >&2
+    exit 1
+fi
 work="$(mktemp -d /tmp/openproof-canonical-pg.XXXXXXXX)"
 port=55418
 started=0
@@ -52,6 +59,7 @@ ctest --test-dir "$repo/cmake-build-gcc-release" \
 # A skipped SQL test must never be mistaken for acceptance of the real DB
 # contract, even if other offline cases passed.
 if [[ ! -s "$work/test-results.xml" ]] \
+    || ! grep -q '<testcase' "$work/test-results.xml" \
     || grep -q '<skipped' "$work/test-results.xml"; then
     echo "Disposable canonical PostgreSQL suite did not exercise every test" >&2
     exit 1

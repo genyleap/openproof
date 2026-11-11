@@ -5,6 +5,14 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pgbin="${OPENPROOF_TEST_PGBIN:-/usr/lib/postgresql/16/bin}"
+# PostgreSQL must never start as root. Some remote shells report uid=0
+# but cannot change identity. Check before even creating a fixture directory,
+# so a failed setuid leaves no orphaned private test directory.
+if [[ "$(id -u)" == 0 ]] &&
+   ! runuser -u postgres -- /usr/bin/true; then
+    echo "Disposable PostgreSQL requires a runner permitted to drop to postgres; no database started." >&2
+    exit 1
+fi
 work="$(mktemp -d /tmp/openproof-auth-pg.XXXXXXXX)"
 port=55417
 started=0
@@ -35,4 +43,13 @@ started=1
 # SQL tests create TEMP tables in the fixture; no production schema is touched.
 export OPENPROOF_TEST_POSTGRES="host=$work port=$port user=$(if [[ $(id -u) == 0 ]]; then echo postgres; else id -un; fi) dbname=postgres"
 ctest --test-dir "$repo/cmake-build-gcc-release" \
-    -R '^NativePgAuthTransaction' --output-on-failure -V -j 1
+    -R '^NativePgAuthTransaction' --output-on-failure -V -j 1 \
+    --output-junit "$work/test-results.xml"
+# CTest may exit zero with all SQL tests SKIPPED. That is a failure of
+# native database acceptance, never a passing PostgreSQL integration run.
+if [[ ! -s "$work/test-results.xml" ]] \
+    || ! grep -q '<testcase' "$work/test-results.xml" \
+    || grep -q '<skipped' "$work/test-results.xml"; then
+    echo "Disposable authentication PostgreSQL tests missing or skipped; SQL acceptance denied." >&2
+    exit 1
+fi

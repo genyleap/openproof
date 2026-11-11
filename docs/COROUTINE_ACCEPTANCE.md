@@ -3670,3 +3670,26 @@ requirements. A previous CTest filter found no registered
 result is not a test pass. The remote command allowlist also declined direct
 execution of the prebuilt `openproof_postgres_domain_tests` executable.
 Do not claim E2E SQL acceptance or a completed coroutine migration.
+
+#### Disposable PostgreSQL acceptance must execute SQL, not skip it (2026-11-12)
+
+The auth-transaction SQL fixture previously trusted a zero CTest exit code:
+CTest can exit successfully even when every PostgreSQL integration case was
+reported `SKIPPED` (or when no tests were discovered). Both the auth and
+canonical SQL fixtures now write JUnit results and **reject missing/empty
+testcase output or any `<skipped` testcase**, in addition to CTest's normal
+nonzero-failure status. When executed as uid 0, the fixture also checks
+`runuser -u postgres` capability **before** allocating a temporary
+directory, refusing a restricted root shell rather than leaking a fixture
+directory or falling back to any host/Production PostgreSQL. The fixtures
+continue to bind only to private temporary Unix-domain sockets, never TCP.
+The source-only regression `scripts/test-disposable-postgres-acceptance.mjs`
+guards these invariants.
+
+A bounded build attempt for the PostgreSQL domain test target on this server
+expanded to **396 Ninja steps** due stale GCC 16 module dependencies. It was
+terminated deliberately after 17 dependency-scan steps and its SIGTERM exit
+was confirmed. No compiled result or benchmark may be claimed from it.
+Remote command restrictions prevent executing the Bash fixture directly,
+and the restricted root runtime cannot change OS identity to `postgres`.
+Neither native SQL E2E nor fresh C++ acceptance has passed on this host.
