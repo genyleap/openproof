@@ -3523,3 +3523,28 @@ protections. This is best-effort in-process hygiene, **not** guaranteed
 erasure of historical heap reallocations, malformed-parser intermediates,
 transport buffers, swap, or core dumps. Native C++ build and disposable LDAP
 network tests remain unverified; release approval is still blocked.
+
+#### Shared Gateway bearer/cookie credential scrubbing (2026-11-11)
+
+The existing protected-route `gateway::takeSessionCredential()` previously
+copied Bearer and session-cookie values into ordinary `std::string` objects
+that could be destroyed without erasure, and discarded incoming Authorization
+or Cookie header storage using `eraseHeader()` without overwriting the
+credential bytes. This also affected invalid and duplicate credentials.
+The extractor now holds parsed Bearer credentials in `SecretString`, delays
+the copy of a session cookie until all cookie duplicates and syntax have been
+checked using request-owned `string_view` slices, and scrubs the original
+header allocations through `wipeAuthorizationHeader()` and
+`wipeCookieHeader()`. Unrelated application cookies are reconstructed using
+views instead of a vector of plain-string copies. Ambiguous authentication
+(Bearer and session cookie together), a duplicate session cookie, or invalid
+authorization fails closed and erases the presented headers. Accepted bearer
+or cookie material remains owned by the auto-wiping `SecretString` type.
+
+Four focused C++ Gateway GTests cover valid bearer, valid session cookie,
+duplicated/mixed credentials and unauthenticated requests while checking the
+unrelated-cookie and non-secret-header compatibility contract. The companion
+source regression `scripts/test-gateway-credential-scrub.mjs` guards the
+copy-before-validation and scrub-before-erase invariants. C++ compilation and
+end-to-end validation of this change are still outstanding. This does not
+grant coroutine release approval or modify the deployed runtime.

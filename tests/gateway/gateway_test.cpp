@@ -352,6 +352,69 @@ TEST(HttpRequestTest, WipesPreAuthenticationCookiesWithoutDroppingOtherHeaders)
     EXPECT_FALSE(request.header("cookie").has_value());
 }
 
+TEST(HttpRequestTest, SessionCredentialExtractionScrubsBearerAndRetainsOtherCookies)
+{
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account",
+        {{"Authorization", "Bearer bearer-secret"},
+         {"Cookie", "theme=dark; portal=locale"},
+         {"X-Trace", "stable"}},
+        "", "192.0.2.1", fnd::CorrelationId{"bearer-extraction"}).value();
+    auto credential = gw::takeSessionCredential(request);
+    ASSERT_TRUE(credential.has_value());
+    ASSERT_TRUE(credential->has_value());
+    EXPECT_EQ(credential->value().expose(), "bearer-secret");
+    EXPECT_FALSE(request.header("authorization").has_value());
+    EXPECT_EQ(request.header("cookie"), "theme=dark; portal=locale");
+    EXPECT_EQ(request.header("x-trace"), "stable");
+}
+
+TEST(HttpRequestTest, SessionCookieExtractionScrubsOriginalAndPreservesOtherCookies)
+{
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account",
+        {{"Cookie", "theme=dark; __Host-openproof-session=session-secret; locale=en"}},
+        "", "192.0.2.1", fnd::CorrelationId{"cookie-extraction"}).value();
+    auto credential = gw::takeSessionCredential(request);
+    ASSERT_TRUE(credential.has_value());
+    ASSERT_TRUE(credential->has_value());
+    EXPECT_EQ(credential->value().expose(), "session-secret");
+    EXPECT_EQ(request.header("cookie"), "theme=dark; locale=en");
+}
+
+TEST(HttpRequestTest, DuplicateOrAmbiguousCredentialsAreRejectedAndScrubbed)
+{
+    for (auto headers : std::vector<std::vector<std::pair<std::string, std::string>>>{
+         {{"Cookie", "__Host-openproof-session=first; __Host-openproof-session=second"}},
+         {{"Authorization", "Bearer bearer-secret"},
+          {"Cookie", "__Host-openproof-session=cookie-secret; locale=en"}},
+         {{"Authorization", "Bearer bad token"},
+          {"Cookie", "__Host-openproof-session=cookie-secret"}}}) {
+        auto request = gw::HttpRequest::create(
+            gw::HttpMethod::Get, "/account",
+            std::move(headers), "", "192.0.2.1",
+            fnd::CorrelationId{"ambiguous-credential"}).value();
+        auto credential = gw::takeSessionCredential(request);
+        ASSERT_FALSE(credential.has_value());
+        EXPECT_EQ(credential.error().code(), fnd::ErrorCode::AuthenticationRequired);
+        EXPECT_FALSE(request.header("authorization").has_value());
+        EXPECT_FALSE(request.header("cookie").has_value());
+    }
+}
+
+TEST(HttpRequestTest, NoSessionCredentialPreservesUnrelatedHeaders)
+{
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account",
+        {{"Cookie", "theme=dark"}, {"X-Trace", "stable"}},
+        "", "192.0.2.1", fnd::CorrelationId{"no-credential"}).value();
+    auto credential = gw::takeSessionCredential(request);
+    ASSERT_TRUE(credential.has_value());
+    EXPECT_FALSE(credential->has_value());
+    EXPECT_EQ(request.header("cookie"), "theme=dark");
+    EXPECT_EQ(request.header("x-trace"), "stable");
+}
+
 TEST(RouterTest, ChoosesLongestSegmentBoundaryPrefix)
 {
     gw::Router router;

@@ -49,6 +49,9 @@ public:
      * an additional copy of its credentials. Header names are normalized
      * during construction, so this operation needs no allocation. */
     void wipeCookieHeader() noexcept;
+    /** Best-effort in-place erasure of Bearer/DPoP authorization material.
+     * Unlike eraseHeader(), this overwrites the owned header bytes first. */
+    void wipeAuthorizationHeader() noexcept;
     [[nodiscard]] std::string_view remoteAddress() const noexcept;
     [[nodiscard]] const foundation::CorrelationId& correlation() const noexcept;
     [[nodiscard]] const Headers& headers() const noexcept;

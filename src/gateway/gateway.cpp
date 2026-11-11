@@ -247,6 +247,13 @@ void HttpRequest::wipeCookieHeader() noexcept
     foundation::secureWipe(found->second.data(), found->second.size());
     m_headers.erase(found);
 }
+void HttpRequest::wipeAuthorizationHeader() noexcept
+{
+    const auto found = m_headers.find("authorization");
+    if (found == m_headers.end()) return;
+    foundation::secureWipe(found->second.data(), found->second.size());
+    m_headers.erase(found);
+}
 std::string_view HttpRequest::remoteAddress() const noexcept { return m_remoteAddress; }
 const foundation::CorrelationId& HttpRequest::correlation() const noexcept { return m_correlation; }
 const Headers& HttpRequest::headers() const noexcept { return m_headers; }
@@ -303,7 +310,9 @@ void HttpResponse::eraseHeader(std::string_view name)
 foundation::Result<std::optional<foundation::SecretString>>
 takeSessionCredential(HttpRequest& request)
 {
-    std::optional<std::string> bearer;
+    // All extracted bearer credentials acquire an auto-wiping owner. Never
+    // leave a plain std::string copy alive when a later cookie fails validation.
+    std::optional<foundation::SecretString> bearer;
     if (const auto authorization = request.header("authorization"); authorization.has_value()) {
         constexpr std::string_view bearerPrefix{"Bearer "};
         constexpr std::string_view dpopPrefix{"DPoP "};
@@ -312,17 +321,26 @@ takeSessionCredential(HttpRequest& request)
         if (prefix.empty() || authorization->size() <= prefix.size()
             || authorization->substr(prefix.size()).contains(' ')
             || authorization->substr(prefix.size()).contains('\t')) {
-            request.eraseHeader("authorization");
+            request.wipeAuthorizationHeader();
+            // Reject all presented credentials together. Otherwise a
+            // malformed Authorization header could leave a session cookie
+            // in the same rejected request's storage.
+            request.wipeCookieHeader();
             return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
                                     "Authentication is required.");
         }
-        bearer = std::string{authorization->substr(prefix.size())};
-        request.eraseHeader("authorization");
+        bearer.emplace(foundation::SecretString{
+            std::string{authorization->substr(prefix.size())}});
+        request.wipeAuthorizationHeader();
     }
 
-    std::optional<std::string> cookieToken;
+    // The view stays bound to the original request header until all cookie
+    // entries have been checked; duplicate/invalid values create no copy.
+    std::optional<std::string_view> cookieTokenView;
     if (const auto cookie = request.header("cookie"); cookie.has_value()) {
-        std::vector<std::string> retained;
+        // Views avoid copying unrelated (potentially sensitive) cookies
+        // twice before the original cookie header is scrubbed.
+        std::vector<std::string_view> retained;
         std::size_t begin = 0U;
         while (begin <= cookie->size()) {
             const std::size_t end = cookie->find(';', begin);
@@ -345,40 +363,49 @@ takeSessionCredential(HttpRequest& request)
                                || (symbol >= '0' && symbol <= '9')
                                || symbol == '-' || symbol == '_';
                        });
-                if (!valid || cookieToken.has_value()) {
-                    request.eraseHeader("cookie");
+                if (!valid || cookieTokenView.has_value()) {
+                    request.wipeCookieHeader();
                     return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
                                             "Authentication is required.");
                 }
-                cookieToken = std::string{value};
+                cookieTokenView = value;
             } else if (!item.empty()) {
                 retained.emplace_back(item);
             }
             if (end == std::string_view::npos) break;
             begin = end + 1U;
         }
-        if (retained.empty()) {
-            request.eraseHeader("cookie");
-        } else {
-            std::string rebuilt;
-            for (const auto& item : retained) {
-                if (!rebuilt.empty()) rebuilt.append("; ");
-                rebuilt.append(item);
-            }
+        // Materialize only an unambiguous validated session token while the
+        // original header still owns its bytes. Then scrub that original
+        // allocation before preserving any unrelated application cookies.
+        std::optional<foundation::SecretString> cookieToken;
+        if (cookieTokenView) {
+            cookieToken.emplace(foundation::SecretString{
+                std::string{*cookieTokenView}});
+        }
+        std::string rebuilt;
+        for (const auto item : retained) {
+            if (!rebuilt.empty()) rebuilt.append("; ");
+            rebuilt.append(item);
+        }
+        request.wipeCookieHeader();
+        if (!rebuilt.empty()) {
             request.setHeader("cookie", std::move(rebuilt));
         }
-    }
-    if (bearer.has_value() && cookieToken.has_value()) {
-        return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
-                                "Authentication is required.");
+        if (bearer.has_value() && cookieToken.has_value()) {
+            // No credential from an ambiguous authentication request may
+            // cross to downstream handlers, including unrelated cookies.
+            request.wipeCookieHeader();
+            return foundation::fail(foundation::ErrorCode::AuthenticationRequired,
+                                    "Authentication is required.");
+        }
+        if (cookieToken.has_value()) {
+            return std::optional<foundation::SecretString>{
+                std::move(*cookieToken)};
+        }
     }
     if (bearer.has_value()) {
-        return std::optional<foundation::SecretString>{
-            foundation::SecretString{std::move(bearer).value()}};
-    }
-    if (cookieToken.has_value()) {
-        return std::optional<foundation::SecretString>{
-            foundation::SecretString{std::move(cookieToken).value()}};
+        return std::optional<foundation::SecretString>{std::move(*bearer)};
     }
     return std::optional<foundation::SecretString>{};
 }
