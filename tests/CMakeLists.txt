@@ -316,6 +316,28 @@ gtest_discover_tests(openproof_provider_async_ldaps_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "provider;async;ldap;security")
 
+# Small crypto security regression that links the exact production RNG
+# object. Unlike the umbrella test executable it does not rebuild OAuth,
+# gateway, session or database modules for each CSPRNG safety change.
+add_executable(openproof_security_rng_tests
+    security/random_secret_lifetime_test.cpp)
+target_compile_features(openproof_security_rng_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_security_rng_tests PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+set_target_properties(openproof_security_rng_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_security_rng_tests PRIVATE
+    openproof_security openproof_foundation
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_security_rng_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_security_rng_tests
+    TEST_PREFIX "SecurityRng."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "security;crypto;native")
+
 # Standalone provider outbound HTTPS coroutine test. Does not load legacy
 # provider modules or launch real external OAuth calls.
 add_executable(openproof_provider_async_https_tests

@@ -3276,3 +3276,30 @@ reported 0 vulnerabilities (0 low, moderate, high or critical).
 This targets the GitHub Dependabot moderate alert's matching dependency;
 the precise alert ID and whether GitHub has closed it must be verified
 separately. No production binaries or live service configuration changed.
+
+#### Temporary CSPRNG entropy memory lifetime (2026-11-11)
+
+A security review found that the successful randomTokenBase64Url path
+previously encoded bytes from an ordinary transient std::vector, whose
+destructor did not explicitly wipe that raw entropy. The CSPRNG remains
+OpenSSL RAND_bytes; no PRNG, token format or entropy strength was changed.
+The raw vector is now transferred into foundation::Secret<vector<byte>>
+and its storage is best-effort securely wiped on scope exit, including
+if base64url encoding throws. If RAND_bytes reports failure after
+partially writing its output, randomBytes explicitly wipes the buffer
+before returning an error. The compiler's C++26 implicit move is
+retained when returning a local vector to Result<T>; an unnecessary
+explicit std::move was rejected by GCC16 under -Werror and removed.
+
+The actual openproof_security static library and a standalone
+openproof_security_rng_tests binary compile and link successfully
+under GCC 16.2 C++26 RelWithDebInfo. Four real GTests pass for token
+alphabet/length/uniqueness, zero-length output, impossible entropy
+request and scoped Secret<vector<byte>> behavior. Four source-contract
+checks prevent regressions in failure-path wipe and transient secret
+ownership. The failure path of RAND_bytes cannot be forced by these
+integration tests; that branch is structurally checked but not
+runtime-fault-injected. The existing full umbrella test and production
+binaries have not been rebuilt for this change, and no deployment is
+authorized. Wiping does not guarantee erasure from allocator copies,
+swapped pages or core dumps, as documented by foundation::secureWipe.
