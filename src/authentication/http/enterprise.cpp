@@ -50,8 +50,11 @@ void clearState(gateway::HttpResponse& response)
 [[nodiscard]] foundation::Result<json::object> parseObject(const gateway::HttpRequest& request)
 {
     const auto contentType = request.header("content-type");
-    if (request.body().empty() || request.body().size() > kMaximumBody || !contentType
-        || !contentType->starts_with("application/json")) {
+    // Accept the JSON media type only, optionally followed by parameters.
+    // Prefix matching alone would also accept application/json-malformed.
+    const bool jsonContentType = contentType &&
+        (*contentType == "application/json" || contentType->starts_with("application/json;"));
+    if (request.body().empty() || request.body().size() > kMaximumBody || !jsonContentType) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
     boost::system::error_code ec;

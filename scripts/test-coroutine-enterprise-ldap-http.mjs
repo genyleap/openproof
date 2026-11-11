@@ -23,6 +23,12 @@ const start=block("EnterpriseAuthenticationHttpApi::startLdapAsync(",
 const completion=block("EnterpriseAuthenticationHttpApi::completeLdapAsync(");
 const allNative=dispatch+start+completion;
 
+test("LDAP JSON input rejects MIME prefix confusion",()=>{
+  const parser=block("parseObject(const gateway::HttpRequest& request)", "[[nodiscard]] foundation::Result<std::string> required(");
+  assert.match(parser,/\*contentType == "application\/json"/);
+  assert.match(parser,/contentType->starts_with\("application\/json;"\)/);
+  assert.doesNotMatch(parser,/!contentType->starts_with\("application\/json"\)/);
+});
 test("legacy LDAP HTTP cannot issue an unredeemable challenge or use blocking session IO",()=>{
   assert.match(compatibility,/ErrorCode::Unavailable/g);
   assert.match(compatibility,/request, true/g);
