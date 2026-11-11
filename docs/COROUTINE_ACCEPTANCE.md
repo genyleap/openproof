@@ -3303,3 +3303,45 @@ runtime-fault-injected. The existing full umbrella test and production
 binaries have not been rebuilt for this change, and no deployment is
 authorized. Wiping does not guarantee erasure from allocator copies,
 swapped pages or core dumps, as documented by foundation::secureWipe.
+
+#### Retired blocking OpenLDAP bind/search, native federation dispatch still blocking release (2026-11-11)
+
+The enterprise LDAP provider's legacy synchronous completion no longer
+opens an OpenLDAP connection or invokes blocking ldap_sasl_bind_s or
+ldap_search_ext_s. The 244-line legacy bind/search/parse and credential-copy
+implementation was removed, not moved to another thread. The existing
+certificate-verified Asio-based AsyncLdapsClient remains the sole network
+LDAP verifier; the existing native completeAuthenticationAsync path still
+awaits it with bounded DNS/TCP/TLS/BER operations. The synchronous provider
+SPI now immediately fails closed with Unavailable. Local RFC4514 DN
+configuration validation and SAML authentication are unchanged.
+
+CRITICAL DEPLOYMENT BLOCKER: FederatedAuthenticationHttpApi in
+src/authentication/http/federated.cpp still calls the synchronous
+AuthenticationService::complete method. Deploying this development
+branch BEFORE native federation HTTP completion is wired will disable
+LDAP sign-in on that route. The old blocking calls removed two source
+violations, but a distinct explicit federation HTTP integration blocker
+was added, so the strict gate moves from 18 to 17 blockers and remains
+NOT_APPROVED. It would be unsafe to merge or deploy now.
+
+GCC 16.2 C++26 successfully compiled and linked
+openproof_provider_enterprise. A focused standalone real C++ GTest
+(openproof_ldap_native_only_tests) confirms legacy completion returns
+Unavailable without directory network I/O. Four structural tests cover
+the synchronous retirement, native LDAPS operations, remaining federation
+HTTP gap, and preservation of SAML/DN validation. The broad source
+suite reports 120 passing tests, and the protocol-independence check
+remains green. Network LDAPS behavior requires running its separate
+openproof_provider_async_ldaps_tests target (not a default build
+artifact in the initial CTest discovery). No production process, main
+branch or live authentication configuration was changed.
+
+Verification update: the GCC16 C++26
+openproof_provider_async_ldaps_tests target was compiled and linked
+successfully. All 9 native LDAP/TLS GTests passed, including verified
+TLS service-bind/search/user rebind, invalid credentials, ambiguous
+search, missing subject, untrusted certificate, BER framing, timeout
+and invalid URI. Together with the focused legacy fail-closed test,
+CTest reports **10/10 successful**. No external directory or
+production database was contacted by these isolated tests.

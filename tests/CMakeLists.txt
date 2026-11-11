@@ -338,6 +338,29 @@ gtest_discover_tests(openproof_security_rng_tests
     DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "security;crypto;native")
 
+# Legacy LDAP sync SPI is retired; only coroutine LDAPS may perform
+# authentication. Run a small source-compatible enterprise test without
+# linking the massive account/OAuth umbrella executable.
+add_executable(openproof_ldap_native_only_tests
+    providers/ldap_native_only_test.cpp)
+target_compile_features(openproof_ldap_native_only_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_ldap_native_only_tests PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+set_target_properties(openproof_ldap_native_only_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_ldap_native_only_tests PRIVATE
+    openproof_provider_enterprise openproof_identity_provider
+    openproof_foundation openproof_security
+    GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_ldap_native_only_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_ldap_native_only_tests
+    TEST_PREFIX "EnterpriseNativeOnly."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "enterprise;ldap;security;native")
+
 # Standalone provider outbound HTTPS coroutine test. Does not load legacy
 # provider modules or launch real external OAuth calls.
 add_executable(openproof_provider_async_https_tests

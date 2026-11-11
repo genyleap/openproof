@@ -1,39 +1,56 @@
 #!/usr/bin/env node
-// Credential-memory hygiene in the legacy LDAP bridge. These source tests
-// deliberately do NOT claim LDAP has migrated to nonblocking coroutines.
+// Legacy LDAP socket operations are retired. A native Asio LDAPS service
+// remains, but federated HTTP integration is an explicit release blocker.
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 
-const root = path.resolve(import.meta.dirname, "..");
-const raw = fs.readFileSync(
-  path.join(root, "src/providers/enterprise/enterprise.cpp"), "utf8");
-const source = cppExecutableText(raw);
-const start = source.indexOf("foundation::Status simpleBind(");
-const end = source.indexOf("std::optional<std::string> ldapValue(", start);
-assert.ok(start >= 0 && end > start);
-const bind = source.slice(start, end);
+const root=path.resolve(import.meta.dirname,"..");
+const read=p=>fs.readFileSync(path.join(root,p),"utf8");
+const enterprise=cppExecutableText(read("src/providers/enterprise/enterprise.cpp"));
+const native=cppExecutableText(read("src/providers/enterprise/async_ldaps.cpp"));
+const gate=read("scripts/verify-coroutine-coverage.mjs");
+const federated=cppExecutableText(read("src/authentication/http/federated.cpp"));
+const sync=enterprise.slice(enterprise.indexOf(
+  "LdapAuthenticationProvider::completeAuthentication("),
+  enterprise.indexOf("LdapAuthenticationProvider::beginAuthenticationAsync("));
+const async=enterprise.slice(enterprise.indexOf(
+  "LdapAuthenticationProvider::completeAuthenticationAsync("),
+  enterprise.indexOf("SamlProviderConfig::SamlProviderConfig("));
 
-test("LDAP simple bind erases temporary plaintext on every exit", () => {
-  assert.match(bind, /std::string passwordStorage\{password\}/);
-  assert.match(bind, /struct PasswordScrub final/);
-  assert.match(bind, /~PasswordScrub\(\) noexcept/);
-  assert.match(bind, /volatile char\* bytes = value\.data\(\)/);
-  assert.match(raw.slice(raw.indexOf("foundation::Status simpleBind("),
-    raw.indexOf("std::optional<std::string> ldapValue(")),
-    /for\s*\(std::size_t i = 0; i < value\.size\(\); \+\+i\) bytes\[i\] = '\\0'/);
-  assert.match(bind, /\}\s*scrub\{passwordStorage\};/);
-  assert.ok(bind.indexOf("scrub{passwordStorage}") <
-            bind.indexOf("ldap_sasl_bind_s("));
+test("retired synchronous LDAP completion fails closed without network I/O",()=>{
+  assert.match(sync,/foundation::fail\(foundation::ErrorCode::Unavailable/);
+  assert.doesNotMatch(sync,/\b(?:simpleBind|ldap_sasl_bind_s|ldap_search_ext_s|openLdap|co_spawn|context\.run)\s*\(/);
+  assert.doesNotMatch(enterprise,/\bldap_(?:sasl_bind_s|search_ext_s|simple_bind_s|unbind_ext_s)\s*\(/);
 });
 
-test("legacy LDAP synchronous search and bind remain explicit blockers", () => {
-  assert.match(source, /ldap_sasl_bind_s\s*\(/);
-  assert.match(source, /ldap_search_ext_s\s*\(/);
-  const gate = fs.readFileSync(
-    path.join(root, "scripts/verify-coroutine-coverage.mjs"), "utf8");
-  assert.match(gate, /blocking LDAP bind\/search/);
-  assert.match(gate, /ldap_\(\?:sasl_bind_s\|search_ext_s\|simple_bind_s\)/);
+test("native LDAP still awaits certificate-verified bounded Asio DNS TCP TLS BER",()=>{
+  for(const rule of [
+    /co_await\s+async_detail::AsyncLdapsClient::authenticate\s*\(/,
+    /security::constantTimeEquals/,
+  ]) assert.match(async,rule);
+  for(const rule of [
+    /resolver\.async_resolve\s*\(/,
+    /async_connect\s*\(/,
+    /stream\.async_handshake\s*\(/,
+    /asio::async_read\s*\(/,
+    /asio::async_write\s*\(/,
+    /ssl::host_name_verification\s*\(/,
+  ]) assert.match(native,rule);
+  assert.doesNotMatch(native,/\bldap_\w+\s*\(/);
+});
+
+test("federated HTTP still blocks release until native completion is wired",()=>{
+  assert.match(federated,/m_authentication->complete\s*\(/);
+  assert.doesNotMatch(federated,/co_await\s+m_authentication->completeAsync\s*\(/);
+  assert.match(gate,/LDAP federation HTTP still lacks native authentication completion/);
+  assert.match(gate,/federatedHttp/);
+});
+
+test("LDAP parser validation remains local-only and does not disable SAML",()=>{
+  assert.match(enterprise,/ldap_str2dn\s*\(/);
+  assert.match(enterprise,/SamlAuthenticationProvider::completeAuthentication\s*\(/);
+  assert.match(enterprise,/LdapAuthenticationProvider::beginAuthenticationAsync\s*\(/);
 });

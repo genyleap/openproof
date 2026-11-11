@@ -146,15 +146,24 @@ const checked = segments.map(([name, relative]) => {
         expression:"bounded async HTTP read then immediate socket close, never async_shutdown"});
   }
   if(relative==="src/providers/enterprise/enterprise.cpp"){
-    const bind = source.slice(
-      source.indexOf("foundation::Status simpleBind("),
-      source.indexOf("std::optional<std::string> ldapValue("));
-    if(!/struct\s+PasswordScrub\s+final/.test(bind)
-       || !/~PasswordScrub\s*\(\s*\)\s*noexcept/.test(bind)
-       || !/volatile\s+char\s*\*\s*bytes\s*=\s*value\.data\s*\(\s*\)/.test(bind)
-       || !/scrub\s*\{\s*passwordStorage\s*\}/.test(bind))
-      issues.push({line:0,kind:"LDAP plaintext bind buffer is not scrubbed on every exit",
-        expression:"PasswordScrub RAII on passwordStorage"});
+    // The old OpenLDAP network bind and search have been deleted, not moved
+    // to another synchronous worker. A compatibility completion must deny
+    // all calls; only the native Asio LDAPS verifier may authenticate.
+    const legacy = executable.slice(
+      executable.indexOf("LdapAuthenticationProvider::completeAuthentication("),
+      executable.indexOf("LdapAuthenticationProvider::beginAuthenticationAsync("));
+    if(!/foundation::fail\(foundation::ErrorCode::Unavailable/.test(legacy)
+       || /\b(?:openLdap|simpleBind|ldap_search|ldap_sasl_bind|co_spawn|context\.run)\s*\(/.test(legacy))
+      issues.push({line:0,kind:"LDAP synchronous compatibility can still execute network I/O",
+        expression:"sync LDAP completion must deny; native LDAPS verifier is async-only"});
+    // Keep the integration gate RED: disabling old sync LDAP completion
+    // breaks LDAP sign-in until the real federated HTTP path calls the
+    // native authentication service. A blocked feature is not a release.
+    const federatedHttp = cppExecutableText(fs.readFileSync(
+      path.join(root,"src/authentication/http/federated.cpp"),"utf8"));
+    if(!/co_await\s+m_authentication->completeAsync\s*\(/.test(federatedHttp))
+      issues.push({line:0,kind:"LDAP federation HTTP still lacks native authentication completion",
+        expression:"federated HTTP must co_await AuthenticationService::completeAsync"});
     const iface = fs.readFileSync(
       path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");
     const native = cppExecutableText(fs.readFileSync(
