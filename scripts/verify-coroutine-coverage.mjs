@@ -553,6 +553,20 @@ const checked = segments.map(([name, relative]) => {
         issues.push({line:0,kind:"native session mutation may reach legacy compatibility",
           expression:route});
     }
+    // Rejected/limited native session mutations must erase the raw
+    // Authorization and Cookie headers even before credential extraction.
+    const mutation= sessionRoutes.slice(sessionRoutes.indexOf("sessionMutation("),
+      sessionRoutes.indexOf("CoroutineSessionHttpHandler::CoroutineSessionHttpHandler("));
+    const mutationGuard = sessionRoutes.slice(
+      sessionRoutes.indexOf("class SensitiveSessionHeadersGuard final"),
+      sessionRoutes.indexOf("[[nodiscard]] gateway::HttpResponse safeResponse("));
+    if(!mutationGuard.includes("m_request.wipeAuthorizationHeader()")
+       || !mutationGuard.includes("m_request.wipeCookieHeader()")
+       || !mutation.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || mutation.indexOf("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+          > mutation.indexOf("limiter.allow("))
+      issues.push({line:0,kind:"native rotate/logout leaves session credentials in rejected request buffers",
+        expression:"RAII wipe Authorization/Cookie before rate-limit and method rejection"});
     // Partial-native composition cannot bypass the awaitable entry for any
     // route, including unknown routes and provider capability revocation.
     if(/\bm_fallback->handle\s*\(/.test(executable)

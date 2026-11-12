@@ -10,6 +10,7 @@ import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 const root = path.resolve(import.meta.dirname, "..");
 const read = p => fs.readFileSync(path.join(root, p), "utf8");
 const accountRaw = read("src/account/http/coroutine_session_http.cpp");
+const nativeSession = cppExecutableText(read("src/storage/postgres/coroutine_session_http.cpp"));
 const legacyAccountRaw = read("src/account/http/http.cpp");
 const account = cppExecutableText(accountRaw);
 const recovery = cppExecutableText(read("src/authentication/http/coroutine_recovery_code_http.cpp"));
@@ -47,6 +48,21 @@ test("native account and recovery handlers securely wipe both request header cla
     if (gate >= 0) assert.ok(guard < gate);
     if (credential >= 0) assert.ok(guard < credential);
   }
+});
+
+test("native PostgreSQL rotate/logout deny paths erase request credential headers", () => {
+  const guard = method(nativeSession, "class SensitiveSessionHeadersGuard final",
+    "[[nodiscard]] gateway::HttpResponse safeResponse(");
+  assert.match(guard, /~SensitiveSessionHeadersGuard\(\)/);
+  assert.match(guard, /m_request\.wipeAuthorizationHeader\(\)/);
+  assert.match(guard, /m_request\.wipeCookieHeader\(\)/);
+  const mutation = method(nativeSession, "sessionMutation(",
+    "CoroutineSessionHttpHandler::CoroutineSessionHttpHandler(");
+  assert.match(mutation, /SensitiveSessionHeadersGuard wipeHeadersOnExit\{request\}/);
+  assert.ok(mutation.indexOf("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}") <
+    mutation.indexOf("limiter.allow("));
+  assert.ok(mutation.indexOf("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}") <
+    mutation.indexOf("gateway::takeSessionCredential(request)"));
 });
 
 test("native and legacy account JSON handlers reject MIME prefix confusion", () => {

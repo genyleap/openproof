@@ -3720,3 +3720,16 @@ charset=utf-8`. The source contract test
 scanner guard early-denial credential handling and media-type matching.
 These source tests are **not** evidence of a successful fresh C++ build;
 the native GTest has not been recompiled and production was not changed.
+
+#### PostgreSQL-native session mutation early-denial scrubbing (2026-11-12)
+
+`sessionMutation` (native rotate/logout/logout-all) previously evaluated its
+IP rate-limit and POST method restrictions *before*
+`gateway::takeSessionCredential`, so invalid requests could be disposed
+without an explicit wipe of the request-owned bearer or cookie header.
+A noncopyable RAII guard now installs before either check and securely wipes
+both headers on normal and exceptional exits. The existing accepted-credential
+path remains single-owner `SecretString`. The route-boundary contract test
+and strict migration scanner validate that the guard precedes rate limiting
+and credential extraction. This change requires fresh C++ validation before
+deployment; no Production listener is modified.

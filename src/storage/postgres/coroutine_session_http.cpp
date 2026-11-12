@@ -15,6 +15,24 @@ namespace openproof::storage::postgres {
 namespace asio = boost::asio;
 namespace {
 
+// The native route can deny a request before credential extraction on a
+// method mismatch or rate limit. Securely scrub headers on every exit,
+// including exceptions during coroutine resumption.
+class SensitiveSessionHeadersGuard final {
+public:
+    explicit SensitiveSessionHeadersGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveSessionHeadersGuard(const SensitiveSessionHeadersGuard&) = delete;
+    SensitiveSessionHeadersGuard& operator=(const SensitiveSessionHeadersGuard&) = delete;
+    ~SensitiveSessionHeadersGuard()
+    {
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
 [[nodiscard]] gateway::HttpResponse safeResponse(int status, std::string body = {})
 {
     gateway::HttpResponse response{
@@ -57,6 +75,7 @@ asio::awaitable<gateway::HttpResponse> sessionMutation(
     gateway::TokenBucketRateLimiter& limiter,
     gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     if (!limiter.allow(
             std::string{"auth-ip:"} + std::string{request.remoteAddress()})) {
         co_return clientError(
