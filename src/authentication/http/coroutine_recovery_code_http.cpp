@@ -14,6 +14,23 @@ namespace json = boost::json;
 namespace idp = identity::provider;
 
 namespace {
+// Even rejected or rate-limited attempts must not retain request-owned
+// session cookies or bearer headers until their normal string destruction.
+class SensitiveSessionHeadersGuard final {
+public:
+    explicit SensitiveSessionHeadersGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveSessionHeadersGuard(const SensitiveSessionHeadersGuard&) = delete;
+    SensitiveSessionHeadersGuard& operator=(const SensitiveSessionHeadersGuard&) = delete;
+    ~SensitiveSessionHeadersGuard()
+    {
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
 [[nodiscard]] bool isRecoveryRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Post
@@ -80,6 +97,7 @@ gateway::HttpResponse CoroutineRecoveryCodeHttpAdapter::fail(
 gateway::HttpResponse CoroutineRecoveryCodeHttpAdapter::handle(
     gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     // Explicit fail-closed protection against a listener invoking the wrong
     // entry point. NEVER delegate to blocking session/local-account stores.
     return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
@@ -88,6 +106,7 @@ gateway::HttpResponse CoroutineRecoveryCodeHttpAdapter::handle(
 asio::awaitable<gateway::HttpResponse>
 CoroutineRecoveryCodeHttpAdapter::handleAsync(gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     // Recheck capability after listener dispatch to defeat capability
     // revocation races and direct misuse of this async facade.
     if (!nativeEnabledFor(request)) {
@@ -106,6 +125,7 @@ CoroutineRecoveryCodeHttpAdapter::handleAsync(gateway::HttpRequest request)
 asio::awaitable<gateway::HttpResponse>
 CoroutineRecoveryCodeHttpAdapter::issue(gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     const std::string limitKey{
         "auth-ip:" + std::string{request.remoteAddress()}};
     if (!m_rateLimiter->allow(limitKey)) {

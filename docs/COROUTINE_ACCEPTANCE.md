@@ -3693,3 +3693,30 @@ was confirmed. No compiled result or benchmark may be claimed from it.
 Remote command restrictions prevent executing the Bash fixture directly,
 and the restricted root runtime cannot change OS identity to `postgres`.
 Neither native SQL E2E nor fresh C++ acceptance has passed on this host.
+
+#### Native account/recovery HTTP credential erasure and MIME tightening (2026-11-12)
+
+Two opt-in coroutine HTTP adapters previously rejected requests before
+`gateway::takeSessionCredential()` on rate limiting or disabled-route
+branches. That meant request-owned `Authorization` and `Cookie` bytes could
+reach ordinary `std::string` destruction without an explicit secure wipe.
+`CoroutineAccountSessionAdapter` now installs a noncopyable RAII header
+wipe guard in `handleAsync`, `sessionList`, and `sessionRevoke`.
+`CoroutineRecoveryCodeHttpAdapter` does likewise in its synchronous
+fail-closed entry, async dispatch and issuance. The guards erase both
+credential header classes on normal and exceptional exits, while the
+existing `takeSessionCredential` path still moves an accepted credential
+into an auto-wiping `SecretString` before suspending.
+
+The native account session-revoke JSON parser and the existing legacy
+account JSON parser also now require the exact `application/json` media
+type, optionally followed by `;` parameters, rather than accepting arbitrary
+prefixes such as `application/json-invalid` or `application/jsonp`.
+The new C++ unit case
+`AccountCoroutineSessionHttpTest.RevokeRejectsLookalikeJsonMimeTypes`
+checks denial without revocation and acceptance of `application/json;
+charset=utf-8`. The source contract test
+`scripts/test-native-http-credential-erasure.mjs` and strict coverage
+scanner guard early-denial credential handling and media-type matching.
+These source tests are **not** evidence of a successful fresh C++ build;
+the native GTest has not been recompiled and production was not changed.

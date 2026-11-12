@@ -61,7 +61,11 @@ constexpr std::size_t kMaximumBody = 32U * 1024U;
                                 "The request was not valid.");
     }
     const auto contentType = request.header("content-type");
-    if (!contentType.has_value() || (!contentType->starts_with("application/json"))) {
+    // Match the native account boundary: reject lookalike media types,
+    // but keep valid application/json parameters compatible.
+    if (!contentType.has_value()
+        || (*contentType != "application/json"
+            && !contentType->starts_with("application/json;"))) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The request was not valid.");
     }

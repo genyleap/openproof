@@ -87,11 +87,11 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
 
 [[nodiscard]] gw::HttpRequest request(
     gw::HttpMethod method, std::string path, std::string token = {},
-    std::string body = {})
+    std::string body = {}, std::string contentType = "application/json")
 {
     std::vector<std::pair<std::string, std::string>> headers;
     if (!token.empty()) headers.emplace_back("authorization", "Bearer " + token);
-    if (!body.empty()) headers.emplace_back("content-type", "application/json");
+    if (!body.empty()) headers.emplace_back("content-type", std::move(contentType));
     return gw::HttpRequest::create(method, std::move(path),
         std::move(headers), std::move(body), "127.0.0.1",
         fnd::CorrelationId{"account-coroutine-test"}).value();
@@ -258,6 +258,27 @@ TEST(AccountCoroutineSessionHttpTest, MissingAndInvalidBearerNeverEnumerate)
         gw::HttpMethod::Get, "/account/sessions", "invalid-token"));
     EXPECT_EQ(denied.status(), 401);
     EXPECT_EQ(f.listCalls, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, RevokeRejectsLookalikeJsonMimeTypes)
+{
+    Fixture f;
+    constexpr std::string_view body{R"({"session_id":"other"})"};
+    for (const std::string& type : {
+            "application/json-invalid", "application/jsonp",
+            "application/json, application/json", "text/plain"}) {
+        const auto response = f.run(request(
+            gw::HttpMethod::Post, "/account/sessions/revoke", "valid-token",
+            std::string{body}, type));
+        EXPECT_EQ(response.status(), 400) << type;
+        EXPECT_EQ(f.revokeCalls, 0) << type;
+    }
+    // MIME parameters are valid and remain compatible with JSON clients.
+    const auto valid = f.run(request(
+        gw::HttpMethod::Post, "/account/sessions/revoke", "valid-token",
+        std::string{body}, "application/json; charset=utf-8"));
+    EXPECT_EQ(valid.status(), 200);
+    EXPECT_EQ(f.revokeCalls, 1);
 }
 
 TEST(AccountCoroutineSessionHttpTest, RevokeRejectsCurrentAndMalformedRequests)

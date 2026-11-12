@@ -21,6 +21,24 @@ namespace {
 // dependency into the provider-neutral Account HTTP adapter.
 constexpr std::size_t kMaximumSessionResponseRows = 256U;
 
+// Authentication may be rejected before takeSessionCredential() (routing,
+// rate limiting, JSON validation). Scrub request-owned secrets even then.
+// Once extracted, the SecretString itself owns its secure-wipe lifecycle.
+class SensitiveSessionHeadersGuard final {
+public:
+    explicit SensitiveSessionHeadersGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveSessionHeadersGuard(const SensitiveSessionHeadersGuard&) = delete;
+    SensitiveSessionHeadersGuard& operator=(const SensitiveSessionHeadersGuard&) = delete;
+    ~SensitiveSessionHeadersGuard()
+    {
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
 [[nodiscard]] bool sessionListRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
@@ -60,7 +78,11 @@ constexpr std::size_t kMaximumSessionResponseRows = 256U;
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
     const auto contentType = request.header("content-type");
-    if (!contentType || !contentType->starts_with("application/json")) {
+    // Require the complete JSON media-type token, optionally parameters.
+    // A bare prefix also accepts application/json-invalid or jsonp.
+    if (!contentType
+        || (*contentType != "application/json"
+            && !contentType->starts_with("application/json;"))) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
     boost::system::error_code parseError;
@@ -137,6 +159,7 @@ gateway::HttpResponse CoroutineAccountSessionAdapter::fail(
 asio::awaitable<gateway::HttpResponse>
 CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     // Check again after dispatch: downstream capability may have been
     // withdrawn, or a caller may have invoked this entry point directly.
     if (!nativeEnabledFor(request)) {
@@ -156,6 +179,7 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
 asio::awaitable<gateway::HttpResponse>
 CoroutineAccountSessionAdapter::sessionList(gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     const std::string rateKey = "account:" + std::string{request.remoteAddress()}
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey)) {
@@ -203,6 +227,7 @@ CoroutineAccountSessionAdapter::sessionList(gateway::HttpRequest request)
 asio::awaitable<gateway::HttpResponse>
 CoroutineAccountSessionAdapter::sessionRevoke(gateway::HttpRequest request)
 {
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
     const std::string rateKey = "account:" + std::string{request.remoteAddress()}
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey)) {

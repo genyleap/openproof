@@ -649,6 +649,24 @@ const checked = segments.map(([name, relative]) => {
        || !/nativeEnabledFor\s*\(/.test(header))
       issues.push({line:0,kind:"partial account session migration enabled for all routes",
         expression:"nativeEnabled false; nativeEnabledFor per request"});
+    // A refusal before credential extraction (including rate limiting) must
+    // scrub both Authorization and Cookie, not just the accepted bearer.
+    const guard=source.slice(source.indexOf("class SensitiveSessionHeadersGuard final"),
+      source.indexOf("[[nodiscard]] bool sessionListRoute("));
+    const list=source.slice(source.indexOf("CoroutineAccountSessionAdapter::sessionList("),
+      source.indexOf("CoroutineAccountSessionAdapter::sessionRevoke("));
+    const revoke=source.slice(source.indexOf("CoroutineAccountSessionAdapter::sessionRevoke("));
+    const parsing=source.slice(source.indexOf("revokeTarget("),
+      source.indexOf("CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter("));
+    if(!guard.includes("m_request.wipeAuthorizationHeader()")
+       || !guard.includes("m_request.wipeCookieHeader()")
+       || !native.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || !list.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || !revoke.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || !parsing.includes('*contentType != "application/json"')
+       || !parsing.includes('contentType->starts_with("application/json;")'))
+      issues.push({line:0,kind:"native account session rejection retains credentials or accepts ambiguous JSON media types",
+        expression:"RAII wipe Authorization/Cookie and exact JSON MIME boundary"});
   }
   if(relative==="src/authentication/http/coroutine_recovery_code_http.cpp"){
     const header=fs.readFileSync(
@@ -684,6 +702,15 @@ const checked = segments.map(([name, relative]) => {
        || !/no-store/.test(source))
       issues.push({line:0,kind:"native recovery HTTP permits synchronous fallback or unverified plaintext issuance",
         expression:"native bearer + IAL2 + dual eligibility + atomic recovery issue/revoke before JSON"});
+    const guard=source.slice(source.indexOf("class SensitiveSessionHeadersGuard final"),
+      source.indexOf("[[nodiscard]] bool isRecoveryRoute("));
+    if(!guard.includes("m_request.wipeAuthorizationHeader()")
+       || !guard.includes("m_request.wipeCookieHeader()")
+       || !handle.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || !native.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}")
+       || !issue.includes("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}"))
+      issues.push({line:0,kind:"native recovery route leaves a credential header on early denial",
+        expression:"RAII wipe request-owned Authorization and Cookie before every return"});
   }
   if(relative==="src/credentials/coroutine_recovery_codes.cpp"){
     const issue = source.slice(
