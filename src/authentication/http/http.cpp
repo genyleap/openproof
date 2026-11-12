@@ -47,6 +47,78 @@ private:
     std::string& m_value;
 };
 
+// Native authentication may deny requests before extracting their credentials
+// or suspend for database/provider I/O. Neither request-owned headers nor the
+// raw JSON password body should survive in an unprotected string buffer.
+class SensitiveAuthRequestGuard final {
+public:
+    explicit SensitiveAuthRequestGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveAuthRequestGuard(const SensitiveAuthRequestGuard&) = delete;
+    SensitiveAuthRequestGuard& operator=(const SensitiveAuthRequestGuard&) = delete;
+    ~SensitiveAuthRequestGuard() { wipe(); }
+    void wipe() noexcept
+    {
+        m_request.wipeBody();
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
+// This guard MUST be constructed after the parsed JSON owner so its
+// destructor wipes parsed credentials before that owner is destroyed.
+class SensitiveParsedAuthSecretsGuard final {
+public:
+    explicit SensitiveParsedAuthSecretsGuard(json::object* object) noexcept
+        : m_object(object) {}
+    SensitiveParsedAuthSecretsGuard(const SensitiveParsedAuthSecretsGuard&) = delete;
+    SensitiveParsedAuthSecretsGuard& operator=(const SensitiveParsedAuthSecretsGuard&) = delete;
+    ~SensitiveParsedAuthSecretsGuard() { wipe(); }
+    void wipe() noexcept
+    {
+        if (m_object == nullptr) return;
+        for (std::string_view name : {"password", "totp", "recovery_code"}) {
+            if (auto* field = m_object->if_contains(name);
+                field != nullptr && field->is_string()) {
+                auto& value = field->as_string();
+                foundation::secureWipe(value.data(), value.size());
+                value.clear();
+            }
+        }
+    }
+private:
+    json::object* m_object;
+};
+
+// Validated std::string and optional<std::string> copies need their own
+// erasure on early returns, including a missing/invalid cookie after a valid
+// password has already been parsed.
+class SensitiveAuthCopyGuard final {
+public:
+    explicit SensitiveAuthCopyGuard(std::string* value) noexcept
+        : m_text(value) {}
+    explicit SensitiveAuthCopyGuard(std::optional<std::string>* value) noexcept
+        : m_optional(value) {}
+    SensitiveAuthCopyGuard(const SensitiveAuthCopyGuard&) = delete;
+    SensitiveAuthCopyGuard& operator=(const SensitiveAuthCopyGuard&) = delete;
+    ~SensitiveAuthCopyGuard() { wipe(); }
+    void wipe() noexcept
+    {
+        std::string* value = m_text;
+        if (m_optional != nullptr && m_optional->has_value()) {
+            value = &m_optional->value();
+        }
+        if (value == nullptr) return;
+        foundation::secureWipe(value->data(), value->size());
+        value->clear();
+    }
+private:
+    std::string* m_text{};
+    std::optional<std::string>* m_optional{};
+};
+
 [[nodiscard]] gateway::HttpResponse response(int status, json::object body)
 {
     gateway::HttpResponse output{
@@ -160,7 +232,9 @@ requiredString(const json::object& object, std::string_view name, std::size_t ma
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The request was not valid.");
     }
-    const auto text = value->as_string();
+    // Borrow the parsed JSON string: plain auto copies passwords/TOTP into
+    // an unprotected temporary before the caller can scrub it.
+    const auto& text = value->as_string();
     if (text.empty() || text.size() > maximum
         || std::ranges::any_of(text, [](char symbol) {
                const auto byte = static_cast<unsigned char>(symbol);
@@ -199,7 +273,9 @@ cookieValue(const gateway::HttpRequest& request, std::string_view wanted,
 {
     const auto header = request.header("cookie");
     if (!header.has_value()) return std::nullopt;
-    std::optional<std::string> found;
+    // Validate the entire cookie list before allocating even one
+    // credential copy; duplicates must never leave un-erased strings.
+    std::optional<std::string_view> found;
     std::size_t begin = 0U;
     while (begin <= header->size()) {
         const std::size_t end = header->find(';', begin);
@@ -219,12 +295,13 @@ cookieValue(const gateway::HttpRequest& request, std::string_view wanted,
                    })) {
                 return std::nullopt;
             }
-            found = std::string{value};
+            found = value;
         }
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
-    return found;
+    if (!found) return std::nullopt;
+    return std::optional<std::string>{std::in_place, *found};
 }
 
 [[nodiscard]] idp::ClientContext clientContext(const gateway::HttpRequest& request)
@@ -314,6 +391,7 @@ bool AuthenticationHttpApi::nativeEnabledFor(
 boost::asio::awaitable<gateway::HttpResponse>
 AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
+    SensitiveAuthRequestGuard wipeRequestOnExit{request};
     if (request.path() != "/auth" && !request.path().starts_with("/auth/")) {
         auto* native =
             dynamic_cast<gateway::http::CoroutineHttpHandler*>(m_fallback);
@@ -346,6 +424,7 @@ AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse>
 AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
 {
+    SensitiveAuthRequestGuard wipeRequestOnExit{request};
     auto body = parseObject(request);
     if (!body || !onlyFields(body.value(), {"subject"})) {
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
@@ -358,14 +437,20 @@ AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
     }
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken) co_return error(bindingToken.error(), request);
+    // Keep the browser-binding credential in an auto-wiping owner while
+    // the challenge is persisted asynchronously.
+    foundation::SecretString bindingSecret{std::move(bindingToken).value()};
     const std::string subjectValue = subject.value();
-    auto binding = preauthBinding(bindingToken.value(), subjectValue);
+    auto binding = preauthBinding(bindingSecret.expose(), subjectValue);
     if (!binding) co_return error(binding.error(), request);
     const std::string encodedSubject = foundation::toBase64Url(
         std::as_bytes(std::span{subjectValue.data(), subjectValue.size()}));
     idp::AuthenticationRequest authRequest{m_provider, clientContext(request)};
     authRequest.setParameter("subject", subjectValue);
     authRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
+    // The subject and client context are already owned by the provider
+    // request. A stale browser session or bearer is not needed by beginAsync.
+    wipeRequestOnExit.wipe();
     auto started = co_await m_authentication->beginAsync(
         std::move(authRequest), binding.value(), request.correlation());
     if (!started) co_return error(started.error(), request);
@@ -378,7 +463,7 @@ AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
     output.addHeader("set-cookie", cookie(
         kPreauthCookie, started->continuationToken().expose(), "/", 300));
     output.addHeader("set-cookie", cookie(
-        kBindingCookie, bindingToken.value(), "/", 300));
+        kBindingCookie, bindingSecret.expose(), "/", 300));
     output.addHeader("set-cookie", cookie(
         kSubjectCookie, encodedSubject, "/", 300));
     co_return output;
@@ -387,11 +472,14 @@ AuthenticationHttpApi::loginAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse>
 AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
 {
+    SensitiveAuthRequestGuard wipeRequestOnExit{request};
     if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
     auto body = parseObject(request);
+    SensitiveParsedAuthSecretsGuard wipeParsedOnExit{
+        body ? &body.value() : nullptr};
     if (!body || !onlyFields(body.value(),
                     {"transaction_id", "challenge_id", "password", "totp", "recovery_code"})) {
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument}
@@ -400,11 +488,19 @@ AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
     auto transaction = requiredString(body.value(), "transaction_id", 128U);
     auto challenge = requiredString(body.value(), "challenge_id", 128U);
     auto knowledgeSecret = requiredString(body.value(), "password", 1024U);
+    SensitiveAuthCopyGuard wipeKnowledgeOnExit{
+        knowledgeSecret ? &knowledgeSecret.value() : nullptr};
     auto totp = optionalString(body.value(), "totp", 8U);
+    SensitiveAuthCopyGuard wipeTotpOnExit{totp ? &totp.value() : nullptr};
     auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
-    const auto continuation = cookieValue(request, kPreauthCookie);
-    const auto bindingToken = cookieValue(request, kBindingCookie);
-    const auto encodedSubject = cookieValue(request, kSubjectCookie, 512U);
+    SensitiveAuthCopyGuard wipeRecoveryOnExit{
+        recoveryCode ? &recoveryCode.value() : nullptr};
+    auto continuation = cookieValue(request, kPreauthCookie);
+    SensitiveAuthCopyGuard wipeContinuationOnExit{&continuation};
+    auto bindingToken = cookieValue(request, kBindingCookie);
+    SensitiveAuthCopyGuard wipeBindingOnExit{&bindingToken};
+    auto encodedSubject = cookieValue(request, kSubjectCookie, 512U);
+    SensitiveAuthCopyGuard wipeSubjectOnExit{&encodedSubject};
     if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
         || (totp->has_value() && recoveryCode->has_value())
         || !continuation || !bindingToken || !encodedSubject) {
@@ -431,12 +527,22 @@ AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
 
     // Keep the legacy browser replay invariant: the new grant and revocation
     // of an authenticated old browser session must be a single SQL mutation.
-    const auto previous = cookieValue(request, "__Host-openproof-session");
+    auto previous = cookieValue(request, "__Host-openproof-session");
+    SensitiveAuthCopyGuard wipePreviousOnExit{&previous};
     std::optional<foundation::SecretString> oldToken;
-    if (previous) oldToken.emplace(std::string{*previous});
+    if (previous) oldToken.emplace(std::move(*previous));
+
+    // Move the one-time continuation directly into the wiping secret owner.
+    // Password, TOTP and recovery-code copies are now owned by CredentialValue.
+    // Clear the original JSON and request buffers *before* any suspension.
+    foundation::SecretString continuationSecret{std::move(*continuation)};
+    wipeParsedOnExit.wipe();
+    wipeBindingOnExit.wipe();
+    wipeSubjectOnExit.wipe();
+    wipeRequestOnExit.wipe();
     auto verified = co_await m_authentication->completeAsync(
         idp::TransactionId{std::move(transaction).value()},
-        foundation::SecretString{*continuation}, binding.value(),
+        std::move(continuationSecret), binding.value(),
         std::move(authResponse));
     if (!verified) co_return error(verified.error(), request, true);
     auto issued = co_await m_asyncSessions->issueReplacingAsync(

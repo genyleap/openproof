@@ -629,6 +629,43 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,
         kind:"native HTTP authentication copies an unprotected bearer token",
         expression:"reference returned SecretString::expose(), never copy into plain std::string"});
+    const localLogin=source.slice(source.indexOf("AuthenticationHttpApi::loginAsync("),
+      source.indexOf("AuthenticationHttpApi::verifyAsync("));
+    const localVerify=source.slice(source.indexOf("AuthenticationHttpApi::verifyAsync("),
+      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+    const awaited=localVerify.indexOf("co_await m_authentication->completeAsync(");
+    const rawGuard=source.slice(source.indexOf("class SensitiveAuthRequestGuard final"),
+      source.indexOf("class SensitiveParsedAuthSecretsGuard final"));
+    const parsedGuard=source.slice(source.indexOf("class SensitiveParsedAuthSecretsGuard final"),
+      source.indexOf("class SensitiveAuthCopyGuard final"));
+    const copyGuard=source.slice(source.indexOf("class SensitiveAuthCopyGuard final"),
+      source.indexOf("[[nodiscard]] gateway::HttpResponse response("));
+    const cookieParser=source.slice(source.indexOf("cookieValue("),
+      source.indexOf("clientContext(", source.indexOf("cookieValue(")));
+    if(!rawGuard.includes("m_request.wipeBody()")
+       || !rawGuard.includes("m_request.wipeCookieHeader()")
+       || !rawGuard.includes("m_request.wipeAuthorizationHeader()")
+       || !parsedGuard.includes("foundation::secureWipe(value.data(), value.size())")
+       || !parsedGuard.includes('"recovery_code"')
+       || !parsedGuard.includes('"totp"')
+       || !copyGuard.includes("foundation::secureWipe(value->data(), value->size())")
+       || !localLogin.includes("foundation::SecretString bindingSecret{std::move(bindingToken).value()}")
+       || !localLogin.includes("wipeRequestOnExit.wipe()")
+       || !localVerify.includes("SensitiveAuthCopyGuard wipeKnowledgeOnExit")
+       || !localVerify.includes("SensitiveAuthCopyGuard wipeRecoveryOnExit")
+       || !localVerify.includes("SensitiveAuthCopyGuard wipePreviousOnExit")
+       || !localVerify.includes("oldToken.emplace(std::move(*previous))")
+       || !localVerify.includes("foundation::SecretString continuationSecret{std::move(*continuation)}")
+       || awaited < 0
+       || localVerify.indexOf("wipeParsedOnExit.wipe()") > awaited
+       || localVerify.indexOf("wipeRequestOnExit.wipe()") > awaited
+       || localVerify.indexOf("wipeBindingOnExit.wipe()") > awaited
+       || !cookieParser.includes("std::optional<std::string_view> found")
+       || cookieParser.includes("found = std::string{value}")
+       || !source.includes("const auto& text = value->as_string();"))
+      issues.push({line:0,
+        kind:"native local password/TOTP proof retains plaintext or browser cookie copies across coroutine suspension",
+        expression:"wipe parsed JSON, extracted copies and raw request before await, and move bearer/continuation into SecretString"});
   }
   if(relative==="src/account/http/coroutine_session_http.cpp"){
     const native = executable.slice(

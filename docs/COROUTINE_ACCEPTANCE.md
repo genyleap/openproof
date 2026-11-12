@@ -3733,3 +3733,37 @@ path remains single-owner `SecretString`. The route-boundary contract test
 and strict migration scanner validate that the guard precedes rate limiting
 and credential extraction. This change requires fresh C++ validation before
 deployment; no Production listener is modified.
+
+#### Native first-party password/TOTP verification scrub before await (2026-11-12)
+
+The experimental `AuthenticationHttpApi::verifyAsync` route previously
+parsed password, TOTP and recovery code into independent `std::string`
+copies; left the matching Boost.JSON strings and raw request body alive;
+and copied continuation/previous-session cookie credentials into temporary
+unprotected storage. These buffers could remain live across two coroutine
+suspension points for native provider verification and PostgreSQL session
+issuance. `requiredString` also copied its parsed JSON value into a
+redundant Boost.JSON temporary through plain `auto`.
+
+A request-owned RAII guard now scrubs body, Authorization and Cookie headers
+on normal and exceptional exits, and both native dispatch and login/verify
+install it before any early-denial checks. A parsed-JSON guard erases
+`password`, `totp` and `recovery_code` values even when the request
+fails field validation. Validated string and optional-string copies also
+have independent noncopyable guards. On successful completion parsing, the
+native handler moves the one-time continuation and old session bearer into
+`SecretString`, clears the parsed JSON and request-owned buffers **before**
+`co_await completeAsync`, and continues to use the atomic native
+`issueReplacingAsync` session grant. Native challenge creation keeps its
+random browser-binding token in an auto-wiping `SecretString` across the
+asynchronous transaction write. Shared `cookieValue` now validates the
+whole cookie header using a `string_view` before allocating the returned
+credential, so duplicate-cookie rejection cannot strand a copied secret.
+
+The source regression suite
+`scripts/test-coroutine-native-auth-secret-scrub.mjs` and the strict scanner
+check exact cleanup ownership and ordering. The change does **not** establish
+that the new C++ coroutine implementations compiled, passed live HTTP/LDAP
+or PostgreSQL E2E, or produced benchmark improvements. All pre-existing
+17 migration blockers remain active; Production still runs the previously
+installed application binary.
