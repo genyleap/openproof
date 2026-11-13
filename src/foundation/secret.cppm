@@ -33,6 +33,21 @@ export namespace openproof::foundation {
 void secureWipe(void* data, std::size_t size) noexcept;
 
 /**
+ * @brief Scrub an rvalue std::string after ownership transfer.
+ *
+ * Moving short strings can copy their characters into the destination while
+ * setting the source's logical size to zero. Its original characters may
+ * remain in the source's inline storage, beyond size(). Re-expose at most the
+ * original logical bytes only when they still fit the moved-from capacity;
+ * then explicitly wipe. For heap-transfer moves, the destination owns the
+ * original allocation and this function does not touch it.
+ *
+ * Best effort across standard-library implementations; a source with lost
+ * capacity cannot be safely resized. Never reads or writes past size().
+ */
+void wipeMovedFromString(std::string& source, std::size_t originalSize) noexcept;
+
+/**
  * @brief Types whose storage can be wiped in place before destruction.
  */
 template <typename T>
@@ -71,11 +86,17 @@ public:
     /** @brief Constructs an empty secret. */
     Secret() = default;
 
-    /** @brief Takes ownership of @p value. */
-    explicit Secret(T value) noexcept(std::is_nothrow_move_constructible_v<T>)
+    /** @brief Takes ownership of an rvalue and scrubs its inline source. */
+    explicit Secret(T&& value) noexcept(std::is_nothrow_move_constructible_v<T>)
         : m_value(std::move(value))
     {
+        if constexpr (std::is_same_v<T, std::string>) {
+            wipeMovedFromString(value, m_value.size());
+        }
     }
+
+    /** @brief Explicitly wraps a copy of a caller-owned lvalue. */
+    explicit Secret(const T& value) : m_value(value) {}
 
     // C++26 delete-with-reason: the diagnostic explains the rule instead of
     // just reporting that the function is deleted, so the fix is obvious at the
@@ -86,7 +107,11 @@ public:
     Secret(Secret&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
         : m_value(std::move(other.m_value))
     {
-        other.wipe();
+        if constexpr (std::is_same_v<T, std::string>) {
+            wipeMovedFromString(other.m_value, m_value.size());
+        } else {
+            other.wipe();
+        }
     }
 
     Secret& operator=(Secret&& other) noexcept(std::is_nothrow_move_assignable_v<T>)
@@ -94,7 +119,11 @@ public:
         if (this != &other) {
             wipe();
             m_value = std::move(other.m_value);
-            other.wipe();
+            if constexpr (std::is_same_v<T, std::string>) {
+                wipeMovedFromString(other.m_value, m_value.size());
+            } else {
+                other.wipe();
+            }
         }
         return *this;
     }

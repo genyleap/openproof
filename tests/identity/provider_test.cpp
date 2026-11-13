@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -32,6 +34,40 @@ static_assert(!std::is_convertible_v<idp::CredentialValue, std::string>);
 static_assert(!std::is_copy_constructible_v<idp::CredentialValue>);
 static_assert(!std::is_copy_assignable_v<idp::CredentialValue>);
 static_assert(std::is_nothrow_move_constructible_v<idp::CredentialValue>);
+
+[[nodiscard]] bool containsObjectBytes(const std::string& value,
+                                       std::string_view needle)
+{
+    const auto* begin = reinterpret_cast<const unsigned char*>(&value);
+    const auto* end = begin + sizeof(value);
+    const auto* pattern = reinterpret_cast<const unsigned char*>(needle.data());
+    return std::search(begin, end, pattern, pattern + needle.size()) != end;
+}
+
+TEST(CredentialValueTest, ShortTotpRvalueConstructionScrubsCaller)
+{
+    std::string code{"619284"};
+    const idp::CredentialValue credential{std::move(code)};
+    EXPECT_EQ(credential.expose(), "619284");
+    EXPECT_TRUE(code.empty());
+    EXPECT_FALSE(containsObjectBytes(code, "19284"));
+}
+
+TEST(CredentialValueTest, ShortSecretMoveScrubsInlineSource)
+{
+    idp::CredentialValue original{std::string{"totp-876"}};
+    const idp::CredentialValue moved{std::move(original)};
+    EXPECT_EQ(moved.expose(), "totp-876");
+    EXPECT_TRUE(original.empty());
+    EXPECT_FALSE(containsObjectBytes(original.expose(), "otp-876"));
+
+    idp::CredentialValue assigned{std::string{"past-secret"}};
+    idp::CredentialValue other{std::string{"mfa-4567"}};
+    assigned = std::move(other);
+    EXPECT_EQ(assigned.expose(), "mfa-4567");
+    EXPECT_TRUE(other.empty());
+    EXPECT_FALSE(containsObjectBytes(other.expose(), "fa-4567"));
+}
 
 TEST(CredentialValueTest, MoveTransfersAndClearsTheSource)
 {

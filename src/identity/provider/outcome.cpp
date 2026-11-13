@@ -10,15 +10,21 @@ module openproof.identity.provider;
 
 namespace openproof::identity::provider {
 
-CredentialValue::CredentialValue(std::string value)
+CredentialValue::CredentialValue(std::string&& value) noexcept
     : m_value(std::move(value))
+{
+    foundation::wipeMovedFromString(value, m_value.size());
+}
+
+CredentialValue::CredentialValue(const std::string& value)
+    : m_value(value)
 {
 }
 
 CredentialValue::CredentialValue(CredentialValue&& other) noexcept
     : m_value(std::move(other.m_value))
 {
-    other.wipe();
+    foundation::wipeMovedFromString(other.m_value, m_value.size());
 }
 
 CredentialValue& CredentialValue::operator=(CredentialValue&& other) noexcept
@@ -26,7 +32,7 @@ CredentialValue& CredentialValue::operator=(CredentialValue&& other) noexcept
     if (this != &other) {
         wipe();
         m_value = std::move(other.m_value);
-        other.wipe();
+        foundation::wipeMovedFromString(other.m_value, m_value.size());
     }
     return *this;
 }

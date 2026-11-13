@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <format>
 #include <ostream>
 
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -66,6 +68,45 @@ TEST(SecretTest, ExposesTheWrappedValue)
     EXPECT_EQ(secret.expose(), "client-secret-value");
     EXPECT_EQ(secret.size(), 19U);
     EXPECT_FALSE(secret.empty());
+}
+
+// Scan only the standard-permitted object representation, not bytes beyond
+// std::string::size(). This detects stale SSO credentials after std::move
+// without depending on a particular libstdc++ inline-buffer offset.
+[[nodiscard]] bool objectContainsText(const std::string& value,
+                                      std::string_view needle)
+{
+    const auto* first = reinterpret_cast<const unsigned char*>(&value);
+    const auto* last = first + sizeof(value);
+    const auto* pattern = reinterpret_cast<const unsigned char*>(needle.data());
+    return std::search(first, last, pattern, pattern + needle.size()) != last;
+}
+
+TEST(SecretTest, ShortRvalueConstructionScrubsInlineSource)
+{
+    std::string source{"otp-1234"};
+    const fnd::SecretString destination{std::move(source)};
+    EXPECT_EQ(destination.expose(), "otp-1234");
+    EXPECT_TRUE(source.empty());
+    // Basic std::string move usually zeros the first SSO byte already;
+    // the remaining tail is what a naive size()==0 wipe misses.
+    EXPECT_FALSE(objectContainsText(source, "tp-1234"));
+}
+
+TEST(SecretTest, ShortMoveConstructionAndAssignmentScrubInlineSources)
+{
+    fnd::SecretString original{std::string{"mfa-7654"}};
+    const fnd::SecretString moved{std::move(original)};
+    EXPECT_EQ(moved.expose(), "mfa-7654");
+    EXPECT_TRUE(original.empty());
+    EXPECT_FALSE(objectContainsText(original.expose(), "fa-7654"));
+
+    fnd::SecretString another{std::string{"code-678"}};
+    fnd::SecretString target{std::string{"old-secret"}};
+    target = std::move(another);
+    EXPECT_EQ(target.expose(), "code-678");
+    EXPECT_TRUE(another.empty());
+    EXPECT_FALSE(objectContainsText(another.expose(), "ode-678"));
 }
 
 TEST(SecretTest, MoveTransfersAndClearsTheSource)

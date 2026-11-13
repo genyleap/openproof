@@ -49,7 +49,8 @@ using AttributeMap = std::map<std::string, std::string, std::less<>>;
  */
 class CredentialValue final {
 public:
-    explicit CredentialValue(std::string value);
+    explicit CredentialValue(std::string&& value) noexcept;
+    explicit CredentialValue(const std::string& value);
 
     CredentialValue(const CredentialValue&) = delete;
     CredentialValue& operator=(const CredentialValue&) = delete;

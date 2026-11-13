@@ -2,10 +2,29 @@ module;
 
 #include <atomic>
 #include <cstddef>
+#include <string>
 
 module openproof.foundation;
 
 namespace openproof::foundation {
+
+void wipeMovedFromString(std::string& source, std::size_t originalSize) noexcept
+{
+    // The standard guarantees only a valid, unspecified moved-from string.
+    // A moved short string commonly has size()==0 while its SSO character
+    // array still contains the original credential. Re-expose exactly the
+    // original length before secure wiping; never write past a string's size.
+    if (source.size() < originalSize && originalSize <= source.capacity()) {
+        try {
+            source.resize(originalSize);
+        } catch (...) {
+            // Best effort on unusual allocators/implementations. No-throw
+            // cleanup must not terminate during another exception's unwind.
+        }
+    }
+    secureWipe(source.data(), source.size());
+    source.clear();
+}
 
 void secureWipe(void* data, const std::size_t size) noexcept
 {

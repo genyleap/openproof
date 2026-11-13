@@ -3767,3 +3767,39 @@ that the new C++ coroutine implementations compiled, passed live HTTP/LDAP
 or PostgreSQL E2E, or produced benchmark improvements. All pre-existing
 17 migration blockers remain active; Production still runs the previously
 installed application binary.
+
+#### Short secret string move: residual inline-buffer bytes (2026-11-13)
+
+An additional low-level secret-lifetime audit identified a specific gap in
+`foundation::SecretString` and `identity::provider::CredentialValue`.
+Moving a short `std::string` (for example a six-digit TOTP) can copy
+its small-string-optimized characters and set the source's length to zero,
+without clearing the remainder of the source's inline buffer. Calling
+`secureWipe(data(), size())` **after** that move consequently wipes zero
+bytes, although most characters may still be present in the source object.
+
+`foundation::wipeMovedFromString` now makes a best-effort, standard-library
+safe correction: if the original length fits the moved-from string's
+**current capacity**, it resizes the moved-from object back to the original
+length, explicitly wipes only its valid elements, then clears it. If
+ownership of a heap buffer transferred (and its prior size does not fit
+the moved-from capacity), the destination will wipe that owned buffer
+normally. The helper never writes beyond `std::string::size()`, and a
+failed resize does not throw from cleanup. The source move constructor,
+move assignment and rvalue-owning constructor in `Secret<T>` use this
+path when `T=std::string`; non-string, contiguous secret types retain
+their earlier behavior. `CredentialValue` likewise uses the helper for
+rvalue construction and both moves, preserving a distinct constructor for
+intentionally copied caller-owned lvalues.
+
+The new native C++ unit cases in `tests/foundation/secret_test.cpp` and
+`tests/identity/provider_test.cpp` inspect the *object representation*
+for residual **suffix bytes** after short-string moves; checking the
+whole value is insufficient because libstdc++ often zeros the first
+byte during a move. The source contract
+`scripts/test-secret-small-string-move-wipe.mjs` complements these tests.
+The tests are not substitutes for fresh GCC16/C++26 compilation and do not
+prove erasure of allocator copies, swapped pages or core dumps.
+
+This security hardening is part of the unapproved development branch;
+it is **not** a completed migration finding or a Production deployment.
