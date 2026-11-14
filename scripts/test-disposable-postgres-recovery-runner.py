@@ -48,6 +48,9 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             "BASH_ENV": "/tmp/untrusted-bashrc",
             "TMP": "/tmp/untrusted-tmp",
             "TEMP": "/tmp/untrusted-temp",
+            "XDG_CONFIG_HOME": "/tmp/untrusted-config",
+            "XDG_CACHE_HOME": "/tmp/untrusted-cache",
+            "XDG_DATA_HOME": "/tmp/untrusted-data",
         }
         def fake_copy(_source, destination):
             Path(destination).write_bytes(b"synthetic-test-binary")
@@ -100,6 +103,8 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             self.assertEqual(child_env["TMPDIR"], child_env["HOME"])
             self.assertEqual(child_env["TMP"], child_env["HOME"])
             self.assertEqual(child_env["TEMP"], child_env["HOME"])
+            for xdg in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+                self.assertEqual(child_env[xdg], child_env["HOME"])
             self.assertIn("/openproof-recovery-pg-", child_env["HOME"])
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])
