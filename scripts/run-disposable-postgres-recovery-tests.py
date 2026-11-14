@@ -58,6 +58,9 @@ def main() -> int:
             # when inherited PG* variables have been removed. Never consult
             # credentials or service definitions from the invoking account.
             env["HOME"] = str(work)
+            # Keep temporary files created by libpq, PostgreSQL utilities or
+            # the native test executable inside the disposable fixture.
+            env["TMPDIR"] = str(work)
             env["PGPASSFILE"] = os.devnull
             env["PGSERVICEFILE"] = str(work / "no-pg-service.conf")
             env["PGSYSCONFDIR"] = str(work)

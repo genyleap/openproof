@@ -94,6 +94,7 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             self.assertEqual(child_env["PGPASSFILE"], os.devnull)
             self.assertTrue(child_env["PGSERVICEFILE"].endswith("/no-pg-service.conf"))
             self.assertEqual(child_env["PGSYSCONFDIR"], child_env["HOME"])
+            self.assertEqual(child_env["TMPDIR"], child_env["HOME"])
             self.assertIn("/openproof-recovery-pg-", child_env["HOME"])
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])
