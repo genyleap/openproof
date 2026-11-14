@@ -49,7 +49,13 @@ def main() -> int:
                 # Root-owned PostgreSQL clusters are forbidden. Abort on any
                 # failed privilege drop rather than retrying as root.
                 command = ["/usr/sbin/runuser", "-u", "postgres", "--", *command]
-            result = subprocess.run(command, check=False, text=True, capture_output=True)
+            try:
+                # Bound cluster initialization, startup and teardown as well
+                # as the native tests; pg_ctl -w can otherwise hang forever.
+                result = subprocess.run(command, check=False, text=True,
+                                        capture_output=True, timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Disposable PostgreSQL setup/teardown exceeded 30 seconds") from exc
             if result.returncode:
                 raise RuntimeError(f"Disposable PostgreSQL setup failed: {result.stderr.strip()}")
             return result

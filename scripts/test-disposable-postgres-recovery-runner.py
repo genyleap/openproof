@@ -60,6 +60,8 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
     def test_root_runs_postgres_and_tests_as_unprivileged_pg_user(self):
         calls, chown = self.simulate(root=True)
         self.assertEqual(len(calls), 4)
+        self.assertEqual([kwargs["timeout"] for _, kwargs in calls],
+                         [30, 30, 120, 30])
         self.assertEqual(chown.call_count, 2)
         for command, _ in calls:
             self.assertEqual(command[:4],
@@ -111,6 +113,30 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[2][1]["timeout"], 120)
         self.assertEqual(calls[3][0][-1], "stop")
+
+    def test_cluster_start_timeout_aborts_before_native_tests(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if len(calls) == 2:
+                raise subprocess.TimeoutExpired(command, 30)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def fake_copy(_source, destination):
+            Path(destination).write_bytes(b"synthetic-test-binary")
+
+        with (
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(fixture.shutil, "copyfile", side_effect=fake_copy),
+            mock.patch.object(fixture.os, "geteuid", return_value=0),
+            mock.patch.object(fixture.shutil, "chown"),
+            mock.patch.object(fixture.subprocess, "run", side_effect=fake_run),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exceeded 30 seconds"):
+                fixture.main()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1]["timeout"], 30)
 
     def test_root_privilege_drop_failure_never_executes_gtests(self):
         calls, _ = self.simulate(root=True, fail_first=True)
