@@ -97,7 +97,8 @@ def main() -> int:
             start_attempted = True
             pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
                 "-l", str(log), "-o",
-                f"-c listen_addresses= -c unix_socket_directories={work} -p {PORT}",
+                f"-c listen_addresses= -c unix_socket_directories={work} "
+                f"-c unix_socket_permissions=0700 -p {PORT}",
                 "-w", "start"])
             started = True
 

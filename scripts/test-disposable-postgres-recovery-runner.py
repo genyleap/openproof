@@ -80,6 +80,7 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
         self.assertNotIn("trust", initdb)
         self.assertTrue(any("listen_addresses=" in part
                             and "unix_socket_directories=" in part
+                            and "unix_socket_permissions=0700" in part
                             for part in calls[1][0]))
         env = calls[2][1]["env"]
         for name in ("PGHOST", "PGSERVICE", "PG" + "PASSWORD",
