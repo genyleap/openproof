@@ -412,8 +412,16 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
                 co_await asio::post(executor, asio::use_awaitable);
             }
         }
+        // A successful final poll must not bypass the operation-wide deadline.
+        // A slow libpq call can complete after the last pre-poll check.
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL connection timed out"};
+        }
         if (PQsetnonblocking(connection.get(), 1) != 0) {
             throw std::runtime_error{"Unable to enable nonblocking PostgreSQL"};
+        }
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL connection timed out"};
         }
     } catch (...) {
         // Never hand a partially connected PGconn to the repository pool.
