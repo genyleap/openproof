@@ -87,6 +87,31 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             self.assertNotIn("runuser", " ".join(command))
         self.assertNotIn(" user=", calls[2][1]["env"]["OPENPROOF_TEST_POSTGRES"])
 
+    def test_native_test_timeout_stops_disposable_cluster(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if len(calls) == 3:
+                raise subprocess.TimeoutExpired(command, 120)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def fake_copy(_source, destination):
+            Path(destination).write_bytes(b"synthetic-test-binary")
+
+        with (
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(fixture.shutil, "copyfile", side_effect=fake_copy),
+            mock.patch.object(fixture.os, "geteuid", return_value=0),
+            mock.patch.object(fixture.shutil, "chown"),
+            mock.patch.object(fixture.subprocess, "run", side_effect=fake_run),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exceeded 120 seconds"):
+                fixture.main()
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[2][1]["timeout"], 120)
+        self.assertEqual(calls[3][0][-1], "stop")
+
     def test_root_privilege_drop_failure_never_executes_gtests(self):
         calls, _ = self.simulate(root=True, fail_first=True)
         self.assertEqual(len(calls), 1)

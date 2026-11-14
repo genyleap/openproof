@@ -84,7 +84,13 @@ def main() -> int:
             command = [str(executable)]
             if must_drop_privileges:
                 command = ["/usr/sbin/runuser", "-u", "postgres", "--", *command]
-            result = subprocess.run(command, env=env, text=True, check=False)
+            # A wedged integration test must not leave the disposable server
+            # running indefinitely. The finally block still stops the cluster.
+            try:
+                result = subprocess.run(command, env=env, text=True,
+                                        check=False, timeout=120)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Disposable PostgreSQL tests exceeded 120 seconds") from exc
             return result.returncode
         finally:
             if started:
