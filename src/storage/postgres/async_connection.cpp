@@ -496,6 +496,11 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 throw std::runtime_error{"PostgreSQL operation timed out"};
             }
             const int flushStatus = PQflush(connection);
+            // A synchronous libpq flush can cross the deadline even when
+            // the preceding check passed. Never accept a late completion.
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL operation timed out"};
+            }
             if (flushStatus == 0) break;
             if (flushStatus < 0) {
                 throw std::runtime_error{"PostgreSQL query flush failed"};
@@ -514,6 +519,10 @@ asio::awaitable<QueryRows> AsyncConnection::query(
             }
             if (PQconsumeInput(connection) == 0) {
                 throw std::runtime_error{"PostgreSQL query read failed"};
+            }
+            // PQconsumeInput can process buffered protocol data synchronously.
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL operation timed out"};
             }
             if (PQisBusy(connection) != 0) {
                 co_await waitForSocket(m_impl->executor, connection,
@@ -573,6 +582,11 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 }
                 output.rows.push_back(std::move(fields));
             }
+        }
+        // Result extraction may complete after the final pre-read deadline
+        // check. Never report a late query as successful or reuse its socket.
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL operation timed out"};
         }
         co_return output;
     } catch (...) {
