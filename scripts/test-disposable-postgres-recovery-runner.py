@@ -38,6 +38,9 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             "PGSERVICE": "a-forbidden-parent-service",
             "PG" + "PASSWORD": "sentinel",
             "OPENPROOF_TEST_POSTGRES": "a-forbidden-parent-dsn",
+            "GTEST_FILTER": "NoTestsCanRun.*",
+            "GTEST_OUTPUT": "xml:/tmp/untrusted-gtest-output.xml",
+            "GTEST_ALSO_RUN_DISABLED_TESTS": "1",
         }
         def fake_copy(_source, destination):
             Path(destination).write_bytes(b"synthetic-test-binary")
@@ -74,7 +77,9 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
                             and "unix_socket_directories=" in part
                             for part in calls[1][0]))
         env = calls[2][1]["env"]
-        for name in ("PGHOST", "PGSERVICE", "PG" + "PASSWORD"):
+        for name in ("PGHOST", "PGSERVICE", "PG" + "PASSWORD",
+                     "GTEST_FILTER", "GTEST_OUTPUT",
+                     "GTEST_ALSO_RUN_DISABLED_TESTS"):
             self.assertNotIn(name, env)
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])

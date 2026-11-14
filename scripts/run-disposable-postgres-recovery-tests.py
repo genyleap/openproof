@@ -79,7 +79,8 @@ def main() -> int:
 
             # Only the just-created private Unix socket is used.
             env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("PG") and key != "OPENPROOF_TEST_POSTGRES"}
+                   if not key.startswith(("PG", "GTEST_"))
+                   and key != "OPENPROOF_TEST_POSTGRES"}
             # Do not inherit any production PGHOST/PGSERVICE/PGPASSWORD.
             # The URI contains NO credential and points only to this
             # freshly initialized, private Unix-domain socket.
