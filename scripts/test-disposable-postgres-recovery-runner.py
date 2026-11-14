@@ -51,6 +51,14 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             "XDG_CONFIG_HOME": "/tmp/untrusted-config",
             "XDG_CACHE_HOME": "/tmp/untrusted-cache",
             "XDG_DATA_HOME": "/tmp/untrusted-data",
+            "ASAN_OPTIONS": "log_path=/tmp/untrusted-asan",
+            "LSAN_OPTIONS": "suppressions=/tmp/untrusted-lsan",
+            "TSAN_OPTIONS": "log_path=/tmp/untrusted-tsan",
+            "UBSAN_OPTIONS": "log_path=/tmp/untrusted-ubsan",
+            "MSAN_OPTIONS": "log_path=/tmp/untrusted-msan",
+            "LLVM_PROFILE_FILE": "/tmp/untrusted-profile.profraw",
+            "GCOV_PREFIX": "/tmp/untrusted-gcov",
+            "GCOV_PREFIX_STRIP": "1",
         }
         def fake_copy(_source, destination):
             Path(destination).write_bytes(b"synthetic-test-binary")
@@ -92,7 +100,9 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
                      "GTEST_FILTER", "GTEST_OUTPUT",
                      "GTEST_ALSO_RUN_DISABLED_TESTS", "LD_PRELOAD",
                      "LD_LIBRARY_PATH", "PYTHONPATH", "GCONV_PATH",
-                     "BASH_ENV"):
+                     "BASH_ENV", "ASAN_OPTIONS", "LSAN_OPTIONS",
+                     "TSAN_OPTIONS", "UBSAN_OPTIONS", "MSAN_OPTIONS",
+                     "LLVM_PROFILE_FILE", "GCOV_PREFIX", "GCOV_PREFIX_STRIP"):
             self.assertNotIn(name, env)
             self.assertNotIn(name, calls[0][1]["env"])
         for _, kwargs in calls:

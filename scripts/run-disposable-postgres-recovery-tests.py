@@ -22,9 +22,14 @@ PORT = "55418"
 def isolated_environment() -> dict[str, str]:
     """Prevent inherited libpq, GTest and dynamic-loader settings from escaping isolation."""
     blocked = ("PG", "GTEST_", "LD_", "DYLD_", "PYTHON")
+    # Sanitizer and coverage runtimes can read external suppression files or
+    # write reports to arbitrary inherited paths, even for an isolated GTest.
+    runtime_outputs = ("ASAN_OPTIONS", "LSAN_OPTIONS", "TSAN_OPTIONS",
+                       "UBSAN_OPTIONS", "MSAN_OPTIONS", "LLVM_PROFILE_FILE",
+                       "GCOV_PREFIX", "GCOV_PREFIX_STRIP")
     return {key: value for key, value in os.environ.items()
             if not key.startswith(blocked)
-            and key not in ("OPENPROOF_TEST_POSTGRES", "GCONV_PATH", "BASH_ENV", "ENV")}
+            and key not in ("OPENPROOF_TEST_POSTGRES", "GCONV_PATH", "BASH_ENV", "ENV", *runtime_outputs)}
 
 
 def main() -> int:
