@@ -63,10 +63,14 @@ def main() -> int:
         datadir = work / "data"
         log = work / "server.log"
         started = False
+        start_attempted = False
         try:
             pg([str(PGBIN / "initdb"), "-D", str(datadir), "--no-sync",
                 "--auth-local=peer", "--auth-host=reject",
                 "--no-instructions"])
+            # pg_ctl can time out after launching postgres but before it
+            # acknowledges readiness. Attempt cleanup even on that path.
+            start_attempted = True
             pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
                 "-l", str(log), "-o",
                 f"-c listen_addresses= -c unix_socket_directories={work} -p {PORT}",
@@ -99,9 +103,15 @@ def main() -> int:
                 raise RuntimeError("Disposable PostgreSQL tests exceeded 120 seconds") from exc
             return result.returncode
         finally:
-            if started:
-                pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
-                    "-m", "immediate", "-w", "stop"])
+            if start_attempted:
+                try:
+                    pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
+                        "-m", "immediate", "-w", "stop"])
+                except RuntimeError:
+                    # A failed startup may have left no running server.
+                    # Do not hide the original startup exception.
+                    if started:
+                        raise
 
 
 if __name__ == "__main__":

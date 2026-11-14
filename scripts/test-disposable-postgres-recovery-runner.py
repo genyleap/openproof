@@ -135,8 +135,37 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "exceeded 30 seconds"):
                 fixture.main()
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertEqual(calls[1][1]["timeout"], 30)
+        self.assertEqual(calls[2][0][-1], "stop")
+        self.assertEqual(calls[2][1]["timeout"], 30)
+
+    def test_failed_start_and_failed_stop_preserve_startup_error(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 2:
+                raise subprocess.TimeoutExpired(command, 30)
+            if len(calls) == 3:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="server never started")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def fake_copy(_source, destination):
+            Path(destination).write_bytes(b"synthetic-test-binary")
+
+        with (
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(fixture.shutil, "copyfile", side_effect=fake_copy),
+            mock.patch.object(fixture.os, "geteuid", return_value=0),
+            mock.patch.object(fixture.shutil, "chown"),
+            mock.patch.object(fixture.subprocess, "run", side_effect=fake_run),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exceeded 30 seconds"):
+                fixture.main()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1][-1], "stop")
 
     def test_root_privilege_drop_failure_never_executes_gtests(self):
         calls, _ = self.simulate(root=True, fail_first=True)
