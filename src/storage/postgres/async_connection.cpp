@@ -463,6 +463,11 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     }
     PGconn* connection = m_impl->connection.get();
     try {
+        // Validation and parameter materialization consume the same absolute
+        // deadline as libpq I/O; never submit an already-expired operation.
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL operation timed out"};
+        }
         std::vector<const char*> values;
         values.reserve(params.size());
         for (const auto& parameter : params) {
@@ -474,6 +479,11 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 nullptr, nullptr, 0) == 0) {
             throw std::runtime_error{"PostgreSQL query could not be submitted"};
         }
+        // PQsendQueryParams may itself take time on the calling thread.
+        // Do not accept a late send as permission to continue the query.
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error{"PostgreSQL operation timed out"};
+        }
         // Enable libpq's row-at-a-time protocol immediately after send.
         // Without this, libpq buffers an entire PGresult before our own
         // result-copy limit can reject oversized queries.
@@ -482,6 +492,9 @@ asio::awaitable<QueryRows> AsyncConnection::query(
         }
 
         for (;;) {
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error{"PostgreSQL operation timed out"};
+            }
             const int flushStatus = PQflush(connection);
             if (flushStatus == 0) break;
             if (flushStatus < 0) {
