@@ -19,6 +19,14 @@ PGBIN = Path("/usr/lib/postgresql/16/bin")
 PORT = "55418"
 
 
+def isolated_environment() -> dict[str, str]:
+    """Prevent inherited libpq, GTest and dynamic-loader settings from escaping isolation."""
+    blocked = ("PG", "GTEST_", "LD_", "DYLD_", "PYTHON")
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith(blocked)
+            and key not in ("OPENPROOF_TEST_POSTGRES", "GCONV_PATH", "BASH_ENV", "ENV")}
+
+
 def main() -> int:
     if not (PGBIN / "initdb").is_file() or not (PGBIN / "pg_ctl").is_file():
         raise SystemExit("PostgreSQL 16 test binaries are missing")
@@ -53,7 +61,8 @@ def main() -> int:
                 # Bound cluster initialization, startup and teardown as well
                 # as the native tests; pg_ctl -w can otherwise hang forever.
                 result = subprocess.run(command, check=False, text=True,
-                                        capture_output=True, timeout=30)
+                                        capture_output=True, timeout=30,
+                                        env=isolated_environment())
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("Disposable PostgreSQL setup/teardown exceeded 30 seconds") from exc
             if result.returncode:
@@ -78,9 +87,7 @@ def main() -> int:
             started = True
 
             # Only the just-created private Unix socket is used.
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("PG", "GTEST_"))
-                   and key != "OPENPROOF_TEST_POSTGRES"}
+            env = isolated_environment()
             # Do not inherit any production PGHOST/PGSERVICE/PGPASSWORD.
             # The URI contains NO credential and points only to this
             # freshly initialized, private Unix-domain socket.

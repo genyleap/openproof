@@ -41,6 +41,11 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             "GTEST_FILTER": "NoTestsCanRun.*",
             "GTEST_OUTPUT": "xml:/tmp/untrusted-gtest-output.xml",
             "GTEST_ALSO_RUN_DISABLED_TESTS": "1",
+            "LD_PRELOAD": "/tmp/untrusted.so",
+            "LD_LIBRARY_PATH": "/tmp/untrusted-libs",
+            "PYTHONPATH": "/tmp/untrusted-python",
+            "GCONV_PATH": "/tmp/untrusted-converters",
+            "BASH_ENV": "/tmp/untrusted-bashrc",
         }
         def fake_copy(_source, destination):
             Path(destination).write_bytes(b"synthetic-test-binary")
@@ -79,8 +84,11 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
         env = calls[2][1]["env"]
         for name in ("PGHOST", "PGSERVICE", "PG" + "PASSWORD",
                      "GTEST_FILTER", "GTEST_OUTPUT",
-                     "GTEST_ALSO_RUN_DISABLED_TESTS"):
+                     "GTEST_ALSO_RUN_DISABLED_TESTS", "LD_PRELOAD",
+                     "LD_LIBRARY_PATH", "PYTHONPATH", "GCONV_PATH",
+                     "BASH_ENV"):
             self.assertNotIn(name, env)
+            self.assertNotIn(name, calls[0][1]["env"])
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])
         self.assertTrue(calls[3][0][-1] == "stop")
