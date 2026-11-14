@@ -191,6 +191,33 @@ asio::awaitable<void> oversizedResultIsRejected(
 
 } // namespace
 
+TEST(PostgresNativeCoroutineTest, ExtremeDeadlineDoesNotOverflowBeforeConninfoValidation)
+{
+    // A bad conninfo fails without contacting a database. The very large
+    // deadline must saturate rather than overflow steady_clock arithmetic,
+    // including before libpq validates its local connection parameters.
+    asio::io_context context;
+    auto future = asio::co_spawn(
+        context,
+        pg::AsyncConnection::connect(
+            "openproof_intentionally_invalid_libpq_option=1",
+            std::chrono::milliseconds::max()),
+        asio::use_future);
+    context.run();
+    EXPECT_THROW(static_cast<void>(future.get()), std::runtime_error);
+}
+
+TEST(PostgresNativeCoroutineTest, ZeroDeadlineIsRejectedBeforeConnect)
+{
+    asio::io_context context;
+    auto future = asio::co_spawn(
+        context,
+        pg::AsyncConnection::connect("dbname=unused", 0ms),
+        asio::use_future);
+    context.run();
+    EXPECT_THROW(static_cast<void>(future.get()), std::invalid_argument);
+}
+
 TEST(PostgresNativeCoroutineTest, ParameterizedQueryHasRealAsyncLibpqTransport)
 {
     const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");

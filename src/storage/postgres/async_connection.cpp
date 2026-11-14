@@ -94,7 +94,13 @@ using ResultPointer = std::unique_ptr<PGresult, ResultDeleter>;
     if (timeout <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument{"PostgreSQL deadline must be positive"};
     }
-    return Clock::now() + timeout;
+    // A caller may supply milliseconds::max(); saturate instead of
+    // overflowing steady_clock::time_point (undefined behavior).
+    const auto now = Clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Deadline::max() - now);
+    if (timeout >= remaining) return Deadline::max();
+    return now + timeout;
 }
 
 asio::awaitable<void> waitForSocket(
