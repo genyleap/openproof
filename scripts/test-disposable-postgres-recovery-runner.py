@@ -209,6 +209,31 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
         self.assertTrue(any("cleanup unavailable" in note
                             for note in caught.exception.__notes__))
 
+    def test_failed_gtest_exit_status_survives_cleanup_failure(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            status = 7 if len(calls) == 3 else (1 if len(calls) == 4 else 0)
+            return subprocess.CompletedProcess(command, status, stdout="",
+                                               stderr="cleanup denied" if status == 1 else "")
+
+        def fake_copy(_source, destination):
+            Path(destination).write_bytes(b"synthetic-test-binary")
+
+        with (
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(fixture.shutil, "copyfile", side_effect=fake_copy),
+            mock.patch.object(fixture.os, "geteuid", return_value=0),
+            mock.patch.object(fixture.shutil, "chown"),
+            mock.patch.object(fixture.subprocess, "run", side_effect=fake_run),
+            mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as stderr,
+        ):
+            self.assertEqual(fixture.main(), 7)
+            self.assertIn("cleanup denied", stderr.getvalue())
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[-1][-1], "stop")
+
     def test_root_privilege_drop_failure_never_executes_gtests(self):
         calls, _ = self.simulate(root=True, fail_first=True)
         self.assertEqual(len(calls), 1)

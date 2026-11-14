@@ -73,6 +73,7 @@ def main() -> int:
         log = work / "server.log"
         started = False
         start_attempted = False
+        test_exit_code = None
         try:
             pg([str(PGBIN / "initdb"), "-D", str(datadir), "--no-sync",
                 "--auth-local=peer", "--auth-host=reject",
@@ -109,7 +110,8 @@ def main() -> int:
                                         check=False, timeout=120)
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("Disposable PostgreSQL tests exceeded 120 seconds") from exc
-            return result.returncode
+            test_exit_code = result.returncode
+            return test_exit_code
         finally:
             primary_error = sys.exc_info()[1]
             if start_attempted:
@@ -121,6 +123,8 @@ def main() -> int:
                     # The cleanup failure remains visible as an exception note.
                     if primary_error is not None:
                         primary_error.add_note(f"Disposable PostgreSQL cleanup failed: {cleanup_error}")
+                    elif test_exit_code is not None and test_exit_code != 0:
+                        print(f"Disposable PostgreSQL cleanup failed: {cleanup_error}", file=sys.stderr)
                     elif started:
                         raise
                     # A failed startup may have left no running server.
