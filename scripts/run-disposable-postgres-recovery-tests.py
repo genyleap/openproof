@@ -61,6 +61,10 @@ def main() -> int:
             # Keep temporary files created by libpq, PostgreSQL utilities or
             # the native test executable inside the disposable fixture.
             env["TMPDIR"] = str(work)
+            # Some native runtimes use TMP or TEMP instead of TMPDIR.
+            # Never let inherited paths redirect fixture temporary output.
+            env["TMP"] = str(work)
+            env["TEMP"] = str(work)
             env["PGPASSFILE"] = os.devnull
             env["PGSERVICEFILE"] = str(work / "no-pg-service.conf")
             env["PGSYSCONFDIR"] = str(work)

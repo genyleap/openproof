@@ -46,6 +46,8 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             "PYTHONPATH": "/tmp/untrusted-python",
             "GCONV_PATH": "/tmp/untrusted-converters",
             "BASH_ENV": "/tmp/untrusted-bashrc",
+            "TMP": "/tmp/untrusted-tmp",
+            "TEMP": "/tmp/untrusted-temp",
         }
         def fake_copy(_source, destination):
             Path(destination).write_bytes(b"synthetic-test-binary")
@@ -96,6 +98,8 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
             self.assertTrue(child_env["PGSERVICEFILE"].endswith("/no-pg-service.conf"))
             self.assertEqual(child_env["PGSYSCONFDIR"], child_env["HOME"])
             self.assertEqual(child_env["TMPDIR"], child_env["HOME"])
+            self.assertEqual(child_env["TMP"], child_env["HOME"])
+            self.assertEqual(child_env["TEMP"], child_env["HOME"])
             self.assertIn("/openproof-recovery-pg-", child_env["HOME"])
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])
