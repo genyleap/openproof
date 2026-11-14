@@ -52,6 +52,17 @@ def main() -> int:
             shutil.chown(executable, user="postgres", group="postgres")
             shutil.chown(work, user="postgres", group="postgres")
 
+        def fixture_environment() -> dict[str, str]:
+            env = isolated_environment()
+            # libpq also reads ~/.pgpass and system/user service files even
+            # when inherited PG* variables have been removed. Never consult
+            # credentials or service definitions from the invoking account.
+            env["HOME"] = str(work)
+            env["PGPASSFILE"] = os.devnull
+            env["PGSERVICEFILE"] = str(work / "no-pg-service.conf")
+            env["PGSYSCONFDIR"] = str(work)
+            return env
+
         def pg(command: list[str]) -> subprocess.CompletedProcess[str]:
             if must_drop_privileges:
                 # Root-owned PostgreSQL clusters are forbidden. Abort on any
@@ -62,7 +73,7 @@ def main() -> int:
                 # as the native tests; pg_ctl -w can otherwise hang forever.
                 result = subprocess.run(command, check=False, text=True,
                                         capture_output=True, timeout=30,
-                                        env=isolated_environment())
+                                        env=fixture_environment())
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("Disposable PostgreSQL setup/teardown exceeded 30 seconds") from exc
             if result.returncode:
@@ -88,7 +99,7 @@ def main() -> int:
             started = True
 
             # Only the just-created private Unix socket is used.
-            env = isolated_environment()
+            env = fixture_environment()
             # Do not inherit any production PGHOST/PGSERVICE/PGPASSWORD.
             # The URI contains NO credential and points only to this
             # freshly initialized, private Unix-domain socket.

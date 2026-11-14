@@ -89,6 +89,12 @@ class DisposableRecoveryRunnerTest(unittest.TestCase):
                      "BASH_ENV"):
             self.assertNotIn(name, env)
             self.assertNotIn(name, calls[0][1]["env"])
+        for _, kwargs in calls:
+            child_env = kwargs["env"]
+            self.assertEqual(child_env["PGPASSFILE"], os.devnull)
+            self.assertTrue(child_env["PGSERVICEFILE"].endswith("/no-pg-service.conf"))
+            self.assertEqual(child_env["PGSYSCONFDIR"], child_env["HOME"])
+            self.assertIn("/openproof-recovery-pg-", child_env["HOME"])
         self.assertIn(" user=postgres", env["OPENPROOF_TEST_POSTGRES"])
         self.assertIn("host=/tmp/openproof-recovery-pg-", env["OPENPROOF_TEST_POSTGRES"])
         self.assertTrue(calls[3][0][-1] == "stop")
