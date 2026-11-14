@@ -111,15 +111,19 @@ def main() -> int:
                 raise RuntimeError("Disposable PostgreSQL tests exceeded 120 seconds") from exc
             return result.returncode
         finally:
+            primary_error = sys.exc_info()[1]
             if start_attempted:
                 try:
                     pg([str(PGBIN / "pg_ctl"), "-D", str(datadir),
                         "-m", "immediate", "-w", "stop"])
-                except RuntimeError:
-                    # A failed startup may have left no running server.
-                    # Do not hide the original startup exception.
-                    if started:
+                except RuntimeError as cleanup_error:
+                    # Preserve the primary failure if native tests failed too.
+                    # The cleanup failure remains visible as an exception note.
+                    if primary_error is not None:
+                        primary_error.add_note(f"Disposable PostgreSQL cleanup failed: {cleanup_error}")
+                    elif started:
                         raise
+                    # A failed startup may have left no running server.
 
 
 if __name__ == "__main__":
