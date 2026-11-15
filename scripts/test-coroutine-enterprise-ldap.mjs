@@ -59,14 +59,14 @@ test("native LDAP runtime has a separate, explicitly gated transactional stack",
   assert.match(app,/nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/);
   assert.match(app,/fallback, nativeSessions\.get\(\)/);
   assert.match(app,/auto nativeTrust = trust;/);
-  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
-  const ldapOnly = app.indexOf("if (nativeLdapEnabled) {", nativeIo);
+  const nativeAuth = app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
   const sessionPool = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const transactionPool = app.indexOf("nativeTransactions = std::make_unique<", nativeIo);
-  assert.ok(nativeIo>=0 && sessionPool>nativeIo && ldapOnly>sessionPool
-      && transactionPool>ldapOnly,
-    "only LDAP can allocate its native transaction and canonical finalizer");
+  assert.ok(nativeIo>=0 && sessionPool>nativeIo && nativeAuth>sessionPool
+      && transactionPool>nativeAuth,
+    "LDAP and Web3 may allocate native transactions; Account-only cannot");
   assert.match(app,/std::move\(\*nativeSessionSecret\), sessionPolicy/);
   const server = app.slice(app.indexOf("[[nodiscard]] ExitCode runGatewayServer("));
   assert.ok(server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP") >= 0

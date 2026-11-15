@@ -83,8 +83,9 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.doesNotMatch(overlay.slice(overlay.indexOf("CoroutineRouteOverlay::handleAsync(")), /m_compatibility->handle\(/);
   assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, \*nativeHandler, std::move\(nativePaths\)/);
   assert.match(app, /nativeHandler = &nativeEnterprise/);
-  assert.match(app, /nativePaths\{[\s\S]*?"\/auth\/ldap\/start", "\/auth\/ldap\/complete"/);
-  assert.match(app, /if \(platform.account\(\).enabled\(\) && nativeSessions\)/);
+  assert.match(app, /if \(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/);
+  assert.match(app, /if \(nativeWeb3Enabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/web3\/start"\);\s*nativePaths\.emplace_back\("\/auth\/web3\/complete"\)/);
+  assert.match(app, /if \(platform.account\(\).enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
   assert.match(app, /nativeHandler = asyncAccount.get\(\)/);
   assert.match(app, /nativePaths.emplace_back\("\/account\/sessions"\)/);
   assert.match(app, /nativePaths.emplace_back\("\/account\/sessions\/revoke"\)/);
@@ -99,23 +100,23 @@ test("native account-session runtime can be enabled independently of native LDAP
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag != "0"/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
   assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled\)\s*nativeSessionSecret\.emplace/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace/);
 
   // The session pool/issuer must be built even when LDAP is NOT enabled.
   const nativeIo=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
-  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled)", nativeIo);
+  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled)", nativeIo);
   const sessionRepo=app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer=app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
-  const ldapGate=app.indexOf("if (nativeLdapEnabled) {", nativeIo);
+  const ldapGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
   const transactionRepo=app.indexOf("nativeTransactions = std::make_unique<", ldapGate);
   assert.ok(setup>=0 && setup<nativeIo);
   assert.ok(nativeIo<sessionRepo && sessionRepo<sessionIssuer && sessionIssuer<ldapGate);
   assert.ok(ldapGate<transactionRepo);
   assert.match(app.slice(ldapGate, app.indexOf("std::optional<passkey::PasskeyService>",ldapGate)),
     /nativeAuthentication = std::make_unique<auth::AuthenticationService>/);
-  assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeSessions\)/);
+  assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
   // A disabled feature must not create another copy of the signing key.
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {

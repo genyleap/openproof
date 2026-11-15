@@ -198,10 +198,10 @@ const checked = segments.map(([name, relative]) => {
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
       && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
-      // The runtime now composes an exact-path array so native account
-      // session routes can coexist with native LDAP. Check the actual
-      // composition instead of an obsolete inline overlay initializer.
-      && /std::vector<std::string>\s+nativePaths\s*\{\s*"\/auth\/ldap\/start"\s*,\s*"\/auth\/ldap\/complete"\s*\}/.test(appSource)
+      // Exact paths must be added ONLY when LDAP is explicitly enabled.
+      // An independent Web3 opt-in may share native transaction/canonical
+      // storage but must not automatically expose LDAP authentication.
+      && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)
       && /nativeHandler\s*=\s*&nativeEnterprise/.test(app)
       && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*healthApi\s*,\s*\*nativeHandler\s*,\s*std::move\(nativePaths\)/.test(app);
     if (!nativeWiring)

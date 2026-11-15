@@ -3857,3 +3857,37 @@ denial paths without weakening native opt-in gates.
 This is **boundary security hardening**, not migration completion:
 C++26 rebuild and HTTP loopback verification remain pending, and legacy
 synchronous repository/provider surfaces are still blocking findings.
+
+#### Independent opt-in native Web3 login composition (2026-11-16)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN=0|1` is now validated
+before connecting to PostgreSQL or applying migrations. When explicitly
+set to `1`, with authentication enabled, the runtime assembles the
+coroutine PostgreSQL transaction repository, canonical finalizer and
+session issuer even if enterprise LDAP is disabled. It constructs a
+native-only `Web3AuthenticationHttpApi` above the enterprise native
+handler and exposes exactly `POST /auth/web3/start` and
+`POST /auth/web3/complete` through the per-request native overlay.
+This uses the already implemented `beginAsync`, `completeAsync` and
+`issueAsync` methods; it never dispatches the old synchronous Web3
+facade from the native request. LDAP paths are now included only when
+the LDAP opt-in is set, and Account session paths only with the separate
+Account opt-in. This avoids enabling unrelated native routes by
+configuring Web3 alone.
+
+**Not migrated:** legacy browser-handoff ticket issue/redemption,
+account-connection ceremonies, and synchronous provider compatibility
+facades. The native Web3 handler rejects unsupported handoff tickets and
+presentation-profile writes before consuming one-time challenge material.
+No default behavior or running application has been changed. Route
+composition and gating have source-contract tests in
+`scripts/test-coroutine-native-web3-runtime.mjs`.
+A real GCC16 C++26 rebuild, isolated PostgreSQL/wallet HTTP E2E and
+operational verification are required before enabling the opt-in.
+The separate Gateway HTTP test build consumed substantial resources
+without completing the named-module compilation and was stopped;
+**it is not a passing C++ test**.
+
+This change is a development-branch increment, not acceptance of the
+entire Web3 provider or HTTP plane. The strict gate remains
+`NOT_APPROVED` with 17 blocking findings.

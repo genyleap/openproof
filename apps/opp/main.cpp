@@ -1396,6 +1396,25 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeAccountEnabled =
         nativeAccountFlag && *nativeAccountFlag == "1";
+    // Wallet/Farcaster already expose native verification coroutines, but
+    // their synchronous browser-handoff APIs are not yet migrated. Select
+    // only the direct native start/complete pair with a separate opt-in.
+    const auto nativeWeb3Flag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN");
+    if (nativeWeb3Flag && *nativeWeb3Flag != "0"
+        && *nativeWeb3Flag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeWeb3Enabled = nativeWeb3Flag && *nativeWeb3Flag == "1";
+    if (nativeWeb3Enabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native Web3 login requires enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeAccountEnabled && !platform.account().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -1423,7 +1442,7 @@ addProtectedRoutes(gateway::Router& router,
     // Native issuance must use the legacy session HMAC key. Never create
     // another copy of that key for a disabled feature.
     std::optional<fnd::SecretString> nativeSessionSecret;
-    if (nativeLdapEnabled || nativeAccountEnabled)
+    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
@@ -2145,7 +2164,7 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
-    if (nativeLdapEnabled || nativeAccountEnabled) {
+    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2164,7 +2183,7 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
-        if (nativeLdapEnabled) {
+        if (nativeLdapEnabled || nativeWeb3Enabled) {
             nativeTransactions = std::make_unique<
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
@@ -2290,9 +2309,18 @@ addProtectedRoutes(gateway::Router& router,
         // All other account routes remain on the compatibility worker.
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
-        std::vector<std::string> nativePaths{
-            "/auth/ldap/start", "/auth/ldap/complete"};
-        if (platform.account().enabled() && nativeSessions) {
+        std::vector<std::string> nativePaths;
+        // A Web3-only opt-in must never activate LDAP inadvertently just
+        // because both login types share the native canonical SQL stack.
+        if (nativeLdapEnabled) {
+            nativePaths.emplace_back("/auth/ldap/start");
+            nativePaths.emplace_back("/auth/ldap/complete");
+        }
+        if (nativeWeb3Enabled) {
+            nativePaths.emplace_back("/auth/web3/start");
+            nativePaths.emplace_back("/auth/web3/complete");
+        }
+        if (platform.account().enabled() && nativeAccountEnabled && nativeSessions) {
             auto* service = nativeSessions.get();
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
                 healthApi, nativeEnterprise, limiter.value(),
@@ -2327,6 +2355,16 @@ addProtectedRoutes(gateway::Router& router,
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             nativeAuthentication ? *nativeAuthentication : authentication,
             sessions, limiter.value(), fallback, nativeSessions.get()};
+        if (nativeWeb3Enabled) {
+            // Compose native Web3 ABOVE the native LDAP adapter. Its guarded
+            // coroutine fallback delegates LDAP without touching the legacy
+            // Web3 handler, and the exact-path overlay decides which opt-ins
+            // actually receive native requests.
+            authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
+                *nativeAuthentication, providers, sessions, limiter.value(),
+                enterpriseApi, nullptr, nativeSessions.get()};
+            return runWithScim(enterpriseApi, nativeWeb3Api);
+        }
         return runWithScim(enterpriseApi, enterpriseApi);
     };
 
