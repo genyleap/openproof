@@ -175,6 +175,22 @@ struct Fixture {
         ASSERT_TRUE(repository.add(std::move(session)));
     }
 
+    void addMembership(std::string_view identity, std::string_view role,
+                       bool suspend = false,
+                       std::string_view organization = "org")
+    {
+        auto member = org::Membership::invite(
+            core::OrganizationId{std::string{organization}},
+            core::IdentityId{std::string{identity}}, kNow);
+        ASSERT_TRUE(member);
+        ASSERT_TRUE(member->grantRole(org::Role{std::string{role}}));
+        ASSERT_TRUE(member->accept());
+        if (suspend) {
+            ASSERT_TRUE(member->suspend());
+        }
+        ASSERT_TRUE(memberships.add(std::move(member).value()));
+    }
+
     fnd::ManualClockSource clock;
     sess::InMemorySessionRepository repository;
     sess::SessionService sessions;
@@ -203,6 +219,50 @@ TEST(AdministrationHttpApiTest, RequiresAnIal2SessionBeforeProvisioning)
                   "ial1-token")).status(),
               403);
     EXPECT_FALSE(fixture.provisioner.called);
+}
+
+TEST(AdministrationHttpApiTest, ListingMembersRequiresActiveOwnerNotJustIal2)
+{
+    Fixture noToken;
+    EXPECT_EQ(noToken.api.handle(request(
+        "/admin/local-members", {}, {}, gw::HttpMethod::Get)).status(), 401);
+
+    Fixture lowAssurance;
+    lowAssurance.addSession("ial1-token", idp::AssuranceLevel::Ial1);
+    lowAssurance.addMembership("owner", "owner");
+    EXPECT_EQ(lowAssurance.api.handle(request(
+        "/admin/local-members", {}, "ial1-token", gw::HttpMethod::Get)).status(), 403);
+
+    Fixture ordinaryMember;
+    ordinaryMember.addSession("member-token", idp::AssuranceLevel::Ial2, "member");
+    ordinaryMember.addMembership("member", "member");
+    EXPECT_EQ(ordinaryMember.api.handle(request(
+        "/admin/local-members", {}, "member-token", gw::HttpMethod::Get)).status(), 403);
+
+    Fixture unrelatedUser;
+    unrelatedUser.addSession("visitor-token", idp::AssuranceLevel::Ial2, "visitor");
+    EXPECT_EQ(unrelatedUser.api.handle(request(
+        "/admin/local-members", {}, "visitor-token", gw::HttpMethod::Get)).status(), 403);
+
+    Fixture anotherTenantOwner;
+    anotherTenantOwner.addSession("other-token", idp::AssuranceLevel::Ial2, "other");
+    anotherTenantOwner.addMembership("other", "owner", false, "another-org");
+    EXPECT_EQ(anotherTenantOwner.api.handle(request(
+        "/admin/local-members", {}, "other-token", gw::HttpMethod::Get)).status(), 403);
+
+    Fixture suspendedOwner;
+    suspendedOwner.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    suspendedOwner.addMembership("owner", "owner", true);
+    EXPECT_EQ(suspendedOwner.api.handle(request(
+        "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get)).status(), 403);
+
+    Fixture activeOwner;
+    activeOwner.addSession("owner-token", idp::AssuranceLevel::Ial2);
+    activeOwner.addMembership("owner", "owner");
+    const auto response = activeOwner.api.handle(request(
+        "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
+    EXPECT_EQ(response.status(), 200) << response.body();
+    EXPECT_NE(response.body().find("\"members\""), std::string::npos);
 }
 
 TEST(AdministrationHttpApiTest, GeneratesCredentialsAndReturnsThemOnlyAfterSuccess)
