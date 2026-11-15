@@ -23,8 +23,8 @@ test("Web3 opt-in is validated before database operations and is off by default"
 });
 
 test("Web3 login gets async transaction, canonical and session services without LDAP opt-in", () => {
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\) \{/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\) \{/);
   assert.match(app, /if \(nativeLdapEnabled \|\| nativeWeb3Enabled\) \{/);
   const runtime = app.slice(app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>"),
     app.indexOf("std::optional<passkey::PasskeyService>"));

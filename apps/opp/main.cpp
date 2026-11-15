@@ -47,6 +47,7 @@
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
 #include "../../src/storage/postgres/coroutine_session_service.hpp"
+#include "../../src/storage/postgres/coroutine_session_listener.hpp"
 #include "../../src/account/http/coroutine_session_http.hpp"
 
 import openproof.account;
@@ -1409,6 +1410,26 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
     const bool nativeWeb3Enabled = nativeWeb3Flag && *nativeWeb3Flag == "1";
+    // Session rotation/revocation has its own native SQL service and HTTP
+    // listener. Enable only these three methods; do not infer readiness of
+    // password login, OAuth or recovery-code issuance.
+    const auto nativeAuthSessionFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
+    if (nativeAuthSessionFlag && *nativeAuthSessionFlag != "0"
+        && *nativeAuthSessionFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAuthSessionEnabled =
+        nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    if (nativeAuthSessionEnabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native authentication sessions require enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeWeb3Enabled && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -1442,7 +1463,8 @@ addProtectedRoutes(gateway::Router& router,
     // Native issuance must use the legacy session HMAC key. Never create
     // another copy of that key for a disabled feature.
     std::optional<fnd::SecretString> nativeSessionSecret;
-    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled)
+    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
+        || nativeAuthSessionEnabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
@@ -2164,7 +2186,8 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
-    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled) {
+    if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
+        || nativeAuthSessionEnabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2307,6 +2330,7 @@ addProtectedRoutes(gateway::Router& router,
         // Only opt-in native PostgreSQL sessions can serve account session
         // routes without blocking the HTTP reactor on the legacy libpq pool.
         // All other account routes remain on the compatibility worker.
+        std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
@@ -2320,10 +2344,23 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/web3/start");
             nativePaths.emplace_back("/auth/web3/complete");
         }
+        if (nativeAuthSessionEnabled && nativeSessions) {
+            // The existing coroutine session listener owns the native
+            // rotate/logout application dispatcher and rejects all sync
+            // compatibility calls. Its only fallback is the already-gated
+            // Web3/LDAP native handler; the route overlay whitelists only
+            // these three explicitly enabled session mutations.
+            asyncAuthSessions = std::make_unique<postgres::CoroutineSessionListenerStack>(
+                *nativeSessions, limiter.value(), *nativeHandler, true);
+            nativeHandler = &asyncAuthSessions->handler();
+            nativePaths.emplace_back("/auth/session/rotate");
+            nativePaths.emplace_back("/auth/logout");
+            nativePaths.emplace_back("/auth/logout-all");
+        }
         if (platform.account().enabled() && nativeAccountEnabled && nativeSessions) {
             auto* service = nativeSessions.get();
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
-                healthApi, nativeEnterprise, limiter.value(),
+                healthApi, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
                     return service->authenticate(std::move(bearer));
                 },

@@ -100,11 +100,11 @@ test("native account-session runtime can be enabled independently of native LDAP
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag != "0"/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
   assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace/);
 
   // The session pool/issuer must be built even when LDAP is NOT enabled.
   const nativeIo=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
-  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled)", nativeIo);
+  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled", nativeIo);
   const sessionRepo=app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer=app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
   const ldapGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
@@ -116,7 +116,7 @@ test("native account-session runtime can be enabled independently of native LDAP
     /nativeAuthentication = std::make_unique<auth::AuthenticationService>/);
   assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
   // A disabled feature must not create another copy of the signing key.
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {

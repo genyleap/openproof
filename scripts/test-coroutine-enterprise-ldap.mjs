@@ -59,7 +59,7 @@ test("native LDAP runtime has a separate, explicitly gated transactional stack",
   assert.match(app,/nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/);
   assert.match(app,/fallback, nativeSessions\.get\(\)/);
   assert.match(app,/auto nativeTrust = trust;/);
-  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
   const nativeAuth = app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
   const sessionPool = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);

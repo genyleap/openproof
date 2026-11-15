@@ -3891,3 +3891,36 @@ without completing the named-module compilation and was stopped;
 This change is a development-branch increment, not acceptance of the
 entire Web3 provider or HTTP plane. The strict gate remains
 `NOT_APPROVED` with 17 blocking findings.
+
+#### Independent native authentication session mutations (2026-11-16)
+
+A fourth independently validated runtime opt-in,
+`OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS=0|1`, allows **only**
+`POST /auth/session/rotate`, `POST /auth/logout`, and
+`POST /auth/logout-all` to use the existing coroutine PostgreSQL
+session service instead of the synchronous SessionService. It is
+validated before migrations and requires configured authentication;
+it is disabled by default. This path uses the same session HMAC key
+derivation and authoritative persisted session policy.
+
+`CoroutineSessionListenerStack` now composes above the native Web3/LDAP
+handlers when this flag is enabled, and below the independently enabled
+Account session adapter. The stack's synchronous entry *always denies*;
+its continuation to Web3/LDAP checks request-scoped native capability
+again and never calls a synchronous fallback. The exact-path overlay
+restricts dispatch to the opt-in endpoints. Configuring this flag
+alone does not silently enable LDAP, Web3, Account session listing,
+password login, MFA, OAuth or recovery-code issuance. The existing
+`openproof_postgres_async_listener` target is linked into the development
+server so that the feature is truly composed, without modifying its
+runtime default or production process.
+
+The native session loopback C++ suite
+`tests/storage/postgres_coroutine_network_test.cpp` already covers
+real Beast HTTP route behavior for rotate and logout. The new source
+contract `scripts/test-coroutine-native-auth-session-runtime.mjs` verifies
+the independent runtime flag, stack order, exact paths, async service
+calls and CMake linkage. **Fresh GCC16 C++26 compilation and isolated
+end-to-end tests are still mandatory**: these structural tests do not
+establish that the server rebuild is passing. The strict migration
+status remains `NOT_APPROVED`, with 17 blocking findings.
