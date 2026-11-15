@@ -32,6 +32,10 @@ gateway::HttpResponse CoroutineSessionListenerAdapter::handle(
 {
     // Never dispatch through a synchronous compatibility handler: not for
     // unknown paths, temporarily disabled providers, or session mutations.
+    // Do not retain presented bearer/cookie credentials on the deny path.
+    request.wipeBody();
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
     gateway::HttpResponse rejected{
         foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
         gateway::Headers{{"content-type", "application/json"}},
@@ -62,6 +66,9 @@ CoroutineSessionListenerStack::CoroutineSessionListenerStack(
               // (for example, its async session issuer becoming unavailable).
               // Never call a disabled coroutine or its synchronous handler.
               if (!fallback.nativeEnabledFor(request)) {
+                  request.wipeBody();
+                  request.wipeAuthorizationHeader();
+                  request.wipeCookieHeader();
                   gateway::HttpResponse unavailable{
                       foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
                       gateway::Headers{{"content-type", "application/json"}},

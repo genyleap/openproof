@@ -3838,3 +3838,22 @@ fresh GCC C++26 compilation or isolated SQL/LDAP acceptance.
 
 **Release remains NOT_APPROVED (17 blocking findings).** No `main`,
 Production, active services or containers were modified.
+
+#### Fail-closed native listener credential erasure (2026-11-16)
+
+When an exact-path CoroutineRouteOverlay denies a route due to unavailable
+native dependencies, **both** synchronous compatibility entry and direct
+`handleAsync` denial now overwrite request-owned Authorization, Cookie
+and body buffers. The direct, disabled /metrics coroutine path performs
+the same scrub. The native PostgreSQL session listener's synchronous
+fail-closed entry and its revoked async fallback also scrub all three
+classes before returning 503. Previously, these branches rejected the
+request but could leave bearer material in the request allocation until
+destruction. Tests in
+`scripts/test-coroutine-native-capability-defaults.mjs` and
+`scripts/test-native-http-credential-erasure.mjs` check the exact
+denial paths without weakening native opt-in gates.
+
+This is **boundary security hardening**, not migration completion:
+C++26 rebuild and HTTP loopback verification remain pending, and legacy
+synchronous repository/provider surfaces are still blocking findings.

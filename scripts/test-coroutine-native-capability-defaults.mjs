@@ -44,6 +44,10 @@ test("metrics asynchronous entry rejects direct sync and revoked fallback calls"
   assert.match(native, /!m_fallback->nativeEnabledFor\(request\)/);
   assert.doesNotMatch(native, /m_metricsFacade->handle\s*\(/);
   assert.match(native, /ErrorCode::Unavailable/);
+  const denied = native.slice(0, native.indexOf("const HttpMethod method"));
+  for (const scrub of ["wipeBody", "wipeAuthorizationHeader", "wipeCookieHeader"])
+    assert.ok(denied.includes("request." + scrub + "()"),
+      "disabled native metrics requests must scrub " + scrub);
   assert.match(native, /cache-control", "no-store"/);
   assert.match(gatewayTests,
     /TEST\(BeastHttpIntegrationTest, DirectMetricsCoroutineCallFailsClosed\)/);
@@ -65,7 +69,16 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(overlay, /m_native->nativeEnabledFor\(request\)/);
   assert.match(overlay, /m_native->handleAsync\(std::move\(request\)\)/);
   assert.match(overlay, /if \(overlays\(request.path\(\)\)\)/);
-  assert.match(overlay, /request.wipeBody\(\)/);
+  const syncReject=overlay.slice(
+    overlay.indexOf("CoroutineRouteOverlay::handle(HttpRequest request)"),
+    overlay.indexOf("CoroutineRouteOverlay::handleAsync(HttpRequest request)"));
+  const asyncReject=overlay.slice(overlay.indexOf(
+    "CoroutineRouteOverlay::handleAsync(HttpRequest request)"));
+  for (const denied of [syncReject, asyncReject]) {
+    assert.match(denied, /request.wipeBody\(\)/);
+    assert.match(denied, /request.wipeAuthorizationHeader\(\)/);
+    assert.match(denied, /request.wipeCookieHeader\(\)/);
+  }
   assert.match(overlay, /return unavailable\(request\)/);
   assert.doesNotMatch(overlay.slice(overlay.indexOf("CoroutineRouteOverlay::handleAsync(")), /m_compatibility->handle\(/);
   assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, \*nativeHandler, std::move\(nativePaths\)/);

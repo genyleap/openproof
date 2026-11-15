@@ -11,6 +11,8 @@ const root = path.resolve(import.meta.dirname, "..");
 const read = p => fs.readFileSync(path.join(root, p), "utf8");
 const accountRaw = read("src/account/http/coroutine_session_http.cpp");
 const nativeSession = cppExecutableText(read("src/storage/postgres/coroutine_session_http.cpp"));
+const nativeListener = cppExecutableText(
+  read("src/storage/postgres/coroutine_session_listener.cpp"));
 const legacyAccountRaw = read("src/account/http/http.cpp");
 const account = cppExecutableText(accountRaw);
 const recovery = cppExecutableText(read("src/authentication/http/coroutine_recovery_code_http.cpp"));
@@ -63,6 +65,23 @@ test("native PostgreSQL rotate/logout deny paths erase request credential header
     mutation.indexOf("limiter.allow("));
   assert.ok(mutation.indexOf("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}") <
     mutation.indexOf("gateway::takeSessionCredential(request)"));
+});
+
+test("native PostgreSQL listener scrubs failed direct and fallback credentials", () => {
+  const deniedDirect = method(nativeListener,
+    "CoroutineSessionListenerAdapter::handle(",
+    "CoroutineSessionListenerAdapter::handleAsync(");
+  const deniedFallback = method(nativeListener,
+    "CoroutineSessionListenerStack::CoroutineSessionListenerStack(",
+    "CoroutineSessionListenerStack::handler()");
+  for (const code of [deniedDirect, deniedFallback]) {
+    for (const scrub of ["wipeBody", "wipeAuthorizationHeader", "wipeCookieHeader"]) {
+      assert.ok(code.includes("request." + scrub + "()"),
+        "native listener denial must scrub " + scrub);
+    }
+  }
+  assert.match(deniedFallback, /!fallback\.nativeEnabledFor\(request\)/);
+  assert.doesNotMatch(deniedFallback,/fallback\.handle\(/);
 });
 
 test("native and legacy account JSON handlers reject MIME prefix confusion", () => {

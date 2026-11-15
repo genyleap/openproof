@@ -786,6 +786,7 @@ HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
         // An unready native login must never fall back to a blocking or
         // differently configured compatibility credential handler.
         request.wipeBody();
+        request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
         return unavailable(request);
     }
@@ -799,6 +800,7 @@ CoroutineRouteOverlay::handleAsync(HttpRequest request)
         // Defense in depth for callers bypassing the listener's capability
         // dispatch. Never invoke synchronous middleware on an Asio worker.
         request.wipeBody();
+        request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
         co_return unavailable(request);
     }
@@ -828,6 +830,10 @@ CoroutineMetricsAdapter::handleAsync(HttpRequest request)
         // metrics or bypass a revoked per-request downstream capability.
         // Even a miscomposed middleware chain therefore fails closed rather
         // than executing a synchronous service on a coroutine executor.
+        // Capability rejection can precede credential extraction.
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
         HttpResponse denied{
             foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
             Headers{{"content-type", "application/json"}},
