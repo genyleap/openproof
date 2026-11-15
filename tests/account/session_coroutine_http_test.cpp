@@ -79,7 +79,7 @@ public:
 }
 
 asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
-    http::CoroutineAccountSessionAdapter& api, gw::HttpRequest request)
+    gw::http::CoroutineHttpHandler& api, gw::HttpRequest request)
 {
     co_return std::optional<gw::HttpResponse>{
         co_await api.handleAsync(std::move(request))};
@@ -165,6 +165,46 @@ struct Fixture final {
     std::string lastTarget;
     http::CoroutineAccountSessionAdapter api;
 };
+
+TEST(AccountCoroutineSessionHttpTest, ExplicitListenerOverlayRoutesSessionsWithoutLegacyIo)
+{
+    Fixture f;
+    gw::http::CoroutineRouteOverlay overlay{
+        f.legacy, f.api,
+        {"/auth/ldap/start", "/auth/ldap/complete",
+         "/account/sessions", "/account/sessions/revoke"}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Get, "/account/sessions")));
+    EXPECT_TRUE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Post, "/account/sessions/revoke")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Get, "/account/sessions/other")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Get, "/account/profile")));
+    // LDAP still needs its own native dependency graph, not this adapter.
+    EXPECT_FALSE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Post, "/auth/ldap/start")));
+
+    asio::io_context io;
+    auto future = asio::co_spawn(io, dispatch(overlay,
+        request(gw::HttpMethod::Get, "/account/sessions", "valid-token")),
+        asio::use_future);
+    io.run();
+    auto response = std::move(future.get()).value();
+    EXPECT_EQ(response.status(), 200);
+    EXPECT_EQ(f.authenticationCalls, 1);
+    EXPECT_EQ(f.listCalls, 1);
+    EXPECT_EQ(f.legacy.invoked, 0);
+
+    // Native routes are fail-closed when entered through the sync facade;
+    // unrelated compatibility routes preserve the legacy public contract.
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Get, "/account/sessions", "valid-token")).status(), 503);
+    EXPECT_EQ(f.legacy.invoked, 0);
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Get, "/account/profile")).status(), 299);
+    EXPECT_EQ(f.legacy.invoked, 1);
+}
 
 TEST(AccountCoroutineSessionHttpTest, RequestSpecificCapabilityAndNativeFallback)
 {

@@ -36,6 +36,7 @@ target_link_libraries(opp
         openproof_application
         openproof_account
         openproof_account_http
+        openproof_account_async_http
         openproof_account_delivery
         openproof_consent
         openproof_evidence

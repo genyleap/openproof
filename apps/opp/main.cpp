@@ -47,6 +47,7 @@
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
 #include "../../src/storage/postgres/coroutine_session_service.hpp"
+#include "../../src/account/http/coroutine_session_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -2256,11 +2257,34 @@ addProtectedRoutes(gateway::Router& router,
             sessions, evidenceProviders, limiter.value(), fallback};
         operationsHttp::HealthHttpApi healthApi{readiness, evidenceApi};
         // Legacy health, evidence and SCIM middleware remain the authoritative
-        // compatibility chain. Only the two explicit LDAP routes may bypass
-        // that chain, and only if their full native dependency graph is ready.
+        // compatibility chain. Exact native routes bypass it only when their
+        // independently verified coroutine dependencies are available.
+        // Only opt-in native PostgreSQL sessions can serve account session
+        // routes without blocking the HTTP reactor on the legacy libpq pool.
+        // All other account routes remain on the compatibility worker.
+        std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
+        gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
+        std::vector<std::string> nativePaths{
+            "/auth/ldap/start", "/auth/ldap/complete"};
+        if (platform.account().enabled() && nativeSessions) {
+            auto* service = nativeSessions.get();
+            asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
+                healthApi, nativeEnterprise, limiter.value(),
+                [service](fnd::SecretString bearer) {
+                    return service->authenticate(std::move(bearer));
+                },
+                [service](identity::IdentityId owner) {
+                    return service->list(std::move(owner));
+                },
+                [service](identity::IdentityId owner, session::SessionId target) {
+                    return service->revokeOwned(std::move(owner), std::move(target));
+                });
+            nativeHandler = asyncAccount.get();
+            nativePaths.emplace_back("/account/sessions");
+            nativePaths.emplace_back("/account/sessions/revoke");
+        }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
-            healthApi, nativeEnterprise,
-            {"/auth/ldap/start", "/auth/ldap/complete"}};
+            healthApi, *nativeHandler, std::move(nativePaths)};
         return runListener(platform, nativeRoutes, logger);
     };
 
