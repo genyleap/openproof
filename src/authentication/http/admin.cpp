@@ -201,7 +201,19 @@ gateway::HttpResponse AdministrationHttpApi::handle(gateway::HttpRequest request
     if (!m_rateLimiter->allow("admin-identity:" + std::string{actor.value()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
-    if (list) return listLocalMembers(std::move(request));
+    if (list) {
+        // A higher assurance session proves identity, not tenant authority.
+        // This read is owner-only; suspended memberships cannot grant roles.
+        auto membership = m_memberships->find(m_organization, actor);
+        if (!membership) return error(membership.error(), request);
+        if (!membership->has_value()
+            || !membership->value().hasRole(organization::Role{"owner"})) {
+            return error(
+                foundation::Error{foundation::ErrorCode::PermissionDenied},
+                request);
+        }
+        return listLocalMembers(std::move(request));
+    }
     if (create) return createLocalMember(std::move(request), actor);
     if (roles) return replaceRoles(std::move(request), actor);
     if (suspend) {
