@@ -18,6 +18,20 @@ const tls = native.slice(
 const server = fs.readFileSync(path.join(root,
   "tests/gateway/http_integration_test.cpp"), "utf8");
 
+test("native gateway refuses late DNS success before initiating TCP or TLS",()=>{
+  const resolved = native.indexOf("co_await resolver->async_resolve(");
+  const cancelled = native.indexOf("resolverDeadline.cancel()", resolved);
+  const timeout = native.indexOf("if (std::chrono::steady_clock::now() >= deadline)", cancelled);
+  const error = native.indexOf("if (error)", cancelled);
+  const tcp = native.indexOf("if (!endpoint.tls())", cancelled);
+  assert.ok(resolved >= 0 && cancelled > resolved && timeout > cancelled);
+  assert.ok(error > timeout && tcp > error,
+    "check the absolute deadline even after a successful DNS resolution");
+  const afterDns = native.slice(timeout, error);
+  assert.match(afterDns, /foundation::ErrorCode::Timeout/);
+  assert.doesNotMatch(afterDns, /co_await/);
+});
+
 test("native gateway still verifies TLS identity and shares the request deadline",()=>{
   assert.match(tls, /SSL_CTRL_SET_TLSEXT_HOSTNAME/);
   assert.match(tls, /ssl::host_name_verification\{host\}/);

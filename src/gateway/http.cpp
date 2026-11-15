@@ -625,11 +625,14 @@ public:
             std::string{endpoint.host()}, std::to_string(endpoint.port()),
             asio::redirect_error(asio::use_awaitable, error));
         resolverDeadline.cancel();
+        // A successful DNS result does not imply that the overall request
+        // deadline is still valid: cancellation can race a resolver result.
+        // Never start TCP/TLS or contact a retry target after that deadline.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         if (error) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                            "The upstream request timed out.");
-            }
             co_return foundation::fail(networkError("resolve upstream", error));
         }
 

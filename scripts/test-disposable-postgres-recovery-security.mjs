@@ -29,7 +29,9 @@ test("disposable PostgreSQL cannot bind TCP or use trust/password authentication
 });
 
 test("test runner discards inherited PostgreSQL secrets and uses only private socket", () => {
-  assert.match(text, /not key\.startswith\("PG"\) and key != "OPENPROOF_TEST_POSTGRES"/);
+  assert.match(text, /blocked = \("PG", "GTEST_", "LD_", "DYLD_", "PYTHON"\)/);
+  assert.match(text, /not key\.startswith\(blocked\)/);
+  assert.match(text, /key not in \("OPENPROOF_TEST_POSTGRES", "GCONV_PATH", "BASH_ENV", "ENV", \*runtime_outputs\)/);
   assert.match(text, /f"host=\{work\} port=\{PORT\} dbname=postgres"/);
   assert.match(text, /if must_drop_privileges:\s+uri \+= " user=postgres"/);
   assert.match(text, /env\["OPENPROOF_TEST_POSTGRES"\] = uri/);
@@ -41,9 +43,11 @@ test("test runner discards inherited PostgreSQL secrets and uses only private so
 });
 
 test("errors and cleanup cannot fall back to a production database", () => {
-  assert.match(text, /finally:\s+if started:/);
+  assert.match(text, /finally:\s+primary_error = sys\.exc_info\(\)\[1\]\s+if start_attempted:/);
+  assert.match(text, /start_attempted = True\s+pg\(\[str\(PGBIN \/ "pg_ctl"\)/);
   assert.match(text, /pg\(\[str\(PGBIN \/ "pg_ctl"\), "-D", str\(datadir\)/);
-  assert.match(text, /subprocess\.run\(command, env=env, text=True, check=False\)/);
+  assert.match(text, /subprocess\.run\(command, env=env, text=True,\s+check=False, timeout=120\)/);
+  assert.match(text, /subprocess\.run\(command, check=False, text=True,\s+capture_output=True, timeout=30/);
   assert.match(text, /raise RuntimeError/);
 });
 

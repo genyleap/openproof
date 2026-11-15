@@ -53,7 +53,7 @@ test("metrics asynchronous entry rejects direct sync and revoked fallback calls"
     /EXPECT_EQ\(disabled\.asynchronousCalls\.load\(\), 0\)/);
 });
 
-test("partially migrated runtime overlays only LDAP with fail-closed native readiness", () => {
+test("partially migrated runtime overlays LDAP and opted-in account sessions with fail-closed readiness", () => {
   const app=read("apps/opp/main.cpp");
   const implementation=read("src/gateway/http.cpp");
   const overlayStart=implementation.indexOf("CoroutineRouteOverlay::CoroutineRouteOverlay(");
@@ -68,13 +68,43 @@ test("partially migrated runtime overlays only LDAP with fail-closed native read
   assert.match(overlay, /request.wipeBody\(\)/);
   assert.match(overlay, /return unavailable\(request\)/);
   assert.doesNotMatch(overlay.slice(overlay.indexOf("CoroutineRouteOverlay::handleAsync(")), /m_compatibility->handle\(/);
-  assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, nativeEnterprise/);
-  assert.match(app, /\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/);
+  assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, \*nativeHandler, std::move\(nativePaths\)/);
+  assert.match(app, /nativeHandler = &nativeEnterprise/);
+  assert.match(app, /nativePaths\{[\s\S]*?"\/auth\/ldap\/start", "\/auth\/ldap\/complete"/);
+  assert.match(app, /if \(platform.account\(\).enabled\(\) && nativeSessions\)/);
+  assert.match(app, /nativeHandler = asyncAccount.get\(\)/);
+  assert.match(app, /nativePaths.emplace_back\("\/account\/sessions"\)/);
+  assert.match(app, /nativePaths.emplace_back\("\/account\/sessions\/revoke"\)/);
   assert.match(app, /runListener\(platform, nativeRoutes, logger\)/);
   assert.match(app, /runWithScim\(enterpriseApi, enterpriseApi\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler\)/);
 });
+test("native account-session runtime can be enabled independently of native LDAP", () => {
+  const app=read("apps/opp/main.cpp");
+  assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS"\)/);
+  assert.match(app, /nativeAccountFlag && \*nativeAccountFlag != "0"/);
+  assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
+  assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled\)\s*nativeSessionSecret\.emplace/);
+
+  // The session pool/issuer must be built even when LDAP is NOT enabled.
+  const nativeIo=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
+  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled)", nativeIo);
+  const sessionRepo=app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
+  const sessionIssuer=app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
+  const ldapGate=app.indexOf("if (nativeLdapEnabled) {", nativeIo);
+  const transactionRepo=app.indexOf("nativeTransactions = std::make_unique<", ldapGate);
+  assert.ok(setup>=0 && setup<nativeIo);
+  assert.ok(nativeIo<sessionRepo && sessionRepo<sessionIssuer && sessionIssuer<ldapGate);
+  assert.ok(ldapGate<transactionRepo);
+  assert.match(app.slice(ldapGate, app.indexOf("std::optional<passkey::PasskeyService>",ldapGate)),
+    /nativeAuthentication = std::make_unique<auth::AuthenticationService>/);
+  assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeSessions\)/);
+  // A disabled feature must not create another copy of the signing key.
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+});
+
 test("loopback-native test implementations explicitly opt in", () => {
   for (const name of ["CoroutineWaitingHandler", "CoroutineProxyHandler", "CoroutineThrowingHandler"]) {
     const start = gatewayTests.indexOf("class " + name + " final");

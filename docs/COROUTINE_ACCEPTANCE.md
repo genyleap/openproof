@@ -3803,3 +3803,38 @@ prove erasure of allocator copies, swapped pages or core dumps.
 
 This security hardening is part of the unapproved development branch;
 it is **not** a completed migration finding or a Production deployment.
+
+#### Separate opt-in native Account session routing and DNS deadline gate (2026-11-16)
+
+The native Account HTTP session overlay was previously instantiated only
+inside the `OPENPROOF_EXPERIMENTAL_NATIVE_LDAP=1` composition branch. This
+incorrectly tied provider-neutral account session list/revoke migration to
+an unrelated LDAP login setting. The composition root now validates an
+independent `OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS=0|1` flag
+**before** database connection/migration, and requires account management
+to be configured when it is enabled. With only this flag set, the runtime
+constructs the bounded coroutine PostgreSQL session repository/issuer and
+the Account HTTP adapter without creating LDAP authentication transactions
+or canonical finalizer pools. LDAP-only and combined opt-in retain their
+original fail-closed native authorization path and HMAC key derivation;
+both flags remain **off by default**, and no live service was reconfigured.
+
+The Gateway native HTTPS/HTTP proxy now rechecks the *absolute deadline*
+after awaitable DNS completion even if DNS returned success. A DNS
+completion racing the timeout must not start an additional TCP/TLS
+connection. This is a correctness change in the native proxy, **not**
+removal of the blocking legacy proxy façade.
+
+Updated source-contract tests cover both independent and combined
+account/LDAP composition and the DNS timeout gate. The LDAP scanner now
+recognizes the actual exact-path vector passed to the route overlay; it
+still reports the authentic remaining blocker, that LDAP is experimental
+and default-disabled pending compiled and isolated LDAP/PostgreSQL E2E.
+Older fixture and enterprise test expectations were updated to assert the
+existing stronger isolation/startup cleanup semantics rather than their
+obsolete syntax. The complete JS/source-contract suite passed
+**150/150**, and the protocol-neutrality checker passed; neither proves
+fresh GCC C++26 compilation or isolated SQL/LDAP acceptance.
+
+**Release remains NOT_APPROVED (17 blocking findings).** No `main`,
+Production, active services or containers were modified.

@@ -198,7 +198,12 @@ const checked = segments.map(([name, relative]) => {
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
       && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
-      && /\{"\/auth\/ldap\/start", "\/auth\/ldap\/complete"\}/.test(appSource);
+      // The runtime now composes an exact-path array so native account
+      // session routes can coexist with native LDAP. Check the actual
+      // composition instead of an obsolete inline overlay initializer.
+      && /std::vector<std::string>\s+nativePaths\s*\{\s*"\/auth\/ldap\/start"\s*,\s*"\/auth\/ldap\/complete"\s*\}/.test(appSource)
+      && /nativeHandler\s*=\s*&nativeEnterprise/.test(app)
+      && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*healthApi\s*,\s*\*nativeHandler\s*,\s*std::move\(nativePaths\)/.test(app);
     if (!nativeWiring)
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
         expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
