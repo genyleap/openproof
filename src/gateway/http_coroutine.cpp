@@ -1,0 +1,189 @@
+module;
+
+#include <chrono>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <boost/asio/detail/call_stack.hpp>
+#include "asio_thread_context_extern.hpp"
+#include <boost/asio/awaitable.hpp>
+
+module openproof.gateway.http;
+
+namespace openproof::gateway::http {
+namespace asio = boost::asio;
+
+CoroutineRouteOverlay::CoroutineRouteOverlay(
+    HttpHandler& compatibility, CoroutineHttpHandler& native,
+    std::vector<std::string> exactNativePaths)
+    : m_compatibility(&compatibility), m_native(&native),
+      m_exactNativePaths(std::move(exactNativePaths))
+{
+}
+
+bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
+{
+    for (const auto& exact : m_exactNativePaths) {
+        if (std::string_view{exact} == path) return true;
+    }
+    return false;
+}
+
+bool CoroutineRouteOverlay::nativeEnabledFor(const HttpRequest& request) const noexcept
+{
+    if (!overlays(request.path())) return false;
+    try {
+        return m_native->nativeEnabledFor(request);
+    } catch (...) {
+        return false;
+    }
+}
+
+HttpResponse CoroutineRouteOverlay::unavailable(const HttpRequest& request)
+{
+    HttpResponse denied{
+        foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
+        Headers{{"content-type", "application/json"}},
+        foundation::toClientJson(
+            foundation::Error{foundation::ErrorCode::Unavailable},
+            request.correlation().value())};
+    denied.setHeader("cache-control", "no-store");
+    denied.setHeader("x-content-type-options", "nosniff");
+    return denied;
+}
+
+HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
+{
+    if (overlays(request.path())) {
+        // An unready native login must never fall back to a blocking or
+        // differently configured compatibility credential handler.
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        return unavailable(request);
+    }
+    return m_compatibility->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineRouteOverlay::handleAsync(HttpRequest request)
+{
+    if (!nativeEnabledFor(request)) {
+        // Defense in depth for callers bypassing the listener's capability
+        // dispatch. Never invoke synchronous middleware on an Asio worker.
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        co_return unavailable(request);
+    }
+    co_return co_await m_native->handleAsync(std::move(request));
+}
+
+CoroutineMetricsAdapter::CoroutineMetricsAdapter(
+    HttpHandler& metricsFacade, CoroutineHttpHandler& fallback, Observer observer)
+    : m_metricsFacade(&metricsFacade), m_fallback(&fallback),
+      m_observer(std::move(observer))
+{
+}
+
+HttpResponse CoroutineMetricsAdapter::handle(HttpRequest request)
+{
+    // Only the legacy synchronous entry goes through the telemetry facade.
+    return m_metricsFacade->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineMetricsAdapter::handleAsync(HttpRequest request)
+{
+    if (request.path() == "/metrics"
+        || !m_fallback->nativeEnabledFor(request)) {
+        // The listener routes /metrics to the authenticated synchronous
+        // facade. A direct native call must not run that facade, disclose
+        // metrics or bypass a revoked per-request downstream capability.
+        // Even a miscomposed middleware chain therefore fails closed rather
+        // than executing a synchronous service on a coroutine executor.
+        // Capability rejection can precede credential extraction.
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        HttpResponse denied{
+            foundation::errorHttpStatus(foundation::ErrorCode::Unavailable),
+            Headers{{"content-type", "application/json"}},
+            foundation::toClientJson(
+                foundation::Error{foundation::ErrorCode::Unavailable},
+                request.correlation().value())};
+        denied.setHeader("cache-control", "no-store");
+        denied.setHeader("x-content-type-options", "nosniff");
+        co_return denied;
+    }
+    const HttpMethod method = request.method();
+    const auto started = std::chrono::steady_clock::now();
+    const auto observe = [this, method, started](int status) noexcept {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        // Observability must never change the result or turn an application
+        // error into an uncaught exception. Count all async 500 responses.
+        try {
+            if (m_observer) m_observer(method, status, elapsed);
+        } catch (...) {}
+    };
+    try {
+        HttpResponse result = co_await m_fallback->handleAsync(std::move(request));
+        observe(result.status());
+        co_return result;
+    } catch (...) {
+        // Beast translates the rethrown exception into a sanitized HTTP 500;
+        // record that outcome just like the synchronous Metrics middleware.
+        observe(500);
+        throw;
+    }
+}
+
+CoroutineGatewayAdapter::CoroutineGatewayAdapter(
+    Gateway& gateway, BeastProxyTransport& transport)
+    : m_gateway(&gateway), m_transport(&transport)
+{
+}
+
+HttpResponse CoroutineGatewayAdapter::handle(HttpRequest request)
+{
+    // Compatibility method for legacy transport-neutral middleware.
+    // Such callers are still blocking and remain subject to the release gate.
+    return m_gateway->handle(std::move(request));
+}
+
+boost::asio::awaitable<HttpResponse>
+CoroutineGatewayAdapter::handleAsync(HttpRequest request)
+{
+    // Authorization, rate limiting and context sealing are performed by the
+    // exact same Gateway domain operations used by its synchronous entry.
+    auto prepared = m_gateway->prepareForward(std::move(request));
+    if (auto* immediate = std::get_if<HttpResponse>(&prepared)) {
+        co_return std::move(*immediate);
+    }
+    auto& plan = std::get<GatewayForwardPlan>(prepared);
+    while (auto endpoint = m_gateway->nextForwardEndpoint(plan)) {
+        // The entire retry sequence shares one deadline. A failing or slow
+        // upstream must not reset the budget before contacting the next peer.
+        const foundation::Duration remaining = m_gateway->remainingForwardBudget(plan);
+        if (remaining <= foundation::Duration::zero()) break;
+        // Own a copy of the sanitized request across every suspension point.
+        // Never keep borrowed header or transaction state in the coroutine.
+        auto result = co_await m_transport->sendAsync(
+            *endpoint, plan.request(), remaining);
+        if (auto response = m_gateway->recordForwardResult(
+                plan, *endpoint, std::move(result))) {
+            co_return std::move(*response);
+        }
+    }
+    co_return m_gateway->finishForward(plan);
+}
+
+} // namespace openproof::gateway::http

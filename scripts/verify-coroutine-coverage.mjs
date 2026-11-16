@@ -47,7 +47,16 @@ const forbidden = [
   ["blocking LDAP shutdown", /\bldap_unbind_ext_s\s*\(/g]
 ];
 const checked = segments.map(([name, relative]) => {
-  const source = fs.readFileSync(path.join(root,relative),"utf8");
+  // Gateway's heavy Beast listener, TLS proxy and coroutine dispatch now
+  // live in separate implementation units of ONE C++26 named module.
+  // Scan all of them as one auditable boundary, including legacy facades:
+  // splitting a translation unit must never hide blocking compatibility.
+  const sourcePaths = relative === "src/gateway/http.cpp"
+    ? ["src/gateway/http.cpp", "src/gateway/http_proxy.cpp",
+       "src/gateway/http_coroutine.cpp"]
+    : [relative];
+  const source = sourcePaths.map(file =>
+    fs.readFileSync(path.join(root,file),"utf8")).join("\n");
   const executable = cppExecutableText(source);
   const issues=[];
   for (const [label,regex] of forbidden) {

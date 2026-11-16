@@ -35,7 +35,7 @@ test("known native handlers explicitly opt in; conditional Web3 remains gated", 
 });
 
 test("metrics asynchronous entry rejects direct sync and revoked fallback calls", () => {
-  const implementation = read("src/gateway/http.cpp");
+  const implementation = read("src/gateway/http_coroutine.cpp");
   const start = implementation.indexOf("CoroutineMetricsAdapter::handleAsync(");
   const end = implementation.indexOf("CoroutineGatewayAdapter::CoroutineGatewayAdapter(", start);
   assert.ok(start >= 0 && end > start);
@@ -59,7 +59,7 @@ test("metrics asynchronous entry rejects direct sync and revoked fallback calls"
 
 test("partially migrated runtime overlays LDAP and opted-in account sessions with fail-closed readiness", () => {
   const app=read("apps/opp/main.cpp");
-  const implementation=read("src/gateway/http.cpp");
+  const implementation=read("src/gateway/http_coroutine.cpp");
   const overlayStart=implementation.indexOf("CoroutineRouteOverlay::CoroutineRouteOverlay(");
   const overlayEnd=implementation.indexOf("CoroutineMetricsAdapter::CoroutineMetricsAdapter(", overlayStart);
   assert.ok(overlayStart >= 0 && overlayEnd > overlayStart);

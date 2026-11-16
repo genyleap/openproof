@@ -8,8 +8,10 @@ import path from "node:path";
 import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const raw = fs.readFileSync(path.join(root, "src/gateway/http.cpp"), "utf8");
+const raw = fs.readFileSync(path.join(root, "src/gateway/http_proxy.cpp"), "utf8");
 const code = cppExecutableText(raw);
+const adapters = cppExecutableText(fs.readFileSync(
+  path.join(root, "src/gateway/http_coroutine.cpp"), "utf8"));
 const native = code.slice(
   code.indexOf("asio::awaitable<foundation::Result<HttpResponse>> sendAsync("),
   code.indexOf("BeastProxyTransport::BeastProxyTransport("));
@@ -54,7 +56,7 @@ test("completed bounded TLS response is returned before optional peer shutdown",
 });
 
 test("native Gateway adapter still awaits the nonblocking upstream transport",()=>{
-  const fn = code.slice(code.indexOf("CoroutineGatewayAdapter::handleAsync("));
+  const fn = adapters.slice(adapters.indexOf("CoroutineGatewayAdapter::handleAsync("));
   assert.match(fn, /co_await m_transport->sendAsync\(/);
   assert.match(fn, /remainingForwardBudget\(plan\)/);
   assert.match(fn, /m_gateway->recordForwardResult\(/);

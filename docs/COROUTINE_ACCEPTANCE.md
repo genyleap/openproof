@@ -3943,3 +3943,31 @@ parsing. This also retains existing legacy cookie semantics.
 ownership and await-order contract. Source-level tests alone are not
 evidence of freshly compiled C++26 or isolated wallet/SQL E2E; these
 release gates remain open.
+
+#### Gateway translation-unit decomposition for bounded GCC 16 builds (2026-11-16)
+
+The gateway's approximately 41 KiB single implementation unit formerly
+instantiated Beast HTTP listener, TLS proxy, and native coroutine routing in
+one GCC 16 C++26 module implementation. With an ongoing module build taking
+many hours on the single-core test host, this created a serious bottleneck
+to release qualification.
+
+The same named module `openproof.gateway.http` now has separate
+implementation units: `http.cpp` (Beast HTTP listener),
+`http_proxy.cpp` (TLS proxy), and `http_coroutine.cpp` (route overlay,
+metrics and gateway coroutine adapters). The CMake target links all three,
+and the coroutine scanner explicitly concatenates the units so that moving
+the old blocking `context.run()` facade cannot hide its blocking finding.
+The TLS-specific headers are limited to the proxy. Public module
+declarations, wire protocol and native opt-in defaults were not changed.
+
+`scripts/test-gateway-translation-unit-split.mjs`,
+`scripts/test-native-gateway-tls-completion.mjs` and
+`scripts/test-coroutine-native-capability-defaults.mjs` validate the
+decomposition, bounded network framing and native capability gates at
+source-contract level. Real C++26 compile/link and loopback tests are
+**not yet passing for this split**: an unrelated long-running build in the
+shared development checkout prevented a fresh isolated rebuild during
+this session. No build success is inferred from CMake source inspection.
+Production remains unchanged. The legacy blocking compatibility facade
+remains a release blocker, and the release gate is NOT_APPROVED.
