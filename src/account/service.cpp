@@ -404,12 +404,29 @@ foundation::Result<identity::core::IdentityId> AccountService::signup(
         return foundation::fail(saved.error());
     }
 
+    // The verification delivery adapter may reject or fail an email after
+    // the identity was provisioned. In that case this signup must not retain
+    // pending password credentials or reserve a subject for later activation.
+    const auto abandonSignup = [&] {
+        static_cast<void>(m_localAccounts->removePending(
+            identity, identity::provider::ExternalSubject{normalized.value()}));
+        static_cast<void>(m_repository->releaseSubject(external, identity));
+        static_cast<void>(m_identities->changeStatus(
+            m_organization, identity, identity::core::IdentityStatus::Deleted));
+    };
+
     auto dispatch = issue(identity, VerificationPurpose::SignupEmail,
                           VerificationChannel::Email, normalized.value(),
                           m_policy.emailVerificationLifetime());
-    if (!dispatch.has_value()) return foundation::fail(dispatch.error());
+    if (!dispatch.has_value()) {
+        abandonSignup();
+        return foundation::fail(dispatch.error());
+    }
     auto delivered = m_delivery->deliver(dispatch.value());
-    if (!delivered.has_value()) return foundation::fail(delivered.error());
+    if (!delivered.has_value()) {
+        abandonSignup();
+        return foundation::fail(delivered.error());
+    }
     return identity;
 }
 
