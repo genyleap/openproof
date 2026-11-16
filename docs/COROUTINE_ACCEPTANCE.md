@@ -3924,3 +3924,22 @@ calls and CMake linkage. **Fresh GCC16 C++26 compilation and isolated
 end-to-end tests are still mandatory**: these structural tests do not
 establish that the server rebuild is passing. The strict migration
 status remains `NOT_APPROVED`, with 17 blocking findings.
+
+#### Web3 coroutine credential ownership before suspension (2026-11-16)
+
+The experimental native Web3 login boundary now owns the browser
+binding token in `foundation::SecretString`, and both native start and
+complete requests wipe their raw body, `Authorization`, and Cookie
+headers on every return. In `completeAsync`, the SIWE message/signature
+are moved into auto-wiping provider `CredentialValue` parameters; the
+continuation is transferred to a `SecretString`, while copied cookie
+tokens and parsed Boost.JSON one-time proofs are securely erased
+**before** suspending for verification. The request's already-captured
+client context and correlation remain available. Duplicated or
+malformed cookies now create no extra temporary plaintext string during
+parsing. This also retains existing legacy cookie semantics.
+
+`scripts/test-coroutine-native-web3-secret-scrub.mjs` checks the exact
+ownership and await-order contract. Source-level tests alone are not
+evidence of freshly compiled C++26 or isolated wallet/SQL E2E; these
+release gates remain open.

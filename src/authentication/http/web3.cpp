@@ -3,6 +3,7 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -35,6 +36,64 @@ constexpr std::string_view kModeCookie{"__Host-openproof-web3-mode"};
 constexpr std::string_view kAuthenticationHandoffCookie{
     "__Host-openproof-web3-auth-handoff"};
 constexpr std::size_t kMaximumBody = 16U * 1024U;
+
+// Native Web3 verification suspends for provider RPC and PostgreSQL. Neither
+// a full Cookie header nor a raw SIWE signature should remain in the request
+// buffer after credentials have acquired their own scoped owners.
+class SensitiveWeb3RequestGuard final {
+public:
+    explicit SensitiveWeb3RequestGuard(gateway::HttpRequest& request) noexcept
+        : m_request(request) {}
+    SensitiveWeb3RequestGuard(const SensitiveWeb3RequestGuard&) = delete;
+    SensitiveWeb3RequestGuard& operator=(const SensitiveWeb3RequestGuard&) = delete;
+    ~SensitiveWeb3RequestGuard() { wipe(); }
+    void wipe() noexcept {
+        m_request.wipeBody();
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
+// Owns a borrowed pointer only while the Result<json::object> owner is alive.
+// Wipe parsed copies of one-time browser tickets and SIWE credentials before
+// any coroutine suspension as well as on all exceptions and early returns.
+class SensitiveWeb3ParsedGuard final {
+public:
+    explicit SensitiveWeb3ParsedGuard(json::object* body) noexcept : m_body(body) {}
+    SensitiveWeb3ParsedGuard(const SensitiveWeb3ParsedGuard&) = delete;
+    SensitiveWeb3ParsedGuard& operator=(const SensitiveWeb3ParsedGuard&) = delete;
+    ~SensitiveWeb3ParsedGuard() { wipe(); }
+    void wipe() noexcept {
+        if (!m_body) return;
+        for (std::string_view key : {"handoff_ticket", "message", "signature"}) {
+            if (auto* field=m_body->if_contains(key); field && field->is_string()) {
+                auto& value=field->as_string();
+                foundation::secureWipe(value.data(), value.size());
+                value.clear();
+            }
+        }
+    }
+private:
+    json::object* m_body;
+};
+
+class SensitiveWeb3CopyGuard final {
+public:
+    explicit SensitiveWeb3CopyGuard(std::optional<std::string>& value) noexcept
+        : m_value(value) {}
+    SensitiveWeb3CopyGuard(const SensitiveWeb3CopyGuard&) = delete;
+    SensitiveWeb3CopyGuard& operator=(const SensitiveWeb3CopyGuard&) = delete;
+    ~SensitiveWeb3CopyGuard() { wipe(); }
+    void wipe() noexcept {
+        if (!m_value) return;
+        foundation::secureWipe(m_value->data(), m_value->size());
+        m_value->clear();
+    }
+private:
+    std::optional<std::string>& m_value;
+};
 
 [[nodiscard]] std::string cookie(std::string_view name, std::string_view value,
                                  std::int64_t maximumAge)
@@ -86,7 +145,9 @@ void clearState(gateway::HttpResponse& response)
 {
     const auto header = request.header("cookie");
     if (!header) return std::nullopt;
-    std::optional<std::string> found;
+    // Keep a borrowed view until the entire header has been validated.
+    // Duplicate/invalid cookies must never leave an extra plaintext copy.
+    std::optional<std::string_view> found;
     std::size_t begin = 0U;
     while (begin <= header->size()) {
         const auto end = header->find(';', begin);
@@ -102,12 +163,13 @@ void clearState(gateway::HttpResponse& response)
                            || (symbol >= '0' && symbol <= '9') || symbol == '-' || symbol == '_' || symbol == '.';
                    });
             if (!safe || found) return std::nullopt;
-            found = std::string{value};
+            found = value;
         }
         if (end == std::string_view::npos) break;
         begin = end + 1U;
     }
-    return found;
+    return found ? std::optional<std::string>{std::string{*found}}
+                 : std::nullopt;
 }
 
 [[nodiscard]] foundation::Result<json::object> parseObject(const gateway::HttpRequest& request)
@@ -615,6 +677,7 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAsync(
     gateway::HttpRequest request, bool connection)
 {
+    SensitiveWeb3RequestGuard wipeRequestOnExit{request};
     // The native route must never call synchronous session authentication or
     // one-time browser-handoff storage on a handler executor. Connection
     // ceremonies remain on the legacy compatibility route until both have
@@ -628,6 +691,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
                         request, true);
     }
     auto body = parseObject(request);
+    SensitiveWeb3ParsedGuard wipeParsedOnExit{body ? &body.value() : nullptr};
     if (!body || !onlyFields(body.value(),
                              {"provider", "address", "chain_id", "fid", "handoff_ticket"})) {
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
@@ -665,7 +729,8 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     }
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken) co_return error(bindingToken.error(), request, true);
-    auto binding = security::sha256(bindingToken.value());
+    foundation::SecretString bindingSecret{std::move(bindingToken).value()};
+    auto binding = security::sha256(bindingSecret.expose());
     if (!binding) co_return error(binding.error(), request, true);
 
     idp::AuthenticationRequest authenticationRequest{providerId, clientContext(request)};
@@ -675,6 +740,10 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     if (fid) {
         authenticationRequest.setParameter("fid", *fid);
     }
+    // The asynchronous coordinator now owns these parameters and context.
+    // Scrub rejected browser tickets and raw cookies before suspending.
+    wipeParsedOnExit.wipe();
+    wipeRequestOnExit.wipe();
     auto started = co_await m_authentication->beginAsync(
         std::move(authenticationRequest), binding.value(),
         request.correlation());
@@ -703,7 +772,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
                                    json::serialize(payload)};
     secure(response);
     response.addHeader("set-cookie", cookie(kContinuationCookie, started->continuationToken().expose(), 600));
-    response.addHeader("set-cookie", cookie(kBindingCookie, bindingToken.value(), 600));
+    response.addHeader("set-cookie", cookie(kBindingCookie, bindingSecret.expose(), 600));
     response.addHeader("set-cookie", cookie(kTransactionCookie, started->transactionId().value(), 600));
     response.addHeader("set-cookie", cookie(kChallengeCookie, started->challenge().id().value(), 600));
     co_return response;
@@ -712,6 +781,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
 boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::completeAsync(
     gateway::HttpRequest request, bool connection)
 {
+    SensitiveWeb3RequestGuard wipeRequestOnExit{request};
     // Reject unsupported session/handoff operations before consuming the
     // one-time proof. No blocking session repository is allowed here.
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
@@ -723,6 +793,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
                         request, true);
     }
     auto body = parseObject(request);
+    SensitiveWeb3ParsedGuard wipeParsedOnExit{body ? &body.value() : nullptr};
     if (!body || !onlyFields(body.value(), {"message", "signature", "display_name",
                                                   "preferred_username", "picture_url"})) {
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
@@ -737,14 +808,22 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
                         request, true);
     }
     auto message = stringField(body.value(), "message", 8192U);
+    SensitiveWeb3CopyGuard wipeMessageOnExit{message};
     auto signature = stringField(body.value(), "signature", 8192U);
-    const auto continuation = cookieValue(request, kContinuationCookie, 256U);
-    const auto bindingToken = cookieValue(request, kBindingCookie, 256U);
-    const auto transaction = cookieValue(request, kTransactionCookie, 256U);
-    const auto challenge = cookieValue(request, kChallengeCookie, 512U);
-    const auto mode = cookieValue(request, kModeCookie, 16U);
-    const auto authenticationHandoff =
+    SensitiveWeb3CopyGuard wipeSignatureOnExit{signature};
+    auto continuation = cookieValue(request, kContinuationCookie, 256U);
+    SensitiveWeb3CopyGuard wipeContinuationOnExit{continuation};
+    auto bindingToken = cookieValue(request, kBindingCookie, 256U);
+    SensitiveWeb3CopyGuard wipeBindingOnExit{bindingToken};
+    auto transaction = cookieValue(request, kTransactionCookie, 256U);
+    SensitiveWeb3CopyGuard wipeTransactionOnExit{transaction};
+    auto challenge = cookieValue(request, kChallengeCookie, 512U);
+    SensitiveWeb3CopyGuard wipeChallengeOnExit{challenge};
+    auto mode = cookieValue(request, kModeCookie, 16U);
+    SensitiveWeb3CopyGuard wipeModeOnExit{mode};
+    auto authenticationHandoff =
         cookieValue(request, kAuthenticationHandoffCookie, 256U);
+    SensitiveWeb3CopyGuard wipeHandoffOnExit{authenticationHandoff};
     // Browser handoff publication still requires synchronous token storage.
     // Reject it before burning the one-time authentication challenge.
     if (authenticationHandoff) {
@@ -757,15 +836,38 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     }
     auto binding = security::sha256(*bindingToken);
     if (!binding) co_return error(binding.error(), request, true);
-    idp::AuthenticationResponse authenticationResponse{idp::ChallengeId{*challenge}, clientContext(request)};
-    authenticationResponse.setParameter("message", idp::CredentialValue{std::move(*message)});
-    authenticationResponse.setParameter("signature", idp::CredentialValue{std::move(*signature)});
+
+    // Transfer the one-time continuation into its wiping owner before any
+    // suspension. Native provider verification owns the signature/message;
+    // no plain text copy or raw Cookie header may outlive this boundary.
+    foundation::SecretString continuationSecret{std::move(*continuation)};
+    idp::TransactionId transactionId{std::move(*transaction)};
+    idp::ChallengeId challengeId{std::move(*challenge)};
+    idp::ClientContext client = clientContext(request);
+    idp::AuthenticationResponse authenticationResponse{
+        std::move(challengeId), client};
+    authenticationResponse.setParameter(
+        "message", idp::CredentialValue{std::move(*message)});
+    authenticationResponse.setParameter(
+        "signature", idp::CredentialValue{std::move(*signature)});
+
+    wipeParsedOnExit.wipe();
+    wipeRequestOnExit.wipe();
+    wipeMessageOnExit.wipe();
+    wipeSignatureOnExit.wipe();
+    wipeContinuationOnExit.wipe();
+    wipeBindingOnExit.wipe();
+    wipeTransactionOnExit.wipe();
+    wipeChallengeOnExit.wipe();
+    wipeModeOnExit.wipe();
+    wipeHandoffOnExit.wipe();
+
     auto verified = co_await m_authentication->completeAsync(
-        idp::TransactionId{*transaction}, foundation::SecretString{*continuation},
+        std::move(transactionId), std::move(continuationSecret),
         binding.value(), std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
     auto issued = co_await m_asyncSessions->issueAsync(
-        verified.value(), clientContext(request));
+        verified.value(), std::move(client));
     if (!issued) co_return error(issued.error(), request, true);
     if (!validSessionCredential(issued->id.value())
         || !validSessionCredential(issued->token.expose())) {
