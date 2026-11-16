@@ -3997,3 +3997,26 @@ The split TLS proxy and listener compilation, full module link,
 fresh HTTP loopback E2E and full SQL/LDAP release acceptance remain
 separate required checks. This fix does not close the migration gate,
 which still reports 17 findings.
+
+#### GCC 16 Gateway build bottleneck closed at library scope (2026-11-16)
+
+The original OpenProof test build had remained at gateway C++ compilation
+for more than seven hours. It was terminated cleanly, and a new isolated
+three-object build was performed against the existing GCC 16.2
+`RelWithDebInfo`, `-std=c++26`, `-Werror` toolchain. The first attempt
+revealed a GCC false-positive `mismatched-new-delete` diagnostic arising
+from inlining Boost.Asio's aligned coroutine allocation. A per-source
+`-fno-inline` workaround, restricted to GCC 16.x and the three gateway
+implementation units only, preserves all diagnostics and public module
+interfaces. The three **fresh native compiler outputs** succeeded:
+`http_coroutine.cpp.o` (previous diagnostic eliminated),
+`http_proxy.cpp.o` (about 124 seconds), and `http.cpp.o` (about 65
+seconds). A subsequent `openproof_gateway_http` target build linked
+`libopenproof_gateway_http.a` successfully.
+
+This is proof of a *compiled and linked gateway static library*, not yet
+proof of a rebuilt `opp` executable, complete HTTP listener integration
+tests, HTTPS identity/timeout E2E, or a release performance benchmark.
+Compiler inlining is disabled only on GCC 16 due to the observed compiler
+behavior. A release-grade performance comparison with the baseline remains
+a mandatory acceptance gate before Production changes.

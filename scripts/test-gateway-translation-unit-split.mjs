@@ -47,8 +47,8 @@ test("TLS includes are isolated from listener and nonnetwork middleware",()=>{
 });
 
 test("GCC16 Asio coroutine allocation workaround is isolated without suppressing -Werror",()=>{
-  assert.match(cmake,/if\(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"\)/);
-  assert.match(cmake,/set_source_files_properties\(http_coroutine\.cpp PROPERTIES\s*COMPILE_OPTIONS "-fno-inline"\)/);
+  assert.match(cmake,/if\(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17"\)/);
+  assert.match(cmake,/set_source_files_properties\(\s*http_coroutine\.cpp http_proxy\.cpp http\.cpp\s*PROPERTIES COMPILE_OPTIONS "-fno-inline"\)/);
   assert.doesNotMatch(cmake,/-Wno-error|-Wno-mismatched-new-delete/);
 });
 

@@ -41,7 +41,10 @@ target_compile_definitions(openproof_gateway_http PRIVATE BOOST_HAS_LONG_LONG=1)
 # allocator/deallocator when handleAsync() is inlined at -O2. Avoid the
 # inlining only for this small dispatch implementation, preserving -Werror
 # and all other diagnostics for the whole project and TLS/listener units.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(http_coroutine.cpp PROPERTIES
-        COMPILE_OPTIONS "-fno-inline")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17")
+    set_source_files_properties(
+        http_coroutine.cpp http_proxy.cpp http.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
