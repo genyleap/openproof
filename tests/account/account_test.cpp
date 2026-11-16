@@ -58,9 +58,14 @@ public:
         destination = std::string{dispatch.destination()};
         secret = std::string{dispatch.secret().expose()};
         purpose = dispatch.purpose();
+        if (reject) {
+            return fnd::fail(fnd::ErrorCode::Unavailable,
+                             "Verification delivery intentionally unavailable.");
+        }
         return fnd::ok();
     }
 
+    bool reject{false};
     std::string id;
     std::string identity;
     std::string destination;
@@ -158,6 +163,43 @@ TEST(AccountPasswordUpgradeTest, ExternalOnlyIdentityNeverReceivesPrompt)
     EXPECT_FALSE(status->has_value());
     EXPECT_FALSE(fixture.service->confirmPasswordUpgrade(
         identity, fnd::SecretString{"unrelated-password"}));
+}
+
+TEST(AccountSignupTest, FailedVerificationDeliveryRetiresPendingAccount)
+{
+    Fixture fixture;
+    fixture.delivery.reject = true;
+    const fnd::SecretString password{"correct-password"};
+
+    auto failed = fixture.service->signup(
+        "undeliverable@example.com", password, std::string{"Not delivered"});
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().code(), fnd::ErrorCode::Unavailable);
+    ASSERT_FALSE(fixture.delivery.identity.empty());
+
+    const core::IdentityId abandoned{fixture.delivery.identity};
+    auto identity = fixture.identities.findById(fixture.organization, abandoned);
+    ASSERT_TRUE(identity);
+    ASSERT_TRUE(identity->has_value());
+    EXPECT_EQ(identity->value().status(), core::IdentityStatus::Deleted);
+
+    const core::ExternalIdentityRef external{
+        fixture.localProvider, idp::ExternalSubject{"undeliverable@example.com"}};
+    auto reservation = fixture.accountRepository.reservedOwner(external, kNow);
+    ASSERT_TRUE(reservation);
+    EXPECT_FALSE(reservation->has_value());
+
+    auto pendingPassword = fixture.localAccounts->verify(
+        idp::ExternalSubject{"undeliverable@example.com"},
+        password, std::nullopt, kNow);
+    EXPECT_FALSE(pendingPassword);
+
+    // An adapter outage must not permanently squat the email address.
+    fixture.delivery.reject = false;
+    auto retry = fixture.service->signup(
+        "undeliverable@example.com", password, std::string{"Retry"});
+    ASSERT_TRUE(retry);
+    EXPECT_NE(retry.value(), abandoned);
 }
 
 TEST(AccountEmailLinkingTest, SignupConvergesOnExistingActiveVerifiedEmail)
