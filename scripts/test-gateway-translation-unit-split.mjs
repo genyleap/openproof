@@ -46,6 +46,12 @@ test("TLS includes are isolated from listener and nonnetwork middleware",()=>{
   }
 });
 
+test("GCC16 Asio coroutine allocation workaround is isolated without suppressing -Werror",()=>{
+  assert.match(cmake,/if\(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"\)/);
+  assert.match(cmake,/set_source_files_properties\(http_coroutine\.cpp PROPERTIES\s*COMPILE_OPTIONS "-fno-inline"\)/);
+  assert.doesNotMatch(cmake,/-Wno-error|-Wno-mismatched-new-delete/);
+});
+
 test("the same gateway library links all three C++26 implementation files",()=>{
   for(const name of ["http.cpp","http_proxy.cpp","http_coroutine.cpp","asio_thread_context.cpp"])
     assert.ok(cmake.includes("        "+name+"\n"));

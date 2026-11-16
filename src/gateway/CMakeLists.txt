@@ -36,3 +36,12 @@ openproof_add_module(openproof_gateway_http
 # supports long long; without this target-local correction Boost.System cannot
 # declare its error-category identifier type.
 target_compile_definitions(openproof_gateway_http PRIVATE BOOST_HAS_LONG_LONG=1)
+
+# GCC 16.2 can misdiagnose Boost.Asio's matching aligned coroutine-frame
+# allocator/deallocator when handleAsync() is inlined at -O2. Avoid the
+# inlining only for this small dispatch implementation, preserving -Werror
+# and all other diagnostics for the whole project and TLS/listener units.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(http_coroutine.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-inline")
+endif()

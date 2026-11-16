@@ -3971,3 +3971,29 @@ shared development checkout prevented a fresh isolated rebuild during
 this session. No build success is inferred from CMake source inspection.
 Production remains unchanged. The legacy blocking compatibility facade
 remains a release blocker, and the release gate is NOT_APPROVED.
+
+#### GCC 16 gateway coroutine-frame diagnostic resolved (2026-11-16)
+
+A seven-hour stalled OpenProof test compilation was terminated via its
+isolated Remote Operations build session. No production processes or
+unrelated projects were stopped. The development checkout was cleanly
+fast-forwarded to the verified GitHub commit `543bbd1` and the
+temporary stash created for this Git synchronization was dropped,
+preserving unrelated historical stashes.
+
+A fresh, limited GCC 16.2 C++26 compile of
+`http_coroutine.cpp.o` exposed
+`-Werror=mismatched-new-delete` in Boost.Asio's aligned
+`awaitable_frame_base` allocation. The same false-positive diagnostic
+was previously resolved in the native PostgreSQL adapters by disabling
+compiler inlining at the translation-unit level. Added GCC-only
+`-fno-inline` **solely** to `http_coroutine.cpp`, preserving
+`-Werror` and all other security/quality diagnostics across the project.
+The formerly failing object then **compiled successfully** with the
+existing C++26 RelWithDebInfo configuration. Source-contract
+regressions verify this narrow scope.
+
+The split TLS proxy and listener compilation, full module link,
+fresh HTTP loopback E2E and full SQL/LDAP release acceptance remain
+separate required checks. This fix does not close the migration gate,
+which still reports 17 findings.
