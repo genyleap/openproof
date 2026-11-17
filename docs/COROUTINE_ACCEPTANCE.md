@@ -4081,3 +4081,79 @@ OAuth binary or HTTP E2E was compiled or executed this run. Do not lower
 the required Boost version to evade this gate. All other OAuth/OIDC routes
 remain synchronous, and the strict migration scanner remains
 `NOT_APPROVED` with 17 findings.
+
+#### GCC 16.2 / Boost 1.88 development build resolution (2026-11-17)
+
+The missing dependency from the first CMake attempt was **not** an absent
+Boost 1.88 installation; it was an incorrectly selected system Boost 1.83.
+The host already has the required private, pinned tree at
+`/opt/genyleap/openproof/.deps/boost-1.88-install`. Configure the isolated
+development checkout with the explicit prefix (replace the prefix on other
+hosts, rather than reducing the protocol's minimum Boost version):
+
+```sh
+cmake -S . -B /tmp/openproof-dev-boost188-20261117 -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/gcc.cmake \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DOPENPROOF_BUILD_TESTS=ON \
+  -DOPENPROOF_ENABLE_EXPERIMENTAL_CONTRACTS=OFF \
+  -DCMAKE_PREFIX_PATH=/opt/genyleap/openproof/.deps/boost-1.88-install
+```
+
+CMake then **configured successfully** with the unchanged GCC 16.2
+production-stability toolchain, Boost 1.88 and tests enabled. The
+production `src/oauth/http/coroutine_discovery_http.cpp.o` subsequently
+**compiled successfully** in that isolated tree, together with the
+prerequisite C++26 module interfaces. This proves the native adapter can
+compile; a separate focused native GTest runner now checks its actual
+GET/JWKS/OPTIONS and security-fallback behavior when compiled and run.
+No production server, database or `main` branch was changed.
+
+#### GCC 16 OAuth partition build recovery in a clean Ninja tree (2026-11-17)
+
+During the first fresh Native OIDC GTest build, GCC/CMake built
+`service.cppm.o` but its corresponding
+`openproof.oauth-service.gcm` module BMI was missing when
+`oauth.cppm` imported `openproof.oauth:service`. This was a genuine
+build failure and **not** an OAuth protocol or C++ API error. Explicitly
+building the two prerequisite objects with the same isolated CMake build
+configuration regenerated the missing BMI, after which the primary OAuth
+module interface compiled successfully:
+
+```sh
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target src/oauth/CMakeFiles/openproof_oauth.dir/service.cppm.o -j 1
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target src/oauth/CMakeFiles/openproof_oauth.dir/oauth.cppm.o -j 1
+```
+
+The module ABI revision and public interface were unchanged, and no
+missing BMI was copied from a different source/build fingerprint. An
+isolated native HTTP GTest target
+`openproof_native_oidc_discovery_tests` was added to verify real
+asynchronous GET/OIDC/JWKS, OPTIONS, invalid-verb denial and native
+provider fallback without accessing PostgreSQL.
+
+#### Executed Native OIDC coroutine regression (2026-11-17)
+
+A focused, real GCC 16.2 / C++26 GoogleTest runner was compiled, linked
+and executed from the isolated Boost 1.88 development tree:
+
+```sh
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target openproof_native_oidc_discovery_tests -j 1
+ctest --test-dir /tmp/openproof-dev-boost188-20261117 \
+  -R '^FocusedNativeOidc\.' --output-on-failure -j 1
+```
+
+**Result: 5/5 CTest tests passed.** The production
+`CoroutineOidcDiscoveryAdapter` was exercised through a real Asio
+`io_context` for anonymous GET discovery/JWKS JSON and policy headers,
+OPTIONS preflight, unsupported-method fail-closed behavior, native
+provider delegation preserving its bearer and cookie input, and direct
+legacy-entry rejection with no synchronous handler calls. This is
+genuine C++ coroutine runtime testing, rather than only a source contract
+or pre-existing binary. The target links the same OAuth HTTP and Gateway
+libraries used by the application. It does **not** establish a socket-level
+HTTP E2E, rebuilt application executable, SQL/LDAP E2E, or full OAuth
+conversion; those remain separate release gates.

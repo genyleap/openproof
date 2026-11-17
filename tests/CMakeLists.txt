@@ -173,6 +173,33 @@ gtest_discover_tests(openproof_gateway_http_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "gateway")
 
+
+# Focused native OIDC/JWKS HTTP dispatch test. It runs the production
+# coroutine adapter directly: no PostgreSQL or live server configuration.
+add_executable(openproof_native_oidc_discovery_tests
+    oauth_native_oidc_discovery_test.cpp)
+target_compile_features(openproof_native_oidc_discovery_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_native_oidc_discovery_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include"
+    "${googletest_SOURCE_DIR}/googletest")
+target_compile_definitions(openproof_native_oidc_discovery_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_native_oidc_discovery_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_native_oidc_discovery_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+target_link_libraries(openproof_native_oidc_discovery_tests PRIVATE
+    openproof_oauth_http openproof_gateway_http openproof_gateway
+    openproof_foundation Boost::headers GTest::gtest_main
+    openproof_test_compile_options)
+gtest_discover_tests(openproof_native_oidc_discovery_tests
+    TEST_PREFIX "FocusedNativeOidc."
+    DISCOVERY_MODE PRE_TEST
+    DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "oauth;oidc;coroutines")
+
 # Direct C++ module boundary test for the native PostgreSQL session adapter.
 # This intentionally links the real domain module, not a duplicate model.
 add_executable(openproof_postgres_domain_tests

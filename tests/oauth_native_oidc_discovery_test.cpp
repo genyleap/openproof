@@ -1,0 +1,188 @@
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <future>
+#include <map>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/asio/detail/call_stack.hpp>
+#include "../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
+
+#include "../src/oauth/http/coroutine_discovery_http.hpp"
+
+import openproof.foundation;
+import openproof.gateway;
+import openproof.gateway.http;
+
+namespace {
+
+namespace asio = boost::asio;
+namespace fnd = openproof::foundation;
+namespace gw = openproof::gateway;
+namespace native = openproof::gateway::http;
+namespace oidc = openproof::oauth::http;
+
+class NativeFallback final : public native::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabledFor(
+        const gw::HttpRequest& request) const noexcept override
+    {
+        return request.method() == gw::HttpMethod::Post
+            && request.path() == "/auth/web3/start";
+    }
+
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        blockingCalls.fetch_add(1);
+        return gw::HttpResponse{500, {}, "blocking fallback called"};
+    }
+
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest request) override
+    {
+        nativeCalls.fetch_add(1);
+        sawAuth = request.header("authorization") == "Bearer sample";
+        sawCookie = request.header("cookie") == "session=sample";
+        sawBody = request.body() == "native-credentials";
+        co_return gw::HttpResponse{202, {}, "delegated"};
+    }
+
+    std::atomic<int> blockingCalls{0};
+    std::atomic<int> nativeCalls{0};
+    bool sawAuth{};
+    bool sawCookie{};
+    bool sawBody{};
+};
+
+[[nodiscard]] gw::HttpRequest makeRequest(
+    gw::HttpMethod method, std::string path,
+    gw::Headers headers = {}, std::string body = {})
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    for (const auto& [name, value] : headers)
+        fields.emplace_back(name, value);
+    auto result = gw::HttpRequest::create(
+        method, std::move(path), std::move(fields), std::move(body),
+        "127.0.0.1", fnd::CorrelationId{"native-oidc-regression"});
+    if (!result) throw std::runtime_error{"Invalid test HTTP request"};
+    return std::move(result).value();
+}
+
+asio::awaitable<void> collectResponse(
+    oidc::CoroutineOidcDiscoveryAdapter& adapter,
+    gw::HttpRequest request,
+    std::optional<gw::HttpResponse>& output)
+{
+    output.emplace(co_await adapter.handleAsync(std::move(request)));
+    co_return;
+}
+
+[[nodiscard]] gw::HttpResponse callAsync(
+    oidc::CoroutineOidcDiscoveryAdapter& adapter,
+    gw::HttpRequest request)
+{
+    asio::io_context context;
+    std::optional<gw::HttpResponse> output;
+    auto future = asio::co_spawn(
+        context, collectResponse(adapter, std::move(request), output),
+        asio::use_future);
+    context.run();
+    future.get();
+    if (!output) throw std::runtime_error{"Native handler returned no response"};
+    return std::move(*output);
+}
+
+TEST(NativeOidcDiscoveryTest, GetDocumentsReturnPublicJsonWithLegacyHeaders)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{
+        fallback, R"({"issuer":"https://test.invalid"})",
+        R"({"keys":[{"kid":"key-1"}]})"};
+
+    for (const auto& [path, expected] : std::vector<std::pair<std::string, std::string>>{
+            {"/.well-known/openid-configuration", R"({"issuer":"https://test.invalid"})"},
+            {"/.well-known/jwks.json", R"({"keys":[{"kid":"key-1"}]})"}}) {
+        auto request = makeRequest(
+            gw::HttpMethod::Get, path,
+            {{"authorization", "Bearer should-not-matter"},
+             {"cookie", "session=should-not-matter"}},
+            "body should not leak");
+        ASSERT_TRUE(handler.nativeEnabledFor(request));
+        auto response = callAsync(handler, std::move(request));
+        EXPECT_EQ(response.status(), 200);
+        EXPECT_EQ(response.body(), expected);
+        EXPECT_EQ(response.headers().at("content-type"), "application/json");
+        EXPECT_EQ(response.headers().at("cache-control"), "no-store");
+        EXPECT_EQ(response.headers().at("access-control-allow-origin"), "*");
+        EXPECT_EQ(response.headers().at("x-content-type-options"), "nosniff");
+    }
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+    EXPECT_EQ(fallback.nativeCalls.load(), 0);
+}
+
+TEST(NativeOidcDiscoveryTest, OptionsPreflightIsEmptyAndNeverDelegated)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{fallback, "{}", "{}"};
+    auto request = makeRequest(
+        gw::HttpMethod::Options, "/.well-known/jwks.json");
+    ASSERT_TRUE(handler.nativeEnabledFor(request));
+    const auto response = callAsync(handler, std::move(request));
+    EXPECT_EQ(response.status(), 204);
+    EXPECT_TRUE(response.body().empty());
+    EXPECT_EQ(response.headers().at("access-control-allow-origin"), "*");
+    EXPECT_EQ(fallback.nativeCalls.load(), 0);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+}
+
+TEST(NativeOidcDiscoveryTest, UnsupportedMethodCannotCallCompatibilityHandler)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{fallback, "{}", "{}"};
+    auto request = makeRequest(
+        gw::HttpMethod::Post, "/.well-known/jwks.json");
+    EXPECT_FALSE(handler.nativeEnabledFor(request));
+    const auto response = callAsync(handler, std::move(request));
+    EXPECT_EQ(response.status(), 503);
+    EXPECT_EQ(fallback.nativeCalls.load(), 0);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+}
+
+TEST(NativeOidcDiscoveryTest, NativeProviderFallbackKeepsOwnedCredentials)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{fallback, "{}", "{}"};
+    auto request = makeRequest(
+        gw::HttpMethod::Post, "/auth/web3/start",
+        {{"authorization", "Bearer sample"},
+         {"cookie", "session=sample"}}, "native-credentials");
+    ASSERT_TRUE(handler.nativeEnabledFor(request));
+    const auto response = callAsync(handler, std::move(request));
+    EXPECT_EQ(response.status(), 202);
+    EXPECT_EQ(response.body(), "delegated");
+    EXPECT_EQ(fallback.nativeCalls.load(), 1);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+    EXPECT_TRUE(fallback.sawAuth);
+    EXPECT_TRUE(fallback.sawCookie);
+    EXPECT_TRUE(fallback.sawBody);
+}
+
+TEST(NativeOidcDiscoveryTest, LegacySynchronousEntryNeverDelegates)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{fallback, "{}", "{}"};
+    const auto response = handler.handle(
+        makeRequest(gw::HttpMethod::Get, "/.well-known/jwks.json"));
+    EXPECT_EQ(response.status(), 503);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+}
+
+} // namespace
