@@ -993,6 +993,44 @@ TEST(BeastHttpIntegrationTest, NativeTlsProxyDoesNotWaitForPeerCloseNotify)
     EXPECT_TRUE(upstream.observedRequest);
 }
 
+TEST(BeastHttpIntegrationTest, NativeCoroutineProxySaturatesExtremeDeadline)
+{
+    // milliseconds::max() overflows when implicitly converted to a
+    // nanosecond steady_clock duration and added to now. It must not
+    // become an already-expired deadline or silently skip the upstream.
+    CountingFastHandler handler;
+    httpAdapter::BeastHttpServer upstream{handler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+
+    auto transport = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(transport.has_value());
+    auto endpoint = gw::Endpoint::create(
+        gw::EndpointId{"extreme-timeout-upstream"}, "127.0.0.1",
+        upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint.has_value());
+    auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/extreme-deadline", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"native-extreme-deadline"});
+    ASSERT_TRUE(request.has_value());
+
+    asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> result;
+    auto completion = asio::co_spawn(
+        io, collectAsyncProxyResponse(
+            *transport.value(), std::move(endpoint).value(),
+            std::move(request).value(), std::chrono::milliseconds::max(), result),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(completion.get());
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ(result->value().status(), 200);
+    EXPECT_EQ(result->value().body(), "fast");
+    EXPECT_EQ(handler.received.load(std::memory_order_relaxed), 1);
+    upstream.stop();
+}
+
 TEST(BeastHttpIntegrationTest, NativeCoroutineProxyEnforcesUpstreamDeadline)
 {
     WaitingHandler handler;

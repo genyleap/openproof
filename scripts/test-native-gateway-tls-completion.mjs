@@ -10,6 +10,8 @@ import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 const root = path.resolve(import.meta.dirname, "..");
 const raw = fs.readFileSync(path.join(root, "src/gateway/http_proxy.cpp"), "utf8");
 const code = cppExecutableText(raw);
+const deadlineHeader = cppExecutableText(fs.readFileSync(
+  path.join(root, "src/gateway/steady_deadline.hpp"), "utf8"));
 const adapters = cppExecutableText(fs.readFileSync(
   path.join(root, "src/gateway/http_coroutine.cpp"), "utf8"));
 const native = code.slice(
@@ -32,6 +34,48 @@ test("native gateway refuses late DNS success before initiating TCP or TLS",()=>
   const afterDns = native.slice(timeout, error);
   assert.match(afterDns, /foundation::ErrorCode::Timeout/);
   assert.doesNotMatch(afterDns, /co_await/);
+});
+
+test("native gateway saturates huge budgets instead of overflowing the steady clock",()=>{
+  assert.match(raw, /#include "steady_deadline\.hpp"/);
+  const creation = native.slice(
+    native.indexOf("const auto deadline = detail::saturatingSteadyDeadline(timeout);"),
+    native.indexOf("auto executor = co_await asio::this_coro::executor;"));
+  assert.match(creation,/detail::saturatingSteadyDeadline\(timeout\)/);
+  assert.match(deadlineHeader,/duration_cast<std::chrono::milliseconds>/);
+  assert.match(deadlineHeader,/Clock::duration::max\(\)/);
+  assert.match(deadlineHeader,/timeout >= longestDelay/);
+  assert.match(deadlineHeader,/Clock::time_point::max\(\) - delay/);
+  assert.match(deadlineHeader,/now >= latestStart/);
+  assert.doesNotMatch(deadlineHeader,/now\(\) \+ timeout/);
+  assert.match(server,/NativeCoroutineProxySaturatesExtremeDeadline/);
+  assert.match(server,/std::chrono::milliseconds::max\(\), result/);
+  assert.match(server,/EXPECT_EQ\(handler.received.load\(std::memory_order_relaxed\), 1\)/);
+});
+
+test("native gateway checks the absolute budget after writing and reading",()=>{
+  const exchange = native.slice(
+    native.indexOf("asio::awaitable<foundation::Result<HttpResponse>> exchangeAsync("),
+    native.indexOf("ProxyConfig m_config;"));
+  const built = exchange.indexOf("auto outgoing = toBeast(endpoint, request);");
+  const write = exchange.indexOf("co_await beastHttp::async_write(");
+  const writeError = exchange.indexOf(
+    "if (error) co_return foundation::fail(networkError(", write);
+  const read = exchange.indexOf("co_await beastHttp::async_read(");
+  const readError = exchange.indexOf(
+    "if (error) co_return foundation::fail(networkError(", read);
+  const returned = exchange.indexOf("co_return fromBeast(parser.release());");
+  assert.ok(built >= 0 && write > built && writeError > write
+    && read > writeError && readError > read && returned > readError);
+  const check = (from,to) => {
+    const section = exchange.slice(from,to);
+    assert.match(section,/if \(std::chrono::steady_clock::now\(\) >= deadline\)/);
+    assert.match(section,/foundation::ErrorCode::Timeout/);
+  };
+  check(built,write);
+  check(write,writeError);
+  check(read,readError);
+  assert.doesNotMatch(exchange.slice(readError,returned),/co_await/);
 });
 
 test("native gateway still verifies TLS identity and shares the request deadline",()=>{

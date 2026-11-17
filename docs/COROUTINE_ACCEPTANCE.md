@@ -4020,3 +4020,31 @@ tests, HTTPS identity/timeout E2E, or a release performance benchmark.
 Compiler inlining is disabled only on GCC 16 due to the observed compiler
 behavior. A release-grade performance comparison with the baseline remains
 a mandatory acceptance gate before Production changes.
+
+#### Native gateway absolute-deadline completion and overflow (2026-11-17)
+
+The gateway coroutine TLS/plain-HTTP transport now uses a transport-local
+`saturatingSteadyDeadline` utility rather than adding a caller-provided
+millisecond duration directly to a nanosecond steady clock. An extreme
+`milliseconds::max()` request therefore saturates at the maximum monotonic
+time point instead of wrapping into an immediately expired deadline. The
+utility also rejects nonpositive budgets. The native upstream exchange
+rechecks the **same absolute deadline** after constructing the outbound
+request, after asynchronous write, and after asynchronous read—even when
+those operations report success. Timed-out operations may not start a new
+read or accept an over-deadline response.
+
+The exact production utility is exercised by a new **standalone GCC 16.2
+C++26 CMake/CTest binary** in
+`tests/gateway/standalone_deadline`: 1/1 native test passed with warnings as
+errors and the test runtime linked statically. A separate Beast loopback
+integration regression was added to
+`tests/gateway/http_integration_test.cpp` for an extreme caller budget.
+Source-contract tests cover post-I/O deadline gates, and all 173 JS
+coroutine/native/security contract tests pass. The protocol-neutrality check
+passes and the three legacy SQL checksums are unchanged.
+
+The standalone test does **not** verify the rebuilt named-module/TLS proxy
+or the new Beast loopback integration binary, and it does not clear the
+legacy synchronous facade. The strict coroutine acceptance remains
+`NOT_APPROVED` with 17 outstanding blockers.

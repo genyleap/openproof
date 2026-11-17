@@ -22,6 +22,7 @@ module;
 // strong symbols when combined with ordinary C++ translation units.
 #include <boost/asio/detail/call_stack.hpp>
 #include "asio_thread_context_extern.hpp"
+#include "steady_deadline.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -186,7 +187,7 @@ public:
             co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                         "The upstream timeout must be positive.");
         }
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = detail::saturatingSteadyDeadline(timeout);
         auto executor = co_await asio::this_coro::executor;
         auto resolver = std::make_shared<Tcp::resolver>(executor);
         asio::steady_timer resolverDeadline{executor};
@@ -276,9 +277,20 @@ private:
     {
         boost::system::error_code error;
         auto outgoing = toBeast(endpoint, request);
+        // Framing and copying an outgoing body consume the same budget.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         beast::get_lowest_layer(stream).expires_at(deadline);
         static_cast<void>(co_await beastHttp::async_write(
             stream, outgoing, asio::redirect_error(asio::use_awaitable, error)));
+        // A successful completion may race timer expiry. Do not treat it
+        // as permission to start a new read after the request deadline.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         if (error) co_return foundation::fail(networkError("write upstream request", error));
 
         beastHttp::response_parser<beastHttp::string_body> parser;
@@ -289,6 +301,12 @@ private:
         beast::get_lowest_layer(stream).expires_at(deadline);
         static_cast<void>(co_await beastHttp::async_read(
             stream, buffer, parser, asio::redirect_error(asio::use_awaitable, error)));
+        // Even fully framed, nominally successful responses are rejected if
+        // completion happens after the absolute upstream deadline.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         if (error) co_return foundation::fail(networkError("read upstream response", error));
         co_return fromBeast(parser.release());
     }
