@@ -4157,3 +4157,22 @@ or pre-existing binary. The target links the same OAuth HTTP and Gateway
 libraries used by the application. It does **not** establish a socket-level
 HTTP E2E, rebuilt application executable, SQL/LDAP E2E, or full OAuth
 conversion; those remain separate release gates.
+
+#### Native OIDC listener wire integration acceptance (2026-11-17)
+
+The focused GCC16/Boost1.88 test binary was extended with **actual
+ephemeral-loopback Beast HTTP listener tests**, not only direct calls.
+It starts `BeastHttpServer` on `127.0.0.1:0` (private ephemeral socket)
+and sends real HTTP/1.1 requests over TCP. It validates public
+Discovery/JWKS GET responses, security/CORS headers, OPTIONS 204,
+unsupported JWKS POST rejection without a synchronous fallback call,
+and that a distinct native Web3 route receives its bearer, cookie,
+and request body intact. The server is stopped in each test.
+
+`ctest --test-dir /tmp/openproof-dev-boost188-20261117
+-R '^FocusedNativeOidc\\.' --output-on-failure -j 1`
+completed with **7/7 tests PASS** from the freshly linked C++26 binary.
+No production server, external identity provider or PostgreSQL instance
+was contacted. This closes the *focused OIDC read-only listener wire
+verification*, but not the full OAuth HTTP migration, full application
+E2E, or the 17 existing release-blocker findings.

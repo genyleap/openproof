@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <future>
 #include <map>
 #include <optional>
@@ -15,6 +17,9 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 
 #include "../src/oauth/http/coroutine_discovery_http.hpp"
 
@@ -183,6 +188,89 @@ TEST(NativeOidcDiscoveryTest, LegacySynchronousEntryNeverDelegates)
         makeRequest(gw::HttpMethod::Get, "/.well-known/jwks.json"));
     EXPECT_EQ(response.status(), 503);
     EXPECT_EQ(fallback.blockingCalls.load(), 0);
+}
+
+namespace beast = boost::beast;
+namespace beastHttp = boost::beast::http;
+using Tcp = asio::ip::tcp;
+
+[[nodiscard]] native::ServerConfig isolatedServerConfig()
+{
+    return native::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 16384U,
+        std::chrono::seconds{2}, std::chrono::seconds{2}, 64U, 2U).value();
+}
+
+[[nodiscard]] beastHttp::response<beastHttp::string_body> sendWire(
+    std::uint16_t port, beastHttp::verb method, std::string target,
+    std::string bearer = {}, std::string cookie = {}, std::string body = {})
+{
+    asio::io_context io;
+    Tcp::resolver resolver{io};
+    beast::tcp_stream stream{io};
+    stream.expires_after(std::chrono::seconds{3});
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(port)));
+    beastHttp::request<beastHttp::string_body> request{method, std::move(target), 11};
+    request.set(beastHttp::field::host, "localhost");
+    if (!bearer.empty()) request.set(beastHttp::field::authorization, bearer);
+    if (!cookie.empty()) request.set(beastHttp::field::cookie, cookie);
+    request.body() = std::move(body);
+    request.prepare_payload();
+    beastHttp::write(stream, request);
+    beast::flat_buffer buffer;
+    beastHttp::response<beastHttp::string_body> response;
+    beastHttp::read(stream, buffer, response);
+    return response;
+}
+
+TEST(NativeOidcDiscoveryTest, ListenerServesPublicEndpointsOnPrivateLoopback)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{
+        fallback, R"({"issuer":"https://test.invalid"})", R"({"keys":[]})"};
+    native::BeastHttpServer server{handler, isolatedServerConfig()};
+    ASSERT_TRUE(server.start());
+    const auto discovery = sendWire(
+        server.boundPort(), beastHttp::verb::get,
+        "/.well-known/openid-configuration");
+    const auto keys = sendWire(
+        server.boundPort(), beastHttp::verb::get, "/.well-known/jwks.json");
+    const auto options = sendWire(
+        server.boundPort(), beastHttp::verb::options, "/.well-known/jwks.json");
+    EXPECT_EQ(discovery.result(), beastHttp::status::ok);
+    EXPECT_EQ(discovery.body(), R"({"issuer":"https://test.invalid"})");
+    EXPECT_EQ(discovery.at("content-type"), "application/json");
+    EXPECT_EQ(discovery.at("cache-control"), "no-store");
+    EXPECT_EQ(keys.result(), beastHttp::status::ok);
+    EXPECT_EQ(keys.body(), R"({"keys":[]})");
+    EXPECT_EQ(options.result(), beastHttp::status::no_content);
+    EXPECT_TRUE(options.body().empty());
+    EXPECT_EQ(fallback.nativeCalls.load(), 0);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+    server.stop();
+}
+
+TEST(NativeOidcDiscoveryTest, ListenerOnlyDelegatesNativeProviderExactRoute)
+{
+    NativeFallback fallback;
+    oidc::CoroutineOidcDiscoveryAdapter handler{fallback, "{}", "{}"};
+    native::BeastHttpServer server{handler, isolatedServerConfig()};
+    ASSERT_TRUE(server.start());
+    const auto denied = sendWire(
+        server.boundPort(), beastHttp::verb::post,
+        "/.well-known/jwks.json", "Bearer denied", {}, "secret");
+    EXPECT_EQ(denied.result(), beastHttp::status::service_unavailable);
+    const auto delegated = sendWire(
+        server.boundPort(), beastHttp::verb::post, "/auth/web3/start",
+        "Bearer sample", "session=sample", "native-credentials");
+    EXPECT_EQ(delegated.result(), beastHttp::status::accepted);
+    EXPECT_EQ(delegated.body(), "delegated");
+    EXPECT_EQ(fallback.nativeCalls.load(), 1);
+    EXPECT_EQ(fallback.blockingCalls.load(), 0);
+    EXPECT_TRUE(fallback.sawAuth);
+    EXPECT_TRUE(fallback.sawCookie);
+    EXPECT_TRUE(fallback.sawBody);
+    server.stop();
 }
 
 } // namespace
