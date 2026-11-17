@@ -4048,3 +4048,36 @@ The standalone test does **not** verify the rebuilt named-module/TLS proxy
 or the new Beast loopback integration binary, and it does not clear the
 legacy synchronous facade. The strict coroutine acceptance remains
 `NOT_APPROVED` with 17 outstanding blockers.
+
+#### Native OAuth/OIDC public discovery slice (2026-11-17)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY=0|1` is a new independent,
+default-disabled cutover for the public `GET` and `OPTIONS` routes
+`/.well-known/openid-configuration` and `/.well-known/jwks.json`.
+Its flag and OIDC configuration preconditions are validated before opening
+PostgreSQL. Once the configured `OpenIdProvider` exists, the runtime obtains
+the same issuer metadata and JWKS that the synchronous OAuth API serves;
+a JWKS construction error fails server startup instead of returning a
+partially configured key set. The documents are snapshotted before listener
+startup. Their keys are immutable during this process lifetime; rotations
+require a restarted instance with the updated signing-key configuration.
+The native handler reads no SQL, uses no synchronous OAuth facade, and
+preserves the existing public no-store/CORS/security headers and GET/OPTIONS
+response codes. The native route overlay includes only these two explicit
+well-known paths and preserves the previously configured Web3/LDAP/Account
+native fallback chain. Unsupported verbs on the opted-in exact paths fail
+closed; all stateful OAuth operations continue on the compatibility workers.
+
+`src/oauth/http/coroutine_discovery_http.cpp` is linked into the OAuth HTTP
+target, and a new source-contract test verifies independent feature gating,
+key initialization, route exactness, OAuth response metadata and credential
+scrubbing without damaging the native fallback's incoming credentials.
+The full JS source/security suite passed 178/178; protocol-neutrality passed.
+
+**Compile/E2E caveat:** this checkout has no retained C++ build directory.
+A new GCC16 CMake configuration reached dependency discovery but could not
+find Boost 1.88+ (the server's system package is Boost 1.83); no native
+OAuth binary or HTTP E2E was compiled or executed this run. Do not lower
+the required Boost version to evade this gate. All other OAuth/OIDC routes
+remain synchronous, and the strict migration scanner remains
+`NOT_APPROVED` with 17 findings.

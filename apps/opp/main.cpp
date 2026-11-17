@@ -49,6 +49,7 @@
 #include "../../src/storage/postgres/coroutine_session_service.hpp"
 #include "../../src/storage/postgres/coroutine_session_listener.hpp"
 #include "../../src/account/http/coroutine_session_http.hpp"
+#include "../../src/oauth/http/coroutine_discovery_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1424,6 +1425,26 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeAuthSessionEnabled =
         nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    // Public OIDC discovery/JWKS are memory-only and can be served without
+    // the synchronous OAuth handler. Keep all state-changing OAuth routes
+    // on the existing compatibility chain until their SQL SPI is migrated.
+    const auto nativeOidcDiscoveryFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY");
+    if (nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag != "0"
+        && *nativeOidcDiscoveryFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeOidcDiscoveryEnabled =
+        nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "1";
+    if (nativeOidcDiscoveryEnabled && !platform.oidc().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native OIDC discovery requires enabled OIDC configuration."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeAuthSessionEnabled && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -2316,6 +2337,7 @@ addProtectedRoutes(gateway::Router& router,
     }
 
     operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
+    const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -2332,6 +2354,7 @@ addProtectedRoutes(gateway::Router& router,
         // All other account routes remain on the compatibility worker.
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
+        std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2373,6 +2396,28 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
+        }
+        if (nativeOidcDiscoveryEnabled) {
+            if (nativeOidcProvider == nullptr) {
+                reportStartupFailure(fnd::Error{
+                    fnd::ErrorCode::FailedPrecondition,
+                    "Native OIDC discovery provider is unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            // Build documents from the configured issuer/key set before
+            // starting listener workers; no database or signing-key read
+            // occurs on the native reactor for these public endpoints.
+            auto jwks = nativeOidcProvider->jwksDocument();
+            if (!jwks) {
+                reportStartupFailure(jwks.error());
+                return ExitCode::ConfigurationError;
+            }
+            asyncOidc = std::make_unique<oauthHttp::CoroutineOidcDiscoveryAdapter>(
+                *nativeHandler, nativeOidcProvider->discoveryDocument(),
+                std::move(jwks).value());
+            nativeHandler = asyncOidc.get();
+            nativePaths.emplace_back("/.well-known/openid-configuration");
+            nativePaths.emplace_back("/.well-known/jwks.json");
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths)};
@@ -2551,6 +2596,7 @@ addProtectedRoutes(gateway::Router& router,
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
         identityProviderStore, std::move(oidcPolicy).value(),
         std::move(previousOidcKeys).value()};
+    nativeOidcProvider = &openIdProvider;
     oauth::DpopService dpopService{
         identityProviderStore, clock, std::chrono::minutes{5}};
     std::optional<fnd::SecretString> mtlsForwardingKey;

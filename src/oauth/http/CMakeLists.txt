@@ -5,11 +5,13 @@ openproof_add_module(openproof_oauth_http
     SOURCES
         http.cpp
         sender.cpp
+        coroutine_discovery_http.cpp
         boost_json.cpp
     LINK_PUBLIC
         openproof_foundation
         openproof_security
         openproof_gateway
+        openproof_gateway_http
         openproof_client
         openproof_consent
         openproof_resource
