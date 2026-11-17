@@ -218,6 +218,10 @@ public:
             stream.expires_at(deadline);
             static_cast<void>(co_await stream.async_connect(endpoints,
                 asio::redirect_error(asio::use_awaitable, error)));
+            if (std::chrono::steady_clock::now() >= deadline) {
+                co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                            "The upstream request timed out.");
+            }
             if (error) co_return foundation::fail(networkError("connect upstream", error));
             auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
             boost::system::error_code ignored;
@@ -237,10 +241,18 @@ public:
         beast::get_lowest_layer(stream).expires_at(deadline);
         static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
             endpoints, asio::redirect_error(asio::use_awaitable, error)));
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         if (error) co_return foundation::fail(networkError("connect TLS upstream", error));
         beast::get_lowest_layer(stream).expires_at(deadline);
         co_await stream.async_handshake(
             ssl::stream_base::client, asio::redirect_error(asio::use_awaitable, error));
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         if (error) co_return foundation::fail(networkError("verify TLS upstream", error));
         auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
         // Beast completed and validated the entire HTTP message under an
