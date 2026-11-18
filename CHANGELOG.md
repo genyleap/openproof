@@ -2,7 +2,25 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
-## Unreleased — protocol independence hardening
+## 1.1.0-rc7 — 2026-11-18
+
+### Authentication and security fixes since RC6
+
+- Added an opt-out for **automatic Ethereum wallet identity creation** through
+  `OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING=false`. Previously linked wallets
+  continue to sign in and an authenticated user can still link a verified new
+  wallet. The default remains `true` for backwards compatibility; deployers
+  must opt out explicitly to block first-time wallet-only self-registration.
+  Invalid setting values now fail startup. The generic core has no built-in
+  Cloudflare or deployment-specific dependencies.
+- Owner-only member-enumeration endpoints now verify an active tenant owner
+  instead of accepting weaker administrative membership assumptions.
+- Failed password-signup verification-delivery no longer leaves behind an
+  incomplete canonical account.
+- Improved GitHub OAuth callback parsing for large HTTP response headers.
+- Updated the Docs MCP transitive HTTP dependencies and release security checks.
+
+### Protocol independence hardening
 
 - Removed publisher/product-specific branding and Farcaster/Genycaster
   assumptions from the built-in OAuth login, device authorization and
