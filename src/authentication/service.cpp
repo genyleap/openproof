@@ -11,6 +11,7 @@ module;
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -158,6 +159,49 @@ bool ProviderTrustPolicy::maySelfProvision(const provider::ProviderId& providerI
 {
     const auto found = m_selfProvisioning.find(providerId);
     return found != m_selfProvisioning.end() && found->second;
+}
+
+foundation::Status ProviderTrustPolicy::disableSelfProvisioningFor(std::string_view providerIds)
+{
+    const auto trim = [](std::string_view value) -> std::string_view {
+        const auto start = value.find_first_not_of(" \\t");
+        if (start == std::string_view::npos) return {};
+        const auto end = value.find_last_not_of(" \\t");
+        return value.substr(start, end - start + 1U);
+    };
+    providerIds = trim(providerIds);
+    if (providerIds == "*") {
+        for (auto& [id, permitted] : m_selfProvisioning) permitted = false;
+        return foundation::ok();
+    }
+    if (providerIds.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A self-provisioning deny list cannot be empty.");
+    }
+
+    // Validate every provider before mutating any trust rule.
+    std::set<provider::ProviderId> disabled;
+    while (true) {
+        const auto separator = providerIds.find(',');
+        const auto name = trim(providerIds.substr(0U, separator));
+        if (name.empty() || name == "*") {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A self-provisioning deny list contains an invalid provider.");
+        }
+        provider::ProviderId id{std::string{name}};
+        if (!m_selfProvisioning.contains(id) || !disabled.insert(id).second) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A self-provisioning deny list contains an unknown or duplicate provider.");
+        }
+        if (separator == std::string_view::npos) break;
+        providerIds.remove_prefix(separator + 1U);
+        if (providerIds.empty()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A self-provisioning deny list cannot end with a comma.");
+        }
+    }
+    for (const auto& id : disabled) m_selfProvisioning.at(id) = false;
+    return foundation::ok();
 }
 
 std::optional<provider::AssuranceLevel>
