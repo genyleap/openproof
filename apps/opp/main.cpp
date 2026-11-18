@@ -2221,6 +2221,18 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
+    // A deployment may deny first-login account creation across any configured
+    // provider without restricting login for already linked external subjects.
+    // The list is validated only after all provider trust rules are registered.
+    if (const auto disabled = environment.get("OPENPROOF_SELF_PROVISIONING_DISABLED_PROVIDERS");
+        disabled.has_value()) {
+        const auto restricted = trust.disableSelfProvisioningFor(*disabled);
+        if (!restricted) {
+            reportStartupFailure(restricted.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
     postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
     // Retain the original synchronous AuthenticationService for the existing
     // OAuth, account, SAML and other compatibility handlers. LDAP's native
