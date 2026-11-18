@@ -2,6 +2,14 @@
 
 Notable user-facing changes to OpenProof are recorded here.
 
+## Unreleased — federated registration hardening
+
+- Added `OPENPROOF_SELF_PROVISIONING_DISABLED_PROVIDERS`, a deny-only list
+  (or `*`) for first-login account creation across all configured external
+  providers. Existing linked-provider sign-in and explicit authenticated
+  account connection remain unaffected. Invalid lists and unknown provider
+  names fail startup instead of silently weakening the policy.
+
 ## 1.1.0-rc7 — 2026-11-18
 
 ### Authentication and security fixes since RC6
