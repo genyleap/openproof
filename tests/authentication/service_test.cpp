@@ -540,13 +540,19 @@ TEST(ProviderTrustPolicyTest, DenyListValidationIsFailClosedAndAtomic)
 TEST(AuthenticationServiceTest, DisabledSelfProvisioningPreservesLinkedWalletLoginButRejectsUnknown)
 {
     Fixture fixture;
+    core::InMemoryIdentityRepository lifecycle;
+    const core::OrganizationId organization{"organization-a"};
+    auto canonical = core::Identity::create(core::IdentityId{"identity-1"},
+                                            core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()).has_value());
     auth::ProviderTrustPolicy policy;
     ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
     ASSERT_TRUE(policy.disableSelfProvisioningFor("provider-a").has_value());
     EXPECT_FALSE(policy.maySelfProvision(idp::ProviderId{"provider-a"}));
     auth::AuthenticationService service{
         fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
-        std::move(policy), kServiceLifetime};
+        std::move(policy), kServiceLifetime, &lifecycle, organization};
     const auto existingBinding = bindingOf("linked-wallet-login");
     auto existing = service.begin(
         fixture.request(), existingBinding, fnd::CorrelationId{"corr-linked-wallet"});
@@ -568,6 +574,7 @@ TEST(AuthenticationServiceTest, DisabledSelfProvisioningPreservesLinkedWalletLog
         validResponse(unknown->challenge().id()));
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(lifecycle.size(), 1U); // No second canonical identity was created.
 }
 
 TEST(AuthenticationServiceTest, SelfProvisioningCreatesOnlyANewCanonicalIdentityForVerifiedSubject)
