@@ -13,6 +13,11 @@ const canonical = read("scripts/run-disposable-postgres-canonical-tests.sh");
 
 test("native auth SQL runner requires actual non-skipped testcases", () => {
   assert.ok(auth.includes('--output-junit "$work/test-results.xml"'));
+  // A fresh native SQL test must accept an explicit isolated CMake build
+  // directory and must not silently fall back to an older cached test binary.
+  assert.ok(auth.includes('build_dir="${1:-$repo/cmake-build-gcc-release}"'));
+  assert.ok(auth.includes('[[ ! -f "$build_dir/CMakeCache.txt"'));
+  assert.ok(auth.includes('ctest --test-dir "$build_dir"'));
   assert.ok(auth.includes('[[ ! -s "$work/test-results.xml" ]]'));
   assert.ok(auth.includes('! grep -q \'<testcase\' "$work/test-results.xml"'));
   assert.ok(auth.includes('grep -q \'<skipped\' "$work/test-results.xml"'));

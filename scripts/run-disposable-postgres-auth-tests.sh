@@ -4,6 +4,13 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The acceptance runner must operate on the CURRENT isolated development
+# build, not silently reuse an old binary from a fixed CMake cache.
+build_dir="${1:-$repo/cmake-build-gcc-release}"
+if [[ ! -f "$build_dir/CMakeCache.txt" || ! -d "$build_dir/tests" ]]; then
+    echo "A configured native C++ test build directory is required." >&2
+    exit 1
+fi
 pgbin="${OPENPROOF_TEST_PGBIN:-/usr/lib/postgresql/16/bin}"
 # PostgreSQL must never start as root. Some remote shells report uid=0
 # but cannot change identity. Check before even creating a fixture directory,
@@ -42,7 +49,7 @@ started=1
 # Only a private Unix-domain socket inside a temporary cluster is reachable.
 # SQL tests create TEMP tables in the fixture; no production schema is touched.
 export OPENPROOF_TEST_POSTGRES="host=$work port=$port user=$(if [[ $(id -u) == 0 ]]; then echo postgres; else id -un; fi) dbname=postgres"
-ctest --test-dir "$repo/cmake-build-gcc-release" \
+ctest --test-dir "$build_dir" \
     -R '^NativePgAuthTransaction' --output-on-failure -V -j 1 \
     --output-junit "$work/test-results.xml"
 # CTest may exit zero with all SQL tests SKIPPED. That is a failure of

@@ -4295,3 +4295,66 @@ Every future hourly development run must compare the latest remote
 `main` and coroutine heads for new upstream fixes and integrate missing
 relevant changes carefully before building further coroutine migrations;
 never blindly merge or overwrite native coroutine code.
+
+#### Rebuilt native PostgreSQL 16 E2E on isolated Docker (2026-11-18)
+
+The GCC 16.2 / Boost 1.88 / C++26 development tree
+`/tmp/openproof-dev-boost188-20261117` compiled and linked the native
+`openproof_postgres_async_tests` and
+`openproof_postgres_async_auth_transaction_tests` executables. The real
+`openproof_postgres_async_repository` and
+`openproof_postgres_async_http` libraries and
+`openproof_postgres_domain_tests` executable were also compiled and linked
+from current sources, not reused from a previous build fingerprint.
+
+The restricted remote host cannot drop UID from root to `postgres`
+(`runuser: cannot set user id: Operation not permitted`). An attempted
+private Unix-socket fixture therefore **failed safely before launching
+any database**. No running system PostgreSQL service was accessed or
+modified. The pre-existing disposable Docker PostgreSQL 16 fixture was
+instead updated to accept `--build-dir` with a checked
+`CMAKE_HOME_DIRECTORY`, and a `--native-only` mode for the actual
+newly compiled native SQL binaries. It rejects occupied test ports,
+pre-existing named containers, inherited libpq and GTest overrides,
+missing test executables, skipped or incomplete test results, and any
+native result with fewer than 32 passed tests. It uses a disposable
+`postgres:16` image, tmpfs-backed data, bounded subprocesses, and
+`127.0.0.1:55432` only; the container is removed on exit.
+
+Executed **real PostgreSQL** commands and results:
+
+```sh
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target openproof_postgres_async_tests \
+           openproof_postgres_async_auth_transaction_tests -j 1
+python3 scripts/ci/test-local-coroutine-docker.py --native-only \
+  --build-dir /tmp/openproof-dev-boost188-20261117
+# PASS: 32 native libpq, pool and session SQL tests
+# PASS: 4 native authentication-transaction SQL tests
+# PASS: disposable test container removed
+
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target openproof_postgres_domain_tests -j 1
+python3 scripts/ci/test-local-coroutine-docker.py \
+  --build-dir /tmp/openproof-dev-boost188-20261117
+# PASS: 32 native SQL tests, 1 full native domain repository test
+# PASS: disposable test container removed
+```
+
+**Unique real PostgreSQL native GTests: 37/37 PASS across these
+executions**, none skipped. The full domain integration applies real
+OpenProof schema migrations solely inside the disposable container and
+checks native/legacy session repository interoperability, canonical
+ownership, HTTP session mutation boundaries, replay rejection,
+revocation, persistence and rollback behavior. The fixture verifies
+the server's expected cluster name and data directory independently.
+Five additional no-database native PostgreSQL tests also passed
+on CTest; source-level disposable acceptance guards passed 8/8.
+
+**Scope remains narrow:** the legacy synchronous `PQexec` and pool
+contracts are still present for compatibility, and the 17-finding
+strict coroutine scanner is still `NOT_APPROVED`. This evidence
+proves actual native PostgreSQL SQL and session-domain operation on
+a disposable database, not full federated OAuth/LDAP HTTP E2E,
+removal of legacy blocking facades, or release approval. `main`
+and Production were not changed.
