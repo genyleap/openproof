@@ -688,6 +688,14 @@ additional CA bundle.
   and non-default HTTPS ports are preserved in the HTTP `Host` header.
   `OPENPROOF_ETHEREUM_RPC_AUTHORIZATION` is applied to configured wallet RPC
   calls when required.
+  Operators may set `OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING=false` to
+  reject new, previously unlinked Ethereum wallet identities while preserving
+  sign-in for existing linked wallets. This is a **provider-neutral registration
+  policy control** (no CAPTCHA, product branding, or Genyleap-specific code in
+  the OpenProof core). Default `true` preserves legacy behavior. Values
+  `true/false`, `1/0`, `yes/no`, and `on/off` are accepted case-insensitively;
+  malformed values fail startup. When false, new users must first register
+  through another approved method and connect their wallet to that identity.
 - Farcaster: `OPENPROOF_FARCASTER_RPC_ENDPOINT`,
   optional `OPENPROOF_FARCASTER_ID_REGISTRY` and
   `OPENPROOF_FARCASTER_KEY_REGISTRY` overrides, and optional

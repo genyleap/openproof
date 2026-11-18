@@ -170,6 +170,8 @@ bind signatures to the public OpenProof domain/URI:
 OPENPROOF_WEB3_DOMAIN=identity.example.com
 OPENPROOF_WEB3_URI=https://identity.example.com/auth/web3
 OPENPROOF_ETHEREUM_WALLET_ENABLED=true
+# Optional: prohibit first-time wallet-only registration but keep linked-wallet sign-in.
+# OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING=false
 ```
 
 Configure `OPENPROOF_ETHEREUM_RPC_ENDPOINTS` only for chains where

@@ -1837,6 +1837,27 @@ addProtectedRoutes(gateway::Router& router,
     const auto web3Uri = environment.get("OPENPROOF_WEB3_URI");
     const auto web3CaFile = environment.get("OPENPROOF_WEB3_CA_FILE").value_or(std::string{});
     const auto ethereumEnabledValue = environment.get("OPENPROOF_ETHEREUM_WALLET_ENABLED");
+    // Generic opt-out for automatic onboarding. Existing wallet links continue
+    // to authenticate normally; only previously unseen subjects are rejected.
+    // Defaults to the historical behavior until an operator opts out.
+    bool ethereumSelfProvision = true;
+    if (const auto configured = environment.get("OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING");
+        configured.has_value()) {
+        std::string lowered = *configured;
+        std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
+            return static_cast<char>(std::tolower(symbol));
+        });
+        if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+            ethereumSelfProvision = true;
+        } else if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+            ethereumSelfProvision = false;
+        } else {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING must be a boolean value."});
+            return ExitCode::ConfigurationError;
+        }
+    }
     const auto ethereumLegacyRpc = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINT");
     const auto ethereumRpcMapValue = environment.get("OPENPROOF_ETHEREUM_RPC_ENDPOINTS");
     bool ethereumEnabled = (ethereumLegacyRpc && !ethereumLegacyRpc->empty())
@@ -1921,7 +1942,8 @@ addProtectedRoutes(gateway::Router& router,
         auto status = providers.registerProvider(
             std::make_unique<web3::WalletAuthenticationProvider>(std::move(walletConfig).value(), clock));
         if (status) {
-            status = trust.trust(idp::ProviderId{"ethereum-wallet"}, idp::AssuranceLevel::Ial1, true);
+            status = trust.trust(idp::ProviderId{"ethereum-wallet"}, idp::AssuranceLevel::Ial1,
+                                 ethereumSelfProvision);
         }
         if (!status) {
             reportStartupFailure(status.error());
