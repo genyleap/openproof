@@ -4176,3 +4176,41 @@ No production server, external identity provider or PostgreSQL instance
 was contacted. This closes the *focused OIDC read-only listener wire
 verification*, but not the full OAuth HTTP migration, full application
 E2E, or the 17 existing release-blocker findings.
+
+#### Public federated provider catalog native slice (2026-11-18)
+
+Added a provider-neutral and independent, default-disabled cutover via
+`OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG=0|1` for the **exact**
+`GET /auth/providers` endpoint. An invalid flag, or enabling it while
+authentication is disabled, fails before any database connection or
+migration. The composition root snapshots the same redirect and
+challenge-response provider classifications as
+`FederatedAuthenticationHttpApi::providers()` from the validated
+registry **once before starting HTTP workers**. The resulting JSON is
+immutable for the lifetime of that server instance. Consequently no
+PostgreSQL, external provider network request, registry mutex or
+synchronous federated facade is reached on the HTTP reactor.
+
+`CoroutineProviderCatalogAdapter` in
+`src/authentication/http/coroutine_provider_catalog_http.cpp` has an
+independent CMake library and a fail-closed synchronous entry point.
+The listener's existing route overlay only opts `/auth/providers` into
+native handling. The adapter denies direct misuse and does not delegate
+unsupported native calls to a synchronous handler. Other explicitly
+enabled native routes continue via `co_await` with their request-owned
+cookies and bearer headers intact. The public catalog request's ignored
+body/cookie/authorization buffers are scrubbed. All federated login,
+callback, linking and token operations retain the existing synchronous
+compatibility path; this change must not be interpreted as their migration.
+
+**Executed acceptance evidence:** GCC 16.2 C++26 / Boost 1.88
+`openproof_authentication_async_catalog_http` compiled and linked in
+`/tmp/openproof-dev-boost188-20261117`. The freshly built
+`openproof_native_provider_catalog_tests` runner passed **4/4 CTest
+tests**, including two real 127.0.0.1 TCP/Beast HTTP listener tests,
+fail-closed route/method rejection and native Web3 fallback credential
+preservation. Four dedicated composition/security contract tests also
+passed. The full application `opp` rebuild and production readiness
+are separate gates, not proven by these focused tests. This is a useful
+native route slice, **not** closure of the scanner's 17 original
+blocking findings.

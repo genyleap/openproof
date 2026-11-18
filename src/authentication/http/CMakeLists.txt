@@ -34,6 +34,29 @@ openproof_add_module(openproof_authentication_http
 
 target_compile_definitions(openproof_authentication_http PRIVATE BOOST_HAS_LONG_LONG=1)
 
+# Standalone, optional runtime adapter with only gateway dependencies.
+# This does not import the blocking federated AuthenticationHttpApi or SQL.
+add_library(openproof_authentication_async_catalog_http STATIC
+    coroutine_provider_catalog_http.cpp)
+target_compile_features(openproof_authentication_async_catalog_http PUBLIC cxx_std_26)
+target_include_directories(openproof_authentication_async_catalog_http PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_authentication_async_catalog_http PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_authentication_async_catalog_http
+    PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_authentication_async_catalog_http
+    PUBLIC openproof_gateway_http openproof_gateway
+        openproof_foundation Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17")
+    set_source_files_properties(coroutine_provider_catalog_http.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
 # GCC16 can incorrectly diagnose Boost.Asio's aligned coroutine frame
 # allocation when inlining named module implementations. Preserve -Werror
 # and disable only this TU's allocator inlining.
