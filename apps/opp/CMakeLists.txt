@@ -24,6 +24,16 @@ set_property(TARGET opp APPEND PROPERTY
 set_source_files_properties(main.cpp PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/default_config.toml")
 
+# The composition root contains startup-only wiring for all protocol modules.
+# GCC 16's O2 cross-module inliner can spend excessive time on this one TU
+# even with sufficient memory. Keep O2 and -Werror; bound inlining only here.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17")
+    set_source_files_properties(main.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-inline")
+endif()
+
 target_link_libraries(opp
     PRIVATE
         openproof_foundation
@@ -48,6 +58,7 @@ target_link_libraries(opp
         openproof_application_http
         openproof_authentication
         openproof_authentication_http
+        openproof_authentication_async_catalog_http
         openproof_credentials
         openproof_provider_github
         openproof_provider_x

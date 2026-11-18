@@ -43,6 +43,7 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/thread_pool.hpp>
+#include <boost/json.hpp>
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
@@ -50,6 +51,7 @@
 #include "../../src/storage/postgres/coroutine_session_listener.hpp"
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
+#include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1439,6 +1441,25 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeOidcDiscoveryEnabled =
         nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "1";
+    // /auth/providers is a public, in-memory registry projection. It can
+    // migrate independently of federated callback/token/session services.
+    const auto nativeCatalogFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG");
+    if (nativeCatalogFlag && *nativeCatalogFlag != "0"
+        && *nativeCatalogFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeCatalogEnabled =
+        nativeCatalogFlag && *nativeCatalogFlag == "1";
+    if (nativeCatalogEnabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native provider catalog requires enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeOidcDiscoveryEnabled && !platform.oidc().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -2355,6 +2376,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
+        std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2418,6 +2440,31 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncOidc.get();
             nativePaths.emplace_back("/.well-known/openid-configuration");
             nativePaths.emplace_back("/.well-known/jwks.json");
+        }
+        if (nativeCatalogEnabled) {
+            // Preserve the FederatedAuthenticationHttpApi projection exactly,
+            // but build it once from the registered providers before workers
+            // start. No registry mutex or provider call runs on the reactor.
+            boost::json::array redirectProviders;
+            boost::json::array challengeProviders;
+            for (const auto& registeredProvider : providers.ids()) {
+                auto* implementation = providers.find(registeredProvider);
+                if (implementation == nullptr) continue;
+                if (implementation->interactionModel()
+                    == idp::InteractionModel::Redirect) {
+                    redirectProviders.emplace_back(registeredProvider.value());
+                } else if (implementation->interactionModel()
+                           == idp::InteractionModel::ChallengeResponse) {
+                    challengeProviders.emplace_back(registeredProvider.value());
+                }
+            }
+            boost::json::object catalog;
+            catalog["providers"] = std::move(redirectProviders);
+            catalog["challenge_providers"] = std::move(challengeProviders);
+            asyncCatalog = std::make_unique<authHttp::CoroutineProviderCatalogAdapter>(
+                *nativeHandler, boost::json::serialize(catalog));
+            nativeHandler = asyncCatalog.get();
+            nativePaths.emplace_back("/auth/providers");
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths)};

@@ -4214,3 +4214,30 @@ passed. The full application `opp` rebuild and production readiness
 are separate gates, not proven by these focused tests. This is a useful
 native route slice, **not** closure of the scanner's 17 original
 blocking findings.
+
+#### Native provider catalog composition-root compile follow-up (2026-11-18)
+
+After the independently tested adapter was committed, its server startup
+wiring in `apps/opp/main.cpp` was compiled with the actual C++26 GCC16
+module graph. The first compile surfaced a genuine
+`-Werror=shadow` collision with an existing outer `providerId`;
+the new snapshot loop variable was renamed `registeredProvider`.
+The O2 build of the oversized composition root subsequently consumed
+extensive compiler time under host contention and was terminated
+without touching production services. GCC16-only `-fno-inline` was
+then confined to **`apps/opp/main.cpp`** (startup composition only),
+retaining `-O2`, `-Werror` and all normal diagnostics. The fresh
+object target
+
+```sh
+cmake --build /tmp/openproof-dev-boost188-20261117 \
+  --target apps/opp/CMakeFiles/opp.dir/main.cpp.o -j 1
+```
+
+then **compiled successfully** with exit code 0. The compilation
+uses the same pinned Boost 1.88 CMake prefix as the focused CTest
+runner. This is a genuinely rebuilt server composition translation
+unit, **not** a fully linked `opp` executable or a production
+performance comparison. A full app link, startup smoke test, and
+benchmark of the GCC16 main-TU inlining tradeoff remain release gates.
+No LDAP/SQL E2E acceptance or broader provider migration is implied.
