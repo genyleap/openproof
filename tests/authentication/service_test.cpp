@@ -504,6 +504,38 @@ TEST(ProviderTrustPolicyTest, DuplicateRulesCannotSilentlyReplaceAReviewedCap)
 
 }
 
+TEST(AuthenticationServiceTest, DisabledSelfProvisioningPreservesLinkedWalletLoginButRejectsUnknown)
+{
+    Fixture fixture;
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, false));
+    EXPECT_FALSE(policy.maySelfProvision(idp::ProviderId{"provider-a"}));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime};
+    const auto existingBinding = bindingOf("linked-wallet-login");
+    auto existing = service.begin(
+        fixture.request(), existingBinding, fnd::CorrelationId{"corr-linked-wallet"});
+    ASSERT_TRUE(existing);
+    auto authenticated = service.complete(
+        existing->transactionId(), existing->continuationToken(), existingBinding,
+        validResponse(existing->challenge().id()));
+    ASSERT_TRUE(authenticated);
+    EXPECT_EQ(authenticated->identity(), core::IdentityId{"identity-1"});
+
+    fixture.implementation->outcomeSubject = "unlinked-new-wallet";
+    fixture.implementation->challengeId = "new-wallet-challenge";
+    const auto unknownBinding = bindingOf("new-wallet-login");
+    auto unknown = service.begin(
+        fixture.request(), unknownBinding, fnd::CorrelationId{"corr-new-wallet"});
+    ASSERT_TRUE(unknown);
+    auto refused = service.complete(
+        unknown->transactionId(), unknown->continuationToken(), unknownBinding,
+        validResponse(unknown->challenge().id()));
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), fnd::ErrorCode::AuthenticationFailed);
+}
+
 TEST(AuthenticationServiceTest, SelfProvisioningCreatesOnlyANewCanonicalIdentityForVerifiedSubject)
 {
     Fixture fixture;
