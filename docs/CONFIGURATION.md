@@ -667,6 +667,27 @@ the authenticator supplies a non-zero counter. Passkeys are treated as a
 phishing-resistant possession factor; biometric unlock is not promoted to a
 server-side inherence claim.
 
+### Deny-only federated identity creation policy
+
+Set `OPENPROOF_SELF_PROVISIONING_DISABLED_PROVIDERS` to a comma-separated
+list of **enabled provider IDs**, for example `google,github,farcaster`, to
+prevent first-time login from implicitly creating a canonical Identity. Set it
+to `*` to prohibit self-provisioning for all authentication providers.
+Spaces around IDs are accepted; an empty value, duplicate, unknown or disabled
+provider, malformed comma list or mixing `*` with IDs causes startup failure.
+When the variable is absent, existing provider defaults are unchanged.
+
+This policy is **deny-only**: it never enables a provider that was already
+restricted (including local password and passkeys). It is evaluated after
+provider registration, applies to both verified-email convergence and creation
+of new identities, and does **not** block sign-in by already linked external
+subjects or authenticated account-connection ceremonies. Local signup through
+its explicit registration endpoint is controlled separately. Deployments may
+combine this rule with provider-specific settings such as
+`OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING=false`; either deny wins. This
+control lives in the generic OpenProof trust policy, not a product-specific
+anti-bot or reverse-proxy integration.
+
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
 
