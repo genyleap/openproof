@@ -38,6 +38,16 @@ public:
                                            provider::AssuranceLevel maximum,
                                            bool allowSelfProvisioning = false);
 
+    /**
+     * @brief Atomically denies new-identity creation for a comma-separated set of
+     * trusted provider IDs, or for all providers via "*".
+     *
+     * This is deliberately deny-only: it cannot enable self-provisioning for
+     * a provider whose own trust rule has disabled it. Empty, duplicate and
+     * unknown provider IDs fail without partially updating the policy.
+     */
+    [[nodiscard]] foundation::Status disableSelfProvisioningFor(std::string_view providerIds);
+
     /** @brief Returns the configured cap, or no value when the provider is untrusted. */
     [[nodiscard]] std::optional<provider::AssuranceLevel>
     maximumFor(const provider::ProviderId& providerId) const noexcept;
