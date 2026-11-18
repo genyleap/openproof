@@ -79,12 +79,16 @@ public:
         }
         co_return idp::AuthenticationOutcome::create(
             idp::ProviderId{forgedProvider ? "forged" : "async-test"},
-            idp::ExternalSubject{"verified-subject"}, idp::VerifiedClaims{},
+            idp::ExternalSubject{externalSubject}, idp::VerifiedClaims{},
             idp::AssuranceLevel::Ial2,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
             idp::ProviderEvidence{}, kNow);
     }
 
+    // Allow a single native provider instance to verify different wallet-like
+    // subjects in the same process. Existing links must stay usable when the
+    // operator disallows first-time identity creation.
+    std::string externalSubject{"verified-subject"};
     bool forgedProvider{};
     int nativeBeginCalls{};
     int nativeCompleteCalls{};
@@ -254,6 +258,131 @@ TEST(TrustedAuthenticationCoroutineTest, VerifiesNativeProofAndConsumesTransacti
     io.run();
     ASSERT_NO_THROW(future.get());
     EXPECT_TRUE(passed);
+}
+
+// Regression for the RC7 wallet onboarding switch. Native verification must
+// authenticate an explicitly linked subject and reject a verified but
+// unlinked subject without creating any canonical identity. No sync provider
+// method may be called on the coroutine reactor.
+asio::awaitable<void> optOutKeepsLinkedAndRejectsUnknown(
+    auth::AuthenticationService& service, Fixture& fixture,
+    bool& linkedAllowed, bool& unknownRefused)
+{
+    const auto existingBinding = binding("opt-out-linked-wallet");
+    auto existing = co_await service.beginAsync(
+        fixture.request(), existingBinding,
+        fnd::CorrelationId{"opt-out-existing-native"});
+    if (!existing) co_return;
+    auto verified = co_await service.completeAsync(
+        idp::TransactionId{std::string{existing->transactionId().value()}},
+        existing->continuationToken().clone(), existingBinding,
+        proof(std::string{existing->challenge().id().value()}));
+    linkedAllowed = verified
+        && verified->identity() == ids::IdentityId{"canonical-identity"};
+
+    fixture.coroutineProvider->externalSubject = "unlinked-native-wallet";
+    const auto freshBinding = binding("opt-out-unknown-wallet");
+    auto newAttempt = co_await service.beginAsync(
+        fixture.request(), freshBinding,
+        fnd::CorrelationId{"opt-out-new-native"});
+    if (!newAttempt) co_return;
+    auto refused = co_await service.completeAsync(
+        idp::TransactionId{std::string{newAttempt->transactionId().value()}},
+        newAttempt->continuationToken().clone(), freshBinding,
+        proof(std::string{newAttempt->challenge().id().value()}));
+    auto owner = fixture.identities.ownerOf(ids::ExternalIdentityRef{
+        idp::ProviderId{"async-test"},
+        idp::ExternalSubject{"unlinked-native-wallet"}});
+    unknownRefused = !refused
+        && refused.error().code() == fnd::ErrorCode::AuthenticationFailed
+        && owner && !owner->has_value()
+        && fixture.coroutineProvider->nativeBeginCalls == 2
+        && fixture.coroutineProvider->nativeCompleteCalls == 2
+        && fixture.coroutineProvider->syncCalls == 0
+        && fixture.nativeCanonical.calls == 2;
+}
+
+TEST(TrustedAuthenticationCoroutineTest,
+     WalletSelfProvisioningOptOutRetainsLinkedNativeLoginAndDeniesUnlinked)
+{
+    Fixture fixture;
+    const auto provider = idp::ProviderId{"async-test"};
+    // Default to the operator's explicit no-self-provision policy; the
+    // provider is trusted to verify proof, NOT to register unknown identities.
+    ASSERT_FALSE(fixture.policy.maySelfProvision(provider));
+    auto service = fixture.service();
+    bool linkedAllowed = false;
+    bool unknownRefused = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, optOutKeepsLinkedAndRejectsUnknown(
+            service, fixture, linkedAllowed, unknownRefused), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(linkedAllowed);
+    EXPECT_TRUE(unknownRefused);
+}
+
+// Disabling automatic wallet identity creation must NOT disable the explicit
+// owner-authorized link ceremony. After a verified new wallet has been bound to
+// an existing canonical identity, a normal native login can reuse that link.
+asio::awaitable<void> optOutAllowsExplicitNativeWalletLink(
+    auth::AuthenticationService& service, Fixture& fixture, bool& accepted)
+{
+    const idp::ExternalSubject unknown{"new-linkable-wallet"};
+    const ids::ExternalIdentityRef external{idp::ProviderId{"async-test"}, unknown};
+    auto before = fixture.identities.ownerOf(external);
+    if (!before || before->has_value()) co_return;
+
+    const auto connectionBinding = binding("opt-out-explicit-link");
+    auto connection = co_await service.beginConnectionAsync(
+        fixture.request(), connectionBinding,
+        fnd::CorrelationId{"opt-out-link-native"},
+        ids::IdentityId{"canonical-identity"});
+    if (!connection) co_return;
+    auto linked = co_await service.completeConnectionAsync(
+        idp::TransactionId{std::string{connection->transactionId().value()}},
+        connection->continuationToken().clone(), connectionBinding,
+        proof(std::string{connection->challenge().id().value()}));
+    if (!linked || linked->subject() != unknown) co_return;
+    auto owner = fixture.identities.ownerOf(external);
+    if (!owner || !owner->has_value()
+        || owner->value() != ids::IdentityId{"canonical-identity"}) {
+        co_return;
+    }
+
+    const auto loginBinding = binding("opt-out-login-after-link");
+    auto started = co_await service.beginAsync(
+        fixture.request(), loginBinding,
+        fnd::CorrelationId{"opt-out-after-link"});
+    if (!started) co_return;
+    auto loggedIn = co_await service.completeAsync(
+        idp::TransactionId{std::string{started->transactionId().value()}},
+        started->continuationToken().clone(), loginBinding,
+        proof(std::string{started->challenge().id().value()}));
+    accepted = loggedIn
+        && loggedIn->identity() == ids::IdentityId{"canonical-identity"}
+        && fixture.coroutineProvider->nativeBeginCalls == 2
+        && fixture.coroutineProvider->nativeCompleteCalls == 2
+        && fixture.coroutineProvider->syncCalls == 0;
+}
+
+TEST(TrustedAuthenticationCoroutineTest,
+     WalletSelfProvisioningOptOutStillAllowsVerifiedExplicitNativeLink)
+{
+    Fixture fixture;
+    ASSERT_FALSE(fixture.policy.maySelfProvision(
+        idp::ProviderId{"async-test"}));
+    fixture.coroutineProvider->externalSubject = "new-linkable-wallet";
+    auto service = fixture.service();
+    bool accepted = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(
+        io, optOutAllowsExplicitNativeWalletLink(service, fixture, accepted),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+    EXPECT_TRUE(accepted);
 }
 
 asio::awaitable<void> noFallback(

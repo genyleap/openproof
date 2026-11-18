@@ -4241,3 +4241,57 @@ unit, **not** a fully linked `opp` executable or a production
 performance comparison. A full app link, startup smoke test, and
 benchmark of the GCC16 main-TU inlining tradeoff remain release gates.
 No LDAP/SQL E2E acceptance or broader provider migration is implied.
+
+#### Main/Coroutine security + RC7 integration audit (2026-11-18)
+
+The independently updated branches were compared against **actual remote**
+`origin/main=3635f83c1ae683a4f83d3dbd8f0fb1c82b85690c` and
+`perf/openproof-full-optimization-20261026=f7138a28b22984cd28f698a159d9280d3df7447d`
+at the start of this integration; future runs must fetch both remote heads
+afresh, rather than treating those SHAs as fixed anchors.
+
+The main-branch wallet self-provisioning change
+`ce150ef0ec553f92b377428b041dde9f8e8a2dbf` was confirmed to be
+**source/test equivalent** to the coroutine branch change
+`f7138a28b22984cd28f698a159d9280d3df7447d`. The switch
+`OPENPROOF_ETHEREUM_WALLET_SELF_PROVISIONING=false` applies through
+the provider-neutral operator trust policy, so previously linked wallets
+retain login but unlinked wallets cannot self-register. Defaults remain
+backward-compatible unless an operator explicitly opts out. Related
+main changes also have independently integrated coroutine counterparts:
+owner-only tenant member enumeration (`a4ab284` / `581832f`),
+failed signup delivery cleanup (`9fadb44` / `7b509e4`), and
+Docs MCP dependency-lock security (`e3064a0` / `b962d3e`);
+the current patched Docs MCP lockfile and the account-service source
+match main. Do not cherry-pick these fixes a second time or overwrite
+the extended coroutine implementations with legacy files.
+
+Main's `1.1.0-rc7` release metadata commit
+`02d48ac5d466b227d18e8b2687c6b4756ca40b80` was applied
+without changing native runtime code to the coroutine development
+branch as `8d8ae29da1d7c8228d5cfd1bf5a9894e0380c135`.
+It aligns `VERSION`, OpenAPI, README, changelog, installation
+handbook, JavaScript/Kotlin SDK versions, and Docs MCP version assertions.
+This is **development metadata parity**, not an authorized RC7 release,
+production deployment, merge to `main`, or closure of release blockers.
+
+A freshly recompiled real GCC 16.2/C++26 GTest runner now also covers the
+operator's wallet registration policy through the native
+`AuthenticationService::beginAsync()/completeAsync()` calls. Two
+additional tests validate both (1) retained linked-wallet login versus
+first-time unlinked-wallet rejection, without invoking synchronous
+provider methods or creating a canonical link, and (2) explicitly
+authorized linking of a previously unseen verified wallet to an
+*existing* canonical identity followed by successful native login.
+Both scenarios run through the test-only in-memory coroutine canonical
+finalizer and **do not** use PostgreSQL; the production PostgreSQL native
+finalizer independently rejects missing canonical links. Results:
+`ctest -R '^TrustedAsyncAuth\\.'` **15/15 PASS**, plus previously
+linked OIDC/catalog HTTP CTests **11/11 PASS**. The core policy and
+migration scanner remain separate acceptance gates; full database
+and network-provider E2E are not asserted here.
+
+Every future hourly development run must compare the latest remote
+`main` and coroutine heads for new upstream fixes and integrate missing
+relevant changes carefully before building further coroutine migrations;
+never blindly merge or overwrite native coroutine code.
