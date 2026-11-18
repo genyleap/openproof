@@ -164,9 +164,9 @@ bool ProviderTrustPolicy::maySelfProvision(const provider::ProviderId& providerI
 foundation::Status ProviderTrustPolicy::disableSelfProvisioningFor(std::string_view providerIds)
 {
     const auto trim = [](std::string_view value) -> std::string_view {
-        const auto start = value.find_first_not_of(" \\t");
+        const auto start = value.find_first_not_of(" \t");
         if (start == std::string_view::npos) return {};
-        const auto end = value.find_last_not_of(" \\t");
+        const auto end = value.find_last_not_of(" \t");
         return value.substr(start, end - start + 1U);
     };
     providerIds = trim(providerIds);
