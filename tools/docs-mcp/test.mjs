@@ -34,7 +34,7 @@ try {
     try {
       const response = await fetch(endpoint + '/health', { signal: AbortSignal.timeout(600) });
       const health = await response.json();
-      if (response.ok && health.ok === true && health.openproofRelease === '1.1.0-rc6') {
+      if (response.ok && health.ok === true && health.openproofRelease === '1.1.0-rc7') {
         ready = true;
         break;
       }
@@ -57,7 +57,7 @@ try {
   }
   const sources = await client.callTool({name:'get_openproof_sources',arguments:{}});
   assert.equal(sources.isError, undefined);
-  assert.equal(JSON.parse(sources.content[0].text).openproofRelease, '1.1.0-rc6');
+  assert.equal(JSON.parse(sources.content[0].text).openproofRelease, '1.1.0-rc7');
   const result = await client.callTool({
     name:'get_openproof_endpoint', arguments:{method:'get',path:'/account/sessions'}});
   assert.notEqual(result.isError,true);
