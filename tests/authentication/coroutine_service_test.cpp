@@ -895,7 +895,10 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncF
     io.run();
     auto response = result.get();
     EXPECT_EQ(response.status(), 302);
-    EXPECT_EQ(response.header("location"), "https://example.test/authorize");
+    EXPECT_EQ(response.headers().at("location"), "https://example.test/authorize");
+    EXPECT_EQ(response.headers().at("cache-control"), "no-store");
+    ASSERT_TRUE(response.headers().contains("set-cookie"));
+    EXPECT_EQ(response.repeatedHeaders().size(), 4U);
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
