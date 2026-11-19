@@ -1134,7 +1134,8 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackConsumesProofAndIssues
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
     EXPECT_EQ(fallback.asyncCalls, 0);
-    EXPECT_EQ(fixture.transactions.size(), 0U);
+    // The in-memory store retains a Consumed tombstone for replay detection.
+    EXPECT_EQ(fixture.transactions.size(), 1U);
 
     // A one-time transaction cannot mint a second session from replay.
     auto replay = invokeCallback(callback, makeFederatedCallback(
@@ -1169,6 +1170,97 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMis
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
     EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRealHttpLoopbackIssuesSession)
+{
+    namespace beast = boost::beast;
+    namespace wire = beast::http;
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{
+        service, fixture.providers, limiter.value(), fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{
+        service, issuer, start};
+    auto config = openproof::gateway::http::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 8192U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 32U, 2U);
+    ASSERT_TRUE(config);
+    openproof::gateway::http::BeastHttpServer server{
+        callback, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+
+    const auto exchange = [&server](
+        std::string target, std::optional<std::string> cookies)
+        -> wire::response<wire::string_body> {
+        asio::io_context io;
+        beast::tcp_stream stream{io};
+        stream.expires_after(std::chrono::seconds{3});
+        asio::ip::tcp::resolver resolver{io};
+        stream.connect(resolver.resolve(
+            "127.0.0.1", std::to_string(server.boundPort())));
+        wire::request<wire::string_body> request{
+            wire::verb::get, std::move(target), 11};
+        request.set(wire::field::host, "localhost");
+        if (cookies) request.set(wire::field::cookie, *cookies);
+        wire::write(stream, request);
+        beast::flat_buffer buffer;
+        wire::response<wire::string_body> response;
+        wire::read(stream, buffer, response);
+        return response;
+    };
+
+    auto authorization = exchange(
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount",
+        std::nullopt);
+    EXPECT_EQ(authorization.result(), wire::status::found);
+    EXPECT_EQ(authorization.at(wire::field::location),
+              "https://example.test/authorize");
+    std::string cookies;
+    std::size_t count = 0U;
+    for (const auto& field : authorization) {
+        if (field.name() != wire::field::set_cookie) continue;
+        ++count;
+        const std::string value{
+            field.value().data(), field.value().size()};
+        if (!cookies.empty()) cookies.append("; ");
+        cookies.append(value.substr(0U, value.find(';')));
+    }
+    EXPECT_EQ(count, 5U);
+    ASSERT_FALSE(cookies.empty());
+
+    auto finished = exchange(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        cookies);
+    EXPECT_EQ(finished.result(), wire::status::found);
+    EXPECT_EQ(finished.at(wire::field::location), "/account");
+    bool foundSession = false;
+    for (const auto& field : finished) {
+        if (field.name() == wire::field::set_cookie
+            && field.value().starts_with(
+                "__Host-openproof-session=new-session-1")) {
+            foundSession = true;
+        }
+    }
+    EXPECT_TRUE(foundSession);
+    EXPECT_EQ(issuer.calls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+
+    auto replay = exchange(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        cookies);
+    EXPECT_GE(replay.result_int(), 400);
+    EXPECT_EQ(issuer.calls, 1);
+    server.stop();
 }
 
 } // namespace
