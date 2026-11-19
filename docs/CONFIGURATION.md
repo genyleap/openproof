@@ -711,6 +711,25 @@ standalone `*`. Omitting this setting retains historical convergence behavior
 for backwards compatibility. Deployments with stricter linking requirements
 should use `*` until providers' email verification guarantees are reviewed.
 
+### Experimental native federated login start (coroutine branch only)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` opts in a native
+`GET /auth/federated/start` adapter backed by the registered coroutine
+provider, native authentication transaction repository, and native canonical
+identity finalizer. The adapter uses `co_await AuthenticationService::beginAsync`
+and produces the same browser redirect and bound continuation cookies as the
+legacy start route. It fails closed for a provider lacking native capability;
+it never executes the synchronous provider SPI on the HTTP reactor.
+
+**Default: disabled.** The `/auth/federated/callback` endpoint, verified
+provider connection ceremonies, and legacy session issuance have **not** been
+migrated by this flag. A successful native start is not evidence of a fully
+nonblocking login. Do not enable this experimental flag in production until
+both halves of the federated flow and the cross-node database/session E2E
+acceptance are complete. Setting any value other than `0` or `1` rejects
+startup. This flag is independent of the deny-only self-provisioning and
+verified-email convergence policies.
+
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
 
