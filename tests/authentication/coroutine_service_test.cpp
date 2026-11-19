@@ -2,6 +2,7 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
+#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 
 #include <chrono>
 #include <memory>
@@ -11,6 +12,8 @@
 
 import openproof.authentication;
 import openproof.foundation;
+import openproof.gateway;
+import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
@@ -65,8 +68,10 @@ public:
         ++nativeBeginCalls;
         co_await asio::post(asio::use_awaitable);
         if (request.provider() != id()) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
-        co_return idp::AuthenticationChallenge{
+        idp::AuthenticationChallenge challenge{
             idp::ChallengeId{"server-challenge"}, kNow + kLifetime};
+        challenge.setParameter("authorization_url", "https://example.test/authorize");
+        co_return challenge;
     }
 
     [[nodiscard]] asio::awaitable<fnd::Result<idp::AuthenticationOutcome>>
