@@ -45,6 +45,17 @@ public:
      */
     [[nodiscard]] foundation::Status disableSelfProvisioningFor(std::string_view providerIds);
 
+    /**
+     * @brief Atomically deny silent linking to an existing Identity by email equality.
+     * This is independent of first-login self-provisioning permission.
+     */
+    [[nodiscard]] foundation::Status disableVerifiedEmailConvergenceFor(
+        std::string_view providerIds);
+
+    /** @brief Whether an unseen subject may join an existing Identity by verified email. */
+    [[nodiscard]] bool mayConvergeOnVerifiedEmail(
+        const provider::ProviderId& providerId) const noexcept;
+
     /** @brief Returns the configured cap, or no value when the provider is untrusted. */
     [[nodiscard]] std::optional<provider::AssuranceLevel>
     maximumFor(const provider::ProviderId& providerId) const noexcept;
@@ -55,6 +66,7 @@ public:
 private:
     std::map<provider::ProviderId, provider::AssuranceLevel> m_maximums;
     std::map<provider::ProviderId, bool> m_selfProvisioning;
+    std::map<provider::ProviderId, bool> m_emailConvergence;
 };
 
 /**

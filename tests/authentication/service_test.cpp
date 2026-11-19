@@ -518,6 +518,27 @@ TEST(ProviderTrustPolicyTest, DenyListRestrictsOnlySelectedProviders)
     EXPECT_EQ(policy.maximumFor(idp::ProviderId{"google"}), idp::AssuranceLevel::Ial1);
 }
 
+TEST(ProviderTrustPolicyTest, VerifiedEmailConvergenceHasIndependentDenyPolicy)
+{
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"google"}, idp::AssuranceLevel::Ial1, true));
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"github"}, idp::AssuranceLevel::Ial1, true));
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2));
+    EXPECT_TRUE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"google"}));
+    EXPECT_FALSE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"passkey"}));
+    EXPECT_FALSE(policy.disableVerifiedEmailConvergenceFor("google,unknown"));
+    EXPECT_TRUE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"google"}));
+    ASSERT_TRUE(policy.disableVerifiedEmailConvergenceFor(" google "));
+    EXPECT_FALSE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"google"}));
+    EXPECT_TRUE(policy.maySelfProvision(idp::ProviderId{"google"}));
+    EXPECT_TRUE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"github"}));
+    EXPECT_FALSE(policy.disableVerifiedEmailConvergenceFor("github,github"));
+    EXPECT_TRUE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"github"}));
+    ASSERT_TRUE(policy.disableVerifiedEmailConvergenceFor("*"));
+    EXPECT_FALSE(policy.mayConvergeOnVerifiedEmail(idp::ProviderId{"github"}));
+    EXPECT_TRUE(policy.maySelfProvision(idp::ProviderId{"github"}));
+}
+
 TEST(ProviderTrustPolicyTest, DenyListValidationIsFailClosedAndAtomic)
 {
     auth::ProviderTrustPolicy policy;
@@ -825,6 +846,104 @@ TEST(AuthenticationServiceTest, SelfProvisioningConvergesOnSingleActiveVerifiedE
     ASSERT_TRUE(owner);
     ASSERT_TRUE(owner->has_value());
     EXPECT_EQ(owner->value(), existingIdentity);
+}
+
+TEST(AuthenticationServiceTest, DisabledEmailConvergenceRejectsUnsolicitedLinkWithoutDuplicate)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "unlinked-google-subject";
+    fixture.implementation->claims.set(idp::ClaimName::Email, "person@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    const core::IdentityId existingIdentity{"existing-local-identity"};
+    auto canonical = core::Identity::create(existingIdentity, core::SubjectKind::Human, kNow);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(lifecycle.add(organization, canonical.value()));
+    auto current = profile::IdentityProfile::create(existingIdentity, kNow);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->setEmail("person@example.test", true, kNow));
+    ASSERT_TRUE(profiles.save(current.value()));
+
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    ASSERT_TRUE(policy.disableVerifiedEmailConvergenceFor("provider-a"));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+
+    const auto binding = bindingOf("email-convergence-disabled");
+    auto started = service.begin(fixture.request(), binding, fnd::CorrelationId{"corr-deny-email"});
+    ASSERT_TRUE(started);
+    auto rejected = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(lifecycle.size(), 1U);
+    const core::ExternalIdentityRef unlinked{
+        idp::ProviderId{"provider-a"}, idp::ExternalSubject{"unlinked-google-subject"}};
+    auto owner = fixture.identities.ownerOf(unlinked);
+    ASSERT_TRUE(owner);
+    EXPECT_FALSE(owner->has_value());
+
+    // Explicit connection is still permitted when the user is authenticated.
+    fixture.implementation->challengeId = "connection-challenge";
+    const auto connectBinding = bindingOf("explicit-account-connection");
+    auto connection = service.beginConnection(
+        fixture.request(), connectBinding, fnd::CorrelationId{"corr-explicit-link"},
+        existingIdentity);
+    ASSERT_TRUE(connection);
+    auto connected = service.completeConnection(
+        connection->transactionId(), connection->continuationToken(), connectBinding,
+        validResponse(connection->challenge().id()));
+    ASSERT_TRUE(connected) << connected.error().internalDetail();
+    auto linkedOwner = fixture.identities.ownerOf(unlinked);
+    ASSERT_TRUE(linkedOwner);
+    ASSERT_TRUE(linkedOwner->has_value());
+    EXPECT_EQ(linkedOwner->value(), existingIdentity);
+    EXPECT_EQ(lifecycle.size(), 1U);
+
+    // An explicitly linked subject retains normal sign-in despite the deny policy.
+    fixture.implementation->challengeId = "linked-login-challenge";
+    const auto linkedBinding = bindingOf("linked-after-explicit-connection");
+    auto linkedLogin = service.begin(
+        fixture.request(), linkedBinding, fnd::CorrelationId{"corr-linked-login"});
+    ASSERT_TRUE(linkedLogin);
+    auto authenticated = service.complete(
+        linkedLogin->transactionId(), linkedLogin->continuationToken(), linkedBinding,
+        validResponse(linkedLogin->challenge().id()));
+    ASSERT_TRUE(authenticated) << authenticated.error().internalDetail();
+    EXPECT_EQ(authenticated->identity(), existingIdentity);
+    EXPECT_EQ(lifecycle.size(), 1U);
+}
+
+TEST(AuthenticationServiceTest, DisabledEmailConvergenceAllowsFirstTimeRegistration)
+{
+    Fixture fixture;
+    fixture.implementation->outcomeSubject = "unseen-provider-subject";
+    fixture.implementation->claims.set(idp::ClaimName::Email, "new@example.test");
+    fixture.implementation->claims.set(idp::ClaimName::EmailVerified, "true");
+    core::InMemoryIdentityRepository lifecycle;
+    profile::InMemoryIdentityProfileRepository profiles;
+    const core::OrganizationId organization{"organization-a"};
+    auth::ProviderTrustPolicy policy;
+    ASSERT_TRUE(policy.trust(idp::ProviderId{"provider-a"}, idp::AssuranceLevel::Ial3, true));
+    ASSERT_TRUE(policy.disableVerifiedEmailConvergenceFor("*"));
+    auth::AuthenticationService service{
+        fixture.registry, fixture.transactions, fixture.identities, fixture.clock,
+        std::move(policy), kServiceLifetime, &lifecycle, organization, &profiles};
+    const auto binding = bindingOf("new-email-registration");
+    auto started = service.begin(
+        fixture.request(), binding, fnd::CorrelationId{"corr-new-email-registration"});
+    ASSERT_TRUE(started);
+    auto completed = service.complete(
+        started->transactionId(), started->continuationToken(), binding,
+        validResponse(started->challenge().id()));
+    ASSERT_TRUE(completed) << completed.error().internalDetail();
+    EXPECT_EQ(lifecycle.size(), 1U);
 }
 
 TEST(AuthenticationServiceTest, VerifiedEmailConvergenceRefusesSuspendedIdentity)

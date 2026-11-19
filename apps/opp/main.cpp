@@ -2076,6 +2076,17 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
+    // Restrict automatic email-based account linking without disabling sign-in,
+    // explicit account connection, or independently allowed new registration.
+    if (const auto disabled = environment.get("OPENPROOF_EMAIL_CONVERGENCE_DISABLED_PROVIDERS");
+        disabled.has_value()) {
+        const auto restricted = trust.disableVerifiedEmailConvergenceFor(*disabled);
+        if (!restricted) {
+            reportStartupFailure(restricted.error());
+            return ExitCode::ConfigurationError;
+        }
+    }
+
     postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
     auth::AuthenticationService authentication{
         providers, transactions, externalIdentities, clock, std::move(trust),
