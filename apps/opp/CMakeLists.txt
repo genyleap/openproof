@@ -59,6 +59,7 @@ target_link_libraries(opp
         openproof_authentication
         openproof_authentication_http
         openproof_authentication_async_catalog_http
+        openproof_authentication_async_federated_start_http
         openproof_credentials
         openproof_provider_github
         openproof_provider_x
