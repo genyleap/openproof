@@ -283,6 +283,8 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     const auto state = values->find("state");
     const auto user = values->find("user");
     if (values->contains("error") || values->contains("denied")
+        || values->contains("SAMLResponse") || values->contains("RelayState")
+        || values->contains("oauth_token") || values->contains("oauth_verifier")
         || code == values->end() || state == values->end()
         || code->second.empty() || code->second.size() > 4096U
         || state->second.empty() || state->second.size() > 512U
