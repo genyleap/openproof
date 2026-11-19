@@ -2152,7 +2152,29 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
     }
-    if (const auto farcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
+    // Explicitly opt in to a TLS-verified *literal loopback* Farcaster RPC.
+    // Default provider traffic still rejects loopback, private IPs, and DNS
+    // rebinding. Never infer permission from a URL or a CA file alone.
+    const auto farcasterLoopbackFlag =
+        environment.get("OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC");
+    if (farcasterLoopbackFlag && *farcasterLoopbackFlag != "0"
+        && *farcasterLoopbackFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool trustedFarcasterLoopback =
+        farcasterLoopbackFlag && *farcasterLoopbackFlag == "1";
+    const auto configuredFarcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
+    if (trustedFarcasterLoopback
+        && (!configuredFarcasterRpc || configuredFarcasterRpc->empty())) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Trusted Farcaster loopback RPC requires an explicit endpoint."});
+        return ExitCode::ConfigurationError;
+    }
+    if (const auto farcasterRpc = configuredFarcasterRpc;
         farcasterRpc && !farcasterRpc->empty()) {
         constexpr std::string_view canonicalIdRegistry{
             "0x00000000fc6c5f01fc30151999387bb99a9f489b"};
@@ -2180,7 +2202,7 @@ addProtectedRoutes(gateway::Router& router,
             *web3Domain, *web3Uri, chainId.value(), *farcasterRpc, registry,
             std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
             fnd::SecretString{environment.get("OPENPROOF_FARCASTER_RPC_AUTHORIZATION").value_or(std::string{})},
-            keyRegistry);
+            keyRegistry, trustedFarcasterLoopback);
         if (!farcasterConfig) {
             reportStartupFailure(farcasterConfig.error());
             return ExitCode::ConfigurationError;
