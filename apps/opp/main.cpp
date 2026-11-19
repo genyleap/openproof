@@ -1526,7 +1526,7 @@ addProtectedRoutes(gateway::Router& router,
     // another copy of that key for a disabled feature.
     std::optional<fnd::SecretString> nativeSessionSecret;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled)
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
