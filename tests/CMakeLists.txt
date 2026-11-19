@@ -627,7 +627,8 @@ target_include_directories(openproof_authentication_coroutine_tests BEFORE PRIVA
 target_compile_definitions(openproof_authentication_coroutine_tests PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_authentication_coroutine_tests PRIVATE
-    openproof_authentication openproof_identity_provider
+    openproof_authentication openproof_authentication_async_federated_start_http
+    openproof_gateway_http openproof_gateway openproof_identity_provider
     openproof_identity_core openproof_identity_profile
     openproof_foundation openproof_security
     Boost::headers GTest::gtest_main openproof_test_compile_options)
