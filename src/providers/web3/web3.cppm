@@ -102,7 +102,7 @@ public:
         std::string optimismRpcEndpoint, std::string idRegistryAddress,
         foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
         std::string caFile = {}, foundation::SecretString authorizationHeader = {},
-        std::string keyRegistryAddress = {});
+        std::string keyRegistryAddress = {}, bool trustedLoopbackRpc = false);
 
     FarcasterProviderConfig(const FarcasterProviderConfig&) = delete;
     FarcasterProviderConfig& operator=(const FarcasterProviderConfig&) = delete;
@@ -115,6 +115,9 @@ public:
     [[nodiscard]] std::string_view rpcEndpoint() const noexcept;
     [[nodiscard]] std::string_view idRegistryAddress() const noexcept;
     [[nodiscard]] std::string_view keyRegistryAddress() const noexcept;
+    /** True only after explicit operator opt-in with a literal loopback
+     * HTTPS RPC endpoint and an independently configured CA certificate. */
+    [[nodiscard]] bool trustedLoopbackRpc() const noexcept;
     [[nodiscard]] const foundation::SecretString& derivationKey() const noexcept;
     [[nodiscard]] foundation::Duration challengeLifetime() const noexcept;
     [[nodiscard]] std::string_view caFile() const noexcept;
@@ -129,7 +132,7 @@ private:
                             foundation::Duration challengeLifetime,
                             std::string caFile,
                             foundation::SecretString authorizationHeader,
-                            std::string keyRegistryAddress);
+                            std::string keyRegistryAddress, bool trustedLoopbackRpc);
 
     std::string m_domain;
     std::string m_uri;
@@ -137,6 +140,7 @@ private:
     std::string m_rpcEndpoint;
     std::string m_idRegistryAddress;
     std::string m_keyRegistryAddress;
+    bool m_trustedLoopbackRpc{};
     foundation::SecretString m_derivationKey;
     foundation::Duration m_challengeLifetime{};
     std::string m_caFile;
