@@ -45,6 +45,10 @@ public:
      * before suspending a coroutine that has extracted a credential. This
      * does not erase historical allocator, transport, or kernel copies. */
     void wipeBody() noexcept;
+    /** Overwrite and remove the query of the owned request target without
+     * invalidating the separately parsed routing path. This protects OAuth
+     * authorization codes before asynchronous provider I/O. */
+    void wipeTargetQuery() noexcept;
     /** Erase and remove the pre-authentication cookie header without making
      * an additional copy of its credentials. Header names are normalized
      * during construction, so this operation needs no allocation. */
