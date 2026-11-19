@@ -846,4 +846,88 @@ TEST(TrustedAuthenticationCoroutineTest, MissingNativeCanonicalRefusesBeforeProo
     EXPECT_EQ(fixture.nativeCanonical.calls, 1);
 }
 
+class FederatedNoFallback final : public openproof::gateway::http::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabledFor(
+        const openproof::gateway::HttpRequest&) const noexcept override { return false; }
+    [[nodiscard]] openproof::gateway::HttpResponse
+    handle(openproof::gateway::HttpRequest) override
+    {
+        ++syncCalls;
+        return openproof::gateway::HttpResponse{500, {}, {}};
+    }
+    [[nodiscard]] asio::awaitable<openproof::gateway::HttpResponse>
+    handleAsync(openproof::gateway::HttpRequest) override
+    {
+        ++asyncCalls;
+        co_return openproof::gateway::HttpResponse{500, {}, {}};
+    }
+    int syncCalls{};
+    int asyncCalls{};
+};
+
+[[nodiscard]] openproof::gateway::HttpRequest makeFederatedStart(std::string target)
+{
+    auto request = openproof::gateway::HttpRequest::create(
+        openproof::gateway::HttpMethod::Get, std::move(target), {}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-federated-start-test"});
+    EXPECT_TRUE(request);
+    return std::move(request).value();
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncFallback)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    auto request = makeFederatedStart(
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount");
+    EXPECT_TRUE(adapter.nativeEnabledFor(request));
+    EXPECT_FALSE(adapter.nativeEnabled());
+    asio::io_context io;
+    auto result = asio::co_spawn(
+        io, adapter.handleAsync(std::move(request)), asio::use_future);
+    io.run();
+    auto response = result.get();
+    EXPECT_EQ(response.status(), 302);
+    EXPECT_EQ(response.header("location"), "https://example.test/authorize");
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartRejectsInvalidQueryAndLegacyProvider)
+{
+    Fixture fixture{false};
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    EXPECT_EQ(adapter.handle(makeFederatedStart(
+        "/auth/federated/start?provider=async-test")).status(), 503);
+    for (const auto bad : {
+            "/auth/federated/start?provider=async-test&provider=async-test",
+            "/auth/federated/start?provider=async-test&return_to=%2F%2Fevil.test",
+            "/auth/federated/start?provider=async-test&return_to=%ZZ",
+            "/auth/federated/start?provider=async-test"}) {
+        asio::io_context io;
+        auto result = asio::co_spawn(
+            io, adapter.handleAsync(makeFederatedStart(bad)), asio::use_future);
+        io.run();
+        EXPECT_GE(result.get().status(), 400);
+    }
+    EXPECT_EQ(fixture.synchronousProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
 } // namespace
