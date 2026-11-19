@@ -1,5 +1,3 @@
-#include "coroutine_federated_start_http.hpp"
-
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -12,6 +10,8 @@
 #include <utility>
 
 #include <boost/asio/awaitable.hpp>
+
+#include "coroutine_federated_start_http.hpp"
 
 import openproof.foundation;
 import openproof.security;
