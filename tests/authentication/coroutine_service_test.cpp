@@ -2,6 +2,8 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 
 #include <chrono>
 #include <memory>
@@ -953,6 +955,56 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartRejectsInvalidQueryAndLeg
     EXPECT_EQ(fixture.synchronousProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
     EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartRealHttpLoopbackPreservesRedirectAndBoundState)
+{
+    namespace beast = boost::beast;
+    namespace wire = beast::http;
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    auto config = openproof::gateway::http::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 8192U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 32U, 2U);
+    ASSERT_TRUE(config);
+    openproof::gateway::http::BeastHttpServer server{
+        adapter, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+
+    asio::io_context io;
+    beast::tcp_stream stream{io};
+    stream.expires_after(std::chrono::seconds{3});
+    asio::ip::tcp::resolver resolver{io};
+    stream.connect(resolver.resolve(
+        "127.0.0.1", std::to_string(server.boundPort())));
+    wire::request<wire::string_body> request{
+        wire::verb::get,
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount", 11};
+    request.set(wire::field::host, "localhost");
+    wire::write(stream, request);
+    beast::flat_buffer buffer;
+    wire::response<wire::string_body> response;
+    wire::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), wire::status::found);
+    EXPECT_EQ(response.at(wire::field::location), "https://example.test/authorize");
+    EXPECT_EQ(response.at(wire::field::cache_control), "no-store");
+    int cookieCount = 0;
+    for (const auto& field : response) {
+        if (field.name() == wire::field::set_cookie) ++cookieCount;
+    }
+    EXPECT_EQ(cookieCount, 5);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+    server.stop();
 }
 
 } // namespace
