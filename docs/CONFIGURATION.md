@@ -688,6 +688,29 @@ combine this rule with provider-specific settings such as
 control lives in the generic OpenProof trust policy, not a product-specific
 anti-bot or reverse-proxy integration.
 
+### Verified-email account-convergence policy
+
+A verified email match is **not** the same as an explicit authenticated account
+connection. By default, a previously unseen provider subject that asserts a
+verified email may be linked to one existing active canonical Identity with
+the same verified email. This changes the methods that can access that account.
+
+Set `OPENPROOF_EMAIL_CONVERGENCE_DISABLED_PROVIDERS=google,github` to disable
+this automatic link for the named configured providers, or `*` to disable it
+for all providers. A new provider login whose verified email matches an
+existing account is then **rejected**: it does not attach an external subject
+and does not create a duplicate Identity. The user can sign into the existing
+account and complete the explicit, session-bound connection ceremony instead.
+
+This deny list is independent from
+`OPENPROOF_SELF_PROVISIONING_DISABLED_PROVIDERS`: a genuinely new verified
+email may still self-provision if that provider is authorized to register new
+identities. Previously linked subjects continue signing in. Both lists reject
+empty, duplicate, unknown and malformed provider entries, and accept a
+standalone `*`. Omitting this setting retains historical convergence behavior
+for backwards compatibility. Deployments with stricter linking requirements
+should use `*` until providers' email verification guarantees are reviewed.
+
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
 
