@@ -240,6 +240,14 @@ void HttpRequest::wipeBody() noexcept
     foundation::secureWipe(m_body.data(), m_body.size());
     m_body.clear();
 }
+void HttpRequest::wipeTargetQuery() noexcept
+{
+    const auto question = m_target.find('?');
+    if (question == std::string::npos) return;
+    foundation::secureWipe(
+        m_target.data() + question + 1U, m_target.size() - question - 1U);
+    m_target.resize(question);
+}
 void HttpRequest::wipeCookieHeader() noexcept
 {
     const auto found = m_headers.find("cookie");
