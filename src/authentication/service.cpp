@@ -9,6 +9,7 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -133,7 +134,53 @@ parseAssurance(std::string_view value) noexcept
         presentationClaim(outcome.claims(), provider::ClaimName::PictureUrl, 2048U)};
 }
 
+// Shared strict parser for independent operator-controlled deny lists.
+[[nodiscard]] foundation::Status disableProviderFlags(
+    std::map<provider::ProviderId, bool>& flags, std::string_view providerIds)
+{
+    const auto trim = [](std::string_view value) -> std::string_view {
+        const auto start = value.find_first_not_of(" \t");
+        if (start == std::string_view::npos) return {};
+        const auto end = value.find_last_not_of(" \t");
+        return value.substr(start, end - start + 1U);
+    };
+    providerIds = trim(providerIds);
+    if (providerIds == "*") {
+        for (auto& [id, permitted] : flags) permitted = false;
+        return foundation::ok();
+    }
+    if (providerIds.empty()) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "A provider deny list cannot be empty.");
+    }
+
+    // Validate every provider before mutating any trust rule.
+    std::set<provider::ProviderId> disabled;
+    while (true) {
+        const auto separator = providerIds.find(',');
+        const auto name = trim(providerIds.substr(0U, separator));
+        if (name.empty() || name == "*") {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A provider deny list contains an invalid provider.");
+        }
+        provider::ProviderId id{std::string{name}};
+        if (!flags.contains(id) || !disabled.insert(id).second) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A provider deny list contains an unknown or duplicate provider.");
+        }
+        if (separator == std::string_view::npos) break;
+        providerIds.remove_prefix(separator + 1U);
+        if (providerIds.empty()) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "A provider deny list cannot end with a comma.");
+        }
+    }
+    for (const auto& id : disabled) flags.at(id) = false;
+    return foundation::ok();
 }
+
+}
+
 
 foundation::Status ProviderTrustPolicy::trust(provider::ProviderId providerId,
                                               provider::AssuranceLevel maximum,
@@ -151,6 +198,7 @@ foundation::Status ProviderTrustPolicy::trust(provider::ProviderId providerId,
             "the operator-reviewed cap.");
     }
     m_selfProvisioning.emplace(providerId, allowSelfProvisioning);
+    m_emailConvergence.emplace(providerId, allowSelfProvisioning);
     m_maximums.emplace(std::move(providerId), maximum);
     return foundation::ok();
 }
@@ -163,45 +211,20 @@ bool ProviderTrustPolicy::maySelfProvision(const provider::ProviderId& providerI
 
 foundation::Status ProviderTrustPolicy::disableSelfProvisioningFor(std::string_view providerIds)
 {
-    const auto trim = [](std::string_view value) -> std::string_view {
-        const auto start = value.find_first_not_of(" \t");
-        if (start == std::string_view::npos) return {};
-        const auto end = value.find_last_not_of(" \t");
-        return value.substr(start, end - start + 1U);
-    };
-    providerIds = trim(providerIds);
-    if (providerIds == "*") {
-        for (auto& [id, permitted] : m_selfProvisioning) permitted = false;
-        return foundation::ok();
-    }
-    if (providerIds.empty()) {
-        return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A self-provisioning deny list cannot be empty.");
-    }
+    return disableProviderFlags(m_selfProvisioning, providerIds);
+}
 
-    // Validate every provider before mutating any trust rule.
-    std::set<provider::ProviderId> disabled;
-    while (true) {
-        const auto separator = providerIds.find(',');
-        const auto name = trim(providerIds.substr(0U, separator));
-        if (name.empty() || name == "*") {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list contains an invalid provider.");
-        }
-        provider::ProviderId id{std::string{name}};
-        if (!m_selfProvisioning.contains(id) || !disabled.insert(id).second) {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list contains an unknown or duplicate provider.");
-        }
-        if (separator == std::string_view::npos) break;
-        providerIds.remove_prefix(separator + 1U);
-        if (providerIds.empty()) {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list cannot end with a comma.");
-        }
-    }
-    for (const auto& id : disabled) m_selfProvisioning.at(id) = false;
-    return foundation::ok();
+foundation::Status ProviderTrustPolicy::disableVerifiedEmailConvergenceFor(
+    std::string_view providerIds)
+{
+    return disableProviderFlags(m_emailConvergence, providerIds);
+}
+
+bool ProviderTrustPolicy::mayConvergeOnVerifiedEmail(
+    const provider::ProviderId& providerId) const noexcept
+{
+    const auto found = m_emailConvergence.find(providerId);
+    return maySelfProvision(providerId) && found != m_emailConvergence.end() && found->second;
 }
 
 std::optional<provider::AssuranceLevel>
@@ -1013,6 +1036,13 @@ AuthenticationService::finishVerified(CompletedExchange exchange)
                         "belongs to an existing non-authenticating canonical identity."));
                 }
                 if (activeCandidates.size() == 1U) {
+                    // An email match does not prove consent to a new login method.
+                    // Refuse instead of silently linking or creating duplicates.
+                    if (!m_trustPolicy.mayConvergeOnVerifiedEmail(outcome.provider())) {
+                        return foundation::fail(authenticationFailure(
+                            "Verified-email convergence is disabled for this provider; "
+                            "connect it from the authenticated account."));
+                    }
                     identity = activeCandidates.front();
                     auto attached = attachVerified(identity, external, completedAt);
                     if (!attached) return foundation::fail(attached.error());
