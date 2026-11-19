@@ -4,6 +4,12 @@ Notable user-facing changes to OpenProof are recorded here.
 
 ## Unreleased — federated registration hardening
 
+- Added `OPENPROOF_EMAIL_CONVERGENCE_DISABLED_PROVIDERS` to reject unsolicited
+  account linking by shared verified email without creating duplicate identities.
+  Existing linked-provider sign-in and explicit authenticated connection work
+  as before. Self-provisioning for new emails remains a separate policy decision.
+  The historical default is preserved for compatibility.
+
 - Added `OPENPROOF_SELF_PROVISIONING_DISABLED_PROVIDERS`, a deny-only list
   (or `*`) for first-login account creation across all configured external
   providers. Existing linked-provider sign-in and explicit authenticated
