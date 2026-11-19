@@ -905,6 +905,19 @@ TEST(AuthenticationServiceTest, DisabledEmailConvergenceRejectsUnsolicitedLinkWi
     ASSERT_TRUE(linkedOwner->has_value());
     EXPECT_EQ(linkedOwner->value(), existingIdentity);
     EXPECT_EQ(lifecycle.size(), 1U);
+
+    // An explicitly linked subject retains normal sign-in despite the deny policy.
+    fixture.implementation->challengeId = "linked-login-challenge";
+    const auto linkedBinding = bindingOf("linked-after-explicit-connection");
+    auto linkedLogin = service.begin(
+        fixture.request(), linkedBinding, fnd::CorrelationId{"corr-linked-login"});
+    ASSERT_TRUE(linkedLogin);
+    auto authenticated = service.complete(
+        linkedLogin->transactionId(), linkedLogin->continuationToken(), linkedBinding,
+        validResponse(linkedLogin->challenge().id()));
+    ASSERT_TRUE(authenticated) << authenticated.error().internalDetail();
+    EXPECT_EQ(authenticated->identity(), existingIdentity);
+    EXPECT_EQ(lifecycle.size(), 1U);
 }
 
 TEST(AuthenticationServiceTest, DisabledEmailConvergenceAllowsFirstTimeRegistration)
