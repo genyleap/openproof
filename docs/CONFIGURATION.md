@@ -721,14 +721,31 @@ and produces the same browser redirect and bound continuation cookies as the
 legacy start route. It fails closed for a provider lacking native capability;
 it never executes the synchronous provider SPI on the HTTP reactor.
 
-**Default: disabled.** The `/auth/federated/callback` endpoint, verified
-provider connection ceremonies, and legacy session issuance have **not** been
-migrated by this flag. A successful native start is not evidence of a fully
-nonblocking login. Do not enable this experimental flag in production until
-both halves of the federated flow and the cross-node database/session E2E
-acceptance are complete. Setting any value other than `0` or `1` rejects
-startup. This flag is independent of the deny-only self-provisioning and
-verified-email convergence policies.
+**Default: disabled.** The start flag alone leaves
+`/auth/federated/callback` on the compatibility path. A second independent
+opt-in, `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1`, enables a
+native OAuth2 **GET** callback requiring the native start flag as well. The
+callback consumes the one-time challenge with `completeAsync`, checks
+server-bound transaction/binding cookies, clears browser callback state and
+uses the PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic
+session replacement. Raw OAuth query credentials are scrubbed before
+asynchronous suspension. Both flags accept only `0` or `1`; the callback
+flag without the start flag rejects startup.
+
+**Scope limitation:** This callback supports OAuth2 authorization-code GET
+responses only. It explicitly does **not** enable SAML/POST, OAuth1 callbacks,
+provider connection ceremonies, or a native login for providers without
+`CoroutineAuthenticationProvider`. These remain on the compatibility path
+when the callback flag is off; when it is on, unsupported callbacks fail closed
+instead of silently executing a blocking provider on the native route.
+For mixed provider deployments, do not enable the native callback until
+every required browser flow is migrated or separately routed.
+
+Do not enable either experimental flag in production until external provider,
+PostgreSQL and browser-session E2E, full C++26 build, security acceptance and
+performance comparison are complete. A green focused test is not an approved
+end-to-end coroutine migration. These flags do not alter the deny-only
+self-provisioning or verified-email convergence policies.
 
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
