@@ -1685,9 +1685,9 @@ FarcasterProviderConfig::FarcasterProviderConfig(
     : m_domain(std::move(domain)), m_uri(std::move(uri)), m_chainId(optimismChainId),
       m_rpcEndpoint(std::move(optimismRpcEndpoint)), m_idRegistryAddress(std::move(idRegistryAddress)),
       m_keyRegistryAddress(std::move(keyRegistryAddress)),
+      m_trustedLoopbackRpc(trustedLoopbackRpc),
       m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
-      m_caFile(std::move(caFile)), m_authorizationHeader(std::move(authorizationHeader)),
-      m_trustedLoopbackRpc(trustedLoopbackRpc) {}
+      m_caFile(std::move(caFile)), m_authorizationHeader(std::move(authorizationHeader)) {}
 
 foundation::Result<FarcasterProviderConfig> FarcasterProviderConfig::create(
     std::string domain, std::string uri, std::uint64_t optimismChainId,
