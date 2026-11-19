@@ -721,22 +721,22 @@ and produces the same browser redirect and bound continuation cookies as the
 legacy start route. It fails closed for a provider lacking native capability;
 it never executes the synchronous provider SPI on the HTTP reactor.
 
-**Default: disabled.** The start flag alone leaves
-`/auth/federated/callback` on the compatibility path. A second independent
-opt-in, `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1`, enables a
-native OAuth2 **GET** callback requiring the native start flag as well. The
-callback consumes the one-time challenge with `completeAsync`, checks
+**Default: both disabled.** `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1`
+and `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1` **must be enabled
+together**. A single enabled leg is rejected during startup: otherwise
+native Start would persist a challenge in the native SQL transaction store
+and the legacy Callback would attempt to redeem it from a different store.
+The callback supports OAuth2 **GET** and uses `completeAsync`, validates
 server-bound transaction/binding cookies, clears browser callback state and
-uses the PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic
-session replacement. Raw OAuth query credentials are scrubbed before
-asynchronous suspension. Both flags accept only `0` or `1`; the callback
-flag without the start flag rejects startup.
+uses PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic session
+replacement. Raw OAuth query credentials are scrubbed before asynchronous
+suspension. Both flags accept only `0` or `1`.
 
 **Scope limitation:** This callback supports OAuth2 authorization-code GET
 responses only. It explicitly does **not** enable SAML/POST, OAuth1 callbacks,
 provider connection ceremonies, or a native login for providers without
 `CoroutineAuthenticationProvider`. These remain on the compatibility path
-when the callback flag is off; when it is on, unsupported callbacks fail closed
+when both flags are off; when they are on, unsupported callbacks fail closed
 instead of silently executing a blocking provider on the native route.
 For mixed provider deployments, do not enable the native callback until
 every required browser flow is migrated or separately routed.
