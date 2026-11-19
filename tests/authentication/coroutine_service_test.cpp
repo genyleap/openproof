@@ -2,13 +2,14 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
-#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+
+#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 
 import openproof.authentication;
 import openproof.foundation;
