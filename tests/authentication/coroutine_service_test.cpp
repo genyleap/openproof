@@ -1159,6 +1159,8 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMis
     for (const auto target : {
         "/auth/federated/callback?code=valid-code&state=matching-state",
         "/auth/federated/callback?code=valid-code&code=again&state=matching-state",
+        "/auth/federated/callback?code=valid-code&state=matching-state&oauth_token=ambiguous",
+        "/auth/federated/callback?code=valid-code&state=matching-state&SAMLResponse=ambiguous",
         "/auth/federated/callback?code=valid-code&state=%ZZ",
         "/auth/federated/callback?code=valid-code"}) {
         auto response = invokeCallback(
