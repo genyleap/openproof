@@ -4358,3 +4358,47 @@ proves actual native PostgreSQL SQL and session-domain operation on
 a disposable database, not full federated OAuth/LDAP HTTP E2E,
 removal of legacy blocking facades, or release approval. `main`
 and Production were not changed.
+
+### Native federated OAuth start: compiler and TCP loopback checkpoint (2026-11-19)
+
+The previously blocking `GET /auth/federated/start` first leg has a separate,
+operator-opt-in `CoroutineFederatedStartAdapter` which awaits the real
+`AuthenticationService::beginAsync` and rejects an untrusted or non-native
+redirect provider before any synchronous provider execution. The adapter
+preserves server-bound continuation/binding/transaction/challenge/return
+cookies and the registered provider's HTTPS authorization redirect. Invalid
+or ambiguous query parameters and nonlocal redirect targets fail closed.
+The option `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` defaults OFF;
+the route's compatibility handler is not modified when it is off.
+
+Validation on a separate detached worktree with
+`/opt/gcc-16.2.0`, Boost 1.88 and a clean RelWithDebInfo C++26 build,
+with `-Werror` and no experimental Contracts:
+
+```sh
+cmake --build /tmp/openproof-fedstart-build-20261119 \
+  --target openproof_authentication_async_federated_start_http --parallel 1
+# PASS: native federated start translation unit compiled, library linked
+cmake --build /tmp/openproof-fedstart-build-20261119 \
+  --target openproof_authentication_coroutine_tests --parallel 1
+# PASS: dedicated compiled C++ test executable linked
+ctest --test-dir /tmp/openproof-fedstart-build-20261119 \
+  -R '^TrustedAsyncAuth\.' --output-on-failure -j 1
+# PASS: 18/18 CTests, including 3 new federated-start tests
+```
+
+The new TCP/Beast loopback test exercises an actual listening HTTP server
+on an OS-chosen localhost port, verifies HTTP 302, location, five distinct
+Set-Cookie headers and no synchronous provider or fallback calls.
+The negative native tests deny malformed/duplicate queries, malicious return
+paths and a synchronous-only provider. These are **not** external GitHub
+OAuth callback E2E or real PostgreSQL login tests.
+
+**Remaining acceptance debt:** the native federated callback, explicit
+connection and session issuing endpoints are not converted by this change;
+startup composition root executable `opp` has not yet had its full build
+and cross-provider end-to-end HTTP/database verification for this opt-in.
+The scanner remains **NOT_APPROVED**, with 17 findings in 11 of 25 critical
+areas (14/25 = 56% static area coverage), unchanged by this first-leg
+migration. Do not merge into `main`, enable in Production or claim an
+approved end-to-end coroutine migration from this checkpoint.
