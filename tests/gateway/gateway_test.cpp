@@ -642,4 +642,25 @@ TEST(GatewayTest, ServerErrorsContributeToCircuitHealth)
     EXPECT_EQ(fixture.circuits.state(gw::EndpointId{"two"}), gw::CircuitState::Open);
 }
 
+TEST(GatewayTest, WipeTargetQueryErasesOAuthCredentialsWithoutChangingRoute)
+{
+    auto created = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/auth/federated/callback?code=one-time-secret&state=pinned",
+        {}, {}, "127.0.0.1", fnd::CorrelationId{"wipe-target-test"});
+    ASSERT_TRUE(created);
+    auto value = std::move(created).value();
+    EXPECT_EQ(value.path(), "/auth/federated/callback");
+    value.wipeTargetQuery();
+    EXPECT_EQ(value.target(), "/auth/federated/callback");
+    EXPECT_EQ(value.path(), "/auth/federated/callback");
+    value.wipeTargetQuery();
+    EXPECT_EQ(value.target(), "/auth/federated/callback");
+    auto noQuery = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"wipe-target-no-query"});
+    ASSERT_TRUE(noQuery);
+    noQuery->wipeTargetQuery();
+    EXPECT_EQ(noQuery->target(), "/account");
+}
+
 }
