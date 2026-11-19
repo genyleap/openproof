@@ -52,6 +52,7 @@
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
+#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1454,6 +1455,25 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeCatalogEnabled =
         nativeCatalogFlag && *nativeCatalogFlag == "1";
+    // Experimental native first leg of federated login; no legacy provider
+    // fallback is permitted on the async route.
+    const auto nativeFederatedStartFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START");
+    if (nativeFederatedStartFlag && *nativeFederatedStartFlag != "0"
+        && *nativeFederatedStartFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeFederatedStartEnabled =
+        nativeFederatedStartFlag && *nativeFederatedStartFlag == "1";
+    if (nativeFederatedStartEnabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native federated start requires enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeCatalogEnabled && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -2274,7 +2294,7 @@ addProtectedRoutes(gateway::Router& router,
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled) {
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2293,7 +2313,7 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
-        if (nativeLdapEnabled || nativeWeb3Enabled) {
+        if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {
             nativeTransactions = std::make_unique<
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
@@ -2422,6 +2442,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
+        std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2510,6 +2531,18 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeHandler, boost::json::serialize(catalog));
             nativeHandler = asyncCatalog.get();
             nativePaths.emplace_back("/auth/providers");
+        }
+        if (nativeFederatedStartEnabled) {
+            if (!nativeAuthentication) {
+                reportStartupFailure(fnd::Error{
+                    fnd::ErrorCode::FailedPrecondition,
+                    "Native federated start requires a native authentication stack."});
+                return ExitCode::ConfigurationError;
+            }
+            asyncFederated = std::make_unique<authHttp::CoroutineFederatedStartAdapter>(
+                *nativeAuthentication, providers, limiter.value(), *nativeHandler);
+            nativeHandler = asyncFederated.get();
+            nativePaths.emplace_back("/auth/federated/start");
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths)};
