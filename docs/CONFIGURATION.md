@@ -788,6 +788,18 @@ additional CA bundle.
   signature verification. Setting `OPENPROOF_FARCASTER_CHAIN_ID` to a value
   other than `10` is rejected. The Optimism RPC endpoint is subject to the same
   strict HTTPS authority and port validation as wallet smart-account RPCs.
+  All RPC destinations are checked against SSRF protections that reject
+  loopback, private, link-local and special-use IP addresses, including
+  mixed public/private DNS results, even if TLS verification succeeds.
+  **Explicit local-node exception:** `OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC=1`
+  authorizes only the literal `https://127.0.0.1:<port>/...` Farcaster RPC
+  configured by the operator, and **requires** a separately configured CA
+  certificate in `OPENPROOF_WEB3_CA_FILE`. It is intended for an isolated,
+  TLS-pinned local verifier (including the disposable E2E fixture); no DNS
+  name, `localhost`, other private IP range or wallet RPC is exempted.
+  Omission or `0` preserves public-only routing; invalid flag values fail
+  startup, and opting in without an endpoint or pinned CA fails closed.
+  Never enable this exception merely to fix an upstream RPC outage.
 
 Web3 authentication is classified as a possession factor but is not promoted to
 WebAuthn-style phishing resistance.
