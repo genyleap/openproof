@@ -1482,10 +1482,15 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeFederatedCallbackEnabled =
         nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag == "1";
-    if (nativeFederatedCallbackEnabled && !nativeFederatedStartEnabled) {
+    // Both HTTP legs must use the SAME native transaction repository.
+    // A native start followed by a legacy callback cannot redeem the
+    // persisted challenge, while a native callback cannot consume a
+    // transaction created by the legacy synchronous store. Refuse a
+    // split-brain deployment before the listener and any migrations start.
+    if (nativeFederatedStartEnabled != nativeFederatedCallbackEnabled) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
-            "Native federated callback requires native federated start."});
+            "Native federated start and callback must be enabled together."});
         return ExitCode::ConfigurationError;
     }
     if (nativeFederatedStartEnabled && !platform.auth().enabled()) {
