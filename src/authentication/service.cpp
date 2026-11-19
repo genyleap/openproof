@@ -148,7 +148,7 @@ parseAssurance(std::string_view value) noexcept
     }
     if (providerIds.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A self-provisioning deny list cannot be empty.");
+                                "A provider deny list cannot be empty.");
     }
 
     // Validate every provider before mutating any trust rule.
@@ -158,18 +158,18 @@ parseAssurance(std::string_view value) noexcept
         const auto name = trim(providerIds.substr(0U, separator));
         if (name.empty() || name == "*") {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list contains an invalid provider.");
+                                    "A provider deny list contains an invalid provider.");
         }
         provider::ProviderId id{std::string{name}};
         if (!flags.contains(id) || !disabled.insert(id).second) {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list contains an unknown or duplicate provider.");
+                                    "A provider deny list contains an unknown or duplicate provider.");
         }
         if (separator == std::string_view::npos) break;
         providerIds.remove_prefix(separator + 1U);
         if (providerIds.empty()) {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "A self-provisioning deny list cannot end with a comma.");
+                                    "A provider deny list cannot end with a comma.");
         }
     }
     for (const auto& id : disabled) flags.at(id) = false;
