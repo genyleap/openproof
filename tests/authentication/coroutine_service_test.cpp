@@ -6,6 +6,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -876,6 +877,33 @@ public:
     return std::move(request).value();
 }
 
+// Boost.Asio's use_future co_spawn completion requires a default-constructible
+// T. HttpResponse deliberately has no default constructor, so deliver it via
+// an owned optional and an awaitable<void> instead.
+asio::awaitable<void> collectFederatedResponse(
+    auth::http::CoroutineFederatedStartAdapter& adapter,
+    openproof::gateway::HttpRequest request,
+    std::optional<openproof::gateway::HttpResponse>& result)
+{
+    result.emplace(co_await adapter.handleAsync(std::move(request)));
+    co_return;
+}
+
+[[nodiscard]] openproof::gateway::HttpResponse invokeFederated(
+    auth::http::CoroutineFederatedStartAdapter& adapter,
+    openproof::gateway::HttpRequest request)
+{
+    asio::io_context io;
+    std::optional<openproof::gateway::HttpResponse> result;
+    auto completion = asio::co_spawn(
+        io, collectFederatedResponse(adapter, std::move(request), result),
+        asio::use_future);
+    io.run();
+    completion.get();
+    if (!result) throw std::runtime_error{"missing federated HTTP response"};
+    return std::move(*result);
+}
+
 TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncFallback)
 {
     Fixture fixture;
@@ -890,11 +918,7 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncF
         "/auth/federated/start?provider=async-test&return_to=%2Faccount");
     EXPECT_TRUE(adapter.nativeEnabledFor(request));
     EXPECT_FALSE(adapter.nativeEnabled());
-    asio::io_context io;
-    auto result = asio::co_spawn(
-        io, adapter.handleAsync(std::move(request)), asio::use_future);
-    io.run();
-    auto response = result.get();
+    auto response = invokeFederated(adapter, std::move(request));
     EXPECT_EQ(response.status(), 302);
     EXPECT_EQ(response.headers().at("location"), "https://example.test/authorize");
     EXPECT_EQ(response.headers().at("cache-control"), "no-store");
@@ -923,11 +947,8 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartRejectsInvalidQueryAndLeg
             "/auth/federated/start?provider=async-test&return_to=%2F%2Fevil.test",
             "/auth/federated/start?provider=async-test&return_to=%ZZ",
             "/auth/federated/start?provider=async-test"}) {
-        asio::io_context io;
-        auto result = asio::co_spawn(
-            io, adapter.handleAsync(makeFederatedStart(bad)), asio::use_future);
-        io.run();
-        EXPECT_GE(result.get().status(), 400);
+        auto response = invokeFederated(adapter, makeFederatedStart(bad));
+        EXPECT_GE(response.status(), 400);
     }
     EXPECT_EQ(fixture.synchronousProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
