@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/use_future.hpp>
+// GCC 16 module imports and Boost.Asio headers must share the same
+// global-fragment declarations. The narrow header mix previously emitted
+// duplicate internal-linkage execution CPOs (prefer/query/require).
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 #include <boost/json.hpp>
 
 #include <chrono>
