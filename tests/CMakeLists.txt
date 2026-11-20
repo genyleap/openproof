@@ -536,8 +536,13 @@ target_link_libraries(openproof_account_coroutine_http_tests PRIVATE
     openproof_account_async_http GTest::gtest_main
     openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 16.2 at -O0 emits the same anonymous-namespace Boost.Asio
+    # execution CPO objects (prefer/query/require) several times in this
+    # module-importing test translation unit and the assembler rejects the
+    # duplicate symbols. Keep -Werror and -fno-inline; use modest optimization
+    # so the frontend coalesces those CPOs while keeping memory use bounded.
     set_source_files_properties(account/session_coroutine_http_test.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_account_coroutine_http_tests PRIVATE
