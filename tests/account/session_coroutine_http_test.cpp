@@ -304,7 +304,7 @@ TEST(AccountCoroutineSessionHttpTest, RevokeRejectsLookalikeJsonMimeTypes)
 {
     Fixture f;
     constexpr std::string_view body{R"({"session_id":"other"})"};
-    for (const std::string& type : {
+    for (const char* type : {
             "application/json-invalid", "application/jsonp",
             "application/json, application/json", "text/plain"}) {
         const auto response = f.run(request(
@@ -324,7 +324,7 @@ TEST(AccountCoroutineSessionHttpTest, RevokeRejectsLookalikeJsonMimeTypes)
 TEST(AccountCoroutineSessionHttpTest, RevokeRejectsCurrentAndMalformedRequests)
 {
     Fixture f;
-    for (const std::string& body : {
+    for (const char* body : {
         R"({"session_id":"current"})",
         R"({"session_id":"other","unrecognized":true})",
         R"({"session_id":""})"}) {
