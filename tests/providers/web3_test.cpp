@@ -147,11 +147,11 @@ TEST(FarcasterProviderTest, TrustedLoopbackRpcNeedsExplicitOptInAndPinnedCa)
             "https://optimism-rpc.openproof.test/"}) {
         auto refused = create(endpoint, "/tmp/fixture-ca.pem", true);
         EXPECT_FALSE(refused) << endpoint;
-        if (!refused) EXPECT_EQ(refused.error().code(), fnd::ErrorCode::InvalidArgument);
+        if (!refused) { EXPECT_EQ(refused.error().code(), fnd::ErrorCode::InvalidArgument); }
     }
     auto noCa = create("https://127.0.0.1:18443/", "", true);
     EXPECT_FALSE(noCa);
-    if (!noCa) EXPECT_EQ(noCa.error().code(), fnd::ErrorCode::InvalidArgument);
+    if (!noCa) { EXPECT_EQ(noCa.error().code(), fnd::ErrorCode::InvalidArgument); }
 }
 
 TEST(WalletProviderTest, ChallengeUsesRequestedEvmChainWithoutRpcDependency)
