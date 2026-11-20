@@ -524,8 +524,13 @@ gtest_discover_tests(openproof_postgres_async_benchmark_tests
 
 # Isolated source-level account session coroutine HTTP regression.
 # No production listener is rewired by constructing this target.
+# The native account-session adapter uses the Boost.JSON compiled API.
+# This isolated executable does not link the legacy account HTTP library,
+# which already owns another Boost.JSON implementation. Provide exactly one
+# implementation translation unit here, as in the isolated Gateway suites.
 add_executable(openproof_account_coroutine_http_tests
-    account/session_coroutine_http_test.cpp)
+    account/session_coroutine_http_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/account/http/boost_json.cpp)
 target_compile_features(openproof_account_coroutine_http_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_account_coroutine_http_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/src/account/http"
