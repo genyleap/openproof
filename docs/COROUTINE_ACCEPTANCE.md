@@ -4402,3 +4402,45 @@ The scanner remains **NOT_APPROVED**, with 17 findings in 11 of 25 critical
 areas (14/25 = 56% static area coverage), unchanged by this first-leg
 migration. Do not merge into `main`, enable in Production or claim an
 approved end-to-end coroutine migration from this checkpoint.
+
+
+### Federated native HTTP development integration checkpoint (2026-11-21)
+
+**Dev integration completed, release NOT APPROVED.** PR #54 was merged to the
+Coroutine development branch in commit
+`845e79e5014dfeea745692e66fe54f3915f88004`. `main` and production
+remain unchanged. The feature is still disabled by default and requires
+**both** `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` and
+`OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1`; a split-brain
+configuration must fail startup rather than mixing transaction stores.
+
+- GitHub Actions CI #204 built the full GCC 16.2/C++26 release tree and
+  completed the full CTest stage successfully, including the previously
+  failing `HistoricalTenantSeedsNeverAutoApply` regression. The test now
+  asserts that only the **three exact archived tenant-specific migrations**
+  stay absent while the unrelated active
+  `0020_active_session_recency.sql` migration remains installed.
+- The disposable PostgreSQL/Farcaster compatibility E2E and native Gateway/TCP
+  integration passed in CI #204. These do **not** constitute full live-provider
+  native Federated Callback/PostgreSQL acceptance.
+- On an isolated GCC 16.2 build of the pre-merge feature head, the dedicated
+  Account, Enterprise and Federated native HTTP CTests passed **30/30**.
+  Seven sensitive native federation/concurrency tests passed **210/210**
+  consecutive executions, and two JS auth-contract/scrubbing suites passed
+  **11/11**. None replaces adversarial real-provider/SQL E2E.
+- The generic CTest intentionally skips four *real-database* coroutine tests
+  lacking an explicit disposable database acknowledgment; their guarded
+  fixtures must never be pointed at production or force-enabled simply to
+  remove a Skip. The dedicated native PostgreSQL integration CI stage passed.
+- The strict source-coverage gate remains **NOT_APPROVED**: **14/25**
+  areas passing, **17 blocking findings** across 11 areas. In particular the
+  legacy synchronous provider facades, PostgreSQL and remaining HTTP APIs
+  have not completed end-to-end Coroutine migration. The paired performance
+  baseline, delayed-upstream benchmark, release builds and dynamic/security
+  release checklist have separate acceptance requirements.
+
+**Next gate:** eliminate blocking I/O from each remaining production-active
+route and provider without relaxing the scanner, the SSRF/PKI policy,
+single-use authentication transactions or tenant boundaries. Run real
+disposable-PostgreSQL identity/callback E2E, all compilation/test profiles and
+matched baseline benchmarks before moving the development branch to `main`.
