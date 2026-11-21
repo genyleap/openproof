@@ -2,18 +2,27 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
+#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
+#include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
+
 import openproof.authentication;
 import openproof.foundation;
+import openproof.gateway;
+import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
+import openproof.session;
 
 namespace {
 namespace asio = boost::asio;
@@ -65,8 +74,10 @@ public:
         ++nativeBeginCalls;
         co_await asio::post(asio::use_awaitable);
         if (request.provider() != id()) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
-        co_return idp::AuthenticationChallenge{
+        idp::AuthenticationChallenge challenge{
             idp::ChallengeId{"server-challenge"}, kNow + kLifetime};
+        challenge.setParameter("authorization_url", "https://example.test/authorize");
+        co_return challenge;
     }
 
     [[nodiscard]] asio::awaitable<fnd::Result<idp::AuthenticationOutcome>>
@@ -74,7 +85,12 @@ public:
     {
         ++nativeCompleteCalls;
         co_await asio::post(asio::use_awaitable);
-        if (response.parameters().find("proof") == response.parameters().end()) {
+        const auto& fields = response.parameters();
+        const bool proof = fields.contains("proof");
+        const bool oauth2 = fields.contains("code") && fields.contains("state")
+            && fields.at("code").expose() == "valid-code"
+            && fields.at("state").expose() == "matching-state";
+        if (!proof && !oauth2) {
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
         co_return idp::AuthenticationOutcome::create(
@@ -839,6 +855,414 @@ TEST(TrustedAuthenticationCoroutineTest, MissingNativeCanonicalRefusesBeforeProo
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
     EXPECT_EQ(fixture.nativeCanonical.calls, 1);
+}
+
+class FederatedNoFallback final : public openproof::gateway::http::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabledFor(
+        const openproof::gateway::HttpRequest&) const noexcept override { return false; }
+    [[nodiscard]] openproof::gateway::HttpResponse
+    handle(openproof::gateway::HttpRequest) override
+    {
+        ++syncCalls;
+        return openproof::gateway::HttpResponse{500, {}, {}};
+    }
+    [[nodiscard]] asio::awaitable<openproof::gateway::HttpResponse>
+    handleAsync(openproof::gateway::HttpRequest) override
+    {
+        ++asyncCalls;
+        co_return openproof::gateway::HttpResponse{500, {}, {}};
+    }
+    int syncCalls{};
+    int asyncCalls{};
+};
+
+[[nodiscard]] openproof::gateway::HttpRequest makeFederatedStart(std::string target)
+{
+    auto request = openproof::gateway::HttpRequest::create(
+        openproof::gateway::HttpMethod::Get, std::move(target), {}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-federated-start-test"});
+    EXPECT_TRUE(request);
+    return std::move(request).value();
+}
+
+// Boost.Asio's use_future co_spawn completion requires a default-constructible
+// T. HttpResponse deliberately has no default constructor, so deliver it via
+// an owned optional and an awaitable<void> instead.
+asio::awaitable<void> collectFederatedResponse(
+    auth::http::CoroutineFederatedStartAdapter& adapter,
+    openproof::gateway::HttpRequest request,
+    std::optional<openproof::gateway::HttpResponse>& result)
+{
+    result.emplace(co_await adapter.handleAsync(std::move(request)));
+    co_return;
+}
+
+[[nodiscard]] openproof::gateway::HttpResponse invokeFederated(
+    auth::http::CoroutineFederatedStartAdapter& adapter,
+    openproof::gateway::HttpRequest request)
+{
+    asio::io_context io;
+    std::optional<openproof::gateway::HttpResponse> result;
+    auto completion = asio::co_spawn(
+        io, collectFederatedResponse(adapter, std::move(request), result),
+        asio::use_future);
+    io.run();
+    completion.get();
+    if (!result) throw std::runtime_error{"missing federated HTTP response"};
+    return std::move(*result);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncFallback)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    auto request = makeFederatedStart(
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount");
+    EXPECT_TRUE(adapter.nativeEnabledFor(request));
+    EXPECT_FALSE(adapter.nativeEnabled());
+    auto response = invokeFederated(adapter, std::move(request));
+    EXPECT_EQ(response.status(), 302);
+    EXPECT_EQ(response.headers().at("location"), "https://example.test/authorize");
+    EXPECT_EQ(response.headers().at("cache-control"), "no-store");
+    ASSERT_TRUE(response.headers().contains("set-cookie"));
+    EXPECT_EQ(response.repeatedHeaders().size(), 4U);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartRejectsInvalidQueryAndLegacyProvider)
+{
+    Fixture fixture{false};
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    EXPECT_EQ(adapter.handle(makeFederatedStart(
+        "/auth/federated/start?provider=async-test")).status(), 503);
+    for (const auto bad : {
+            "/auth/federated/start?provider=async-test&provider=async-test",
+            "/auth/federated/start?provider=async-test&return_to=%2F%2Fevil.test",
+            "/auth/federated/start?provider=async-test&return_to=%ZZ",
+            "/auth/federated/start?provider=async-test"}) {
+        auto response = invokeFederated(adapter, makeFederatedStart(bad));
+        EXPECT_GE(response.status(), 400);
+    }
+    EXPECT_EQ(fixture.synchronousProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartRealHttpLoopbackPreservesRedirectAndBoundState)
+{
+    namespace beast = boost::beast;
+    namespace wire = beast::http;
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+    auto config = openproof::gateway::http::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 8192U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 32U, 2U);
+    ASSERT_TRUE(config);
+    openproof::gateway::http::BeastHttpServer server{
+        adapter, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+
+    asio::io_context io;
+    beast::tcp_stream stream{io};
+    stream.expires_after(std::chrono::seconds{3});
+    asio::ip::tcp::resolver resolver{io};
+    stream.connect(resolver.resolve(
+        "127.0.0.1", std::to_string(server.boundPort())));
+    wire::request<wire::string_body> request{
+        wire::verb::get,
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount", 11};
+    request.set(wire::field::host, "localhost");
+    wire::write(stream, request);
+    beast::flat_buffer buffer;
+    wire::response<wire::string_body> response;
+    wire::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), wire::status::found);
+    EXPECT_EQ(response.at(wire::field::location), "https://example.test/authorize");
+    EXPECT_EQ(response.at(wire::field::cache_control), "no-store");
+    int cookieCount = 0;
+    for (const auto& field : response) {
+        if (field.name() == wire::field::set_cookie) ++cookieCount;
+    }
+    EXPECT_EQ(cookieCount, 5);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+    server.stop();
+}
+
+// Test-only native session issuer: verifies that callback really suspends on
+// a native issuer, never touching the synchronous SessionService.
+class FederatedNativeSessionIssuer final
+    : public openproof::session::CoroutineReplacingSessionIssuer {
+public:
+    [[nodiscard]] asio::awaitable<fnd::Result<openproof::session::CoroutineIssuedSession>>
+    issueAsync(const auth::VerifiedAuthentication& verification,
+               idp::ClientContext client) override
+    {
+        co_return co_await issueReplacingAsync(
+            verification, std::move(client), std::nullopt);
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Result<openproof::session::CoroutineIssuedSession>>
+    issueReplacingAsync(
+        const auth::VerifiedAuthentication& verification,
+        idp::ClientContext,
+        std::optional<fnd::SecretString> previousToken) override
+    {
+        ++calls;
+        sawPrevious = previousToken && previousToken->expose() == "prior-session";
+        co_await asio::post(asio::use_awaitable);
+        if (verification.identity() != ids::IdentityId{"canonical-identity"})
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return openproof::session::CoroutineIssuedSession{
+            openproof::session::SessionId{"test-session-1"},
+            fnd::SecretString{"new-session-1"}};
+    }
+
+    int calls{};
+    bool sawPrevious{};
+};
+
+[[nodiscard]] std::string federatedCookies(
+    const openproof::gateway::HttpResponse& response)
+{
+    std::string result;
+    const auto append = [&result](std::string_view field) {
+        const auto semi = field.find(';');
+        if (!result.empty()) result.append("; ");
+        result.append(field.substr(0U, semi));
+    };
+    const auto first = response.headers().find("set-cookie");
+    if (first != response.headers().end()) append(first->second);
+    for (const auto& [name, value] : response.repeatedHeaders())
+        if (name == "set-cookie") append(value);
+    return result;
+}
+
+[[nodiscard]] openproof::gateway::HttpRequest makeFederatedCallback(
+    std::string target, std::string cookieHeader)
+{
+    auto request = openproof::gateway::HttpRequest::create(
+        openproof::gateway::HttpMethod::Get, std::move(target),
+        {{"cookie", std::move(cookieHeader)}}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-federated-callback-test"});
+    EXPECT_TRUE(request);
+    return std::move(request).value();
+}
+
+asio::awaitable<void> collectCallbackResponse(
+    auth::http::CoroutineFederatedCallbackAdapter& adapter,
+    openproof::gateway::HttpRequest request,
+    std::optional<openproof::gateway::HttpResponse>& result)
+{
+    result.emplace(co_await adapter.handleAsync(std::move(request)));
+    co_return;
+}
+
+[[nodiscard]] openproof::gateway::HttpResponse invokeCallback(
+    auth::http::CoroutineFederatedCallbackAdapter& adapter,
+    openproof::gateway::HttpRequest request)
+{
+    asio::io_context io;
+    std::optional<openproof::gateway::HttpResponse> result;
+    auto completed = asio::co_spawn(io,
+        collectCallbackResponse(adapter, std::move(request), result),
+        asio::use_future);
+    io.run();
+    completed.get();
+    if (!result) throw std::runtime_error{"missing native callback HTTP response"};
+    return std::move(*result);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackConsumesProofAndIssuesNativeSessionOnce)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{
+        service, fixture.providers, limiter.value(), fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{
+        service, issuer, fallback};
+
+    auto started = invokeFederated(start, makeFederatedStart(
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount"));
+    ASSERT_EQ(started.status(), 302);
+    auto cookies = federatedCookies(started);
+    ASSERT_FALSE(cookies.empty());
+    auto first = makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        cookies + "; __Host-openproof-session=prior-session");
+    EXPECT_TRUE(callback.nativeEnabledFor(first));
+    EXPECT_FALSE(callback.nativeEnabled());
+    auto response = invokeCallback(callback, std::move(first));
+    EXPECT_EQ(response.status(), 302);
+    EXPECT_EQ(response.headers().at("location"), "/account");
+    const auto newCookie = federatedCookies(response);
+    EXPECT_NE(newCookie.find("__Host-openproof-session=new-session-1"),
+              std::string::npos);
+    EXPECT_EQ(issuer.calls, 1);
+    EXPECT_TRUE(issuer.sawPrevious);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+    // The in-memory store retains a Consumed tombstone for replay detection.
+    EXPECT_EQ(fixture.transactions.size(), 1U);
+
+    // A one-time transaction cannot mint a second session from replay.
+    auto replay = invokeCallback(callback, makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state", cookies));
+    EXPECT_GE(replay.status(), 400);
+    EXPECT_EQ(issuer.calls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMissingState)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    FederatedNoFallback fallback;
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{
+        service, issuer, fallback};
+    EXPECT_EQ(callback.handle(makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        "cookie-name=cookie-value")).status(), 503);
+    for (const auto target : {
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        "/auth/federated/callback?code=valid-code&code=again&state=matching-state",
+        "/auth/federated/callback?code=valid-code&state=matching-state&oauth_token=ambiguous",
+        "/auth/federated/callback?code=valid-code&state=matching-state&SAMLResponse=ambiguous",
+        "/auth/federated/callback?code=valid-code&state=%ZZ",
+        "/auth/federated/callback?code=valid-code"}) {
+        auto response = invokeCallback(
+            callback, makeFederatedCallback(target, "cookie-name=cookie-value"));
+        EXPECT_GE(response.status(), 400);
+    }
+    EXPECT_EQ(issuer.calls, 0);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRealHttpLoopbackIssuesSession)
+{
+    namespace beast = boost::beast;
+    namespace wire = beast::http;
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{
+        service, fixture.providers, limiter.value(), fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{
+        service, issuer, start};
+    auto config = openproof::gateway::http::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 8192U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 32U, 2U);
+    ASSERT_TRUE(config);
+    openproof::gateway::http::BeastHttpServer server{
+        callback, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+
+    const auto exchange = [&server](
+        std::string target, std::optional<std::string> cookies)
+        -> wire::response<wire::string_body> {
+        asio::io_context io;
+        beast::tcp_stream stream{io};
+        stream.expires_after(std::chrono::seconds{3});
+        asio::ip::tcp::resolver resolver{io};
+        stream.connect(resolver.resolve(
+            "127.0.0.1", std::to_string(server.boundPort())));
+        wire::request<wire::string_body> request{
+            wire::verb::get, std::move(target), 11};
+        request.set(wire::field::host, "localhost");
+        if (cookies) request.set(wire::field::cookie, *cookies);
+        wire::write(stream, request);
+        beast::flat_buffer buffer;
+        wire::response<wire::string_body> response;
+        wire::read(stream, buffer, response);
+        return response;
+    };
+
+    auto authorization = exchange(
+        "/auth/federated/start?provider=async-test&return_to=%2Faccount",
+        std::nullopt);
+    EXPECT_EQ(authorization.result(), wire::status::found);
+    EXPECT_EQ(authorization.at(wire::field::location),
+              "https://example.test/authorize");
+    std::string cookies;
+    std::size_t count = 0U;
+    for (const auto& field : authorization) {
+        if (field.name() != wire::field::set_cookie) continue;
+        ++count;
+        const std::string value{
+            field.value().data(), field.value().size()};
+        if (!cookies.empty()) cookies.append("; ");
+        cookies.append(value.substr(0U, value.find(';')));
+    }
+    EXPECT_EQ(count, 5U);
+    ASSERT_FALSE(cookies.empty());
+
+    auto finished = exchange(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        cookies);
+    EXPECT_EQ(finished.result(), wire::status::found);
+    EXPECT_EQ(finished.at(wire::field::location), "/account");
+    bool foundSession = false;
+    for (const auto& field : finished) {
+        if (field.name() == wire::field::set_cookie
+            && field.value().starts_with(
+                "__Host-openproof-session=new-session-1")) {
+            foundSession = true;
+        }
+    }
+    EXPECT_TRUE(foundSession);
+    EXPECT_EQ(issuer.calls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+
+    auto replay = exchange(
+        "/auth/federated/callback?code=valid-code&state=matching-state",
+        cookies);
+    EXPECT_GE(replay.result_int(), 400);
+    EXPECT_EQ(issuer.calls, 1);
+    server.stop();
 }
 
 } // namespace

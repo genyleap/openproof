@@ -507,11 +507,11 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
     NativeRpcClient& client, std::string_view endpoint,
     std::string_view method, json::array parameters,
-    const foundation::SecretString& authorization, RpcDeadline deadline);
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false);
 
 [[nodiscard]] foundation::Result<RpcResponse> rpc(
     std::string_view endpoint, std::string_view method, json::array parameters,
-    std::string_view caFile, const foundation::SecretString& authorization)
+    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
 {
     try {
         asio::io_context io;
@@ -519,7 +519,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
         auto completion = asio::co_spawn(io,
             rpcAsync(client, endpoint, method, std::move(parameters),
                 authorization, std::chrono::steady_clock::now()
-                    + std::chrono::seconds{10}),
+                    + std::chrono::seconds{10}, allowLoopback),
             asio::use_future);
         io.run();
         return completion.get();
@@ -531,9 +531,9 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 
 [[nodiscard]] foundation::Result<std::string> rpcString(
     std::string_view endpoint, std::string_view method, json::array parameters,
-    std::string_view caFile, const foundation::SecretString& authorization)
+    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
 {
-    auto response = rpc(endpoint, method, std::move(parameters), caFile, authorization);
+    auto response = rpc(endpoint, method, std::move(parameters), caFile, authorization, allowLoopback);
     if (!response || !response->result.is_string()) {
         return foundation::fail(foundation::ErrorCode::Unavailable,
                                 "The Web3 RPC result is not a string.");
@@ -548,7 +548,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
     NativeRpcClient& client, std::string_view endpoint,
     std::string_view method, json::array parameters,
-    const foundation::SecretString& authorization, RpcDeadline deadline)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback)
 {
     const auto parsed = parseHttpsUrl(endpoint);
     if (!parsed) co_return foundation::fail(parsed.error());
@@ -568,6 +568,15 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     if (result.ec != std::errc{} || number == 0U || number > 65535U)
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
     request.port = static_cast<std::uint16_t>(number);
+    // The default remains public-only. A separate, operator-authorized
+    // Farcaster loopback mode is restricted to the literal IP and a pinned
+    // CA file by FarcasterProviderConfig::create(). Never let a DNS name
+    // bypass the private-address/DNS-rebinding policy.
+    if (allowLoopback) {
+        if (request.host != "127.0.0.1")
+            co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+        request.addressPolicy = NativeRpcRequest::AddressPolicy::PermitPrivate;
+    }
     request.target = parsed->target;
     request.timeout = std::chrono::seconds{10};
     request.absoluteDeadline = deadline;
@@ -602,10 +611,10 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<std::string>> rpcStringAsync(
     NativeRpcClient& client, std::string_view endpoint,
     std::string_view method, json::array parameters,
-    const foundation::SecretString& authorization, RpcDeadline deadline)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     auto response = co_await rpcAsync(
-        client, endpoint, method, std::move(parameters), authorization, deadline);
+        client, endpoint, method, std::move(parameters), authorization, deadline, allowLoopback);
     if (!response || !response->result.is_string())
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
                                    "The Web3 RPC result is not a string.");
@@ -630,9 +639,9 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 
 [[nodiscard]] foundation::Result<bool> rpcChainMatches(
     std::string_view endpoint, std::uint64_t expected, std::string_view caFile,
-    const foundation::SecretString& authorization)
+    const foundation::SecretString& authorization, bool allowLoopback = false)
 {
-    auto chain = rpcString(endpoint, "eth_chainId", {}, caFile, authorization);
+    auto chain = rpcString(endpoint, "eth_chainId", {}, caFile, authorization, allowLoopback);
     if (!chain || !chain->starts_with("0x") || chain->size() > 34U) {
         return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::Unavailable}
                                       : chain.error());
@@ -650,7 +659,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] foundation::Result<bool> universalSignatureValid(
     std::string_view endpoint, std::string_view address,
     std::span<const std::byte, 32> digest, std::string_view signature,
-    std::string_view caFile, const foundation::SecretString& authorization)
+    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
 {
     auto signatureBytes = decodeHex(signature);
     if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 8192U) {
@@ -670,7 +679,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["data"] = std::move(data);
     auto result = rpcString(endpoint, "eth_call",
-        json::array{std::move(call), "latest"}, caFile, authorization);
+        json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
     if (!result) return foundation::fail(result.error());
     if (!result->starts_with("0x") || result->size() > 66U) {
         return foundation::fail(foundation::ErrorCode::Unavailable,
@@ -685,18 +694,18 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] foundation::Result<bool> contractWalletValid(
     std::string_view endpoint, std::string_view address,
     std::span<const std::byte, 32> digest, std::string_view signature,
-    std::string_view caFile, const foundation::SecretString& authorization)
+    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
 {
     // Match the verifier used by Farcaster AuthKit/viem. The deployless
     // ERC-6492 validator handles EOAs, deployed ERC-1271 wallets, and
     // counterfactual smart accounts without persisting any deployment.
     auto universal = universalSignatureValid(
-        endpoint, address, digest, signature, caFile, authorization);
+        endpoint, address, digest, signature, caFile, authorization, allowLoopback);
     if (universal) return universal.value();
 
     // Preserve the previous direct paths as a compatibility fallback for RPC
     // providers that do not permit contract-creation eth_call simulations.
-    auto code = rpcString(endpoint, "eth_getCode", json::array{address, "latest"}, caFile, authorization);
+    auto code = rpcString(endpoint, "eth_getCode", json::array{address, "latest"}, caFile, authorization, allowLoopback);
     if (!code) return foundation::fail(code.error());
     const bool contract = *code != "0x" && *code != "0x0" && *code != "0x00";
     if (!contract) {
@@ -722,7 +731,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["to"] = address;
     call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization);
+    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
     if (!result) return foundation::fail(result.error());
     std::string lowered = *result;
     std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
@@ -732,9 +741,9 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 }
 
 [[nodiscard]] asio::awaitable<foundation::Result<bool>> rpcChainMatchesAsync(
-    NativeRpcClient& client, std::string_view endpoint, std::uint64_t expected, const foundation::SecretString& authorization, RpcDeadline deadline)
+    NativeRpcClient& client, std::string_view endpoint, std::uint64_t expected, const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
-    auto chain = co_await rpcStringAsync(client, endpoint, "eth_chainId", {}, authorization, deadline);
+    auto chain = co_await rpcStringAsync(client, endpoint, "eth_chainId", {}, authorization, deadline, allowLoopback);
     if (!chain || !chain->starts_with("0x") || chain->size() > 34U) {
         co_return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::Unavailable}
                                       : chain.error());
@@ -751,7 +760,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<bool>> universalSignatureValidAsync(
     NativeRpcClient& client, std::string_view endpoint, std::string_view address,
     std::span<const std::byte, 32> digest, std::string_view signature,
-    const foundation::SecretString& authorization, RpcDeadline deadline)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     auto signatureBytes = decodeHex(signature);
     if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 8192U) {
@@ -771,7 +780,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["data"] = std::move(data);
     auto result = co_await rpcStringAsync(client, endpoint, "eth_call",
-        json::array{std::move(call), "latest"}, authorization, deadline);
+        json::array{std::move(call), "latest"}, authorization, deadline, allowLoopback);
     if (!result) co_return foundation::fail(result.error());
     if (!result->starts_with("0x") || result->size() > 66U) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
@@ -786,18 +795,18 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<bool>> contractWalletValidAsync(
     NativeRpcClient& client, std::string_view endpoint, std::string_view address,
     std::span<const std::byte, 32> digest, std::string_view signature,
-    const foundation::SecretString& authorization, RpcDeadline deadline)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     // Match the verifier used by Farcaster AuthKit/viem. The deployless
     // ERC-6492 validator handles EOAs, deployed ERC-1271 wallets, and
     // counterfactual smart accounts without persisting any deployment.
     auto universal = co_await universalSignatureValidAsync(
-        client, endpoint, address, digest, signature, authorization, deadline);
+        client, endpoint, address, digest, signature, authorization, deadline, allowLoopback);
     if (universal) co_return universal.value();
 
     // Preserve the previous direct paths as a compatibility fallback for RPC
     // providers that do not permit contract-creation eth_call simulations.
-    auto code = co_await rpcStringAsync(client, endpoint, "eth_getCode", json::array{address, "latest"}, authorization, deadline);
+    auto code = co_await rpcStringAsync(client, endpoint, "eth_getCode", json::array{address, "latest"}, authorization, deadline, allowLoopback);
     if (!code) co_return foundation::fail(code.error());
     const bool contract = *code != "0x" && *code != "0x0" && *code != "0x00";
     if (!contract) {
@@ -823,7 +832,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["to"] = address;
     call["data"] = std::move(data);
-    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline, allowLoopback);
     if (!result) co_return foundation::fail(result.error());
     std::string lowered = *result;
     std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
@@ -834,7 +843,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 
 [[nodiscard]] foundation::Result<std::uint64_t> farcasterIdOf(
     std::string_view endpoint, std::string_view registry, std::string_view address,
-    std::string_view caFile, const foundation::SecretString& authorization)
+    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
 {
     auto selector = functionSelector("idOf(address)");
     if (!selector) return foundation::fail(selector.error());
@@ -845,7 +854,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["to"] = registry;
     call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization);
+    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
     if (!result || !result->starts_with("0x") || result->size() > 66U) {
         return foundation::fail(result ? foundation::Error{foundation::ErrorCode::Unavailable}
                                        : result.error());
@@ -888,7 +897,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] foundation::Result<bool> farcasterAuthAddressValid(
     std::string_view endpoint, std::string_view registry, std::uint64_t fid,
     std::string_view address, std::string_view caFile,
-    const foundation::SecretString& authorization)
+    const foundation::SecretString& authorization, bool allowLoopback = false)
 {
     auto selector = functionSelector("keyDataOf(uint256,bytes)");
     if (!selector) return foundation::fail(selector.error());
@@ -903,7 +912,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     call["to"] = registry;
     call["data"] = std::move(data);
     auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"},
-                            caFile, authorization);
+                            caFile, authorization, allowLoopback);
     if (!result) return foundation::fail(result.error());
     auto state = abiUint64(*result, 0U);
     auto keyType = abiUint64(*result, 1U);
@@ -913,7 +922,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 
 [[nodiscard]] asio::awaitable<foundation::Result<std::uint64_t>> farcasterIdOfAsync(
     NativeRpcClient& client, std::string_view endpoint, std::string_view registry, std::string_view address,
-    const foundation::SecretString& authorization, RpcDeadline deadline)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     auto selector = functionSelector("idOf(address)");
     if (!selector) co_return foundation::fail(selector.error());
@@ -924,7 +933,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["to"] = registry;
     call["data"] = std::move(data);
-    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline, allowLoopback);
     if (!result || !result->starts_with("0x") || result->size() > 66U) {
         co_return foundation::fail(result ? foundation::Error{foundation::ErrorCode::Unavailable}
                                        : result.error());
@@ -947,7 +956,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 
 [[nodiscard]] asio::awaitable<foundation::Result<bool>> farcasterAuthAddressValidAsync(
     NativeRpcClient& client, std::string_view endpoint, std::string_view registry, std::uint64_t fid,
-    std::string_view address, const foundation::SecretString& authorization, RpcDeadline deadline)
+    std::string_view address, const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     auto selector = functionSelector("keyDataOf(uint256,bytes)");
     if (!selector) co_return foundation::fail(selector.error());
@@ -961,7 +970,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     json::object call;
     call["to"] = registry;
     call["data"] = std::move(data);
-    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline);
+    auto result = co_await rpcStringAsync(client, endpoint, "eth_call", json::array{std::move(call), "latest"}, authorization, deadline, allowLoopback);
     if (!result) co_return foundation::fail(result.error());
     auto state = abiUint64(*result, 0U);
     auto keyType = abiUint64(*result, 1U);
@@ -1351,7 +1360,7 @@ public:
     [[nodiscard]] foundation::Result<bool> chainMatches() override
     {
         return rpcChainMatches(m_config->rpcEndpoint(), m_config->chainId(),
-                               m_config->caFile(), m_config->authorizationHeader());
+                               m_config->caFile(), m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
     }
 
     [[nodiscard]] foundation::Result<bool> verifySignature(
@@ -1361,7 +1370,7 @@ public:
         auto digest = ethereumMessageHash(message);
         if (!digest) return foundation::fail(digest.error());
         return contractWalletValid(m_config->rpcEndpoint(), address, digest.value(), signature,
-                                   m_config->caFile(), m_config->authorizationHeader());
+                                   m_config->caFile(), m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
     }
 
     [[nodiscard]] foundation::Result<std::optional<FarcasterSignerKind>>
@@ -1369,7 +1378,7 @@ public:
     {
         auto custodyFid = farcasterIdOf(m_config->rpcEndpoint(),
             m_config->idRegistryAddress(), address, m_config->caFile(),
-            m_config->authorizationHeader());
+            m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
         if (!custodyFid) return foundation::fail(custodyFid.error());
         if (custodyFid.value() == fid) return FarcasterSignerKind::Custody;
         if (m_config->keyRegistryAddress().empty()) {
@@ -1377,7 +1386,7 @@ public:
         }
         auto valid = farcasterAuthAddressValid(m_config->rpcEndpoint(),
             m_config->keyRegistryAddress(), fid, address, m_config->caFile(),
-            m_config->authorizationHeader());
+            m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
         if (!valid) return foundation::fail(valid.error());
         if (valid.value()) return FarcasterSignerKind::AuthAddress;
         return std::optional<FarcasterSignerKind>{};
@@ -1390,7 +1399,7 @@ public:
     {
         co_return co_await rpcChainMatchesAsync(
             m_rpcClient, m_config->rpcEndpoint(), m_config->chainId(),
-            m_config->authorizationHeader(), deadline);
+            m_config->authorizationHeader(), deadline, m_config->trustedLoopbackRpc());
     }
 
     [[nodiscard]] asio::awaitable<foundation::Result<bool>>
@@ -1401,7 +1410,7 @@ public:
         if (!digest) co_return foundation::fail(digest.error());
         co_return co_await contractWalletValidAsync(
             m_rpcClient, m_config->rpcEndpoint(), address,
-            digest.value(), signature, m_config->authorizationHeader(), deadline);
+            digest.value(), signature, m_config->authorizationHeader(), deadline, m_config->trustedLoopbackRpc());
     }
 
     [[nodiscard]] asio::awaitable<
@@ -1412,7 +1421,7 @@ public:
         auto custodyFid = co_await farcasterIdOfAsync(
             m_rpcClient, m_config->rpcEndpoint(),
             m_config->idRegistryAddress(), address,
-            m_config->authorizationHeader(), deadline);
+            m_config->authorizationHeader(), deadline, m_config->trustedLoopbackRpc());
         if (!custodyFid) co_return foundation::fail(custodyFid.error());
         if (custodyFid.value() == fid)
             co_return std::optional<FarcasterSignerKind>{FarcasterSignerKind::Custody};
@@ -1421,7 +1430,7 @@ public:
         auto valid = co_await farcasterAuthAddressValidAsync(
             m_rpcClient, m_config->rpcEndpoint(),
             m_config->keyRegistryAddress(), fid, address,
-            m_config->authorizationHeader(), deadline);
+            m_config->authorizationHeader(), deadline, m_config->trustedLoopbackRpc());
         if (!valid) co_return foundation::fail(valid.error());
         if (valid.value())
             co_return std::optional<FarcasterSignerKind>{FarcasterSignerKind::AuthAddress};
@@ -1672,10 +1681,11 @@ FarcasterProviderConfig::FarcasterProviderConfig(
     std::string optimismRpcEndpoint, std::string idRegistryAddress,
     foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
     std::string caFile, foundation::SecretString authorizationHeader,
-    std::string keyRegistryAddress)
+    std::string keyRegistryAddress, bool trustedLoopbackRpc)
     : m_domain(std::move(domain)), m_uri(std::move(uri)), m_chainId(optimismChainId),
       m_rpcEndpoint(std::move(optimismRpcEndpoint)), m_idRegistryAddress(std::move(idRegistryAddress)),
       m_keyRegistryAddress(std::move(keyRegistryAddress)),
+      m_trustedLoopbackRpc(trustedLoopbackRpc),
       m_derivationKey(std::move(derivationKey)), m_challengeLifetime(challengeLifetime),
       m_caFile(std::move(caFile)), m_authorizationHeader(std::move(authorizationHeader)) {}
 
@@ -1684,13 +1694,16 @@ foundation::Result<FarcasterProviderConfig> FarcasterProviderConfig::create(
     std::string optimismRpcEndpoint, std::string idRegistryAddress,
     foundation::SecretString derivationKey, foundation::Duration challengeLifetime,
     std::string caFile, foundation::SecretString authorizationHeader,
-    std::string keyRegistryAddress)
+    std::string keyRegistryAddress, bool trustedLoopbackRpc)
 {
     auto registry = normalizeAddress(idRegistryAddress);
     auto keyRegistry = keyRegistryAddress.empty()
         ? std::optional<std::string>{std::string{}}
         : normalizeAddress(keyRegistryAddress);
-    if (!validDomain(domain) || !parseHttpsUrl(uri) || !parseHttpsUrl(optimismRpcEndpoint)
+    const auto parsedRpc = parseHttpsUrl(optimismRpcEndpoint);
+    if (!validDomain(domain) || !parseHttpsUrl(uri) || !parsedRpc
+        || (trustedLoopbackRpc
+            && (parsedRpc->host != "127.0.0.1" || caFile.empty()))
         || !registry || !keyRegistry || optimismChainId != kOptimismMainnetChainId
         || derivationKey.expose().size() < 32U
         || challengeLifetime < std::chrono::seconds{30}
@@ -1701,7 +1714,7 @@ foundation::Result<FarcasterProviderConfig> FarcasterProviderConfig::create(
     return FarcasterProviderConfig{std::move(domain), std::move(uri), optimismChainId,
         std::move(optimismRpcEndpoint), std::move(*registry), std::move(derivationKey),
         challengeLifetime, std::move(caFile), std::move(authorizationHeader),
-        std::move(*keyRegistry)};
+        std::move(*keyRegistry), trustedLoopbackRpc};
 }
 
 std::string_view FarcasterProviderConfig::domain() const noexcept { return m_domain; }
@@ -1713,6 +1726,9 @@ std::string_view FarcasterProviderConfig::keyRegistryAddress() const noexcept { 
 const foundation::SecretString& FarcasterProviderConfig::derivationKey() const noexcept { return m_derivationKey; }
 foundation::Duration FarcasterProviderConfig::challengeLifetime() const noexcept { return m_challengeLifetime; }
 std::string_view FarcasterProviderConfig::caFile() const noexcept { return m_caFile; }
+bool FarcasterProviderConfig::trustedLoopbackRpc() const noexcept {
+    return m_trustedLoopbackRpc;
+}
 const foundation::SecretString& FarcasterProviderConfig::authorizationHeader() const noexcept { return m_authorizationHeader; }
 
 class FarcasterAuthenticationProvider::Implementation final {

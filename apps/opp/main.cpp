@@ -52,6 +52,8 @@
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
+#include "../../src/authentication/http/coroutine_federated_start_http.hpp"
+#include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1454,6 +1456,49 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeCatalogEnabled =
         nativeCatalogFlag && *nativeCatalogFlag == "1";
+    // Experimental native first leg of federated login; no legacy provider
+    // fallback is permitted on the async route.
+    const auto nativeFederatedStartFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START");
+    if (nativeFederatedStartFlag && *nativeFederatedStartFlag != "0"
+        && *nativeFederatedStartFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeFederatedStartEnabled =
+        nativeFederatedStartFlag && *nativeFederatedStartFlag == "1";
+    // The callback has a separate experimental gate: enabling only the
+    // first leg must not change compatibility callbacks or SAML/OAuth1.
+    const auto nativeFederatedCallbackFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK");
+    if (nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag != "0"
+        && *nativeFederatedCallbackFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeFederatedCallbackEnabled =
+        nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag == "1";
+    // Both HTTP legs must use the SAME native transaction repository.
+    // A native start followed by a legacy callback cannot redeem the
+    // persisted challenge, while a native callback cannot consume a
+    // transaction created by the legacy synchronous store. Refuse a
+    // split-brain deployment before the listener and any migrations start.
+    if (nativeFederatedStartEnabled != nativeFederatedCallbackEnabled) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native federated start and callback must be enabled together."});
+        return ExitCode::ConfigurationError;
+    }
+    if (nativeFederatedStartEnabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native federated start requires enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     if (nativeCatalogEnabled && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,
@@ -1506,7 +1551,7 @@ addProtectedRoutes(gateway::Router& router,
     // another copy of that key for a disabled feature.
     std::optional<fnd::SecretString> nativeSessionSecret;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled)
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
@@ -2107,7 +2152,29 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
     }
-    if (const auto farcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
+    // Explicitly opt in to a TLS-verified *literal loopback* Farcaster RPC.
+    // Default provider traffic still rejects loopback, private IPs, and DNS
+    // rebinding. Never infer permission from a URL or a CA file alone.
+    const auto farcasterLoopbackFlag =
+        environment.get("OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC");
+    if (farcasterLoopbackFlag && *farcasterLoopbackFlag != "0"
+        && *farcasterLoopbackFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool trustedFarcasterLoopback =
+        farcasterLoopbackFlag && *farcasterLoopbackFlag == "1";
+    const auto configuredFarcasterRpc = environment.get("OPENPROOF_FARCASTER_RPC_ENDPOINT");
+    if (trustedFarcasterLoopback
+        && (!configuredFarcasterRpc || configuredFarcasterRpc->empty())) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Trusted Farcaster loopback RPC requires an explicit endpoint."});
+        return ExitCode::ConfigurationError;
+    }
+    if (const auto farcasterRpc = configuredFarcasterRpc;
         farcasterRpc && !farcasterRpc->empty()) {
         constexpr std::string_view canonicalIdRegistry{
             "0x00000000fc6c5f01fc30151999387bb99a9f489b"};
@@ -2135,7 +2202,7 @@ addProtectedRoutes(gateway::Router& router,
             *web3Domain, *web3Uri, chainId.value(), *farcasterRpc, registry,
             std::move(derivationKey).value(), std::chrono::minutes{5}, web3CaFile,
             fnd::SecretString{environment.get("OPENPROOF_FARCASTER_RPC_AUTHORIZATION").value_or(std::string{})},
-            keyRegistry);
+            keyRegistry, trustedFarcasterLoopback);
         if (!farcasterConfig) {
             reportStartupFailure(farcasterConfig.error());
             return ExitCode::ConfigurationError;
@@ -2274,7 +2341,7 @@ addProtectedRoutes(gateway::Router& router,
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled) {
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2293,7 +2360,7 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
-        if (nativeLdapEnabled || nativeWeb3Enabled) {
+        if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {
             nativeTransactions = std::make_unique<
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
@@ -2422,6 +2489,8 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
+        std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
+        std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2510,6 +2579,31 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeHandler, boost::json::serialize(catalog));
             nativeHandler = asyncCatalog.get();
             nativePaths.emplace_back("/auth/providers");
+        }
+        if (nativeFederatedStartEnabled) {
+            if (!nativeAuthentication) {
+                reportStartupFailure(fnd::Error{
+                    fnd::ErrorCode::FailedPrecondition,
+                    "Native federated start requires a native authentication stack."});
+                return ExitCode::ConfigurationError;
+            }
+            asyncFederated = std::make_unique<authHttp::CoroutineFederatedStartAdapter>(
+                *nativeAuthentication, providers, limiter.value(), *nativeHandler);
+            nativeHandler = asyncFederated.get();
+            nativePaths.emplace_back("/auth/federated/start");
+        }
+        if (nativeFederatedCallbackEnabled) {
+            if (!nativeAuthentication || !nativeSessions) {
+                reportStartupFailure(fnd::Error{
+                    fnd::ErrorCode::FailedPrecondition,
+                    "Native federated callback requires native canonical and session services."});
+                return ExitCode::ConfigurationError;
+            }
+            asyncFederatedCallback = std::make_unique<
+                authHttp::CoroutineFederatedCallbackAdapter>(
+                    *nativeAuthentication, *nativeSessions, *nativeHandler);
+            nativeHandler = asyncFederatedCallback.get();
+            nativePaths.emplace_back("/auth/federated/callback");
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths)};

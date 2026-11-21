@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/use_future.hpp>
+// GCC 16 module imports and Boost.Asio headers must share the same
+// global-fragment declarations. The narrow header mix previously emitted
+// duplicate internal-linkage execution CPOs (prefer/query/require).
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 #include <boost/json.hpp>
 
 #include <chrono>
@@ -304,7 +306,7 @@ TEST(AccountCoroutineSessionHttpTest, RevokeRejectsLookalikeJsonMimeTypes)
 {
     Fixture f;
     constexpr std::string_view body{R"({"session_id":"other"})"};
-    for (const std::string& type : {
+    for (const char* type : {
             "application/json-invalid", "application/jsonp",
             "application/json, application/json", "text/plain"}) {
         const auto response = f.run(request(
@@ -324,7 +326,7 @@ TEST(AccountCoroutineSessionHttpTest, RevokeRejectsLookalikeJsonMimeTypes)
 TEST(AccountCoroutineSessionHttpTest, RevokeRejectsCurrentAndMalformedRequests)
 {
     Fixture f;
-    for (const std::string& body : {
+    for (const char* body : {
         R"({"session_id":"current"})",
         R"({"session_id":"other","unrecognized":true})",
         R"({"session_id":""})"}) {

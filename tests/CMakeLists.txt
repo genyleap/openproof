@@ -524,8 +524,13 @@ gtest_discover_tests(openproof_postgres_async_benchmark_tests
 
 # Isolated source-level account session coroutine HTTP regression.
 # No production listener is rewired by constructing this target.
+# The native account-session adapter uses the Boost.JSON compiled API.
+# This isolated executable does not link the legacy account HTTP library,
+# which already owns another Boost.JSON implementation. Provide exactly one
+# implementation translation unit here, as in the isolated Gateway suites.
 add_executable(openproof_account_coroutine_http_tests
-    account/session_coroutine_http_test.cpp)
+    account/session_coroutine_http_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/account/http/boost_json.cpp)
 target_compile_features(openproof_account_coroutine_http_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_account_coroutine_http_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/src/account/http"
@@ -536,8 +541,13 @@ target_link_libraries(openproof_account_coroutine_http_tests PRIVATE
     openproof_account_async_http GTest::gtest_main
     openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 16.2 at -O0 emits the same anonymous-namespace Boost.Asio
+    # execution CPO objects (prefer/query/require) several times in this
+    # module-importing test translation unit and the assembler rejects the
+    # duplicate symbols. Keep -Werror and -fno-inline; use modest optimization
+    # so the frontend coalesces those CPOs while keeping memory use bounded.
     set_source_files_properties(account/session_coroutine_http_test.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_account_coroutine_http_tests PRIVATE
@@ -602,8 +612,12 @@ target_link_libraries(openproof_enterprise_coroutine_http_tests PRIVATE
     openproof_foundation openproof_security
     Boost::headers GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 16.2's -O0 module/Boost.Asio combination emits duplicate
+    # anonymous-namespace execution CPOs (prefer/require/query) and fails
+    # at assembly time. The account-session coroutine test uses the same
+    # targeted -O1 workaround. Preserve -Werror and -fno-inline.
     set_source_files_properties(authentication/enterprise_coroutine_http_test.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O0;-g0")
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_enterprise_coroutine_http_tests PRIVATE
@@ -627,7 +641,8 @@ target_include_directories(openproof_authentication_coroutine_tests BEFORE PRIVA
 target_compile_definitions(openproof_authentication_coroutine_tests PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_authentication_coroutine_tests PRIVATE
-    openproof_authentication openproof_identity_provider
+    openproof_authentication openproof_authentication_async_federated_start_http
+    openproof_gateway_http openproof_gateway openproof_identity_provider
     openproof_identity_core openproof_identity_profile
     openproof_foundation openproof_security
     Boost::headers GTest::gtest_main openproof_test_compile_options)

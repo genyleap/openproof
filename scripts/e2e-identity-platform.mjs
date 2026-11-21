@@ -497,6 +497,11 @@ async function main() {
     OPENPROOF_WEB3_URI: `${issuer}/auth/farcaster`,
     OPENPROOF_WEB3_CA_FILE: tlsCertificate,
     OPENPROOF_FARCASTER_RPC_ENDPOINT: `https://127.0.0.1:${farcasterRpcPort}/`,
+    // The shared HTTPS transport blocks private/loopback RPCs by default.
+    // Explicitly authorize only this disposable, locally generated TLS RPC
+    // fixture; FarcasterProviderConfig rejects nonliteral/private DNS hosts
+    // and missing pinned CA certificates when this option is enabled.
+    OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC: "1",
     OPENPROOF_FARCASTER_CHAIN_ID: "10",
     OPENPROOF_FARCASTER_ID_REGISTRY: farcasterIdRegistry,
     OPENPROOF_FARCASTER_KEY_REGISTRY: farcasterKeyRegistry,

@@ -165,12 +165,26 @@ TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
     ASSERT_EQ(PQresultStatus(seeded.get()), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(seeded.get(), 0, 0), "0");
 
+    // Only the three archived tenant-provisioning files are forbidden.
+    // A legitimate provider-neutral schema migration also starts with 0020:
+    // 0020_active_session_recency.sql. A numeric prefix is not a tenant ID.
     std::unique_ptr<PGresult, ResultDeleter> recorded{PQexec(direct.get(),
         "SELECT count(*) FROM openproof.schema_migrations "
-        "WHERE version LIKE '0020_%' OR version LIKE '0021_%' OR version LIKE '0022_%'")};
+        "WHERE version IN ('0020_genycaster_native_client.sql',"
+        "'0021_genycaster_production_environment.sql',"
+        "'0022_tegra_cms_browser_client.sql')")};
     ASSERT_NE(recorded.get(), nullptr);
     ASSERT_EQ(PQresultStatus(recorded.get()), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(recorded.get(), 0, 0), "0");
+
+    // Check the positive invariant as well: tenant-neutral migrations still
+    // apply on fresh installs and must not be hidden by this regression.
+    std::unique_ptr<PGresult, ResultDeleter> current{PQexec(direct.get(),
+        "SELECT count(*) FROM openproof.schema_migrations "
+        "WHERE version='0020_active_session_recency.sql'")};
+    ASSERT_NE(current.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(current.get()), PGRES_TUPLES_OK);
+    EXPECT_STREQ(PQgetvalue(current.get(), 0, 0), "1");
 
     auto repeated = migrator.applyDirectory(
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");

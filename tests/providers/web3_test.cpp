@@ -117,6 +117,43 @@ public:
     return found == challenge.parameters().end() ? std::string{} : found->second;
 }
 
+
+TEST(FarcasterProviderTest, TrustedLoopbackRpcNeedsExplicitOptInAndPinnedCa)
+{
+    const auto create = [](std::string endpoint, std::string caFile, bool enabled) {
+        return web3::FarcasterProviderConfig::create(
+            "login.openproof.test", "https://login.openproof.test/auth/farcaster",
+            10U, std::move(endpoint),
+            "0x00000000fc6c5f01fc30151999387bb99a9f489b",
+            fnd::SecretString{std::string(48U, 'f')},
+            std::chrono::minutes{5}, std::move(caFile), {},
+            "0x00000000fc1237824fb747abde0ff18990e59b7e", enabled);
+    };
+
+    auto defaultDenied = create("https://127.0.0.1:18443/", "/tmp/fixture-ca.pem", false);
+    ASSERT_TRUE(defaultDenied);
+    EXPECT_FALSE(defaultDenied->trustedLoopbackRpc());
+
+    auto explicitlyTrusted = create("https://127.0.0.1:18443/", "/tmp/fixture-ca.pem", true);
+    ASSERT_TRUE(explicitlyTrusted);
+    EXPECT_TRUE(explicitlyTrusted->trustedLoopbackRpc());
+
+    // Pinned loopback permission is not a generic private/DNS allowance.
+    for (const auto endpoint : {
+            "https://localhost:18443/",
+            "https://127.0.0.1.attacker.invalid:18443/",
+            "https://10.0.0.5:18443/",
+            "https://192.168.1.7:18443/",
+            "https://optimism-rpc.openproof.test/"}) {
+        auto refused = create(endpoint, "/tmp/fixture-ca.pem", true);
+        EXPECT_FALSE(refused) << endpoint;
+        if (!refused) { EXPECT_EQ(refused.error().code(), fnd::ErrorCode::InvalidArgument); }
+    }
+    auto noCa = create("https://127.0.0.1:18443/", "", true);
+    EXPECT_FALSE(noCa);
+    if (!noCa) { EXPECT_EQ(noCa.error().code(), fnd::ErrorCode::InvalidArgument); }
+}
+
 TEST(WalletProviderTest, ChallengeUsesRequestedEvmChainWithoutRpcDependency)
 {
     fnd::ManualClockSource clock{kNow};

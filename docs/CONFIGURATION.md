@@ -711,6 +711,42 @@ standalone `*`. Omitting this setting retains historical convergence behavior
 for backwards compatibility. Deployments with stricter linking requirements
 should use `*` until providers' email verification guarantees are reviewed.
 
+### Experimental native federated login start (coroutine branch only)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` opts in a native
+`GET /auth/federated/start` adapter backed by the registered coroutine
+provider, native authentication transaction repository, and native canonical
+identity finalizer. The adapter uses `co_await AuthenticationService::beginAsync`
+and produces the same browser redirect and bound continuation cookies as the
+legacy start route. It fails closed for a provider lacking native capability;
+it never executes the synchronous provider SPI on the HTTP reactor.
+
+**Default: both disabled.** `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1`
+and `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1` **must be enabled
+together**. A single enabled leg is rejected during startup: otherwise
+native Start would persist a challenge in the native SQL transaction store
+and the legacy Callback would attempt to redeem it from a different store.
+The callback supports OAuth2 **GET** and uses `completeAsync`, validates
+server-bound transaction/binding cookies, clears browser callback state and
+uses PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic session
+replacement. Raw OAuth query credentials are scrubbed before asynchronous
+suspension. Both flags accept only `0` or `1`.
+
+**Scope limitation:** This callback supports OAuth2 authorization-code GET
+responses only. It explicitly does **not** enable SAML/POST, OAuth1 callbacks,
+provider connection ceremonies, or a native login for providers without
+`CoroutineAuthenticationProvider`. These remain on the compatibility path
+when both flags are off; when they are on, unsupported callbacks fail closed
+instead of silently executing a blocking provider on the native route.
+For mixed provider deployments, do not enable the native callback until
+every required browser flow is migrated or separately routed.
+
+Do not enable either experimental flag in production until external provider,
+PostgreSQL and browser-session E2E, full C++26 build, security acceptance and
+performance comparison are complete. A green focused test is not an approved
+end-to-end coroutine migration. These flags do not alter the deny-only
+self-provisioning or verified-email convergence policies.
+
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
 
@@ -752,6 +788,18 @@ additional CA bundle.
   signature verification. Setting `OPENPROOF_FARCASTER_CHAIN_ID` to a value
   other than `10` is rejected. The Optimism RPC endpoint is subject to the same
   strict HTTPS authority and port validation as wallet smart-account RPCs.
+  All RPC destinations are checked against SSRF protections that reject
+  loopback, private, link-local and special-use IP addresses, including
+  mixed public/private DNS results, even if TLS verification succeeds.
+  **Explicit local-node exception:** `OPENPROOF_FARCASTER_TRUSTED_LOOPBACK_RPC=1`
+  authorizes only the literal `https://127.0.0.1:<port>/...` Farcaster RPC
+  configured by the operator, and **requires** a separately configured CA
+  certificate in `OPENPROOF_WEB3_CA_FILE`. It is intended for an isolated,
+  TLS-pinned local verifier (including the disposable E2E fixture); no DNS
+  name, `localhost`, other private IP range or wallet RPC is exempted.
+  Omission or `0` preserves public-only routing; invalid flag values fail
+  startup, and opting in without an endpoint or pinned CA fails closed.
+  Never enable this exception merely to fix an upstream RPC outage.
 
 Web3 authentication is classified as a possession factor but is not promoted to
 WebAuthn-style phishing resistance.
