@@ -4432,6 +4432,22 @@ configuration must fail startup rather than mixing transaction stores.
   lacking an explicit disposable database acknowledgment; their guarded
   fixtures must never be pointed at production or force-enabled simply to
   remove a Skip. The dedicated native PostgreSQL integration CI stage passed.
+- Matched **real TCP Gateway benchmark**, CI #204 (five alternating pairs on the
+  same runner; 600 requests, 24 concurrent, 50 ms delayed upstream per run):
+  median throughput approximately **422 versus 78 req/s** (about **5.4x**);
+  p50 approximately **57 versus 306 ms**, p95 **60 versus 309 ms** and
+  p99 **62 versus 310 ms**, optimized versus pinned baseline, respectively.
+  All ten runs reported **zero request errors**. This is evidence for the
+  gateway's specific network-wait workload, *not* for all OpenProof requests,
+  production load or complete Coroutine migration.
+- The separate paired **mixed-read identity E2E** sample (600 requests,
+  concurrency 24) measured approximately **591 versus 596 req/s**
+  and p95 **45.85 versus 45.49 ms**, optimized versus baseline.
+  This shows **no validated identity-path speedup**, and a single
+  uncontrolled sample cannot establish a meaningful regression or win.
+  CPU/RSS differed as well, so performance release acceptance still needs
+  repeated matched, isolated measurements at 1/8/32/128 concurrency with
+  latency, error, resource and correctness checks.
 - The strict source-coverage gate remains **NOT_APPROVED**: **14/25**
   areas passing, **17 blocking findings** across 11 areas. In particular the
   legacy synchronous provider facades, PostgreSQL and remaining HTTP APIs
