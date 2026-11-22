@@ -137,7 +137,12 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return m_asyncFallback->nativeEnabledFor(request);
     }
     if (profileReadRoute(request)) {
-        return static_cast<bool>(m_authenticate)
+        // Legacy AccountHttpApi also accepts delegated OAuth Bearer grants.
+        // Native PostgreSQL session authentication supports first-party
+        // sessions only. Preserve delegated OAuth semantics on the bounded
+        // compatibility worker; do not misclassify Bearer as a session.
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readProfile);
     }
     return static_cast<bool>(m_authenticate)
