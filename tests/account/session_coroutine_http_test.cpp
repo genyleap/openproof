@@ -101,6 +101,15 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
         fnd::CorrelationId{"account-coroutine-test"}).value();
 }
 
+[[nodiscard]] gw::HttpRequest profileCookieRequest(
+    std::string token = "valid-token")
+{
+    return gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account/profile",
+        {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-profile-cookie-test"}).value();
+}
+
 struct Fixture final {
     explicit Fixture(bool profileEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
@@ -394,15 +403,13 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilit
     EXPECT_EQ(missing.status(), 401);
     EXPECT_EQ(missing.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.profileReadCalls, 0);
-    const auto invalid = f.run(request(
-        gw::HttpMethod::Get, "/account/profile", "invalid-token"));
+    const auto invalid = f.run(profileCookieRequest("invalid-token"));
     EXPECT_EQ(invalid.status(), 401);
     EXPECT_EQ(invalid.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.profileReadCalls, 0);
     EXPECT_EQ(f.legacy.invoked, 0);
 
-    const auto response = f.run(request(
-        gw::HttpMethod::Get, "/account/profile", "valid-token"));
+    const auto response = f.run(profileCookieRequest());
     ASSERT_EQ(response.status(), 200) << response.body();
     const auto document = json::parse(response.body()).as_object();
     EXPECT_EQ(document.at("identity_id").as_string(), "identity-current");
@@ -417,23 +424,28 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilit
     EXPECT_EQ(response.body().find("valid-token"), std::string::npos);
     EXPECT_EQ(f.profileReadCalls, 1);
     EXPECT_EQ(f.legacy.invoked, 0);
+    EXPECT_EQ(overlay.handle(profileCookieRequest()).status(), 503);
+    // Delegated OAuth Bearer credentials are not native Session tokens.
+    // They must retain the legacy authorization path, not be rejected by
+    // the profile-only native cookie adapter.
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(
+        gw::HttpMethod::Get, "/account/profile", "valid-token")));
     EXPECT_EQ(overlay.handle(request(
-        gw::HttpMethod::Get, "/account/profile", "valid-token")).status(), 503);
+        gw::HttpMethod::Get, "/account/profile", "valid-token")).status(), 299);
     // The native GET overlay must preserve PATCH/PUT compatibility instead
     // of returning a 503 for profile mutations on the same URL.
     EXPECT_EQ(overlay.handle(request(
         gw::HttpMethod::Patch, "/account/profile", "valid-token")).status(), 299);
     EXPECT_EQ(overlay.handle(request(
         gw::HttpMethod::Put, "/account/profile", "valid-token")).status(), 299);
-    EXPECT_EQ(f.legacy.invoked, 2);
+    EXPECT_EQ(f.legacy.invoked, 3);
 }
 
 TEST(AccountCoroutineSessionHttpTest, ProfileReadFailsClosedOnForeignOrMissingProfile)
 {
     Fixture f{true};
     f.profileForeign = true;
-    const auto foreign = f.run(request(
-        gw::HttpMethod::Get, "/account/profile", "valid-token"));
+    const auto foreign = f.run(profileCookieRequest());
     EXPECT_EQ(foreign.status(), 503);
     EXPECT_EQ(foreign.body().find("verified@example.invalid"), std::string::npos);
     EXPECT_EQ(foreign.body().find("identity-foreign"), std::string::npos);
@@ -442,8 +454,7 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadFailsClosedOnForeignOrMissingPr
     EXPECT_EQ(f.legacy.invoked, 0);
     f.profileForeign = false;
     f.profileMissing = true;
-    const auto missing = f.run(request(
-        gw::HttpMethod::Get, "/account/profile", "valid-token"));
+    const auto missing = f.run(profileCookieRequest());
     EXPECT_EQ(missing.status(), 404);
     EXPECT_EQ(missing.body().find("verified@example.invalid"), std::string::npos);
     EXPECT_EQ(f.profileReadCalls, 2);
