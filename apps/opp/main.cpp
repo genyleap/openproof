@@ -1423,6 +1423,27 @@ addProtectedRoutes(gateway::Router& router,
             "Native account profile requires enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
+    // Read-only connection enumeration is separately gated. It may share
+    // the active tenant canonical reader with profile but never enables
+    // identity creation, linking or connection mutation.
+    const auto nativeAccountConnectionsFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS");
+    if (nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag != "0"
+        && *nativeAccountConnectionsFlag != "1") {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountConnectionsEnabled =
+        nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "1";
+    if (nativeAccountConnectionsEnabled
+        && (!nativeAccountEnabled || !platform.account().enabled())) {
+        reportStartupFailure(fnd::Error{
+            fnd::ErrorCode::FailedPrecondition,
+            "Native account connections require enabled account sessions and account API."});
+        return ExitCode::ConfigurationError;
+    }
     // Wallet/Farcaster already expose native verification coroutines, but
     // their synchronous browser-handoff APIs are not yet migrated. Select
     // only the direct native start/complete pair with a separate opt-in.
@@ -2382,7 +2403,7 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
-            || nativeAccountProfileEnabled) {
+            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2555,6 +2576,19 @@ addProtectedRoutes(gateway::Router& router,
                     return reader->readProfileAsync(std::move(owner));
                 };
             }
+            accountHttp::CoroutineAccountSessionAdapter::ReadConnections connectionsReader;
+            if (nativeAccountConnectionsEnabled) {
+                if (!nativeCanonical) {
+                    reportStartupFailure(fnd::Error{
+                        fnd::ErrorCode::FailedPrecondition,
+                        "Native account connections require a canonical reader."});
+                    return ExitCode::ConfigurationError;
+                }
+                auto* reader = nativeCanonical.get();
+                connectionsReader = [reader](identity::IdentityId owner) {
+                    return reader->readConnectionsAsync(std::move(owner));
+                };
+            }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
                 healthApi, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
@@ -2565,7 +2599,7 @@ addProtectedRoutes(gateway::Router& router,
                 },
                 [service](identity::IdentityId owner, session::SessionId target) {
                     return service->revokeOwned(std::move(owner), std::move(target));
-                }, std::move(profileReader));
+                }, std::move(profileReader), std::move(connectionsReader));
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
@@ -2647,6 +2681,9 @@ addProtectedRoutes(gateway::Router& router,
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
         if (nativeAccountProfileEnabled) {
             nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
+        }
+        if (nativeAccountConnectionsEnabled) {
+            nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),
