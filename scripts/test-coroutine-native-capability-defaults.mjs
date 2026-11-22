@@ -110,7 +110,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   const sessionRepo = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer = app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
   const canonicalGate = app.indexOf(
-    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled) {", sessionIssuer);
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled) {", sessionIssuer);
   const canonical = app.indexOf("nativeCanonical = std::make_unique<", canonicalGate);
   const authGate = app.indexOf(
     "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {", canonical);
@@ -126,6 +126,8 @@ test("native account-session runtime remains independent of LDAP and profile rea
   assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
+  assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
+  assert.match(app, /nativeAccountConnectionsEnabled[\s\S]*?!nativeAccountEnabled/);
   assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods\.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
 });
 
