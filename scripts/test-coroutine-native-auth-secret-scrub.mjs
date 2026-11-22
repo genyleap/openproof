@@ -101,8 +101,9 @@ test("shared parsed-string and cookie parsers do not create prevalidation copies
 
 
 test("native federated redirect rejects before SQL without exposing a Location header", () => {
-  const source = cppExecutableText(fs.readFileSync(
-    path.join(root, "src/authentication/service.cpp"), "utf8"));
+  // Retain literal characters: the lexer intentionally blanks quoted C++ strings.
+  const source = fs.readFileSync(
+    path.join(root, "src/authentication/service.cpp"), "utf8");
   const helper = block(source,
     "safeNativeAuthorizationUrl(", "[[nodiscard]] std::string digestHex(");
   for (const guard of ["url.starts_with(scheme)", "url.size() > 8192U",
