@@ -79,3 +79,21 @@ test("profile route is isolated from OAuth transaction provisioning", () => {
   assert.match(native, /if \(nativeLdapEnabled \|\| nativeWeb3Enabled \|\| nativeFederatedStartEnabled\) \{\s*nativeTransactions/);
   assert.match(main, /reader->readProfileAsync\(std::move\(owner\)\)/);
 });
+
+test("delegated Bearer profile access preserves compatibility without blocking reactor", () => {
+  assert.match(account, /!request\.header\("authorization"\)\.has_value\(\)/);
+  const gateway = read("src/gateway/http_coroutine.cpp");
+  const sync = gateway.slice(
+    gateway.indexOf("HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)"),
+    gateway.indexOf("boost::asio::awaitable<HttpResponse>\nCoroutineRouteOverlay::handleAsync("));
+  assert.match(sync, /overlays\(request\.path\(\)\) \|\| nativeEnabledFor\(request\)/);
+  assert.match(sync, /return m_compatibility->handle\(std::move\(request\)\)/);
+  const asyncMethod = gateway.slice(
+    gateway.indexOf("CoroutineRouteOverlay::handleAsync("),
+    gateway.indexOf("CoroutineMetricsAdapter::CoroutineMetricsAdapter("));
+  assert.doesNotMatch(asyncMethod, /m_compatibility->handle\(/);
+  const tests = read("tests/account/session_coroutine_http_test.cpp");
+  assert.match(tests, /profileCookieRequest\(/);
+  assert.match(tests, /Delegated OAuth Bearer credentials/);
+  assert.match(tests, /EXPECT_FALSE\(overlay\.nativeEnabledFor\(request\(/);
+});
