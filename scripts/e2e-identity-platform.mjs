@@ -860,6 +860,20 @@ async function main() {
       jsonBody(connectionsBefore).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
       [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
     );
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Exercise the opt-in read concurrently: connection-pool contention
+      // must suspend without dropping sockets or leaking another identity.
+      // Default/benchmark runs keep their existing compatibility workload.
+      const reads = await Promise.all(Array.from({ length: 8 },
+        () => edgeRequest("/account/connections", { jar: consumerJar })));
+      for (const response of reads) {
+        expectStatus(response, 200);
+        assert.deepEqual(
+          jsonBody(response).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
+          [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
+        );
+      }
+    }
     const connectionStart = await jsonRequest("/account/connections/web3/start", "POST", {
       provider: "farcaster",
       address: farcasterAddress,
