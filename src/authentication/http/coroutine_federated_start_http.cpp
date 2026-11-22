@@ -230,7 +230,13 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
         co_return denied(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
     const auto params = query(request);
-    if (!params) {
+    // Native federation is login-only. Reject ambiguous or unsupported
+    // parameters rather than silently treating a requested connection or
+    // alternative ceremony as a fresh login transaction.
+    if (!params || params->size() > 2U
+        || std::ranges::any_of(*params, [](const auto& entry) {
+            return entry.first != "provider" && entry.first != "return_to";
+        })) {
         co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
     }
     const auto provider = params->find("provider");
