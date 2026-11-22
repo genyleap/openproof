@@ -66,3 +66,29 @@ test("native connection list preserves Farcaster projection and no-store", () =>
   assert.match(tests, /"www-authenticate"\), "Bearer"/);
   assert.match(tests, /"cache-control"\), "no-store"/);
 });
+
+test("canonical PostgreSQL and repeated HTTP E2E use isolated guarded databases", () => {
+  const workflow = read(".github/workflows/ci.yml");
+  assert.match(workflow, /Native canonical connections isolated PostgreSQL regressions/);
+  assert.match(workflow, /bash scripts\/run-disposable-postgres-canonical-tests\.sh/);
+  const collect = (name, endName) => {
+    const start = workflow.indexOf("      - name: " + name);
+    const end = workflow.indexOf(endName, start);
+    assert.ok(start >= 0 && end > start, "missing scoped E2E step: " + name);
+    const section = workflow.slice(start, end);
+    const db = section.match(/OPENPROOF_E2E_POSTGRES: [^\n]*\/([a-z0-9_]+)\s*$/m)?.[1];
+    assert.ok(db && /(^|_)e2e($|_)/i.test(db), "unsafe E2E database in " + name);
+    assert.match(section, new RegExp("createdb -O openproof_ci " + db + "\\b"));
+    assert.match(section, /OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
+    assert.match(section, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"/);
+    assert.match(section, /node scripts\/e2e-identity-platform\.mjs/);
+    return db;
+  };
+  const profile = collect(
+    "Native account profile read disposable PostgreSQL E2E",
+    "      - name: Repeated native connections disposable PostgreSQL HTTP E2E");
+  const connections = collect(
+    "Repeated native connections disposable PostgreSQL HTTP E2E",
+    "      - name: Isolated OpenProof PostgreSQL E2E and mixed-read benchmark");
+  assert.notEqual(profile, connections, "repeat E2E must use a fresh empty database");
+});
