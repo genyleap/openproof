@@ -524,8 +524,8 @@ TEST(AccountCoroutineSessionHttpTest, ConnectionsReadIsCookieOnlyAndPreservesLeg
 
     const auto allowed = f.run(connectionsCookieRequest());
     ASSERT_EQ(allowed.status(), 200) << allowed.body();
-    const auto& values = json::parse(allowed.body()).as_object()
-        .at("connections").as_array();
+    const auto document = json::parse(allowed.body());
+    const auto& values = document.as_object().at("connections").as_array();
     ASSERT_EQ(values.size(), 2U);
     EXPECT_EQ(values[0].as_object().at("provider").as_string(), "local");
     EXPECT_EQ(values[1].as_object().at("fid").as_string(), "6841");
