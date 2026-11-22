@@ -346,6 +346,55 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
     }
 }
 
+asio::awaitable<foundation::Result<profile::IdentityProfile>>
+CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
+{
+    if (owner.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    }
+    // The authenticated session supplies owner; SQL independently checks
+    // both active identity and configured tenant to prevent cross-tenant
+    // profile disclosure when a caller or repository is misconfigured.
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{
+            std::string{owner.value()},
+            std::string{m_impl->organization.value()}};
+        const auto result = co_await lease.connection().query(
+            "SELECT p.display_name,p.preferred_username,p.email,p.email_verified,"
+            "p.phone_number,p.phone_number_verified,p.locale,p.picture_url,"
+            "p.avatar_source,p.created_at_ms,p.updated_at_ms "
+            "FROM openproof.identity_profiles p "
+            "JOIN openproof.identities i ON i.id=p.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE p.identity_id=$1 AND i.organization_id=$2 "
+            "AND i.status=0 AND o.state=0 LIMIT 2",
+            std::move(params), remaining(deadline));
+        if (result.rows.empty()) {
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        if (result.rows.size() != 1U || result.rows.front().size() != 11U) {
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        }
+        const auto& fields = result.rows.front();
+        auto value = profile::IdentityProfile::restore(
+            std::move(owner), text(fields, 0), text(fields, 1), text(fields, 2),
+            boolean(fields[3]), text(fields, 4), boolean(fields[5]),
+            text(fields, 6), text(fields, 7),
+            foundation::Instant{foundation::Duration{milliseconds(fields[9])}},
+            foundation::Instant{foundation::Duration{milliseconds(fields[10])}},
+            required(fields[8]));
+        if (!value) {
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        }
+        co_return value;
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native account profile lookup is unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Status>
 CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
     core::IdentityId target)
