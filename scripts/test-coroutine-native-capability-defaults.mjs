@@ -68,7 +68,7 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(gateway, /m_exactNativePaths/);
   assert.match(overlay, /m_native->nativeEnabledFor\(request\)/);
   assert.match(overlay, /m_native->handleAsync\(std::move\(request\)\)/);
-  assert.match(overlay, /if \(overlays\(request.path\(\)\)\)/);
+  assert.match(overlay, /if \(overlays\(request\)\)/);
   const syncReject=overlay.slice(
     overlay.indexOf("CoroutineRouteOverlay::handle(HttpRequest request)"),
     overlay.indexOf("CoroutineRouteOverlay::handleAsync(HttpRequest request)"));
@@ -126,7 +126,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths\.emplace_back\("\/account\/profile"\)/);
+  assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods\.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {
