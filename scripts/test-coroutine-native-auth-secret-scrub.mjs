@@ -98,3 +98,77 @@ test("shared parsed-string and cookie parsers do not create prevalidation copies
   assert.match(cookie, /return std::optional<std::string>\{std::in_place, \*found\}/);
   assert.doesNotMatch(cookie, /found = std::string\{value\}/);
 });
+
+
+test("native federated redirect rejects before SQL without exposing a Location header", () => {
+  // Retain literal characters: the lexer intentionally blanks quoted C++ strings.
+  const source = fs.readFileSync(
+    path.join(root, "src/authentication/service.cpp"), "utf8");
+  const helper = block(source,
+    "safeNativeAuthorizationUrl(", "[[nodiscard]] std::string digestHex(");
+  for (const guard of ["url.starts_with(scheme)", "url.size() > 8192U",
+                       "authority.empty()", "authority.contains('@')",
+                       "authority.contains('%')", "authority.contains('\\\\')",
+                       "byte >= 0x21U", "byte <= 0x7EU", "c != '#'"]) {
+    assert.ok(helper.includes(guard), "missing safe redirect constraint: " + guard);
+  }
+  const asyncStart = block(source,
+    "AuthenticationService::beginInternalAsync(", "AuthenticationService::completeExchange(");
+  const check = asyncStart.indexOf("safeNativeAuthorizationUrl(url->second)");
+  const persist = asyncStart.indexOf("nativeTransactions->beginAsync(");
+  assert.ok(check > 0 && persist > check,
+    "Reject an unsafe provider redirect before allocating a durable transaction");
+
+  const nativeStart = cppExecutableText(fs.readFileSync(
+    path.join(root, "src/authentication/http/coroutine_federated_start_http.cpp"), "utf8"));
+  const handler = block(nativeStart,
+    "CoroutineFederatedStartAdapter::handleAsync(", null);
+  assert.match(handler, /if \(!started\) co_return denied\(started.error\(\), request\)/);
+  assert.ok(handler.indexOf("if (!started)") <
+    handler.indexOf('gateway::HttpResponse response{'),
+    "No Location or cookies may be built after a rejected start");
+});
+
+test("both native federation HTTP legs erase raw request secrets on early denial", () => {
+  const configurations = [
+    ["src/authentication/http/coroutine_federated_start_http.cpp",
+     "SensitiveFederatedStartRequestGuard",
+     "CoroutineFederatedStartAdapter::handleAsync(",
+     "if (!m_limiter->allow("],
+    ["src/authentication/http/coroutine_federated_callback_http.cpp",
+     "SensitiveFederatedCallbackRequestGuard",
+     "CoroutineFederatedCallbackAdapter::handleAsync(",
+     "if (request.method() != gateway::HttpMethod::Get)"],
+  ];
+  for (const [file, type, method, firstRejection] of configurations) {
+    const source = cppExecutableText(fs.readFileSync(
+      path.join(root, file), "utf8"));
+    const guard = block(source, "class " + type + " final", "};");
+    for (const wipe of ["wipeTargetQuery", "wipeBody",
+                        "wipeAuthorizationHeader", "wipeCookieHeader"])
+      assert.ok(guard.includes("m_request." + wipe + "()"),
+        file + " must scrub " + wipe);
+    assert.ok(guard.includes("~" + type + "() { wipe(); }"),
+      file + " must scrub on all return paths");
+    const handler = block(source, method, null);
+    const entry = handler.indexOf(type + " wipeRequestOnExit{request}");
+    assert.ok(entry > 0 && entry < handler.indexOf(firstRejection),
+      file + " must install the wipe guard before validation");
+  }
+  const startSource = cppExecutableText(fs.readFileSync(
+    path.join(root, configurations[0][0]), "utf8"));
+  const start = block(startSource,
+    "CoroutineFederatedStartAdapter::handleAsync(", null);
+  assert.ok(start.indexOf("request.wipeTargetQuery();") <
+    start.indexOf("co_await m_authentication->beginAsync("),
+    "The raw URL query must be erased before the first native auth suspension");
+  const source = fs.readFileSync(
+    path.join(root, configurations[0][0]), "utf8");
+  const nativeHandler = block(source,
+    "CoroutineFederatedStartAdapter::handleAsync(", null);
+  assert.match(nativeHandler, /params->size\(\) > 2U/);
+  assert.match(nativeHandler, /entry\.first != "provider" && entry\.first != "return_to"/);
+  assert.ok(nativeHandler.indexOf('entry.first != "provider"') <
+    nativeHandler.indexOf("co_await m_authentication->beginAsync("),
+    "An unsupported native ceremony must fail before its transaction is persisted");
+});

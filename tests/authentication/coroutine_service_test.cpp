@@ -76,7 +76,7 @@ public:
         if (request.provider() != id()) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
         idp::AuthenticationChallenge challenge{
             idp::ChallengeId{"server-challenge"}, kNow + kLifetime};
-        challenge.setParameter("authorization_url", "https://example.test/authorize");
+        challenge.setParameter("authorization_url", authorizationUrl);
         co_return challenge;
     }
 
@@ -104,6 +104,7 @@ public:
     // Allow a single native provider instance to verify different wallet-like
     // subjects in the same process. Existing links must stay usable when the
     // operator disallows first-time identity creation.
+    std::string authorizationUrl{"https://example.test/authorize"};
     std::string externalSubject{"verified-subject"};
     bool forgedProvider{};
     int nativeBeginCalls{};
@@ -962,6 +963,66 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartRejectsInvalidQueryAndLeg
     EXPECT_EQ(fixture.synchronousProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
     EXPECT_EQ(fallback.asyncCalls, 0);
+}
+
+// The native service must reject untrusted or malformed provider redirects
+// before writing any authentication transaction (including in PostgreSQL).
+// A mere "https://" prefix is insufficient to protect the Location header.
+TEST(TrustedAuthenticationCoroutineTest, FederatedStartUnsafeRedirectDoesNotPersistTransaction)
+{
+    Fixture fixture;
+    auto service = fixture.service();
+    auto limiter = openproof::gateway::TokenBucketRateLimiter::create(
+        fixture.clock, 100.0, 100.0, 100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter adapter{
+        service, fixture.providers, limiter.value(), fallback};
+
+    // A connection or callback intent must not silently become an ordinary
+    // anonymous login and create a durable transaction.
+    for (const auto unsupported : {
+            "/auth/federated/start?provider=async-test&intent=connect",
+            "/auth/federated/start?provider=async-test&return_to=%2F&mode=link",
+            "/auth/federated/start?provider=async-test&state=caller-controlled"}) {
+        auto response = invokeFederated(adapter, makeFederatedStart(unsupported));
+        EXPECT_GE(response.status(), 400);
+        EXPECT_FALSE(response.headers().contains("location"));
+        EXPECT_EQ(fixture.transactions.size(), 0U);
+    }
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 0);
+
+    for (const std::string_view invalid : {
+            std::string_view{"https://example.test/authorize\\r\\nset-cookie: compromised=1"},
+            std::string_view{"https://trusted.test@attacker.test/authorize"},
+            std::string_view{"https://example.test/authorize#fragment"},
+            std::string_view{"https://example.test/authorize with space"},
+            std::string_view{"https://example.test/authorize\\backslash"},
+            std::string_view{"https:///missing-authority"},
+            std::string_view{"https://example.test%0d.invalid/authorize"},
+            std::string_view{"http://example.test/authorize"},
+            std::string_view{""}}) {
+        fixture.coroutineProvider->authorizationUrl = invalid;
+        auto response = invokeFederated(adapter, makeFederatedStart(
+            "/auth/federated/start?provider=async-test&return_to=%2Faccount"));
+        EXPECT_GE(response.status(), 400) << invalid;
+        EXPECT_FALSE(response.headers().contains("location"));
+        EXPECT_FALSE(response.headers().contains("authorization"));
+        EXPECT_EQ(fixture.transactions.size(), 0U)
+            << "Bad provider response must not persist a one-time transaction";
+    }
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
+    EXPECT_EQ(fallback.syncCalls, 0);
+    EXPECT_EQ(fallback.asyncCalls, 0);
+
+    fixture.coroutineProvider->authorizationUrl =
+        "https://example.test/authorize?state=valid%2B123";
+    auto good = invokeFederated(adapter, makeFederatedStart(
+        "/auth/federated/start?provider=async-test"));
+    EXPECT_EQ(good.status(), 302);
+    EXPECT_EQ(good.headers().at("location"),
+              "https://example.test/authorize?state=valid%2B123");
+    EXPECT_EQ(fixture.transactions.size(), 1U);
 }
 
 TEST(TrustedAuthenticationCoroutineTest, FederatedStartRealHttpLoopbackPreservesRedirectAndBoundState)
