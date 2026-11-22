@@ -587,6 +587,10 @@ struct ProfileReadChecks final {
     bool foreignTenantDenied{};
     bool inactiveIdentityDenied{};
     bool inactiveOrganizationDenied{};
+    bool activeConnections{};
+    bool wrongTenantConnectionsDenied{};
+    bool inactiveConnectionsDenied{};
+    bool suspendedConnectionsDenied{};
 };
 
 asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
@@ -617,6 +621,22 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
         ids::IdentityId{seed.suspendedOwner});
     checks.inactiveOrganizationDenied = !suspended
         && suspended.error().code() == fnd::ErrorCode::NotFound;
+
+    auto linked = co_await canonical.readConnectionsAsync(ids::IdentityId{seed.owner});
+    checks.activeConnections = linked
+        && linked->first.value() == seed.owner && !linked->second.empty();
+    auto wrongLinks = co_await wrongTenant.readConnectionsAsync(
+        ids::IdentityId{seed.owner});
+    checks.wrongTenantConnectionsDenied = !wrongLinks
+        && wrongLinks.error().code() == fnd::ErrorCode::NotFound;
+    auto inactiveLinks = co_await canonical.readConnectionsAsync(
+        ids::IdentityId{seed.lockedOwner});
+    checks.inactiveConnectionsDenied = !inactiveLinks
+        && inactiveLinks.error().code() == fnd::ErrorCode::NotFound;
+    auto suspendedLinks = co_await suspendedTenant.readConnectionsAsync(
+        ids::IdentityId{seed.suspendedOwner});
+    checks.suspendedConnectionsDenied = !suspendedLinks
+        && suspendedLinks.error().code() == fnd::ErrorCode::NotFound;
     co_return checks;
 }
 
@@ -815,5 +835,9 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(profileChecks.foreignTenantDenied);
     EXPECT_TRUE(profileChecks.inactiveIdentityDenied);
     EXPECT_TRUE(profileChecks.inactiveOrganizationDenied);
+    EXPECT_TRUE(profileChecks.activeConnections);
+    EXPECT_TRUE(profileChecks.wrongTenantConnectionsDenied);
+    EXPECT_TRUE(profileChecks.inactiveConnectionsDenied);
+    EXPECT_TRUE(profileChecks.suspendedConnectionsDenied);
 }
 } // namespace
