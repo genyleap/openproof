@@ -576,7 +576,8 @@ TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStric
     SelectiveCoroutineHandler native;
     httpAdapter::CoroutineRouteOverlay overlay{
         compatibility, native, {"/native-unavailable"},
-        {{"/native", gw::HttpMethod::Get}}};
+        {{"/native", gw::HttpMethod::Get},
+         {"/native-unsupported", gw::HttpMethod::Get}}};
     EXPECT_TRUE(overlay.nativeEnabledFor(gw::HttpRequest::create(
         gw::HttpMethod::Get, "/native", {}, {}, "127.0.0.1",
         fnd::CorrelationId{"method-native-get"}).value()));
@@ -591,6 +592,8 @@ TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStric
         server.boundPort(), beastHttp::verb::patch, "/native", "{}");
     const auto updatePut = sendRequest(
         server.boundPort(), beastHttp::verb::put, "/native", "{}");
+    const auto unsupported = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native-unsupported");
     const auto strict = sendRequest(
         server.boundPort(), beastHttp::verb::patch, "/native-unavailable", "{}");
 
@@ -600,10 +603,12 @@ TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStric
     EXPECT_EQ(update.body(), "fast");
     EXPECT_EQ(updatePut.result(), beastHttp::status::ok);
     EXPECT_EQ(updatePut.body(), "fast");
+    EXPECT_EQ(unsupported.result(), beastHttp::status::ok);
+    EXPECT_EQ(unsupported.body(), "fast");
     EXPECT_EQ(strict.result(), beastHttp::status::service_unavailable);
     EXPECT_EQ(native.asynchronousCalls.load(), 1);
     EXPECT_EQ(native.synchronousCalls.load(), 0);
-    EXPECT_EQ(compatibility.received.load(), 2);
+    EXPECT_EQ(compatibility.received.load(), 3);
     server.stop();
 }
 
