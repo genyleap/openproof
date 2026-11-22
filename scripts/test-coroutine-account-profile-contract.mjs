@@ -24,7 +24,15 @@ test("native profile route is explicit, read-only and disabled by default", () =
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(main, /nativeAccountProfileFlag && \*nativeAccountProfileFlag == "1"/);
   assert.match(main, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths.emplace_back\("\/account\/profile"\)/);
+  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
+  const overlay = read("src/gateway/http_coroutine.cpp");
+  assert.match(overlay, /m_methodScopedNativePaths/);
+  assert.match(overlay, /method == request\.method\(\)/);
+  const gatewayTests = read("tests/gateway/http_integration_test.cpp");
+  assert.match(gatewayTests, /MethodScopedNativeGetPreservesLegacyPatchAndStrictPaths/);
+  const accountTests = read("tests/account/session_coroutine_http_test.cpp");
+  assert.match(accountTests, /gw::HttpMethod::Patch, "\/account\/profile"/);
+  assert.match(accountTests, /gw::HttpMethod::Put, "\/account\/profile"/);
 });
 
 test("native profile reader checks active tenant and rejects duplicate or corrupt rows", () => {
