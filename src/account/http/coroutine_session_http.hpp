@@ -9,6 +9,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 import openproof.foundation;
@@ -32,13 +33,19 @@ public:
     using ReadProfile = std::function<boost::asio::awaitable<
         foundation::Result<identity::profile::IdentityProfile>>(
             identity::core::IdentityId)>;
+    // Explicit owner echo makes accidental cross-identity callback results
+    // fail closed before any external account metadata is serialized.
+    using ConnectionList = std::pair<identity::core::IdentityId,
+        std::vector<identity::core::ExternalIdentityRef>>;
+    using ReadConnections = std::function<boost::asio::awaitable<
+        foundation::Result<ConnectionList>>(identity::core::IdentityId)>;
 
     CoroutineAccountSessionAdapter(
         gateway::HttpHandler& legacyAccount,
         gateway::http::CoroutineHttpHandler& asyncFallback,
         gateway::TokenBucketRateLimiter& limiter,
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
-        ReadProfile readProfile = {});
+        ReadProfile readProfile = {}, ReadConnections readConnections = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -55,6 +62,8 @@ private:
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> profileRead(
         gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> connectionsRead(
+        gateway::HttpRequest request);
     [[nodiscard]] static gateway::HttpResponse fail(
         const foundation::Error& failure, const gateway::HttpRequest& request);
     gateway::HttpHandler* m_legacyAccount;
@@ -64,6 +73,7 @@ private:
     List m_list;
     RevokeOwned m_revokeOwned;
     ReadProfile m_readProfile;
+    ReadConnections m_readConnections;
 };
 
 } // namespace openproof::account::http
