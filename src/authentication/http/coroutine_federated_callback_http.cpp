@@ -30,6 +30,27 @@ constexpr std::string_view kReturn = "__Host-openproof-federation-return";
 constexpr std::string_view kMode = "__Host-openproof-federation-mode";
 constexpr std::string_view kSession = "__Host-openproof-session";
 
+// A callback that fails parsing, cookie validation, or rate/route checks must
+// erase raw credentials just as reliably as a callback which reaches SQL.
+// This guard is scoped to the native callback route, not delegated requests.
+class SensitiveFederatedCallbackRequestGuard final {
+public:
+    explicit SensitiveFederatedCallbackRequestGuard(gateway::HttpRequest& request)
+        : m_request(request) {}
+    SensitiveFederatedCallbackRequestGuard(const SensitiveFederatedCallbackRequestGuard&) = delete;
+    SensitiveFederatedCallbackRequestGuard& operator=(const SensitiveFederatedCallbackRequestGuard&) = delete;
+    ~SensitiveFederatedCallbackRequestGuard() { wipe(); }
+    void wipe() noexcept {
+        m_request.wipeTargetQuery();
+        m_request.wipeBody();
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
+
 [[nodiscard]] bool isCallback(const gateway::HttpRequest& request) noexcept
 {
     return request.path() == "/auth/federated/callback";
@@ -262,6 +283,7 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeCookieHeader();
         co_return unavailable();
     }
+    SensitiveFederatedCallbackRequestGuard wipeRequestOnExit{request};
 
     // The native opt-in initially supports only OAuth2 GET redirects.
     // SAML/POST, OAuth1 and account connection ceremonies remain disabled.
