@@ -102,6 +102,21 @@ jobs:
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 
+      # Run the ordinary identity-platform HTTP scenarios over real native
+      # PostgreSQL profile reads, with a separate disposable database. Keep
+      # the paired baseline workload unchanged by not enabling these flags
+      # in the default E2E and performance comparison.
+      - name: Native account profile read disposable PostgreSQL E2E
+        timeout-minutes: 20
+        env:
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_profile_ci
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_native_profile_ci
+          node scripts/e2e-identity-platform.mjs
+
       # Run the real application E2E immediately after the executable
       # links, even if another independent test binary cannot link. A
       # benchmark result is still NOT release approval without all gates.
