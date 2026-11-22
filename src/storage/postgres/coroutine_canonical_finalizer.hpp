@@ -10,6 +10,7 @@ import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.identity.profile;
 
 namespace openproof::storage::postgres {
 
@@ -47,6 +48,14 @@ public:
         foundation::Result<identity::core::IdentityId>>
     finishLoginAsync(const identity::provider::AuthenticationOutcome& outcome,
                      foundation::Instant completedAt) override;
+
+    /** Tenant-scoped, read-only native account profile lookup.
+     * Caller must authenticate the session first. Never creates a profile
+     * or identity, and refuses inactive identities/organizations.
+     */
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::profile::IdentityProfile>>
+    readProfileAsync(identity::core::IdentityId owner);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;
