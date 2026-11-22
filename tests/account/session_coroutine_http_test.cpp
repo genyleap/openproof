@@ -321,12 +321,15 @@ TEST(AccountCoroutineSessionHttpTest, SessionListExactLimitAndOverflow)
 TEST(AccountCoroutineSessionHttpTest, MissingAndInvalidBearerNeverEnumerate)
 {
     Fixture f;
-    EXPECT_EQ(f.run(request(
-        gw::HttpMethod::Get, "/account/sessions")).status(), 401);
+    const auto missing = f.run(request(
+        gw::HttpMethod::Get, "/account/sessions"));
+    EXPECT_EQ(missing.status(), 401);
+    EXPECT_EQ(missing.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.authenticationCalls, 0);
     const auto denied = f.run(request(
         gw::HttpMethod::Get, "/account/sessions", "invalid-token"));
     EXPECT_EQ(denied.status(), 401);
+    EXPECT_EQ(denied.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.listCalls, 0);
 }
 
@@ -386,10 +389,15 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilit
         request(gw::HttpMethod::Patch, "/account/profile")));
     EXPECT_FALSE(overlay.nativeEnabledFor(
         request(gw::HttpMethod::Get, "/account/other")));
-    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/profile")).status(), 401);
+    const auto missing = f.run(request(
+        gw::HttpMethod::Get, "/account/profile"));
+    EXPECT_EQ(missing.status(), 401);
+    EXPECT_EQ(missing.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.profileReadCalls, 0);
-    EXPECT_EQ(f.run(request(
-        gw::HttpMethod::Get, "/account/profile", "invalid-token")).status(), 401);
+    const auto invalid = f.run(request(
+        gw::HttpMethod::Get, "/account/profile", "invalid-token"));
+    EXPECT_EQ(invalid.status(), 401);
+    EXPECT_EQ(invalid.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.profileReadCalls, 0);
     EXPECT_EQ(f.legacy.invoked, 0);
 
