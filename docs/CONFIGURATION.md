@@ -711,6 +711,30 @@ standalone `*`. Omitting this setting retains historical convergence behavior
 for backwards compatibility. Deployments with stricter linking requirements
 should use `*` until providers' email verification guarantees are reviewed.
 
+### Experimental native account connections read (coroutine branch only)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS=1` selects only
+`GET /account/connections` for first-party authenticated session cookies.
+The default is `0` (disabled). Enabling it requires
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS=1` and the account API;
+invalid values or missing prerequisites reject startup. Profile reads have a
+**separate** opt-in and do not become native merely by enabling connections.
+
+The native implementation verifies the session before a tenant-scoped,
+read-only asynchronous PostgreSQL query; it checks active identity and
+organization lifecycle, rejects malformed rows, limits output to 256 linked
+accounts, and verifies the returned owner again before HTTP serialization.
+The response retains the established JSON `connections` array, including
+numeric Farcaster `fid` and `profile_url` fields. No identity, provider
+connection, or authentication transaction is created by the read.
+
+**Compatibility:** OAuth delegated Bearer grants for this endpoint continue
+to use the existing bounded synchronous compatibility worker; the new native
+reader cannot authenticate those grants. Non-GET connection routes remain on
+legacy compatibility handlers. Do not enable the feature in production until
+GCC16/CTest and disposable PostgreSQL HTTP E2E have passed, followed by the
+usual global Coroutine migration release gate.
+
 ### Experimental native federated login start (coroutine branch only)
 
 `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` opts in a native
