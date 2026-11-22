@@ -567,6 +567,46 @@ TEST(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnread
     server.stop();
 }
 
+// Migrating a read-only route must not hijack the same path's PATCH/PUT
+// compatibility handlers. Security-critical strict-path overlays still
+// refuse ALL methods rather than silently falling back to blocking auth.
+TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStrictPaths)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native;
+    httpAdapter::CoroutineRouteOverlay overlay{
+        compatibility, native, {"/native-unavailable"},
+        {{"/native", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/native", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"method-native-get"}).value()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(gw::HttpRequest::create(
+        gw::HttpMethod::Patch, "/native", {}, {}, "127.0.0.1",
+        fnd::CorrelationId{"method-compat-patch"}).value()));
+    httpAdapter::BeastHttpServer server{overlay, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto read = sendRequest(
+        server.boundPort(), beastHttp::verb::get, "/native");
+    const auto update = sendRequest(
+        server.boundPort(), beastHttp::verb::patch, "/native", "{}");
+    const auto updatePut = sendRequest(
+        server.boundPort(), beastHttp::verb::put, "/native", "{}");
+    const auto strict = sendRequest(
+        server.boundPort(), beastHttp::verb::patch, "/native-unavailable", "{}");
+
+    EXPECT_EQ(read.result(), beastHttp::status::ok);
+    EXPECT_EQ(read.body(), "native");
+    EXPECT_EQ(update.result(), beastHttp::status::ok);
+    EXPECT_EQ(update.body(), "fast");
+    EXPECT_EQ(updatePut.result(), beastHttp::status::ok);
+    EXPECT_EQ(updatePut.body(), "fast");
+    EXPECT_EQ(strict.result(), beastHttp::status::service_unavailable);
+    EXPECT_EQ(native.asynchronousCalls.load(), 1);
+    EXPECT_EQ(native.synchronousCalls.load(), 0);
+    EXPECT_EQ(compatibility.received.load(), 2);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler)
 {
     CountingFastHandler compatibility;
