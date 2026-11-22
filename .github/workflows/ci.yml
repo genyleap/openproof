@@ -110,6 +110,15 @@ jobs:
           cmake --build --preset gcc-release --target openproof_account_coroutine_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
 
+      # A dedicated Unix-socket PostgreSQL instance, created and destroyed
+      # by the checked-in guard script, validates the new connection SQL
+      # against real tenant/lifecycle fixture rows before HTTP E2E.
+      - name: Native canonical connections isolated PostgreSQL regressions
+        timeout-minutes: 20
+        run: |
+          cmake --build --preset gcc-release --target openproof_postgres_async_canonical_tests --parallel 2
+          bash scripts/run-disposable-postgres-canonical-tests.sh
+
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 
@@ -127,6 +136,21 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_profile_e2e_ci
+          node scripts/e2e-identity-platform.mjs
+
+      # Repeat the native HTTP workload on a DIFFERENT empty, disposable
+      # database. A single green run does not establish stability after the
+      # previously observed 502 on the connections read.
+      - name: Repeated native connections disposable PostgreSQL HTTP E2E
+        timeout-minutes: 20
+        env:
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_connections_e2e_ci
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
           node scripts/e2e-identity-platform.mjs
 
       # Run the real application E2E immediately after the executable
