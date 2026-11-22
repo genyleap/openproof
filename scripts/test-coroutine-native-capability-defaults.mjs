@@ -68,7 +68,7 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(gateway, /m_exactNativePaths/);
   assert.match(overlay, /m_native->nativeEnabledFor\(request\)/);
   assert.match(overlay, /m_native->handleAsync\(std::move\(request\)\)/);
-  assert.match(overlay, /if \(overlays\(request\)\)/);
+  assert.match(overlay, /if \(!overlays\(request\)\) return false;/);
   const syncReject=overlay.slice(
     overlay.indexOf("CoroutineRouteOverlay::handle(HttpRequest request)"),
     overlay.indexOf("CoroutineRouteOverlay::handleAsync(HttpRequest request)"));
