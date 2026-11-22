@@ -97,3 +97,21 @@ test("delegated Bearer profile access preserves compatibility without blocking r
   assert.match(tests, /Delegated OAuth Bearer credentials/);
   assert.match(tests, /EXPECT_FALSE\(overlay\.nativeEnabledFor\(request\(/);
 });
+
+test("native profile HTTP E2E keeps a separate guard-approved disposable database", () => {
+  const ci = read(".github/workflows/ci.yml");
+  const start = ci.indexOf("      - name: Native account profile read disposable PostgreSQL E2E");
+  const end = ci.indexOf("      - name: Isolated OpenProof PostgreSQL E2E", start);
+  assert.ok(start >= 0 && end > start, "missing isolated profile E2E step");
+  const step = ci.slice(start, end);
+  const configured = step.match(/OPENPROOF_E2E_POSTGRES: [^\n]*\/([a-z0-9_]+)\s*$/m);
+  assert.ok(configured, "missing explicit dedicated profile test database");
+  const database = configured[1];
+  assert.match(database, /(^|_)e2e($|_)/i,
+    "E2E runner requires a standalone e2e database-name segment");
+  assert.match(step, new RegExp("createdb -O openproof_ci " + database + "\\b"),
+    "created disposable database must match the E2E connection URI");
+  assert.match(step, /OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
+  assert.match(step, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"/);
+  assert.match(step, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"/);
+});
