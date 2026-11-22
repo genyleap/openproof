@@ -1,7 +1,8 @@
 #pragma once
 
-// Provider-neutral, opt-in coroutine HTTP entry for account session management.
-// Keep the existing AccountHttpApi and every non-session account route intact.
+// Provider-neutral, opt-in coroutine HTTP entry for account session and
+// read-only profile management. Keep the existing AccountHttpApi and all
+// mutation routes intact.
 // Native callbacks can be bound to any real asynchronous session repository:
 // this contract never imports PostgreSQL, a vendor, or an operator product.
 #include <boost/asio/awaitable.hpp>
@@ -14,6 +15,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
+import openproof.identity.profile;
 import openproof.session;
 
 namespace openproof::account::http {
@@ -27,12 +29,16 @@ public:
             identity::core::IdentityId)>;
     using RevokeOwned = std::function<boost::asio::awaitable<foundation::Status>(
         identity::core::IdentityId, session::SessionId)>;
+    using ReadProfile = std::function<boost::asio::awaitable<
+        foundation::Result<identity::profile::IdentityProfile>>(
+            identity::core::IdentityId)>;
 
     CoroutineAccountSessionAdapter(
         gateway::HttpHandler& legacyAccount,
         gateway::http::CoroutineHttpHandler& asyncFallback,
         gateway::TokenBucketRateLimiter& limiter,
-        Authenticate authenticate, List list, RevokeOwned revokeOwned);
+        Authenticate authenticate, List list, RevokeOwned revokeOwned,
+        ReadProfile readProfile = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -47,6 +53,8 @@ private:
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionRevoke(
         gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> profileRead(
+        gateway::HttpRequest request);
     [[nodiscard]] static gateway::HttpResponse fail(
         const foundation::Error& failure, const gateway::HttpRequest& request);
     gateway::HttpHandler* m_legacyAccount;
@@ -55,6 +63,7 @@ private:
     Authenticate m_authenticate;
     List m_list;
     RevokeOwned m_revokeOwned;
+    ReadProfile m_readProfile;
 };
 
 } // namespace openproof::account::http
