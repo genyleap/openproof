@@ -47,6 +47,8 @@ jobs:
           npm audit --audit-level=moderate
           npm run check
           npm test
+      - name: Native account profile tenant and capability contract
+        run: node scripts/test-coroutine-account-profile-contract.mjs
       - name: Whitespace
         run: git diff --check
       - name: End-to-end coroutine coverage gate
