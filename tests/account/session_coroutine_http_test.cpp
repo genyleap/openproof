@@ -379,7 +379,7 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilit
 {
     Fixture f{true};
     gw::http::CoroutineRouteOverlay overlay{
-        f.legacy, f.api, {"/account/profile"}};
+        f.legacy, f.api, {}, {{"/account/profile", gw::HttpMethod::Get}}};
     EXPECT_TRUE(overlay.nativeEnabledFor(
         request(gw::HttpMethod::Get, "/account/profile")));
     EXPECT_FALSE(overlay.nativeEnabledFor(
@@ -411,6 +411,13 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilit
     EXPECT_EQ(f.legacy.invoked, 0);
     EXPECT_EQ(overlay.handle(request(
         gw::HttpMethod::Get, "/account/profile", "valid-token")).status(), 503);
+    // The native GET overlay must preserve PATCH/PUT compatibility instead
+    // of returning a 503 for profile mutations on the same URL.
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Patch, "/account/profile", "valid-token")).status(), 299);
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Put, "/account/profile", "valid-token")).status(), 299);
+    EXPECT_EQ(f.legacy.invoked, 2);
 }
 
 TEST(AccountCoroutineSessionHttpTest, ProfileReadFailsClosedOnForeignOrMissingProfile)
