@@ -92,3 +92,15 @@ test("canonical PostgreSQL and repeated HTTP E2E use isolated guarded databases"
     "      - name: Isolated OpenProof PostgreSQL E2E and mixed-read benchmark");
   assert.notEqual(profile, connections, "repeat E2E must use a fresh empty database");
 });
+
+test("native HTTP E2E exercises concurrent reads with no extra identity creation", () => {
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"/);
+  assert.match(e2e, /Promise\.all\(Array\.from\(\{ length: 8 \}/);
+  assert.match(e2e, /edgeRequest\("\/account\/connections", \{ jar: consumerJar \}\)/);
+  assert.match(e2e, /jsonBody\(response\)\.connections\.map/);
+  assert.doesNotMatch(
+    e2e.slice(e2e.indexOf("const reads = await Promise.all"),
+      e2e.indexOf("const connectionStart = await jsonRequest")),
+    /\/account\/signup|\/account\/connections\/web3\/complete/);
+});
