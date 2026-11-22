@@ -4460,3 +4460,38 @@ route and provider without relaxing the scanner, the SSRF/PKI policy,
 single-use authentication transactions or tenant boundaries. Run real
 disposable-PostgreSQL identity/callback E2E, all compilation/test profiles and
 matched baseline benchmarks before moving the development branch to `main`.
+
+
+### Native federated redirect and request-secret hardening (2026-11-22)
+
+**Development integration complete; release NOT APPROVED.** PR #55
+was merged into the Coroutine development branch as
+`ba012bca96910e8a99ecc30df846d8e5924e30f5`. No changes were made to
+`main` or production. Experimental native federation remains default-off,
+with both native start/callback switches required together.
+
+- Native Redirect provider authorization URLs are syntactically validated
+  before the authentication service allocates or persists a one-time
+  transaction. A malformed URL, unsafe authority or raw header-control
+  sequence fails closed without creating an orphaned transaction or emitting
+  a Location header. This supplements, and does **not** replace, trusted
+  provider configuration and HTTPS/PKI/SSRF controls.
+- The native start endpoint explicitly accepts only `provider` and optional
+  `return_to`. Unsupported `intent=connect`, `mode=link` or arbitrary
+  `state` cannot silently become a login ceremony. The native start and
+  callback handlers erase raw credential and request-query bytes on error
+  paths, before coroutine suspension and on completion.
+- CI #212 (`45010024925`) passed GCC 16.2 `opp` and full C++26
+  **Build**, full **CTest**, disposable PostgreSQL/Farcaster compatibility
+  E2E, and native Gateway/TCP integration on the PR head. Dedicated native
+  Account/Enterprise/Trusted Authentication tests passed **31/31** locally;
+  eight federation/concurrency tests repeated 30 times passed **240/240**;
+  JavaScript source-contract tests passed **13/13**.
+- This adds no new identity provisioning or schema dependencies. A real
+  provider + native callback + PostgreSQL cross-service E2E remains a separate
+  required release acceptance test. Baseline benchmarks and packaging have
+  independent acceptance; do not interpret passing focused tests as approval
+  for production migration.
+- The strict coroutine static gate remains **NOT_APPROVED** with **17
+  findings** and **14/25 areas passing**. The synchronous legacy PostgreSQL,
+  provider and HTTP facades still need separate, real nonblocking retirement.
