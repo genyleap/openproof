@@ -29,6 +29,27 @@ constexpr std::string_view kChallengeCookie = "__Host-openproof-federation-chall
 constexpr std::string_view kReturnCookie = "__Host-openproof-federation-return";
 constexpr std::string_view kModeCookie = "__Host-openproof-federation-mode";
 
+// Cover early rate-limit, parser and provider failures as well as successful
+// redirects. Request-owned bearer/cookie/query bytes must not be left in an
+// ordinary string allocation after a native HTTP coroutine returns.
+class SensitiveFederatedStartRequestGuard final {
+public:
+    explicit SensitiveFederatedStartRequestGuard(gateway::HttpRequest& request)
+        : m_request(request) {}
+    SensitiveFederatedStartRequestGuard(const SensitiveFederatedStartRequestGuard&) = delete;
+    SensitiveFederatedStartRequestGuard& operator=(const SensitiveFederatedStartRequestGuard&) = delete;
+    ~SensitiveFederatedStartRequestGuard() { wipe(); }
+    void wipe() noexcept {
+        m_request.wipeTargetQuery();
+        m_request.wipeBody();
+        m_request.wipeAuthorizationHeader();
+        m_request.wipeCookieHeader();
+    }
+private:
+    gateway::HttpRequest& m_request;
+};
+
+
 [[nodiscard]] bool isStart(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
@@ -202,6 +223,7 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeCookieHeader();
         co_return unavailable();
     }
+    SensitiveFederatedStartRequestGuard wipeRequestOnExit{request};
 
     if (!m_limiter->allow(
             std::string{"federation-ip:"} + std::string{request.remoteAddress()})) {
@@ -243,6 +265,7 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
     begin.setRequestedAssurance(idp::AssuranceLevel::Ial1);
     // Public start has no need for client-provided cookies or body. Erase
     // them before the first suspension point.
+    request.wipeTargetQuery();
     request.wipeBody();
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
