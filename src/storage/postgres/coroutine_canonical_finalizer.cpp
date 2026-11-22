@@ -395,6 +395,60 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     }
 }
 
+// The active identity row anchors the LEFT JOIN, so a legitimate account
+// with no linked providers returns an empty list without confusing a missing
+// or cross-tenant identity with an empty result.
+asio::awaitable<foundation::Result<std::pair<core::IdentityId,
+    std::vector<core::ExternalIdentityRef>>>>
+CoroutinePostgresCanonicalFinalizer::readConnectionsAsync(core::IdentityId owner)
+{
+    using Output = std::pair<core::IdentityId, std::vector<core::ExternalIdentityRef>>;
+    if (owner.empty())
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{owner.value()},
+                      std::string{m_impl->organization.value()}};
+        const auto result = co_await lease.connection().query(
+            "SELECT i.id,e.provider,e.external_subject,e.display_name,"
+            "e.preferred_username,e.picture_url "
+            "FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "LEFT JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "WHERE i.id=$1 AND i.organization_id=$2 "
+            "AND i.status=0 AND o.state=0 "
+            "ORDER BY e.provider,e.external_subject LIMIT 257",
+            std::move(params), remaining(deadline));
+        if (result.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        // A bounded output prevents an unexpected SQL cardinality explosion
+        // from becoming an unbounded sensitive HTTP response.
+        if (result.rows.size() > 256U)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        std::vector<core::ExternalIdentityRef> values;
+        values.reserve(result.rows.size());
+        for (const auto& row : result.rows) {
+            if (row.size() != 6U || required(row[0]) != owner.value())
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            if (!row[1] && !row[2]) {
+                if (result.rows.size() != 1U || row[3] || row[4] || row[5])
+                    co_return foundation::fail(foundation::ErrorCode::Unavailable);
+                continue;
+            }
+            if (!row[1] || !row[2] || row[1]->empty() || row[2]->empty()
+                || row[1]->size() > 200U || row[2]->size() > 1000U)
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            values.emplace_back(idp::ProviderId{*row[1]},
+                idp::ExternalSubject{*row[2]}, row[3], row[4], row[5]);
+        }
+        co_return Output{std::move(owner), std::move(values)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native external connections lookup is unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Status>
 CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
     core::IdentityId target)
