@@ -162,4 +162,13 @@ test("both native federation HTTP legs erase raw request secrets on early denial
   assert.ok(start.indexOf("request.wipeTargetQuery();") <
     start.indexOf("co_await m_authentication->beginAsync("),
     "The raw URL query must be erased before the first native auth suspension");
+  const source = fs.readFileSync(
+    path.join(root, configurations[0][0]), "utf8");
+  const nativeHandler = block(source,
+    "CoroutineFederatedStartAdapter::handleAsync(", null);
+  assert.match(nativeHandler, /params->size\(\) > 2U/);
+  assert.match(nativeHandler, /entry\.first != "provider" && entry\.first != "return_to"/);
+  assert.ok(nativeHandler.indexOf('entry.first != "provider"') <
+    nativeHandler.indexOf("co_await m_authentication->beginAsync("),
+    "An unsupported native ceremony must fail before its transaction is persisted");
 });
