@@ -2569,9 +2569,8 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
-            if (nativeAccountProfileEnabled) {
-                nativePaths.emplace_back("/account/profile");
-            }
+            // This read-only route is method scoped below. PATCH/PUT on
+            // /account/profile must keep using the compatibility API.
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
@@ -2645,8 +2644,13 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncFederatedCallback.get();
             nativePaths.emplace_back("/auth/federated/callback");
         }
+        std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
+        if (nativeAccountProfileEnabled) {
+            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
+        }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
-            healthApi, *nativeHandler, std::move(nativePaths)};
+            healthApi, *nativeHandler, std::move(nativePaths),
+            std::move(nativeMethods)};
         return runListener(platform, nativeRoutes, logger);
     };
 
