@@ -57,6 +57,34 @@ constexpr std::string_view kAuthenticationHandoffVerifiedAtMetadata =
     "auth_handoff_verified_at";
 constexpr foundation::Duration kBrowserHandoffLifetime = std::chrono::minutes{2};
 
+// A native redirect challenge must be safe for an HTTP Location header
+// *before* allocating a one-time transaction in the durable store. A malformed
+// trusted-provider response otherwise leaves unusable transaction rows behind.
+// This is a syntax boundary, not authorization to contact the URL or bypass
+// provider-specific endpoint/SSRF verification.
+[[nodiscard]] bool safeNativeAuthorizationUrl(std::string_view url) noexcept
+{
+    constexpr std::string_view scheme{"https://"};
+    if (!url.starts_with(scheme) || url.size() > 8192U)
+        return false;
+    const auto rest = url.substr(scheme.size());
+    const auto authority = rest.substr(0U, rest.find_first_of("/?"));
+    if (authority.empty() || authority.contains('@') || authority.contains('%')
+        || authority.contains('\\') || authority.front() == '.'
+        || authority.front() == '-' || authority.back() == ':') {
+        return false;
+    }
+    // Raw whitespace, control bytes, fragments and non-ASCII are not valid
+    // Location values. An HTTPS provider may percent-encode URL parameters,
+    // but cannot smuggle CR/LF or userinfo through the authority.
+    return std::ranges::all_of(url, [](char c) {
+        const auto byte = static_cast<unsigned char>(c);
+        return byte >= 0x21U && byte <= 0x7EU
+            && c != '\\' && c != '#';
+    });
+}
+
+
 [[nodiscard]] std::string digestHex(const security::Sha256Digest& digest)
 {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -607,6 +635,16 @@ AuthenticationService::beginInternalAsync(
     if (challenge->id().empty() || challenge->isExpiredAt(now)) {
         co_return foundation::fail(authenticationFailure(
             "Provider returned an empty or already-expired challenge."));
+    }
+    if (implementation->interactionModel() == provider::InteractionModel::Redirect) {
+        const auto url = challenge->parameters().find("authorization_url");
+        if (url == challenge->parameters().end()
+            || !safeNativeAuthorizationUrl(url->second)) {
+            // Reject *before* creating and persisting a disposable transaction.
+            // An invalid provider redirect cannot set Location or orphan SQL.
+            co_return foundation::fail(authenticationFailure(
+                "Native redirect provider returned an unsafe authorization URL."));
+        }
     }
 
     foundation::Result<std::string> generatedId =
