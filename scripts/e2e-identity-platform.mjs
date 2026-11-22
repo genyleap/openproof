@@ -847,6 +847,14 @@ async function main() {
     const consumerJar = new CookieJar();
     await login("consumer@e2e.invalid", consumerPassword, consumerJar);
     const connectionsBefore = await edgeRequest("/account/connections", { jar: consumerJar });
+    if (connectionsBefore.status === 502) {
+      // Never print upstream stdout/stderr or response bodies: those may hold
+      // session cookies, OAuth codes and other secrets. A process exit/signal
+      // is sufficient to distinguish a fatal native crash from a transport
+      // or fixture timeout on this exact experimental boundary.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      fail(`native account connections upstream disconnected (opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+    }
     expectStatus(connectionsBefore, 200);
     assert.deepEqual(
       jsonBody(connectionsBefore).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
