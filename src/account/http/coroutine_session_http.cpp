@@ -165,6 +165,11 @@ gateway::HttpResponse CoroutineAccountSessionAdapter::fail(
     response.setHeader("pragma", "no-cache");
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
+    // An HTTP 401 requires a challenge. Keep native session and profile
+    // endpoints interoperable with Bearer-aware clients (including the
+    // synchronous Account API's missing-credential response).
+    if (response.status() == 401)
+        response.setHeader("www-authenticate", "Bearer");
     return response;
 }
 
