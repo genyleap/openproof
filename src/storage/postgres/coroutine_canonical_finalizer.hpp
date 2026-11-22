@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 
 import openproof.authentication;
 import openproof.foundation;
@@ -56,6 +58,15 @@ public:
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::profile::IdentityProfile>>
     readProfileAsync(identity::core::IdentityId owner);
+
+    /** Read-only, tenant-scoped external account enumeration. Returns the
+     * verified owner with bounded rows for HTTP defense in depth. No
+     * implicit creation, linking, or mutation is permitted.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<
+        std::pair<identity::core::IdentityId,
+                  std::vector<identity::core::ExternalIdentityRef>>>>
+    readConnectionsAsync(identity::core::IdentityId owner);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;
