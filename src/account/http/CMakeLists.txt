@@ -37,7 +37,7 @@ target_compile_definitions(openproof_account_async_http PRIVATE
 target_link_libraries(openproof_account_async_http
     PUBLIC openproof_gateway_http openproof_gateway
         openproof_session openproof_foundation openproof_identity_provider
-        Boost::headers
+        openproof_identity_profile Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_session_http.cpp

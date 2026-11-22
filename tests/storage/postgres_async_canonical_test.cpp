@@ -580,6 +580,46 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
     EXPECT_TRUE(cleaned);
 }
 
+
+struct ProfileReadChecks final {
+    bool activeProfile{};
+    bool wrongTenantDenied{};
+    bool foreignTenantDenied{};
+    bool inactiveIdentityDenied{};
+    bool inactiveOrganizationDenied{};
+};
+
+asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
+    pg::CoroutinePostgresCanonicalFinalizer& canonical,
+    pg::CoroutinePostgresCanonicalFinalizer& wrongTenant,
+    pg::CoroutinePostgresCanonicalFinalizer& suspendedTenant,
+    const Seed& seed)
+{
+    ProfileReadChecks checks;
+    auto allowed = co_await canonical.readProfileAsync(ids::IdentityId{seed.owner});
+    checks.activeProfile = allowed
+        && allowed->identity().value() == seed.owner
+        && allowed->displayName().has_value()
+        && *allowed->displayName() == "User-chosen name";
+    auto deniedTenant = co_await wrongTenant.readProfileAsync(
+        ids::IdentityId{seed.owner});
+    checks.wrongTenantDenied = !deniedTenant
+        && deniedTenant.error().code() == fnd::ErrorCode::NotFound;
+    auto foreign = co_await canonical.readProfileAsync(
+        ids::IdentityId{seed.foreignOwner});
+    checks.foreignTenantDenied = !foreign
+        && foreign.error().code() == fnd::ErrorCode::NotFound;
+    auto locked = co_await canonical.readProfileAsync(
+        ids::IdentityId{seed.lockedOwner});
+    checks.inactiveIdentityDenied = !locked
+        && locked.error().code() == fnd::ErrorCode::NotFound;
+    auto suspended = co_await suspendedTenant.readProfileAsync(
+        ids::IdentityId{seed.suspendedOwner});
+    checks.inactiveOrganizationDenied = !suspended
+        && suspended.error().code() == fnd::ErrorCode::NotFound;
+    co_return checks;
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
 {
     const auto dsn = disposableDsn();
@@ -752,5 +792,28 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     ASSERT_EQ(PQntuples(afterNoop.get()), 1);
     EXPECT_STREQ(PQgetvalue(afterNoop.get(), 0, 0), beforeCtid.c_str());
     EXPECT_STREQ(PQgetvalue(afterNoop.get(), 0, 1), beforeXmin.c_str());
+
+    // Seed profile data even for forbidden identity states: the SQL reader
+    // must not mistake "profile exists" for authorization to disclose it.
+    for (const auto& forbidden : {
+             seed.foreignOwner, seed.lockedOwner, seed.suspendedOwner}) {
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.identity_profiles("
+            "identity_id,display_name,created_at_ms,updated_at_ms) "
+            "VALUES($1,'Do not disclose',1770000000000,1770000000000) "
+            "ON CONFLICT(identity_id) DO UPDATE "
+            "SET display_name=EXCLUDED.display_name", {forbidden}));
+    }
+    io.restart();
+    auto profileReads = asio::co_spawn(io,
+        verifyTenantScopedProfileRead(
+            canonical, wrongTenant, suspendedTenant, seed), asio::use_future);
+    io.run();
+    const auto profileChecks = profileReads.get();
+    EXPECT_TRUE(profileChecks.activeProfile);
+    EXPECT_TRUE(profileChecks.wrongTenantDenied);
+    EXPECT_TRUE(profileChecks.foreignTenantDenied);
+    EXPECT_TRUE(profileChecks.inactiveIdentityDenied);
+    EXPECT_TRUE(profileChecks.inactiveOrganizationDenied);
 }
 } // namespace

@@ -20,6 +20,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
+import openproof.identity.profile;
 import openproof.identity.provider;
 import openproof.session;
 import openproof.security;
@@ -33,6 +34,7 @@ namespace http = openproof::account::http;
 namespace sess = openproof::session;
 namespace idp = openproof::identity::provider;
 namespace core = openproof::identity::core;
+namespace profile = openproof::identity::profile;
 namespace sec = openproof::security;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
@@ -99,8 +101,17 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
         fnd::CorrelationId{"account-coroutine-test"}).value();
 }
 
+[[nodiscard]] gw::HttpRequest profileCookieRequest(
+    std::string token = "valid-token")
+{
+    return gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account/profile",
+        {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-profile-cookie-test"}).value();
+}
+
 struct Fixture final {
-    Fixture()
+    explicit Fixture(bool profileEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -141,7 +152,30 @@ struct Fixture final {
                   lastIdentity = std::string{identity.value()};
                   lastTarget = std::string{id.value()};
                   co_return fnd::ok();
-              })
+              }, profileEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadProfile{
+                      [this](core::IdentityId owner)
+                          -> asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+                          ++profileReadCalls;
+                          if (owner.value() != "identity-current") {
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          }
+                          if (profileMissing) {
+                              co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          }
+                          const auto resultOwner = profileForeign
+                              ? core::IdentityId{"identity-foreign"} : owner;
+                          co_return profile::IdentityProfile::restore(
+                              resultOwner,
+                              std::optional<std::string>{"Visible Account"},
+                              std::optional<std::string>{"profile-user"},
+                              std::optional<std::string>{"verified@example.invalid"},
+                              true,
+                              std::nullopt, false,
+                              std::optional<std::string>{"en"},
+                              std::nullopt, kNow, kNow, "auto");
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadProfile{})
     {
     }
 
@@ -163,6 +197,9 @@ struct Fixture final {
     bool includeForeignSession{};
     std::size_t generatedSessionCount{};
     int revokeCalls{};
+    int profileReadCalls{};
+    bool profileForeign{};
+    bool profileMissing{};
     std::string lastIdentity;
     std::string lastTarget;
     http::CoroutineAccountSessionAdapter api;
@@ -293,12 +330,15 @@ TEST(AccountCoroutineSessionHttpTest, SessionListExactLimitAndOverflow)
 TEST(AccountCoroutineSessionHttpTest, MissingAndInvalidBearerNeverEnumerate)
 {
     Fixture f;
-    EXPECT_EQ(f.run(request(
-        gw::HttpMethod::Get, "/account/sessions")).status(), 401);
+    const auto missing = f.run(request(
+        gw::HttpMethod::Get, "/account/sessions"));
+    EXPECT_EQ(missing.status(), 401);
+    EXPECT_EQ(missing.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.authenticationCalls, 0);
     const auto denied = f.run(request(
         gw::HttpMethod::Get, "/account/sessions", "invalid-token"));
     EXPECT_EQ(denied.status(), 401);
+    EXPECT_EQ(denied.headers().at("www-authenticate"), "Bearer");
     EXPECT_EQ(f.listCalls, 0);
 }
 
@@ -344,6 +384,80 @@ TEST(AccountCoroutineSessionHttpTest, RevokeRejectsCurrentAndMalformedRequests)
     EXPECT_EQ(f.lastTarget, "other");
     EXPECT_EQ(f.revokeCalls, 1);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+
+TEST(AccountCoroutineSessionHttpTest, ProfileReadRequiresExplicitNativeCapabilityAndSession)
+{
+    Fixture f{true};
+    gw::http::CoroutineRouteOverlay overlay{
+        f.legacy, f.api, {}, {{"/account/profile", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Get, "/account/profile")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Patch, "/account/profile")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(
+        request(gw::HttpMethod::Get, "/account/other")));
+    const auto missing = f.run(request(
+        gw::HttpMethod::Get, "/account/profile"));
+    EXPECT_EQ(missing.status(), 401);
+    EXPECT_EQ(missing.headers().at("www-authenticate"), "Bearer");
+    EXPECT_EQ(f.profileReadCalls, 0);
+    const auto invalid = f.run(profileCookieRequest("invalid-token"));
+    EXPECT_EQ(invalid.status(), 401);
+    EXPECT_EQ(invalid.headers().at("www-authenticate"), "Bearer");
+    EXPECT_EQ(f.profileReadCalls, 0);
+    EXPECT_EQ(f.legacy.invoked, 0);
+
+    const auto response = f.run(profileCookieRequest());
+    ASSERT_EQ(response.status(), 200) << response.body();
+    const auto document = json::parse(response.body()).as_object();
+    EXPECT_EQ(document.at("identity_id").as_string(), "identity-current");
+    EXPECT_EQ(document.at("display_name").as_string(), "Visible Account");
+    EXPECT_EQ(document.at("preferred_username").as_string(), "profile-user");
+    EXPECT_EQ(document.at("email").as_string(), "verified@example.invalid");
+    EXPECT_TRUE(document.at("email_verified").as_bool());
+    EXPECT_FALSE(document.at("phone_number_verified").as_bool());
+    EXPECT_EQ(document.at("locale").as_string(), "en");
+    EXPECT_EQ(document.at("avatar_source").as_string(), "auto");
+    EXPECT_EQ(response.headers().at("cache-control"), "no-store");
+    EXPECT_EQ(response.body().find("valid-token"), std::string::npos);
+    EXPECT_EQ(f.profileReadCalls, 1);
+    EXPECT_EQ(f.legacy.invoked, 0);
+    EXPECT_EQ(overlay.handle(profileCookieRequest()).status(), 503);
+    // Delegated OAuth Bearer credentials are not native Session tokens.
+    // They must retain the legacy authorization path, not be rejected by
+    // the profile-only native cookie adapter.
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(
+        gw::HttpMethod::Get, "/account/profile", "valid-token")));
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Get, "/account/profile", "valid-token")).status(), 299);
+    // The native GET overlay must preserve PATCH/PUT compatibility instead
+    // of returning a 503 for profile mutations on the same URL.
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Patch, "/account/profile", "valid-token")).status(), 299);
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Put, "/account/profile", "valid-token")).status(), 299);
+    EXPECT_EQ(f.legacy.invoked, 3);
+}
+
+TEST(AccountCoroutineSessionHttpTest, ProfileReadFailsClosedOnForeignOrMissingProfile)
+{
+    Fixture f{true};
+    f.profileForeign = true;
+    const auto foreign = f.run(profileCookieRequest());
+    EXPECT_EQ(foreign.status(), 503);
+    EXPECT_EQ(foreign.body().find("verified@example.invalid"), std::string::npos);
+    EXPECT_EQ(foreign.body().find("identity-foreign"), std::string::npos);
+    EXPECT_EQ(foreign.headers().at("cache-control"), "no-store");
+    EXPECT_EQ(f.profileReadCalls, 1);
+    EXPECT_EQ(f.legacy.invoked, 0);
+    f.profileForeign = false;
+    f.profileMissing = true;
+    const auto missing = f.run(profileCookieRequest());
+    EXPECT_EQ(missing.status(), 404);
+    EXPECT_EQ(missing.body().find("verified@example.invalid"), std::string::npos);
+    EXPECT_EQ(f.profileReadCalls, 2);
 }
 
 } // namespace

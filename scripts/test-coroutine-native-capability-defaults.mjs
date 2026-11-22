@@ -68,7 +68,7 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(gateway, /m_exactNativePaths/);
   assert.match(overlay, /m_native->nativeEnabledFor\(request\)/);
   assert.match(overlay, /m_native->handleAsync\(std::move\(request\)\)/);
-  assert.match(overlay, /if \(overlays\(request.path\(\)\)\)/);
+  assert.match(overlay, /if \(!overlays\(request\)\) return false;/);
   const syncReject=overlay.slice(
     overlay.indexOf("CoroutineRouteOverlay::handle(HttpRequest request)"),
     overlay.indexOf("CoroutineRouteOverlay::handleAsync(HttpRequest request)"));
@@ -94,29 +94,39 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler\)/);
 });
-test("native account-session runtime can be enabled independently of native LDAP", () => {
-  const app=read("apps/opp/main.cpp");
+test("native account-session runtime remains independent of LDAP and profile reads", () => {
+  const app = read("apps/opp/main.cpp");
   assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS"\)/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag != "0"/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
   assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace/);
 
-  // The session pool/issuer must be built even when LDAP is NOT enabled.
-  const nativeIo=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
-  const setup=app.lastIndexOf("if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled", nativeIo);
-  const sessionRepo=app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
-  const sessionIssuer=app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
-  const ldapGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
-  const transactionRepo=app.indexOf("nativeTransactions = std::make_unique<", ldapGate);
-  assert.ok(setup>=0 && setup<nativeIo);
-  assert.ok(nativeIo<sessionRepo && sessionRepo<sessionIssuer && sessionIssuer<ldapGate);
-  assert.ok(ldapGate<transactionRepo);
-  assert.match(app.slice(ldapGate, app.indexOf("std::optional<passkey::PasskeyService>",ldapGate)),
-    /nativeAuthentication = std::make_unique<auth::AuthenticationService>/);
+  // Account session management must not allocate an OAuth transaction store,
+  // canonical finalizer, or another key on its own. Profile reads have a
+  // second explicit flag and can initialize only their canonical SQL reader.
+  const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
+  const setup = app.lastIndexOf(
+    "if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled", nativeIo);
+  const sessionRepo = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
+  const sessionIssuer = app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
+  const canonicalGate = app.indexOf(
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled) {", sessionIssuer);
+  const canonical = app.indexOf("nativeCanonical = std::make_unique<", canonicalGate);
+  const authGate = app.indexOf(
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {", canonical);
+  const transactions = app.indexOf("nativeTransactions = std::make_unique<", authGate);
+  const nativeAuthentication = app.indexOf(
+    "nativeAuthentication = std::make_unique<auth::AuthenticationService>", transactions);
+  assert.ok(setup >= 0 && setup < nativeIo);
+  assert.ok(nativeIo < sessionRepo && sessionRepo < sessionIssuer
+    && sessionIssuer < canonicalGate && canonicalGate < canonical);
+  assert.ok(canonical < authGate && authGate < transactions
+    && transactions < nativeAuthentication);
   assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
-  // A disabled feature must not create another copy of the signing key.
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
+  assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
+  assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods\.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {

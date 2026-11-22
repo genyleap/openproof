@@ -22,9 +22,11 @@ namespace asio = boost::asio;
 
 CoroutineRouteOverlay::CoroutineRouteOverlay(
     HttpHandler& compatibility, CoroutineHttpHandler& native,
-    std::vector<std::string> exactNativePaths)
+    std::vector<std::string> exactNativePaths,
+    std::vector<std::pair<std::string, HttpMethod>> methodScopedNativePaths)
     : m_compatibility(&compatibility), m_native(&native),
-      m_exactNativePaths(std::move(exactNativePaths))
+      m_exactNativePaths(std::move(exactNativePaths)),
+      m_methodScopedNativePaths(std::move(methodScopedNativePaths))
 {
 }
 
@@ -36,9 +38,21 @@ bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
     return false;
 }
 
+bool CoroutineRouteOverlay::overlays(const HttpRequest& request) const noexcept
+{
+    if (overlays(request.path())) return true;
+    for (const auto& [path, method] : m_methodScopedNativePaths) {
+        if (std::string_view{path} == request.path()
+            && method == request.method()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool CoroutineRouteOverlay::nativeEnabledFor(const HttpRequest& request) const noexcept
 {
-    if (!overlays(request.path())) return false;
+    if (!overlays(request)) return false;
     try {
         return m_native->nativeEnabledFor(request);
     } catch (...) {
@@ -61,14 +75,19 @@ HttpResponse CoroutineRouteOverlay::unavailable(const HttpRequest& request)
 
 HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
 {
-    if (overlays(request.path())) {
-        // An unready native login must never fall back to a blocking or
-        // differently configured compatibility credential handler.
+    if (overlays(request.path()) || nativeEnabledFor(request)) {
+        // Strict path overlays ALWAYS fail closed, including unsupported
+        // methods. For a method-scoped route, a native-enabled request must
+        // also deny direct synchronous dispatch, never block a reactor.
         request.wipeBody();
         request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
         return unavailable(request);
     }
+    // A method-scoped native read may explicitly decline a credential type
+    // it cannot authenticate (e.g. delegated OAuth Bearer). Only the bounded
+    // synchronous compatibility worker may process that request. All strict
+    // authentication overlays remain fail-closed regardless of capability.
     return m_compatibility->handle(std::move(request));
 }
 

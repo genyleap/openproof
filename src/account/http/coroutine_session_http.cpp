@@ -51,6 +51,12 @@ private:
         && request.path() == "/account/sessions/revoke";
 }
 
+[[nodiscard]] bool profileReadRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Get
+        && request.path() == "/account/profile";
+}
+
 [[nodiscard]] bool accountNamespace(const gateway::HttpRequest& request) noexcept
 {
     return request.path() == "/account"
@@ -115,10 +121,12 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     gateway::HttpHandler& legacyAccount,
     gateway::http::CoroutineHttpHandler& asyncFallback,
     gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate, List list, RevokeOwned revokeOwned)
+    Authenticate authenticate, List list, RevokeOwned revokeOwned,
+    ReadProfile readProfile)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
-      m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned))
+      m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
+      m_readProfile(std::move(readProfile))
 {
 }
 
@@ -127,6 +135,15 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
 {
     if (!accountNamespace(request)) {
         return m_asyncFallback->nativeEnabledFor(request);
+    }
+    if (profileReadRoute(request)) {
+        // Legacy AccountHttpApi also accepts delegated OAuth Bearer grants.
+        // Native PostgreSQL session authentication supports first-party
+        // sessions only. Preserve delegated OAuth semantics on the bounded
+        // compatibility worker; do not misclassify Bearer as a session.
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_readProfile);
     }
     return static_cast<bool>(m_authenticate)
         && static_cast<bool>(m_list)
@@ -153,6 +170,11 @@ gateway::HttpResponse CoroutineAccountSessionAdapter::fail(
     response.setHeader("pragma", "no-cache");
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
+    // An HTTP 401 requires a challenge. Keep native session and profile
+    // endpoints interoperable with Bearer-aware clients (including the
+    // synchronous Account API's missing-credential response).
+    if (response.status() == 401)
+        response.setHeader("www-authenticate", "Bearer");
     return response;
 }
 
@@ -170,6 +192,9 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (sessionRevokeRoute(request)) {
         co_return co_await sessionRevoke(std::move(request));
+    }
+    if (profileReadRoute(request)) {
+        co_return co_await profileRead(std::move(request));
     }
     // Only non-account requests can reach the fallback's native entry.
     // No synchronous AccountHttpApi method executes on the reactor.
@@ -251,6 +276,48 @@ CoroutineAccountSessionAdapter::sessionRevoke(gateway::HttpRequest request)
         authenticated->identity(), std::move(target).value());
     if (!revoked) co_return fail(revoked.error(), request);
     co_return jsonResponse(200, json::object{{"revoked", true}});
+}
+
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::profileRead(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey)) {
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(), request);
+    if (!credential->has_value()) {
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    }
+    // Never authorize a read based only on the requested identity or a
+    // caller-supplied HTTP parameter. The owner must come from the verified
+    // native session and the repository must independently verify tenancy.
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(), request);
+    auto value = co_await m_readProfile(authenticated->identity());
+    if (!value) co_return fail(value.error(), request);
+    if (value->identity() != authenticated->identity()) {
+        // Prevent a misconfigured adapter from disclosing another identity.
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    }
+    json::object body;
+    body["identity_id"] = value->identity().value();
+    if (value->displayName()) body["display_name"] = *value->displayName();
+    if (value->preferredUsername()) {
+        body["preferred_username"] = *value->preferredUsername();
+    }
+    if (value->email()) body["email"] = *value->email();
+    body["email_verified"] = value->emailVerified();
+    if (value->phoneNumber()) body["phone_number"] = *value->phoneNumber();
+    body["phone_number_verified"] = value->phoneNumberVerified();
+    if (value->locale()) body["locale"] = *value->locale();
+    if (value->pictureUrl()) body["picture"] = *value->pictureUrl();
+    body["avatar_source"] = value->avatarSource();
+    co_return jsonResponse(200, std::move(body));
 }
 
 } // namespace openproof::account::http
