@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+// Native account profile boundary checks complement, not replace, GCC16
+// compilation and the disposable real-PostgreSQL integration suite.
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+import path from "node:path";
+import { cppExecutableText } from "./cpp-lexical-scan.mjs";
+
+const root = path.resolve(import.meta.dirname, "..");
+const read = name => fs.readFileSync(path.join(root, name), "utf8");
+const account = read("src/account/http/coroutine_session_http.cpp");
+const accountNative = cppExecutableText(account);
+const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
+const sqlNative = cppExecutableText(sql);
+const main = read("apps/opp/main.cpp");
+
+test("native profile route is explicit, read-only and disabled by default", () => {
+  const header = read("src/account/http/coroutine_session_http.hpp");
+  assert.match(header, /ReadProfile readProfile = \{\}/);
+  assert.match(header, /nativeEnabled\(\) const noexcept override \{ return false; \}/);
+  assert.match(account, /request.method\(\) == gateway::HttpMethod::Get[\s\S]*?request.path\(\) == "\/account\/profile"/);
+  assert.match(account, /if \(profileReadRoute\(request\)\)[\s\S]*?static_cast<bool>\(m_readProfile\)/);
+  assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
+  assert.match(main, /nativeAccountProfileFlag && \*nativeAccountProfileFlag == "1"/);
+  assert.match(main, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
+  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths.emplace_back\("\/account\/profile"\)/);
+});
+
+test("native profile reader checks active tenant and rejects duplicate or corrupt rows", () => {
+  const start = sqlNative.indexOf("CoroutinePostgresCanonicalFinalizer::readProfileAsync(");
+  const end = sqlNative.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(", start);
+  assert.ok(start >= 0 && end > start);
+  const body = sqlNative.slice(start, end);
+  for (const guard of ["m_impl->pool.acquire(deadline)", "remaining(deadline)",
+                       "owner.empty()", "result.rows.size() != 1U",
+                       "result.rows.front().size() != 11U",
+                       "profile::IdentityProfile::restore("])
+    assert.ok(body.includes(guard), "missing native profile SQL validation: " + guard);
+  const sqlText = sql.slice(start, end);
+  for (const condition of ["p.identity_id=$1", "i.organization_id=$2",
+                          "i.status=0", "o.state=0", "LIMIT 2",
+                          "JOIN openproof.identities i",
+                          "JOIN openproof.organizations o"])
+    assert.ok(sqlText.includes(condition), "missing SQL tenant/lifecycle boundary: " + condition);
+  assert.doesNotMatch(body, /\bPQ(?:exec|execParams|connectdb|reset)\s*\(|\bcontext\.run\s*\(/);
+});
+
+test("native HTTP authenticates session before lookup and checks returned identity", () => {
+  const start = accountNative.indexOf("CoroutineAccountSessionAdapter::profileRead(");
+  assert.ok(start >= 0);
+  const code = accountNative.slice(start);
+  const auth = code.indexOf("co_await m_authenticate(std::move(credential->value()))");
+  const readIndex = code.indexOf("co_await m_readProfile(authenticated->identity())");
+  const identityCheck = code.indexOf("value->identity() != authenticated->identity()");
+  const serialize = code.indexOf("json::object body;");
+  assert.ok(auth >= 0 && auth < readIndex && readIndex < identityCheck
+    && identityCheck < serialize, "authorization and ownership must precede JSON");
+  assert.doesNotMatch(code, /m_legacyAccount->handle\s*\(|\bPQexec\s*\(/);
+  const cpp = read("tests/account/session_coroutine_http_test.cpp");
+  assert.match(cpp, /ProfileReadRequiresExplicitNativeCapabilityAndSession/);
+  assert.match(cpp, /ProfileReadFailsClosedOnForeignOrMissingProfile/);
+});
+
+test("profile route is isolated from OAuth transaction provisioning", () => {
+  assert.match(main, /nativeLdapEnabled \|\| nativeWeb3Enabled \|\| nativeFederatedStartEnabled[\s\S]*?\|\| nativeAccountProfileEnabled/);
+  const native = main.slice(main.indexOf("nativeSessionRepository = std::make_unique<"),
+    main.indexOf("std::optional<passkey::PasskeyService>"));
+  assert.ok(native.indexOf("nativeCanonical = std::make_unique<") <
+    native.indexOf("nativeTransactions = std::make_unique<"));
+  assert.match(native, /if \(nativeLdapEnabled \|\| nativeWeb3Enabled \|\| nativeFederatedStartEnabled\) \{\s*nativeTransactions/);
+  assert.match(main, /reader->readProfileAsync\(std::move\(owner\)\)/);
+});
