@@ -128,6 +128,7 @@ struct Seed final {
     std::string suspendedOrg = "nc-suspended-org-" + suffix;
     std::string owner = "nc-owner-" + suffix;
     std::string secondOwner = "nc-second-" + suffix;
+    std::string emptyConnectionsOwner = "nc-empty-connections-" + suffix;
     std::string freshLoginOwner = "nc-fresh-login-" + suffix;
     std::string simultaneousOwner = "nc-simultaneous-" + suffix;
     std::string lockedOwner = "nc-locked-" + suffix;
@@ -155,6 +156,7 @@ struct Seed final {
         for (const auto& [id, tenant, status] :
             {std::tuple{owner, org, "0"},
              std::tuple{secondOwner, org, "0"},
+             std::tuple{emptyConnectionsOwner, org, "0"},
              std::tuple{freshLoginOwner, org, "0"},
              std::tuple{simultaneousOwner, org, "0"},
              std::tuple{lockedOwner, org, "2"},
@@ -588,6 +590,7 @@ struct ProfileReadChecks final {
     bool inactiveIdentityDenied{};
     bool inactiveOrganizationDenied{};
     bool activeConnections{};
+    bool emptyConnections{};
     bool wrongTenantConnectionsDenied{};
     bool inactiveConnectionsDenied{};
     bool suspendedConnectionsDenied{};
@@ -625,6 +628,11 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
     auto linked = co_await canonical.readConnectionsAsync(ids::IdentityId{seed.owner});
     checks.activeConnections = linked
         && linked->first.value() == seed.owner && !linked->second.empty();
+    auto emptyLinks = co_await canonical.readConnectionsAsync(
+        ids::IdentityId{seed.emptyConnectionsOwner});
+    checks.emptyConnections = emptyLinks
+        && emptyLinks->first.value() == seed.emptyConnectionsOwner
+        && emptyLinks->second.empty();
     auto wrongLinks = co_await wrongTenant.readConnectionsAsync(
         ids::IdentityId{seed.owner});
     checks.wrongTenantConnectionsDenied = !wrongLinks
@@ -836,6 +844,7 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(profileChecks.inactiveIdentityDenied);
     EXPECT_TRUE(profileChecks.inactiveOrganizationDenied);
     EXPECT_TRUE(profileChecks.activeConnections);
+    EXPECT_TRUE(profileChecks.emptyConnections);
     EXPECT_TRUE(profileChecks.wrongTenantConnectionsDenied);
     EXPECT_TRUE(profileChecks.inactiveConnectionsDenied);
     EXPECT_TRUE(profileChecks.suspendedConnectionsDenied);
