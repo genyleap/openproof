@@ -102,6 +102,14 @@ jobs:
           ./cmake-build-gcc-release/tests/openproof_gateway_http_tests \
             --gtest_filter='BeastHttpIntegrationTest.*'
 
+      # Validate the opt-in native account boundary in-process before
+      # invoking the disposable HTTP E2E. This isolates C++ coroutine
+      # regressions from proxy/backend diagnostic noise.
+      - name: Focused native account coroutine C++ regressions
+        run: |
+          cmake --build --preset gcc-release --target openproof_account_coroutine_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
+
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 
