@@ -979,6 +979,19 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartUnsafeRedirectDoesNotPers
     auth::http::CoroutineFederatedStartAdapter adapter{
         service, fixture.providers, limiter.value(), fallback};
 
+    // A connection or callback intent must not silently become an ordinary
+    // anonymous login and create a durable transaction.
+    for (const auto unsupported : {
+            "/auth/federated/start?provider=async-test&intent=connect",
+            "/auth/federated/start?provider=async-test&return_to=%2F&mode=link",
+            "/auth/federated/start?provider=async-test&state=caller-controlled"}) {
+        auto response = invokeFederated(adapter, makeFederatedStart(unsupported));
+        EXPECT_GE(response.status(), 400);
+        EXPECT_FALSE(response.headers().contains("location"));
+        EXPECT_EQ(fixture.transactions.size(), 0U);
+    }
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 0);
+
     for (const std::string_view invalid : {
             std::string_view{"https://example.test/authorize\\r\\nset-cookie: compromised=1"},
             std::string_view{"https://trusted.test@attacker.test/authorize"},
