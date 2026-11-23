@@ -131,3 +131,16 @@ test("canonical integration exercises pool contention across executor threads", 
   assert.match(integration, /for \(auto& worker : workers\) worker\.join\(\)/);
   assert.match(read(".github/workflows/ci.yml"), /bash scripts\/run-disposable-postgres-canonical-tests\.sh/);
 });
+
+test("disposable reverse proxy does not reuse one-request Beast TCP sockets", () => {
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  const start = e2e.indexOf("const forwarded = http.request({");
+  const end = e2e.indexOf("}, (upstream) => {", start);
+  assert.ok(start >= 0 && end > start);
+  const options = e2e.slice(start, end);
+  assert.match(options, /hostname: "127\.0\.0\.1"/);
+  assert.match(options, /port: oppPort/);
+  assert.match(options, /agent: false/);
+  const gateway = read("src/gateway/http.cpp");
+  assert.match(gateway, /output\.keep_alive\(false\)/);
+});
