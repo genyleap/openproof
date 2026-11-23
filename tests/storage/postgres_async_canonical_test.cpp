@@ -5,6 +5,7 @@
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <future>
@@ -867,41 +868,40 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     // executor threads. A simple sequential SELECT would never exercise
     // the channel handoff and connection lifetime under real contention.
     io.restart();
-    // Keep the executor alive until EVERY asynchronous completion is observed.
-    // Joining run() threads before collecting futures can abandon pending
-    // coroutine frames on some Asio/GCC16 executor paths (broken_promise).
+    // Keep the executor alive until all eight completion handlers fire.
+    // Per-coroutine use_future completion on GCC16/Asio multi-threaded
+    // io_contexts can report broken_promise without identifying which
+    // storage operation failed. Count explicit callbacks instead.
     auto work = asio::make_work_guard(io);
-    std::vector<std::future<bool>> pendingReads;
-    pendingReads.reserve(8U);
+    std::atomic<std::size_t> completed{0U};
+    std::atomic<std::size_t> failed{0U};
+    std::promise<void> allCompleted;
+    auto completion = allCompleted.get_future();
     for (std::size_t index = 0U; index < 8U; ++index) {
         const bool emptyExpected = index % 2U == 1U;
-        pendingReads.emplace_back(asio::co_spawn(io,
+        asio::co_spawn(io,
             concurrentConnectionRead(canonical, ids::IdentityId{
                 emptyExpected ? seed.emptyConnectionsOwner : seed.owner},
-                emptyExpected), asio::use_future));
+                emptyExpected),
+            [&](std::exception_ptr exception, bool valid) {
+                if (exception || !valid)
+                    failed.fetch_add(1U, std::memory_order_relaxed);
+                if (completed.fetch_add(1U, std::memory_order_acq_rel) + 1U == 8U)
+                    allCompleted.set_value();
+            });
     }
     std::vector<std::thread> workers;
     workers.reserve(4U);
     for (std::size_t index = 0U; index < 4U; ++index)
         workers.emplace_back([&io] { io.run(); });
-    // A bounded shared deadline prevents a deadlocked pool from hanging CI.
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds{10};
-    bool concurrentReadsSucceeded = true;
-    for (auto& result : pendingReads) {
-        if (result.wait_until(deadline) != std::future_status::ready) {
-            concurrentReadsSucceeded = false;
-            break;
-        }
-        try {
-            concurrentReadsSucceeded = result.get() && concurrentReadsSucceeded;
-        } catch (const std::exception&) {
-            concurrentReadsSucceeded = false;
-        }
-    }
+    // A shared ten-second ceiling prevents deadlocks from hanging CI.
+    const bool finished = completion.wait_for(std::chrono::seconds{10})
+        == std::future_status::ready;
     work.reset();
     io.stop();
     for (auto& worker : workers) worker.join();
-    EXPECT_TRUE(concurrentReadsSucceeded);
+    EXPECT_TRUE(finished);
+    EXPECT_EQ(completed.load(std::memory_order_acquire), 8U);
+    EXPECT_EQ(failed.load(std::memory_order_relaxed), 0U);
 }
 } // namespace
