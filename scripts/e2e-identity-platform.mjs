@@ -413,11 +413,12 @@ async function main() {
         method: request.method,
         path: request.url,
         headers,
-        // Beast deliberately sends one response per TCP connection and
-        // sets Connection: close. Never allow Node's default pooled Agent
-        // to reuse a socket racing the server's half-close under concurrent
-        // HTTP E2E: each forwarded request gets its own upstream socket.
-        agent: false,
+        // In the experimental concurrent-read E2E, Beast explicitly sends
+        // Connection: close. Use a fresh upstream socket to exclude stale
+        // pooled-socket races, without changing the existing Agent behavior
+        // in the default E2E or pinned comparative benchmark workload.
+        ...(process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"
+          ? { agent: false } : {}),
       }, (upstream) => {
         const responseHeaders = { ...upstream.headers };
         responseHeaders["strict-transport-security"] = "max-age=31536000";
