@@ -867,6 +867,12 @@ async function main() {
       const reads = await Promise.all(Array.from({ length: 8 },
         () => edgeRequest("/account/connections", { jar: consumerJar })));
       for (const response of reads) {
+        if (response.status === 502) {
+          // Preserve process status without exposing the upstream's HTTP
+          // response bodies, logs, session tokens, OAuth codes or secrets.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          fail(`concurrent native connections upstream disconnected (opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+        }
         expectStatus(response, 200);
         assert.deepEqual(
           jsonBody(response).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
