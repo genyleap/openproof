@@ -141,6 +141,8 @@ test("disposable reverse proxy does not reuse one-request Beast TCP sockets", ()
   assert.match(options, /hostname: "127\.0\.0\.1"/);
   assert.match(options, /port: oppPort/);
   assert.match(options, /agent: false/);
+  assert.match(options, /process\.env\.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"/);
+  assert.match(options, /\? \{ agent: false \} : \{\}/);
   const gateway = read("src/gateway/http.cpp");
   assert.match(gateway, /output\.keep_alive\(false\)/);
 });
