@@ -120,3 +120,14 @@ test("disposable proxy error classification never exposes raw upstream exception
   assert.match(e2e, /concurrent native connections upstream disconnected \(transport=/);
   assert.match(e2e, /oppProcess\?\.signalCode \?\? "none"/);
 });
+
+test("canonical integration exercises pool contention across executor threads", () => {
+  const integration = read("tests/storage/postgres_async_canonical_test.cpp");
+  assert.match(integration, /asio::awaitable<bool> concurrentConnectionRead\(/);
+  assert.match(integration, /pendingReads\.reserve\(8U\)/);
+  assert.match(integration, /workers\.reserve\(4U\)/);
+  assert.match(integration, /io\.restart\(\);[\s\S]*?std::vector<std::future<bool>> pendingReads;/);
+  assert.match(integration, /emptyExpected \? seed\.emptyConnectionsOwner : seed\.owner/);
+  assert.match(integration, /for \(auto& worker : workers\) worker\.join\(\)/);
+  assert.match(read(".github/workflows/ci.yml"), /bash scripts\/run-disposable-postgres-canonical-tests\.sh/);
+});
