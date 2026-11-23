@@ -867,6 +867,10 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     // executor threads. A simple sequential SELECT would never exercise
     // the channel handoff and connection lifetime under real contention.
     io.restart();
+    // Keep the executor alive until EVERY asynchronous completion is observed.
+    // Joining run() threads before collecting futures can abandon pending
+    // coroutine frames on some Asio/GCC16 executor paths (broken_promise).
+    auto work = asio::make_work_guard(io);
     std::vector<std::future<bool>> pendingReads;
     pendingReads.reserve(8U);
     for (std::size_t index = 0U; index < 8U; ++index) {
@@ -880,8 +884,24 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     workers.reserve(4U);
     for (std::size_t index = 0U; index < 4U; ++index)
         workers.emplace_back([&io] { io.run(); });
+    // A bounded shared deadline prevents a deadlocked pool from hanging CI.
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds{10};
+    bool concurrentReadsSucceeded = true;
+    for (auto& result : pendingReads) {
+        if (result.wait_until(deadline) != std::future_status::ready) {
+            concurrentReadsSucceeded = false;
+            break;
+        }
+        try {
+            concurrentReadsSucceeded = result.get() && concurrentReadsSucceeded;
+        } catch (const std::exception&) {
+            concurrentReadsSucceeded = false;
+        }
+    }
+    work.reset();
+    io.stop();
     for (auto& worker : workers) worker.join();
-    for (auto& result : pendingReads)
-        EXPECT_TRUE(result.get());
+    EXPECT_TRUE(concurrentReadsSucceeded);
 }
 } // namespace
