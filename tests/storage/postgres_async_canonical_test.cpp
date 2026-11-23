@@ -7,12 +7,14 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <utility>
@@ -648,6 +650,18 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
     co_return checks;
 }
 
+// Exercise concurrent native readers on different io_context threads,
+// including an active Identity with no external providers. No request may
+// inherit another owner's linked account metadata through pool reuse.
+asio::awaitable<bool> concurrentConnectionRead(
+    pg::CoroutinePostgresCanonicalFinalizer& canonical,
+    ids::IdentityId owner, bool emptyExpected)
+{
+    auto linked = co_await canonical.readConnectionsAsync(owner);
+    co_return linked && linked->first == owner
+        && linked->second.empty() == emptyExpected;
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
 {
     const auto dsn = disposableDsn();
@@ -848,5 +862,26 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(profileChecks.wrongTenantConnectionsDenied);
     EXPECT_TRUE(profileChecks.inactiveConnectionsDenied);
     EXPECT_TRUE(profileChecks.suspendedConnectionsDenied);
+
+    // Run more requests than the bounded connection-pool capacity on four
+    // executor threads. A simple sequential SELECT would never exercise
+    // the channel handoff and connection lifetime under real contention.
+    io.restart();
+    std::vector<std::future<bool>> pendingReads;
+    pendingReads.reserve(8U);
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        const bool emptyExpected = index % 2U == 1U;
+        pendingReads.emplace_back(asio::co_spawn(io,
+            concurrentConnectionRead(canonical, ids::IdentityId{
+                emptyExpected ? seed.emptyConnectionsOwner : seed.owner},
+                emptyExpected), asio::use_future));
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(4U);
+    for (std::size_t index = 0U; index < 4U; ++index)
+        workers.emplace_back([&io] { io.run(); });
+    for (auto& worker : workers) worker.join();
+    for (auto& result : pendingReads)
+        EXPECT_TRUE(result.get());
 }
 } // namespace
