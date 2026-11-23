@@ -413,6 +413,11 @@ async function main() {
         method: request.method,
         path: request.url,
         headers,
+        // Beast deliberately sends one response per TCP connection and
+        // sets Connection: close. Never allow Node's default pooled Agent
+        // to reuse a socket racing the server's half-close under concurrent
+        // HTTP E2E: each forwarded request gets its own upstream socket.
+        agent: false,
       }, (upstream) => {
         const responseHeaders = { ...upstream.headers };
         responseHeaders["strict-transport-security"] = "max-age=31536000";
