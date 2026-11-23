@@ -104,3 +104,19 @@ test("native HTTP E2E exercises concurrent reads with no extra identity creation
       e2e.indexOf("const connectionStart = await jsonRequest")),
     /\/account\/signup|\/account\/connections\/web3\/complete/);
 });
+
+test("disposable proxy error classification never exposes raw upstream exception data", () => {
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  const start = e2e.indexOf('forwarded.on("error", (error) =>');
+  const end = e2e.indexOf('request.pipe(forwarded);', start);
+  assert.ok(start > 0 && end > start);
+  const proxy = e2e.slice(start, end);
+  for (const safeCode of ["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT"]) {
+    assert.ok(proxy.includes(safeCode));
+  }
+  assert.match(proxy, /permitted\.has\(error\?\.code\) \? error\.code : "OTHER"/);
+  assert.match(proxy, /"x-openproof-e2e-upstream-failure": category/);
+  assert.doesNotMatch(proxy, /error\?\.message|error\.stack|console\.|oppLog/);
+  assert.match(e2e, /concurrent native connections upstream disconnected \(transport=/);
+  assert.match(e2e, /oppProcess\?\.signalCode \?\? "none"/);
+});
