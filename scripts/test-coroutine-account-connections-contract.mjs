@@ -128,6 +128,9 @@ test("canonical integration exercises pool contention across executor threads", 
   assert.match(integration, /workers\.reserve\(4U\)/);
   assert.match(integration, /io\.restart\(\);[\s\S]*?std::vector<std::future<bool>> pendingReads;/);
   assert.match(integration, /emptyExpected \? seed\.emptyConnectionsOwner : seed\.owner/);
+  assert.match(integration, /auto work = asio::make_work_guard\(io\)/);
+  assert.match(integration, /result\.wait_until\(deadline\) != std::future_status::ready/);
+  assert.match(integration, /work\.reset\(\);\s*io\.stop\(\);/);
   assert.match(integration, /for \(auto& worker : workers\) worker\.join\(\)/);
   assert.match(read(".github/workflows/ci.yml"), /bash scripts\/run-disposable-postgres-canonical-tests\.sh/);
 });
