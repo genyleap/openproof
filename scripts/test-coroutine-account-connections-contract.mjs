@@ -124,12 +124,16 @@ test("disposable proxy error classification never exposes raw upstream exception
 test("canonical integration exercises pool contention across executor threads", () => {
   const integration = read("tests/storage/postgres_async_canonical_test.cpp");
   assert.match(integration, /asio::awaitable<bool> concurrentConnectionRead\(/);
-  assert.match(integration, /pendingReads\.reserve\(8U\)/);
+  assert.match(integration, /std::atomic<std::size_t> completed\{0U\}/);
+  assert.match(integration, /std::atomic<std::size_t> failed\{0U\}/);
   assert.match(integration, /workers\.reserve\(4U\)/);
-  assert.match(integration, /io\.restart\(\);[\s\S]*?std::vector<std::future<bool>> pendingReads;/);
+  assert.match(integration, /std::promise<void> allCompleted/);
+  assert.match(integration, /asio::co_spawn\(io,[\s\S]*?std::exception_ptr exception, bool valid/);
   assert.match(integration, /emptyExpected \? seed\.emptyConnectionsOwner : seed\.owner/);
   assert.match(integration, /auto work = asio::make_work_guard\(io\)/);
-  assert.match(integration, /result\.wait_until\(deadline\) != std::future_status::ready/);
+  assert.match(integration, /completion\.wait_for\(std::chrono::seconds\{10\}\)/);
+  assert.match(integration, /completed\.fetch_add\(1U, std::memory_order_acq_rel\) \+ 1U == 8U/);
+  assert.match(integration, /EXPECT_EQ\(failed\.load\(std::memory_order_relaxed\), 0U\)/);
   assert.match(integration, /work\.reset\(\);\s*io\.stop\(\);/);
   assert.match(integration, /for \(auto& worker : workers\) worker\.join\(\)/);
   assert.match(read(".github/workflows/ci.yml"), /bash scripts\/run-disposable-postgres-canonical-tests\.sh/);
