@@ -206,3 +206,21 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   assert.match(testBody, /clients\.reserve\(16\)/);
   assert.match(testBody, /EXPECT_EQ\(completed\.load\(std::memory_order_relaxed\), 16\)/);
 });
+
+test("cancelled channel receives cannot silently consume native PostgreSQL pool capacity", () => {
+  const header = read("src/storage/postgres/async_pool.hpp");
+  const implementation = read("src/storage/postgres/async_pool.cpp");
+  assert.match(header, /std::unique_ptr<void, void\(\*\)\(void\*\)> m_permit/);
+  assert.match(implementation, /struct Slot final/);
+  assert.match(implementation, /std::weak_ptr<State> owner/);
+  assert.match(implementation, /static void recoverSlot\(void\* raw\) noexcept/);
+  assert.match(implementation, /SlotToken recovered\{raw, &State::recoverSlot\}/);
+  assert.match(implementation, /state->slots\.try_send\(boost::system::error_code\{\},/);
+  assert.match(implementation, /recovered\.release\(\)/);
+  assert.match(implementation, /new Slot\{weak_from_this\(\), \{\}\}/);
+  assert.match(implementation, /State::SlotToken permit = co_await state->slots\.async_receive/);
+  assert.match(implementation, /auto connection = std::move\(slot->connection\)/);
+  assert.match(implementation, /slot->connection = std::move\(m_connection\)/);
+  assert.match(implementation, /if \(!returned\) std::terminate\(\)/);
+  assert.doesNotMatch(implementation, /std::condition_variable/);
+});
