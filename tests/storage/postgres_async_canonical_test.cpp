@@ -867,20 +867,28 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     // Run more requests than the bounded connection-pool capacity on four
     // executor threads. A simple sequential SELECT would never exercise
     // the channel handoff and connection lifetime under real contention.
-    io.restart();
-    // Keep the executor alive until all eight completion handlers fire.
-    // Per-coroutine use_future completion on GCC16/Asio multi-threaded
-    // io_contexts can report broken_promise without identifying which
-    // storage operation failed. Count explicit callbacks instead.
-    auto work = asio::make_work_guard(io);
+    // The normal runtime constructs a dedicated native PostgreSQL executor.
+    // Do the same here: prior identity mutation/negative-timeout scenarios
+    // have already stopped/restarted "io" repeatedly, and reusing their
+    // reactor introduces unrelated stale cancellation state into this probe.
+    // This is still the SAME disposable database, and all eight SQL requests
+    // contend for two physical connections in four running OS threads.
+    asio::io_context concurrentIo;
+    pg::CoroutinePostgresCanonicalFinalizer concurrentCanonical{
+        concurrentIo.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, 2U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    // Keep the independent executor alive until all eight completions fire.
+    auto work = asio::make_work_guard(concurrentIo);
     std::atomic<std::size_t> completed{0U};
     std::atomic<std::size_t> failed{0U};
     std::promise<void> allCompleted;
     auto completion = allCompleted.get_future();
     for (std::size_t index = 0U; index < 8U; ++index) {
         const bool emptyExpected = index % 2U == 1U;
-        asio::co_spawn(io,
-            concurrentConnectionRead(canonical, ids::IdentityId{
+        asio::co_spawn(concurrentIo,
+            concurrentConnectionRead(concurrentCanonical, ids::IdentityId{
                 emptyExpected ? seed.emptyConnectionsOwner : seed.owner},
                 emptyExpected),
             [&](std::exception_ptr exception, bool valid) {
@@ -893,12 +901,12 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     std::vector<std::thread> workers;
     workers.reserve(4U);
     for (std::size_t index = 0U; index < 4U; ++index)
-        workers.emplace_back([&io] { io.run(); });
+        workers.emplace_back([&concurrentIo] { concurrentIo.run(); });
     // A shared ten-second ceiling prevents deadlocks from hanging CI.
     const bool finished = completion.wait_for(std::chrono::seconds{10})
         == std::future_status::ready;
     work.reset();
-    io.stop();
+    concurrentIo.stop();
     for (auto& worker : workers) worker.join();
     EXPECT_TRUE(finished);
     EXPECT_EQ(completed.load(std::memory_order_acquire), 8U);
