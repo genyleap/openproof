@@ -7,11 +7,25 @@
 
 #include <chrono>
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
 
 namespace openproof::storage::postgres::async_detail {
+
+// Unlike a raw function-pointer deleter, this POD is default-constructible.
+// Asio's channel cancellation/close messages may need an empty permit token.
+// A nonempty token must always carry an explicit recovery callback.
+struct PoolPermitDeleter final {
+    void (*recover)(void*) noexcept = nullptr;
+    void operator()(void* raw) const noexcept
+    {
+        if (!raw) return;
+        if (!recover) std::terminate();
+        recover(raw);
+    }
+};
 
 // Internal, bounded coroutine pool. A channel token represents exactly one
 // exclusive connection slot, even when its physical PGconn must be replaced.
@@ -35,10 +49,10 @@ public:
         // If a cancelled async channel receive drops the slot before a Lease
         // is constructed, the slot's deleter safely restores pool capacity.
         Lease(std::shared_ptr<State> state,
-              std::unique_ptr<void, void(*)(void*)> permit,
+              std::unique_ptr<void, PoolPermitDeleter> permit,
               std::unique_ptr<AsyncConnection> conn);
         std::shared_ptr<State> m_state;
-        std::unique_ptr<void, void(*)(void*)> m_permit;
+        std::unique_ptr<void, PoolPermitDeleter> m_permit;
         std::unique_ptr<AsyncConnection> m_connection;
     };
 
