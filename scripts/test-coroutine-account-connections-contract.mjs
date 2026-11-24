@@ -187,3 +187,20 @@ test("unexpected Beast read-coroutine exceptions return sanitized JSON instead o
   assert.doesNotMatch(fallback, /exception\.what\(|error\.message\(|std::cerr|std::cout/);
   assert.match(gateway, /if \(error\) self->sendReadFailureIfUnanswered\(\)/);
 });
+
+test("Beast sockets and post-dispatch responses stay on the same strand", () => {
+  const gateway = read("src/gateway/http.cpp");
+  assert.match(gateway,
+    /m_acceptor\.async_accept\(\s*asio::make_strand\(m_context\)/);
+  assert.match(gateway, /asio::post\(m_stream\.get_executor\(\),/);
+  assert.doesNotMatch(gateway, /asio::post\(m_owner->m_context,/);
+  const integration = read("tests/gateway/http_integration_test.cpp");
+  const start = integration.indexOf(
+    "TEST(BeastHttpIntegrationTest, NativeHttpConcurrentResponsesUseIndependentStrands)");
+  assert.ok(start > 0);
+  const testBody = integration.slice(start, integration.indexOf("TEST(", start + 5));
+  assert.match(testBody, /64U, 32U/);
+  assert.match(testBody, /round < 3/);
+  assert.match(testBody, /clients\.reserve\(16\)/);
+  assert.match(testBody, /EXPECT_EQ\(completed\.load\(std::memory_order_relaxed\), 16\)/);
+});
