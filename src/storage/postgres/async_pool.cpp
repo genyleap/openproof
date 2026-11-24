@@ -19,9 +19,40 @@
 namespace openproof::storage::postgres::async_detail {
 namespace asio = boost::asio;
 
-struct AsyncConnectionPool::State final {
+struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
+    // The connection travels inside an exclusive slot, rather than being the
+    // channel payload itself. A cancellation which drops a delivered payload
+    // before co_await resumes must NOT permanently consume pool capacity.
+    struct Slot final {
+        std::weak_ptr<State> owner;
+        std::unique_ptr<AsyncConnection> connection;
+    };
+    using SlotToken = std::unique_ptr<void, void(*)(void*)>;
     using SlotChannel = asio::experimental::concurrent_channel<
-        void(boost::system::error_code, std::unique_ptr<AsyncConnection>)>;
+        void(boost::system::error_code, SlotToken)>;
+
+    // This deleter is also installed on a slot while it is in the channel.
+    // Normal channel destruction occurs after the last State strong reference
+    // is gone, so weak_ptr::lock fails and frees the slot. If a cancelled
+    // receiver discards an already delivered token, it is put back once.
+    static void recoverSlot(void* raw) noexcept
+    {
+        if (!raw) return;
+        auto* slot = static_cast<Slot*>(raw);
+        auto state = slot->owner.lock();
+        if (!state) {
+            delete slot;
+            return;
+        }
+        SlotToken recovered{raw, &State::recoverSlot};
+        if (!state->slots.try_send(boost::system::error_code{},
+                                    std::move(recovered))) {
+            // A full channel here violates exclusive slot accounting.
+            // Do not recurse through this token's recovery deleter.
+            delete static_cast<Slot*>(recovered.release());
+            std::terminate();
+        }
+    }
 
     State(asio::any_io_executor executor, std::string connectionStringValue,
           std::size_t capacity, std::chrono::milliseconds acquireTimeoutValue,
@@ -30,13 +61,17 @@ struct AsyncConnectionPool::State final {
           connectionString(std::move(connectionStringValue)),
           maximumConnections(capacity),
           acquireTimeout(acquireTimeoutValue),
-          connectTimeout(connectTimeoutValue)
+          connectTimeout(connectTimeoutValue) {}
+
+    void initialize()
     {
-        // A null slot is an exclusive permit to create the physical connection.
-        // Replacing a poisoned connection consumes the same permit.
-        for (std::size_t index = 0U; index < capacity; ++index) {
-            if (!slots.try_send(boost::system::error_code{},
-                                std::unique_ptr<AsyncConnection>{})) {
+        // A null physical connection is an exclusive permit for a lazy
+        // nonblocking connect. initialize() runs only after shared ownership
+        // exists, allowing every slot to carry a recovery-safe weak owner.
+        for (std::size_t index = 0U; index < maximumConnections; ++index) {
+            SlotToken slot{static_cast<void*>(new Slot{weak_from_this(), {}}),
+                           &State::recoverSlot};
+            if (!slots.try_send(boost::system::error_code{}, std::move(slot))) {
                 throw std::runtime_error{"Unable to initialize async PostgreSQL pool"};
             }
         }
@@ -64,8 +99,10 @@ struct AsyncConnectionPool::State final {
 };
 
 AsyncConnectionPool::Lease::Lease(
-    std::shared_ptr<State> state, std::unique_ptr<AsyncConnection> conn)
-    : m_state(std::move(state)), m_connection(std::move(conn)) {}
+    std::shared_ptr<State> state, State::SlotToken permit,
+    std::unique_ptr<AsyncConnection> conn)
+    : m_state(std::move(state)), m_permit(std::move(permit)),
+      m_connection(std::move(conn)) {}
 
 AsyncConnectionPool::Lease::~Lease() noexcept
 {
@@ -73,8 +110,11 @@ AsyncConnectionPool::Lease::~Lease() noexcept
     // Every acquired permit must return even if connect/query throws. Poisoned
     // or aborted transactions become null slots, never an inherited PGconn.
     if (m_connection && !m_connection->reusable()) m_connection.reset();
+    auto* slot = static_cast<State::Slot*>(m_permit.get());
+    if (!slot) std::terminate();
+    slot->connection = std::move(m_connection);
     const bool returned = m_state->slots.try_send(
-        boost::system::error_code{}, std::move(m_connection));
+        boost::system::error_code{}, std::move(m_permit));
     // If channel lifetime/slot accounting breaks, fail closed rather than
     // accidentally sharing the same physical connection with another lease.
     if (!returned) std::terminate();
@@ -99,6 +139,7 @@ AsyncConnectionPool::AsyncConnectionPool(
     m_state = std::make_shared<State>(
         std::move(executor), std::move(connectionString), maximumConnections,
         acquireTimeout, connectTimeout);
+    m_state->initialize();
 }
 
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
@@ -137,14 +178,18 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
     };
 
     boost::system::error_code error;
-    std::unique_ptr<AsyncConnection> connection = co_await state->slots.async_receive(
+    State::SlotToken permit = co_await state->slots.async_receive(
         asio::cancel_after(bounded(state->acquireTimeout),
             asio::redirect_error(asio::use_awaitable, error)));
     if (error) {
+        // If cancellation raced with delivery, the token's custom deleter
+        // automatically restores its permit instead of silently losing it.
         throw std::runtime_error{"Async PostgreSQL pool acquisition timed out or cancelled"};
     }
-
-    Lease lease{state, std::move(connection)};
+    if (!permit) throw std::runtime_error{"Async PostgreSQL pool returned an empty permit"};
+    auto* slot = static_cast<State::Slot*>(permit.get());
+    auto connection = std::move(slot->connection);
+    Lease lease{state, std::move(permit), std::move(connection)};
     if (!lease.m_connection) {
         // A failed or cancelled connection attempt is also slot-safe:
         // the local lease reissues a null permit from its noexcept destructor.
