@@ -172,3 +172,18 @@ test("native reset probe returns only safe status or transport categories", () =
   assert.match(e2e, /const direct = await directNativeConnectionsProbe\(consumerJar\)/);
   assert.match(e2e, /stage=\$\{response\.headers\["x-openproof-e2e-upstream-stage"\]/);
 });
+
+test("unexpected Beast read-coroutine exceptions return sanitized JSON instead of dropping TCP", () => {
+  const gateway = read("src/gateway/http.cpp");
+  const start = gateway.indexOf("void sendReadFailureIfUnanswered() noexcept");
+  const end = gateway.indexOf("asio::awaitable<void> readRequest()", start);
+  assert.ok(start > 0 && end > start);
+  const fallback = gateway.slice(start, end);
+  assert.match(fallback, /m_response\.has_value\(\)/);
+  assert.match(fallback, /beastHttp::status::internal_server_error/);
+  assert.match(fallback, /beastHttp::field::cache_control, "no-store"/);
+  assert.match(fallback, /failure\.keep_alive\(false\)/);
+  assert.match(fallback, /write\(std::move\(failure\)\)/);
+  assert.doesNotMatch(fallback, /exception\.what\(|error\.message\(|std::cerr|std::cout/);
+  assert.match(gateway, /if \(error\) self->sendReadFailureIfUnanswered\(\)/);
+});
