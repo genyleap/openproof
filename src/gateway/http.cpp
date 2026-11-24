@@ -180,8 +180,8 @@ public:
                 failure.set(beastHttp::field::content_type, "application/json");
                 failure.set(beastHttp::field::cache_control, "no-store");
                 failure.set("x-content-type-options", "nosniff");
-                failure.body() = "{\\\"error\\\":{\\\"code\\\":\\\"INTERNAL\\\","
-                                 "\\\"message\\\":\\\"The request failed.\\\"}}";
+                failure.body() = "{\"error\":{\"code\":\"INTERNAL\","
+                                 "\"message\":\"The request failed.\"}}";
                 failure.keep_alive(false);
                 failure.prepare_payload();
                 write(std::move(failure));
