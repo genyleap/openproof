@@ -220,7 +220,12 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /state->slots\.try_send\(boost::system::error_code\{\},/);
   assert.match(implementation, /recovered\.release\(\)/);
   assert.match(implementation, /new Slot\{weak_from_this\(\), \{\}\}/);
-  assert.match(implementation, /State::SlotToken permit = co_await state->slots\.async_receive/);
+  assert.match(implementation, /const bool received = state->slots\.try_receive\(/);
+  assert.match(implementation, /asio::steady_timer retryTimer\{executor\}/);
+  assert.match(implementation, /constexpr auto retryInterval = std::chrono::milliseconds\{4\}/);
+  assert.match(implementation, /retryTimer\.expires_at\(std::min\(admissionDeadline, now \+ retryInterval\)\)/);
+  assert.match(implementation, /co_await retryTimer\.async_wait/);
+  assert.doesNotMatch(implementation, /slots\.async_receive\(/);
   assert.match(implementation, /auto connection = std::move\(slot->connection\)/);
   assert.match(implementation, /slot->connection = std::move\(m_connection\)/);
   assert.match(implementation, /if \(!returned\) std::terminate\(\)/);
