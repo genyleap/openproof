@@ -343,7 +343,11 @@ public:
             // Post the completion first. If posting fails, co_spawn's
             // exception callback owns the pending-handler decrement; doing
             // the decrement earlier would underflow the admission counter.
-            asio::post(m_owner->m_context,
+            // Dispatch was executed on the independent handler pool. The
+            // response must be posted to this *connection's strand*, not
+            // an arbitrary HTTP reactor worker: Beast's stream timer and
+            // socket operations are not thread-safe across executors.
+            asio::post(m_stream.get_executor(),
                 [self = shared_from_this(), result = std::move(wire)]() mutable {
                     if (self->m_owner->m_running.load(std::memory_order_acquire)) {
                         self->write(std::move(result));
@@ -459,7 +463,12 @@ private:
     {
             while (m_running.load(std::memory_order_acquire)) {
                 boost::system::error_code error;
+                // Every accepted connection owns a distinct strand. The
+                // listener runs multiple reactor threads in production;
+                // reads, response writes and socket deadlines must never
+                // execute simultaneously on different worker threads.
                 Tcp::socket socket = co_await m_acceptor.async_accept(
+                    asio::make_strand(m_context),
                     asio::redirect_error(asio::use_awaitable, error));
                 if (error == asio::error::operation_aborted) co_return;
                 if (error) continue;
