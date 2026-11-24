@@ -425,6 +425,16 @@ async function main() {
         response.writeHead(upstream.statusCode, responseHeaders);
         upstream.pipe(response);
       });
+      // Record protocol phase without recording any request/response bytes.
+      // A reset during TCP connection differs from one after the request
+      // has been completely flushed to the Beast listener.
+      let upstreamConnected = false;
+      let upstreamRequestSent = false;
+      forwarded.once("socket", (socket) => {
+        if (!socket.connecting) upstreamConnected = true;
+        else socket.once("connect", () => { upstreamConnected = true; });
+      });
+      forwarded.once("finish", () => { upstreamRequestSent = true; });
       forwarded.on("error", (error) => {
         // Expose ONLY a fixed allow-list of transport error categories in
         // this disposable local test proxy. Never include raw socket error
@@ -434,9 +444,12 @@ async function main() {
           "EHOSTUNREACH", "ENETUNREACH", "ERR_STREAM_PREMATURE_CLOSE",
         ]);
         const category = permitted.has(error?.code) ? error.code : "OTHER";
+        const stage = !upstreamConnected ? "connect"
+          : !upstreamRequestSent ? "send" : "response";
         if (!response.headersSent) response.writeHead(502, {
           "content-type": "text/plain",
           "x-openproof-e2e-upstream-failure": category,
+          "x-openproof-e2e-upstream-stage": stage,
         });
         response.end("identity upstream unavailable");
       });
@@ -925,7 +938,7 @@ async function main() {
           // response bodies, logs, session tokens, OAuth codes or secrets.
           await new Promise((resolve) => setTimeout(resolve, 100));
           const direct = await directNativeConnectionsProbe(consumerJar);
-          fail(`concurrent native connections upstream disconnected (transport=${response.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, direct=${direct}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+          fail(`concurrent native connections upstream disconnected (transport=${response.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, stage=${response.headers["x-openproof-e2e-upstream-stage"] ?? "unknown"}, direct=${direct}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
         }
         expectStatus(response, 200);
         assert.deepEqual(
