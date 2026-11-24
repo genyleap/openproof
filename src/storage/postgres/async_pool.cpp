@@ -1,8 +1,9 @@
 #include "async_pool.hpp"
 
-#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
 #include <boost/system/error_code.hpp>
@@ -177,16 +178,53 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         return std::min(configured, remaining);
     };
 
-    boost::system::error_code error;
-    State::SlotToken permit = co_await state->slots.async_receive(
-        asio::cancel_after(bounded(state->acquireTimeout),
-            asio::redirect_error(asio::use_awaitable, error)));
-    if (error) {
-        // If cancellation raced with delivery, the token's custom deleter
-        // automatically restores its permit instead of silently losing it.
-        throw std::runtime_error{"Async PostgreSQL pool acquisition timed out or cancelled"};
+    const auto admissionTimeout = bounded(state->acquireTimeout);
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto availableClockRange =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - startedAt);
+    const auto admissionDeadline = admissionTimeout >= availableClockRange
+        ? std::chrono::steady_clock::time_point::max()
+        : startedAt + admissionTimeout;
+
+    // Asio's cancellable async_receive may leave an in-flight channel waiter
+    // stranded after a release/cancellation race on a multithreaded executor.
+    // Only take permits through the synchronous, internally locked try_receive
+    // operation; when the bounded pool is exhausted suspend on an Asio timer,
+    // never a condition_variable or a busy loop. This trades at most 4 ms
+    // admission latency under contention for cancellation-safe capacity.
+    auto executor = co_await asio::this_coro::executor;
+    asio::steady_timer retryTimer{executor};
+    State::SlotToken permit;
+    constexpr auto retryInterval = std::chrono::milliseconds{4};
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= admissionDeadline)
+            throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+        boost::system::error_code channelError;
+        const bool received = state->slots.try_receive(
+            [&](boost::system::error_code error, State::SlotToken value) {
+                channelError = error;
+                permit = std::move(value);
+            });
+        if (received) {
+            if (channelError || !permit)
+                throw std::runtime_error{"Async PostgreSQL pool returned an invalid permit"};
+            // Even an immediate queue delivery cannot extend an expired
+            // deadline. The RAII token safely returns itself if we reject it.
+            if (std::chrono::steady_clock::now() >= admissionDeadline)
+                throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= admissionDeadline)
+            throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+        retryTimer.expires_at(std::min(admissionDeadline, now + retryInterval));
+        boost::system::error_code error;
+        co_await retryTimer.async_wait(
+            asio::redirect_error(asio::use_awaitable, error));
+        if (error)
+            throw std::runtime_error{"Async PostgreSQL pool acquisition cancelled"};
     }
-    if (!permit) throw std::runtime_error{"Async PostgreSQL pool returned an empty permit"};
     auto* slot = static_cast<State::Slot*>(permit.get());
     auto connection = std::move(slot->connection);
     Lease lease{state, std::move(permit), std::move(connection)};
