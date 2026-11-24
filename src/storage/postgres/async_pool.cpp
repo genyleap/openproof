@@ -27,7 +27,7 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
         std::weak_ptr<State> owner;
         std::unique_ptr<AsyncConnection> connection;
     };
-    using SlotToken = std::unique_ptr<void, void(*)(void*)>;
+    using SlotToken = std::unique_ptr<void, PoolPermitDeleter>;
     using SlotChannel = asio::experimental::concurrent_channel<
         void(boost::system::error_code, SlotToken)>;
 
@@ -44,7 +44,7 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
             delete slot;
             return;
         }
-        SlotToken recovered{raw, &State::recoverSlot};
+        SlotToken recovered{raw, PoolPermitDeleter{&State::recoverSlot}};
         if (!state->slots.try_send(boost::system::error_code{},
                                     std::move(recovered))) {
             // A full channel here violates exclusive slot accounting.
@@ -70,7 +70,7 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
         // exists, allowing every slot to carry a recovery-safe weak owner.
         for (std::size_t index = 0U; index < maximumConnections; ++index) {
             SlotToken slot{static_cast<void*>(new Slot{weak_from_this(), {}}),
-                           &State::recoverSlot};
+                           PoolPermitDeleter{&State::recoverSlot}};
             if (!slots.try_send(boost::system::error_code{}, std::move(slot))) {
                 throw std::runtime_error{"Unable to initialize async PostgreSQL pool"};
             }
