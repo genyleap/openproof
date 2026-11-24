@@ -116,6 +116,9 @@ test("disposable proxy error classification never exposes raw upstream exception
   }
   assert.match(proxy, /permitted\.has\(error\?\.code\) \? error\.code : "OTHER"/);
   assert.match(proxy, /"x-openproof-e2e-upstream-failure": category/);
+  assert.match(proxy, /"x-openproof-e2e-upstream-stage": stage/);
+  assert.match(proxy, /!upstreamConnected \? "connect"/);
+  assert.match(proxy, /!upstreamRequestSent \? "send" : "response"/);
   assert.doesNotMatch(proxy, /error\?\.message|error\.stack|console\.|oppLog/);
   assert.match(e2e, /concurrent native connections upstream disconnected \(transport=/);
   assert.match(e2e, /oppProcess\?\.signalCode \?\? "none"/);
@@ -152,4 +155,20 @@ test("disposable reverse proxy does not reuse one-request Beast TCP sockets", ()
   assert.match(options, /\? \{ agent: false \} : \{\}/);
   const gateway = read("src/gateway/http.cpp");
   assert.match(gateway, /output\.keep_alive\(false\)/);
+});
+
+test("native reset probe returns only safe status or transport categories", () => {
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  const start = e2e.indexOf("async function directNativeConnectionsProbe(jar)");
+  const end = e2e.indexOf("async function waitUntilReady()", start);
+  assert.ok(start > 0 && end > start);
+  const probe = e2e.slice(start, end);
+  assert.match(probe, /path: "\/account\/connections", method: "GET"/);
+  assert.match(probe, /"x-forwarded-for": "127\.0\.0\.1"/);
+  assert.match(probe, /agent: false, timeout: 1500/);
+  assert.match(probe, /response\.resume\(\)/);
+  assert.match(probe, /"invalid-status"/);
+  assert.doesNotMatch(probe, /console\.|error\.message|error\.stack|response\.body/);
+  assert.match(e2e, /const direct = await directNativeConnectionsProbe\(consumerJar\)/);
+  assert.match(e2e, /stage=\$\{response\.headers\["x-openproof-e2e-upstream-stage"\]/);
 });
