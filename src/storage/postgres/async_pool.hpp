@@ -31,8 +31,14 @@ public:
         [[nodiscard]] AsyncConnection& connection() const noexcept;
     private:
         friend class AsyncConnectionPool;
-        Lease(std::shared_ptr<State> state, std::unique_ptr<AsyncConnection> conn);
+        // A received slot remains an RAII permit until its Lease returns it.
+        // If a cancelled async channel receive drops the slot before a Lease
+        // is constructed, the slot's deleter safely restores pool capacity.
+        Lease(std::shared_ptr<State> state,
+              std::unique_ptr<void, void(*)(void*)> permit,
+              std::unique_ptr<AsyncConnection> conn);
         std::shared_ptr<State> m_state;
+        std::unique_ptr<void, void(*)(void*)> m_permit;
         std::unique_ptr<AsyncConnection> m_connection;
     };
 
