@@ -594,6 +594,42 @@ async function main() {
     });
   }
 
+  // Only after a failed experimental HTTPS fanout, query the same native
+  // read over loopback HTTP to isolate a proxy reset from a listener or
+  // account-session failure. Return a fixed status category, not any body,
+  // exception message, URL, session cookie or response header.
+  async function directNativeConnectionsProbe(jar) {
+    return new Promise((resolve) => {
+      const headers = {
+        host: `127.0.0.1:${oppPort}`,
+        "x-forwarded-for": "127.0.0.1",
+      };
+      if (jar?.header()) headers.cookie = jar.header();
+      const request = http.request({
+        hostname: "127.0.0.1", port: oppPort,
+        path: "/account/connections", method: "GET", headers,
+        agent: false, timeout: 1500,
+      }, (response) => {
+        response.resume();
+        response.once("end", () => {
+          const status = response.statusCode;
+          resolve(Number.isInteger(status) && status >= 100 && status <= 599
+            ? `http-${status}` : "invalid-status");
+        });
+        response.once("error", () => resolve("response-error"));
+      });
+      request.once("timeout", () => {
+        request.destroy();
+        resolve("timeout");
+      });
+      request.once("error", (error) => {
+        resolve(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"].includes(error?.code)
+          ? error.code : "network-error");
+      });
+      request.end();
+    });
+  }
+
   async function waitUntilReady() {
     let lastError;
     for (let attempt = 0; attempt < 100; ++attempt) {
@@ -888,7 +924,8 @@ async function main() {
           // Preserve process status without exposing the upstream's HTTP
           // response bodies, logs, session tokens, OAuth codes or secrets.
           await new Promise((resolve) => setTimeout(resolve, 100));
-          fail(`concurrent native connections upstream disconnected (transport=${response.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+          const direct = await directNativeConnectionsProbe(consumerJar);
+          fail(`concurrent native connections upstream disconnected (transport=${response.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, direct=${direct}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
         }
         expectStatus(response, 200);
         assert.deepEqual(
