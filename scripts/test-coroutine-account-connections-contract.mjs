@@ -210,11 +210,13 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
 test("cancelled channel receives cannot silently consume native PostgreSQL pool capacity", () => {
   const header = read("src/storage/postgres/async_pool.hpp");
   const implementation = read("src/storage/postgres/async_pool.cpp");
-  assert.match(header, /std::unique_ptr<void, void\(\*\)\(void\*\)> m_permit/);
+  assert.match(header, /struct PoolPermitDeleter final/);
+  assert.match(header, /void \(\*recover\)\(void\*\) noexcept = nullptr/);
+  assert.match(header, /std::unique_ptr<void, PoolPermitDeleter> m_permit/);
   assert.match(implementation, /struct Slot final/);
   assert.match(implementation, /std::weak_ptr<State> owner/);
   assert.match(implementation, /static void recoverSlot\(void\* raw\) noexcept/);
-  assert.match(implementation, /SlotToken recovered\{raw, &State::recoverSlot\}/);
+  assert.match(implementation, /SlotToken recovered\{raw, PoolPermitDeleter\{&State::recoverSlot\}\}/);
   assert.match(implementation, /state->slots\.try_send\(boost::system::error_code\{\},/);
   assert.match(implementation, /recovered\.release\(\)/);
   assert.match(implementation, /new Slot\{weak_from_this\(\), \{\}\}/);
