@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -67,6 +68,14 @@ public:
         std::pair<identity::core::IdentityId,
                   std::vector<identity::core::ExternalIdentityRef>>>>
     readConnectionsAsync(identity::core::IdentityId owner);
+
+    /** Read-only TOTP status. nullopt means no configured local-provider link;
+     * false means linked but no usable password/TOTP pair. Never read secrets.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<
+        std::pair<identity::core::IdentityId, std::optional<bool>>>>
+    readTotpStatusAsync(identity::core::IdentityId owner,
+                        identity::provider::ProviderId localProvider);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;

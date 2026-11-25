@@ -52,6 +52,7 @@ jobs:
           node scripts/test-coroutine-native-capability-defaults.mjs
           node scripts/test-coroutine-account-profile-contract.mjs
           node scripts/test-coroutine-account-connections-contract.mjs
+          node scripts/test-coroutine-account-totp-status-contract.mjs
       - name: Whitespace
         run: git diff --check
       - name: End-to-end coroutine coverage gate
@@ -134,6 +135,7 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_profile_e2e_ci
           node scripts/e2e-identity-platform.mjs
@@ -149,6 +151,7 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
           node scripts/e2e-identity-platform.mjs

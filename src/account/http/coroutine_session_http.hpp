@@ -8,6 +8,7 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,12 +41,17 @@ public:
     using ReadConnections = std::function<boost::asio::awaitable<
         foundation::Result<ConnectionList>>(identity::core::IdentityId)>;
 
+    using TotpStatus = std::pair<identity::core::IdentityId, std::optional<bool>>;
+    using ReadTotpStatus = std::function<boost::asio::awaitable<
+        foundation::Result<TotpStatus>>(identity::core::IdentityId)>;
+
     CoroutineAccountSessionAdapter(
         gateway::HttpHandler& legacyAccount,
         gateway::http::CoroutineHttpHandler& asyncFallback,
         gateway::TokenBucketRateLimiter& limiter,
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
-        ReadProfile readProfile = {}, ReadConnections readConnections = {});
+        ReadProfile readProfile = {}, ReadConnections readConnections = {},
+        ReadTotpStatus readTotpStatus = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -64,6 +70,8 @@ private:
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> connectionsRead(
         gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> totpStatusRead(
+        gateway::HttpRequest request);
     [[nodiscard]] static gateway::HttpResponse fail(
         const foundation::Error& failure, const gateway::HttpRequest& request);
     gateway::HttpHandler* m_legacyAccount;
@@ -74,6 +82,7 @@ private:
     RevokeOwned m_revokeOwned;
     ReadProfile m_readProfile;
     ReadConnections m_readConnections;
+    ReadTotpStatus m_readTotpStatus;
 };
 
 } // namespace openproof::account::http

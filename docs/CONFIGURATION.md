@@ -910,3 +910,14 @@ OAuth access additionally carries a verified client ID and scopes from the token
 service; caller-provided scope headers are removed at the gateway boundary.
 
 See `examples/openproof.toml` for a complete deployment sample.
+
+### Experimental native account TOTP status (coroutine branch only)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS=1` enables only
+`GET /account/totp` with a first-party authenticated cookie. Default is disabled;
+requires native account sessions and the account API. Authorization header
+requests and all TOTP enrollment, replacement and disable operations retain
+compatibility dispatch. A single native PostgreSQL read checks active tenant,
+identity and the configured local provider. It returns only availability,
+enrollment status and the authenticated session's assurance; no password hash,
+TOTP seed or recovery code is queried or returned. No identity is provisioned.
