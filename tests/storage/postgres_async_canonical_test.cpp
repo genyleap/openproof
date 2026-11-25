@@ -636,6 +636,57 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
     EXPECT_TRUE(result.get());
 }
 
+// The fixture is isolated by the same guarded Unix socket as every
+// canonical SQL integration test. Never insert credentials on a live DB.
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBooleans)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,'fixture-only-not-a-password-hash',1770000000000)", {seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,enrolled_at_ms) "
+        "VALUES($1,decode('00','hex'),1,1770000000000)", {seed.owner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer canonical{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    pg::CoroutinePostgresCanonicalFinalizer suspended{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.suspendedOrg}, 1U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    auto run = [&]() -> asio::awaitable<void> {
+        const idp::ProviderId provider{"native-canonical-provider"};
+        const auto enabled = co_await canonical.readTotpStatusAsync(ids::IdentityId{seed.owner}, provider);
+        EXPECT_TRUE(enabled && enabled->first.value() == seed.owner && enabled->second == true);
+        const auto disabled = co_await canonical.readTotpStatusAsync(ids::IdentityId{seed.freshLoginOwner}, provider);
+        EXPECT_TRUE(disabled && disabled->second == false);
+        const auto absent = co_await canonical.readTotpStatusAsync(ids::IdentityId{seed.emptyConnectionsOwner}, provider);
+        EXPECT_TRUE(absent && !absent->second.has_value());
+        const auto differentProvider = co_await canonical.readTotpStatusAsync(ids::IdentityId{seed.owner}, idp::ProviderId{"other-provider"});
+        EXPECT_TRUE(differentProvider && !differentProvider->second.has_value());
+        for (const auto& denied : {seed.foreignOwner, seed.lockedOwner, seed.suspendedOwner}) {
+            const auto status = co_await canonical.readTotpStatusAsync(ids::IdentityId{denied}, provider);
+            EXPECT_TRUE(!status && status.error().code() == fnd::ErrorCode::NotFound);
+        }
+        const auto inactiveTenant = co_await suspended.readTotpStatusAsync(ids::IdentityId{seed.suspendedOwner}, provider);
+        EXPECT_TRUE(!inactiveTenant && inactiveTenant.error().code() == fnd::ErrorCode::NotFound);
+    };
+    auto done = asio::co_spawn(io, run(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+}
+
 struct ProfileReadChecks final {
     bool activeProfile{};
     bool wrongTenantDenied{};
