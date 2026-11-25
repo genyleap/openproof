@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -345,6 +346,74 @@ TEST_F(PostgresIntegrationTest, RecoveryCodeIsConsumedExactlyOnceAcrossNodes)
     second.join();
     EXPECT_EQ(winners.load(), 1U);
     EXPECT_EQ(firstRepository.remaining(core::IdentityId{"identity-1"}).value(), 3U);
+}
+
+TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
+{
+    // The fixture already applies the real schema in the exclusive
+    // integration database. Hold the exact advisory transaction lock
+    // used by AsyncRecoveryCodeSql::replace on a separate connection.
+    pg::PostgresRecoveryCodeRepository repository{*pool};
+    const core::IdentityId identity{"identity-1"};
+    cred::RecoveryCodeDigest prior{};
+    prior.fill(std::byte{0x11});
+    cred::RecoveryCodeDigest next{};
+    next.fill(std::byte{0x22});
+    ASSERT_TRUE(repository.replace(identity, {prior}));
+    execute("BEGIN");
+    std::unique_ptr<PGresult, ResultDeleter> locked{PQexec(direct.get(),
+        "SELECT pg_advisory_xact_lock(hashtextextended('identity-1',0))")};
+    ASSERT_TRUE(locked && PQresultStatus(locked.get()) == PGRES_TUPLES_OK);
+    // Emulate the intervening native transaction with its real shared
+    // lock key and disjoint code batch, not an in-memory repository.
+    execute("DELETE FROM openproof.recovery_codes WHERE identity_id='identity-1'");
+    execute("INSERT INTO openproof.recovery_codes(identity_id,code_digest,issued_at_ms) "
+            "VALUES('identity-1',decode(repeat('33',32),'hex'),1770000000000)");
+
+    bool replaced = false;
+    std::jthread rotate{[&] {
+        replaced = repository.replace(identity, {next}).has_value();
+    }};
+    // Observe a real ungranted advisory lock on our lock key rather
+    // than guessing from a thread's sleep or scheduling delay.
+    bool waited = false;
+    bool observerFailed = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (std::chrono::steady_clock::now() < deadline && !waited) {
+        std::unique_ptr<PGresult, ResultDeleter> observed{PQexec(direct.get(),
+            "SELECT EXISTS(SELECT 1 FROM pg_locks h JOIN pg_locks w "
+            "ON h.locktype=w.locktype AND h.database=w.database "
+            "AND h.classid=w.classid AND h.objid=w.objid AND h.objsubid=w.objsubid "
+            "WHERE h.locktype='advisory' AND h.pid=pg_backend_pid() "
+            "AND h.granted AND NOT w.granted AND w.pid<>h.pid)")};
+        if (!observed || PQresultStatus(observed.get()) != PGRES_TUPLES_OK
+            || PQntuples(observed.get()) != 1) {
+            observerFailed = true;
+            break;
+        }
+        waited = std::string_view{PQgetvalue(observed.get(), 0, 0)} == "t";
+        if (!waited) std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    // Always release before joining, including a failed observation.
+    std::unique_ptr<PGresult, ResultDeleter> committed{PQexec(direct.get(), "COMMIT")};
+    if (!committed || PQresultStatus(committed.get()) != PGRES_COMMAND_OK) {
+        std::unique_ptr<PGresult, ResultDeleter> rollbackResult{PQexec(direct.get(), "ROLLBACK")};
+        static_cast<void>(rollbackResult);
+    }
+    rotate.join();
+    ASSERT_TRUE(committed && PQresultStatus(committed.get()) == PGRES_COMMAND_OK);
+    ASSERT_FALSE(observerFailed);
+    EXPECT_TRUE(waited);
+    ASSERT_TRUE(replaced);
+    auto count = repository.remaining(identity);
+    ASSERT_TRUE(count);
+    EXPECT_EQ(count.value(), 1U);
+    cred::RecoveryCodeDigest intervening{};
+    intervening.fill(std::byte{0x33});
+    EXPECT_FALSE(repository.consume(identity, prior));
+    EXPECT_FALSE(repository.consume(identity, intervening));
+    EXPECT_TRUE(repository.consume(identity, next));
+    EXPECT_FALSE(repository.consume(identity, next));
 }
 
 TEST_F(PostgresIntegrationTest, IdentityOrganizationMembershipAndExternalLinksRoundTrip)
