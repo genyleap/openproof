@@ -66,3 +66,26 @@ test("socket readiness remains cancellation- and deadline-bound", () => {
   assert.match(body, /asio::cancel_after\(remaining/);
   assert.match(body, /asio::redirect_error\(asio::use_awaitable,\s*error\)/);
 });
+
+test("timed PostgreSQL operations are serialized on their current executor", () => {
+  const connect = source.indexOf("AsyncConnection::connect(");
+  const connectImpl = source.indexOf("AsyncConnection::connectSerialized(", connect);
+  const query = source.indexOf("AsyncConnection::query(");
+  const queryImpl = source.indexOf("AsyncConnection::querySerialized(", query);
+  assert.ok(connect > 0 && connectImpl > connect && query > connectImpl && queryImpl > query);
+  for (const wrapper of [source.slice(connect, connectImpl), source.slice(query, queryImpl)]) {
+    assert.match(wrapper, /const Deadline deadline = makeDeadline\(timeout\)/);
+    assert.match(wrapper, /co_await asio::this_coro::executor/);
+    assert.match(wrapper, /asio::co_spawn\(asio::make_strand\(executor\)/);
+    assert.match(wrapper, /asio::use_awaitable/);
+  }
+  assert.doesNotMatch(source, /m_impl->executor/);
+  const implementation = source.slice(queryImpl);
+  assert.match(implementation, /auto executor = co_await asio::this_coro::executor/);
+  assert.match(implementation, /waitForSocket\(executor, connection,/);
+  const testSource = fs.readFileSync(path.join(root,
+    "tests/storage/postgres_async_canonical_test.cpp"), "utf8");
+  assert.match(testSource, /TEST\(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor\)/);
+  assert.match(testSource, /ASSERT_TRUE\(opening.stopped\(\)\)/);
+  assert.match(testSource, /queryOnNextExecutor\(std::move\(connection\)\)/);
+});
