@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
+import { parseFixtureSubjects } from "./ci/native-ldap-fixture.mjs";
 const root = path.resolve(import.meta.dirname, "..");
 const read = p => fs.readFileSync(path.join(root,p), "utf8");
 test("real LDAP fixture is guarded, loopback-only and owns its process", () => {
@@ -27,4 +28,19 @@ test("HTTP LDAP E2E checks negative proofs against persistent row counts", () =>
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /createdb -O openproof_ci openproof_native_ldap_e2e_ci/);
   assert.match(ci, /OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"/);
+});
+
+test("LDIF identity mapping requires two independently unique subjects", () => {
+  const linked = "11111111-1111-4111-8111-111111111111";
+  const unlinked = "22222222-2222-4222-8222-222222222222";
+  const first = "dn: uid=linked,ou=people,dc=e2e,dc=invalid\nuid: linked\nentryUUID: " + linked;
+  const second = "dn: uid=unlinked,ou=people,dc=e2e,dc=invalid\nentryUUID: " + unlinked + "\nuid: unlinked";
+  assert.deepEqual(parseFixtureSubjects(second + "\n\n" + first + "\n\n"), { linked, unlinked });
+  assert.equal(parseFixtureSubjects(first), null);
+  assert.equal(parseFixtureSubjects(first + "\n\n" + first), null);
+  assert.equal(parseFixtureSubjects(first + "\n\n" + second.replace(unlinked, linked)), null);
+  assert.equal(parseFixtureSubjects(first + "\n\n" + second + "\n\n" + first), null);
+  assert.equal(parseFixtureSubjects(first + "\n\n" + second.replace("uid: unlinked", "uid: other")), null);
+  assert.equal(parseFixtureSubjects(first + "\n\n" + second.replace(unlinked, "malformed")), null);
+  assert.equal(parseFixtureSubjects(first + "\nentryUUID: " + unlinked + "\n\n" + second), null);
 });
