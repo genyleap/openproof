@@ -586,6 +586,56 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
 }
 
 
+// Own the physical connection throughout the query, including cancellation.
+asio::awaitable<bool> queryOnNextExecutor(
+    std::unique_ptr<pg::async_detail::AsyncConnection> connection)
+{
+    const auto rows = co_await connection->query(
+        "SELECT 'executor-handoff'::text FROM pg_sleep(0.05)", {},
+        std::chrono::seconds{1});
+    co_return connection->reusable() && rows.rows.size() == 1U
+        && rows.rows.front().size() == 1U
+        && rows.rows.front().front() == "executor-handoff";
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "A disposable SQL database was requested with an invalid DSN.";
+        GTEST_SKIP() << "No explicitly acknowledged disposable PostgreSQL cluster.";
+    }
+    // Keep the original context alive but stopped throughout the next
+    // operation. A cached opening executor cannot service its socket.
+    asio::io_context next;
+    asio::io_context opening;
+    auto connected = asio::co_spawn(opening,
+        pg::async_detail::AsyncConnection::connect(*dsn,
+            std::chrono::seconds{2}), asio::use_future);
+    opening.run();
+    auto connection = connected.get();
+    ASSERT_TRUE(connection);
+    ASSERT_TRUE(opening.stopped());
+
+    auto result = asio::co_spawn(next,
+        queryOnNextExecutor(std::move(connection)), asio::use_future);
+    next.run_for(std::chrono::seconds{3});
+    const bool ready = result.wait_for(std::chrono::seconds{0})
+        == std::future_status::ready;
+    EXPECT_TRUE(ready) << "Query did not complete on its current executor.";
+    if (!ready) {
+        // Drain a regressed implementation without destroying a context
+        // while a coroutine still owns a descriptor on that context.
+        opening.restart();
+        opening.run_for(std::chrono::seconds{2});
+        next.restart();
+        next.run_for(std::chrono::seconds{2});
+        return;
+    }
+    EXPECT_TRUE(result.get());
+}
+
 struct ProfileReadChecks final {
     bool activeProfile{};
     bool wrongTenantDenied{};
