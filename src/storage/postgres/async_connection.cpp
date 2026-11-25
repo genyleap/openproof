@@ -149,16 +149,14 @@ asio::awaitable<void> waitForSocket(
 } // namespace
 
 struct AsyncConnection::Impl final {
-    asio::any_io_executor executor;
     PgPointer connection;
     std::atomic<bool> busy{false};
 
-    Impl(asio::any_io_executor executorValue, PGconn* handle)
-        : executor(std::move(executorValue)), connection(handle) {}
+    explicit Impl(PGconn* handle) : connection(handle) {}
 };
 
-AsyncConnection::AsyncConnection(asio::any_io_executor executor, pg_conn* handle)
-    : m_impl(std::make_unique<Impl>(std::move(executor), handle)) {}
+AsyncConnection::AsyncConnection(pg_conn* handle)
+    : m_impl(std::make_unique<Impl>(handle)) {}
 
 AsyncConnection::~AsyncConnection() = default;
 
@@ -179,6 +177,18 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
     std::string connectionString, std::chrono::milliseconds timeout)
 {
     const Deadline deadline = makeDeadline(timeout);
+    SecretBufferScrub scrubConnectionString{connectionString};
+    // cancel_after's timer and I/O completion must execute serially even
+    // when the caller's io_context or thread_pool runs on several threads.
+    auto executor = co_await asio::this_coro::executor;
+    co_return co_await asio::co_spawn(asio::make_strand(executor),
+        connectSerialized(std::move(connectionString), deadline),
+        asio::use_awaitable);
+}
+
+asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connectSerialized(
+    std::string connectionString, Deadline deadline)
+{
     // The original conninfo may contain credentials. Preserve it across
     // asynchronous DNS resolution, then wipe on success, timeout or cancel.
     SecretBufferScrub scrubConnectionString{connectionString};
@@ -428,7 +438,7 @@ asio::awaitable<std::unique_ptr<AsyncConnection>> AsyncConnection::connect(
         throw;
     }
     co_return std::unique_ptr<AsyncConnection>{
-        new AsyncConnection{executor, connection.release()}};
+        new AsyncConnection{connection.release()}};
 }
 
 asio::awaitable<QueryRows> AsyncConnection::query(
@@ -436,6 +446,20 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     std::chrono::milliseconds timeout)
 {
     const Deadline deadline = makeDeadline(timeout);
+    auto executor = co_await asio::this_coro::executor;
+    // A pooled PGconn can move between request executors. Its next query
+    // must use the current operation's serialized executor, not the one
+    // on which the physical connection happened to be opened.
+    co_return co_await asio::co_spawn(asio::make_strand(executor),
+        querySerialized(std::move(sql), std::move(params), deadline),
+        asio::use_awaitable);
+}
+
+asio::awaitable<QueryRows> AsyncConnection::querySerialized(
+    std::string sql, std::vector<std::optional<std::string>> params,
+    Deadline deadline)
+{
+    auto executor = co_await asio::this_coro::executor;
     if (m_impl->busy.exchange(true, std::memory_order_acq_rel)) {
         throw std::runtime_error{"PostgreSQL connection is already busy"};
     }
@@ -505,7 +529,7 @@ asio::awaitable<QueryRows> AsyncConnection::query(
             if (flushStatus < 0) {
                 throw std::runtime_error{"PostgreSQL query flush failed"};
             }
-            co_await waitForSocket(m_impl->executor, connection,
+            co_await waitForSocket(executor, connection,
                 asio::posix::stream_descriptor::wait_write, deadline);
         }
 
@@ -525,7 +549,7 @@ asio::awaitable<QueryRows> AsyncConnection::query(
                 throw std::runtime_error{"PostgreSQL operation timed out"};
             }
             if (PQisBusy(connection) != 0) {
-                co_await waitForSocket(m_impl->executor, connection,
+                co_await waitForSocket(executor, connection,
                     asio::posix::stream_descriptor::wait_read, deadline);
                 continue;
             }
