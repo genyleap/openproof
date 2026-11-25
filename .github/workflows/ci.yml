@@ -52,6 +52,10 @@ jobs:
           node scripts/test-coroutine-native-capability-defaults.mjs
           node scripts/test-coroutine-account-profile-contract.mjs
           node scripts/test-coroutine-account-connections-contract.mjs
+      - name: Native LDAP disposable fixture and transport contract
+        run: |
+          node scripts/test-native-enterprise-ldaps.mjs
+          node scripts/test-native-ldap-real-e2e-contract.mjs
       - name: Whitespace
         run: git diff --check
       - name: End-to-end coroutine coverage gate
@@ -71,6 +75,9 @@ jobs:
 
       - name: Install build dependencies
         run: ./scripts/ci/install-build-deps.sh
+
+      - name: Install disposable LDAPS fixture tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends slapd ldap-utils
 
       - name: Configure
         run: |
@@ -151,6 +158,16 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
+          node scripts/e2e-identity-platform.mjs
+
+      - name: Native LDAP TLS and PostgreSQL HTTP E2E
+        timeout-minutes: 20
+        env:
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_ldap_e2e_ci
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_native_ldap_e2e_ci
           node scripts/e2e-identity-platform.mjs
 
       # Run the real application E2E immediately after the executable
