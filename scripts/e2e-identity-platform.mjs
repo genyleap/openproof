@@ -413,14 +413,44 @@ async function main() {
         method: request.method,
         path: request.url,
         headers,
+        // In the experimental concurrent-read E2E, Beast explicitly sends
+        // Connection: close. Use a fresh upstream socket to exclude stale
+        // pooled-socket races, without changing the existing Agent behavior
+        // in the default E2E or pinned comparative benchmark workload.
+        ...(process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"
+          ? { agent: false } : {}),
       }, (upstream) => {
         const responseHeaders = { ...upstream.headers };
         responseHeaders["strict-transport-security"] = "max-age=31536000";
         response.writeHead(upstream.statusCode, responseHeaders);
         upstream.pipe(response);
       });
-      forwarded.on("error", () => {
-        if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
+      // Record protocol phase without recording any request/response bytes.
+      // A reset during TCP connection differs from one after the request
+      // has been completely flushed to the Beast listener.
+      let upstreamConnected = false;
+      let upstreamRequestSent = false;
+      forwarded.once("socket", (socket) => {
+        if (!socket.connecting) upstreamConnected = true;
+        else socket.once("connect", () => { upstreamConnected = true; });
+      });
+      forwarded.once("finish", () => { upstreamRequestSent = true; });
+      forwarded.on("error", (error) => {
+        // Expose ONLY a fixed allow-list of transport error categories in
+        // this disposable local test proxy. Never include raw socket error
+        // messages, request URLs, headers, OAuth codes or cookie material.
+        const permitted = new Set([
+          "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT",
+          "EHOSTUNREACH", "ENETUNREACH", "ERR_STREAM_PREMATURE_CLOSE",
+        ]);
+        const category = permitted.has(error?.code) ? error.code : "OTHER";
+        const stage = !upstreamConnected ? "connect"
+          : !upstreamRequestSent ? "send" : "response";
+        if (!response.headersSent) response.writeHead(502, {
+          "content-type": "text/plain",
+          "x-openproof-e2e-upstream-failure": category,
+          "x-openproof-e2e-upstream-stage": stage,
+        });
         response.end("identity upstream unavailable");
       });
       request.pipe(forwarded);
@@ -573,6 +603,42 @@ async function main() {
       });
       request.on("error", reject);
       if (body) request.write(body);
+      request.end();
+    });
+  }
+
+  // Only after a failed experimental HTTPS fanout, query the same native
+  // read over loopback HTTP to isolate a proxy reset from a listener or
+  // account-session failure. Return a fixed status category, not any body,
+  // exception message, URL, session cookie or response header.
+  async function directNativeConnectionsProbe(jar) {
+    return new Promise((resolve) => {
+      const headers = {
+        host: `127.0.0.1:${oppPort}`,
+        "x-forwarded-for": "127.0.0.1",
+      };
+      if (jar?.header()) headers.cookie = jar.header();
+      const request = http.request({
+        hostname: "127.0.0.1", port: oppPort,
+        path: "/account/connections", method: "GET", headers,
+        agent: false, timeout: 1500,
+      }, (response) => {
+        response.resume();
+        response.once("end", () => {
+          const status = response.statusCode;
+          resolve(Number.isInteger(status) && status >= 100 && status <= 599
+            ? `http-${status}` : "invalid-status");
+        });
+        response.once("error", () => resolve("response-error"));
+      });
+      request.once("timeout", () => {
+        request.destroy();
+        resolve("timeout");
+      });
+      request.once("error", (error) => {
+        resolve(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"].includes(error?.code)
+          ? error.code : "network-error");
+      });
       request.end();
     });
   }
@@ -847,11 +913,40 @@ async function main() {
     const consumerJar = new CookieJar();
     await login("consumer@e2e.invalid", consumerPassword, consumerJar);
     const connectionsBefore = await edgeRequest("/account/connections", { jar: consumerJar });
+    if (connectionsBefore.status === 502) {
+      // Never print upstream stdout/stderr or response bodies: those may hold
+      // session cookies, OAuth codes and other secrets. A process exit/signal
+      // is sufficient to distinguish a fatal native crash from a transport
+      // or fixture timeout on this exact experimental boundary.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      fail(`native account connections upstream disconnected (transport=${connectionsBefore.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+    }
     expectStatus(connectionsBefore, 200);
     assert.deepEqual(
       jsonBody(connectionsBefore).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
       [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
     );
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Exercise the opt-in read concurrently: connection-pool contention
+      // must suspend without dropping sockets or leaking another identity.
+      // Default/benchmark runs keep their existing compatibility workload.
+      const reads = await Promise.all(Array.from({ length: 8 },
+        () => edgeRequest("/account/connections", { jar: consumerJar })));
+      for (const response of reads) {
+        if (response.status === 502) {
+          // Preserve process status without exposing the upstream's HTTP
+          // response bodies, logs, session tokens, OAuth codes or secrets.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          const direct = await directNativeConnectionsProbe(consumerJar);
+          fail(`concurrent native connections upstream disconnected (transport=${response.headers["x-openproof-e2e-upstream-failure"] ?? "unknown"}, stage=${response.headers["x-openproof-e2e-upstream-stage"] ?? "unknown"}, direct=${direct}, opp exit=${oppProcess?.exitCode ?? "running"}, signal=${oppProcess?.signalCode ?? "none"})`);
+        }
+        expectStatus(response, 200);
+        assert.deepEqual(
+          jsonBody(response).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
+          [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
+        );
+      }
+    }
     const connectionStart = await jsonRequest("/account/connections/web3/start", "POST", {
       provider: "farcaster",
       address: farcasterAddress,

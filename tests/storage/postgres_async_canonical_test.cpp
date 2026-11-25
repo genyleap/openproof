@@ -5,14 +5,17 @@
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <utility>
@@ -128,6 +131,7 @@ struct Seed final {
     std::string suspendedOrg = "nc-suspended-org-" + suffix;
     std::string owner = "nc-owner-" + suffix;
     std::string secondOwner = "nc-second-" + suffix;
+    std::string emptyConnectionsOwner = "nc-empty-connections-" + suffix;
     std::string freshLoginOwner = "nc-fresh-login-" + suffix;
     std::string simultaneousOwner = "nc-simultaneous-" + suffix;
     std::string lockedOwner = "nc-locked-" + suffix;
@@ -155,6 +159,7 @@ struct Seed final {
         for (const auto& [id, tenant, status] :
             {std::tuple{owner, org, "0"},
              std::tuple{secondOwner, org, "0"},
+             std::tuple{emptyConnectionsOwner, org, "0"},
              std::tuple{freshLoginOwner, org, "0"},
              std::tuple{simultaneousOwner, org, "0"},
              std::tuple{lockedOwner, org, "2"},
@@ -581,12 +586,67 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
 }
 
 
+// Own the physical connection throughout the query, including cancellation.
+asio::awaitable<bool> queryOnNextExecutor(
+    std::unique_ptr<pg::async_detail::AsyncConnection> connection)
+{
+    const auto rows = co_await connection->query(
+        "SELECT 'executor-handoff'::text FROM pg_sleep(0.05)", {},
+        std::chrono::seconds{1});
+    co_return connection->reusable() && rows.rows.size() == 1U
+        && rows.rows.front().size() == 1U
+        && rows.rows.front().front() == "executor-handoff";
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "A disposable SQL database was requested with an invalid DSN.";
+        GTEST_SKIP() << "No explicitly acknowledged disposable PostgreSQL cluster.";
+    }
+    // Keep the original context alive but stopped throughout the next
+    // operation. A cached opening executor cannot service its socket.
+    asio::io_context next;
+    asio::io_context opening;
+    auto connected = asio::co_spawn(opening,
+        pg::async_detail::AsyncConnection::connect(*dsn,
+            std::chrono::seconds{2}), asio::use_future);
+    opening.run();
+    auto connection = connected.get();
+    ASSERT_TRUE(connection);
+    ASSERT_TRUE(opening.stopped());
+
+    auto result = asio::co_spawn(next,
+        queryOnNextExecutor(std::move(connection)), asio::use_future);
+    next.run_for(std::chrono::seconds{3});
+    const bool ready = result.wait_for(std::chrono::seconds{0})
+        == std::future_status::ready;
+    EXPECT_TRUE(ready) << "Query did not complete on its current executor.";
+    if (!ready) {
+        // Drain a regressed implementation without destroying a context
+        // while a coroutine still owns a descriptor on that context.
+        opening.restart();
+        opening.run_for(std::chrono::seconds{2});
+        next.restart();
+        next.run_for(std::chrono::seconds{2});
+        return;
+    }
+    EXPECT_TRUE(result.get());
+}
+
 struct ProfileReadChecks final {
     bool activeProfile{};
     bool wrongTenantDenied{};
     bool foreignTenantDenied{};
     bool inactiveIdentityDenied{};
     bool inactiveOrganizationDenied{};
+    bool activeConnections{};
+    bool emptyConnections{};
+    bool wrongTenantConnectionsDenied{};
+    bool inactiveConnectionsDenied{};
+    bool suspendedConnectionsDenied{};
 };
 
 asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
@@ -617,7 +677,40 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
         ids::IdentityId{seed.suspendedOwner});
     checks.inactiveOrganizationDenied = !suspended
         && suspended.error().code() == fnd::ErrorCode::NotFound;
+
+    auto linked = co_await canonical.readConnectionsAsync(ids::IdentityId{seed.owner});
+    checks.activeConnections = linked
+        && linked->first.value() == seed.owner && !linked->second.empty();
+    auto emptyLinks = co_await canonical.readConnectionsAsync(
+        ids::IdentityId{seed.emptyConnectionsOwner});
+    checks.emptyConnections = emptyLinks
+        && emptyLinks->first.value() == seed.emptyConnectionsOwner
+        && emptyLinks->second.empty();
+    auto wrongLinks = co_await wrongTenant.readConnectionsAsync(
+        ids::IdentityId{seed.owner});
+    checks.wrongTenantConnectionsDenied = !wrongLinks
+        && wrongLinks.error().code() == fnd::ErrorCode::NotFound;
+    auto inactiveLinks = co_await canonical.readConnectionsAsync(
+        ids::IdentityId{seed.lockedOwner});
+    checks.inactiveConnectionsDenied = !inactiveLinks
+        && inactiveLinks.error().code() == fnd::ErrorCode::NotFound;
+    auto suspendedLinks = co_await suspendedTenant.readConnectionsAsync(
+        ids::IdentityId{seed.suspendedOwner});
+    checks.suspendedConnectionsDenied = !suspendedLinks
+        && suspendedLinks.error().code() == fnd::ErrorCode::NotFound;
     co_return checks;
+}
+
+// Exercise concurrent native readers on different io_context threads,
+// including an active Identity with no external providers. No request may
+// inherit another owner's linked account metadata through pool reuse.
+asio::awaitable<bool> concurrentConnectionRead(
+    pg::CoroutinePostgresCanonicalFinalizer& canonical,
+    ids::IdentityId owner, bool emptyExpected)
+{
+    auto linked = co_await canonical.readConnectionsAsync(owner);
+    co_return linked && linked->first == owner
+        && linked->second.empty() == emptyExpected;
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
@@ -815,5 +908,58 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(profileChecks.foreignTenantDenied);
     EXPECT_TRUE(profileChecks.inactiveIdentityDenied);
     EXPECT_TRUE(profileChecks.inactiveOrganizationDenied);
+    EXPECT_TRUE(profileChecks.activeConnections);
+    EXPECT_TRUE(profileChecks.emptyConnections);
+    EXPECT_TRUE(profileChecks.wrongTenantConnectionsDenied);
+    EXPECT_TRUE(profileChecks.inactiveConnectionsDenied);
+    EXPECT_TRUE(profileChecks.suspendedConnectionsDenied);
+
+    // Run more requests than the bounded connection-pool capacity on four
+    // executor threads. A simple sequential SELECT would never exercise
+    // the channel handoff and connection lifetime under real contention.
+    // The normal runtime constructs a dedicated native PostgreSQL executor.
+    // Do the same here: prior identity mutation/negative-timeout scenarios
+    // have already stopped/restarted "io" repeatedly, and reusing their
+    // reactor introduces unrelated stale cancellation state into this probe.
+    // This is still the SAME disposable database, and all eight SQL requests
+    // contend for two physical connections in four running OS threads.
+    asio::io_context concurrentIo;
+    pg::CoroutinePostgresCanonicalFinalizer concurrentCanonical{
+        concurrentIo.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, 2U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    // Keep the independent executor alive until all eight completions fire.
+    auto work = asio::make_work_guard(concurrentIo);
+    std::atomic<std::size_t> completed{0U};
+    std::atomic<std::size_t> failed{0U};
+    std::promise<void> allCompleted;
+    auto completion = allCompleted.get_future();
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        const bool emptyExpected = index % 2U == 1U;
+        asio::co_spawn(concurrentIo,
+            concurrentConnectionRead(concurrentCanonical, ids::IdentityId{
+                emptyExpected ? seed.emptyConnectionsOwner : seed.owner},
+                emptyExpected),
+            [&](std::exception_ptr exception, bool valid) {
+                if (exception || !valid)
+                    failed.fetch_add(1U, std::memory_order_relaxed);
+                if (completed.fetch_add(1U, std::memory_order_acq_rel) + 1U == 8U)
+                    allCompleted.set_value();
+            });
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(4U);
+    for (std::size_t index = 0U; index < 4U; ++index)
+        workers.emplace_back([&concurrentIo] { concurrentIo.run(); });
+    // A shared ten-second ceiling prevents deadlocks from hanging CI.
+    const bool finished = completion.wait_for(std::chrono::seconds{10})
+        == std::future_status::ready;
+    work.reset();
+    concurrentIo.stop();
+    for (auto& worker : workers) worker.join();
+    EXPECT_TRUE(finished);
+    EXPECT_EQ(completed.load(std::memory_order_acquire), 8U);
+    EXPECT_EQ(failed.load(std::memory_order_relaxed), 0U);
 }
 } // namespace

@@ -161,15 +161,36 @@ public:
             // compatibility pool until repository/provider SPIs are async.
             asio::co_spawn(m_stream.get_executor(), readRequest(),
                 [self = shared_from_this()](std::exception_ptr error) {
-                    // co_spawn must consume exceptions rather than terminate a worker.
-                    if (error) {
-                        try { std::rethrow_exception(error); }
-                        catch (...) {}
-                    }
+                    // An unexpected exception during request parsing or
+                    // dispatch must not silently tear down a client socket.
+                    // The exception can contain secrets; never render or log
+                    // its message. A response may already be in flight.
+                    if (error) self->sendReadFailureIfUnanswered();
                 });
         }
 
     private:
+        void sendReadFailureIfUnanswered() noexcept
+        {
+            if (m_response.has_value()
+                || !m_owner->m_running.load(std::memory_order_acquire)) return;
+            try {
+                beastHttp::response<beastHttp::string_body> failure{
+                    beastHttp::status::internal_server_error, 11U};
+                failure.set(beastHttp::field::content_type, "application/json");
+                failure.set(beastHttp::field::cache_control, "no-store");
+                failure.set("x-content-type-options", "nosniff");
+                failure.body() = "{\"error\":{\"code\":\"INTERNAL\","
+                                 "\"message\":\"The request failed.\"}}";
+                failure.keep_alive(false);
+                failure.prepare_payload();
+                write(std::move(failure));
+            } catch (...) {
+                // If memory or socket setup is unavailable, there is no
+                // recoverable response. Preserve fail-closed behavior.
+            }
+        }
+
         asio::awaitable<void> readRequest()
         {
             m_parser.emplace();
@@ -322,7 +343,11 @@ public:
             // Post the completion first. If posting fails, co_spawn's
             // exception callback owns the pending-handler decrement; doing
             // the decrement earlier would underflow the admission counter.
-            asio::post(m_owner->m_context,
+            // Dispatch was executed on the independent handler pool. The
+            // response must be posted to this *connection's strand*, not
+            // an arbitrary HTTP reactor worker: Beast's stream timer and
+            // socket operations are not thread-safe across executors.
+            asio::post(m_stream.get_executor(),
                 [self = shared_from_this(), result = std::move(wire)]() mutable {
                     if (self->m_owner->m_running.load(std::memory_order_acquire)) {
                         self->write(std::move(result));
@@ -438,7 +463,12 @@ private:
     {
             while (m_running.load(std::memory_order_acquire)) {
                 boost::system::error_code error;
+                // Every accepted connection owns a distinct strand. The
+                // listener runs multiple reactor threads in production;
+                // reads, response writes and socket deadlines must never
+                // execute simultaneously on different worker threads.
                 Tcp::socket socket = co_await m_acceptor.async_accept(
+                    asio::make_strand(m_context),
                     asio::redirect_error(asio::use_awaitable, error));
                 if (error == asio::error::operation_aborted) co_return;
                 if (error) continue;

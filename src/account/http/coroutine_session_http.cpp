@@ -57,6 +57,12 @@ private:
         && request.path() == "/account/profile";
 }
 
+[[nodiscard]] bool connectionsReadRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Get
+        && request.path() == "/account/connections";
+}
+
 [[nodiscard]] bool accountNamespace(const gateway::HttpRequest& request) noexcept
 {
     return request.path() == "/account"
@@ -122,11 +128,12 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     gateway::http::CoroutineHttpHandler& asyncFallback,
     gateway::TokenBucketRateLimiter& limiter,
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
-    ReadProfile readProfile)
+    ReadProfile readProfile, ReadConnections readConnections)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
-      m_readProfile(std::move(readProfile))
+      m_readProfile(std::move(readProfile)),
+      m_readConnections(std::move(readConnections))
 {
 }
 
@@ -144,6 +151,13 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return !request.header("authorization").has_value()
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readProfile);
+    }
+    if (connectionsReadRoute(request)) {
+        // Delegated OAuth Bearer grants are still authenticated only by the
+        // compatibility route; native reads accept first-party cookies.
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_readConnections);
     }
     return static_cast<bool>(m_authenticate)
         && static_cast<bool>(m_list)
@@ -195,6 +209,9 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (profileReadRoute(request)) {
         co_return co_await profileRead(std::move(request));
+    }
+    if (connectionsReadRoute(request)) {
+        co_return co_await connectionsRead(std::move(request));
     }
     // Only non-account requests can reach the fallback's native entry.
     // No synchronous AccountHttpApi method executes on the reactor.
@@ -318,6 +335,64 @@ CoroutineAccountSessionAdapter::profileRead(gateway::HttpRequest request)
     if (value->pictureUrl()) body["picture"] = *value->pictureUrl();
     body["avatar_source"] = value->avatarSource();
     co_return jsonResponse(200, std::move(body));
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(), request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{
+            foundation::ErrorCode::AuthenticationRequired}, request);
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(), request);
+    auto connections = co_await m_readConnections(authenticated->identity());
+    if (!connections) co_return fail(connections.error(), request);
+    if (connections->first != authenticated->identity()
+        || connections->second.size() > 256U) {
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    }
+    // Validate the entire repository response before serializing metadata.
+    // A faulty asynchronous storage adapter must never leak malformed rows.
+    for (const auto& external : connections->second) {
+        if (external.providerId().empty() || external.subject().empty()
+            || external.providerId().value().size() > 200U
+            || external.subject().value().size() > 1000U) {
+            co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+        }
+    }
+    json::array connectionsJson;
+    for (const auto& external : connections->second) {
+        json::object item{
+            {"provider", external.providerId().value()},
+            {"subject", external.subject().value()}};
+        if (external.displayName()) item["display_name"] = *external.displayName();
+        if (external.preferredUsername())
+            item["preferred_username"] = *external.preferredUsername();
+        if (external.pictureUrl()) item["picture_url"] = *external.pictureUrl();
+        // Maintain the existing provider-neutral HTTP projection, including
+        // legacy Farcaster profile links for numeric FIDs only.
+        if (external.providerId().value() == "farcaster") {
+            const std::string fid{external.subject().value()};
+            const bool numeric = !fid.empty()
+                && std::ranges::all_of(fid, [](char symbol) {
+                    return symbol >= '0' && symbol <= '9';
+                });
+            if (numeric) {
+                item["fid"] = fid;
+                item["profile_url"] = "https://farcaster.xyz/~/profiles/" + fid;
+            }
+        }
+        connectionsJson.emplace_back(std::move(item));
+    }
+    co_return jsonResponse(200,
+        json::object{{"connections", std::move(connectionsJson)}});
 }
 
 } // namespace openproof::account::http

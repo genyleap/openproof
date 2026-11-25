@@ -110,8 +110,18 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
         "127.0.0.1", fnd::CorrelationId{"native-profile-cookie-test"}).value();
 }
 
+[[nodiscard]] gw::HttpRequest connectionsCookieRequest(
+    std::string token = "valid-token")
+{
+    return gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/account/connections",
+        {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-connections-test"}).value();
+}
+
 struct Fixture final {
-    explicit Fixture(bool profileEnabled = false)
+    explicit Fixture(bool profileEnabled = false,
+                     bool connectionsEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -175,7 +185,29 @@ struct Fixture final {
                               std::optional<std::string>{"en"},
                               std::nullopt, kNow, kNow, "auto");
                       }}
-                  : http::CoroutineAccountSessionAdapter::ReadProfile{})
+                  : http::CoroutineAccountSessionAdapter::ReadProfile{},
+              connectionsEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadConnections{
+                      [this](core::IdentityId owner) -> asio::awaitable<
+                          fnd::Result<http::CoroutineAccountSessionAdapter::ConnectionList>> {
+                          ++connectionsReadCalls;
+                          if (connectionsMissing)
+                              co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          const auto resultOwner = connectionsForeign
+                              ? core::IdentityId{"identity-foreign"} : owner;
+                          std::vector<core::ExternalIdentityRef> values;
+                          if (!connectionsEmpty) {
+                              values.emplace_back(idp::ProviderId{"local"},
+                                  idp::ExternalSubject{"verified@example.invalid"});
+                              values.emplace_back(idp::ProviderId{"farcaster"},
+                                  idp::ExternalSubject{"6841"},
+                                  std::optional<std::string>{"Visible Farcaster"},
+                                  std::nullopt, std::nullopt);
+                          }
+                          co_return http::CoroutineAccountSessionAdapter::ConnectionList{
+                              resultOwner, std::move(values)};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadConnections{})
     {
     }
 
@@ -198,6 +230,10 @@ struct Fixture final {
     std::size_t generatedSessionCount{};
     int revokeCalls{};
     int profileReadCalls{};
+    int connectionsReadCalls{};
+    bool connectionsForeign{};
+    bool connectionsMissing{};
+    bool connectionsEmpty{};
     bool profileForeign{};
     bool profileMissing{};
     std::string lastIdentity;
@@ -458,6 +494,66 @@ TEST(AccountCoroutineSessionHttpTest, ProfileReadFailsClosedOnForeignOrMissingPr
     EXPECT_EQ(missing.status(), 404);
     EXPECT_EQ(missing.body().find("verified@example.invalid"), std::string::npos);
     EXPECT_EQ(f.profileReadCalls, 2);
+}
+
+TEST(AccountCoroutineSessionHttpTest, ConnectionsReadIsCookieOnlyAndPreservesLegacyBearer)
+{
+    Fixture f{false, true};
+    gw::http::CoroutineRouteOverlay overlay{
+        f.legacy, f.api, {}, {{"/account/connections", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(connectionsCookieRequest()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(
+        gw::HttpMethod::Get, "/account/connections", "delegated-oauth")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(
+        gw::HttpMethod::Post, "/account/connections")));
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Get, "/account/connections", "delegated-oauth")).status(), 299);
+    EXPECT_EQ(overlay.handle(request(
+        gw::HttpMethod::Post, "/account/connections")).status(), 299);
+    EXPECT_EQ(overlay.handle(connectionsCookieRequest()).status(), 503);
+    EXPECT_EQ(f.legacy.invoked, 2);
+
+    const auto noCredential = f.run(request(
+        gw::HttpMethod::Get, "/account/connections"));
+    EXPECT_EQ(noCredential.status(), 401);
+    EXPECT_EQ(noCredential.headers().at("www-authenticate"), "Bearer");
+    EXPECT_EQ(f.connectionsReadCalls, 0);
+    const auto invalid = f.run(connectionsCookieRequest("invalid-token"));
+    EXPECT_EQ(invalid.status(), 401);
+    EXPECT_EQ(f.connectionsReadCalls, 0);
+
+    const auto allowed = f.run(connectionsCookieRequest());
+    ASSERT_EQ(allowed.status(), 200) << allowed.body();
+    const auto document = json::parse(allowed.body());
+    const auto& values = document.as_object().at("connections").as_array();
+    ASSERT_EQ(values.size(), 2U);
+    EXPECT_EQ(values[0].as_object().at("provider").as_string(), "local");
+    EXPECT_EQ(values[1].as_object().at("fid").as_string(), "6841");
+    EXPECT_EQ(values[1].as_object().at("profile_url").as_string(),
+        "https://farcaster.xyz/~/profiles/6841");
+    EXPECT_EQ(allowed.headers().at("cache-control"), "no-store");
+    EXPECT_EQ(allowed.body().find("valid-token"), std::string::npos);
+    EXPECT_EQ(f.connectionsReadCalls, 1);
+    EXPECT_EQ(f.legacy.invoked, 2);
+}
+
+TEST(AccountCoroutineSessionHttpTest, ConnectionsReadRejectsForeignAndMissingWithoutDisclosure)
+{
+    Fixture f{false, true};
+    f.connectionsForeign = true;
+    const auto denied = f.run(connectionsCookieRequest());
+    EXPECT_EQ(denied.status(), 503);
+    EXPECT_EQ(denied.body().find("verified@example.invalid"), std::string::npos);
+    EXPECT_EQ(denied.body().find("identity-foreign"), std::string::npos);
+    f.connectionsForeign = false;
+    f.connectionsEmpty = true;
+    const auto empty = f.run(connectionsCookieRequest());
+    ASSERT_EQ(empty.status(), 200);
+    EXPECT_TRUE(json::parse(empty.body()).as_object().at("connections")
+        .as_array().empty());
+    f.connectionsMissing = true;
+    EXPECT_EQ(f.run(connectionsCookieRequest()).status(), 404);
+    EXPECT_EQ(f.legacy.invoked, 0);
 }
 
 } // namespace

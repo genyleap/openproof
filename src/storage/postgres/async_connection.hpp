@@ -50,7 +50,12 @@ public:
     [[nodiscard]] bool reusable() const noexcept;
 
 private:
-    AsyncConnection(boost::asio::any_io_executor executor, pg_conn* handle);
+    explicit AsyncConnection(pg_conn* handle);
+    static boost::asio::awaitable<std::unique_ptr<AsyncConnection>> connectSerialized(
+        std::string connectionString, std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<QueryRows> querySerialized(
+        std::string sql, std::vector<std::optional<std::string>> params,
+        std::chrono::steady_clock::time_point deadline);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

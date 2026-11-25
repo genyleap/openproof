@@ -703,6 +703,50 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, NativeHttpConcurrentResponsesUseIndependentStrands)
+{
+    // Production can use 32 reactor threads, unlike the ordinary 2-thread
+    // integration fixture. Repeated concurrent suspensions must not race a
+    // socket's deadline, close or response write across reactor workers.
+    auto config = httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U,
+        std::chrono::seconds{2}, std::chrono::seconds{2}, 64U, 32U);
+    ASSERT_TRUE(config);
+    CoroutineWaitingHandler handler;
+    httpAdapter::BeastHttpServer server{handler, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+
+    for (int round = 0; round < 3; ++round) {
+        std::latch start{17};
+        std::atomic<int> completed{0};
+        std::vector<std::thread> clients;
+        clients.reserve(16);
+        for (int index = 0; index < 16; ++index) {
+            clients.emplace_back([&] {
+                start.count_down();
+                start.wait();
+                try {
+                    const auto response = sendRequest(
+                        server.boundPort(), beastHttp::verb::get, "/");
+                    if (response.result() == beastHttp::status::ok
+                        && response.body() == "async") {
+                        completed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } catch (...) {
+                    // Count a reset/early close as failure without logging
+                    // request details or silently retrying it.
+                }
+            });
+        }
+        start.count_down();
+        start.wait();
+        for (auto& client : clients) client.join();
+        EXPECT_EQ(completed.load(std::memory_order_relaxed), 16);
+    }
+    EXPECT_GT(handler.peak(), 8);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, DirectMetricsCoroutineCallFailsClosed)
 {
     DisabledCoroutineHandler disabled;
