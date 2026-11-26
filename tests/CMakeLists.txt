@@ -869,8 +869,12 @@ gtest_discover_tests(openproof_web3_coroutine_http_tests
 
 # Isolated canonical async persistence tests. Any SQL fixture must opt in with
 # an exact disposable DB URL and acknowledgement; never touch the live server.
+# The session and legacy audit fixtures pull evidence/passkey objects from
+# static storage archives. Supply the same Boost.JSON implementation used
+# by the other isolated test binaries, exactly once in this executable.
 add_executable(openproof_postgres_async_canonical_tests
-    storage/postgres_async_canonical_test.cpp)
+    storage/postgres_async_canonical_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
 target_compile_features(openproof_postgres_async_canonical_tests PRIVATE cxx_std_26)
 set_target_properties(openproof_postgres_async_canonical_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
