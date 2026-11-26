@@ -172,7 +172,9 @@ TEST(NativeVerificationDeliveryTest, DispatchLifetimeAndWebhookStatusOverRealTcp
         ASSERT_NO_THROW(completed.get());
         ASSERT_TRUE(result);
         EXPECT_EQ(result->has_value(), status == 204);
-        if (status != 204 && !*result) EXPECT_EQ(result->error().code(), fnd::ErrorCode::Unavailable);
+        if (status != 204 && !*result) {
+            EXPECT_EQ(result->error().code(), fnd::ErrorCode::Unavailable);
+        }
         EXPECT_TRUE(receiver.accepted.load());
         deferred.pending.reset();
     }
