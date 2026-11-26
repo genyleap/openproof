@@ -853,6 +853,32 @@ async function main() {
       // A verified but unlinked directory account must NOT create a canonical
       // identity, external link or session. Test the actual SQL counts.
       assert.equal(counts(), initialCounts, "denied LDAP proof changed identity/link/session counts");
+      // A valid directory account linked to a different organization must
+      // not enter the configured tenant, create a duplicate, or issue a session.
+      const sql = statement => command("psql", [databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c", statement]).trim();
+      assert.ok(/^[0-9a-f-]{36}$/.test(ldapFixture.unlinkedSubject));
+      sql("INSERT INTO openproof.organizations(id,name,state,created_at_ms) VALUES " +
+        "('e2e-ldap-foreign-org','Foreign LDAP fixture',0,1770000000000); " +
+        "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) VALUES " +
+        "('e2e-ldap-foreign','e2e-ldap-foreign-org',0,0,1770000000000); " +
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) VALUES " +
+        "('ldap','" + ldapFixture.unlinkedSubject + "','e2e-ldap-foreign',1770000000000)");
+      const foreignCounts = counts();
+      const foreignOwnerJar = new CookieJar();
+      const foreignOwner = await startLdap("unlinked", foreignOwnerJar);
+      expectStatus(await completeLdap(foreignOwner, ldapFixture.unlinkedPassword, foreignOwnerJar), 401);
+      assert.equal(counts(), foreignCounts, "foreign LDAP proof changed persistent state");
+      sql("DELETE FROM openproof.external_identities WHERE identity_id='e2e-ldap-foreign'; " +
+        "DELETE FROM openproof.identities WHERE id='e2e-ldap-foreign'; " +
+        "DELETE FROM openproof.organizations WHERE id='e2e-ldap-foreign-org'");
+      assert.equal(counts(), initialCounts);
+      sql("UPDATE openproof.identities SET status=2 WHERE id='e2e-ldap-linked'");
+      const lockedJar = new CookieJar();
+      const locked = await startLdap("linked", lockedJar);
+      expectStatus(await completeLdap(locked, ldapFixture.linkedPassword, lockedJar), 401);
+      assert.equal(counts(), initialCounts, "locked LDAP proof changed persistent state");
+      sql("UPDATE openproof.identities SET status=0 WHERE id='e2e-ldap-linked'");
+      const activeCount = () => Number(sql("SELECT count(*) FROM openproof.sessions WHERE identity_id='e2e-ldap-linked' AND state=0"));
       const linkedJar = new CookieJar();
       const linked = await startLdap("linked", linkedJar);
       const replayCookie = linkedJar.header();
@@ -866,8 +892,40 @@ async function main() {
       expectStatus(await completeLdap(linked, ldapFixture.linkedPassword, undefined,
         { cookie: replayCookie }), 401);
       assert.equal(counts(), afterLogin, "replayed LDAP proof changed persistent state");
+      assert.equal(activeCount(), 1);
+      const previousSessionCookie = linkedJar.header();
+      const failedRelogin = await startLdap("linked", linkedJar);
+      expectStatus(await completeLdap(failedRelogin, "intentionally-invalid-fixture-password", linkedJar), 401);
+      expectStatus(await edgeRequest("/account/profile", { jar: linkedJar }), 200);
+      assert.equal(counts(), afterLogin, "failed re-login changed persistent state");
+      const replacementChallenge = await startLdap("linked", linkedJar);
+      const replaced = await completeLdap(replacementChallenge, ldapFixture.linkedPassword, linkedJar);
+      expectStatus(replaced, 200);
+      assert.notEqual(jsonBody(replaced).session_id, jsonBody(completed).session_id);
+      expectStatus(await edgeRequest("/account/profile", { headers: { cookie: previousSessionCookie } }), 401);
+      expectStatus(await edgeRequest("/account/profile", { jar: linkedJar }), 200);
+      assert.equal(activeCount(), 1, "same-browser re-login must replace the old grant");
+      // Four separate browsers share only the prepared trust store, never
+      // sockets, TLS streams, transactions or credential/session cookies.
+      const browsers = Array.from({ length: 4 }, () => new CookieJar());
+      const concurrentChallenges = await Promise.all(browsers.map(jar => startLdap("linked", jar)));
+      const beforeConcurrent = counts().split("|").map(Number);
+      const results = await Promise.all(browsers.map((jar, index) =>
+        completeLdap(concurrentChallenges[index], ldapFixture.linkedPassword, jar)));
+      for (const response of results) expectStatus(response, 200);
+      assert.equal(new Set(results.map(response => jsonBody(response).session_id)).size, browsers.length);
+      const afterConcurrent = counts().split("|").map(Number);
+      assert.deepEqual(afterConcurrent, [beforeConcurrent[0], beforeConcurrent[1], beforeConcurrent[2] + browsers.length]);
+      assert.equal(activeCount(), 1 + browsers.length);
+      for (const jar of browsers) {
+        const response = await edgeRequest("/account/profile", { jar });
+        expectStatus(response, 200);
+        assert.equal(jsonBody(response).identity_id, "e2e-ldap-linked");
+        expectStatus(await jsonRequest("/auth/logout", "POST", undefined, jar), 204);
+      }
       expectStatus(await jsonRequest("/auth/logout", "POST", undefined, linkedJar), 204);
-      console.log("- native LDAPS real directory + PostgreSQL: explicit link, invalid password, binding, replay, and no implicit provisioning");
+      assert.equal(activeCount(), 0);
+      console.log("- native LDAPS real directory + PostgreSQL: explicit link, invalid password, binding, replay, no implicit provisioning, foreign/locked rejection, atomic replacement and four concurrent proofs");
     }
 
     const deniedMetrics = await edgeRequest("/metrics");
@@ -991,6 +1049,14 @@ async function main() {
         assurance: consumerGrant.assurance });
       assert.equal(status.headers["cache-control"], "no-store");
     }
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Preserve the legacy projection: retired/unregistered provider links
+      // can exist in storage, but cannot appear as available login methods.
+      command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) " +
+        "SELECT 'fixture-retired-provider','fixture-retired-subject',identity_id,1770000000000 " +
+        "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid'"]);
+    }
     const connectionsBefore = await edgeRequest("/account/connections", { jar: consumerJar });
     if (connectionsBefore.status === 502) {
       // Never print upstream stdout/stderr or response bodies: those may hold
@@ -1025,6 +1091,12 @@ async function main() {
           [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
         );
       }
+    }
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Remove only the dedicated fixture before testing last-method policy.
+      command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
+        "DELETE FROM openproof.external_identities WHERE provider='fixture-retired-provider' " +
+        "AND external_subject='fixture-retired-subject'"]);
     }
     const connectionStart = await jsonRequest("/account/connections/web3/start", "POST", {
       provider: "farcaster",

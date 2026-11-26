@@ -128,6 +128,23 @@ TEST(EnterpriseLdapConfigTest, RejectsPlaintextLdapAndHalfConfiguredServiceBind)
     EXPECT_FALSE(incompleteBind);
 }
 
+TEST(EnterpriseLdapConfigTest, InvalidCaPathCannotCreateAnOperationalProvider)
+{
+    auto config = enterprise::LdapProviderConfig::create(
+        "ldaps://directory.example.invalid:636", "dc=example,dc=invalid",
+        "uid", "entryUUID", "cn", "mail", {}, {}, derivationKey(),
+        "/dev/null/openproof-invalid-ca.pem", std::chrono::minutes{5});
+    ASSERT_TRUE(config);
+    fnd::ManualClockSource clock{fnd::Instant{std::chrono::milliseconds{1770000000000LL}}};
+    enterprise::LdapAuthenticationProvider provider{std::move(config).value(), clock};
+    EXPECT_FALSE(provider.nativeTrustReady());
+    idp::AuthenticationRequest request{idp::ProviderId{"ldap"}, idp::ClientContext{}};
+    request.setParameter("username", "fixture-user");
+    const auto denied = provider.beginAuthentication(request);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(), fnd::ErrorCode::Unavailable);
+}
+
 TEST(EnterpriseSamlConfigTest, RejectsInsecureEndpointsBeforeTrustMaterialIsUsed)
 {
     const std::string placeholderCertificate(128U, 'x');

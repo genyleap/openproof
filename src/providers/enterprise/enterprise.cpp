@@ -629,15 +629,21 @@ class LdapAuthenticationProvider::Implementation final {
 public:
     Implementation(LdapProviderConfig providerConfig,
                    const foundation::ClockSource& clockSource)
-        : config(std::move(providerConfig)), clock(&clockSource) {}
+        : config(std::move(providerConfig)), clock(&clockSource),
+          trust(async_detail::LdapsTrust::load(config.caFile())) {}
     LdapProviderConfig config;
     const foundation::ClockSource* clock;
+    std::shared_ptr<const async_detail::LdapsTrust> trust;
 };
 
 LdapAuthenticationProvider::LdapAuthenticationProvider(LdapProviderConfig config,
                                                        const foundation::ClockSource& clock)
     : m_implementation(std::make_unique<Implementation>(std::move(config), clock)) {}
 LdapAuthenticationProvider::~LdapAuthenticationProvider() = default;
+bool LdapAuthenticationProvider::nativeTrustReady() const noexcept
+{
+    return static_cast<bool>(m_implementation->trust);
+}
 idp::ProviderId LdapAuthenticationProvider::id() const { return idp::ProviderId{"ldap"}; }
 idp::InteractionModel LdapAuthenticationProvider::interactionModel() const noexcept { return idp::InteractionModel::ChallengeResponse; }
 idp::AssuranceLevel LdapAuthenticationProvider::maximumClaimableAssurance() const noexcept { return idp::AssuranceLevel::Ial1; }
@@ -645,6 +651,10 @@ idp::AssuranceLevel LdapAuthenticationProvider::maximumClaimableAssurance() cons
 foundation::Result<idp::AuthenticationChallenge> LdapAuthenticationProvider::beginAuthentication(
     const idp::AuthenticationRequest& request)
 {
+    if (!nativeTrustReady()) {
+        return foundation::fail(foundation::ErrorCode::Unavailable,
+                                "LDAP certificate trust is unavailable.");
+    }
     if (request.provider() != id()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The LDAP authentication request targets another provider.");
@@ -690,6 +700,10 @@ LdapAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest 
 boost::asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
 LdapAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
 {
+    if (!nativeTrustReady()) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                                   "LDAP certificate trust is unavailable.");
+    }
     const auto usernameIt = response.parameters().find("username");
     const auto passwordIt = response.parameters().find("password");
     const auto bindingIt = response.parameters().find("username_binding");
@@ -728,7 +742,7 @@ LdapAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
             async_detail::SensitiveString{config.m_serviceBindPassword.expose()},
             std::string{usernameIt->second.expose()},
             async_detail::SensitiveString{passwordIt->second.expose()},
-            std::string{config.m_caFile}
+            m_implementation->trust
         });
     if (!directory.success()) {
         if (directory.failure == async_detail::LdapsFailure::Timeout

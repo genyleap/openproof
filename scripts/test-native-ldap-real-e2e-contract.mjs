@@ -63,3 +63,16 @@ test("fixture verifies a real certificate chain and tests bind before full build
   assert.match(smoke, /assert\.notEqual\(denied\.status, 0/);
   assert.match(read(".github/workflows/ci.yml"), /name: Real LDAPS fixture preflight/);
 });
+
+test("LDAP real HTTP acceptance covers tenant isolation, lifecycle, replacement and concurrent proof isolation", () => {
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e, /completeLdap\(foreignOwner, ldapFixture\.unlinkedPassword, foreignOwnerJar\), 401/);
+  assert.match(e2e, /assert\.equal\(counts\(\), foreignCounts/);
+  assert.match(e2e, /completeLdap\(locked, ldapFixture\.linkedPassword, lockedJar\), 401/);
+  assert.match(e2e, /assert\.equal\(counts\(\), initialCounts, "locked LDAP proof/);
+  assert.match(e2e, /cookie: previousSessionCookie \} \}\), 401/);
+  assert.match(e2e, /assert\.equal\(activeCount\(\), 1, "same-browser re-login/);
+  assert.match(e2e, /const browsers = Array\.from\(\{ length: 4 \}/);
+  assert.match(e2e, /const results = await Promise\.all\(browsers\.map/);
+  assert.match(e2e, /assert\.equal\(activeCount\(\), 0\)/);
+});

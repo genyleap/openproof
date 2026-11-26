@@ -934,3 +934,15 @@ member; oversized or malformed results fail closed with 503 rather than
 silently truncating. All administrative mutations remain on compatibility
 routes. This bounded experimental projection requires full acceptance before
 default activation.
+
+#### LDAP certificate trust lifecycle
+
+The LDAP provider prepares its TLS trust context before listener startup. A
+configured private CA file is read once; an invalid/unreadable CA refuses
+startup with a sanitized configuration error. Each authentication opens its
+own TLS connection, verifies the server certificate and hostname, and uses
+its own deadline. Rotate the configured private CA using a normal controlled
+restart; changing the file alone does not alter an already prepared trust
+store. With no private CA, OpenSSL's normal system trust defaults remain in
+use (system certificate-directory lookup is governed by OpenSSL). LDAP native
+routing remains explicitly experimental and default-off.

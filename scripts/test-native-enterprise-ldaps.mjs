@@ -87,3 +87,21 @@ test("LDAPS timed IO is serialized on the current executor", () => {
   assert.match(wrapper, /co_await asio::co_spawn\(asio::make_strand\(executor\)/);
   assert.match(wrapper, /authenticateSerialized\(std::move\(request\), deadline\)/);
 });
+
+test("LDAPS explicit certificate trust is prepared at startup, not reopened per request", () => {
+  const start = native.indexOf("LdapsTrust::load(");
+  const end = native.indexOf("AsyncLdapsClient::authenticate(LdapsRequest request)", start);
+  assert.ok(start >= 0 && end > start);
+  const preparation = native.slice(start, end);
+  const request = native.slice(end);
+  assert.match(preparation, /context\.set_verify_mode\(ssl::verify_peer\)/);
+  assert.match(preparation, /context\.load_verify_file\(/);
+  assert.match(preparation, /SSL_SESS_CACHE_OFF/);
+  assert.doesNotMatch(request, /load_verify_file|set_default_verify_paths|LdapsTrust::load\(/);
+  assert.match(request, /!request\.trust/);
+  assert.match(request, /request\.trust->m_implementation->context/);
+  assert.match(providerSource, /trust\(async_detail::LdapsTrust::load\(config\.caFile\(\)\)\)/);
+  assert.match(read("apps/opp/main.cpp"), /if \(!ldapProvider->nativeTrustReady\(\)\)/);
+  assert.match(testSource, /PreparedPrivateCaIsNotReopenedDuringAuthentication/);
+  assert.match(testSource, /MissingPreparedTrustFailsBeforeNetworking/);
+});
