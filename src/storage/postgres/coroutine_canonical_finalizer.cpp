@@ -3152,4 +3152,111 @@ CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync(client::ClientId id,
+    std::optional<std::string> keyId,std::optional<std::string> publicKeyPem,
+    core::IdentityId actor,session::SessionId sessionId,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || id.empty() || id.value().size()>256U || now.time_since_epoch().count()<0
+        || keyId.has_value()!=publicKeyPem.has_value())
+        co_return foundation::fail(E::InvalidArgument);
+    std::optional<oauth::ClientRequestSigningKey> key;
+    if (keyId) {
+        // Accept exactly one public PEM envelope, not a concatenated
+        // certificate/private key or unrelated trailing material.
+        std::string_view pem{*publicKeyPem};
+        constexpr std::string_view begin="-----BEGIN PUBLIC KEY-----",end="-----END PUBLIC KEY-----";
+        const auto whitespace=[](char c){return c==' ' || c=='\t' || c=='\r' || c=='\n';};
+        while (!pem.empty() && whitespace(pem.front())) pem.remove_prefix(1U);
+        while (!pem.empty() && whitespace(pem.back())) pem.remove_suffix(1U);
+        if (pem.size()>16U*1024U || !pem.starts_with(begin) || !pem.ends_with(end)
+            || pem.find("-----BEGIN ",begin.size())!=std::string_view::npos
+            || pem.find("-----END ")!=pem.size()-end.size()
+            || std::ranges::any_of(*keyId,[](unsigned char c){return c<0x20U || c==0x7fU;}))
+            co_return foundation::fail(E::InvalidArgument);
+        auto valid=security::validateRs256PublicKey(pem);
+        if (!valid) co_return foundation::fail(valid.error());
+        auto prepared=oauth::ClientRequestSigningKey::create(id,std::move(*keyId),std::string{pem}+"\n",now);
+        if (!prepared) co_return foundation::fail(prepared.error());
+        key.emplace(std::move(prepared).value());
+    }
+    const auto tenant=std::string{m_impl->organization.value()};
+    const auto timestamp=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        // Serialize against native/legacy owner lifecycle changes. Keep the
+        // authorization rows locked until the application change commits.
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        Params actorArgs{std::string{actor.value()},tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.assurance FROM openproof.organizations o "
+            "JOIN openproof.identities i ON i.organization_id=o.id "
+            "JOIN openproof.memberships m ON m.identity_id=i.id AND m.organization_id=o.id "
+            "JOIN openproof.membership_roles r ON r.identity_id=i.id AND r.organization_id=o.id "
+            "JOIN openproof.sessions s ON s.identity_id=i.id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND o.state=0 AND m.state=1 AND r.role='owner' "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR SHARE OF o,i,m,r,s",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto assurance=milliseconds(permitted.rows.front()[0]);
+        if (assurance<2 || assurance>4) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AssuranceInsufficient);
+        }
+        Params clientArgs{std::string{id.value()},tenant};
+        const auto parent=co_await execute(
+            "SELECT c.id,c.status FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",std::move(clientArgs));
+        if (parent.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (parent.rows.size()!=1U || parent.rows.front().size()!=2U)
+            throw std::runtime_error{"Malformed JAR client"};
+        if (key && milliseconds(parent.rows.front()[1])==2) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::FailedPrecondition);
+        }
+        if (key) {
+            Params args{std::string{id.value()},std::string{key->keyId()},
+                std::string{key->publicKeyPem()},timestamp};
+            const auto changed=co_await execute(
+                "INSERT INTO openproof.oauth_client_request_signing_keys(client_id,key_id,public_key_pem,updated_at_ms) "
+                "VALUES($1,$2,$3,$4) ON CONFLICT(client_id) DO UPDATE SET key_id=EXCLUDED.key_id,"
+                "public_key_pem=EXCLUDED.public_key_pem,updated_at_ms=EXCLUDED.updated_at_ms "
+                "WHERE openproof.oauth_client_request_signing_keys.updated_at_ms<=EXCLUDED.updated_at_ms "
+                "RETURNING client_id",std::move(args));
+            if (changed.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::Conflict);
+            }
+            if (changed.rows.size()!=1U || changed.rows.front().size()!=1U
+                || required(changed.rows.front()[0])!=id.value())
+                throw std::runtime_error{"JAR key update mismatch"};
+        } else {
+            Params args{std::string{id.value()}};
+            static_cast<void>(co_await execute(
+                "DELETE FROM openproof.oauth_client_request_signing_keys WHERE client_id=$1",std::move(args)));
+        }
+        // Replay records intentionally survive rotation and removal.
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native JAR key mutation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

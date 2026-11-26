@@ -80,7 +80,8 @@ test("native client lifecycle and secret rotation preserve domain checks and exp
     const index=http.indexOf(term,previous+1);
     assert.ok(index>previous,term); previous=index;
   }
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync("));
   for(const term of ["pg_advisory_xact_lock(7299730475761673315)","FOR SHARE OF o,i,m,r,s",
     "assurance<2 || assurance>4","WHERE id=$1 AND organization_id=$2 FOR SHARE",
     "client::Client::create","INSERT INTO openproof.oauth_clients","INSERT INTO openproof.oauth_client_redirect_uris",
@@ -92,4 +93,26 @@ test("native client lifecycle and secret rotation preserve domain checks and exp
   assert.ok(store.indexOf("UPDATE openproof.oauth_clients")<store.lastIndexOf('execute("COMMIT",{})'));
   assert.doesNotMatch(cppExecutableText(store),/PQexec|SecretString|randomTokenBase64Url/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/ASSERT_NE\(ca.has_value\(\),cb.has_value\(\)\)/);
+});
+test("JAR key management validates one RSA public envelope and preserves durable replay protection",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync("));
+  assert.match(http,/r.path\(\)=="\/admin\/clients\/jar-key"\s*&& \(r.method\(\)==Method::Post \|\| r.method\(\)==Method::Delete\)/);
+  assert.match(http,/parseJarMutation\(r\)/);
+  assert.match(http,/co_await m_clients->mutateJarKey/);
+  assert.match(app,/reader->mutateOAuthJarKeyAsync/);
+  assert.match(app,/nativePaths.emplace_back\(route\)/);
+  for(const term of ["pem.starts_with(begin)","pem.ends_with(end)","pem.find(\"-----BEGIN \",begin.size())",
+    "security::validateRs256PublicKey(pem)","oauth::ClientRequestSigningKey::create",
+    "pg_advisory_xact_lock(7299730475761673315)","FOR SHARE OF o,i,m,r,s","assurance<2 || assurance>4",
+    "WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",
+    "if (key && milliseconds(parent.rows.front()[1])==2)",
+    "INSERT INTO openproof.oauth_client_request_signing_keys","ON CONFLICT(client_id) DO UPDATE",
+    "updated_at_ms<=EXCLUDED.updated_at_ms","DELETE FROM openproof.oauth_client_request_signing_keys"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("assurance<2")<store.indexOf("INSERT INTO openproof.oauth_client_request_signing_keys"));
+  assert.ok(store.indexOf("DELETE FROM openproof.oauth_client_request_signing_keys")<store.lastIndexOf('execute("COMMIT",{})'));
+  assert.doesNotMatch(store,/DELETE FROM openproof.oauth_jar_replays/);
+  assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/keyTask\(client,"stale",pem/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/keyTask\(client,"bad",pem\+pem\)/);
 });

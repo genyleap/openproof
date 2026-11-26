@@ -24,9 +24,13 @@ public:
         ApplicationMutationCommand,identity::core::IdentityId,session::SessionId)>;
     using MutateClient=std::function<boost::asio::awaitable<foundation::Result<client::Client>>(
         client::ManagementMutationCommand,identity::core::IdentityId,session::SessionId)>;
+    using MutateJarKey=std::function<boost::asio::awaitable<foundation::Status>(
+        client::ClientId,std::optional<std::string>,std::optional<std::string>,
+        identity::core::IdentityId,session::SessionId)>;
     struct ClientContext final {
         foundation::SecretString key;
         MutateClient mutate;
+        MutateJarKey mutateJarKey{};
     };
     CoroutineManagementReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter,Authenticate authenticate,Read read,Mutate mutate={},

@@ -935,11 +935,52 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
     ASSERT_TRUE(runMutation(clientTask(clientChange(COp::Revoke,privateId))));
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::RotateSecret,privateId,next))));
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Activate,privateId))));
+    constexpr std::string_view kTestRsaPublicKey = R"PEM(-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxQQ9mwfAEgVMWUY1rcqU
+Q4YMPqUwXvppmoB2ffh5TXTN2YGR14AmL5wcCvxvA/LdmJ55vLWryzt6CBjp+1Ym
+1pkT5jKpfKGPF+BC4PmqHo7SSR/Hr/e9lHHVQr1BHvxPHw8tC6jOWueB6HrZLUar
++xg6ix+x/mJmB85zL2C21LgKzLbiIOkPWpOE29CQ4RgnpFLtUegBFJTn+7op70O1
+MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
+7D1jmGHYDJZCA2E/GuOinFTHuQIHt/dQtJ73GX2SH+TniwPrYZQmJbPS1QQxdJeb
+2wIDAQAB
+-----END PUBLIC KEY-----
+)PEM";
+    const auto keyTask=[&](std::string id,std::optional<std::string> kid,std::optional<std::string> pem,
+        std::string actor={},std::string session={},fnd::Instant when=kNow+4s) {
+        return native.mutateOAuthJarKeyAsync(cli::ClientId{std::move(id)},std::move(kid),std::move(pem),
+            ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    const std::string pem{kTestRsaPublicKey};
+    EXPECT_FALSE(runMutation(keyTask(client,"bad","not a key")));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",pem+pem)));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",pem+"trailing material")));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",std::nullopt)));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem,seed.secondOwner)));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem,seed.owner,weakSession)));
+    EXPECT_FALSE(runMutation(keyTask(privateId,"revoked",pem)));
+    EXPECT_FALSE(runMutation(keyTask("missing-client","missing",pem)));
+    ASSERT_TRUE(runMutation(keyTask(client,"native-key",pem)));
+    auto registeredJar=read(Read::JarKey,client);
+    ASSERT_TRUE(registeredJar);
+    EXPECT_NE(registeredJar->find("native-key"),std::string::npos);
+    EXPECT_FALSE(runMutation(keyTask(client,"stale",pem,{}, {},kNow+3s)));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_jar_replays(client_id,jwt_id,expires_at_ms) "
+        "VALUES($1,'fixture-replay',1770000600000)",{client}));
+    ASSERT_TRUE(runMutation(keyTask(client,"rotated-key",pem)));
+    ASSERT_TRUE(runMutation(keyTask(client,std::nullopt,std::nullopt)));
+    ASSERT_TRUE(runMutation(keyTask(client,std::nullopt,std::nullopt)));
+    EXPECT_FALSE(read(Read::JarKey,client));
+    const auto replay=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_jar_replays WHERE client_id=$1 AND jwt_id='fixture-replay'",{client});
+    ASSERT_EQ(PQntuples(replay.get()),1);
+    EXPECT_STREQ(PQgetvalue(replay.get(),0,0),"1");
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
     EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem)));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)

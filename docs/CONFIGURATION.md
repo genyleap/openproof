@@ -1116,7 +1116,14 @@ the newly generated secret is returned once, after commit, and never
 for a public client. Revoked clients cannot be reactivated or rotated.
 The existing token-family lifetime policy is unchanged.
 
-The remaining PostgreSQL compatibility surfaces include JAR key,
+JAR key registration, rotation and removal also use the owner/session
+transaction and lock the same tenant-bound client as native JAR
+verification. Exactly one RSA public PEM envelope is accepted; invalid
+keys, trailing material, stale updates and registration on revoked clients
+are rejected. Removal remains idempotent and replay records are retained
+across key rotation and removal.
+
+The remaining PostgreSQL compatibility surfaces include
 resource and service-identity mutations and the administration console,
 passkey operations, evidence/trust and enabled SCIM operations, as well
 as startup and offline administration.

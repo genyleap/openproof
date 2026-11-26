@@ -136,6 +136,47 @@ foundation::Result<client::ManagementMutationCommand> parseClientMutation(
     return client::ManagementMutationCommand{op,client::ClientId{"opc_"+id.value()},
         ApplicationId{std::move(*app)},std::move(*name),parsed,std::move(redirects),std::move(grants),std::nullopt};
 }
+bool jarMutation(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/admin/clients/jar-key"
+        && (r.method()==Method::Post || r.method()==Method::Delete);
+}
+struct JarCommand final {
+    client::ClientId id;
+    std::optional<std::string> kid,pem;
+};
+foundation::Result<JarCommand> parseJarMutation(gateway::HttpRequest& r) {
+    if (r.method()==Method::Delete) {
+        auto target=r.target();
+        constexpr std::string_view prefix="/admin/clients/jar-key?client_id=";
+        if (!target.starts_with(prefix)) return foundation::fail(E::InvalidArgument);
+        auto id=target.substr(prefix.size());
+        if (id.empty() || id.size()>256U || id.find_first_of("&%+")!=std::string_view::npos
+            || std::ranges::any_of(id,[](unsigned char c){return c<0x20U || c==0x7fU;}))
+            return foundation::fail(E::InvalidArgument);
+        return JarCommand{client::ClientId{std::string{id}},std::nullopt,std::nullopt};
+    }
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/json" && !media->starts_with("application/json;"))
+        || r.body().empty() || r.body().size()>32U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    boost::system::error_code error;
+    auto value=boost::json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !value.is_object()) return foundation::fail(E::InvalidArgument);
+    const auto& object=value.as_object();
+    const auto field=[&](std::string_view name,std::size_t maximum,bool multiline)->std::optional<std::string> {
+        const auto* item=object.if_contains(name);
+        if (!item || !item->is_string()) return std::nullopt;
+        const auto& s=item->as_string();
+        if (s.empty() || s.size()>maximum || std::ranges::any_of(s,[&](unsigned char c) {
+            return (c<0x20U && !(multiline && (c=='\r' || c=='\n' || c=='\t'))) || c==0x7fU;
+        })) return std::nullopt;
+        return std::string{s.data(),s.size()};
+    };
+    auto id=field("client_id",256U,false),kid=field("key_id",128U,false),pem=field("public_key_pem",16U*1024U,true);
+    if (object.size()!=3U || !id || !kid || !pem) return foundation::fail(E::InvalidArgument);
+    return JarCommand{client::ClientId{std::move(*id)},std::move(kid),std::move(pem)};
+}
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeBody(); r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
 }
@@ -178,7 +219,7 @@ CoroutineManagementReadAdapter::CoroutineManagementReadAdapter(
 
 bool CoroutineManagementReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     return operation(r).has_value() || mutation(r).has_value() || clientMutation(r).has_value()
-        || m_fallback->nativeEnabledFor(r);
+        || jarMutation(r) || m_fallback->nativeEnabledFor(r);
 }
 
 gateway::HttpResponse CoroutineManagementReadAdapter::handle(gateway::HttpRequest r) {
@@ -190,14 +231,16 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     const auto op=operation(r);
     const auto write=mutation(r);
     const auto clientWrite=clientMutation(r);
-    if (!op && !write && !clientWrite) {
+    const bool jarWrite=jarMutation(r);
+    if (!op && !write && !clientWrite && !jarWrite) {
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r);
         co_return failure(E::Unavailable,r);
     }
     Scrub wipe{r};
     if (!m_authenticate || (op && !m_read) || (write && !m_mutate)
-        || (clientWrite && (!m_clients || !m_clients->mutate)))
+        || (clientWrite && (!m_clients || !m_clients->mutate))
+        || (jarWrite && (!m_clients || !m_clients->mutateJarKey)))
         co_return failure(E::Unavailable,r);
     if (!m_limiter->allow("idp-admin-ip:"+std::string{r.remoteAddress()}))
         co_return failure(E::RateLimited,r);
@@ -206,6 +249,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     std::optional<std::string> selected;
     std::optional<ApplicationMutationCommand> command;
     std::optional<client::ManagementMutationCommand> clientCommand;
+    std::optional<JarCommand> jarCommand;
     if (op) {
         auto parsed=filter(r,*op);
         if (!parsed) co_return failure(parsed.error().code(),r);
@@ -214,10 +258,14 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         auto parsed=parseMutation(r,*write);
         if (!parsed) co_return failure(parsed.error().code(),r);
         command.emplace(std::move(parsed).value());
-    } else {
+    } else if (clientWrite) {
         auto parsed=parseClientMutation(r,*clientWrite);
         if (!parsed) co_return failure(parsed.error().code(),r);
         clientCommand.emplace(std::move(parsed).value());
+    } else {
+        auto parsed=parseJarMutation(r);
+        if (!parsed) co_return failure(parsed.error().code(),r);
+        jarCommand.emplace(std::move(parsed).value());
     }
     auto credential=gateway::takeSessionCredential(r);
     if (!credential) co_return failure(credential.error().code(),r);
@@ -238,6 +286,17 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             .add("name",changed->displayName()).add("environment",environmentName(changed->environment()))
             .add("status",applicationStatusName(changed->status()));
         co_return response(status,body.build());
+    }
+    if (jarCommand) {
+        const bool registration=jarCommand->kid.has_value();
+        const std::string id{jarCommand->id.value()};
+        auto changed=co_await m_clients->mutateJarKey(std::move(jarCommand->id),
+            std::move(jarCommand->kid),std::move(jarCommand->pem),actor->identity(),actor->id());
+        if (!changed) co_return failure(changed.error().code(),r);
+        if (!registration) co_return gateway::HttpResponse{204,{},{}};
+        foundation::JsonObjectWriter body;
+        body.add("client_id",id).add("registered",true);
+        co_return response(200,body.build());
     }
     if (clientCommand) {
         using Op=client::ManagementMutation;
