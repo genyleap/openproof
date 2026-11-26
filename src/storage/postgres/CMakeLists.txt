@@ -272,6 +272,7 @@ set_target_properties(openproof_postgres_async_local_credentials PROPERTIES
 target_compile_definitions(openproof_postgres_async_local_credentials PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_local_credentials PUBLIC
     openproof_postgres_async_io openproof_identity_core openproof_identity_provider
+    openproof_credentials openproof_security
     openproof_foundation Boost::headers PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_local_credential_store.cpp

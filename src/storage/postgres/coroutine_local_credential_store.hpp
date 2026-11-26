@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 
+import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
@@ -48,6 +49,16 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeTotpAsync(identity::provider::ExternalSubject subject,
                      LocalCredentialSnapshot snapshot, std::uint64_t step);
+    // Require an enrolled second factor and the same verified password/MFA
+    // generation when redeeming a recovery-code digest. Never accept plaintext.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    consumeRecoveryAsync(identity::provider::ExternalSubject subject,
+                         LocalCredentialSnapshot snapshot, credentials::RecoveryCodeDigest digest);
+    // Best-effort password policy upgrade AFTER complete factor verification.
+    // Preserve changed_at_ms; a rehash is not a password change.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<bool>>
+    rehashAsync(identity::provider::ExternalSubject subject, LocalCredentialSnapshot snapshot,
+                credentials::PasswordHash replacement);
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;

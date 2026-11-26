@@ -186,4 +186,85 @@ asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::consumeTotpAs
     }
 }
 
+asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::consumeRecoveryAsync(
+    idp::ExternalSubject subject, LocalCredentialSnapshot snapshot,
+    credentials::RecoveryCodeDigest digest)
+{
+    if (!bounded(subject.value(), 1000U) || !valid(snapshot) || !snapshot.encryptedTotpHex)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        auto& conn = lease.connection();
+        static_cast<void>(co_await conn.query("BEGIN", {}, remaining(deadline)));
+        // Same transaction advisory lock as native and legacy code rotation.
+        // Acquire before DELETE so a rotation cannot leave an obsolete batch
+        // usable after it commits. Recheck all proof inputs in a fresh snapshot.
+        Params lockParams{std::string{snapshot.owner.value()}};
+        static_cast<void>(co_await conn.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            std::move(lockParams), remaining(deadline)));
+        Params params{std::string{snapshot.owner.value()}, snapshot.passwordHash,
+            snapshot.passwordChangedAt, std::string{m_impl->provider.value()},
+            std::string{subject.value()}, std::string{m_impl->tenant.value()},
+            snapshot.encryptedTotpHex, snapshot.keyVersion, snapshot.totpEnrolledAt,
+            foundation::toHex(digest)};
+        const auto result = co_await conn.query(
+            "DELETE FROM openproof.recovery_codes r WHERE r.identity_id=$1 "
+            "AND r.code_digest=decode($10,'hex') "
+            "AND EXISTS (SELECT 1 FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+            "WHERE i.id=r.identity_id AND p.password_hash=$2 AND p.changed_at_ms=$3::bigint "
+            "AND e.provider=$4 AND e.external_subject=$5 AND i.organization_id=$6 "
+            "AND i.status=0 AND o.state=0 AND t.encrypted_seed=decode($7,'hex') "
+            "AND t.key_version=$8::integer AND t.enrolled_at_ms=$9::bigint) "
+            "RETURNING r.identity_id", std::move(params), remaining(deadline));
+        auto status = confirmed(result, snapshot.owner.value());
+        if (!status) {
+            static_cast<void>(co_await conn.query("ROLLBACK", {}, remaining(deadline)));
+            co_return status;
+        }
+        static_cast<void>(co_await conn.query("COMMIT", {}, remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        // A non-idle/ambiguous lease is discarded by the pool; no retry.
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
+asio::awaitable<foundation::Result<bool>> CoroutineLocalCredentialStore::rehashAsync(
+    idp::ExternalSubject subject, LocalCredentialSnapshot snapshot,
+    credentials::PasswordHash replacement)
+{
+    if (!bounded(subject.value(), 1000U) || !valid(snapshot)
+        || !bounded(replacement.encoded(), 4096U))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{snapshot.owner.value()}, snapshot.passwordHash,
+            snapshot.passwordChangedAt, std::string{m_impl->provider.value()},
+            std::string{subject.value()}, std::string{m_impl->tenant.value()},
+            std::string{replacement.encoded()}};
+        const auto result = co_await lease.connection().query(
+            "UPDATE openproof.password_credentials p SET password_hash=$7 "
+            "WHERE p.identity_id=$1 AND p.password_hash=$2 AND p.changed_at_ms=$3::bigint "
+            "AND EXISTS (SELECT 1 FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "WHERE i.id=p.identity_id AND e.provider=$4 AND e.external_subject=$5 "
+            "AND i.organization_id=$6 AND i.status=0 AND o.state=0) RETURNING p.identity_id",
+            std::move(params), remaining(deadline));
+        if (result.rows.empty()) co_return false;
+        auto status = confirmed(result, snapshot.owner.value());
+        if (!status) co_return foundation::fail(status.error());
+        co_return true;
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
 }

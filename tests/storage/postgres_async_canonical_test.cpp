@@ -35,6 +35,7 @@ import openproof.account;
 import openproof.authentication;
 import openproof.audit;
 import openproof.consent;
+import openproof.credentials;
 import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
@@ -1604,6 +1605,120 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndT
     auto locked = run(store.readAsync(subject));
     ASSERT_TRUE(locked);
     EXPECT_FALSE(locked->has_value());
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeLocalRecoveryAndRehashRejectChangedCredentialGeneration)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace cred = openproof::credentials;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,'fixture-hash',1770000000000)", {seed.owner})));
+    cred::RecoveryCodeDigest digest{}, secondDigest{};
+    digest[0] = std::byte{42};
+    secondDigest[0] = std::byte{43};
+    for (const auto& code : {digest, secondDigest}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.recovery_codes(identity_id,code_digest,issued_at_ms) "
+            "VALUES($1,decode($2,'hex'),1770000000000)", {seed.owner, fnd::toHex(code)})));
+    }
+
+    asio::io_context io;
+    const idp::ProviderId provider{"native-canonical-provider"};
+    const idp::ExternalSubject subject{seed.subject};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, provider, 2U, 500ms, 1000ms, 3000ms};
+    pg::CoroutineLocalCredentialStore foreign{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg}, provider, 1U, 500ms, 1000ms, 3000ms};
+    auto run = [&]<typename T>(asio::awaitable<T> pending) {
+        io.restart();
+        auto complete = asio::co_spawn(io, std::move(pending), asio::use_future);
+        io.run();
+        return complete.get();
+    };
+    auto remaining = [&] {
+        auto count = execute(fixture.get(),
+            "SELECT count(*)::text FROM openproof.recovery_codes WHERE identity_id=$1", {seed.owner});
+        return std::string{PQgetvalue(count.get(), 0, 0)};
+    };
+    auto noMfa = run(store.readAsync(subject));
+    ASSERT_TRUE(noMfa && noMfa->has_value());
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, noMfa->value(), digest)));
+    EXPECT_EQ(remaining(), "2");
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,enrolled_at_ms) "
+        "VALUES($1,decode('010203','hex'),1,1770000000000)", {seed.owner})));
+    auto initial = run(store.readAsync(subject));
+    ASSERT_TRUE(initial && initial->has_value());
+    EXPECT_FALSE(run(foreign.consumeRecoveryAsync(subject, initial->value(), digest)));
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(idp::ExternalSubject{seed.unlinkedSubject},
+                                                initial->value(), digest)));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.password_credentials SET changed_at_ms=1770000000001 WHERE identity_id=$1",
+        {seed.owner})));
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, initial->value(), digest)));
+    auto verified = run(store.readAsync(subject));
+    ASSERT_TRUE(verified && verified->has_value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.totp_credentials SET enrolled_at_ms=1770000000001 WHERE identity_id=$1",
+        {seed.owner})));
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, verified->value(), digest)));
+    EXPECT_EQ(remaining(), "2");
+    auto current = run(store.readAsync(subject));
+    ASSERT_TRUE(current && current->has_value());
+
+    // Same digest concurrently redeemed on separate leases: exactly one
+    // success, other codes unaffected.
+    io.restart();
+    auto first = asio::co_spawn(io, store.consumeRecoveryAsync(subject, current->value(), digest), asio::use_future);
+    auto second = asio::co_spawn(io, store.consumeRecoveryAsync(subject, current->value(), digest), asio::use_future);
+    io.run();
+    const auto one = first.get();
+    const auto two = second.get();
+    EXPECT_NE(static_cast<bool>(one), static_cast<bool>(two));
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, current->value(), digest)));
+    EXPECT_EQ(remaining(), "1");
+
+    // Rehash uses a real encoded hash, preserves the password-change
+    // timestamp, and cannot overwrite a concurrently changed password.
+    auto policy = cred::PasswordPolicy::create(1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U);
+    ASSERT_TRUE(policy);
+    auto hasher = cred::PasswordHasher::create(fnd::SecretString{std::string(32U, 'p')}, policy.value());
+    ASSERT_TRUE(hasher);
+    auto replacement = hasher->hash(fnd::SecretString{"disposable-fixture-password"});
+    ASSERT_TRUE(replacement);
+    auto stale = run(store.rehashAsync(subject, initial->value(), replacement.value()));
+    ASSERT_TRUE(stale);
+    EXPECT_FALSE(stale.value());
+    auto otherTenant = run(foreign.rehashAsync(subject, current->value(), replacement.value()));
+    ASSERT_TRUE(otherTenant);
+    EXPECT_FALSE(otherTenant.value());
+    auto upgraded = run(store.rehashAsync(subject, current->value(), replacement.value()));
+    ASSERT_TRUE(upgraded && upgraded.value());
+    auto updated = run(store.readAsync(subject));
+    ASSERT_TRUE(updated && updated->has_value());
+    EXPECT_EQ(updated->value().passwordHash, replacement->encoded());
+    EXPECT_EQ(updated->value().passwordChangedAt, current->value().passwordChangedAt);
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, current->value(), secondDigest)));
+    EXPECT_EQ(remaining(), "1");
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.identities SET status=2 WHERE id=$1", {seed.owner})));
+    EXPECT_FALSE(run(store.consumeRecoveryAsync(subject, updated->value(), secondDigest)));
+    EXPECT_EQ(remaining(), "1");
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.identities SET status=0 WHERE id=$1", {seed.owner})));
+    EXPECT_TRUE(run(store.consumeRecoveryAsync(subject, updated->value(), secondDigest)));
+    EXPECT_EQ(remaining(), "0");
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)

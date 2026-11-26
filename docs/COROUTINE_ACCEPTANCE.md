@@ -4515,3 +4515,20 @@ The dedicated disposable PostgreSQL tests exercise tenant/lifecycle
 isolation, stale credentials, intervening MFA enrollment, concurrent
 same-step consumption and re-enrollment. No runtime route switches changed.
 The full PostgreSQL and authentication coverage gates remain NOT_APPROVED.
+
+
+### Native local recovery redemption and password-policy upgrade
+
+The local credential store now redeems recovery-code digests under the
+same transaction advisory lock used by code-set rotation, checking the
+exact password and enrolled MFA generation, active canonical owner,
+provider subject and tenant in the deletion statement. Failed/stale
+proofs do not consume codes. A separate post-verification password
+rehash uses compare-and-swap on the original encoded hash and password
+change timestamp; successful rehash does not change that timestamp.
+
+The disposable SQL regression covers no-MFA denial, foreign tenant,
+stale password and MFA generations, concurrent single-use redemption,
+preserved unused codes, rehash and locked-account denial. The SQL
+primitives still require bounded cryptographic verification and native
+provider composition before HTTP activation. No production flags changed.
