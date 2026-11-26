@@ -74,7 +74,8 @@ test("registration completion and removal serialize against disconnect and commi
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Passkey mutation rollback and last credential protection/);
 });
 test("native passkey assertion uses one-time broker, owner-bound proof and locked counter advancement before session issuance",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::readScimAsync("));
   const handler=http.slice(http.indexOf("CoroutinePasskeyAccountAdapter::assertion("));
   const provider=http.slice(http.indexOf("CoroutinePasskeyProvider::completeAuthenticationAsync("),
     http.indexOf("CoroutinePasskeyAccountAdapter::CoroutinePasskeyAccountAdapter("));

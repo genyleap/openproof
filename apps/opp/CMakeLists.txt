@@ -73,6 +73,7 @@ target_link_libraries(opp
         openproof_provider_enterprise
         openproof_enterprise_scim
         openproof_enterprise_scim_http
+        openproof_enterprise_scim_async_http
         openproof_storage_postgres
         openproof_postgres_async_auth_repository
         openproof_postgres_async_canonical

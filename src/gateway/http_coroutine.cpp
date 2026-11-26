@@ -24,11 +24,13 @@ CoroutineRouteOverlay::CoroutineRouteOverlay(
     HttpHandler& compatibility, CoroutineHttpHandler& native,
     std::vector<std::string> exactNativePaths,
     std::vector<std::pair<std::string, HttpMethod>> methodScopedNativePaths,
-    std::vector<std::string> strictNativePrefixes)
+    std::vector<std::string> strictNativePrefixes,
+    std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes)
     : m_compatibility(&compatibility), m_native(&native),
       m_exactNativePaths(std::move(exactNativePaths)),
       m_methodScopedNativePaths(std::move(methodScopedNativePaths)),
-      m_strictNativePrefixes(std::move(strictNativePrefixes))
+      m_strictNativePrefixes(std::move(strictNativePrefixes)),
+      m_strictMethodPrefixes(std::move(strictMethodPrefixes))
 {
 }
 
@@ -43,9 +45,18 @@ bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
     return false;
 }
 
+bool CoroutineRouteOverlay::strictMethodOverlay(const HttpRequest& request) const noexcept
+{
+    for (const auto& [prefix,method]:m_strictMethodPrefixes) {
+        if (method==request.method() && !prefix.empty() && prefix.back()=='/'
+            && request.path().starts_with(prefix)) return true;
+    }
+    return false;
+}
+
 bool CoroutineRouteOverlay::overlays(const HttpRequest& request) const noexcept
 {
-    if (overlays(request.path())) return true;
+    if (overlays(request.path()) || strictMethodOverlay(request)) return true;
     for (const auto& [path, method] : m_methodScopedNativePaths) {
         if (std::string_view{path} == request.path()
             && method == request.method()) {
@@ -80,7 +91,7 @@ HttpResponse CoroutineRouteOverlay::unavailable(const HttpRequest& request)
 
 HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
 {
-    if (overlays(request.path()) || nativeEnabledFor(request)) {
+    if (overlays(request.path()) || strictMethodOverlay(request) || nativeEnabledFor(request)) {
         // Strict path overlays ALWAYS fail closed, including unsupported
         // methods. For a method-scoped route, a native-enabled request must
         // also deny direct synchronous dispatch, never block a reactor.

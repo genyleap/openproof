@@ -119,6 +119,21 @@ protected:
     DirectoryRepository() = default;
 };
 
+enum class ReadKind { Users, Groups };
+enum class ReadSelector { All, Id, Name };
+struct ReadRequest final {
+    ReadKind kind;
+    ReadSelector selector;
+    std::optional<std::string> value;
+};
+struct ReadRow final {
+    std::string json;
+    foundation::Instant updatedAt;
+};
+struct ReadResult final {
+    std::vector<ReadRow> rows;
+};
+
 struct UserView final {
     UserRecord record;
     identity::core::IdentityStatus status{identity::core::IdentityStatus::Active};

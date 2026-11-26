@@ -49,6 +49,7 @@
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/operations/http/coroutine_health_http.hpp"
 #include "../../src/authentication/http/coroutine_passkey_http.hpp"
+#include "../../src/enterprise/scim/http/coroutine_read_http.hpp"
 #include "../../src/application/http/coroutine_management_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
@@ -3534,13 +3535,26 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/passkey/options");
             nativePaths.emplace_back("/auth/passkey/verify");
         }
+        std::unique_ptr<scimHttp::CoroutineReadAdapter> nativeScimRead;
+        std::vector<std::pair<std::string,gateway::HttpMethod>> strictMethodPrefixes;
+        if (scimBearerToken) {
+            nativeScimRead=std::make_unique<scimHttp::CoroutineReadAdapter>(
+                *nativeHandler,limiter.value(),scimBearerToken->clone(),
+                [reader=nativeCanonical.get()](scim::ReadRequest request) {
+                    return reader->readScimAsync(std::move(request));
+                });
+            nativeHandler=nativeScimRead.get();
+            nativePaths.emplace_back("/scim/v2");
+            strictMethodPrefixes.emplace_back("/scim/v2/",gateway::HttpMethod::Get);
+        }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
         nativePaths.emplace_back("/health/live");
         nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             evidenceApi, nativeHealth, std::move(nativePaths),
-            std::move(nativeMethods),passkeyConfig?std::vector<std::string>{"/account/passkeys/"}:std::vector<std::string>{}};
+            std::move(nativeMethods),passkeyConfig?std::vector<std::string>{"/account/passkeys/"}:std::vector<std::string>{},
+            std::move(strictMethodPrefixes)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,

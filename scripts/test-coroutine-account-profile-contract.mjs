@@ -97,7 +97,7 @@ test("delegated Bearer reads use the native scope verifier when configured", () 
   const sync = gateway.slice(
     gateway.indexOf("HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)"),
     gateway.indexOf("boost::asio::awaitable<HttpResponse>\nCoroutineRouteOverlay::handleAsync("));
-  assert.match(sync, /overlays\(request\.path\(\)\) \|\| nativeEnabledFor\(request\)/);
+  assert.match(sync, /overlays\(request\.path\(\)\) \|\| strictMethodOverlay\(request\) \|\| nativeEnabledFor\(request\)/);
   assert.match(sync, /return m_compatibility->handle\(std::move\(request\)\)/);
   const asyncMethod = gateway.slice(
     gateway.indexOf("CoroutineRouteOverlay::handleAsync("),

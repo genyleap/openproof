@@ -25,6 +25,7 @@ import openproof.session;
 import openproof.oauth;
 import openproof.resource;
 import openproof.provider.passkey;
+import openproof.enterprise.scim;
 
 namespace openproof::storage::postgres {
 
@@ -97,6 +98,9 @@ public:
     verifyPasskeyAssertionAsync(const provider::passkey::PasskeyConfig& config,
         identity::provider::ChallengeId challenge,provider::passkey::AssertionResponse assertion,
         foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
+    readScimAsync(enterprise::scim::ReadRequest request);
 
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();

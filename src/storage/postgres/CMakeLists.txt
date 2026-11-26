@@ -226,7 +226,7 @@ target_link_libraries(openproof_postgres_async_canonical PUBLIC
     openproof_identity_profile openproof_organization openproof_policy openproof_session
     openproof_administration openproof_audit openproof_security openproof_credentials_async
     openproof_oauth openproof_client openproof_application openproof_resource openproof_provider_passkey
-    openproof_foundation Boost::headers
+    openproof_enterprise_scim openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_canonical_finalizer.cpp coroutine_authorization_audit.cpp coroutine_admin_store.cpp

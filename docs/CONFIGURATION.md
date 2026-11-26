@@ -1176,8 +1176,19 @@ transaction commits before session issuance; a failed issuance requires
 a new assertion ceremony. The server no longer constructs synchronous
 passkey repositories, services or HTTP handlers.
 
+Enabled SCIM GET routes (Users, Groups, item and equality-filter reads,
+and service discovery) use native dispatch and the same operator bearer
+token and rate limiter. The directory projection is a tenant-bound
+read-only repeatable-read snapshot, including canonical identity status,
+profile and group membership. It preserves SCIM JSON, ETags and
+discovery responses. Results beyond 10,000 resources/members or the
+8,380,000-byte aggregate projection budget fail closed rather than
+silently truncating. Existing list behavior is preserved; pagination
+is not introduced by this migration. Mutations remain on the compatibility
+worker until their atomic transaction boundaries are migrated.
+
 The remaining PostgreSQL compatibility surfaces include evidence/trust
-and enabled SCIM operations, as well as startup and offline administration.
+and enabled SCIM mutations, as well as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

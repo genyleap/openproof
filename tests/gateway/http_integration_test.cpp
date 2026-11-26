@@ -624,6 +624,25 @@ TEST(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnread
 // Migrating a read-only route must not hijack the same path's PATCH/PUT
 // compatibility handlers. Security-critical strict-path overlays still
 // refuse ALL methods rather than silently falling back to blocking auth.
+TEST(BeastHttpIntegrationTest, StrictMethodPrefixNeverFallsBackForReads)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native;
+    httpAdapter::CoroutineRouteOverlay overlay{
+        compatibility,native,{}, {}, {},{{"/directory/",gw::HttpMethod::Get}}};
+    httpAdapter::BeastHttpServer server{overlay,serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto denied=sendRequest(server.boundPort(),beastHttp::verb::get,"/directory/users");
+    const auto write=sendRequest(server.boundPort(),beastHttp::verb::patch,"/directory/users","{}");
+    const auto near=sendRequest(server.boundPort(),beastHttp::verb::get,"/directory-other/users");
+    EXPECT_EQ(denied.result(),beastHttp::status::service_unavailable);
+    EXPECT_EQ(write.result(),beastHttp::status::ok);
+    EXPECT_EQ(near.result(),beastHttp::status::ok);
+    EXPECT_EQ(compatibility.received.load(),2);
+    EXPECT_EQ(native.synchronousCalls.load(),0);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStrictPaths)
 {
     CountingFastHandler compatibility;

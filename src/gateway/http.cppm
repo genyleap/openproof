@@ -184,7 +184,8 @@ public:
                           std::vector<std::string> exactNativePaths,
                           std::vector<std::pair<std::string, HttpMethod>>
                               methodScopedNativePaths = {},
-                          std::vector<std::string> strictNativePrefixes = {});
+                          std::vector<std::string> strictNativePrefixes = {},
+                          std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes = {});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
         const HttpRequest& request) const noexcept override;
@@ -200,6 +201,8 @@ private:
     std::vector<std::string> m_exactNativePaths;
     std::vector<std::pair<std::string, HttpMethod>> m_methodScopedNativePaths;
     std::vector<std::string> m_strictNativePrefixes;
+    std::vector<std::pair<std::string, HttpMethod>> m_strictMethodPrefixes;
+    [[nodiscard]] bool strictMethodOverlay(const HttpRequest& request) const noexcept;
 };
 
 class CoroutineMetricsAdapter final : public CoroutineHttpHandler {

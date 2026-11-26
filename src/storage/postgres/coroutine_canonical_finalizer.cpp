@@ -3894,4 +3894,92 @@ CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync(const provider:
     }
 }
 
+asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
+CoroutinePostgresCanonicalFinalizer::readScimAsync(enterprise::scim::ReadRequest request)
+{
+    namespace scim=enterprise::scim;
+    using E=foundation::ErrorCode;
+    if ((request.kind!=scim::ReadKind::Users && request.kind!=scim::ReadKind::Groups)
+        || (request.selector!=scim::ReadSelector::All && request.selector!=scim::ReadSelector::Id
+            && request.selector!=scim::ReadSelector::Name)
+        || (request.selector==scim::ReadSelector::All)==request.value.has_value()
+        || (request.value && (request.value->empty() || request.value->size()>512U ||
+            std::ranges::any_of(*request.value,[](unsigned char c){return c<0x20U || c==0x7fU;}))))
+        co_return foundation::fail(E::InvalidArgument);
+    const bool users=request.kind==scim::ReadKind::Users;
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params tenantArgs{tenant};
+        const auto permitted=co_await execute(
+            "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0",std::move(tenantArgs));
+        if (permitted.rows.size()!=1U) co_return foundation::fail(E::PermissionDenied);
+        // Bound SQL materialization before libpq transfers it. Do not silently
+        // truncate directory lists or individual group membership.
+        std::string projection=users?
+            "SELECT u.user_name AS sort_name,u.identity_id AS id,u.updated_at_ms AS updated,"
+            "jsonb_strip_nulls(jsonb_build_object('schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:User'),"
+            "'id',u.identity_id,'externalId',u.external_id,'userName',u.user_name,'active',i.status=0,"
+            "'displayName',p.display_name,'emails',CASE WHEN p.email IS NOT NULL THEN "
+            "jsonb_build_array(jsonb_build_object('value',p.email,'primary',true)) END,"
+            "'meta',jsonb_build_object('resourceType','User','created',"
+            "to_char(to_timestamp(u.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'lastModified',to_char(to_timestamp(u.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'location','/scim/v2/Users/'||u.identity_id,'version','W/\"'||u.updated_at_ms::text||'\"')))::text AS value "
+            "FROM openproof.scim_users u JOIN openproof.identities i ON i.id=u.identity_id AND i.organization_id=u.organization_id "
+            "LEFT JOIN openproof.identity_profiles p ON p.identity_id=i.id WHERE u.organization_id=$1 AND i.kind=0"
+            :
+            "SELECT g.display_name AS sort_name,g.id,g.updated_at_ms AS updated,"
+            "CASE WHEN children.total<=10000 THEN jsonb_strip_nulls(jsonb_build_object("
+            "'schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:Group'),"
+            "'id',g.id,'externalId',g.external_id,'displayName',g.display_name,'members',children.members,"
+            "'meta',jsonb_build_object('resourceType','Group','created',"
+            "to_char(to_timestamp(g.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'lastModified',to_char(to_timestamp(g.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'location','/scim/v2/Groups/'||g.id,'version','W/\"'||g.updated_at_ms::text||'\"')))::text END AS value "
+            "FROM openproof.scim_groups g CROSS JOIN LATERAL (SELECT count(*) AS total,"
+            "COALESCE(jsonb_agg(jsonb_build_object('value',m.identity_id,'$ref','/scim/v2/Users/'||m.identity_id) "
+            "ORDER BY m.identity_id COLLATE \"C\"),'[]'::jsonb) AS members FROM "
+            "(SELECT identity_id FROM openproof.scim_group_members WHERE organization_id=g.organization_id "
+            "AND group_id=g.id ORDER BY identity_id COLLATE \"C\" LIMIT 10001) m) children WHERE g.organization_id=$1";
+        Params args{tenant};
+        if (request.selector!=scim::ReadSelector::All) {
+            if (request.selector==scim::ReadSelector::Id)
+                projection+=users?" AND u.identity_id=$2":" AND g.id=$2";
+            else projection+=users?" AND u.user_name=$2":" AND g.display_name=$2";
+            args.push_back(*request.value);
+        }
+        projection+=" ORDER BY sort_name,id LIMIT 10001";
+        const auto sql="WITH projected AS MATERIALIZED ("+projection+"), "
+            "bounds AS (SELECT count(*)<=10000 AND count(value)=count(*) AND "
+            "COALESCE(sum(octet_length(value)),0)<=8380000 AS ok FROM projected) "
+            "SELECT value,updated::text FROM (SELECT sort_name,id,value,updated FROM projected,bounds WHERE ok "
+            "UNION ALL SELECT NULL::text,NULL::text,NULL::text,NULL::bigint FROM bounds WHERE NOT ok) bounded "
+            "ORDER BY sort_name,id";
+        const auto rows=co_await execute(sql,std::move(args));
+        if (request.selector==scim::ReadSelector::Id && rows.rows.empty())
+            co_return foundation::fail(E::NotFound);
+        if (rows.rows.size()>10000U || (request.selector!=scim::ReadSelector::All && rows.rows.size()>1U))
+            co_return foundation::fail(E::Unavailable);
+        scim::ReadResult result;
+        std::size_t bytes=0;
+        for (const auto& row:rows.rows) {
+            if (row.size()!=2U || !row[0] || !row[1] || row[0]->size()>8380000U
+                || bytes>8380000U-row[0]->size()) co_return foundation::fail(E::Unavailable);
+            bytes+=row[0]->size();
+            result.rows.push_back(scim::ReadRow{*row[0],foundation::Instant{foundation::Duration{milliseconds(row[1])}}});
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native SCIM read is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

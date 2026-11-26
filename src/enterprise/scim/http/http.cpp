@@ -307,6 +307,11 @@ bool Api::authorized(const gateway::HttpRequest& request) const
 gateway::HttpResponse Api::error(const foundation::Error& failure,
                                  const gateway::HttpRequest&) const
 {
+    return renderScimError(failure);
+}
+
+gateway::HttpResponse renderScimError(const foundation::Error& failure)
+{
     int status = foundation::errorHttpStatus(failure.code());
     if (failure.code() == foundation::ErrorCode::AlreadyExists) status = 409;
     json::object body;
@@ -634,7 +639,8 @@ gateway::HttpResponse Api::group(gateway::HttpRequest request, GroupId id)
     return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
 }
 
-gateway::HttpResponse Api::serviceProviderConfig(const gateway::HttpRequest&) const
+namespace {
+gateway::HttpResponse discoveryConfig()
 {
     json::object body;
     body["schemas"] = json::array{"urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"};
@@ -650,7 +656,7 @@ gateway::HttpResponse Api::serviceProviderConfig(const gateway::HttpRequest&) co
     return scimResponse(200, std::move(body));
 }
 
-gateway::HttpResponse Api::resourceTypes(const gateway::HttpRequest&) const
+gateway::HttpResponse discoveryResourceTypes()
 {
     json::array resources;
     resources.push_back(json::object{{"schemas", json::array{"urn:ietf:params:scim:schemas:core:2.0:ResourceType"}},
@@ -660,7 +666,7 @@ gateway::HttpResponse Api::resourceTypes(const gateway::HttpRequest&) const
     return scimResponse(200, listResponse(std::move(resources), 2U));
 }
 
-gateway::HttpResponse Api::schemas(const gateway::HttpRequest&) const
+gateway::HttpResponse discoverySchemas()
 {
     json::array resources;
     resources.push_back(json::object{{"id", std::string{kUserSchema}}, {"name", "User"},
@@ -668,6 +674,79 @@ gateway::HttpResponse Api::schemas(const gateway::HttpRequest&) const
     resources.push_back(json::object{{"id", std::string{kGroupSchema}}, {"name", "Group"},
         {"description", "OpenProof SCIM group schema"}});
     return scimResponse(200, listResponse(std::move(resources), 2U));
+}
+
+} // namespace
+
+gateway::HttpResponse Api::serviceProviderConfig(const gateway::HttpRequest&) const {return discoveryConfig();}
+gateway::HttpResponse Api::resourceTypes(const gateway::HttpRequest&) const {return discoveryResourceTypes();}
+gateway::HttpResponse Api::schemas(const gateway::HttpRequest&) const {return discoverySchemas();}
+
+std::optional<gateway::HttpResponse> renderDiscovery(const gateway::HttpRequest& request)
+{
+    if (request.method()!=gateway::HttpMethod::Get) return std::nullopt;
+    if (request.path()=="/scim/v2/ServiceProviderConfig") return discoveryConfig();
+    if (request.path()=="/scim/v2/ResourceTypes") return discoveryResourceTypes();
+    if (request.path()=="/scim/v2/Schemas") return discoverySchemas();
+    return std::nullopt;
+}
+
+foundation::Result<ReadRequest> parseReadRequest(const gateway::HttpRequest& request)
+{
+    using E=foundation::ErrorCode;
+    if (request.method()!=gateway::HttpMethod::Get || request.target().size()>8192U)
+        return foundation::fail(E::InvalidArgument);
+    const auto path=request.path();
+    constexpr std::string_view users="/scim/v2/Users",groups="/scim/v2/Groups";
+    ReadKind kind;
+    std::string_view base;
+    if (path==users || path.starts_with("/scim/v2/Users/")) {kind=ReadKind::Users;base=users;}
+    else if (path==groups || path.starts_with("/scim/v2/Groups/")) {kind=ReadKind::Groups;base=groups;}
+    else return foundation::fail(E::NotFound);
+    const auto valid=[](std::string_view value,std::size_t limit){
+        return !value.empty() && value.size()<=limit && std::ranges::none_of(value,[](unsigned char c){
+            return c<0x20U || c==0x7fU;
+        });
+    };
+    if (path!=base) {
+        const auto id=path.substr(base.size()+1U);
+        if (!valid(id,256U) || id.contains('/')) return foundation::fail(E::InvalidArgument);
+        return ReadRequest{kind,ReadSelector::Id,std::string{id}};
+    }
+    auto parameters=query(request);
+    if (!parameters) return foundation::fail(parameters.error());
+    if (const auto found=parameters->find("filter");found!=parameters->end()) {
+        auto filter=equalityFilter(found->second);
+        if (!filter || filter->first!=(kind==ReadKind::Users?"userName":"displayName")
+            || !valid(filter->second,kind==ReadKind::Users?320U:512U))
+            return foundation::fail(E::InvalidArgument);
+        return ReadRequest{kind,ReadSelector::Name,std::move(filter->second)};
+    }
+    return ReadRequest{kind,ReadSelector::All,std::nullopt};
+}
+
+gateway::HttpResponse renderReadResult(const ReadRequest& request,ReadResult result)
+{
+    using E=foundation::ErrorCode;
+    if (request.selector==ReadSelector::Id) {
+        if (result.rows.empty()) return renderScimError(foundation::Error{E::NotFound});
+        if (result.rows.size()!=1U) return renderScimError(foundation::Error{E::Unavailable});
+        boost::system::error_code ec;
+        auto value=json::parse(result.rows.front().json,ec);
+        if (ec || !value.is_object()) return renderScimError(foundation::Error{E::Unavailable});
+        auto response=scimResponse(200,std::move(value));
+        response.setHeader("etag",versionTag(result.rows.front().updatedAt));
+        return response;
+    }
+    json::array resources;
+    for (const auto& row:result.rows) {
+        boost::system::error_code ec;
+        auto value=json::parse(row.json,ec);
+        if (ec || !value.is_object()) return renderScimError(foundation::Error{E::Unavailable});
+        resources.push_back(std::move(value));
+    }
+    const auto total=resources.size();
+    return scimResponse(200,listResponse(std::move(resources),total));
 }
 
 } // namespace openproof::enterprise::scim::http

@@ -742,6 +742,84 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     ASSERT_NO_THROW(done.get());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeScimReadsPreserveTenantAndCanonicalState)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace scim=openproof::enterprise::scim;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto group="scim-group-"+seed.suffix,foreignGroup="scim-foreign-"+seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_users(identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'alice','fixture-external',1770000000000,1770000000123),"
+        "($3,$2,'bob',NULL,1770000000000,1770000000123),"
+        "($4,$5,'alice','foreign-external',1770000000000,1770000000123)",
+        {seed.owner,seed.org,seed.lockedOwner,seed.foreignOwner,seed.foreignOrg})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_groups(id,organization_id,display_name,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Engineering',1770000000000,1770000000123),"
+        "($3,$4,'Engineering',1770000000000,1770000000123)",
+        {group,seed.org,foreignGroup,seed.foreignOrg})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_group_members(organization_id,group_id,identity_id) VALUES($1,$2,$3),($1,$2,$4),($5,$6,$7)",
+        {seed.org,group,seed.owner,seed.lockedOwner,seed.foreignOrg,foreignGroup,seed.foreignOwner})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,email,email_verified,created_at_ms,updated_at_ms) "
+        "VALUES($1,'Alice Fixture','alice@example.invalid',false,1770000000000,1770000000123) "
+        "ON CONFLICT(identity_id) DO UPDATE SET display_name=EXCLUDED.display_name,email=EXCLUDED.email",
+        {seed.owner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](scim::ReadKind kind,scim::ReadSelector selector=scim::ReadSelector::All,
+        std::optional<std::string> value=std::nullopt) {
+        io.restart();
+        auto done=asio::co_spawn(io,native.readScimAsync({kind,selector,std::move(value)}),asio::use_future);
+        io.run();return done.get();
+    };
+    auto users=read(scim::ReadKind::Users);
+    ASSERT_TRUE(users);
+    ASSERT_EQ(users->rows.size(),2U);
+    EXPECT_NE(users->rows[0].json.find(seed.owner),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find("Alice Fixture"),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find("alice@example.invalid"),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find(fnd::toIso8601(kNow+123ms)),std::string::npos);
+    EXPECT_EQ(users->rows[0].updatedAt,kNow+123ms);
+    EXPECT_EQ(users->rows[0].json.find("foreign-external"),std::string::npos);
+    EXPECT_EQ(users->rows[1].json.find("externalId"),std::string::npos);
+    EXPECT_NE(users->rows[1].json.find("false"),std::string::npos);
+    auto matched=read(scim::ReadKind::Users,scim::ReadSelector::Name,"alice");
+    ASSERT_TRUE(matched && matched->rows.size()==1U);
+    EXPECT_NE(matched->rows.front().json.find(seed.owner),std::string::npos);
+    auto absent=read(scim::ReadKind::Users,scim::ReadSelector::Name,"missing");
+    ASSERT_TRUE(absent);
+    EXPECT_TRUE(absent->rows.empty());
+    auto foreign=read(scim::ReadKind::Users,scim::ReadSelector::Id,seed.foreignOwner);
+    ASSERT_FALSE(foreign);
+    EXPECT_EQ(foreign.error().code(),fnd::ErrorCode::NotFound);
+    auto groups=read(scim::ReadKind::Groups,scim::ReadSelector::Name,"Engineering");
+    ASSERT_TRUE(groups && groups->rows.size()==1U);
+    EXPECT_NE(groups->rows.front().json.find(group),std::string::npos);
+    EXPECT_NE(groups->rows.front().json.find(seed.owner),std::string::npos);
+    EXPECT_NE(groups->rows.front().json.find(seed.lockedOwner),std::string::npos);
+    EXPECT_EQ(groups->rows.front().json.find(seed.foreignOwner),std::string::npos);
+    EXPECT_FALSE(read(scim::ReadKind::Groups,scim::ReadSelector::Id,foreignGroup));
+    EXPECT_FALSE(read(scim::ReadKind::Users,scim::ReadSelector::All,"unexpected"));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.organizations SET state=1 WHERE id=$1",{seed.org})));
+    auto disabled=read(scim::ReadKind::Users);
+    ASSERT_FALSE(disabled);
+    EXPECT_EQ(disabled.error().code(),fnd::ErrorCode::PermissionDenied);
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChallengeAreSessionBound)
 {
     const auto dsn=disposableDsn();
