@@ -919,7 +919,7 @@ target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_consent openproof_consent
     openproof_postgres_async_repository openproof_policy openproof_session
     openproof_postgres_async_verification openproof_storage_postgres openproof_account
-    openproof_postgres_async_local_credentials
+    openproof_postgres_async_local_credentials openproof_postgres_async_recovery_repository
     openproof_authentication openproof_identity_core
     openproof_identity_provider openproof_identity_profile
     openproof_security openproof_foundation Boost::headers OpenProof::libpq

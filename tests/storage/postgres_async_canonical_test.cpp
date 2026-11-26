@@ -31,6 +31,7 @@
 #include "coroutine_authorization_audit.hpp"
 #include "coroutine_verification_challenge_store.hpp"
 #include "coroutine_local_credential_store.hpp"
+#include "coroutine_recovery_code_repository.hpp"
 #include "coroutine_local_proof_verifier.hpp"
 
 import openproof.account;
@@ -2645,6 +2646,79 @@ TEST(PostgresCanonicalCoroutineTest, NativeTotpCeremonyVerifiesActualSeedAndBurn
     auto removed=run(store.readAsync(idp::ExternalSubject{seed.subject}));
     ASSERT_TRUE(removed && removed->has_value());
     EXPECT_FALSE(removed->value().encryptedTotpHex);
+}
+
+TEST(PostgresCanonicalCoroutineTest, RecoveryIssuanceFenceRejectsChangedFactorWithoutDeletingNewBatch)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace cred=openproof::credentials;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,'fixture-hash',1770000000000)",{seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+        "VALUES($1,decode('010203','hex'),1,100,1770000000000)",{seed.owner})));
+    asio::io_context io;
+    const idp::ProviderId provider{"native-canonical-provider"};
+    const ids::IdentityId owner{seed.owner};
+    pg::CoroutinePostgresRecoveryCodeRepository repo{io.get_executor(),fnd::SecretString{*dsn},
+        2U,500ms,1000ms,3000ms,ids::OrganizationId{seed.org},provider};
+    pg::CoroutinePostgresRecoveryCodeRepository foreign{io.get_executor(),fnd::SecretString{*dsn},
+        1U,500ms,1000ms,3000ms,ids::OrganizationId{seed.foreignOrg},provider};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},provider,2U,500ms,1000ms,3000ms};
+    auto run=[&]<typename T>(asio::awaitable<T> pending){
+        io.restart();
+        std::optional<T> output;
+        auto capture=[](asio::awaitable<T> task,std::optional<T>& target)->asio::awaitable<void>{
+            target.emplace(co_await std::move(task));
+        };
+        auto done=asio::co_spawn(io,capture(std::move(pending),output),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(output.value());
+    };
+    EXPECT_FALSE(run(foreign.captureIssuanceAsync(owner)));
+    auto stale=run(repo.captureIssuanceAsync(owner));
+    ASSERT_TRUE(stale);
+    const auto firstDigest=openproof::security::sha256("fixture-first").value();
+    const auto nextDigest=openproof::security::sha256("fixture-next").value();
+    const auto rejectedDigest=openproof::security::sha256("fixture-stale").value();
+    EXPECT_FALSE(run(repo.replaceAsync(owner,{firstDigest})));
+    ASSERT_TRUE(run(repo.replaceFencedAsync(owner,{firstDigest},stale.value())));
+    const idp::ExternalSubject subject{seed.subject};
+    auto before=run(store.readAsync(subject));
+    ASSERT_TRUE(before && before->has_value());
+    using Owner=pg::CoroutineLocalCredentialStore::OwnerCredential;
+    using Enrollment=pg::CoroutineLocalCredentialStore::EncryptedTotpEnrollment;
+    ASSERT_TRUE(run(store.changeTotpAsync(Owner{subject,before->value()},Enrollment{"040506",1U,101U},kNow)));
+    auto current=run(repo.captureIssuanceAsync(owner));
+    ASSERT_TRUE(current);
+    EXPECT_NE(current->credentialGeneration,stale->credentialGeneration);
+    ASSERT_TRUE(run(repo.replaceFencedAsync(owner,{nextDigest},current.value())));
+    EXPECT_FALSE(run(repo.replaceFencedAsync(owner,{rejectedDigest},stale.value())));
+    EXPECT_FALSE(run(foreign.replaceFencedAsync(owner,{rejectedDigest},current.value())));
+    EXPECT_FALSE(run(repo.consumeAsync(owner,rejectedDigest)));
+    EXPECT_FALSE(run(repo.consumeAsync(owner,firstDigest)));
+    EXPECT_TRUE(run(repo.consumeAsync(owner,nextDigest)));
+    auto after=run(store.readAsync(subject));
+    ASSERT_TRUE(after && after->has_value());
+    ASSERT_TRUE(run(store.changeTotpAsync(Owner{subject,after->value()},std::nullopt,kNow)));
+    EXPECT_FALSE(run(repo.captureIssuanceAsync(owner)));
+    EXPECT_FALSE(run(repo.replaceFencedAsync(owner,{rejectedDigest},current.value())));
 }
 
 TEST(PostgresCanonicalCoroutineTest, NativeMfaMutationFencesOldLoginAndRecoveryGenerations)

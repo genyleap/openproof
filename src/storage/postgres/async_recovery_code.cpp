@@ -87,6 +87,24 @@ boost::asio::awaitable<void> AsyncRecoveryCodeSql::replace(
     AsyncConnection& conn, std::string identityId,
     std::vector<std::string> digestsHex, std::chrono::milliseconds timeout)
 {
+    if (m_table==Table::Production && !digestsHex.empty())
+        throw std::invalid_argument{"Production recovery issuance requires a generation fence"};
+    static_cast<void>(co_await replaceImpl(conn,std::move(identityId),std::move(digestsHex),std::nullopt,timeout));
+}
+
+boost::asio::awaitable<bool> AsyncRecoveryCodeSql::replaceFenced(
+    AsyncConnection& conn,std::string identityId,std::vector<std::string> digestsHex,
+    IssuanceScope scope,std::chrono::milliseconds timeout)
+{
+    if (m_table!=Table::Production || digestsHex.empty())
+        throw std::invalid_argument{"Invalid fenced recovery replacement"};
+    co_return co_await replaceImpl(conn,std::move(identityId),std::move(digestsHex),std::move(scope),timeout);
+}
+
+boost::asio::awaitable<bool> AsyncRecoveryCodeSql::replaceImpl(
+    AsyncConnection& conn,std::string identityId,std::vector<std::string> digestsHex,
+    std::optional<IssuanceScope> scope,std::chrono::milliseconds timeout)
+{
     if (!validIdentity(identityId)
         || digestsHex.size() > kMaximumRecoveryCodes
         || timeout <= std::chrono::milliseconds::zero()) {
@@ -101,7 +119,7 @@ boost::asio::awaitable<void> AsyncRecoveryCodeSql::replace(
     const Deadline deadline = Clock::now() + timeout;
     const std::string table = tableName(m_table);
     static_cast<void>(co_await conn.query(
-        "BEGIN", {}, remainingBudget(deadline)));
+        "BEGIN ISOLATION LEVEL READ COMMITTED", {}, remainingBudget(deadline)));
     // Two concurrent rotations of the same identity must serialize BEFORE
     // either DELETE. Otherwise READ COMMITTED can let both transactions
     // insert disjoint code sets after deleting the same prior snapshot,
@@ -111,6 +129,36 @@ boost::asio::awaitable<void> AsyncRecoveryCodeSql::replace(
     static_cast<void>(co_await conn.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         {identityId}, remainingBudget(deadline)));
+    if (scope) {
+        const auto exact=[&](const QueryRows& rows){
+            return rows.rows.size()==1U && rows.rows.front().size()==1U
+                && rows.rows.front().front()==identityId;
+        };
+        std::vector<std::optional<std::string>> ownerParams{identityId,scope->tenant};
+        const auto owner=co_await conn.query(
+            "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.kind=0 AND i.status=0 AND o.state=0 "
+            "FOR UPDATE OF i FOR SHARE OF o",std::move(ownerParams),remainingBudget(deadline));
+        if (!exact(owner)) {
+            static_cast<void>(co_await conn.query("ROLLBACK",{},remainingBudget(deadline)));
+            co_return false;
+        }
+        std::vector<std::optional<std::string>> factorParams{identityId,scope->provider,scope->subject,
+            scope->credentialGeneration,scope->factorGeneration};
+        const auto factor=co_await conn.query(
+            "SELECT p.identity_id FROM openproof.password_credentials p "
+            "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+            "JOIN openproof.totp_credentials t ON t.identity_id=p.identity_id "
+            "WHERE p.identity_id=$1 AND e.provider=$2 AND e.external_subject=$3 "
+            "AND p.changed_at_ms=$4::bigint AND t.enrolled_at_ms=$5::bigint "
+            "AND NOT EXISTS(SELECT 1 FROM openproof.external_identities other "
+            "WHERE other.identity_id=$1 AND other.provider=$2 AND other.external_subject<>$3) "
+            "FOR SHARE OF p,e,t",std::move(factorParams),remainingBudget(deadline));
+        if (!exact(factor)) {
+            static_cast<void>(co_await conn.query("ROLLBACK",{},remainingBudget(deadline)));
+            co_return false;
+        }
+    }
     static_cast<void>(co_await conn.query(
         "DELETE FROM " + table + " WHERE identity_id=$1",
         {identityId}, remainingBudget(deadline)));
@@ -136,7 +184,7 @@ boost::asio::awaitable<void> AsyncRecoveryCodeSql::replace(
     }
     static_cast<void>(co_await conn.query(
         "COMMIT", {}, remainingBudget(deadline)));
-    co_return;
+    co_return true;
 }
 
 boost::asio::awaitable<bool> AsyncRecoveryCodeSql::consume(

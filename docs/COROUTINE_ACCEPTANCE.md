@@ -5220,3 +5220,20 @@ generated seed, wrong owner/password, expiry, attempt exhaustion, replay,
 replacement/removal assurance and HTTP first-party routing. No schema
 change. Recovery issuance fencing, legacy MFA writer parity and exact
 compiled/live acceptance remain blockers to default native cutover.
+
+### Generation-fenced recovery batch issuance
+
+Recovery HTTP now uses issueFenced, not two separate boolean eligibility
+checks and an unconditional compensating revocation. A tenant-scoped
+read captures the unique active local subject, credential generation and
+TOTP generation. The batch transaction obtains the recovery advisory
+lock and canonical owner lock, then rechecks and locks the exact
+password, local subject and TOTP generation before any DELETE. A stale
+request returns 412 without deleting any newer recovery batch. Native
+MFA mutation shares those locks and invalidates all prior batches.
+Only committed digests produce plaintext codes; a later MFA change may
+invalidate already-issued codes, as expected. The production coroutine
+repository refuses unfenced nonempty replacements. No change to the
+existing IAL2 session lifetime policy. Legacy factor writers remain a
+separate compatibility concern; exact-head C++/E2E acceptance is pending.
+No schema change.

@@ -2638,7 +2638,8 @@ addProtectedRoutes(gateway::Router& router,
             nativeRecoveryRepository = std::make_unique<
                 postgres::CoroutinePostgresRecoveryCodeRepository>(
                     executor, platform.database().connectionString().clone(),
-                    nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+                    nativeConnections, acquireDeadline, connectDeadline, queryDeadline,
+                    identity::OrganizationId{std::string{platform.auth().organizationId()}},providerId);
             auto created = credentials::CoroutineRecoveryCodeService::create(
                 *nativeRecoveryRepository, std::move(*nativeRecoverySecret));
             if (!created) {
@@ -2898,25 +2899,10 @@ addProtectedRoutes(gateway::Router& router,
                 return ExitCode::ConfigurationError;
             }
             auto* service = nativeSessions.get();
-            auto* canonical = nativeCanonical.get();
             asyncRecovery = std::make_unique<authHttp::CoroutineRecoveryCodeHttpAdapter>(
                 *nativeHandler, limiter.value(), *nativeRecoveryCodes,
                 [service](fnd::SecretString bearer) {
                     return service->authenticate(std::move(bearer));
-                },
-                [canonical, providerId](identity::IdentityId owner)
-                    -> boost::asio::awaitable<fnd::Result<bool>> {
-                    // Both adapter eligibility calls use fresh, tenant-bound
-                    // reads of canonical ownership and local credential state.
-                    auto status = co_await canonical->readTotpStatusAsync(owner, providerId);
-                    if (!status) {
-                        if (status.error().code() == fnd::ErrorCode::NotFound)
-                            co_return false;
-                        co_return fnd::fail(status.error());
-                    }
-                    if (status->first != owner)
-                        co_return fnd::fail(fnd::ErrorCode::Unavailable);
-                    co_return status->second.value_or(false);
                 });
             nativeHandler = asyncRecovery.get();
         }

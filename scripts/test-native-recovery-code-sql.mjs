@@ -37,14 +37,14 @@ test("recovery-code replacement validates/normalizes before changing any rows",(
   assert.match(replace,/std::sort\(digestsHex\.begin\(\), digestsHex\.end\(\)\)/);
   assert.match(replace,/std::adjacent_find/);
   assert.match(replace,/throw std::invalid_argument/);
-  assert.ok(replace.indexOf("std::adjacent_find") < replace.indexOf('"BEGIN"'));
+  assert.ok(replace.indexOf("std::adjacent_find") < replace.indexOf('"BEGIN ISOLATION LEVEL READ COMMITTED"'));
   assert.match(replace,/const Deadline deadline = Clock::now\(\) \+ timeout/);
 });
 
 test("recovery-code replacement commits DELETE and one parameterized batch INSERT atomically",()=>{
   const replace=body("AsyncRecoveryCodeSql::replace(","AsyncRecoveryCodeSql::consume(");
   for(const q of [
-    /co_await conn\.query\(\s*"BEGIN", \{\}, remainingBudget\(deadline\)\)/,
+    /co_await conn\.query\(\s*"BEGIN ISOLATION LEVEL READ COMMITTED", \{\}, remainingBudget\(deadline\)\)/,
     /SELECT pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/,
     /co_await conn\.query\(\s*"DELETE FROM "/,
     /parameters\.emplace_back\(digest\)/,
@@ -52,9 +52,15 @@ test("recovery-code replacement commits DELETE and one parameterized batch INSER
     /std::move\(sql\), std::move\(parameters\), remainingBudget\(deadline\)/,
     /co_await conn\.query\(\s*"COMMIT", \{\}, remainingBudget\(deadline\)\)/,
   ]) assert.match(replace,q);
-  assert.equal((replace.match(/\bco_await\b/g)||[]).length,5);
+  assert.equal((replace.match(/\bco_await\b/g)||[]).length,11);
   assert.ok(replace.indexOf("pg_advisory_xact_lock") < replace.indexOf('"DELETE FROM "'));
   assert.match(replace, /\{identityId\}, remainingBudget\(deadline\)/);
+  assert.match(replace,/m_table==Table::Production && !digestsHex.empty\(\)/);
+  assert.match(replace,/FOR UPDATE OF i FOR SHARE OF o/);
+  assert.match(replace,/p.changed_at_ms=\$4::bigint AND t.enrolled_at_ms=\$5::bigint/);
+  assert.match(replace,/FOR SHARE OF p,e,t/);
+  assert.ok(replace.indexOf("FOR SHARE OF p,e,t")<replace.indexOf('"DELETE FROM "'));
+  assert.match(replace,/if \(!exact\(factor\)\)[\s\S]*?co_return false/);
   assert.doesNotMatch(replace,/INSERT[^;]+(?:\+\s*identityId|\+\s*digest)/);
 });
 
