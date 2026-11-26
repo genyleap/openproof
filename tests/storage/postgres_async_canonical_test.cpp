@@ -1924,6 +1924,43 @@ TEST(PostgresCanonicalCoroutineTest, PasswordResetCommitsHashProofAndSessionRevo
     EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{otherId}),"0");
     EXPECT_EQ(scalar("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{idText}),"0");
     EXPECT_FALSE(run(reset(store,digest)));
+
+    // Simulate a login proof captured before reset, then persisted after it.
+    namespace ses=openproof::session;
+    pg::CoroutinePostgresSessionRepository repository{io.get_executor(),fnd::SecretString{*dsn},
+        2U,500ms,1000ms,3000ms};
+    const auto makeSession=[&](const std::string& name){
+        return ses::Session::create(ses::SessionId{name},ids::IdentityId{seed.owner},provider,
+            idp::AssuranceLevel::Ial1,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+            kNow,ses::TokenDigest{openproof::security::sha256(name).value()},kNow+1s,2h,15min);
+    };
+    const auto staleName="stale-"+seed.suffix;
+    const auto currentName="current-"+seed.suffix;
+    const auto staleReplacement="stale-replacement-"+seed.suffix;
+    using Fence=pg::CoroutinePostgresSessionRepository::PasswordFence;
+    auto stale=run(repository.addFenced(makeSession(staleName).value(),
+        Fence{idp::ExternalSubject{destination},kNow}));
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    ASSERT_TRUE(run(repository.addFenced(makeSession(currentName).value(),
+        Fence{idp::ExternalSubject{destination},kNow+1s})));
+    auto deniedReplacement=run(repository.replace(makeSession(staleReplacement).value(),
+        ses::SessionId{currentName},ses::TokenDigest{openproof::security::sha256(currentName).value()},
+        kNow+1s,Fence{idp::ExternalSubject{destination},kNow}));
+    ASSERT_FALSE(deniedReplacement);
+    EXPECT_EQ(deniedReplacement.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{currentName}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.sessions WHERE id IN ($1,$2)",
+        {staleName,staleReplacement}),"0");
+    EXPECT_FALSE(run(repository.addFenced(makeSession(staleName).value(),
+        Fence{idp::ExternalSubject{"different-subject"},kNow+1s})));
+    const auto nextName="next-"+seed.suffix;
+    ASSERT_TRUE(run(repository.replace(makeSession(nextName).value(),
+        ses::SessionId{currentName},ses::TokenDigest{openproof::security::sha256(currentName).value()},
+        kNow+1s,Fence{idp::ExternalSubject{destination},kNow+1s})));
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{currentName}),"1");
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{nextName}),"0");
 }
 
 TEST(PostgresCanonicalCoroutineTest, ReapOnlyExpiredUntouchedNativeSignupOwners)

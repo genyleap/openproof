@@ -2335,7 +2335,7 @@ foundation::Status PostgresLocalAccountDirectory::changePassword(
     if (!lease) return foundation::fail(lease.error());
     ResultPointer result = execParams(lease->get(),
         "UPDATE openproof.password_credentials p SET password_hash=$3,"
-        "changed_at_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint "
+        "changed_at_ms=GREATEST(p.changed_at_ms+1,(extract(epoch FROM clock_timestamp())*1000)::bigint) "
         "FROM openproof.external_identities e WHERE e.provider=$1 AND e.external_subject=$2 "
         "AND e.identity_id=p.identity_id RETURNING p.identity_id",
         {std::string{m_provider.value()}, std::string{subject.value()},
@@ -3482,7 +3482,7 @@ foundation::Status PostgresAdministrationRepository::resetCredentials(
     ResultPointer password = execParams(
         connection,
         "UPDATE openproof.password_credentials "
-        "SET password_hash=$2,changed_at_ms=$3 WHERE identity_id=$1 RETURNING identity_id",
+        "SET password_hash=$2,changed_at_ms=GREATEST(changed_at_ms+1,$3::bigint) WHERE identity_id=$1 RETURNING identity_id",
         {std::string{reset.identityId().value()},
          std::string{passwordHash->encoded()}, instant(reset.occurredAt())});
     if (!tuplesOk(password.get())) {

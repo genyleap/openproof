@@ -5123,3 +5123,22 @@ or cookie. Added HTTP and live E2E checks for replay denial and old-cookie
 revocation. The route remains opt-in: a previously verified local login
 can still race reset before final session persistence, so credential
 generation fencing is a prerequisite for default cutover.
+
+### Local password generation fence at session commit
+
+The native local proof carries the verified password changed_at_ms
+generation through the internal AuthenticationOutcome. It is not a claim
+or a client-visible field. Fresh and replacing first-party sessions
+both acquire the canonical owner lock, then verify the same provider,
+subject, active owner/organization and locked password generation before
+persisting and committing. Native reset uses the same lock order. If
+login wins, reset revokes the inserted session; if reset wins, login's
+stale generation is denied. Real password changes now advance the
+generation monotonically even for same-ms/backward clock observations,
+including compatibility local/admin password writes. Policy rehash
+preserves generation. Native handoff rejects password-fenced outcomes
+rather than dropping the constraint. Added C++ regression for stale
+insert/replacement, subject mismatch and successful current generation.
+No schema change. This does not yet fence all non-password grants, MFA
+generation transitions or legacy session issuers. Exact compiled/live
+acceptance remains required before enabling signup/reset by default.

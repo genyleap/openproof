@@ -26,6 +26,7 @@ constexpr std::size_t kEntropyBytes = 32U;
 struct PreparedIssue final {
     session::Session session;
     CoroutineSessionGrant grant;
+    std::optional<CoroutinePostgresSessionRepository::PasswordFence> fence;
 };
 
 foundation::Result<PreparedIssue> prepareIssue(
@@ -58,8 +59,15 @@ foundation::Result<PreparedIssue> prepareIssue(
             : std::optional<std::string>{std::string{client.remoteAddress()}});
     if (!value) return foundation::fail(value.error());
 
+    std::optional<CoroutinePostgresSessionRepository::PasswordFence> fence;
+    if (outcome.passwordGeneration()) {
+        if (!outcome.requiredCanonicalOwner() || *outcome.requiredCanonicalOwner()!=authentication.identity().value())
+            return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        fence.emplace(CoroutinePostgresSessionRepository::PasswordFence{
+            outcome.subject(),*outcome.passwordGeneration()});
+    }
     return PreparedIssue{std::move(value).value(),
-                         CoroutineSessionGrant{std::move(id), std::move(bearer)}};
+                         CoroutineSessionGrant{std::move(id), std::move(bearer)},std::move(fence)};
 }
 
 [[gnu::noinline]] asio::awaitable<foundation::Result<CoroutineSessionGrant>> persistIssue(
@@ -68,7 +76,9 @@ foundation::Result<PreparedIssue> prepareIssue(
 {
     if (!prepared) co_return foundation::fail(prepared.error());
     auto item = std::move(prepared).value();
-    auto saved = co_await repo.add(std::move(item.session));
+    foundation::Status saved=foundation::ok();
+    if (item.fence) saved=co_await repo.addFenced(std::move(item.session),std::move(*item.fence));
+    else saved=co_await repo.add(std::move(item.session));
     if (!saved) co_return foundation::fail(saved.error());
     co_return std::move(item.grant);
 }
@@ -101,12 +111,14 @@ foundation::Result<PreparedIssue> prepareIssue(
         // if revocation fails, nor can rollback failure create a second grant.
         auto saved = co_await repo.replace(
             std::move(item.session), std::move(*previousId),
-            std::move(*oldDigest), clock.now());
+            std::move(*oldDigest), clock.now(),std::move(item.fence));
         if (!saved) co_return foundation::fail(saved.error());
     } else {
         // An unknown / expired browser cookie is not an authenticated prior
         // session. Retain first-party fresh-login semantics.
-        auto saved = co_await repo.add(std::move(item.session));
+        foundation::Status saved=foundation::ok();
+        if (item.fence) saved=co_await repo.addFenced(std::move(item.session),std::move(*item.fence));
+        else saved=co_await repo.add(std::move(item.session));
         if (!saved) co_return foundation::fail(saved.error());
     }
     co_return std::move(item.grant);
