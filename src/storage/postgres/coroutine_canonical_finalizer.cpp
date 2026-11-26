@@ -4209,4 +4209,116 @@ CoroutinePostgresCanonicalFinalizer::mutateScimAsync(enterprise::scim::MutationR
     }
 }
 
+asio::awaitable<foundation::Result<std::vector<evidence::Evidence>>>
+CoroutinePostgresCanonicalFinalizer::evidenceAccountAsync(core::IdentityId actor,session::SessionId sessionId,
+    foundation::Instant now,evidence::verification::AccountCommand command)
+{
+    using E=foundation::ErrorCode;
+    using Op=evidence::verification::AccountOperation;
+    const auto op=command.operation;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U ||
+        now.time_since_epoch().count()<0 || static_cast<unsigned>(op)>3U ||
+        (op!=Op::List && (command.provider.empty() || command.provider.value().size()>200U)) ||
+        ((op==Op::Issue || op==Op::Consume) && (command.digest.value().size()!=64U ||
+        !std::ranges::all_of(command.digest.value(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))) ||
+        (op==Op::Issue && (command.expiresAt<=now || command.expiresAt-now>std::chrono::minutes{5})) ||
+        (op==Op::Persist && (command.records.empty() || command.records.size()>16U)) ||
+        (op!=Op::Persist && !command.records.empty()))
+        co_return foundation::fail(E::InvalidArgument);
+    for (const auto& record:command.records)
+        if (record.identity()!=actor || record.provider()!=command.provider ||
+            record.status()!=evidence::EvidenceStatus::Verified || !record.activeAt(now) || record.verifiedAt()>now)
+            co_return foundation::fail(E::PermissionDenied);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args){
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute(op==Op::List?"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY":
+            "BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string identityId{actor.value()},tenant{m_impl->organization.value()};
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        if (op!=Op::List) {
+            Params lockArgs{identityId};
+            static_cast<void>(co_await execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",std::move(lockArgs)));
+        }
+        Params actorArgs{identityId,tenant,std::string{sessionId.value()},timestamp};
+        std::string check="SELECT s.id FROM openproof.sessions s JOIN openproof.identities i ON i.id=s.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 AND i.status=0 AND o.state=0 "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4";
+        if (op!=Op::List) check+=" FOR SHARE OF i,o,s";
+        const auto permitted=co_await execute(std::move(check),std::move(actorArgs));
+        if (permitted.rows.size()!=1U) co_return foundation::fail(E::AuthenticationFailed);
+        std::vector<evidence::Evidence> result;
+        if (op==Op::List) {
+            Params args{identityId};
+            const auto rows=co_await execute(
+                "SELECT id,provider,kind,claim,value,confidence,status,verified_at_ms,expires_at_ms "
+                "FROM openproof.evidence WHERE identity_id=$1 ORDER BY verified_at_ms,id LIMIT 257",std::move(args));
+            if (rows.rows.size()>256U) co_return foundation::fail(E::Unavailable);
+            for (const auto& row:rows.rows) {
+                if (row.size()!=9U) throw std::runtime_error{"Malformed evidence row"};
+                const auto confidence=milliseconds(row[5]),status=milliseconds(row[6]);
+                if (confidence>100 || status>1) throw std::runtime_error{"Malformed evidence state"};
+                std::optional<foundation::Instant> expiry;
+                if (row[8]) expiry.emplace(foundation::Duration{milliseconds(row[8])});
+                auto restored=evidence::Evidence::restore(evidence::EvidenceId{required(row[0])},actor,
+                    idp::ProviderId{required(row[1])},required(row[2]),required(row[3]),required(row[4]),
+                    static_cast<unsigned>(confidence),static_cast<evidence::EvidenceStatus>(status),
+                    foundation::Instant{foundation::Duration{milliseconds(row[7])}},expiry);
+                if (!restored) throw std::runtime_error{"Invalid stored evidence"};
+                result.push_back(std::move(restored).value());
+            }
+        } else if (op==Op::Issue) {
+            Params purgeArgs{identityId,timestamp};
+            static_cast<void>(co_await execute(
+                "WITH expired AS (SELECT digest FROM openproof.evidence_verification_challenges "
+                "WHERE identity_id=$1 AND expires_at_ms<=$2 ORDER BY expires_at_ms LIMIT 128 FOR UPDATE SKIP LOCKED) "
+                "DELETE FROM openproof.evidence_verification_challenges c USING expired e WHERE c.digest=e.digest",
+                std::move(purgeArgs)));
+            Params countArgs{identityId,timestamp};
+            const auto active=co_await execute(
+                "SELECT digest FROM openproof.evidence_verification_challenges WHERE identity_id=$1 "
+                "AND expires_at_ms>$2 AND consumed_at_ms IS NULL LIMIT 33",std::move(countArgs));
+            if (active.rows.size()>=32U) co_return foundation::fail(E::RateLimited);
+            Params args{std::string{command.digest.value()},identityId,std::string{command.provider.value()},
+                timestamp,std::to_string(command.expiresAt.time_since_epoch().count())};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.evidence_verification_challenges(digest,identity_id,provider,issued_at_ms,expires_at_ms) "
+                "VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING digest",std::move(args));
+            if (inserted.rows.size()!=1U) co_return foundation::fail(E::Conflict);
+        } else if (op==Op::Consume) {
+            Params args{std::string{command.digest.value()},identityId,std::string{command.provider.value()},timestamp};
+            const auto consumed=co_await execute(
+                "UPDATE openproof.evidence_verification_challenges SET consumed_at_ms=$4 "
+                "WHERE digest=$1 AND identity_id=$2 AND provider=$3 AND consumed_at_ms IS NULL "
+                "AND issued_at_ms<=$4 AND expires_at_ms>$4 RETURNING digest",std::move(args));
+            if (consumed.rows.size()!=1U) co_return foundation::fail(E::AuthenticationFailed);
+        } else {
+            Params countArgs{identityId};
+            const auto count=co_await execute("SELECT id FROM openproof.evidence WHERE identity_id=$1 LIMIT 257",std::move(countArgs));
+            if (count.rows.size()+command.records.size()>256U) co_return foundation::fail(E::RateLimited);
+            for (const auto& record:command.records) {
+                Params args{std::string{record.id().value()},identityId,std::string{record.provider().value()},
+                    std::string{record.kind()},std::string{record.claim()},std::string{record.value()},
+                    std::to_string(record.confidence()),std::to_string(record.verifiedAt().time_since_epoch().count()),
+                    record.expiresAt()?std::optional<std::string>{std::to_string(record.expiresAt()->time_since_epoch().count())}:std::nullopt};
+                const auto inserted=co_await execute(
+                    "INSERT INTO openproof.evidence(id,identity_id,provider,kind,claim,value,confidence,status,verified_at_ms,expires_at_ms) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9) ON CONFLICT DO NOTHING RETURNING id",std::move(args));
+                if (inserted.rows.size()!=1U) co_return foundation::fail(E::Conflict);
+            }
+            result=std::move(command.records);
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native evidence account operation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

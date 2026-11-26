@@ -1197,8 +1197,26 @@ Group additions are idempotent; membership validation and mutation are
 atomic. The synchronous SCIM service and directory repository are no
 longer constructed by the server.
 
-The remaining PostgreSQL compatibility surfaces include evidence/trust,
-as well as startup and offline administration.
+Evidence challenge issuance, proof verification, listing and trust
+assessment now use native first-party session authentication and
+tenant-bound SQL transactions. Challenges are digest-only, expire
+after five minutes, and have at most 32 active records per identity.
+The one-time challenge is consumed before proof verification, matching
+the previous burn-on-attempt behavior. A single admitted worker handles
+JWT/X.509 verification, including CA/CRL file reads, outside the HTTP
+reactor. Evidence batch persistence rechecks the active session and
+identity, accepts only evidence for the selected identity/provider,
+and commits the whole batch or none. Listing and trust computation
+share a bounded consistent snapshot and the existing trust policy.
+The server no longer constructs the synchronous evidence HTTP API,
+challenge store, evidence service or trust engine.
+
+The blocking PostgreSQL compatibility implementation still exists.
+Startup, offline administration, and residual compatibility callers
+must be inventoried and retired before the final storage gate can pass.
+Native route migration is not proof of a fully nonblocking executable;
+the full C++ build, executable regressions, security and E2E gates must
+also pass.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

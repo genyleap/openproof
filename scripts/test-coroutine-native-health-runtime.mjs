@@ -13,7 +13,7 @@ test("production health routes exclusively use strict native dispatch",()=>{
   assert.match(app,/reader->healthCheckAsync\(\)/);
   assert.match(app,/nativePaths.emplace_back\("\/health\/live"\)/);
   assert.match(app,/nativePaths.emplace_back\("\/health\/ready"\)/);
-  assert.match(app,/CoroutineRouteOverlay nativeRoutes\{\s*evidenceApi, nativeHealth,/);
+  assert.match(app,/CoroutineRouteOverlay nativeRoutes\{\s*fallback, nativeHealth,/);
   assert.doesNotMatch(app,/operationsHttp::PostgresReadinessCheck\s+\w+\s*\{/);
   assert.doesNotMatch(app,/operationsHttp::HealthHttpApi\s+\w+\s*\{/);
   assert.doesNotMatch(cppExecutableText(http),/m_fallback->handle\(|PQexec|condition_variable|\.wait_for\(/);

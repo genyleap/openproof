@@ -326,7 +326,7 @@ const checked = segments.map(([name, relative]) => {
       // An independent Web3 opt-in must not expose an unconfigured directory.
       && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)
       && /nativeHandler\s*=\s*&nativeEnterprise/.test(app)
-      && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*evidenceApi\s*,\s*nativeHealth\s*,\s*std::move\(nativePaths\)/.test(app)
+      && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*fallback\s*,\s*nativeHealth\s*,\s*std::move\(nativePaths\)/.test(app)
       && /CoroutineHealthAdapter nativeHealth\{\*nativeHandler,/.test(app);
     if (!nativeWiring)
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",

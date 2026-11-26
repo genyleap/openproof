@@ -26,6 +26,8 @@ import openproof.oauth;
 import openproof.resource;
 import openproof.provider.passkey;
 import openproof.enterprise.scim;
+import openproof.evidence;
+import openproof.evidence.verifiers;
 
 namespace openproof::storage::postgres {
 
@@ -104,6 +106,10 @@ public:
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
     mutateScimAsync(enterprise::scim::MutationRequest request,foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::vector<evidence::Evidence>>>
+    evidenceAccountAsync(identity::core::IdentityId actor,session::SessionId sessionId,
+        foundation::Instant now,evidence::verification::AccountCommand command);
 
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();

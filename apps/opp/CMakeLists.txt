@@ -51,7 +51,7 @@ target_link_libraries(opp
         openproof_consent
         openproof_evidence
         openproof_evidence_verifiers
-        openproof_evidence_http
+        openproof_evidence_async_http
         openproof_trust
         openproof_resource
         openproof_client

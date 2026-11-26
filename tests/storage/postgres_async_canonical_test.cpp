@@ -742,6 +742,84 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     ASSERT_NO_THROW(done.get());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeEvidenceChallengesAndBatchesAreSessionBound)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace ev=openproof::evidence;
+    namespace verify=ev::verification;
+    using Op=verify::AccountOperation;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto sessionName="evidence-session-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(sessionName).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto provider=openproof::identity::provider::ProviderId{"signed-jwt-evidence"};
+    const auto challenge=verify::ChallengeDigest{fnd::toHex(openproof::security::sha256(seed.suffix).value())};
+    const auto task=[&](verify::AccountCommand command,std::string identity={},fnd::Instant when=kNow+1s){
+        return native.evidenceAccountAsync(ids::IdentityId{identity.empty()?seed.owner:identity},
+            openproof::session::SessionId{sessionName},when,std::move(command));
+    };
+    const auto run=[&](verify::AccountCommand command,std::string identity={},fnd::Instant when=kNow+1s){
+        io.restart();
+        auto done=asio::co_spawn(io,task(std::move(command),std::move(identity),when),asio::use_future);
+        io.run();return done.get();
+    };
+    const verify::AccountCommand list{Op::List,openproof::identity::provider::ProviderId{""},verify::ChallengeDigest{""},{},{}};
+    auto empty=run(list);
+    ASSERT_TRUE(empty && empty->empty());
+    EXPECT_FALSE(run(list,seed.foreignOwner));
+    const verify::AccountCommand issue{Op::Issue,provider,challenge,kNow+300s,{}};
+    const verify::AccountCommand consume{Op::Consume,provider,challenge,{},{}};
+    ASSERT_TRUE(run(issue));
+    EXPECT_FALSE(run(issue));
+    auto wrong=consume;wrong.provider=openproof::identity::provider::ProviderId{"x509-evidence"};
+    EXPECT_FALSE(run(wrong));
+    EXPECT_FALSE(run(consume,seed.secondOwner));
+    io.restart();
+    auto first=asio::co_spawn(io,task(consume),asio::use_future);
+    auto second=asio::co_spawn(io,task(consume),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_FALSE(run(consume));
+    const auto evidenceId="native-evidence-"+seed.suffix;
+    const auto record=[&](std::string id,std::string owner){
+        return ev::Evidence::create(ev::EvidenceId{std::move(id)},ids::IdentityId{std::move(owner)},
+            provider,"jwt.attestation","fixture.claim","fixture-value",85U,kNow+1s,kNow+200s).value();
+    };
+    auto item=record(evidenceId,seed.owner);
+    auto foreign=record(evidenceId+"-foreign",seed.foreignOwner);
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{foreign}}));
+    // A duplicate in the batch must roll back the first insert as well.
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{item,item}}));
+    auto rolledBack=run(list);
+    ASSERT_TRUE(rolledBack && rolledBack->empty());
+    ASSERT_TRUE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{item}}));
+    auto listed=run(list);
+    ASSERT_TRUE(listed && listed->size()==1U);
+    EXPECT_EQ(listed->front().id(),item.id());
+    EXPECT_EQ(listed->front().confidence(),85U);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
+    EXPECT_FALSE(run(list));
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{record(evidenceId+"-revoked",seed.owner)}}));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeScimReadsPreserveTenantAndCanonicalState)
 {
     const auto dsn=disposableDsn();

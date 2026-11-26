@@ -50,7 +50,8 @@ test("SCIM user and group reads are tenant-scoped consistent bounded projections
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeScimReadsPreserveTenantAndCanonicalState/);
 });
 test("SCIM native writes serialize owner, identity and metadata changes, preserving tenant and version invariants",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateScimAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateScimAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::evidenceAccountAsync("));
   const order=["BEGIN ISOLATION LEVEL READ COMMITTED","pg_advisory_xact_lock(7299730475761673315)",
     "WHERE id=$1 AND state=0 FOR SHARE","pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
     "WHERE u.organization_id=$1 AND u.identity_id=$2 AND i.kind=0 FOR UPDATE OF u,i,m",

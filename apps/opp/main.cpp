@@ -50,6 +50,7 @@
 #include "../../src/operations/http/coroutine_health_http.hpp"
 #include "../../src/authentication/http/coroutine_passkey_http.hpp"
 #include "../../src/enterprise/scim/http/coroutine_read_http.hpp"
+#include "../../src/evidence/http/coroutine_evidence_http.hpp"
 #include "../../src/application/http/coroutine_management_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
@@ -97,7 +98,6 @@ import openproof.enterprise.scim;
 import openproof.enterprise.scim.http;
 import openproof.evidence;
 import openproof.evidence.verifiers;
-import openproof.evidence.http;
 import openproof.trust;
 import openproof.identity.provider;
 import openproof.identity.profile;
@@ -2821,11 +2821,7 @@ addProtectedRoutes(gateway::Router& router,
         memberPolicy->get(), organizations, identities, memberships,
         &authorizationAudit};
 
-    postgres::PostgresEvidenceChallengeStore evidenceChallengeStore{*pool.value()};
-    evidence::EvidenceService evidenceService{identityProviderStore, clock};
-    evidenceVerification::ChallengeService evidenceChallenges{
-        evidenceChallengeStore, clock, std::chrono::minutes{5}};
-    std::set<std::string, std::less<>> evidenceProviders;
+    std::vector<std::unique_ptr<evidence::EvidenceVerifier>> evidenceVerifiers;
 
     if (const auto publicKey = environment.get("OPENPROOF_EVIDENCE_JWT_PUBLIC_KEY_PEM");
         publicKey && !publicKey->empty()) {
@@ -2843,12 +2839,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(verifier.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = evidenceService.registerVerifier(std::move(verifier).value());
-        if (!status) {
-            reportStartupFailure(status.error());
-            return ExitCode::ConfigurationError;
-        }
-        evidenceProviders.emplace("signed-jwt-evidence");
+        evidenceVerifiers.push_back(std::move(verifier).value());
     }
 
     if (const auto caFile = environment.get("OPENPROOF_EVIDENCE_X509_CA_FILE");
@@ -2860,12 +2851,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(verifier.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = evidenceService.registerVerifier(std::move(verifier).value());
-        if (!status) {
-            reportStartupFailure(status.error());
-            return ExitCode::ConfigurationError;
-        }
-        evidenceProviders.emplace("x509-evidence");
+        evidenceVerifiers.push_back(std::move(verifier).value());
     }
 
     trustModel::TrustPolicy evidenceTrustPolicy;
@@ -2875,7 +2861,6 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
-    trustModel::TrustEngine evidenceTrust{identityProviderStore, clock, std::move(evidenceTrustPolicy)};
 
     std::optional<fnd::SecretString> scimBearerToken;
     if (auto configuredScimToken = environment.get("OPENPROOF_SCIM_BEARER_TOKEN");
@@ -2936,18 +2921,8 @@ addProtectedRoutes(gateway::Router& router,
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
         gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
-        evidenceHttp::Api evidenceApi{
-            evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
-            sessions, evidenceProviders, limiter.value(), fallback};
-        // Health probes share the native SQL admission/deadline boundary.
-        // The compatibility chain must never construct a synchronous readiness check.
-
-        // Legacy health, evidence and SCIM middleware remain the authoritative
-        // compatibility chain. Exact native routes bypass it only when their
-        // independently verified coroutine dependencies are available.
-        // Only opt-in native PostgreSQL sessions can serve account session
-        // routes without blocking the HTTP reactor on the legacy libpq pool.
-        // All other account routes remain on the compatibility worker.
+        // Protocol routes own their native dispatch boundary. Legacy
+        // compatibility is retained only for explicitly remaining callers.
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<accountHttp::CoroutineContactVerificationAdapter> asyncContact;
@@ -3547,12 +3522,25 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/scim/v2");
             strictNativePrefixes.emplace_back("/scim/v2/");
         }
+        evidenceHttp::CoroutineEvidenceAdapter nativeEvidence{*nativeHandler,limiter.value(),clock,
+            std::move(evidenceVerifiers),std::move(evidenceTrustPolicy),
+            [service=nativeSessions.get()](fnd::SecretString credential) {
+                return service->authenticate(std::move(credential));
+            },
+            [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                fnd::Instant now,evidenceVerification::AccountCommand command) {
+                return reader->evidenceAccountAsync(std::move(actor),std::move(sessionId),now,std::move(command));
+            }};
+        nativeHandler=&nativeEvidence;
+        nativePaths.emplace_back("/evidence");
+        nativePaths.emplace_back("/trust");
+        strictNativePrefixes.emplace_back("/evidence/");
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
         nativePaths.emplace_back("/health/live");
         nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
-            evidenceApi, nativeHealth, std::move(nativePaths),
+            fallback, nativeHealth, std::move(nativePaths),
             std::move(nativeMethods),std::move(strictNativePrefixes)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
