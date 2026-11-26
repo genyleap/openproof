@@ -43,3 +43,15 @@ test("loopback test retains complete TLS response while peer defers closing", ()
   assert.match(tests, /EXPECT_LT\(elapsed, 350ms\)/);
   assert.match(tests, /pghttp::AsyncHttpsClient client\{server\.caFile\}/);
 });
+
+test("each HTTPS exchange serializes DNS cancellation without extending its deadline", () => {
+  assert.match(exchange, /asio::make_strand\(executor\)/);
+  assert.match(exchange, /exchangeSerialized\(std::move\(request\), deadline\)/);
+  assert.ok(exchange.indexOf("request.absoluteDeadline.value_or") <
+            exchange.indexOf("asio::make_strand(executor)"));
+  assert.match(exchange, /const auto remaining = deadline - Clock::now\(\)/);
+  assert.match(exchange, /asio::cancel_after\(remaining,/);
+  assert.match(tests, /TEST\(AsyncProviderHttpsTest, ConcurrentExchangesOnFourThreadsPreserveDeadline\)/);
+  assert.match(tests, /index < 8U/);
+  assert.match(tests, /index < 4U/);
+});
