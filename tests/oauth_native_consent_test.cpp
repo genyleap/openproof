@@ -72,7 +72,7 @@ struct Fixture {
     bool foreign{}, unavailable{};
     std::string revokedId;
     explicit Fixture(double burst = 1000.0)
-        : limiter(gw::TokenBucketRateLimiter::create(clock, 1000.0, burst, 1000U).value()),
+        : limiter(gw::TokenBucketRateLimiter::create(clock, burst, 1000.0, 1000U).value()),
           api(fallback, limiter, clock,
             [this](fnd::SecretString token) -> asio::awaitable<fnd::Result<sess::Session>> {
                 ++authenticationCalls;
@@ -197,5 +197,14 @@ TEST(NativeConsentHttpTest, RateLimitAndStorageFailureNeverReportSuccess)
     EXPECT_EQ(f.authenticationCalls, 1);
     EXPECT_EQ(f.revokeCalls, 1);
     EXPECT_EQ(f.listCalls, 0);
+
+    // Both consent routes share the legacy OAuth IP bucket. Once it refills,
+    // storage failure must still fail closed rather than report success.
+    f.clock.advance(1ms);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/oauth/consents",
+        std::string{sessionCookie})).status(), 503);
+    EXPECT_EQ(f.authenticationCalls, 2);
+    EXPECT_EQ(f.revokeCalls, 1);
+    EXPECT_EQ(f.listCalls, 1);
 }
 } // namespace
