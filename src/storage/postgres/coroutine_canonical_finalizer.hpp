@@ -121,6 +121,9 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeHandoffOwnerAsync(identity::core::IdentityId owner,
         identity::core::ExternalIdentityRef external) override;
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    updatePresentationAsync(identity::core::IdentityId owner,
+        identity::core::ExternalIdentityRef external,foundation::Instant now) override;
 
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::core::ExternalIdentityRef>>

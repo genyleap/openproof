@@ -4826,3 +4826,13 @@ cookies are cleared on start and malformed or duplicate optional cookies
 cannot silently downgrade a handoff to ordinary login. Native connection
 and presentation persistence remain incomplete; the Web3 RPC bridge is
 not retired. Compiled and disposable end-to-end acceptance are pending.
+
+### Native Web3 login presentation
+
+Wallet login and mobile publication accept the same sanitized presentation
+fields as the legacy path. They never enter the provider proof or trusted
+claims. The post-proof native update locks the active tenant identity,
+conditionally updates only the originally verified owner/provider/subject
+link and refreshes presentation without contact claims. Failure remains
+best effort as in the legacy HTTP contract. Native connection presentation
+and complete Web3 cutover remain pending. No schema change.

@@ -98,8 +98,23 @@ test("native wallet handoff owns the two one-time tickets and revalidates owners
   assert.doesNotMatch(native,/m_transactions\.(?:begin|consume)\(|m_identities\.ownerOf\(|requireActiveIdentity\(/);
   const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const owner=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync("),
-    sql.indexOf("CoroutinePostgresCanonicalFinalizer::finishConnectionAsync("));
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::updatePresentationAsync("));
   assert.match(owner,/i.id=\$1 AND e.provider=\$2 AND e.external_subject=\$3/);
   assert.match(owner,/i.organization_id=\$4 AND i.status=0 AND o.state=0/);
   assert.doesNotMatch(owner,/\b(?:UPDATE|INSERT|DELETE)\b/);
+});
+
+test("native Web3 presentation is owner-bound and cannot alter proof or contact claims",()=>{
+  const complete=web3.slice(web3.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+  const proof=complete.indexOf("co_await m_authentication->completeAsync(");
+  const update=complete.indexOf("co_await m_authentication->updateConnectionPresentationAsync(");
+  assert.ok(proof>=0 && update>proof);
+  assert.match(complete,/updateConnectionPresentationAsync\(\s*verified->identity\(\)/);
+  const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
+  const body=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::updatePresentationAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::finishConnectionAsync("));
+  assert.match(body,/activeTarget\(/);
+  assert.match(body,/WHERE identity_id=\$1 AND provider=\$2 AND external_subject=\$3 RETURNING identity_id/);
+  assert.match(body,/ProfilePurpose::Connection/);
+  assert.doesNotMatch(body,/ClaimName::(?:Email|PhoneNumber)|INSERT INTO openproof.external_identities/);
 });

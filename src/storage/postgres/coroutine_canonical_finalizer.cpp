@@ -815,6 +815,58 @@ CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::updatePresentationAsync(
+    core::IdentityId owner,core::ExternalIdentityRef external,foundation::Instant now)
+{
+    if (owner.empty() || owner.value().size()>200U
+        || external.providerId().empty() || external.providerId().value().size()>128U
+        || external.subject().empty() || external.subject().value().size()>1000U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const auto safe=[](const auto& field,std::size_t maximum) {
+        return !field || (field->size()<=maximum && field->find('\0')==std::string::npos);
+    };
+    if (!safe(external.displayName(),256U) || !safe(external.preferredUsername(),128U)
+        || !safe(external.pictureUrl(),2048U))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN",{},remaining(deadline)));
+        if (!(co_await activeTarget(connection,std::string{owner.value()},
+                std::string{m_impl->organization.value()},deadline,true))) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        Params params{std::string{owner.value()},std::string{external.providerId().value()},
+            std::string{external.subject().value()},optionalText(external.displayName()),
+            optionalText(external.preferredUsername()),optionalText(external.pictureUrl())};
+        const auto updated=co_await connection.query(
+            "UPDATE openproof.external_identities SET "
+            "display_name=COALESCE(NULLIF($4,''),display_name),"
+            "preferred_username=COALESCE(NULLIF($5,''),preferred_username),"
+            "picture_url=COALESCE(NULLIF($6,''),picture_url) "
+            "WHERE identity_id=$1 AND provider=$2 AND external_subject=$3 RETURNING identity_id",
+            std::move(params),remaining(deadline));
+        if (updated.rows.size()!=1U || updated.rows.front().size()!=1U
+            || required(updated.rows.front().front())!=owner.value()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        idp::VerifiedClaims presentation;
+        if (external.displayName()) presentation.set(idp::ClaimName::DisplayName,std::string{*external.displayName()});
+        if (external.preferredUsername()) presentation.set(idp::ClaimName::PreferredUsername,std::string{*external.preferredUsername()});
+        if (external.pictureUrl()) presentation.set(idp::ClaimName::PictureUrl,std::string{*external.pictureUrl()});
+        if (!presentation.empty())
+            co_await saveProfile(connection,owner,presentation,now,deadline,ProfilePurpose::Connection);
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
 asio::awaitable<foundation::Result<core::ExternalIdentityRef>>
 CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
     const idp::AuthenticationOutcome& outcome,
