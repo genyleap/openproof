@@ -81,8 +81,21 @@ public:
 
 private:
     friend class SessionService;
+    friend class SessionVerificationSource;
     explicit AuthenticatedSession(Session session);
     Session m_session;
+};
+
+/** Trusted server-side adapter seam for native session repositories.
+ * A derived implementation MUST validate the bearer against authoritative
+ * storage before calling acceptVerifiedSession. Never expose this helper to
+ * HTTP callers or use it to construct a session from request claims.
+ */
+class SessionVerificationSource {
+protected:
+    SessionVerificationSource() = default;
+    [[nodiscard]] static foundation::Result<AuthenticatedSession>
+    acceptVerifiedSession(Session verified, foundation::Instant now);
 };
 
 /** @brief Sender-constraining mechanism carried by delegated OAuth access. */

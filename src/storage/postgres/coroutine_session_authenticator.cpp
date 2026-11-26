@@ -65,6 +65,23 @@ CoroutineSessionAuthenticator::authenticate(foundation::SecretString bearer) con
                            m_clock->now());
 }
 
+asio::awaitable<foundation::Result<session::AuthenticatedSession>>
+CoroutineSessionAuthenticator::verifyAsync(foundation::SecretString bearer) const
+{
+    // authenticate() performs the HMAC synchronously and returns an
+    // awaitable containing only the digest; this wrapper is not a coroutine.
+    return wrapVerified(authenticate(std::move(bearer)));
+}
+
+asio::awaitable<foundation::Result<session::AuthenticatedSession>>
+CoroutineSessionAuthenticator::wrapVerified(
+    asio::awaitable<foundation::Result<session::Session>> pending) const
+{
+    auto verified = co_await std::move(pending);
+    if (!verified) co_return foundation::fail(verified.error());
+    co_return acceptVerifiedSession(std::move(verified).value(), m_clock->now());
+}
+
 asio::awaitable<foundation::Result<session::Session>>
 CoroutineSessionAuthenticator::authorizeDigest(
     session::TokenDigest digest, foundation::Instant now) const

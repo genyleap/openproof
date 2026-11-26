@@ -23,6 +23,7 @@
 
 #include "async_pool.hpp"
 #include "coroutine_canonical_finalizer.hpp"
+#include "coroutine_session_authenticator.hpp"
 
 import openproof.authentication;
 import openproof.foundation;
@@ -30,6 +31,9 @@ import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.identity.provider;
 import openproof.organization;
+import openproof.policy;
+import openproof.session;
+import openproof.security;
 
 namespace {
 namespace asio = boost::asio;
@@ -813,7 +817,62 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
         io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.suspendedOrg}, 1U,
         std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
         std::chrono::milliseconds{2000}};
+    namespace pol = openproof::policy;
+    namespace ses = openproof::session;
+    fnd::ManualClockSource clock{kNow};
+    const std::string bearer = "native-policy-fixture-" + seed.suffix;
+    const fnd::SecretString key{std::string(32U, 'P')};
+    pg::CoroutinePostgresSessionRepository sessionRepository{
+        io.get_executor(), fnd::SecretString{*dsn}, 1U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    pg::CoroutineSessionAuthenticator verifier{sessionRepository, clock, key.clone()};
+    auto rule = pol::RolePolicyRule::create(pol::Action{"protected.read"},
+        pol::Resource{"protected-resource"}, {pol::Role{"owner"}},
+        pol::RoleMatchMode::All, idp::AssuranceLevel::Ial2);
+    ASSERT_TRUE(rule);
+    auto engine = pol::RolePolicyEngine::create({std::move(rule).value()});
+    ASSERT_TRUE(engine);
+    auto evaluate = [&]() -> asio::awaitable<void> {
+        auto authenticated = co_await verifier.verifyAsync(fnd::SecretString{bearer});
+        if (!authenticated) {
+            ADD_FAILURE() << "Expected authoritative first-party session";
+            co_return;
+        }
+        auto context = co_await canonical.readAuthorizationContextAsync(
+            authenticated.value(), ids::OrganizationId{seed.org},
+            pol::Action{"protected.read"}, pol::Resource{"protected-resource"});
+        if (!context) {
+            ADD_FAILURE() << "Expected active policy context";
+            co_return;
+        }
+        EXPECT_EQ(context->subject().value(), seed.owner);
+        EXPECT_EQ(context->organization().value(), seed.org);
+        EXPECT_EQ(context->authentication().claimedAssurance(), idp::AssuranceLevel::Ial2);
+        EXPECT_EQ(context->authentication().providerId().value(), "native-canonical-provider");
+        EXPECT_TRUE(pol::evaluateProtected(engine->get(), context.value()).isPermitted());
+        auto wrongTenant = co_await canonical.readAuthorizationContextAsync(
+            authenticated.value(), ids::OrganizationId{seed.foreignOrg},
+            pol::Action{"protected.read"}, pol::Resource{"protected-resource"});
+        EXPECT_TRUE(!wrongTenant && wrongTenant.error().code() == fnd::ErrorCode::PermissionDenied);
+        auto wrongAction = co_await canonical.readAuthorizationContextAsync(
+            authenticated.value(), ids::OrganizationId{seed.org},
+            pol::Action{"other.action"}, pol::Resource{"protected-resource"});
+        EXPECT_TRUE(wrongAction && !pol::evaluateProtected(engine->get(), wrongAction.value()).isPermitted());
+    };
     auto check = [&]() -> asio::awaitable<void> {
+        auto digest = openproof::security::hmacSha256(key, bearer);
+        if (!digest) { ADD_FAILURE() << "Fixture HMAC failed"; co_return; }
+        auto value = ses::Session::create(ses::SessionId{"policy-" + seed.suffix},
+            ids::IdentityId{seed.owner}, idp::ProviderId{"native-canonical-provider"},
+            idp::AssuranceLevel::Ial2,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
+            kNow, ses::TokenDigest{digest.value()}, kNow,
+            std::chrono::hours{2}, std::chrono::minutes{15});
+        if (!value) { ADD_FAILURE() << "Fixture session failed"; co_return; }
+        auto saved = co_await sessionRepository.add(std::move(value).value());
+        if (!saved) { ADD_FAILURE() << "Fixture session storage failed"; co_return; }
+        co_await evaluate();
         auto allowed = co_await canonical.readAuthorizationMembershipAsync(
             ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org});
         if (!allowed) {
@@ -865,6 +924,18 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
     ASSERT_TRUE(member);
     EXPECT_FALSE(member->hasRole(openproof::organization::Role{"owner"}));
     EXPECT_TRUE(member->hasRole(openproof::organization::Role{"auditor"}));
+    auto afterRevocation = [&]() -> asio::awaitable<void> {
+        auto verified = co_await verifier.verifyAsync(fnd::SecretString{bearer});
+        if (!verified) { ADD_FAILURE() << "Fixture session disappeared"; co_return; }
+        auto context = co_await canonical.readAuthorizationContextAsync(
+            std::move(verified).value(), ids::OrganizationId{seed.org},
+            pol::Action{"protected.read"}, pol::Resource{"protected-resource"});
+        EXPECT_TRUE(context && !pol::evaluateProtected(engine->get(), context.value()).isPermitted());
+    };
+    io.restart();
+    auto decision = asio::co_spawn(io, afterRevocation(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(decision.get());
 
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
         "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) "

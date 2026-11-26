@@ -15,6 +15,8 @@ import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.identity.profile;
 import openproof.organization;
+import openproof.policy;
+import openproof.session;
 
 namespace openproof::storage::postgres {
 
@@ -28,7 +30,8 @@ namespace openproof::storage::postgres {
  * uses a synchronous PostgreSQL repository on the Asio reactor.
  */
 class CoroutinePostgresCanonicalFinalizer final
-    : public authentication::CoroutineCanonicalIdentityFinalizer {
+    : public authentication::CoroutineCanonicalIdentityFinalizer,
+      private policy::AuthorizationContextSource {
 public:
     CoroutinePostgresCanonicalFinalizer(
         boost::asio::any_io_executor executor,
@@ -87,6 +90,15 @@ public:
         foundation::Result<organization::Membership>>
     readAuthorizationMembershipAsync(identity::core::IdentityId subject,
                                      identity::core::OrganizationId tenant);
+
+    /** Trusted context for native protected-route policy evaluation.
+     * All values are owned across suspension; authorization itself is still
+     * performed by the existing policy engine, not by this repository.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<policy::AuthorizationRequest>>
+    readAuthorizationContextAsync(session::AuthenticatedSession authenticated,
+                                  identity::core::OrganizationId tenant,
+                                  policy::Action action, policy::Resource resource);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;
