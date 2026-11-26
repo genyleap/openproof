@@ -74,6 +74,14 @@ public:
     activateSignupAsync(identity::provider::ProviderId provider,account::VerificationId id,
         account::VerificationDigest presented,foundation::Instant now,std::uint32_t maximumAttempts);
 
+    // The new hash must be computed on the bounded KDF worker before
+    // entering storage. Proof, password and existing session revocation
+    // commit together. No authentication grant is issued.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    resetPasswordAsync(identity::provider::ProviderId provider,account::VerificationId id,
+        account::VerificationDigest presented,credentials::PasswordHash replacement,
+        foundation::Instant now,std::uint32_t maximumAttempts);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.

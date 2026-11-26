@@ -58,7 +58,7 @@ test("signup provisions identity, reservation, credential and digest in one tran
 test("signup proof activation binds tenant, owner, purpose and reservation before an atomic promotion",()=>{
   const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
   const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::activateSignupAsync("),
-    source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+    source.indexOf("CoroutineVerificationChallengeStore::resetPasswordAsync("));
   const order=["BEGIN ISOLATION LEVEL READ COMMITTED","c.purpose=0 AND c.channel=0",
     "FOR UPDATE OF i FOR SHARE OF o","purpose=0 AND channel=0 FOR UPDATE",
     "security::constantTimeEquals","r.verification_id IS NULL",
@@ -150,4 +150,24 @@ test("expired enrollment retry requires exact pending provenance and a locked ha
   assert.match(body,/ON CONFLICT\(identity_id\) DO NOTHING/);
   assert.ok(body.indexOf("expiredCredentialGeneration=generation")<body.indexOf("const auto reserved="));
   assert.ok(body.indexOf("const auto credential=")<body.indexOf("const auto stored="));
+});
+
+test("password reset consumes only the exact proof and revokes sessions in the hash transaction",()=>{
+  const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::resetPasswordAsync("),
+    source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+  const ordered=["BEGIN ISOLATION LEVEL READ COMMITTED","c.purpose=3 AND c.channel=0",
+    "i.organization_id=$2 AND i.kind=0 AND i.status=0","FOR UPDATE OF i FOR SHARE OF o",
+    "purpose=3 AND channel=0 FOR UPDATE","security::constantTimeEquals",
+    "e.provider=$1 AND e.external_subject=$2 AND p.identity_id=$3",
+    "p.changed_at_ms<=$4","FOR UPDATE OF p FOR SHARE OF e",
+    "UPDATE openproof.password_credentials","UPDATE openproof.sessions SET state=1",
+    "const auto consumed=",'connection.query("COMMIT",{},remaining(deadline)));\n        co_return foundation::ok()'];
+  let previous=-1;
+  for(const marker of ordered){const index=body.indexOf(marker);assert.ok(index>previous,marker);previous=index;}
+  assert.match(body,/expires<=time \|\| attempts>=maximumAttempts/);
+  assert.match(body,/attempts=attempts\+1/);
+  assert.match(body,/WHERE identity_id=\$1 AND changed_at_ms<=\$4 RETURNING identity_id/);
+  assert.match(body,/WHERE identity_id=\$1 AND state=0/);
+  assert.doesNotMatch(body,/purpose=0|hasher.hash\(|issueAsync\(/);
 });

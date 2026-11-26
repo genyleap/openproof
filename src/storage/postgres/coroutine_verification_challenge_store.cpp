@@ -637,6 +637,142 @@ CoroutineVerificationChallengeStore::activateSignupAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutineVerificationChallengeStore::resetPasswordAsync(
+    identity::provider::ProviderId provider,account::VerificationId id,
+    account::VerificationDigest presented,credentials::PasswordHash replacement,
+    foundation::Instant now,std::uint32_t maximumAttempts)
+{
+    if (replacement.encoded().empty() || replacement.encoded().size()>4096U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    if (provider.empty() || provider.value().size()>200U
+        || id.empty() || id.value().size()>200U
+        || provider.value().find('\0')!=std::string_view::npos
+        || id.value().find('\0')!=std::string_view::npos
+        || maximumAttempts==0U || maximumAttempts>20U || now.time_since_epoch().count()<0)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    const std::string generation{id.value()},providerName{provider.value()},tenant{m_impl->tenant.value()};
+    const std::string observed=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+        // Lock order matches challenge replacement: owner before proof row.
+        // The initial read is only a locator, never authorization.
+        Params locator{generation,tenant};
+        const auto located=co_await connection.query(
+            "SELECT c.identity_id FROM openproof.account_verification_challenges c "
+            "JOIN openproof.identities i ON i.id=c.identity_id "
+            "WHERE c.id=$1 AND c.purpose=3 AND c.channel=0 AND i.organization_id=$2",
+            std::move(locator),remaining(deadline));
+        if (located.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        if (located.rows.size()!=1U || located.rows.front().size()!=1U || !located.rows.front().front())
+            throw std::runtime_error{"Invalid password reset proof locator"};
+        const std::string owner=*located.rows.front().front();
+        Params lockParams{owner,tenant};
+        const auto locked=co_await connection.query(
+            "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.kind=0 AND i.status=0 AND o.state=0 "
+            "FOR UPDATE OF i FOR SHARE OF o",std::move(lockParams),remaining(deadline));
+        if (!exactRow(locked,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        Params proofParams{generation,owner};
+        const auto proof=co_await connection.query(
+            "SELECT destination,encode(secret_digest,'hex'),attempts,created_at_ms,expires_at_ms "
+            "FROM openproof.account_verification_challenges "
+            "WHERE id=$1 AND identity_id=$2 AND purpose=3 AND channel=0 FOR UPDATE",
+            std::move(proofParams),remaining(deadline));
+        if (proof.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        if (proof.rows.size()!=1U || proof.rows.front().size()!=5U
+            || std::ranges::any_of(proof.rows.front(),[](const auto& v){return !v.has_value();}))
+            throw std::runtime_error{"Malformed password reset proof"};
+        const auto& row=proof.rows.front();
+        const auto parse=[](const std::string& text) {
+            std::int64_t value{};
+            const auto result=std::from_chars(text.data(),text.data()+text.size(),value);
+            if (result.ec!=std::errc{} || result.ptr!=text.data()+text.size() || value<0)
+                throw std::runtime_error{"Malformed password reset proof integer"};
+            return value;
+        };
+        const auto attempts=parse(*row[2]),created=parse(*row[3]),expires=parse(*row[4]);
+        const auto time=now.time_since_epoch().count();
+        auto digest=foundation::fromHex(*row[1]);
+        if (!digest || digest->size()!=32U || expires<=created)
+            throw std::runtime_error{"Malformed password reset proof digest/window"};
+        const std::string destination=*row[0];
+        const auto normalized=account::VerificationPreparation::normalizePublicEmail(destination);
+        if (!normalized || normalized.value()!=destination || destination.find('\0')!=std::string::npos
+            || created>time) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        const bool expired=expires<=time || attempts>=maximumAttempts;
+        const bool matches=security::constantTimeEquals(digest.value(),presented.bytes());
+        if (expired || !matches) {
+            Params mismatch{generation,owner};
+            if (expired || attempts+1>=maximumAttempts) {
+                static_cast<void>(co_await connection.query(
+                    "DELETE FROM openproof.account_verification_challenges WHERE id=$1 AND identity_id=$2 AND purpose=3",
+                    std::move(mismatch),remaining(deadline)));
+            } else {
+                static_cast<void>(co_await connection.query(
+                    "UPDATE openproof.account_verification_challenges SET attempts=attempts+1 "
+                    "WHERE id=$1 AND identity_id=$2 AND purpose=3",
+                    std::move(mismatch),remaining(deadline)));
+            }
+            static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        // The verified email subject must still be the exact owner's
+        // local link. A reset issued before a subsequent password change
+        // is stale, even if its own expiry has not passed.
+        Params eligibilityParams{providerName,destination,owner,std::to_string(created),observed};
+        const auto eligible=co_await connection.query(
+            "SELECT p.identity_id FROM openproof.password_credentials p "
+            "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+            "WHERE e.provider=$1 AND e.external_subject=$2 AND p.identity_id=$3 "
+            "AND p.changed_at_ms<=$4 AND p.changed_at_ms<=$5 "
+            "FOR UPDATE OF p FOR SHARE OF e",
+            std::move(eligibilityParams),remaining(deadline));
+        if (!exactRow(eligible,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        Params credentialParams{owner,std::string{replacement.encoded()},observed,std::to_string(created)};
+        const auto changed=co_await connection.query(
+            "UPDATE openproof.password_credentials SET password_hash=$2,changed_at_ms=$3 "
+            "WHERE identity_id=$1 AND changed_at_ms<=$4 RETURNING identity_id",
+            std::move(credentialParams),remaining(deadline));
+        if (!exactRow(changed,owner)) throw std::runtime_error{"Password reset generation changed"};
+        // Match legacy revokeAll semantics, but in the same transaction.
+        // No unbounded RETURNING row materialization.
+        Params revokeParams{owner,observed};
+        static_cast<void>(co_await connection.query(
+            "UPDATE openproof.sessions SET state=1,revoked_at_ms=$2 WHERE identity_id=$1 AND state=0",
+            std::move(revokeParams),remaining(deadline)));
+        Params consumeParams{generation,owner};
+        const auto consumed=co_await connection.query(
+            "DELETE FROM openproof.account_verification_challenges "
+            "WHERE id=$1 AND identity_id=$2 AND purpose=3 RETURNING id",
+            std::move(consumeParams),remaining(deadline));
+        if (!exactRow(consumed,generation)) throw std::runtime_error{"Password reset proof changed"};
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native password reset persistence is unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceImpl(
     account::VerificationChallenge challenge,
     std::optional<identity::provider::ProviderId> provider,bool publicEmail)
