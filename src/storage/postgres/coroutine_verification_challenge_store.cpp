@@ -322,7 +322,7 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
         // local link. No caller-selected identity may receive a credential.
         Params matchesParams{tenant,destination};
         const auto matches=co_await connection.query(
-            "SELECT i.id,i.status FROM openproof.identities i JOIN openproof.identity_profiles p ON p.identity_id=i.id "
+            "SELECT i.id,i.status,i.kind FROM openproof.identities i JOIN openproof.identity_profiles p ON p.identity_id=i.id "
             "WHERE i.organization_id=$1 AND p.email_verified=true AND lower(p.email)=lower($2) "
             "AND i.status NOT IN (4,5) ORDER BY i.status,i.id LIMIT 2 FOR UPDATE OF i",
             std::move(matchesParams),remaining(deadline));
@@ -331,18 +331,19 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
             // Active candidates sort before blocked candidates. Two blocked
             // matches retain the legacy AlreadyExists response.
             const auto& first=matches.rows.front();
-            if (first.size()!=2U || !first[1])
+            if (first.size()!=3U || !first[1])
                 throw std::runtime_error{"Invalid signup identity row"};
             co_return foundation::fail(*first[1]=="0"?foundation::ErrorCode::Conflict
                 :foundation::ErrorCode::AlreadyExists);
         }
         const bool createdIdentity=matches.rows.empty();
         std::string owner;
+        std::optional<std::string> expiredCredentialGeneration;
         if (!createdIdentity) {
             const auto& row=matches.rows.front();
-            if (row.size()!=2U || !row[0] || !row[1])
+            if (row.size()!=3U || !row[0] || !row[1] || !row[2])
                 throw std::runtime_error{"Invalid signup identity row"};
-            if (*row[1]!="0") {
+            if (*row[1]!="0" || *row[2]!="0") {
                 static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
                 co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
             }
@@ -353,11 +354,42 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
                 "WHERE p.identity_id=$1 AND p.email_verified=true AND lower(p.email)=lower($2) "
                 "AND NOT EXISTS(SELECT 1 FROM openproof.external_identities e "
                 "WHERE e.identity_id=$1 AND e.provider=$3) "
-                "AND NOT EXISTS(SELECT 1 FROM openproof.password_credentials c WHERE c.identity_id=$1) "
                 "FOR SHARE OF p",std::move(eligibilityParams),remaining(deadline));
             if (!exactRow(eligible,owner)) {
                 static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
                 co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+            // Lock an existing credential before deciding whether it is a
+            // replaceable, expired pending enrollment. A password row on
+            // its own is never evidence of pending signup.
+            Params existingParams{owner};
+            const auto existingCredential=co_await connection.query(
+                "SELECT changed_at_ms FROM openproof.password_credentials WHERE identity_id=$1 FOR UPDATE",
+                std::move(existingParams),remaining(deadline));
+            if (!existingCredential.rows.empty()) {
+                if (existingCredential.rows.size()!=1U || existingCredential.rows.front().size()!=1U
+                    || !existingCredential.rows.front().front())
+                    throw std::runtime_error{"Invalid existing signup credential"};
+                const auto& generation=*existingCredential.rows.front().front();
+                Params expiredParams{providerName,destination,owner,observed,generation};
+                const auto expiredEnrollment=co_await connection.query(
+                    "SELECT r.identity_id FROM openproof.pending_external_identity_reservations r "
+                    "WHERE r.provider=$1 AND r.external_subject=$2 AND r.identity_id=$3 "
+                    "AND r.verification_id IS NULL AND r.expires_at_ms<=$4 "
+                    "AND $5::bigint>=0 AND $5::bigint<r.expires_at_ms "
+                    "AND NOT EXISTS(SELECT 1 FROM openproof.pending_external_identity_reservations other "
+                    "WHERE other.identity_id=$3 AND (other.provider<>$1 OR other.external_subject<>$2)) "
+                    "AND NOT EXISTS(SELECT 1 FROM openproof.account_verification_challenges v "
+                    "WHERE v.identity_id=$3 AND (v.purpose<>0 OR v.channel<>0 "
+                    "OR v.destination<>$2 OR v.expires_at_ms>$4)) "
+                    "AND NOT EXISTS(SELECT 1 FROM openproof.external_identities e "
+                    "WHERE e.provider=$1 AND (e.external_subject=$2 OR e.identity_id=$3)) "
+                    "FOR UPDATE OF r",std::move(expiredParams),remaining(deadline));
+                if (!exactRow(expiredEnrollment,owner)) {
+                    static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                    co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+                }
+                expiredCredentialGeneration=generation;
             }
         } else {
             auto random=security::randomTokenBase64Url(24U);
@@ -414,9 +446,15 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
             co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
         }
         Params credentialParams{owner,std::string{passwordHash.encoded()},observed};
+        if (expiredCredentialGeneration) credentialParams.emplace_back(*expiredCredentialGeneration);
+        // Only the exact locked expired enrollment may replace a hash.
+        // A normal signup retains insert-only behavior.
         const auto credential=co_await connection.query(
-            "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
-            "VALUES($1,$2,$3) ON CONFLICT(identity_id) DO NOTHING RETURNING identity_id",
+            expiredCredentialGeneration
+                ? "UPDATE openproof.password_credentials SET password_hash=$2,changed_at_ms=$3 "
+                  "WHERE identity_id=$1 AND changed_at_ms=$4 RETURNING identity_id"
+                : "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+                  "VALUES($1,$2,$3) ON CONFLICT(identity_id) DO NOTHING RETURNING identity_id",
             std::move(credentialParams),remaining(deadline));
         if (!exactRow(credential,owner)) {
             static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));

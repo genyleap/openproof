@@ -132,3 +132,22 @@ test("abandoned signup collection is bounded, tenant-scoped and refuses unrelate
   assert.match(body,/DELETE FROM openproof.identities target WHERE target.id=\$4/);
   assert.match(read("apps/opp/main.cpp"),/co_await contactStore.reapExpiredSignupsAsync\(clock.now\(\)\)/);
 });
+
+test("expired enrollment retry requires exact pending provenance and a locked hash generation",()=>{
+  const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::provisionSignupAsync("),
+    source.indexOf("CoroutineVerificationChallengeStore::activateSignupAsync("));
+  assert.match(body,/SELECT changed_at_ms FROM openproof.password_credentials WHERE identity_id=\$1 FOR UPDATE/);
+  assert.match(body,/r.provider=\$1 AND r.external_subject=\$2 AND r.identity_id=\$3/);
+  assert.match(body,/r.verification_id IS NULL AND r.expires_at_ms<=\$4/);
+  assert.match(body,/\$5::bigint<r.expires_at_ms/);
+  assert.match(body,/other.identity_id=\$3 AND \(other.provider<>\$1 OR other.external_subject<>\$2\)/);
+  assert.match(body,/OR v.destination<>\$2 OR v.expires_at_ms>\$4/);
+  assert.match(body,/FOR UPDATE OF r/);
+  assert.match(body,/if \(!exactRow\(expiredEnrollment,owner\)\)/);
+  assert.match(body,/expiredCredentialGeneration=generation/);
+  assert.match(body,/WHERE identity_id=\$1 AND changed_at_ms=\$4 RETURNING identity_id/);
+  assert.match(body,/ON CONFLICT\(identity_id\) DO NOTHING/);
+  assert.ok(body.indexOf("expiredCredentialGeneration=generation")<body.indexOf("const auto reserved="));
+  assert.ok(body.indexOf("const auto credential=")<body.indexOf("const auto stored="));
+});
