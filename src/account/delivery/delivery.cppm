@@ -9,6 +9,7 @@ export module openproof.account.delivery;
 import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
+export import :coroutine;
 
 export namespace openproof::account::delivery {
 
