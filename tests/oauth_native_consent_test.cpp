@@ -486,7 +486,7 @@ TEST(NativeOAuthTokenReadTest, LoginBindsReturnTargetAndReplacesPriorSessionNati
     const auto start=page.body().find(marker);
     ASSERT_NE(start,std::string::npos);
     const auto pos=start+marker.size();
-    const auto csrf=page.body().substr(pos,page.body().find('"',pos)-pos);
+    const std::string csrf{page.body().substr(pos,page.body().find('"',pos)-pos)};
     const auto cookie="__Host-openproof-login-csrf="+csrf+"; __Host-openproof-session=previous-session";
     const auto form="&csrf="+csrf+"&subject=fixture-owner&password=fixture-credential&totp=123456";
     EXPECT_EQ(run(request(gw::HttpMethod::Post,"/login",cookie,"return_to=%2Fadmin%2Fconsole"+form)).status(),401);

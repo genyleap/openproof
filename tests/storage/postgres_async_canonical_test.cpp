@@ -1443,7 +1443,9 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
     io.run(); revokeTask.get(); activateTask.get();
     ASSERT_TRUE(revokeResult && revokeResult->has_value());
     ASSERT_TRUE(activateResult.has_value());
-    if (!activateResult->has_value()) EXPECT_EQ(activateResult->error().code(),fnd::ErrorCode::FailedPrecondition);
+    if (!activateResult->has_value()) {
+        EXPECT_EQ(activateResult->error().code(),fnd::ErrorCode::FailedPrecondition);
+    }
     EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+8s)));
     const auto resourceState=execute(fixture.get(),
         "SELECT status::text,(SELECT count(*) FROM openproof.oauth_resource_scopes WHERE resource_id=$1)::text "
@@ -2192,7 +2194,9 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         auto done=asio::co_spawn(io,capture(native,digest,result,issued),asio::use_future);
         io.run();
         done.get();
-        if (result && *result) EXPECT_EQ(issued,kNow);
+        if (result && *result) {
+            EXPECT_EQ(issued,kNow);
+        }
         return std::move(result.value());
     };
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'gateway.read')",{family}));
@@ -2283,7 +2287,9 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     const auto revoked=revoke(native,client,std::nullopt,refreshHex);
     const auto rotated=rotate.get();
     ASSERT_TRUE(revoked);
-    if (!rotated) EXPECT_EQ(rotated.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    if (!rotated) {
+        EXPECT_EQ(rotated.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    }
     const auto states=execute(fixture.get(),
         "SELECT (f.revoked_at_ms IS NOT NULL)::text,"
         "(SELECT count(*) FROM openproof.oauth_access_tokens t WHERE t.family_id=f.id AND t.state=0)::text,"
@@ -2387,10 +2393,15 @@ TEST(PostgresCanonicalCoroutineTest, NativeParPreservesLoopbackAndCommitsJarRepl
         ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
     pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
         ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    const auto capture=[](auto task,auto& output)->asio::awaitable<void> {
+        output.emplace(co_await std::move(task));
+    };
     const auto run=[&](auto task) {
         io.restart();
-        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
-        io.run(); return done.get();
+        std::optional<typename decltype(task)::value_type> result;
+        auto done=asio::co_spawn(io,capture(std::move(task),result),asio::use_future);
+        io.run(); done.get();
+        return std::move(result).value();
     };
     auto push=[&](auto& store,std::string label,oauth::AuthorizationRequest request,
         std::optional<std::string> proof=std::nullopt) {
@@ -2470,10 +2481,11 @@ TEST(PostgresCanonicalCoroutineTest, NativeParPreservesLoopbackAndCommitsJarRepl
     ASSERT_TRUE(afterFailure);
     EXPECT_TRUE(afterFailure->consentRequired);
     io.restart();
-    auto approveA=asio::co_spawn(io,complete(native,"-direct","-approve-a",Decision::Approve),asio::use_future);
-    auto approveB=asio::co_spawn(io,complete(native,"-direct","-approve-b",Decision::Approve),asio::use_future);
-    io.run();
-    auto approvedA=approveA.get(),approvedB=approveB.get();
+    std::optional<fnd::Result<oauth::NativeAuthorizationResult>> resultA,resultB;
+    auto approveA=asio::co_spawn(io,capture(complete(native,"-direct","-approve-a",Decision::Approve),resultA),asio::use_future);
+    auto approveB=asio::co_spawn(io,capture(complete(native,"-direct","-approve-b",Decision::Approve),resultB),asio::use_future);
+    io.run();approveA.get();approveB.get();
+    auto approvedA=std::move(resultA).value(),approvedB=std::move(resultB).value();
     ASSERT_NE(approvedA.has_value(),approvedB.has_value());
     const auto& approved=approvedA?approvedA.value():approvedB.value();
     ASSERT_TRUE(approved.signedResponse);
