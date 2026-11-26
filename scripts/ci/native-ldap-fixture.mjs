@@ -1,5 +1,5 @@
-// A real OpenLDAP instance owned exclusively by this disposable E2E process.
-// No system slapd config, database, service manager or external directory.
+// A real OpenLDAP instance in a dedicated unprivileged disposable container.
+// No host slapd config, service manager, confinement changes or external directory.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -96,20 +96,20 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     "include /etc/ldap/schema/core.schema",
     "include /etc/ldap/schema/cosine.schema",
     "include /etc/ldap/schema/inetorgperson.schema",
-    "pidfile " + path.join(directory, "slapd.pid"),
-    "argsfile " + path.join(directory, "slapd.args"),
+    "pidfile /fixture/slapd.pid",
+    "argsfile /fixture/slapd.args",
     "modulepath /usr/lib/ldap",
     "moduleload back_mdb",
-    "TLSCertificateFile " + cert,
-    "TLSCertificateKeyFile " + key,
-    "TLSCACertificateFile " + ca,
+    "TLSCertificateFile /fixture/ldap.crt",
+    "TLSCertificateKeyFile /fixture/ldap.key",
+    "TLSCACertificateFile /fixture/ca.crt",
     "TLSVerifyClient never",
     "database mdb",
     "maxsize 16777216",
     'suffix "' + baseDn + '"',
     'rootdn "cn=fixture-root,' + baseDn + '"',
     "rootpw " + hashPassword(rootPassword),
-    "directory " + db,
+    "directory /fixture/mdb",
     "access to attrs=userPassword by anonymous auth by * none",
     'access to * by dn.exact="' + readerDn + '" read by * none',
   ];
@@ -132,14 +132,23 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     entry("unlinked", "Unlinked LDAP Fixture", unlinkedPassword),
   ];
   fs.writeFileSync(ldif, records.join("\n\n") + "\n\n", { mode: 0o600 });
-  run("/usr/sbin/slapadd", ["-f", config, "-l", ldif]);
+  if (typeof process.getuid !== "function" || process.getuid() === 0) {
+    throw new Error("real LDAPS fixture requires an unprivileged Linux runner");
+  }
   const port = await reservePort();
-  // Exact loopback address matches the bound interface and the IP SAN.
-  // Do not depend on localhost DNS ordering or reverse name resolution.
   const uri = "ldaps://127.0.0.1:" + port;
-  const child = spawn("/usr/sbin/slapd",
-    ["-f", config, "-h", "ldaps://127.0.0.1:" + port + "/", "-d", "1"],
-    { stdio: ["ignore", "ignore", "pipe"] });
+  const token = crypto.randomBytes(16).toString("hex");
+  const containerName = "openproof-ldap-e2e-" + token;
+  const child = spawn("docker", [
+    "run", "--rm", "--name", containerName,
+    "--label", "org.openproof.fixture=" + token,
+    "--user", process.getuid() + ":" + process.getgid(),
+    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+    "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m",
+    "--publish", "127.0.0.1:" + port + ":1636",
+    "--mount", "type=bind,source=" + directory + ",target=/fixture",
+    "openproof-ldap-fixture:ci",
+  ], { stdio: ["ignore", "ignore", "pipe"] });
   let failed = false;
   let daemonOutcome = "no-startup-error-observed";
   child.once("error", () => { failed = true; });
@@ -153,13 +162,35 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     else if (/mdb.*(?:error|failed)/i.test(message)) daemonOutcome = "mdb";
   });
   async function close() {
-    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-    const exited = new Promise(resolve => child.once("exit", resolve));
-    child.kill("SIGTERM");
-    if (!await Promise.race([exited.then(() => true), delay(2000, false)])) {
-      child.kill("SIGKILL");
-      await exited;
+    // Inspect the exact randomly named container and match its ownership
+    // label before stopping it. Never stop a host daemon or other container.
+    const inspect = () => spawnSync("docker", [
+      "inspect", "--format", '{{.Id}} {{index .Config.Labels "org.openproof.fixture"}}',
+      containerName,
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+    const stopOwned = () => {
+      const info = inspect();
+      if (info.status !== 0) return;
+      const [id, owner] = info.stdout.trim().split(" ");
+      if (!/^[0-9a-f]{64}$/.test(id) || owner !== token)
+        throw new Error("disposable LDAPS container ownership mismatch");
+      const stopped = spawnSync("docker", ["stop", "--time", "2", id],
+        { stdio: "ignore", timeout: 5000 });
+      if (stopped.status !== 0 && inspect().status === 0)
+        throw new Error("disposable LDAPS container failed to stop");
+    };
+    stopOwned();
+    if (child.pid && child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise(resolve => child.once("exit", resolve));
+      if (!await Promise.race([exited.then(() => true), delay(2000, false)])) {
+        child.kill("SIGTERM"); // Only our attached docker CLI, not a host service.
+        if (!await Promise.race([exited.then(() => true), delay(2000, false)])) {
+          child.kill("SIGKILL");
+          await exited;
+        }
+      }
     }
+    stopOwned(); // Cover a startup/cleanup race after the attached CLI exited.
   }
   const lookup = () => spawnSync("ldapsearch", [
     "-LLL", "-x", "-H", uri, "-D", readerDn, "-y", readerPasswordFile,

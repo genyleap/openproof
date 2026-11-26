@@ -9,6 +9,10 @@ test("real LDAP fixture is guarded, loopback-only and owns its process", () => {
   const fixture = read("scripts/ci/native-ldap-fixture.mjs");
   assert.match(fixture, /OPENPROOF_E2E_DATABASE_ACK !== "YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"/);
   assert.match(fixture, /ldaps:\/\/127\.0\.0\.1:/);
+  assert.match(fixture, /"--publish", "127\.0\.0\.1:" \+ port \+ ":1636"/);
+  assert.match(fixture, /"--cap-drop", "ALL", "--security-opt", "no-new-privileges:true"/);
+  assert.match(fixture, /owner !== token/);
+  assert.doesNotMatch(fixture, /--privileged|apparmor=unconfined|--network=host/);
   assert.match(fixture, /LDAPTLS_REQCERT: "demand"/);
   assert.match(fixture, /LDAPTLS_CACERT: ca/);
   assert.match(fixture, /child\.kill\("SIGTERM"\)/);
@@ -50,7 +54,7 @@ test("fixture verifies a real certificate chain and tests bind before full build
   assert.match(fixture, /basicConstraints=critical,CA:FALSE/);
   assert.match(fixture, /extendedKeyUsage=serverAuth/);
   assert.match(fixture, /rejectUnauthorized: true/);
-  assert.match(fixture, /TLSCertificateFile " \+ cert/);
+  assert.match(fixture, /TLSCertificateFile \/fixture\/ldap\.crt/);
   assert.match(fixture, /TLS_REQCERT demand/);
   assert.match(fixture, /const uri = "ldaps:\/\/127\.0\.0\.1:"/);
   const smoke = read("scripts/ci/test-native-ldap-fixture.mjs");

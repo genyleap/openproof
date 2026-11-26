@@ -71,7 +71,9 @@ jobs:
       - name: Install fixture dependencies
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends slapd ldap-utils openssl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ldap-utils openssl
+      - name: Build isolated LDAP fixture image
+        run: docker build --tag openproof-ldap-fixture:ci --file scripts/ci/native-ldap-fixture.Dockerfile scripts/ci
       - name: Verify real LDAPS fixture without building opp
         env:
           OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
@@ -80,6 +82,7 @@ jobs:
 
   build:
     name: Build and test
+    needs: ldap-fixture
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -93,8 +96,10 @@ jobs:
       - name: Install build dependencies
         run: ./scripts/ci/install-build-deps.sh
 
-      - name: Install disposable LDAPS fixture tools
-        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends slapd ldap-utils
+      - name: Install disposable LDAPS fixture client tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ldap-utils
+      - name: Build isolated LDAP fixture image
+        run: docker build --tag openproof-ldap-fixture:ci --file scripts/ci/native-ldap-fixture.Dockerfile scripts/ci
 
       - name: Configure
         run: |
