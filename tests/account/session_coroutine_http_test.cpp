@@ -56,7 +56,9 @@ public:
     [[nodiscard]] bool nativeEnabledFor(
         const gw::HttpRequest& request) const noexcept override
     {
-        return request.path() == "/other/api";
+        return request.path() == "/other/api"
+            || (request.method()==gw::HttpMethod::Post
+                && request.path()=="/account/connections/web3/start");
     }
     gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -361,6 +363,12 @@ TEST(AccountCoroutineSessionHttpTest, RequestSpecificCapabilityAndNativeFallback
     EXPECT_EQ(response.status(), 209);
     EXPECT_EQ(f.fallback.invoked, 1);
     EXPECT_EQ(f.legacy.invoked, 0);
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/connections/web3/start")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Post,"/account/connections/web3/start")).status(),209);
+    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/connections/web3/start")));
+    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/connections/web3/complete")));
+    EXPECT_EQ(f.fallback.invoked,2);
+    EXPECT_EQ(f.legacy.invoked,0);
     const auto unavailable = f.run(
         request(gw::HttpMethod::Get, "/account/profile"));
     EXPECT_EQ(unavailable.status(), 503);

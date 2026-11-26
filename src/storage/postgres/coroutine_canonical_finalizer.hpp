@@ -93,6 +93,11 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
     readDelegatedAccessAsync(std::string digestHex,foundation::Instant now);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    consumeSenderReplayAsync(session::DelegatedSenderConstraintKind kind,
+        std::string thumbprint,std::string identifier,foundation::Instant expiresAt,
+        foundation::Instant now);
+
     /** Read-only TOTP status. nullopt means no configured local-provider link;
      * false means linked but no usable password/TOTP pair. Never read secrets.
      */
