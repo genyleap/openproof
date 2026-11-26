@@ -5,10 +5,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 
 import openproof.account;
 import openproof.foundation;
 import openproof.identity.core;
+import openproof.identity.provider;
 
 namespace openproof::storage::postgres {
 
@@ -31,6 +33,13 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     replaceAsync(account::VerificationChallenge challenge);
 
+    /** Reserve the normalized external subject and persist its challenge in
+     * one transaction. Provider must come from trusted configuration.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    reserveAndReplaceAsync(account::VerificationChallenge challenge,
+                           identity::provider::ProviderId provider);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.
@@ -39,6 +48,9 @@ public:
     discardAsync(account::VerificationId id, identity::core::IdentityId owner,
                  account::VerificationPurpose purpose);
 private:
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    replaceImpl(account::VerificationChallenge challenge,
+                std::optional<identity::provider::ProviderId> provider);
     class Impl;
     std::unique_ptr<Impl> m_impl;
 };
