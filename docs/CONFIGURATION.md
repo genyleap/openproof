@@ -921,3 +921,26 @@ compatibility dispatch. A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
+
+### Experimental native protected gateway (coroutine branch only)
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY=1` opts in to the native
+first-party protected reverse proxy. Default is disabled; only `0` and `1`
+are accepted. Authentication must be enabled and OIDC must be disabled.
+The flag does not add any route: the existing configured route policy must
+match the HTTP method and path, require authorization, and specify neither
+an OAuth scope nor an audience. Native dispatch is restricted to the
+segment-boundary namespace `/proxy` and `/proxy/...`; all other paths and
+scope/audience-constrained routes retain their existing dispatch. Reserve
+this namespace exclusively for upstream applications, not local HTTP APIs.
+
+The native path uses the existing session HMAC key and verifies the bearer
+against PostgreSQL asynchronously, then resolves authoritative tenant
+membership/roles, evaluates the configured RBAC/assurance policy, and awaits
+rejected-decision audit/outbox persistence. It strips supplied trusted
+identity headers and credentials before sealing the accepted upstream
+context, and uses the existing retry and circuit-breaker decisions with
+native network I/O. DPoP credentials are not supported by this first-party
+slice. The flag is experimental and does not imply full migration acceptance;
+OAuth delegated access, other paths, and legacy synchronous transport
+consumers remain subject to the global release gate.
