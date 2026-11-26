@@ -1388,6 +1388,16 @@ foundation::Status PostgresRecoveryCodeRepository::replace(
     PGconn* connection = lease->get();
     auto begun = beginTransaction(connection);
     if (!begun) return foundation::fail(begun.error());
+    // The native coroutine SQL repository uses this exact transaction lock.
+    // Serialize legacy/legacy and legacy/native rotations before DELETE so
+    // READ COMMITTED cannot leave two concurrently issued batches valid.
+    ResultPointer locked = execParams(connection,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        {std::string{identity.value()}});
+    if (!tuplesOk(locked.get()) || PQntuples(locked.get()) != 1) {
+        rollback(connection);
+        return foundation::fail(databaseError(locked.get(), "lock recovery code replacement"));
+    }
     ResultPointer removed = execParams(connection,
         "DELETE FROM openproof.recovery_codes WHERE identity_id=$1",
         {std::string{identity.value()}});
