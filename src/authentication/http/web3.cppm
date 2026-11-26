@@ -31,6 +31,12 @@ public:
                               session::DelegatedAccessAuthenticator* delegated = nullptr,
                               session::CoroutineSessionIssuer* asyncSessions = nullptr,
                               Authenticate authenticate = {});
+    Web3AuthenticationHttpApi(AuthenticationService& authentication,
+                              identity::provider::ProviderRegistry& providers,
+                              gateway::TokenBucketRateLimiter& rateLimiter,
+                              gateway::HttpHandler& fallback,
+                              session::CoroutineSessionIssuer& asyncSessions,
+                              Authenticate authenticate);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
@@ -66,8 +72,8 @@ private:
 
     AuthenticationService* m_authentication;
     identity::provider::ProviderRegistry* m_providers;
-    session::SessionService* m_sessions;
-    session::DelegatedAccessAuthenticator* m_delegated;
+    session::SessionService* m_sessions{};
+    session::DelegatedAccessAuthenticator* m_delegated{};
     session::CoroutineSessionIssuer* m_asyncSessions;
     Authenticate m_authenticate;
     gateway::TokenBucketRateLimiter* m_rateLimiter;

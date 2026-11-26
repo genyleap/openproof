@@ -85,5 +85,7 @@ test("runtime delegated federation initiation issues a native handoff instead of
   assert.doesNotMatch(native,/m_authentication->(?:beginConnection|beginAuthentication|issueBrowserConnectionHandoff)\(/);
   const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
   assert.match(app,/authApi, nullptr, true\}/);
-  assert.match(app,/authApi, &tokenService, true\}/);
+  assert.equal([...app.matchAll(/authApi, nullptr, true\}/g)].length,2);
+  assert.doesNotMatch(app,/\btoken::TokenService\s+\w+\s*\{/);
+  assert.doesNotMatch(app,/\bclient::ClientManager\s+\w+\s*\{/);
 });

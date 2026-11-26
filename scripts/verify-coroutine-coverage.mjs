@@ -207,8 +207,9 @@ const checked = segments.map(([name, relative]) => {
         || (oidc && (native.match(/co_await m_implementation->discoveryAsync\(/g)||[]).length!==2))
       issues.push({line:0,kind:"redirect provider retains a blocking path or misses native exchanges",
         expression:type+" native start and completion"});
-    if (!app.includes("authApi, nullptr, true}")
-        || !app.includes("authApi, &tokenService, true}")
+    if ((app.match(/authApi, nullptr, true\}/g)||[]).length!==2
+        || /\btoken::TokenService\s+\w+\s*\{/.test(app)
+        || /\bclient::ClientManager\s+\w+\s*\{/.test(app)
         || !app.includes('nativePaths.emplace_back("/account/connections/handoff")')
         || !app.includes('nativePaths.emplace_back("/account/connections/start")')
         || !legacy.includes('|| request.path()=="/account/connections/handoff"')

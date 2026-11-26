@@ -1149,8 +1149,11 @@ CSP nonce and no-store caching. Unauthenticated browsers are redirected
 to login and insufficient assurance to account security. The server no
 longer constructs the synchronous application management HTTP API,
 application registry, resource registry, service identity service or JAR
-management service. The legacy client manager is still needed by the
-compatibility token service; it is not used for native management.
+management service. The synchronous client manager and compatibility token service are no
+longer composed by the server. Web3 native dispatch uses only the
+coroutine session issuer and native delegated-account reader; its
+synchronous entry point fails closed without a compatibility session
+service.
 
 Passkey credential listing and registration-options creation use native
 first-party session authentication and the configured tenant. The

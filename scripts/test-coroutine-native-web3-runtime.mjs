@@ -35,7 +35,7 @@ test("Web3 login gets async transaction, canonical and session services without 
   assert.match(runtime, /CoroutinePostgresAuthenticationTransactionStore/);
   assert.match(runtime, /CoroutinePostgresCanonicalFinalizer/);
   assert.match(runtime, /nativeCanonical\.get\(\)/);
-  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\),\s*authenticateNativeWeb3\}/);
+  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, limiter\.value\(\),\s*enterpriseApi, \*nativeSessions,\s*authenticateNativeWeb3\}/);
   assert.match(app, /runWithEvidence\(enterpriseApi, nativeWeb3Api\)/);
   assert.match(app, /runWithEvidence\(enterpriseApi, enterpriseApi\)/);
 });

@@ -265,6 +265,13 @@ Web3AuthenticationHttpApi::Web3AuthenticationHttpApi(
       m_authenticate(std::move(authenticate)),
       m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
 
+Web3AuthenticationHttpApi::Web3AuthenticationHttpApi(
+    AuthenticationService& authentication,idp::ProviderRegistry& providers,
+    gateway::TokenBucketRateLimiter& rateLimiter,gateway::HttpHandler& fallback,
+    session::CoroutineSessionIssuer& asyncSessions,Authenticate authenticate)
+    :m_authentication(&authentication),m_providers(&providers),m_asyncSessions(&asyncSessions),
+     m_authenticate(std::move(authenticate)),m_rateLimiter(&rateLimiter),m_fallback(&fallback) {}
+
 gateway::HttpResponse Web3AuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request,
     bool shouldClearState) const
@@ -279,6 +286,13 @@ gateway::HttpResponse Web3AuthenticationHttpApi::error(
 
 gateway::HttpResponse Web3AuthenticationHttpApi::handle(gateway::HttpRequest request)
 {
+    if (!m_sessions) {
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request,true);
+    }
     if (request.path() == "/auth/web3/handoff"
         && request.method() == gateway::HttpMethod::Post) {
         return issueAuthenticationHandoff(std::move(request));

@@ -3055,7 +3055,7 @@ addProtectedRoutes(gateway::Router& router,
                 };
             }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
-                healthApi, *nativeHandler, limiter.value(),
+                fallback, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
                     return service->authenticate(std::move(bearer));
                 },
@@ -3622,8 +3622,8 @@ addProtectedRoutes(gateway::Router& router,
                 sessions, limiter.value(), nativeLocalApi, nativeSessions.get()};
             if (nativeWeb3Enabled) {
                 authHttp::Web3AuthenticationHttpApi localWeb3Api{
-                    *nativeAuthentication, providers, sessions, limiter.value(),
-                    localEnterpriseApi, nullptr, nativeSessions.get(),
+                    *nativeAuthentication, providers, limiter.value(),
+                    localEnterpriseApi, *nativeSessions,
                     authenticateNativeWeb3};
                 return runWithEvidence(enterpriseApi, localWeb3Api);
             }
@@ -3635,24 +3635,16 @@ addProtectedRoutes(gateway::Router& router,
             // Web3 handler, and the exact-path overlay decides which opt-ins
             // actually receive native requests.
             authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
-                *nativeAuthentication, providers, sessions, limiter.value(),
-                enterpriseApi, nullptr, nativeSessions.get(),
+                *nativeAuthentication, providers, limiter.value(),
+                enterpriseApi, *nativeSessions,
                 authenticateNativeWeb3};
             return runWithEvidence(enterpriseApi, nativeWeb3Api);
         }
         return runWithEvidence(enterpriseApi, enterpriseApi);
     };
 
-    const auto runWithWeb3 = [&](gateway::HttpHandler& fallback,
-                                 session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        authHttp::Web3AuthenticationHttpApi web3Api{
-            authentication, providers, sessions, limiter.value(), fallback, delegated};
-        return runWithEnterprise(web3Api);
-    };
-
-    const auto runWithAccount = [&](gateway::HttpHandler& fallback,
-                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        if (!platform.account().enabled()) return runWithWeb3(fallback, delegated);
+    const auto runWithAccount = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        if (!platform.account().enabled()) return runWithEnterprise(fallback);
 
         auto verificationMaterial = deriveSecret(
             platform.security().tokenSigningKey(), "openproof/account-verification-key/v1");
@@ -3838,7 +3830,7 @@ addProtectedRoutes(gateway::Router& router,
             };
         }
         nativeContactIssuer=&contactIssuer;
-        const auto result=runWithWeb3(accountApi,delegated);
+        const auto result=runWithEnterprise(accountApi);
         nativeSignup={};
         nativeVerifySignup={};
         nativeResetPassword={};
@@ -3860,7 +3852,7 @@ addProtectedRoutes(gateway::Router& router,
             limiter.value(), providerId, administrationApi};
         authHttp::FederatedAuthenticationHttpApi federatedApi{
             authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
-        return runWithAccount(federatedApi, nullptr);
+        return runWithAccount(federatedApi);
     }
 
     auto clientSecretMaterial = oauthClientSecretMaterial(platform.security());
@@ -3902,12 +3894,6 @@ addProtectedRoutes(gateway::Router& router,
 
     nativeOAuthAccessLifetime=tokenPolicy->accessLifetime();
     nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime();
-    client::ClientManager clientManager{
-        identityProviderStore, identityProviderStore, clock,
-        std::move(clientSecretKey).value()};
-    token::TokenService tokenService{
-        identityProviderStore, clientManager, clock, std::move(tokenKey).value(),
-        std::move(tokenPolicy).value()};
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
         identityProviderStore, std::move(oidcPolicy).value(),
@@ -3940,8 +3926,8 @@ addProtectedRoutes(gateway::Router& router,
         *nativeLocalAuthentication, *nativeSessions,
         limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
-        authentication, providers, sessions, limiter.value(), authApi, &tokenService, true};
-    return runWithAccount(federatedApi, &tokenService);
+        authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
+    return runWithAccount(federatedApi);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
