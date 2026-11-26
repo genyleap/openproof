@@ -60,8 +60,10 @@ std::optional<foundation::Instant> optionalInstant(const std::optional<std::stri
 bool validId(std::string_view value, std::size_t maximum = 200U)
 {
     if (value.empty() || value.size() > maximum) return false;
-    for (const unsigned char character : value)
+    for (const char raw : value) {
+        const auto character = static_cast<unsigned char>(raw);
         if (character < 32U || character == 127U) return false;
+    }
     return true;
 }
 
