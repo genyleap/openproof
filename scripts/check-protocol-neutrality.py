@@ -42,7 +42,21 @@ def audit() -> list[str]:
         if file.name not in HISTORICAL:
             findings.append(f"Unreviewed archived migration: {file.name}")
     engine = (ROOT / "src/storage/postgres/postgres.cpp").read_text(encoding="utf-8")
-    if "legacyDirectory" not in engine or "historic->second != hex" not in engine:
+    # Scope the source contract to the actual migration implementation.
+    # Runtime PostgreSQL regression tests independently exercise the invariant.
+    start = engine.find("Migrator::applyDirectory(")
+    end = engine.find("PostgresCredentialRekeyer::", start)
+    migrator = engine[start:end] if start >= 0 and end > start else ""
+    required = (
+        'existing->checksum != hex',
+        'load(directory / "legacy", true)',
+        'load(directory, false)',
+        'existing->checksum != field(ledger.get(), row, 1)',
+        'if (migration.archived || migration.recorded) continue;',
+        'exec(connection, migration.sql)',
+    )
+    positions = [migrator.find(fragment) for fragment in required]
+    if -1 in positions or positions != sorted(positions):
         findings.append("Migrator lacks checksum-preserving historical SQL exclusion")
     if "SELECT 1 FROM openproof.organizations WHERE id='genyleap'" in engine:
         findings.append("Vendor tenant lookup still exists in shared migrator")
