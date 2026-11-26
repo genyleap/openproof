@@ -63,6 +63,10 @@ jobs:
           node scripts/test-coroutine-account-totp-status-contract.mjs
           node scripts/test-native-admin-members-contract.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Mandatory native public discovery and provider catalog contract
+        run: |
+          node scripts/test-coroutine-native-oidc-discovery-runtime.mjs
+          node scripts/test-coroutine-native-provider-catalog-runtime.mjs
       - name: Native LDAP disposable fixture and transport contract
         run: |
           node scripts/test-native-enterprise-ldaps.mjs

@@ -14,10 +14,11 @@ const source=read("src/oauth/http/coroutine_discovery_http.cpp");
 const cmake=read("src/oauth/http/CMakeLists.txt");
 const legacy=read("src/oauth/http/http.cpp");
 
-test("native public OIDC discovery is independent and off by default",()=>{
+test("native public OIDC discovery is mandatory whenever OIDC is enabled",()=>{
   assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY"\)/);
   assert.match(app,/nativeOidcDiscoveryFlag && \*nativeOidcDiscoveryFlag != "0"/);
-  assert.match(app,/nativeOidcDiscoveryFlag && \*nativeOidcDiscoveryFlag == "1"/);
+  assert.match(app,/const bool nativeOidcDiscoveryEnabled = platform\.oidc\(\)\.enabled\(\)\s*\|\| \(nativeOidcDiscoveryFlag && \*nativeOidcDiscoveryFlag == "1"\)/);
+  assert.match(app,/platform\.oidc\(\)\.enabled\(\) && nativeOidcDiscoveryFlag && \*nativeOidcDiscoveryFlag == "0"[\s\S]*?return ExitCode::ConfigurationError;/);
   assert.match(app,/nativeOidcDiscoveryEnabled && !platform\.oidc\(\)\.enabled\(\)/);
   const flag=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY");
   const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",flag);
@@ -74,10 +75,10 @@ test("credentials are wiped only on discovery and failure, never before native f
   const route=source.slice(source.indexOf("CoroutineOidcDiscoveryAdapter::handleAsync("));
   const publicBranch=route.slice(route.indexOf("if (readOnlyRoute(request)) {"),
     route.indexOf("co_return response;"));
-  for(const method of ["wipeBody","wipeAuthorizationHeader","wipeCookieHeader"])
+  for(const method of ["wipeBody","wipeAuthorizationHeader","wipeCookieHeader","wipeTargetQuery"])
     assert.ok(publicBranch.includes("request."+method+"()"));
   const fallback=route.slice(route.indexOf("if (!m_fallback->nativeEnabledFor(request))"));
-  for(const method of ["wipeBody","wipeAuthorizationHeader","wipeCookieHeader"])
+  for(const method of ["wipeBody","wipeAuthorizationHeader","wipeCookieHeader","wipeTargetQuery"])
     assert.ok(fallback.includes("request."+method+"()"));
   assert.match(fallback,/co_return co_await m_fallback->handleAsync\(std::move\(request\)\)/);
   assert.doesNotMatch(source,/co_return co_await m_fallback->handle\(/);

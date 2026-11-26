@@ -45,6 +45,7 @@ gateway::HttpResponse CoroutineProviderCatalogAdapter::handle(
     request.wipeBody();
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
+    request.wipeTargetQuery();
     return denied();
 }
 
@@ -56,6 +57,7 @@ CoroutineProviderCatalogAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeBody();
         request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
+        request.wipeTargetQuery();
         gateway::HttpResponse response{
             200, gateway::Headers{{"content-type", "application/json"}},
             m_catalogJson};
@@ -69,6 +71,7 @@ CoroutineProviderCatalogAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeBody();
         request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
+        request.wipeTargetQuery();
         co_return denied();
     }
     // Provider/native login credentials must survive delegation unchanged.

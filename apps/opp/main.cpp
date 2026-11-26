@@ -1616,8 +1616,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeOidcDiscoveryEnabled =
-        nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "1";
+    if (platform.oidc().enabled() && nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled OIDC requires native discovery and JWKS."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeOidcDiscoveryEnabled = platform.oidc().enabled()
+        || (nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "1");
     // Browser consent management uses the existing native first-party
     // session stack, but never turns on any other OAuth endpoint.
     const auto nativeConsentFlag = environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS");
@@ -1644,8 +1649,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeCatalogEnabled =
-        nativeCatalogFlag && *nativeCatalogFlag == "1";
+    if (platform.auth().enabled() && nativeCatalogFlag && *nativeCatalogFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled authentication requires the native provider catalog."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeCatalogEnabled = platform.auth().enabled()
+        || (nativeCatalogFlag && *nativeCatalogFlag == "1");
     // Authenticated runtimes require native federation; the historical
     // opt-in flags are accepted only when they do not restore blocking I/O.
     const auto nativeFederatedStartFlag =
