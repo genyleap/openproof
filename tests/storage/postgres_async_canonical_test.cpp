@@ -1776,6 +1776,101 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
     EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE destination=$1",{broken}),"0");
 }
 
+TEST(PostgresCanonicalCoroutineTest, ReapOnlyExpiredUntouchedNativeSignupOwners)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto make=[&](std::string owner,std::string tenant,std::string status,std::string expiry) {
+        const std::string email=owner+"@example.test";
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+            "VALUES($1,$2,0,$3,1770000000000)",{owner,tenant,status}));
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.identity_profiles(identity_id,email,email_verified,created_at_ms,updated_at_ms) "
+            "VALUES($1,$2,false,1770000000000,1770000000000)",{owner,email}));
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES($1,'fixture-hash',1770000000000)",{owner}));
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.pending_external_identity_reservations(provider,external_subject,identity_id,expires_at_ms) "
+            "VALUES('local',$2,$1,$3)",{owner,email,expiry}));
+    };
+    const auto nativeId=[&](char suffix) {
+        std::string id=seed.suffix;
+        id.resize(31U,'x');
+        return "opi_signup_"+id+suffix;
+    };
+    const auto expired="1770086400000",live="1770300000000";
+    const auto ordinary="opi_legacy-"+seed.suffix;
+    const auto foreign=nativeId('f'),active=nativeId('a'),unexpired=nativeId('u'),
+        changed=nativeId('c'),linked=nativeId('l'),member=nativeId('m'),audited=nativeId('e');
+    ASSERT_NO_THROW(make(ordinary,seed.org,"3",expired));
+    ASSERT_NO_THROW(make(foreign,seed.foreignOrg,"3",expired));
+    ASSERT_NO_THROW(make(active,seed.org,"0",expired));
+    ASSERT_NO_THROW(make(unexpired,seed.org,"3",live));
+    ASSERT_NO_THROW(make(changed,seed.org,"3",expired));
+    ASSERT_NO_THROW(make(linked,seed.org,"3",expired));
+    ASSERT_NO_THROW(make(member,seed.org,"3",expired));
+    ASSERT_NO_THROW(make(audited,seed.org,"3",expired));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.identity_profiles SET updated_at_ms=1770000000001 WHERE identity_id=$1",{changed})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms)"
+        " VALUES('fixture',$1,$1,1770000000000)",{linked})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms)"
+        " VALUES($1,$2,0,1770000000000)",{seed.org,member})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.audit_events(event_id,occurred_at_ms,correlation_id,identity_id,category,action,outcome,event_hash)"
+        " VALUES($1,1770000000000,$1,$2,'fixture','fixture','fixture',decode(repeat('00',32),'hex'))",
+        {"event-"+seed.suffix,audited})));
+    for (char suffix='0';suffix<='8';++suffix)
+        ASSERT_NO_THROW(make(nativeId(suffix),seed.org,"3",expired));
+    const auto run=[&](fnd::Instant now){
+        io.restart();
+        auto done=asio::co_spawn(io,store.reapExpiredSignupsAsync(now),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    const auto early=run(kNow+47h);
+    ASSERT_TRUE(early);
+    EXPECT_EQ(early.value(),0U);
+    const auto first=run(kNow+48h);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.value(),8U);
+    const auto second=run(kNow+48h);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second.value(),1U);
+    const auto none=run(kNow+48h);
+    ASSERT_TRUE(none);
+    EXPECT_EQ(none.value(),0U);
+    for (const auto& owner:{ordinary,foreign,active,unexpired,changed,linked,member,audited}) {
+        auto result=execute(fixture.get(),"SELECT count(*) FROM openproof.identities WHERE id=$1",{owner});
+        EXPECT_STREQ(PQgetvalue(result.get(),0,0),"1");
+    }
+    for (char suffix='0';suffix<='8';++suffix) {
+        auto result=execute(fixture.get(),
+            "SELECT (SELECT count(*) FROM openproof.identities WHERE id=$1)"
+            "+(SELECT count(*) FROM openproof.identity_profiles WHERE identity_id=$1)"
+            "+(SELECT count(*) FROM openproof.password_credentials WHERE identity_id=$1)"
+            "+(SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE identity_id=$1)",
+            {nativeId(suffix)});
+        EXPECT_STREQ(PQgetvalue(result.get(),0,0),"0");
+    }
+}
+
 TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPreserveLatestOwnerChallenge)
 {
     const auto dsn = disposableDsn();

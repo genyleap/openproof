@@ -50,9 +50,14 @@ for migration in \
     0001_identity_auth_gateway.sql \
     0002_memberships.sql \
     0003_identity_provider.sql \
+    0004_trust_evidence.sql \
     0005_account_lifecycle.sql \
     0006_resource_consent.sql \
+    0007_oauth_device_flow.sql \
     0010_oauth_sender_constraints.sql \
+    0011_webauthn_passkeys.sql \
+    0012_enterprise_scim.sql \
+    0013_evidence_verification.sql \
     0017_session_client_metadata.sql \
     0018_profile_avatar_sources.sql \
     0021_verification_reservation_generation.sql; do

@@ -69,6 +69,44 @@ std::string publicOwnerSql(account::VerificationPurpose purpose,bool locked)
     return sql;
 }
 
+// Fresh native signup uses a reserved ID namespace. Never infer
+// provenance from Deactivated status alone or the historical opi_ prefix.
+// The 48h grace covers the maximum signup policy and retained resend proofs.
+// All other known identity references must be absent before physical removal.
+constexpr std::string_view abandonedSignupEligibility=
+    " FROM openproof.identities i "
+    "JOIN openproof.identity_profiles p ON p.identity_id=i.id "
+    "JOIN openproof.password_credentials c ON c.identity_id=i.id "
+    "WHERE i.organization_id=$1 AND i.kind=0 AND i.status=3 "
+    "AND starts_with(i.id,'opi_signup_') AND length(i.id)=43 "
+    "AND i.created_at_ms<=$2 AND p.created_at_ms=i.created_at_ms "
+    "AND p.updated_at_ms=i.created_at_ms AND c.changed_at_ms=i.created_at_ms "
+    "AND p.email IS NOT NULL AND NOT p.email_verified AND p.phone_number IS NULL "
+    "AND NOT p.phone_number_verified AND p.preferred_username IS NULL "
+    "AND p.locale IS NULL AND p.picture_url IS NULL AND p.avatar_source='auto' "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.pending_external_identity_reservations r "
+    "WHERE r.identity_id=i.id AND (r.expires_at_ms>$3 OR r.verification_id IS NOT NULL "
+    "OR r.external_subject<>p.email)) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.account_verification_challenges v "
+    "WHERE v.identity_id=i.id AND (v.expires_at_ms>$3 OR v.purpose<>0 OR v.channel<>0 "
+    "OR v.destination<>p.email)) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.external_identities e WHERE e.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.sessions s WHERE s.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.memberships m WHERE m.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.totp_credentials t WHERE t.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.recovery_codes r WHERE r.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.oauth_authorization_codes a WHERE a.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.oauth_token_families f WHERE f.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.oauth_consents o WHERE o.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.service_identities s WHERE s.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.oauth_device_authorizations d WHERE d.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.passkey_registration_ceremonies a WHERE a.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.passkey_credentials a WHERE a.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.scim_users s WHERE s.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.evidence e WHERE e.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.evidence_verification_challenges e WHERE e.identity_id=i.id) "
+    "AND NOT EXISTS(SELECT 1 FROM openproof.audit_events a WHERE a.identity_id=i.id) ";
+
 bool exactRow(const async_detail::QueryRows& rows, std::string_view expected)
 {
     return rows.rows.size() == 1U && rows.rows.front().size() == 1U
@@ -146,6 +184,83 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
     account::VerificationChallenge challenge,identity::provider::ProviderId provider)
 {
     return replaceImpl(std::move(challenge),std::move(provider),true);
+}
+
+asio::awaitable<foundation::Result<std::size_t>>
+CoroutineVerificationChallengeStore::reapExpiredSignupsAsync(foundation::Instant now)
+{
+    constexpr auto grace=std::chrono::hours{48};
+    if (now.time_since_epoch()<grace) co_return std::size_t{0};
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const std::string tenant{m_impl->tenant.value()};
+        const std::string cutoff=std::to_string((now-grace).time_since_epoch().count());
+        const std::string observed=std::to_string(now.time_since_epoch().count());
+        static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+        Params organizationParams{tenant};
+        const auto organization=co_await connection.query(
+            "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0 FOR SHARE",
+            std::move(organizationParams),remaining(deadline));
+        if (!exactRow(organization,tenant)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        }
+        // Fail closed if a future migration adds an unfamiliar cascading
+        // dependency. It must be explicitly considered by the reaper.
+        const auto unknown=co_await connection.query(
+            "SELECT 1 FROM pg_catalog.pg_constraint f "
+            "WHERE f.contype='f' AND f.confrelid='openproof.identities'::regclass "
+            "AND (f.confdeltype IN ('n','d') OR (f.confdeltype='c' AND f.conrelid NOT IN ("
+            "'openproof.identity_profiles'::regclass,'openproof.password_credentials'::regclass,"
+            "'openproof.totp_credentials'::regclass,'openproof.recovery_codes'::regclass,"
+            "'openproof.account_verification_challenges'::regclass,'openproof.pending_external_identity_reservations'::regclass,"
+            "'openproof.oauth_authorization_codes'::regclass,'openproof.oauth_token_families'::regclass,"
+            "'openproof.oauth_consents'::regclass,'openproof.service_identities'::regclass,"
+            "'openproof.passkey_registration_ceremonies'::regclass,'openproof.passkey_credentials'::regclass,"
+            "'openproof.scim_users'::regclass,'openproof.evidence'::regclass,"
+            "'openproof.evidence_verification_challenges'::regclass))) LIMIT 1",{},remaining(deadline));
+        if (!unknown.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::Unavailable,"Unknown signup cleanup dependency.");
+        }
+        Params candidatesParams{tenant,cutoff,observed};
+        const auto candidates=co_await connection.query(
+            "SELECT i.id"+std::string{abandonedSignupEligibility}
+            +"ORDER BY i.created_at_ms,i.id LIMIT 8 FOR UPDATE OF i,p,c SKIP LOCKED",
+            std::move(candidatesParams),remaining(deadline));
+        std::size_t removed=0;
+        for (const auto& candidate:candidates.rows) {
+            if (candidate.size()!=1U || !candidate.front())
+                throw std::runtime_error{"Malformed abandoned signup candidate"};
+            const std::string& owner=*candidate.front();
+            // Lock the dependent reservation/proof rows as well; an old
+            // compatibility writer may renew a reservation without i's lock.
+            Params reservationParams{owner};
+            static_cast<void>(co_await connection.query(
+                "SELECT provider,external_subject FROM openproof.pending_external_identity_reservations "
+                "WHERE identity_id=$1 FOR UPDATE",std::move(reservationParams),remaining(deadline)));
+            Params proofParams{owner};
+            static_cast<void>(co_await connection.query(
+                "SELECT id FROM openproof.account_verification_challenges WHERE identity_id=$1 FOR UPDATE",
+                std::move(proofParams),remaining(deadline)));
+            // A new READ COMMITTED snapshot must recheck every condition
+            // after locks. FK inserts cannot race an exclusive identity lock.
+            Params deleteParams{tenant,cutoff,observed,owner};
+            const auto deleted=co_await connection.query(
+                "DELETE FROM openproof.identities target WHERE target.id=$4 AND target.id IN (SELECT i.id"
+                +std::string{abandonedSignupEligibility}+"AND i.id=$4) RETURNING target.id",
+                std::move(deleteParams),remaining(deadline));
+            if (deleted.rows.empty()) continue;
+            if (!exactRow(deleted,owner)) throw std::runtime_error{"Invalid abandoned signup deletion"};
+            ++removed;
+        }
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return removed;
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,"Native signup cleanup unavailable.");
+    }
 }
 
 asio::awaitable<foundation::Result<CoroutineVerificationChallengeStore::PendingSignup>>
@@ -250,7 +365,7 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
                 static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
                 co_return foundation::fail(random.error());
             }
-            owner="opi_"+std::move(random).value();
+            owner="opi_signup_"+std::move(random).value();
             Params identityParams{owner,tenant,observed};
             const auto inserted=co_await connection.query(
                 "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
