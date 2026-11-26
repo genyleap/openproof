@@ -5,6 +5,7 @@
 #include <boost/json.hpp>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,6 +52,11 @@ gw::HttpRequest request(gw::HttpMethod method, std::string path, std::string tok
     return gw::HttpRequest::create(method, std::move(path), std::move(headers), {},
         "127.0.0.1", fnd::CorrelationId{"admin-read-test"}).value();
 }
+asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
+    adm::http::CoroutineAdministrationReadAdapter& api, gw::HttpRequest request) {
+    co_return std::optional<gw::HttpResponse>{
+        co_await api.handleAsync(std::move(request))};
+}
 struct Fixture final {
     fnd::ManualClockSource clock{now};
     gw::TokenBucketRateLimiter limiter{
@@ -81,9 +87,9 @@ struct Fixture final {
         }};
     gw::HttpResponse run(gw::HttpRequest input) {
         asio::io_context io;
-        auto done = asio::co_spawn(io, api.handleAsync(std::move(input)), asio::use_future);
+        auto done = asio::co_spawn(io, dispatch(api, std::move(input)), asio::use_future);
         io.run();
-        return done.get();
+        return std::move(done.get()).value();
     }
 };
 TEST(NativeAdministrationReadTest, Ial2AndOwnerAreRequiredBeforeSerialization) {
