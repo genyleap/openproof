@@ -749,7 +749,7 @@ CoroutineVerificationChallengeStore::resetPasswordAsync(
         }
         Params credentialParams{owner,std::string{replacement.encoded()},observed,std::to_string(created)};
         const auto changed=co_await connection.query(
-            "UPDATE openproof.password_credentials SET password_hash=$2,changed_at_ms=$3 "
+            "UPDATE openproof.password_credentials SET password_hash=$2,changed_at_ms=GREATEST(changed_at_ms+1,$3::bigint) "
             "WHERE identity_id=$1 AND changed_at_ms<=$4 RETURNING identity_id",
             std::move(credentialParams),remaining(deadline));
         if (!exactRow(changed,owner)) throw std::runtime_error{"Password reset generation changed"};

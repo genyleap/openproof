@@ -1969,6 +1969,8 @@ boost::asio::awaitable<foundation::Status> AuthenticationService::publishBrowser
     foundation::SecretString publisherTicket,
     VerifiedAuthentication authentication)
 {
+    if (authentication.outcome().passwordGeneration())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     const std::string_view presented = publisherTicket.expose();
     const auto separator = presented.find('.');
     if (separator == std::string_view::npos || separator == 0U

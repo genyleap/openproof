@@ -85,6 +85,6 @@ CoroutineLocalAuthenticationProvider::completeAuthenticationAsync(idp::Authentic
         idp::AuthenticationStrength{multiFactor
             ? idp::AuthenticationFactor::Knowledge | idp::AuthenticationFactor::Possession
             : idp::AuthenticationFactor::Knowledge, false}, std::move(evidence), now,
-        std::move(proof->canonicalOwner));
+        std::move(proof->canonicalOwner),proof->passwordGeneration);
 }
 }

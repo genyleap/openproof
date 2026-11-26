@@ -158,7 +158,8 @@ AuthenticationOutcome::AuthenticationOutcome(ProviderId provider, ExternalSubjec
                                              AuthenticationStrength strength,
                                              ProviderEvidence evidence,
                                              foundation::Instant verifiedAt,
-                                             std::optional<std::string> requiredCanonicalOwner)
+                                             std::optional<std::string> requiredCanonicalOwner,
+                                             std::optional<foundation::Instant> passwordGeneration)
     : m_provider(std::move(provider))
     , m_subject(std::move(subject))
     , m_claims(std::move(claims))
@@ -167,6 +168,7 @@ AuthenticationOutcome::AuthenticationOutcome(ProviderId provider, ExternalSubjec
     , m_evidence(std::move(evidence))
     , m_verifiedAt(verifiedAt)
     , m_requiredCanonicalOwner(std::move(requiredCanonicalOwner))
+    , m_passwordGeneration(passwordGeneration)
 {
 }
 
@@ -174,7 +176,8 @@ foundation::Result<AuthenticationOutcome>
 AuthenticationOutcome::create(ProviderId provider, ExternalSubject subject, VerifiedClaims claims,
                               AssuranceLevel claimedAssurance, AuthenticationStrength strength,
                               ProviderEvidence evidence, foundation::Instant verifiedAt,
-                              std::optional<std::string> requiredCanonicalOwner)
+                              std::optional<std::string> requiredCanonicalOwner,
+                              std::optional<foundation::Instant> passwordGeneration)
 {
     if (provider.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -193,10 +196,14 @@ AuthenticationOutcome::create(ProviderId provider, ExternalSubject subject, Veri
         || requiredCanonicalOwner->find('\0') != std::string::npos)) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }
+    if (passwordGeneration && (!requiredCanonicalOwner
+        || passwordGeneration->time_since_epoch().count()<0)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    }
     return AuthenticationOutcome{std::move(provider),  std::move(subject),
                                  std::move(claims),    claimedAssurance,
                                  strength,             std::move(evidence),
-                                 verifiedAt, std::move(requiredCanonicalOwner)};
+                                 verifiedAt, std::move(requiredCanonicalOwner),passwordGeneration};
 }
 
 const ProviderId& AuthenticationOutcome::provider() const noexcept
@@ -232,6 +239,11 @@ const ProviderEvidence& AuthenticationOutcome::evidence() const noexcept
 const std::optional<std::string>& AuthenticationOutcome::requiredCanonicalOwner() const noexcept
 {
     return m_requiredCanonicalOwner;
+}
+
+std::optional<foundation::Instant> AuthenticationOutcome::passwordGeneration() const noexcept
+{
+    return m_passwordGeneration;
 }
 
 foundation::Instant AuthenticationOutcome::verifiedAt() const noexcept

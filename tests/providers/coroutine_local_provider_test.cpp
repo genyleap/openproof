@@ -28,7 +28,7 @@ public:
         ++calls;
         if (denied || subject.value() != "alice" || password.expose() != "fixture-password")
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
-        co_return local::LocalCredentialProof{result, "fixture-owner"};
+        co_return local::LocalCredentialProof{result, "fixture-owner",fnd::Instant{1770000000000ms}};
     }
 };
 struct Fixture {
@@ -71,6 +71,8 @@ TEST(NativeLocalProviderTest, ChallengeAndPasswordAssurance)
     EXPECT_EQ(proof->claimedAssurance(), idp::AssuranceLevel::Ial1);
     ASSERT_TRUE(proof->requiredCanonicalOwner());
     EXPECT_EQ(*proof->requiredCanonicalOwner(), "fixture-owner");
+    ASSERT_TRUE(proof->passwordGeneration());
+    EXPECT_EQ(*proof->passwordGeneration(),fnd::Instant{1770000000000ms});
     EXPECT_FALSE(proof->strength().isMultiFactor());
     EXPECT_FALSE(f.provider.completeAuthentication(Fixture::response()));
     EXPECT_EQ(f.verifier.calls, 1U);

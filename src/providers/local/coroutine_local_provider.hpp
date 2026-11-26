@@ -13,6 +13,7 @@ namespace openproof::provider::local {
 struct LocalCredentialProof final {
     LocalVerification verification;
     std::string canonicalOwner;
+    foundation::Instant passwordGeneration;
 };
 
 class CoroutineLocalProofVerifier {

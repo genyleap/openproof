@@ -55,6 +55,9 @@ CoroutinePostgresLocalProofVerifier::verifyAsync(identity::provider::ExternalSub
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     auto snapshot = std::move(found->value());
     const std::string verifiedOwner{snapshot.owner.value()};
+    const auto generation=decimal<foundation::Duration::rep>(snapshot.passwordChangedAt);
+    if (!generation || *generation<0)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
     auto verified = local::LocalVerification::Password;
     if (!snapshot.encryptedTotpHex) {
         if (recovery) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
@@ -100,6 +103,6 @@ CoroutinePostgresLocalProofVerifier::verifyAsync(identity::provider::ExternalSub
                 std::move(replacement->value())));
         }
     }
-    co_return local::LocalCredentialProof{verified, verifiedOwner};
+    co_return local::LocalCredentialProof{verified, verifiedOwner,foundation::Instant{foundation::Duration{*generation}}};
 }
 }

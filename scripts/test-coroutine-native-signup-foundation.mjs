@@ -189,3 +189,34 @@ test("native password reset HTTP scrubs both secrets and only commits a precompu
   assert.match(reset,/password_reset/);
   assert.doesNotMatch(reset,/set-cookie|m_verifySignup/);
 });
+
+test("local password proof generation remains fenced through both session persistence paths",()=>{
+  const proof=read("src/storage/postgres/coroutine_local_proof_verifier.cpp");
+  const provider=read("src/providers/local/coroutine_local_provider.cpp");
+  const service=read("src/storage/postgres/coroutine_session_service.cpp");
+  const repo=read("src/storage/postgres/coroutine_session_repository.cpp");
+  const reset=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  assert.match(proof,/decimal<foundation::Duration::rep>\(snapshot.passwordChangedAt\)/);
+  assert.match(provider,/std::move\(proof->canonicalOwner\),proof->passwordGeneration/);
+  assert.match(service,/outcome.subject\(\),\*outcome.passwordGeneration\(\)/);
+  assert.equal([...service.matchAll(/co_await repo.addFenced\(/g)].length,2);
+  assert.match(service,/std::move\(\*oldDigest\), clock.now\(\),std::move\(item.fence\)/);
+  const lock=repo.slice(repo.indexOf("asio::awaitable<bool> lockPasswordGeneration("),
+    repo.indexOf("asio::awaitable<foundation::Status> insertCapturedSession("));
+  assert.match(lock,/FOR UPDATE OF i FOR SHARE OF o/);
+  assert.match(lock,/p.identity_id=\$1 AND e.provider=\$2 AND e.external_subject=\$3/);
+  assert.match(lock,/p.changed_at_ms=\$4 FOR SHARE OF p,e/);
+  for(const [start,end,write] of [
+    ["asio::awaitable<foundation::Status> insertCapturedSession(","} // namespace","co_await sql.add(connection"],
+    ["CoroutinePostgresSessionRepository::replace(","CoroutinePostgresSessionRepository::rotate(","co_await m_impl->sql.replace("]]){
+    const body=repo.slice(repo.indexOf(start),repo.indexOf(end,repo.indexOf(start)));
+    const markers=["BEGIN ISOLATION LEVEL READ COMMITTED","co_await lockPasswordGeneration(",write,'connection.query("COMMIT"'];
+    let previous=-1;for(const marker of markers){const index=body.indexOf(marker);assert.ok(index>previous,marker);previous=index;}
+    assert.match(body,/AuthenticationFailed/);
+  }
+  assert.match(reset,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  const legacy=read("src/storage/postgres/postgres.cpp");
+  assert.match(legacy,/GREATEST\(p.changed_at_ms\+1,\(extract\(epoch FROM clock_timestamp\(\)\)/);
+  assert.match(legacy,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  assert.match(read("src/authentication/service.cpp"),/if \(authentication.outcome\(\).passwordGeneration\(\)\)\s*co_return foundation::fail/);
+});
