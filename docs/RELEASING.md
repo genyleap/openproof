@@ -43,11 +43,12 @@ the recorded history to accommodate moved tags.
 ### Verify published package migration parity
 
 Download the named release assets and its SHA256SUMS from the official
-release. Verify the package digests against the published SHA256SUMS first.
-Then compare the packaged SQL against the independently pinned tag, without
+release. The checker verifies complete package digests against the published
+SHA256SUMS before comparing SQL against the independently pinned tag, without
 checking out or executing historical SQL:
 
     python3 scripts/verify-migration-artifacts.py --release-tag v1.1.0-rc7 \
+      --sha256sums SHA256SUMS \
       --deb openproof_1.1.0-rc7_amd64.deb \
       --bundle openproof_1.1.0-rc7_linux_amd64.tar.gz
 

@@ -158,6 +158,31 @@ class MigrationArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No migrations pinned"):
             checker["release_migrations"](manifest, "v1")
 
+    def test_complete_package_digest(self):
+        path = self.root / "test.deb"
+        path.write_bytes(b"package bytes")
+        sums = self.root / "SHA256SUMS"
+        value = checker["digest"](path.read_bytes())
+        sums.write_text(f"{value}  {path.name}\n")
+        checker["verify_package_digest"](path, sums)
+        path.write_bytes(b"tampered bytes")
+        with self.assertRaisesRegex(ValueError, "Package SHA-256 mismatch"):
+            checker["verify_package_digest"](path, sums)
+
+    def test_package_digest_requires_unique_exact_filename(self):
+        path = self.root / "test.deb"
+        path.write_bytes(b"package bytes")
+        sums = self.root / "SHA256SUMS"
+        value = checker["digest"](path.read_bytes())
+        for content in (
+            f"{value}  other.deb\n",
+            f"{value}  test.deb\n{value}  test.deb\n",
+            f"{value}  ../test.deb\n",
+        ):
+            sums.write_text(content)
+            with self.assertRaises(ValueError):
+                checker["verify_package_digest"](path, sums)
+
     def test_empty_source_rejected(self):
         for file in self.source.iterdir():
             file.unlink()

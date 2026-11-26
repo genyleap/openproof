@@ -111,6 +111,24 @@ def read_deb(path):
             process.stdout.close()
 
 
+def verify_package_digest(path, sums_path):
+    """Check the complete package against its exact published filename."""
+    matches = []
+    for line in sums_path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64}) [ *]([^/\\\\]+)", line)
+        if not match:
+            raise ValueError("Invalid published SHA256SUMS entry")
+        if match[2] == path.name:
+            matches.append(match[1])
+    if len(matches) != 1:
+        raise ValueError(f"Expected one published digest for {path.name}")
+    with path.open("rb") as stream:
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual != matches[0]:
+        raise ValueError(f"Package SHA-256 mismatch: {path.name}")
+    print(f"PASS package SHA-256: {path.name}")
+
+
 def verify(label, expected, actual):
     missing = sorted(expected.keys() - actual.keys())
     extra = sorted(actual.keys() - expected.keys())
@@ -131,11 +149,19 @@ def main():
     mode.add_argument("--release-tag", help="Compare with an exact pinned release tag")
     parser.add_argument("--manifest", type=Path,
                         default=Path(__file__).resolve().parent.parent / "docs/schema-release-inventory.json")
+    parser.add_argument("--sha256sums", type=Path,
+                        help="Published SHA256SUMS (required in release-tag mode)")
     parser.add_argument("--deb", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
     if args.deb is None and args.bundle is None:
         parser.error("At least one of --deb or --bundle is required")
+    if args.release_tag is not None and args.sha256sums is None:
+        parser.error("--release-tag requires --sha256sums")
+    if args.sha256sums is not None:
+        for package in (args.deb, args.bundle):
+            if package is not None:
+                verify_package_digest(package, args.sha256sums)
     expected = (source_migrations(args.source) if args.source is not None
                 else release_migrations(args.manifest, args.release_tag))
     if args.deb is not None:
