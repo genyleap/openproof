@@ -416,7 +416,10 @@ async function main() {
     (request, response) => {
       const headers = {
         ...request.headers,
-        host: `127.0.0.1:${oppPort}`,
+        // Preserve the public TLS authority for the same-origin POST
+        // contract; other fixture routes retain their historical Host.
+        host: request.method === "POST" && request.url === "/account/password/upgrade"
+          ? request.headers.host : `127.0.0.1:${oppPort}`,
         "x-forwarded-for": request.socket.remoteAddress,
       };
       const forwarded = http.request({
