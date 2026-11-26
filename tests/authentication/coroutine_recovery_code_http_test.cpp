@@ -75,11 +75,14 @@ public:
     unsigned int asyncCalls{};
     unsigned int syncCalls{};
     bool enabled{true};
+    bool logoutEnabled{false};
 
     bool nativeEnabled() const noexcept override { return false; }
     bool nativeEnabledFor(const gw::HttpRequest& request) const noexcept override
     {
-        return enabled && request.path() == "/other/api";
+        return enabled && (request.path() == "/other/api"
+            || (logoutEnabled && request.path() == "/auth/logout"
+                && request.method() == gw::HttpMethod::Post));
     }
     gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -120,11 +123,12 @@ public:
         fnd::CorrelationId{"recovery-http-test"}).value();
 }
 
-asio::awaitable<gw::HttpResponse> dispatch(
+asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
     auth::CoroutineRecoveryCodeHttpAdapter& adapter,
     gw::HttpRequest input)
 {
-    co_return co_await adapter.handleAsync(std::move(input));
+    co_return std::optional<gw::HttpResponse>{
+        co_await adapter.handleAsync(std::move(input))};
 }
 
 struct Fixture final {
@@ -178,7 +182,7 @@ struct Fixture final {
         auto future = asio::co_spawn(
             io, dispatch(adapter, std::move(input)), asio::use_future);
         io.run();
-        return future.get();
+        return std::move(future.get()).value();
     }
 };
 
@@ -207,6 +211,22 @@ TEST(CoroutineRecoveryHttpTest, OnlyOneAuthorizedRouteIsNative)
         gw::HttpMethod::Post, "/auth/recovery-codes"));
     EXPECT_EQ(direct.status(), 503);
     EXPECT_EQ(fixture.store.replaced, 0U);
+}
+
+TEST(CoroutineRecoveryHttpTest, OtherNativeAuthCapabilityIsPreserved)
+{
+    Fixture fixture;
+    fixture.fallback.logoutEnabled = true;
+    EXPECT_TRUE(fixture.adapter.nativeEnabledFor(request(
+        gw::HttpMethod::Post, "/auth/logout")));
+    EXPECT_EQ(fixture.run(request(gw::HttpMethod::Post, "/auth/logout")).status(), 209);
+    EXPECT_EQ(fixture.fallback.asyncCalls, 1U);
+    EXPECT_EQ(fixture.fallback.syncCalls, 0U);
+    EXPECT_EQ(fixture.store.replaced, 0U);
+    fixture.fallback.enabled = false;
+    EXPECT_FALSE(fixture.adapter.nativeEnabledFor(request(
+        gw::HttpMethod::Post, "/auth/logout")));
+    EXPECT_EQ(fixture.run(request(gw::HttpMethod::Post, "/auth/logout")).status(), 503);
 }
 
 TEST(CoroutineRecoveryHttpTest, WeakOrMissingSessionNeverIssuesCode)

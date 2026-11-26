@@ -55,6 +55,7 @@ jobs:
           node scripts/test-coroutine-account-profile-contract.mjs
           node scripts/test-coroutine-account-connections-contract.mjs
           node scripts/test-coroutine-account-totp-status-contract.mjs
+          node scripts/test-native-recovery-runtime-contract.mjs
       - name: Native LDAP disposable fixture and transport contract
         run: |
           node scripts/test-native-enterprise-ldaps.mjs
@@ -166,6 +167,8 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_profile_e2e_ci
           node scripts/e2e-identity-platform.mjs
@@ -182,6 +185,8 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
           node scripts/e2e-identity-platform.mjs
