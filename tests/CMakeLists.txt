@@ -914,6 +914,7 @@ target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_canonical openproof_postgres_async_io
     openproof_postgres_async_consent openproof_consent
     openproof_postgres_async_repository openproof_policy openproof_session
+    openproof_postgres_async_verification openproof_storage_postgres openproof_account
     openproof_authentication openproof_identity_core
     openproof_identity_provider openproof_identity_profile
     openproof_security openproof_foundation Boost::headers OpenProof::libpq
@@ -951,3 +952,33 @@ endif()
 gtest_discover_tests(openproof_admin_coroutine_http_tests
     TEST_PREFIX "NativeAdminRead." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
+
+# Isolated native delivery regression: keep the Gateway Asio definitions
+# separate from the umbrella provider executable.
+add_executable(openproof_account_delivery_coroutine_tests
+    account/delivery_coroutine_test.cpp)
+target_compile_features(openproof_account_delivery_coroutine_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_account_delivery_coroutine_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_account_delivery_coroutine_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_account_delivery_coroutine_tests PRIVATE
+    BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_account_delivery_coroutine_tests PRIVATE
+    openproof_account_delivery openproof_account openproof_gateway_http
+    openproof_gateway openproof_provider_local openproof_identity_core
+    openproof_identity_profile openproof_identity_provider
+    openproof_session openproof_credentials openproof_foundation
+    Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(account/delivery_coroutine_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_account_delivery_coroutine_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_account_delivery_coroutine_tests
+    TEST_PREFIX "NativeDelivery."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "account;async;gateway")

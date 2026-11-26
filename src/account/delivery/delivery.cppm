@@ -1,6 +1,7 @@
 module;
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -9,6 +10,9 @@ export module openproof.account.delivery;
 import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
+export import :coroutine;
+import openproof.identity.core;
+import openproof.identity.provider;
 
 export namespace openproof::account::delivery {
 

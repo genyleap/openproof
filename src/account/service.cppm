@@ -35,6 +35,7 @@ public:
 
 private:
     friend class AccountService;
+    friend class VerificationPreparation;
     explicit VerificationKey(foundation::SecretString key);
     foundation::SecretString m_key;
 };
@@ -61,6 +62,29 @@ private:
     foundation::Duration m_phoneLifetime{};
     foundation::Duration m_resetLifetime{};
     std::uint32_t m_maximumAttempts{};
+};
+
+/** Shared creation of the digest-only persisted challenge and move-only
+ * delivery secret. Neither method provisions an identity or authorizes
+ * contact ownership; callers must persist through the trusted repository.
+ */
+class VerificationPreparation final {
+public:
+    using Prepared = std::pair<VerificationChallenge, VerificationDispatch>;
+
+    [[nodiscard]] static foundation::Result<VerificationDigest> digest(
+        const VerificationKey& key, const VerificationId& id,
+        const foundation::SecretString& secret);
+
+    [[nodiscard]] static foundation::Result<Prepared> prepare(
+        const VerificationKey& key, const identity::core::IdentityId& identity,
+        VerificationPurpose purpose, VerificationChannel channel,
+        std::string destination, foundation::Instant now, foundation::Duration lifetime);
+
+    [[nodiscard]] static foundation::Result<Prepared> prepareContact(
+        const VerificationKey& key, const AccountPolicy& policy,
+        const identity::core::IdentityId& identity, VerificationPurpose purpose,
+        std::string destination, foundation::Instant now);
 };
 
 /** @brief Delivery boundary. Implementations send secrets without logging them. */

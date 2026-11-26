@@ -24,6 +24,50 @@ CI validates:
 - Debian package generation;
 - standalone runtime bundle generation.
 
+## Stable schema consolidation (mandatory before coroutine migration release)
+
+During development, numbered SQL migrations are incremental review and test
+units. They are not the intended permanent fresh-install layout of the
+completed OpenProof protocol.
+
+Before the first stable release of the completed migration:
+
+- Freeze the accepted schema and consolidate the development-only changes into
+  one versioned, tenant-neutral fresh-install baseline. Do not ship the
+  development sequence as the normal fresh-install execution path.
+- Inventory all schema versions and exact SQL checksums already distributed
+  in public release artifacts, including release candidates. Keep a separate
+  supported upgrade path and immutable checksum manifest/archive for those
+  versions. Never execute historical customer-specific SQL on a fresh database.
+- Teach the migrator to distinguish empty installations, known upgrade
+  histories, partial installations and unknown/drifted schemas under a common
+  migration lock. Fail closed on ambiguous history or mismatched checksums;
+  never infer that a database is current from a version number alone.
+- Verify schema equivalence on disposable PostgreSQL databases (tables,
+  columns, defaults, constraints, foreign keys, indexes, functions and
+  privileges), and run the full authentication/session/tenant/OAuth/credential
+  and coroutine acceptance suites against both clean baseline and supported
+  upgrade paths. Test concurrent bootstrap, rollback on failure, repeat
+  execution, preservation of existing data and tampered histories.
+- Verify packaged AMD64/ARM64 installs and upgrades, and explicitly document
+  the supported upgrade matrix and backup/restore procedure. The stable
+  release is not approved until this evidence is recorded.
+
+Do not rewrite applied migration files or delete migration ledger rows merely
+to make the source tree smaller. Published compatibility material is distinct
+from the new baseline and may be distributed as a separate upgrade bundle
+only once the migrator and packaging support that arrangement.
+
+After the stable baseline is released, its contents are immutable. Subsequent
+schema evolution uses reviewed versioned upgrade steps; a later baseline
+consolidation must preserve the same compatibility guarantees.
+
+**Current development state:** the existing migrator still executes the
+root-level numbered SQL sequence and validates the legacy archive. The
+consolidated baseline and upgraded migrator are a pending release requirement,
+not a capability of this branch. Keep current migration artifacts intact
+until the new installation and upgrade paths are verified.
+
 ## 2. Tag
 
 For a release candidate:

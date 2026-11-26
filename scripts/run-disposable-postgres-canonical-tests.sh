@@ -48,7 +48,8 @@ for migration in \
     0005_account_lifecycle.sql \
     0006_resource_consent.sql \
     0017_session_client_metadata.sql \
-    0018_profile_avatar_sources.sql; do
+    0018_profile_avatar_sources.sql \
+    0021_verification_reservation_generation.sql; do
     "${as_pg[@]}" "$pgbin/psql" -X -q -v ON_ERROR_STOP=1 \
         -h "$work" -p "$port" -U postgres -d openproof_coroutine_ci \
         -f "$repo/migrations/$migration"

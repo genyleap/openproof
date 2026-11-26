@@ -169,8 +169,9 @@ AccountService::AccountService(
 {
 }
 
-foundation::Result<VerificationDigest> AccountService::digest(
-    const VerificationId& id, const foundation::SecretString& secret) const
+foundation::Result<VerificationDigest> VerificationPreparation::digest(
+    const VerificationKey& key, const VerificationId& id,
+    const foundation::SecretString& secret)
 {
     if (id.empty() || secret.empty() || secret.size() > 256U) {
         return foundation::fail(genericVerificationFailure("Verification input is malformed."));
@@ -178,16 +179,16 @@ foundation::Result<VerificationDigest> AccountService::digest(
     std::string bound{id.value()};
     bound.push_back(':');
     bound.append(secret.expose());
-    auto value = security::hmacSha256(m_key.m_key, bound);
+    auto value = security::hmacSha256(key.m_key, bound);
     foundation::secureWipe(bound.data(), bound.size());
     if (!value.has_value()) return foundation::fail(value.error());
     return VerificationDigest{value.value()};
 }
 
-foundation::Result<VerificationDispatch> AccountService::issue(
-    const identity::core::IdentityId& identity,
+foundation::Result<VerificationPreparation::Prepared> VerificationPreparation::prepare(
+    const VerificationKey& key, const identity::core::IdentityId& identity,
     VerificationPurpose purpose, VerificationChannel channel,
-    std::string destination, foundation::Duration lifetime)
+    std::string destination, foundation::Instant now, foundation::Duration lifetime)
 {
     auto idRaw = security::randomTokenBase64Url(kVerificationIdEntropyBytes);
     if (!idRaw.has_value()) return foundation::fail(idRaw.error());
@@ -197,17 +198,51 @@ foundation::Result<VerificationDispatch> AccountService::issue(
         ? numericCode(8U) : security::randomTokenBase64Url(kEmailSecretEntropyBytes);
     if (!secretRaw.has_value()) return foundation::fail(secretRaw.error());
     foundation::SecretString secret{std::move(secretRaw).value()};
-    auto fingerprint = digest(id, secret);
+    auto fingerprint = digest(key, id, secret);
     if (!fingerprint.has_value()) return foundation::fail(fingerprint.error());
-    const auto now = m_clock->now();
     auto challenge = VerificationChallenge::create(
         id, identity, purpose, channel, destination, fingerprint.value(), now, lifetime);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     const auto expiresAt = challenge->expiresAt();
-    auto stored = m_repository->replace(std::move(challenge).value());
-    if (!stored.has_value()) return foundation::fail(stored.error());
-    return VerificationDispatch{id, identity, purpose, channel, std::move(destination),
-                                std::move(secret), expiresAt};
+    return Prepared{std::move(challenge).value(),
+        VerificationDispatch{id, identity, purpose, channel, std::move(destination),
+                             std::move(secret), expiresAt}};
+}
+
+foundation::Result<VerificationPreparation::Prepared> VerificationPreparation::prepareContact(
+    const VerificationKey& key, const AccountPolicy& policy,
+    const identity::core::IdentityId& identity, VerificationPurpose purpose,
+    std::string destination, foundation::Instant now)
+{
+    if (purpose != VerificationPurpose::ChangeEmail && purpose != VerificationPurpose::VerifyPhone)
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const bool email = purpose == VerificationPurpose::ChangeEmail;
+    auto normalized = email ? normalizeEmail(std::move(destination))
+                            : normalizePhone(std::move(destination));
+    if (!normalized) return foundation::fail(normalized.error());
+    return prepare(key, identity, purpose,
+        email ? VerificationChannel::Email : VerificationChannel::Sms,
+        std::move(normalized).value(), now,
+        email ? policy.emailVerificationLifetime() : policy.phoneVerificationLifetime());
+}
+
+foundation::Result<VerificationDigest> AccountService::digest(
+    const VerificationId& id, const foundation::SecretString& secret) const
+{
+    return VerificationPreparation::digest(m_key, id, secret);
+}
+
+foundation::Result<VerificationDispatch> AccountService::issue(
+    const identity::core::IdentityId& identity,
+    VerificationPurpose purpose, VerificationChannel channel,
+    std::string destination, foundation::Duration lifetime)
+{
+    auto prepared = VerificationPreparation::prepare(
+        m_key, identity, purpose, channel, std::move(destination), m_clock->now(), lifetime);
+    if (!prepared) return foundation::fail(prepared.error());
+    auto stored = m_repository->replace(std::move(prepared->first));
+    if (!stored) return foundation::fail(stored.error());
+    return std::move(prepared->second);
 }
 
 foundation::Result<VerificationChallenge> AccountService::consume(
@@ -217,9 +252,9 @@ foundation::Result<VerificationChallenge> AccountService::consume(
 {
     auto fingerprint = digest(id, secret);
     if (!fingerprint.has_value()) return foundation::fail(fingerprint.error());
-    auto challenge = m_repository->consume(
+    auto challenge = m_repository->consumeForPurpose(
         id, fingerprint.value(), m_clock->now(), m_policy.maximumAttempts(),
-        expectedIdentity);
+        purpose, expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     if (challenge->purpose() != purpose) {
         return foundation::fail(genericVerificationFailure(
@@ -545,10 +580,10 @@ foundation::Status AccountService::completeEmailChange(
     const identity::core::ExternalIdentityRef newExternal{
         m_localProvider, identity::provider::ExternalSubject{replacement}};
     const auto releaseReservation = [&]() {
-        static_cast<void>(m_repository->releaseSubject(
-            newExternal, challenge->identity()));
+        static_cast<void>(m_repository->releaseSubjectForChallenge(
+            newExternal, challenge->identity(), challenge->id()));
     };
-    auto reservedOwner = m_repository->reservedOwner(newExternal, m_clock->now());
+    auto reservedOwner = m_repository->reservedOwnerForChallenge(newExternal, m_clock->now(), challenge->id());
     if (!reservedOwner.has_value()) {
         return foundation::fail(reservedOwner.error());
     }
@@ -609,7 +644,7 @@ foundation::Status AccountService::completeEmailChange(
                 releaseReservation();
                 return saved;
             }
-            return m_repository->releaseSubject(newExternal, challenge->identity());
+            return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
         }
 
         auto set = profile->setEmail(replacement, true, m_clock->now());
@@ -622,7 +657,7 @@ foundation::Status AccountService::completeEmailChange(
             releaseReservation();
             return saved;
         }
-        return m_repository->releaseSubject(newExternal, challenge->identity());
+        return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
     }
 
     const std::string previous{local->subject().value()};
@@ -637,7 +672,7 @@ foundation::Status AccountService::completeEmailChange(
             releaseReservation();
             return saved;
         }
-        return m_repository->releaseSubject(newExternal, challenge->identity());
+        return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
     }
 
     const identity::core::ExternalIdentityRef oldExternal{
@@ -678,7 +713,7 @@ foundation::Status AccountService::completeEmailChange(
         releaseReservation();
         return detached;
     }
-    return m_repository->releaseSubject(newExternal, challenge->identity());
+    return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
 }
 
 foundation::Status AccountService::beginPhoneVerification(
@@ -709,7 +744,7 @@ foundation::Status AccountService::completePhoneVerification(
     const identity::core::IdentityId& expectedIdentity,
     const VerificationId& id, const foundation::SecretString& secret)
 {
-    auto challenge = consume(id, secret, VerificationPurpose::VerifyPhone);
+    auto challenge = consume(id, secret, VerificationPurpose::VerifyPhone, &expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     if (challenge->identity() != expectedIdentity) {
         return foundation::fail(genericVerificationFailure(
@@ -718,6 +753,11 @@ foundation::Status AccountService::completePhoneVerification(
     const identity::core::ExternalIdentityRef external{
         m_phoneProvider, identity::provider::ExternalSubject{
             std::string{challenge->destination()}}};
+    auto reservation = m_repository->reservedOwnerForChallenge(
+        external, m_clock->now(), challenge->id());
+    if (!reservation) return foundation::fail(reservation.error());
+    if (!reservation->has_value() || reservation->value() != expectedIdentity)
+        return foundation::fail(genericVerificationFailure("Phone reservation is absent or superseded."));
     auto attached = attachVerified(challenge->identity(), external);
     if (!attached.has_value()) return attached;
     auto profile = requireProfile(challenge->identity());
@@ -733,7 +773,7 @@ foundation::Status AccountService::completePhoneVerification(
         static_cast<void>(m_externalIdentities->detach(external, challenge->identity()));
         return saved;
     }
-    return m_repository->releaseSubject(external, challenge->identity());
+    return m_repository->releaseSubjectForChallenge(external, challenge->identity(), challenge->id());
 }
 
 foundation::Status AccountService::beginPasswordReset(std::string email)
