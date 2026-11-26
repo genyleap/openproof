@@ -1394,7 +1394,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeSignupEnabled=nativeSignupFlag && *nativeSignupFlag=="1";
+    if (platform.account().enabled() && nativeSignupFlag && *nativeSignupFlag=="0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native signup and credential lifecycle."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeSignupEnabled=platform.account().enabled()
+        || (nativeSignupFlag && *nativeSignupFlag=="1");
     if (nativeSignupEnabled && (!platform.auth().enabled() || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native signup requires authentication and account API."});
@@ -1455,9 +1461,8 @@ addProtectedRoutes(gateway::Router& router,
     const bool nativeLdapEnabled = nativeLdapFlag
         ? *nativeLdapFlag == "1"
         : ldapUri && !ldapUri->empty();
-    // Account session management must not depend on whether enterprise LDAP
-    // is configured. Keep its native SQL path independently opt-in until
-    // compiled listener and disposable-PostgreSQL acceptance is complete.
+    // Account session management is mandatory whenever the account API
+    // is enabled, independent of the enterprise directory configuration.
     const auto nativeAccountFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS");
     if (nativeAccountFlag && *nativeAccountFlag != "0"
@@ -1467,11 +1472,14 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountEnabled =
-        nativeAccountFlag && *nativeAccountFlag == "1";
-    // Profile reads use the same native session authority and a separately
-    // tenant-scoped coroutine profile reader. Opt in explicitly; enabling
-    // session management alone must not migrate another account route.
+    if (platform.account().enabled() && nativeAccountFlag && *nativeAccountFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native session management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountEnabled = platform.account().enabled()
+        || (nativeAccountFlag && *nativeAccountFlag == "1");
+    // Profile management shares native sessions and tenant-scoped storage.
     const auto nativeAccountProfileFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE");
     if (nativeAccountProfileFlag && *nativeAccountProfileFlag != "0"
@@ -1481,8 +1489,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountProfileEnabled =
-        nativeAccountProfileFlag && *nativeAccountProfileFlag == "1";
+    if (platform.account().enabled() && nativeAccountProfileFlag && *nativeAccountProfileFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native profile management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountProfileEnabled = platform.account().enabled()
+        || (nativeAccountProfileFlag && *nativeAccountProfileFlag == "1");
     if (nativeAccountProfileEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{
@@ -1490,9 +1503,8 @@ addProtectedRoutes(gateway::Router& router,
             "Native account profile requires enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
-    // Read-only connection enumeration is separately gated. It may share
-    // the active tenant canonical reader with profile but never enables
-    // identity creation, linking or connection mutation.
+    // Connection enumeration shares the tenant reader, never provisioning
+    // identities or mutating links.
     const auto nativeAccountConnectionsFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS");
     if (nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag != "0"
@@ -1502,8 +1514,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountConnectionsEnabled =
-        nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "1";
+    if (platform.account().enabled() && nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native connection reads."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountConnectionsEnabled = platform.account().enabled()
+        || (nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "1");
     if (nativeAccountConnectionsEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{
@@ -1511,8 +1528,8 @@ addProtectedRoutes(gateway::Router& router,
             "Native account connections require enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
-    // Status is read-only and independently gated; enrollment and disable
-    // remain on the compatibility implementation until migrated separately.
+    // TOTP status reads only boolean credential metadata. Mutations use
+    // the native credential lifecycle selected above.
     const auto nativeAccountTotpStatusFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS");
     if (nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag != "0"
@@ -1521,8 +1538,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountTotpStatusEnabled =
-        nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "1";
+    if (platform.account().enabled() && nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native TOTP status."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountTotpStatusEnabled = platform.account().enabled()
+        || (nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "1");
     if (nativeAccountTotpStatusEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3020,8 +3042,9 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
-            // Profile reads and writes are method scoped below; delegated
-            // OAuth credentials remain on the compatibility worker.
+            // Profile reads accept scoped native Bearer authentication.
+            // Profile writes remain method-scoped; Bearer writes retain
+            // their compatibility authorization until separately migrated.
         }
         if (nativeContactIssuer) {
             asyncContact=std::make_unique<accountHttp::CoroutineContactVerificationAdapter>(
@@ -3132,23 +3155,21 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
-        if (nativeContactIssuer) {
-            nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
-            if (nativeTotp) {
-                nativeMethods.emplace_back("/account/totp/start",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/totp/complete",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/totp/disable",gateway::HttpMethod::Post);
+        if (nativeSignupEnabled) {
+            if (!nativeContactIssuer || !nativeSignup || !nativeVerifySignup
+                || !nativeResetPassword || !nativeVerifyPhone || !nativeVerifyEmailChange || !nativeTotp) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native account credential lifecycle is unavailable."});
+                return ExitCode::ConfigurationError;
             }
-            if (nativeVerifyPhone) nativeMethods.emplace_back("/account/phone/verify",gateway::HttpMethod::Post);
-            if (nativeVerifyEmailChange) nativeMethods.emplace_back("/account/email/change/verify",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
-            if (nativeResetPassword) nativeMethods.emplace_back("/account/password/reset",gateway::HttpMethod::Post);
-            if (nativeSignupEnabled) {
-                nativeMethods.emplace_back("/account/signup",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/email/verify",gateway::HttpMethod::Post);
-            }
+            // Exact paths fail closed even if capability is withdrawn. No
+            // signup, verification or credential mutation can reach legacy SQL.
+            for (const auto* path : {"/account/signup", "/account/email/verify",
+                    "/account/email/change", "/account/email/change/verify",
+                    "/account/email/resend", "/account/phone", "/account/phone/verify",
+                    "/account/password/forgot", "/account/password/reset",
+                    "/account/totp/start", "/account/totp/complete", "/account/totp/disable"})
+                nativePaths.emplace_back(path);
         }
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/account/connections/web3/start");
@@ -3463,8 +3484,8 @@ addProtectedRoutes(gateway::Router& router,
                 co_return co_await nativeSessions->issueAsync(verified.value(),std::move(client));
             };
         }
-        // Keep reset cutover coupled to the isolated native signup opt-in
-        // until session-generation fencing and live acceptance are verified.
+        // Password reset shares the native credential lifecycle and its
+        // session-generation fence.
         if (nativeSignupEnabled) {
             nativeResetPassword=[&](account::VerificationId id,fnd::SecretString secret,fnd::SecretString password)
                 ->boost::asio::awaitable<fnd::Status> {

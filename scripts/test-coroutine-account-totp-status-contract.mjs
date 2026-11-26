@@ -7,7 +7,7 @@ const read = p => fs.readFileSync(path.join(root, p), "utf8");
 const app = read("apps/opp/main.cpp");
 const http = read("src/account/http/coroutine_session_http.cpp");
 const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
-test("TOTP status is separately gated, read-only and preserves compatibility", () => {
+test("TOTP status is mandatory for enabled account API and read-only", () => {
   assert.match(app, /nativeAccountTotpStatusFlag && \*nativeAccountTotpStatusFlag == "1"/);
   assert.match(app, /nativeAccountTotpStatusEnabled\s*&& \(!nativeAccountEnabled \|\| !platform\.account\(\)\.enabled\(\)\)/);
   assert.match(app, /nativeMethods\.emplace_back\("\/account\/totp", gateway::HttpMethod::Get\)/);

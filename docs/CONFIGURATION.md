@@ -711,14 +711,25 @@ standalone `*`. Omitting this setting retains historical convergence behavior
 for backwards compatibility. Deployments with stricter linking requirements
 should use `*` until providers' email verification guarantees are reviewed.
 
-### Experimental native account connections read (coroutine branch only)
+### Native account and credential lifecycle (coroutine branch only)
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS=1` selects only
-`GET /account/connections` for first-party authenticated session cookies.
-The default is `0` (disabled). Enabling it requires
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS=1` and the account API;
-invalid values or missing prerequisites reject startup. Profile reads have a
-**separate** opt-in and do not become native merely by enabling connections.
+An enabled account API requires native sessions, profile, connection reads,
+TOTP status, signup, password reset, email and phone verification, and
+TOTP enrollment/disable. The historical configuration flags
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS`, and
+`OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP` accept unset or 1 when accounts are
+enabled. Explicit 0, invalid values, or missing required dependencies
+reject startup. Explicit 1 is invalid if account management is disabled.
+
+Signup, contact challenge issuance and verification, password reset and TOTP
+mutation paths are exact native overlays. Unsupported methods or missing
+native capability fail closed instead of dispatching legacy credential SQL.
+Password hashing remains on the bounded KDF executor. Account profile
+mutations and other methods not yet fully migrated retain method-specific
+compatibility where documented.
 
 The native implementation verifies the session before a tenant-scoped,
 read-only asynchronous PostgreSQL query; it checks active identity and
@@ -903,13 +914,13 @@ service; caller-provided scope headers are removed at the gateway boundary.
 
 See `examples/openproof.toml` for a complete deployment sample.
 
-### Experimental native account TOTP status (coroutine branch only)
+### Native account TOTP status (coroutine branch only)
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS=1` enables only
-`GET /account/totp` with a first-party authenticated cookie. Default is disabled;
-requires native account sessions and the account API. Authorization header
-requests and all TOTP enrollment, replacement and disable operations retain
-compatibility dispatch. A single native PostgreSQL read checks active tenant,
+`GET /account/totp` defaults to the native first-party cookie verifier in
+account-enabled runtimes. Requests carrying an Authorization header still
+retain compatibility dispatch. TOTP enrollment, replacement and disable use
+the strict native credential lifecycle described above.
+A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.

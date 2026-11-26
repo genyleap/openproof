@@ -409,6 +409,9 @@ async function main() {
   const consumerPassword = `E2E-consumer-${base64Url(crypto.randomBytes(24))}`;
   const replacementPassword = `E2E-replaced-${base64Url(crypto.randomBytes(24))}`;
   const resourceAudience = "https://api.e2e.openproof.invalid";
+  // The candidate enables native account capabilities by default. Only the
+  // explicitly pinned historical binary retains the legacy expectations.
+  const nativeAccountRuntime = process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1";
 
   let frontPort;
   const edgeServer = https.createServer(
@@ -1022,7 +1025,7 @@ async function main() {
       secret: notifications[0].secret,
     });
     expectStatus(verifiedEmail, 200);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       assert.equal(jsonBody(verifiedEmail).verified, true);
       assert.ok(jsonBody(verifiedEmail).session_id);
       const replay = await jsonRequest("/account/email/verify", "POST", {
@@ -1170,7 +1173,7 @@ async function main() {
       expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 200);
       assert.equal(active(), beforeActive, "same-browser local login must atomically replace the session");
       console.log("- native local HTTP: unknown/locked subject, invalid password, binding, replay, no provisioning and session replacement passed");
-      if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS === "1") {
+      if (nativeAccountRuntime) {
         expectStatus(await edgeRequest("/account/password/upgrade"), 401);
         const projection = await edgeRequest("/account/password/upgrade", { jar: consumerJar });
         expectStatus(projection, 200);
@@ -1203,7 +1206,7 @@ async function main() {
         console.log("- native password upgrade HTTP: owner-bound metadata, no-store, inactive identity denial, origin and policy enforcement passed");
       }
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/account/totp"), 401);
       const status = await edgeRequest("/account/totp", { jar: consumerJar });
       expectStatus(status, 200);
@@ -1211,7 +1214,7 @@ async function main() {
         assurance: consumerGrant.assurance });
       assert.equal(status.headers["cache-control"], "no-store");
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+    if (nativeAccountRuntime) {
       // Preserve the legacy projection: retired/unregistered provider links
       // can exist in storage, but cannot appear as available login methods.
       command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
@@ -1233,10 +1236,10 @@ async function main() {
       jsonBody(connectionsBefore).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
       [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
     );
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
-      // Exercise the opt-in read concurrently: connection-pool contention
+    if (nativeAccountRuntime) {
+      // Exercise the native read concurrently: connection-pool contention
       // must suspend without dropping sockets or leaking another identity.
-      // Default/benchmark runs keep their existing compatibility workload.
+      // The later timed mixed-read workload is unchanged.
       const reads = await Promise.all(Array.from({ length: 8 },
         () => edgeRequest("/account/connections", { jar: consumerJar })));
       for (const response of reads) {
@@ -1254,7 +1257,7 @@ async function main() {
         );
       }
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+    if (nativeAccountRuntime) {
       // Remove only the dedicated fixture before testing last-method policy.
       command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
         "DELETE FROM openproof.external_identities WHERE provider='fixture-retired-provider' " +
@@ -1294,7 +1297,7 @@ async function main() {
     }, consumerJar);
     expectStatus(updatedProfile, 200);
     assert.equal(jsonBody(updatedProfile).locale, "fa-IR");
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE === "1") {
+    if (nativeAccountRuntime) {
       const refused = await jsonRequest("/account/profile", "PATCH", {
         display_name: "Uncommitted profile", avatar_source: "missing-avatar-provider",
       }, consumerJar);
@@ -1322,7 +1325,7 @@ async function main() {
       new_password: replacementPassword,
     });
     expectStatus(reset, 200);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       assert.equal(jsonBody(reset).password_reset, true);
       assert.equal(reset.headers["set-cookie"], undefined);
       const resetReplay = await jsonRequest("/account/password/reset", "POST", {
@@ -1336,7 +1339,7 @@ async function main() {
     }
     const consumerJarAfterReset = new CookieJar();
     await login("consumer@e2e.invalid", replacementPassword, consumerJarAfterReset);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       const enrollment = await jsonRequest("/account/totp/start", "POST",
         { password: replacementPassword }, consumerJarAfterReset);
       expectStatus(enrollment, 201);
@@ -1387,7 +1390,7 @@ async function main() {
       assert.equal(countOwnerSessions(), before);
       console.log("- native local MFA: missing second factor and previously consumed TOTP denied");
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+    if (nativeAccountRuntime) {
       const status = await edgeRequest("/account/totp", { jar: ownerJar });
       expectStatus(status, 200);
       assert.deepEqual(jsonBody(status), { available: true, enabled: true, assurance: "ial2" });
@@ -1548,9 +1551,7 @@ async function main() {
       headers: { authorization: `Bearer ${profileOnlyTokens.access_token}` },
     });
     expectStatus(connectionsWithoutScope, 403);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE === "1"
-        && process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"
-        && process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1") {
+    if (nativeAccountRuntime) {
       for (const route of ["/account/profile", "/account/connections"]) {
         const proofWithoutVerifier = await edgeRequest(route, {
           headers: { authorization: `DPoP ${nativeTokens.access_token}` },

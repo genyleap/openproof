@@ -15,7 +15,7 @@ const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 const main = read("apps/opp/main.cpp");
 
-test("native profile routes are method scoped and disabled by default", () => {
+test("native profile routes are method scoped and mandatory for enabled account API", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadProfile readProfile = \{\}/);
   assert.match(header, /nativeEnabled\(\) const noexcept override \{ return false; \}/);

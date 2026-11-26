@@ -14,7 +14,7 @@ const native = cppExecutableText(http);
 const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 
-test("connection reads are independently enabled and method-scoped", () => {
+test("connection reads are mandatory for enabled account API and method-scoped", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadConnections readConnections = \{\}/);
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
@@ -95,7 +95,8 @@ test("canonical PostgreSQL and repeated HTTP E2E use isolated guarded databases"
 
 test("native HTTP E2E exercises concurrent reads with no extra identity creation", () => {
   const e2e = read("scripts/e2e-identity-platform.mjs");
-  assert.match(e2e, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"/);
+  assert.match(e2e, /const nativeAccountRuntime = process\.env\.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1"/);
+  assert.match(e2e, /if \(nativeAccountRuntime\) \{[\s\S]*?const reads = await Promise\.all/);
   assert.match(e2e, /Promise\.all\(Array\.from\(\{ length: 8 \}/);
   assert.match(e2e, /edgeRequest\("\/account\/connections", \{ jar: consumerJar \}\)/);
   assert.match(e2e, /jsonBody\(response\)\.connections\.map/);

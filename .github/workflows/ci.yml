@@ -64,6 +64,10 @@ jobs:
           node scripts/test-coroutine-account-totp-status-contract.mjs
           node scripts/test-native-admin-members-contract.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Mandatory native account credential lifecycle contract
+        run: |
+          node scripts/test-coroutine-native-contact-runtime.mjs
+          node scripts/test-coroutine-native-signup-foundation.mjs
       - name: Mandatory native public discovery and provider catalog contract
         run: |
           node scripts/test-coroutine-native-oidc-discovery-runtime.mjs

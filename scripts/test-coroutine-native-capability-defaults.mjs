@@ -94,16 +94,34 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler\)/);
 });
-test("native account-session runtime remains independent of LDAP and profile reads", () => {
+test("native account lifecycle is mandatory and independent of LDAP", () => {
   const app = read("apps/opp/main.cpp");
   assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS"\)/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag != "0"/);
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
   assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
+  const runtime=app.indexOf("ExitCode runGatewayServer(");
+  const migrator=app.indexOf("postgres::Migrator migrator",runtime);
+  assert.ok(runtime>=0 && migrator>runtime);
+  for (const [flag,capability] of [
+    ["nativeAccountFlag","nativeAccountEnabled"],
+    ["nativeAccountProfileFlag","nativeAccountProfileEnabled"],
+    ["nativeAccountConnectionsFlag","nativeAccountConnectionsEnabled"],
+    ["nativeAccountTotpStatusFlag","nativeAccountTotpStatusEnabled"],
+    ["nativeSignupFlag","nativeSignupEnabled"]
+  ]) {
+    const declaration=new RegExp("const bool "+capability+"\\s*=\\s*platform\\.account\\(\\)\\.enabled\\(\\)\\s*\\|\\|\\s*\\("+flag+" && \\*"+flag+"\\s*==\\s*\"1\"\\)");
+    const refuse=new RegExp("if \\(platform\\.account\\(\\)\\.enabled\\(\\) && "+flag+" && \\*"+flag+"\\s*==\\s*\"0\"\\) \\{[\\s\\S]*?return ExitCode::ConfigurationError;");
+    assert.match(app,declaration);
+    assert.match(app.slice(0,migrator),refuse);
+  }
+  assert.match(app,/if \(!nativeContactIssuer \|\| !nativeSignup \|\| !nativeVerifySignup[\s\S]*?!nativeTotp\) \{[\s\S]*?return ExitCode::ConfigurationError;/);
+  const exact=app.slice(app.indexOf('for (const auto* path : {"/account/signup"'),app.indexOf("nativePaths.emplace_back(path);"));
+  for (const route of ["/account/signup","/account/email/verify","/account/email/change","/account/email/change/verify","/account/email/resend","/account/phone","/account/phone/verify","/account/password/forgot","/account/password/reset","/account/totp/start","/account/totp/complete","/account/totp/disable"])
+    assert.ok(exact.includes('"'+route+'"'),route);
 
-  // Account session management must not allocate an OAuth transaction store,
-  // canonical finalizer, or another key on its own. Profile reads have a
-  // second explicit flag and can initialize only their canonical SQL reader.
+  // Keep the session and tenant readers independent of provider transaction
+  // initialization even though the account feature now requires both readers.
   const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
   const setup = app.lastIndexOf(
     "if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled", nativeIo);
