@@ -596,58 +596,94 @@ Migrator::Migrator(ConnectionPool& pool) : m_pool(&pool) {}
 foundation::Result<MigrationReport> Migrator::applyDirectory(
     const std::filesystem::path& directory)
 {
+    struct Migration final {
+        std::string version;
+        std::string sql;
+        std::string checksum;
+        bool archived{};
+        bool recorded{};
+    };
     std::error_code filesystemError;
     if (!std::filesystem::is_directory(directory, filesystemError) || filesystemError) {
         return foundation::fail(foundation::ErrorCode::NotFound,
                                 "The migration directory was not found.");
     }
-    std::vector<std::filesystem::path> files;
-    for (std::filesystem::directory_iterator iterator{directory, filesystemError};
-         !filesystemError && iterator != std::filesystem::directory_iterator{}; ++iterator) {
-        if (iterator->is_regular_file() && iterator->path().extension() == ".sql") {
+    std::vector<Migration> migrations;
+    // Read and hash each file once. Execute the same bytes that were validated.
+    const auto load = [&](const std::filesystem::path& source, bool archived)
+        -> foundation::Status {
+        if (!std::filesystem::is_directory(source, filesystemError) || filesystemError
+            || std::filesystem::is_symlink(source, filesystemError) || filesystemError) {
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "A migration directory is invalid.");
+        }
+        std::vector<std::filesystem::path> files;
+        for (std::filesystem::directory_iterator iterator{source, filesystemError};
+             !filesystemError && iterator != std::filesystem::directory_iterator{};
+             iterator.increment(filesystemError)) {
+            if (iterator->path().extension() != ".sql") continue;
+            if (iterator->is_symlink(filesystemError) || filesystemError
+                || !iterator->is_regular_file(filesystemError) || filesystemError) {
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                        "A migration artifact is invalid.");
+            }
             files.push_back(iterator->path());
         }
-    }
-    if (filesystemError) return foundation::fail(foundation::ErrorCode::Internal,
-                                                  "The migration directory could not be read.");
-    std::ranges::sort(files);
-
-    // Historical tenant-specific SQL is retained as an immutable checksum
-    // archive, never as an executable schema migration. Fresh installations
-    // must never provision an unrelated product's OAuth clients.
-    const auto legacyDirectory = directory / "legacy";
-    if (!std::filesystem::is_directory(legacyDirectory, filesystemError)
-        || filesystemError) {
-        return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                "The legacy migration checksum archive is missing.");
-    }
-    std::vector<std::pair<std::string, std::string>> archived;
-    for (std::filesystem::directory_iterator iterator{legacyDirectory, filesystemError};
-         !filesystemError && iterator != std::filesystem::directory_iterator{}; ++iterator) {
-        if (iterator->path().extension() != ".sql") continue;
-        if (!iterator->is_regular_file() || iterator->is_symlink()) {
+        if (filesystemError || files.empty()) {
             return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                    "The legacy migration archive contains an invalid file.");
+                                    "A migration directory is incomplete.");
         }
-        std::ifstream stream{iterator->path(), std::ios::binary};
-        const std::string sql{std::istreambuf_iterator<char>{stream},
-                              std::istreambuf_iterator<char>{}};
-        if (stream.bad() || sql.empty()) {
-            return foundation::fail(foundation::ErrorCode::Internal,
-                                    "A legacy migration checksum could not be read.");
+        std::ranges::sort(files);
+        for (const auto& path : files) {
+            std::ifstream stream{path, std::ios::binary};
+            std::string sql{std::istreambuf_iterator<char>{stream},
+                            std::istreambuf_iterator<char>{}};
+            if (!stream.is_open() || stream.bad() || sql.empty()
+                || sql.find('\0') != std::string::npos) {
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                        "A migration file could not be read.");
+            }
+            auto checksum = security::sha256(sql);
+            if (!checksum) return foundation::fail(checksum.error());
+            const auto version = path.filename().string();
+            const auto hex = foundation::toHex(checksum.value());
+            const auto existing = std::ranges::find_if(migrations,
+                [&version](const auto& entry) { return entry.version == version; });
+            if (existing != migrations.end()) {
+                // In-place upgrades can leave exact historical seeds in root.
+                // Never execute them, even if not yet recorded.
+                if (!existing->archived || archived || existing->checksum != hex) {
+                    return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                            "A historical migration file has changed.");
+                }
+                continue;
+            }
+            migrations.push_back(Migration{version, std::move(sql), hex, archived, false});
         }
-        auto checksum = security::sha256(sql);
-        if (!checksum) return foundation::fail(checksum.error());
-        archived.emplace_back(iterator->path().filename().string(),
-                              foundation::toHex(checksum.value()));
-    }
-    if (filesystemError || archived.empty()) {
+        return foundation::ok();
+    };
+    auto archive = load(directory / "legacy", true);
+    if (!archive) return foundation::fail(archive.error());
+    auto active = load(directory, false);
+    if (!active) return foundation::fail(active.error());
+    if (std::ranges::none_of(migrations, [](const auto& entry) { return !entry.archived; })) {
         return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                "The legacy migration archive is incomplete.");
+                                "No executable schema migrations were found.");
     }
+
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     PGconn* connection = lease->get();
+    ResultPointer begun = exec(connection, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    if (!commandOk(begun.get())) return foundation::fail(databaseError(begun.get(), "BEGIN migrations"));
+    struct MigrationTransaction final {
+        PGconn* connection;
+        bool committed{};
+        ~MigrationTransaction() { if (!committed) rollback(connection); }
+    } transaction{connection};
+    // Serialize the whole batch, including ledger creation and validation.
+    ResultPointer lock = exec(connection, "SELECT pg_advisory_xact_lock(1827364512)");
+    if (!tuplesOk(lock.get())) return foundation::fail(databaseError(lock.get(), "lock migrations"));
     ResultPointer bootstrap = exec(connection,
         "CREATE SCHEMA IF NOT EXISTS openproof;"
         "CREATE TABLE IF NOT EXISTS openproof.schema_migrations ("
@@ -656,81 +692,42 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
     if (!commandOk(bootstrap.get())) return foundation::fail(databaseError(bootstrap.get(), "bootstrap migrations"));
 
     MigrationReport report;
-    for (const auto& path : files) {
-        std::ifstream stream{path, std::ios::binary};
-        std::string sql{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
-        if (stream.bad() || sql.empty()) return foundation::fail(foundation::ErrorCode::Internal,
-                                                                 "A migration file could not be read.");
-        auto checksum = security::sha256(sql);
-        if (!checksum) return foundation::fail(checksum.error());
-        const std::string version = path.filename().string();
-        const std::string hex = foundation::toHex(checksum.value());
-        const auto historic = std::ranges::find_if(archived,
-            [&version](const auto& entry) { return entry.first == version; });
-        if (historic != archived.end() && historic->second != hex) {
+    ResultPointer ledger = exec(connection,
+        "SELECT version, encode(checksum, 'hex') FROM openproof.schema_migrations");
+    if (!tuplesOk(ledger.get())) return foundation::fail(databaseError(ledger.get(), "read migration state"));
+    // Reject incomplete packages, altered history and unsupported downgrades
+    // before executing any new migration.
+    for (int row = 0; row < PQntuples(ledger.get()); ++row) {
+        const auto version = field(ledger.get(), row, 0);
+        const auto existing = std::ranges::find_if(migrations,
+            [&version](const auto& entry) { return entry.version == version; });
+        if (existing == migrations.end() || existing->checksum != field(ledger.get(), row, 1)) {
             return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                    "A historical migration file has changed.");
+                                    "An applied migration is missing or has changed.");
         }
-        auto begun = beginTransaction(connection);
-        if (!begun) return foundation::fail(begun.error());
-        ResultPointer lock = exec(connection, "SELECT pg_advisory_xact_lock(1827364512)");
-        if (!tuplesOk(lock.get())) { rollback(connection); return foundation::fail(databaseError(lock.get(), "lock migrations")); }
-        ResultPointer existing = execParams(connection,
-            "SELECT encode(checksum, 'hex') FROM openproof.schema_migrations WHERE version=$1",
-            {version});
-        if (!tuplesOk(existing.get())) { rollback(connection); return foundation::fail(databaseError(existing.get(), "read migration state")); }
-        if (PQntuples(existing.get()) == 1) {
-            if (field(existing.get(), 0, 0) != hex) {
-                rollback(connection);
-                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                        "An applied migration file has changed.");
-            }
-            auto committed = commit(connection);
-            if (!committed) return foundation::fail(committed.error());
-            ++report.alreadyApplied;
-            continue;
-        }
+        existing->recorded = true;
+        ++report.alreadyApplied;
+    }
 
-        // An older in-place upgrade might still leave the archived SQL files
-        // in the root directory. Verify their *unchanged bytes* and skip them.
-        // Never execute tenant-specific bootstrap SQL as a schema migration.
-        if (historic != archived.end()) {
-            auto committed = commit(connection);
-            if (!committed) return foundation::fail(committed.error());
-            continue;
+    for (const auto& migration : migrations) {
+        if (migration.archived || migration.recorded) continue;
+        ResultPointer applied = exec(connection, migration.sql);
+        if (!commandOk(applied.get())) return foundation::fail(databaseError(applied.get(), "apply migration"));
+        if (PQtransactionStatus(connection) != PQTRANS_INTRANS) {
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "A migration did not preserve the transaction.");
         }
-        ResultPointer applied = exec(connection, sql);
-        if (!commandOk(applied.get())) { rollback(connection); return foundation::fail(databaseError(applied.get(), "apply migration")); }
         ResultPointer recorded = execParams(connection,
             "INSERT INTO openproof.schema_migrations(version, checksum) VALUES($1, decode($2,'hex'))",
-            {version, hex});
-        if (!commandOk(recorded.get())) { rollback(connection); return foundation::fail(databaseError(recorded.get(), "record migration")); }
-        auto committed = commit(connection);
-        if (!committed) return foundation::fail(committed.error());
+            {migration.version, migration.checksum});
+        if (!commandOk(recorded.get())) return foundation::fail(databaseError(recorded.get(), "record migration"));
         ++report.applied;
     }
-
-    // Preserve checksum validation for old installations which already applied
-    // the legacy SQL. Never apply those files on a new installation, even if a
-    // tenant happens to have the same organization identifier as the publisher.
-    for (const auto& [version, expected] : archived) {
-        const bool inRoot = std::ranges::any_of(files,
-            [&version](const auto& path) { return path.filename().string() == version; });
-        if (inRoot) continue; // Already checked in the root-file loop above.
-        ResultPointer existing = execParams(connection,
-            "SELECT encode(checksum, 'hex') FROM openproof.schema_migrations WHERE version=$1",
-            {version});
-        if (!tuplesOk(existing.get())) {
-            return foundation::fail(databaseError(existing.get(), "read archived migration state"));
-        }
-        if (PQntuples(existing.get()) == 1) {
-            if (field(existing.get(), 0, 0) != expected) {
-                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                        "An applied historical migration file has changed.");
-            }
-            ++report.alreadyApplied;
-        }
+    ResultPointer committed = exec(connection, "COMMIT");
+    if (!commandOk(committed.get()) || std::string_view{PQcmdStatus(committed.get())} != "COMMIT") {
+        return foundation::fail(databaseError(committed.get(), "commit migrations"));
     }
+    transaction.committed = true;
     return report;
 }
 

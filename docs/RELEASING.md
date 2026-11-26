@@ -58,6 +58,17 @@ locations. Unknown tags and ambiguous checksums fail closed. This is a
 migration parity check, not binary provenance or runtime acceptance.
 The current-source packaging checks continue to use `--source`.
 
+### Atomic schema upgrades
+
+The PostgreSQL migrator checks the complete recorded ledger, including archived
+tenant-specific records, before applying pending SQL. An unknown or modified
+record fails closed; downgrading an upgraded database is not supported.
+The entire batch and ledger bootstrap share one READ COMMITTED transaction
+and the migration advisory lock. Pending migration SQL must be trusted,
+transaction-compatible release SQL without explicit transaction control.
+Take a verified backup and stop application traffic during schema upgrades;
+this is not an online migration or a substitute for upgrade testing.
+
 ### Development baseline round-trip
 
 Run `python3 scripts/verify-schema-baseline.py` on a PostgreSQL 16-capable

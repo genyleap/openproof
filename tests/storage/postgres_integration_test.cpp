@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -209,6 +210,88 @@ TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
     EXPECT_FALSE(mismatched);
     execute("DELETE FROM openproof.schema_migrations "
             "WHERE version='0020_genycaster_native_client.sql'");
+}
+
+TEST_F(PostgresIntegrationTest, MigrationRejectsUnknownLedgerBeforeNewSql)
+{
+    // A newer database cannot be silently opened by an older package.
+    execute("INSERT INTO openproof.schema_migrations(version,checksum) VALUES "
+            "('9999_future_schema.sql',decode(repeat('ab',32),'hex'))");
+    pg::Migrator migrator{*pool};
+    auto result = migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    execute("DELETE FROM openproof.schema_migrations WHERE version='9999_future_schema.sql'");
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), fnd::ErrorCode::FailedPrecondition);
+    EXPECT_TRUE(pool->healthCheck());
+}
+
+TEST_F(PostgresIntegrationTest, MigrationBatchRollsBackEarlierSqlAndLedgerOnLaterFailure)
+{
+    const auto suffix = sec::randomTokenBase64Url(18U);
+    ASSERT_TRUE(suffix);
+    const auto directory = std::filesystem::temp_directory_path()
+        / ("openproof-migration-test-" + suffix.value());
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    struct Cleanup final {
+        std::filesystem::path directory;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    } cleanup{directory};
+    std::filesystem::copy(std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations",
+                          directory, std::filesystem::copy_options::recursive);
+    {
+        std::ofstream first{directory / "9997_fixture_first.sql"};
+        first << "UPDATE openproof.organizations SET name='must roll back' WHERE id='org';";
+        ASSERT_TRUE(first);
+        std::ofstream second{directory / "9998_fixture_failure.sql"};
+        second << "SELECT * FROM openproof.nonexistent_migration_fixture;";
+        ASSERT_TRUE(second);
+    }
+    pg::Migrator migrator{*pool};
+    const auto result = migrator.applyDirectory(directory);
+    // Read and clean any unexpected writes before assertions, so a failing
+    // regression cannot poison subsequent tests on the disposable database.
+    std::unique_ptr<PGresult, ResultDeleter> name{PQexec(direct.get(),
+        "SELECT name FROM openproof.organizations WHERE id='org'")};
+    std::unique_ptr<PGresult, ResultDeleter> ledger{PQexec(direct.get(),
+        "SELECT count(*) FROM openproof.schema_migrations "
+        "WHERE version IN ('9997_fixture_first.sql','9998_fixture_failure.sql')")};
+    execute("UPDATE openproof.organizations SET name='Test' WHERE id='org'");
+    execute("DELETE FROM openproof.schema_migrations "
+            "WHERE version IN ('9997_fixture_first.sql','9998_fixture_failure.sql')");
+    ASSERT_FALSE(result);
+    ASSERT_NE(name.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(name.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(name.get()), 1);
+    EXPECT_STREQ(PQgetvalue(name.get(), 0, 0), "Test");
+    ASSERT_NE(ledger.get(), nullptr);
+    ASSERT_EQ(PQresultStatus(ledger.get()), PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(ledger.get()), 1);
+    EXPECT_STREQ(PQgetvalue(ledger.get(), 0, 0), "0");
+    EXPECT_TRUE(pool->healthCheck());
+    EXPECT_TRUE(migrator.applyDirectory(
+        std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations"));
+}
+
+TEST_F(PostgresIntegrationTest, ConcurrentMigrationChecksShareOneLedger)
+{
+    std::atomic<int> success{0};
+    const auto directory = std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations";
+    const auto check = [&] {
+        pg::Migrator migrator{*pool};
+        const auto result = migrator.applyDirectory(directory);
+        if (result && result->applied == 0U && result->alreadyApplied > 0U)
+            success.fetch_add(1, std::memory_order_relaxed);
+    };
+    std::thread first(check);
+    std::thread second(check);
+    first.join();
+    second.join();
+    EXPECT_EQ(success.load(std::memory_order_relaxed), 2);
+    EXPECT_TRUE(pool->healthCheck());
 }
 
 TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)

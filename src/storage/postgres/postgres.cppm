@@ -103,7 +103,7 @@ struct MigrationReport final {
 class Migrator final {
 public:
     explicit Migrator(ConnectionPool& pool);
-    /** Applies lexically ordered .sql files and rejects changed applied files. */
+    /** Validates the full ledger and atomically applies pending SQL under a migration lock. */
     [[nodiscard]] foundation::Result<MigrationReport>
     applyDirectory(const std::filesystem::path& directory);
 private:
