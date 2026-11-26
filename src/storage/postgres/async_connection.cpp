@@ -166,6 +166,11 @@ bool AsyncConnection::healthy() const noexcept
         && PQstatus(m_impl->connection.get()) == CONNECTION_OK;
 }
 
+bool AsyncConnection::inTransaction() const noexcept
+{
+    return healthy() && PQtransactionStatus(m_impl->connection.get())==PQTRANS_INTRANS;
+}
+
 bool AsyncConnection::reusable() const noexcept
 {
     return !m_impl->busy.load(std::memory_order_acquire)
@@ -455,9 +460,18 @@ asio::awaitable<QueryRows> AsyncConnection::query(
         asio::use_awaitable);
 }
 
+asio::awaitable<void> AsyncConnection::executeMigrationScript(
+    std::string sql,std::chrono::milliseconds timeout)
+{
+    const auto deadline=makeDeadline(timeout);
+    auto executor=co_await asio::this_coro::executor;
+    static_cast<void>(co_await asio::co_spawn(asio::make_strand(executor),
+        querySerialized(std::move(sql),{},deadline,true),asio::use_awaitable));
+}
+
 asio::awaitable<QueryRows> AsyncConnection::querySerialized(
     std::string sql, std::vector<std::optional<std::string>> params,
-    Deadline deadline)
+    Deadline deadline,bool migrationScript)
 {
     auto executor = co_await asio::this_coro::executor;
     if (m_impl->busy.exchange(true, std::memory_order_acq_rel)) {
@@ -486,6 +500,9 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         throw std::invalid_argument{"PostgreSQL parameter count exceeds libpq bounds"};
     }
     PGconn* connection = m_impl->connection.get();
+    if (migrationScript && (!params.empty() || !inTransaction() || sql.empty()
+        || sql.size()>16U*1024U*1024U))
+        throw std::invalid_argument{"Invalid PostgreSQL migration script boundary"};
     try {
         // Validation and parameter materialization consume the same absolute
         // deadline as libpq I/O; never submit an already-expired operation.
@@ -497,10 +514,10 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         for (const auto& parameter : params) {
             values.push_back(parameter.has_value() ? parameter->c_str() : nullptr);
         }
-        if (PQsendQueryParams(connection, sql.c_str(),
-                static_cast<int>(values.size()), nullptr,
-                values.empty() ? nullptr : values.data(),
-                nullptr, nullptr, 0) == 0) {
+        const int submitted=migrationScript?PQsendQuery(connection,sql.c_str()):
+            PQsendQueryParams(connection,sql.c_str(),static_cast<int>(values.size()),nullptr,
+                values.empty()?nullptr:values.data(),nullptr,nullptr,0);
+        if (submitted==0) {
             throw std::runtime_error{"PostgreSQL query could not be submitted"};
         }
         // PQsendQueryParams may itself take time on the calling thread.
@@ -511,7 +528,9 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         // Enable libpq's row-at-a-time protocol immediately after send.
         // Without this, libpq buffers an entire PGresult before our own
         // result-copy limit can reject oversized queries.
-        if (PQsetSingleRowMode(connection) != 1) {
+        // Multi-command startup artifacts may return complete tuple results
+        // (for example pg_dump's set_config). No request data uses this path.
+        if (!migrationScript && PQsetSingleRowMode(connection) != 1) {
             throw std::runtime_error{"PostgreSQL single-row mode unavailable"};
         }
 
@@ -562,17 +581,27 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
             }
             const ExecStatusType status = PQresultStatus(result.get());
             if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
-                if (finished || PQntuples(result.get()) != 0) {
+                if (migrationScript) {
+                    const int count=PQntuples(result.get()),fields=PQnfields(result.get());
+                    if (count<0 || fields<0 || static_cast<std::uint64_t>(count)*static_cast<std::uint64_t>(fields)>kMaximumResultCells-copiedCells)
+                        throw std::runtime_error{"PostgreSQL migration result limit exceeded"};
+                    copiedCells+=static_cast<std::size_t>(count)*static_cast<std::size_t>(fields);
+                } else if (finished || PQntuples(result.get()) != 0) {
                     throw std::runtime_error{"Unexpected PostgreSQL result completion"};
                 }
+                output.commandTag=PQcmdStatus(result.get());
+                if (migrationScript && (output.commandTag=="COMMIT" || output.commandTag=="ROLLBACK"
+                    || output.commandTag=="BEGIN" || output.commandTag=="PREPARE TRANSACTION"))
+                    throw std::runtime_error{"PostgreSQL migration changed transaction boundary"};
                 finished = true;
                 continue;
             }
-            if (status != PGRES_SINGLE_TUPLE || finished) {
+            if (status != PGRES_SINGLE_TUPLE || (!migrationScript && finished)) {
                 // An error after partial rows discards both the rows and the
                 // connection; nothing escapes before the terminal result.
                 throw std::runtime_error{"PostgreSQL query returned an error"};
             }
+            finished=false;
             const int rowCount = PQntuples(result.get());
             const int fieldCount = PQnfields(result.get());
             if (rowCount < 0 || fieldCount < 0
@@ -604,7 +633,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
                             static_cast<std::size_t>(length)});
                     }
                 }
-                output.rows.push_back(std::move(fields));
+                if (!migrationScript) output.rows.push_back(std::move(fields));
             }
         }
         // Result extraction may complete after the final pre-read deadline
@@ -612,6 +641,8 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         if (Clock::now() >= deadline) {
             throw std::runtime_error{"PostgreSQL operation timed out"};
         }
+        if (migrationScript && !inTransaction())
+            throw std::runtime_error{"PostgreSQL migration did not preserve transaction"};
         co_return output;
     } catch (...) {
         // A lost or cancelled query may still be executing on the server.

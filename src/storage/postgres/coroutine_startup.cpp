@@ -1,0 +1,160 @@
+#include "async_connection.hpp"
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
+#include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <exception>
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+#include "coroutine_startup.hpp"
+
+import openproof.storage.migration_package;
+
+namespace openproof::storage::postgres {
+namespace {
+namespace asio=boost::asio;
+namespace pg=async_detail;
+using E=foundation::ErrorCode;
+using Clock=std::chrono::steady_clock;
+using Params=std::vector<std::optional<std::string>>;
+std::chrono::milliseconds remaining(Clock::time_point deadline)
+{
+    auto budget=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-Clock::now());
+    if (budget<=std::chrono::milliseconds::zero()) throw std::runtime_error{"Startup deadline expired"};
+    return budget;
+}
+asio::awaitable<foundation::Status> validateAsync(foundation::SecretString dsn,
+    identity::core::OrganizationId tenant,unsigned int version,security::Sha256Digest fingerprint)
+{
+    if (version==0U || tenant.empty()) co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+std::chrono::seconds{10};
+        auto connection=co_await pg::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        static_cast<void>(co_await connection->query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",{},remaining(deadline)));
+        auto journal=co_await connection->query(
+            "SELECT to_version,encode(to_fingerprint,'hex') FROM openproof.master_key_rotations ORDER BY sequence DESC LIMIT 1",
+            {},remaining(deadline));
+        if (journal.rows.empty()) {
+            if (version!=1U) co_return foundation::fail(E::FailedPrecondition,"Configured master key has no committed rotation journal.");
+        } else {
+            if (journal.rows.size()!=1U || journal.rows.front().size()!=2U ||
+                !journal.rows.front()[0] || !journal.rows.front()[1])
+                co_return foundation::fail(E::FailedPrecondition);
+            const auto& row=journal.rows.front();
+            unsigned int storedVersion{};
+            const auto& number=*row[0];
+            const auto [end,error]=std::from_chars(number.data(),number.data()+number.size(),storedVersion);
+            auto bytes=foundation::fromHex(*row[1]);
+            if (error!=std::errc{} || end!=number.data()+number.size() || storedVersion!=version ||
+                !bytes || bytes->size()!=fingerprint.size() ||
+                !security::constantTimeEquals(std::span<const std::byte>{bytes->data(),bytes->size()},
+                    std::span<const std::byte>{fingerprint.data(),fingerprint.size()}))
+                co_return foundation::fail(E::FailedPrecondition,"Configured master key does not match the committed journal.");
+        }
+        Params args{std::string{tenant.value()}};
+        const auto organization=co_await connection->query(
+            "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0",std::move(args),remaining(deadline));
+        if (organization.rows.size()!=1U || organization.rows.front().size()!=1U ||
+            organization.rows.front()[0]!=std::optional<std::string>{std::string{tenant.value()}})
+            co_return foundation::fail(E::FailedPrecondition,"Configured authentication organization is absent or inactive.");
+        const auto committed=co_await connection->query("COMMIT",{},remaining(deadline));
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return foundation::ok();
+    } catch (const std::exception&) {co_return foundation::fail(E::Unavailable,"Database startup validation is unavailable.");}
+}
+}
+asio::awaitable<foundation::Result<NativeMigrationReport>>
+migrateSchemaAsync(foundation::SecretString dsn,std::filesystem::path directory,foundation::Duration timeout)
+{
+    if (timeout<=foundation::Duration::zero() || timeout>std::chrono::minutes{10})
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        // Files are trusted deployment artifacts, read only during startup or CLI.
+        auto package=migration::loadPackage(directory);
+        if (!package) co_return foundation::fail(package.error());
+        auto& [migrations,baselineSql]=package.value();
+        const auto deadline=Clock::now()+timeout;
+        auto connection=co_await pg::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        const auto execute=[&](std::string sql,Params args) {
+            return connection->query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(1827364512)",{}));
+        bool freshNamespace=false;
+        if (baselineSql) {
+            const auto existing=co_await execute(
+                "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname='openproof')",{});
+            if (existing.rows.size()!=1U || existing.rows.front().size()!=1U ||
+                !existing.rows.front()[0]) co_return foundation::fail(E::Unavailable);
+            freshNamespace=*existing.rows.front()[0]=="f";
+        }
+        co_await connection->executeMigrationScript(
+            "CREATE SCHEMA IF NOT EXISTS openproof;"
+            "CREATE TABLE IF NOT EXISTS openproof.schema_migrations ("
+            "version text PRIMARY KEY, checksum bytea NOT NULL CHECK (octet_length(checksum)=32),"
+            "applied_at timestamptz NOT NULL DEFAULT clock_timestamp())",remaining(deadline));
+        NativeMigrationReport report;
+        const auto ledger=co_await execute("SELECT version,encode(checksum,'hex') FROM openproof.schema_migrations",{});
+        for (const auto& row:ledger.rows) {
+            if (row.size()!=2U || !row[0] || !row[1]) co_return foundation::fail(E::FailedPrecondition);
+            const auto existing=std::ranges::find_if(migrations,[&](const auto& entry){return entry.version==*row[0];});
+            if (existing==migrations.end() || existing->checksum!=*row[1])
+                co_return foundation::fail(E::FailedPrecondition,"An applied migration is missing or has changed.");
+            existing->recorded=true;
+            ++report.alreadyApplied;
+        }
+        if (baselineSql && ledger.rows.empty()) {
+            if (!freshNamespace) co_return foundation::fail(E::FailedPrecondition,"An empty migration ledger does not identify a fresh schema.");
+            co_await connection->executeMigrationScript(*baselineSql,remaining(deadline));
+            report.usedBaseline=true;
+        }
+        for (const auto& migration:migrations) {
+            if (migration.archived || migration.recorded) continue;
+            if (!report.usedBaseline)
+                co_await connection->executeMigrationScript(migration.sql,remaining(deadline));
+            Params args{migration.version,migration.checksum};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.schema_migrations(version,checksum) VALUES($1,decode($2,'hex')) RETURNING version",
+                std::move(args));
+            if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U ||
+                inserted.rows.front()[0]!=std::optional<std::string>{migration.version})
+                co_return foundation::fail(E::Unavailable);
+            ++report.applied;
+        }
+        const auto committed=co_await execute("COMMIT",{});
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return report;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native schema migration is unavailable.");
+    }
+}
+foundation::Result<NativeMigrationReport> migrateSchemaBeforeListener(
+    foundation::SecretString dsn,std::filesystem::path directory)
+{
+    try {
+        asio::io_context io;
+        auto migrated=asio::co_spawn(io,migrateSchemaAsync(std::move(dsn),std::move(directory),std::chrono::minutes{5}),asio::use_future);
+        io.run();
+        return migrated.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Database migration failed.");}
+}
+foundation::Status nativeDatabasePreflight(foundation::SecretString dsn,std::filesystem::path directory,
+    identity::core::OrganizationId tenant,unsigned int masterVersion,security::Sha256Digest fingerprint)
+{
+    try {
+        auto result=migrateSchemaBeforeListener(dsn.clone(),std::move(directory));
+        if (!result) return foundation::fail(result.error());
+        asio::io_context io;
+        auto checked=asio::co_spawn(io,validateAsync(std::move(dsn),std::move(tenant),masterVersion,fingerprint),asio::use_future);
+        io.run();
+        return checked.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Database preflight failed.");}
+}
+}

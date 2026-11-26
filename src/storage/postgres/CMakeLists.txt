@@ -32,6 +32,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 
+# Shared checksum-validated migration package, independent of libpq.
+openproof_add_module(openproof_migration_package
+    MODULES migration_package.cppm
+    SOURCES migration_package.cpp
+    LINK_PUBLIC openproof_foundation openproof_security)
+
 openproof_add_module(openproof_storage_postgres
     MODULES
         postgres.cppm
@@ -64,7 +70,20 @@ openproof_add_module(openproof_storage_postgres
     LINK_PRIVATE
         OpenProof::libpq
         openproof_postgres_async_io
+        openproof_migration_package
 )
+
+add_library(openproof_postgres_async_startup STATIC coroutine_startup.cpp)
+target_compile_features(openproof_postgres_async_startup PUBLIC cxx_std_26)
+set_target_properties(openproof_postgres_async_startup PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_startup PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_startup PUBLIC
+    openproof_migration_package openproof_postgres_async_io openproof_foundation
+    openproof_security openproof_identity_core Boost::headers PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_startup.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
 
 # Keep native Asio types in ordinary C++ translation units rather than
 # attaching their Boost headers (and thread-local template definitions) to

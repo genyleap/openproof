@@ -20,7 +20,7 @@ test("authenticated runtime requires native Web3 before database operations", ()
   assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeWeb3Flag && \*nativeWeb3Flag == "0"/);
   assert.match(app,/const bool nativeWeb3Enabled = platform\.auth\(\)\.enabled\(\)/);
   const start = app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN");
-  const migrator = app.indexOf("postgres::Migrator migrator{*pool.value()}", start);
+  const migrator = app.indexOf("postgres::nativeDatabasePreflight(", start);
   assert.ok(start >= 0 && migrator > start);
 });
 

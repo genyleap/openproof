@@ -21,7 +21,7 @@ test("auth session cutover is mandatory and rejects invalid or disabled configur
   assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeAuthSessionFlag && \*nativeAuthSessionFlag == "0"/);
   assert.match(app,/nativeAuthSessionEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const begin=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
-  const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",begin);
+  const migrate=app.indexOf("postgres::nativeDatabasePreflight(",begin);
   assert.ok(begin>=0 && migrate>begin);
 });
 

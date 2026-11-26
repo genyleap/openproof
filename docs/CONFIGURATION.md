@@ -1234,15 +1234,20 @@ points fail closed when the corresponding synchronous repository is
 absent. Native UserInfo and durable replay handling remain in the
 coroutine PostgreSQL storage layer.
 
-Authenticated startup uses a single temporary blocking connection for
-schema validation/application, master-key verification and organization
-validation. That pool and its repositories are destroyed before native
-I/O workers and listener construction. Native session storage no longer
-imports or links the blocking PostgreSQL module. Offline CLI operations
-still use the compatibility module; the server executable also links it
-for preflight. The strict storage gate therefore remains open until the
-blocking implementation itself is retired, not merely isolated from
-request handling.
+Authenticated startup now uses native socket-driven libpq for schema
+application, master-key journal validation and organization validation.
+Both migrators share one checksum-validated package loader. Trusted
+deployment SQL artifacts use a startup-only multi-command operation;
+normal request queries remain single-statement and parameterized.
+Schema migration has a five-minute SQL deadline and a shared advisory
+lock; final COMMIT and transaction state are checked. Master-key and
+organization checks use a separate bounded read-only snapshot.
+The finite startup event loop completes before the listener is created;
+filesystem loading occurs only before serving requests. Deployment SQL
+files are trusted administrative artifacts, not untrusted request data.
+Offline CLI operations still use the compatibility module, so the server
+executable continues to link that module for CLI subcommands. The strict
+storage gate remains open until the blocking implementation itself is retired.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must
 also pass.

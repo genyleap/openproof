@@ -21,7 +21,7 @@ test("native public OIDC discovery is mandatory whenever OIDC is enabled",()=>{
   assert.match(app,/platform\.oidc\(\)\.enabled\(\) && nativeOidcDiscoveryFlag && \*nativeOidcDiscoveryFlag == "0"[\s\S]*?return ExitCode::ConfigurationError;/);
   assert.match(app,/nativeOidcDiscoveryEnabled && !platform\.oidc\(\)\.enabled\(\)/);
   const flag=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY");
-  const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",flag);
+  const migrate=app.indexOf("postgres::nativeDatabasePreflight(",flag);
   assert.ok(flag>=0 && migrate>flag,"reject invalid flag before SQL migrations");
   assert.match(app,/const oidc::OpenIdProvider\* nativeOidcProvider = nullptr;/);
   assert.match(app,/nativeOidcProvider = &openIdProvider;/);

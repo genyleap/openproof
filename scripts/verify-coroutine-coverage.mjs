@@ -748,7 +748,7 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"synchronous authentication HTTP entry or dependency remains reachable",
         expression:"native-only login leaf and fail-closed synchronous entry"});
     const flagStart=app.indexOf("const auto nativeLocalFlag");
-    const serveMigration=app.indexOf("postgres::Migrator migrator{*pool.value()}",flagStart);
+    const serveMigration=app.indexOf("postgres::nativeDatabasePreflight(",flagStart);
     const beforeMigration=flagStart>=0 && serveMigration>flagStart
       ? app.slice(flagStart,serveMigration) : "";
 

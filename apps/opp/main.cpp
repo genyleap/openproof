@@ -45,6 +45,7 @@
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/thread_pool.hpp>
 #include <boost/json.hpp>
+#include "../../src/storage/postgres/coroutine_startup.hpp"
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/operations/http/coroutine_health_http.hpp"
@@ -1903,51 +1904,20 @@ addProtectedRoutes(gateway::Router& router,
         return runListener(platform, asyncGateway, logger);
     }
 
-    // The blocking compatibility pool is an exclusive startup resource.
-    // Destroy its leases, repositories and connections before creating any
-    // native I/O worker or HTTP listener. Sequential preflight needs one slot.
-    {
-        auto poolConfig = postgres::PoolConfig::create(
-            platform.database().connectionString().clone(), 1U,
-            std::chrono::seconds{5});
-        if (!poolConfig) {
-            reportStartupFailure(poolConfig.error());
-            return ExitCode::ConfigurationError;
-        }
-        auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-        if (!pool) {
-            reportStartupFailure(pool.error());
-            return ExitCode::ConfigurationError;
-        }
-        postgres::Migrator migrator{*pool.value()};
-        auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-        if (!migrations) {
-            reportStartupFailure(migrations.error());
-            return ExitCode::ConfigurationError;
-        }
-        const fnd::Status activeMaster = verifyActiveMasterKey(
-            *pool.value(), platform.security());
-        if (!activeMaster) {
-            reportStartupFailure(activeMaster.error());
-            return ExitCode::ConfigurationError;
-        }
-
-        postgres::PostgresOrganizationRepository organizations{*pool.value()};
-
-        auto configuredOrganization = organizations.findById(
-            identity::OrganizationId{std::string{platform.auth().organizationId()}});
-        if (!configuredOrganization) {
-            reportStartupFailure(configuredOrganization.error());
-            return ExitCode::ConfigurationError;
-        }
-        if (!configuredOrganization->has_value()
-            || !configuredOrganization->value().isUsable()) {
-            reportStartupFailure(fnd::Error{
-                fnd::ErrorCode::FailedPrecondition,
-                "The configured authentication organization is absent or inactive."});
-            return ExitCode::ConfigurationError;
-        }
-    } // End of blocking database preflight.
+    // Native SQL preflight finishes before any listener or request worker exists.
+    const auto fingerprint=masterKeyFingerprint(platform.security());
+    if (!fingerprint) {
+        reportStartupFailure(fingerprint.error());
+        return ExitCode::ConfigurationError;
+    }
+    const auto preflight=postgres::nativeDatabasePreflight(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory(),
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        platform.security().masterKeyVersion(),fingerprint.value());
+    if (!preflight) {
+        reportStartupFailure(preflight.error());
+        return ExitCode::ConfigurationError;
+    }
 
     auto passwordSecret = passwordPepperMaterial(platform.security());
     auto totpSecret = credentialEncryptionMaterial(platform.security());

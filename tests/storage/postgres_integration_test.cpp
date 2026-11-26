@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <libpq-fe.h>
+#include "../../src/storage/postgres/coroutine_startup.hpp"
 
 import openproof.foundation;
 import openproof.administration;
@@ -311,7 +312,7 @@ TEST(PostgresMigrationBaselineTest, FreshSnapshotRecordsHistoricalChecksumsAndIs
     auto pool = pg::ConnectionPool::create(std::move(config).value());
     ASSERT_TRUE(pool);
     pg::Migrator migrator{*pool.value()};
-    auto first = migrator.applyDirectory(std::filesystem::path{path});
+    auto first = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{path});
     ASSERT_TRUE(first) << (first ? "" : std::string{first.error().internalDetail()});
     EXPECT_TRUE(first->usedBaseline);
     EXPECT_GT(first->applied, 0U);
@@ -349,7 +350,7 @@ TEST(PostgresMigrationBaselineTest, HistoricalReleaseUpgrade)
     auto pool = pg::ConnectionPool::create(std::move(config).value());
     ASSERT_TRUE(pool);
     pg::Migrator migrator{*pool.value()};
-    auto result = migrator.applyDirectory(std::filesystem::path{directory});
+    auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{directory});
     ASSERT_TRUE(result) << (result ? "" : std::string{result.error().internalDetail()});
     EXPECT_FALSE(result->usedBaseline);
     EXPECT_EQ(result->applied, std::stoull(pending));

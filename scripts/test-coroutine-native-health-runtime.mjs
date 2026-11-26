@@ -18,19 +18,34 @@ test("production health routes exclusively use strict native dispatch",()=>{
   assert.doesNotMatch(app,/operationsHttp::HealthHttpApi\s+\w+\s*\{/);
   assert.doesNotMatch(cppExecutableText(http),/m_fallback->handle\(|PQexec|condition_variable|\.wait_for\(/);
 });
-test("blocking PostgreSQL preflight has no lifetime overlap with the native listener",()=>{
-  const serve=app.slice(app.indexOf("ExitCode runGatewayServer("));
-  const start=serve.indexOf("// The blocking compatibility pool is an exclusive startup resource.");
-  const end=serve.indexOf("} // End of blocking database preflight.",start);
-  assert.ok(start>=0 && end>start);
-  const preflight=serve.slice(start,end);
-  assert.match(preflight,/PoolConfig::create\(\s*platform.database\(\).connectionString\(\).clone\(\), 1U,/);
-  assert.match(preflight,/postgres::Migrator migrator\{\*pool.value\(\)\}/);
-  assert.match(preflight,/verifyActiveMasterKey\(/);
-  assert.match(preflight,/PostgresOrganizationRepository organizations/);
-  const runtime=cppExecutableText(serve.slice(end));
-  assert.doesNotMatch(runtime,/\bpostgres::(?:ConnectionPool|PoolConfig|Migrator|Postgres\w+Repository|Postgres\w+Store)\b/);
-  assert.ok(serve.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>",end)>end);
+test("server preflight and listener use no blocking PostgreSQL repository",()=>{
+  const serve=app.slice(app.indexOf("ExitCode runGatewayServer("),app.indexOf("int main("));
+  const preflight=serve.indexOf("postgres::nativeDatabasePreflight(");
+  assert.ok(preflight>=0);
+  assert.doesNotMatch(cppExecutableText(serve),/\bpostgres::(?:ConnectionPool|PoolConfig|Migrator|Postgres\w+Repository|Postgres\w+Store)\b/);
+  assert.ok(serve.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>",preflight)>preflight);
+  const startup=read("src/storage/postgres/coroutine_startup.cpp");
+  const migrate=startup.slice(startup.indexOf("migrateSchemaAsync("),startup.indexOf("migrateSchemaBeforeListener("));
+  const ordered=["migration::loadPackage(directory)","co_await pg::AsyncConnection::connect",
+    "BEGIN ISOLATION LEVEL READ COMMITTED","pg_advisory_xact_lock(1827364512)",
+    "SELECT version,encode(checksum,'hex')","existing->checksum!=*row[1]",
+    "if (baselineSql && ledger.rows.empty())","if (migration.archived || migration.recorded) continue;",
+    "executeMigrationScript(migration.sql","INSERT INTO openproof.schema_migrations",
+    'execute("COMMIT",{})','committed.commandTag!="COMMIT"'];
+  let previous=-1;
+  for(const term of ordered){
+    const index=migrate.indexOf(term,previous+1);
+    assert.ok(index>previous,term);previous=index;
+  }
+  assert.match(startup,/security::constantTimeEquals/);
+  assert.match(startup,/WHERE id=\$1 AND state=0/);
+  assert.doesNotMatch(cppExecutableText(startup),/PQexec|PQconnectdb|PQreset|condition_variable/);
+  const transport=read("src/storage/postgres/async_connection.cpp");
+  assert.match(transport,/migrationScript\?PQsendQuery\(connection,sql.c_str\(\)\):/);
+  assert.match(transport,/migrationScript && \(!params.empty\(\) \|\| !inTransaction\(\)/);
+  assert.match(transport,/migrationScript && !inTransaction\(\)/);
+  assert.match(read("tests/storage/postgres_async_test.cpp"),/MigrationScriptUsesExplicitTransactionAndKeepsRequestQueriesSingleStatement/);
+  assert.match(read("tests/storage/postgres_integration_test.cpp"),/pg::migrateSchemaBeforeListener\(fnd::SecretString\{dsn\}/);
   for(const file of ["session_domain.cpp","coroutine_session_repository.cpp"])
     assert.doesNotMatch(read("src/storage/postgres/"+file),/import openproof.storage.postgres;/);
   const cmake=read("src/storage/postgres/CMakeLists.txt");

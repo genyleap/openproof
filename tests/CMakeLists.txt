@@ -99,6 +99,7 @@ target_link_libraries(openproof_tests
         openproof_gateway_http
         Boost::headers
         openproof_storage_postgres
+        openproof_postgres_async_startup
         openproof_operations_http
         openproof_credentials
         OpenProof::libpq

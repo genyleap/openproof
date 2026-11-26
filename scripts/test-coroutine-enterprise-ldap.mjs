@@ -73,7 +73,7 @@ test("configured native LDAP runtime has a separate, fail-closed transactional s
   const server = app.slice(app.indexOf("[[nodiscard]] ExitCode runGatewayServer("));
   assert.ok(server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP") >= 0
        && server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP")
-          < server.indexOf("postgres::Migrator migrator{*pool.value()}"),
+          < server.indexOf("postgres::nativeDatabasePreflight("),
     "invalid native flags must fail before any schema migration");
   assert.match(app,/!platform\.auth\(\)\.enabled\(\)\s*\|\|\s*!ldapUri/);
   assert.match(gate,/LDAP native HTTP login not connected to runtime transaction\/canonical\/session stack/);

@@ -47,17 +47,19 @@ def audit() -> list[str]:
     start = engine.find("Migrator::applyDirectory(")
     end = engine.find("PostgresCredentialRekeyer::", start)
     migrator = engine[start:end] if start >= 0 and end > start else ""
-    required = (
-        'existing->checksum != hex',
-        'load(directory / "legacy", true)',
-        'load(directory, false)',
-        'existing->checksum != field(ledger.get(), row, 1)',
-        'if (migration.archived || migration.recorded) continue;',
-        'exec(connection, migration.sql)',
+    package = (ROOT / "src/storage/postgres/migration_package.cpp").read_text(encoding="utf-8")
+    native = (ROOT / "src/storage/postgres/coroutine_startup.cpp").read_text(encoding="utf-8")
+    contracts = (
+        (package, ('existing->checksum != hex', 'load(directory / "legacy", true)', 'load(directory, false)')),
+        (migrator, ('migration::loadPackage(directory)', 'existing->checksum != field(ledger.get(), row, 1)',
+                    'if (migration.archived || migration.recorded) continue;', 'exec(connection, migration.sql)')),
+        (native, ('migration::loadPackage(directory)', 'existing->checksum!=*row[1]',
+                  'if (migration.archived || migration.recorded) continue;', 'executeMigrationScript(migration.sql')),
     )
-    positions = [migrator.find(fragment) for fragment in required]
-    if -1 in positions or positions != sorted(positions):
-        findings.append("Migrator lacks checksum-preserving historical SQL exclusion")
+    for implementation, required in contracts:
+        positions = [implementation.find(fragment) for fragment in required]
+        if -1 in positions or positions != sorted(positions):
+            findings.append("Migrator lacks checksum-preserving historical SQL exclusion")
     if "SELECT 1 FROM openproof.organizations WHERE id='genyleap'" in engine:
         findings.append("Vendor tenant lookup still exists in shared migrator")
     return findings

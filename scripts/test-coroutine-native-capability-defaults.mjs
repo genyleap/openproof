@@ -102,7 +102,7 @@ test("native account lifecycle is mandatory and independent of LDAP", () => {
   assert.match(app, /nativeAccountFlag && \*nativeAccountFlag == "1"/);
   assert.match(app, /nativeAccountEnabled && !platform\.account\(\)\.enabled\(\)/);
   const runtime=app.indexOf("ExitCode runGatewayServer(");
-  const migrator=app.indexOf("postgres::Migrator migrator",runtime);
+  const migrator=app.indexOf("postgres::nativeDatabasePreflight(",runtime);
   assert.ok(runtime>=0 && migrator>runtime);
   for (const [flag,capability] of [
     ["nativeAccountFlag","nativeAccountEnabled"],
@@ -203,7 +203,7 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   assert.match(app, /platform\.auth\(\)\.enabled\(\) && nativeLocalFlag && \*nativeLocalFlag == "0"/);
   assert.match(app, /nativeLocalEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const flag = app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN");
-  assert.ok(flag < app.indexOf("postgres::Migrator migrator{*pool.value()}", flag));
+  assert.ok(flag < app.indexOf("postgres::nativeDatabasePreflight(", flag));
   assert.match(app, /BoundedPasswordExecutor::create\(std::move\(hasher\)\.value\(\), 1U\)/);
   assert.match(app, /nativeLocalProviders->registerProvider\(\s*std::make_unique<local::CoroutineLocalAuthenticationProvider>/);
   assert.match(app, /catalogStatus=providers.registerProvider\(\s*std::make_unique<local::CoroutineLocalAuthenticationProvider>/);
@@ -238,7 +238,7 @@ test("OIDC requires native tenant-bound consent management with no synchronous d
   assert.match(app,/const bool nativeConsentEnabled = platform\.oidc\(\)\.enabled\(\)\s*\|\| \(nativeConsentFlag && \*nativeConsentFlag == "1"\)/);
   assert.match(app,/platform\.oidc\(\)\.enabled\(\) && nativeConsentFlag && \*nativeConsentFlag == "0"[\s\S]*?return ExitCode::ConfigurationError;/);
   const flag=app.indexOf('environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS")');
-  assert.ok(flag>=0 && flag<app.indexOf("postgres::Migrator migrator",flag));
+  assert.ok(flag>=0 && flag<app.indexOf("postgres::nativeDatabasePreflight(",flag));
   assert.match(app,/if \(nativeConsentEnabled\) \{\s*nativePaths\.emplace_back\("\/oauth\/consents"\);\s*nativePaths\.emplace_back\("\/oauth\/consents\/revoke"\);/);
   assert.match(app,/std::make_unique<postgres::CoroutineConsentStore>/);
   assert.match(app,/std::make_unique<oauthHttp::CoroutineConsentAdapter>/);
