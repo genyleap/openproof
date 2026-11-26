@@ -6,11 +6,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
+
+namespace openproof::credentials { class BoundedPasswordExecutor; }
 
 namespace openproof::storage::postgres {
 
@@ -39,6 +42,11 @@ public:
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<LocalCredentialSnapshot>>>
     readAsync(identity::provider::ExternalSubject subject);
+    // Owner-scoped read; never return a password hash to the HTTP layer.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<
+        std::pair<identity::core::IdentityId, std::optional<bool>>>>
+    readPasswordUpgradeStatusAsync(identity::core::IdentityId owner,
+                                   const credentials::BoundedPasswordExecutor& policy);
     // Only for password-only authentication, after verification of the
     // captured hash. An intervening MFA enrollment must deny the proof.
     [[nodiscard]] boost::asio::awaitable<foundation::Status>

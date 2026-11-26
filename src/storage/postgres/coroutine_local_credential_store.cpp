@@ -7,6 +7,7 @@
 #include <string_view>
 #include <utility>
 #include "coroutine_local_credential_store.hpp"
+#include "bounded_password_executor.hpp"
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -121,6 +122,55 @@ CoroutineLocalCredentialStore::readAsync(idp::ExternalSubject subject)
             row[3], row[4], *row[5], row[6]};
         if (!valid(snapshot)) co_return foundation::fail(foundation::ErrorCode::Unavailable);
         co_return std::optional<LocalCredentialSnapshot>{std::move(snapshot)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
+asio::awaitable<foundation::Result<std::pair<core::IdentityId, std::optional<bool>>>>
+CoroutineLocalCredentialStore::readPasswordUpgradeStatusAsync(
+    core::IdentityId owner, const credentials::BoundedPasswordExecutor& policy)
+{
+    using Output = std::pair<core::IdentityId, std::optional<bool>>;
+    if (!bounded(owner.value(), 200U))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        const bool inspectHash = policy.prefersArgon2id();
+        Params params{std::string{owner.value()}, std::string{m_impl->tenant.value()},
+            std::string{m_impl->provider.value()}, inspectHash ? "true" : "false"};
+        // Resolve the link and password under a single tenant/owner snapshot.
+        // No TOTP data, recovery codes or password plaintext is queried.
+        // Do not even retrieve the encoded hash if Argon2id is not selected.
+        const auto result = co_await lease.connection().query(
+            "SELECT i.id,EXISTS(SELECT 1 FROM openproof.external_identities e "
+            "WHERE e.identity_id=i.id AND e.provider=$3),"
+            "CASE WHEN $4::boolean AND octet_length(p.password_hash)<=4096 "
+            "THEN p.password_hash END "
+            "FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "LEFT JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "AND EXISTS(SELECT 1 FROM openproof.external_identities e "
+            "WHERE e.identity_id=i.id AND e.provider=$3) "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 LIMIT 2",
+            std::move(params), remaining(deadline));
+        if (result.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        if (result.rows.size()!=1U || result.rows.front().size()!=3U)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        const auto& row = result.rows.front();
+        if (!row[0] || *row[0]!=owner.value() || !row[1]
+            || (*row[1]!="t" && *row[1]!="f"))
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        if (*row[1]=="f") co_return Output{std::move(owner), std::nullopt};
+        if (!inspectHash) co_return Output{std::move(owner), false};
+        if (!row[2] || !bounded(*row[2], 4096U))
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        auto hash = credentials::PasswordHash::parse(*row[2]);
+        if (!hash) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        auto needed = policy.upgradeNeeded(hash.value());
+        if (!needed) co_return foundation::fail(needed.error());
+        co_return Output{std::move(owner), needed.value()};
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
     }

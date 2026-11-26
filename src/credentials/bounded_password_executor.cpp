@@ -97,6 +97,17 @@ BoundedPasswordExecutor::create(PasswordHasher hasher, std::size_t workers)
     }
 }
 
+bool BoundedPasswordExecutor::prefersArgon2id() const noexcept
+{
+    return m_impl->state->hasher.prefersArgon2id();
+}
+
+foundation::Result<bool> BoundedPasswordExecutor::upgradeNeeded(const PasswordHash& hash) const
+{
+    if (!prefersArgon2id()) return false;
+    return m_impl->state->hasher.needsRehash(hash);
+}
+
 asio::awaitable<foundation::Result<bool>> BoundedPasswordExecutor::verifyAsync(
     foundation::SecretString password, std::optional<PasswordHash> expected)
 {

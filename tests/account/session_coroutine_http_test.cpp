@@ -122,7 +122,8 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
 struct Fixture final {
     explicit Fixture(bool profileEnabled = false,
                      bool connectionsEnabled = false,
-                     bool totpStatusEnabled = false)
+                     bool totpStatusEnabled = false,
+                     bool passwordStatusEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -219,7 +220,18 @@ struct Fixture final {
                               totpForeign ? core::IdentityId{"identity-foreign"} : owner,
                               totpEnabled};
                       }}
-                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{})
+                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{},
+              passwordStatusEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{
+                      [this](core::IdentityId owner) -> asio::awaitable<
+                          fnd::Result<http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus>> {
+                          ++passwordStatusCalls;
+                          if (passwordStatusMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus{
+                              passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              passwordStatus};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{})
     {
     }
 
@@ -244,6 +256,10 @@ struct Fixture final {
     int profileReadCalls{};
     int connectionsReadCalls{};
     int totpStatusCalls{};
+    int passwordStatusCalls{};
+    bool passwordStatusForeign{};
+    bool passwordStatusMissing{};
+    std::optional<bool> passwordStatus{false};
     bool totpForeign{};
     bool totpMissing{};
     std::optional<bool> totpEnabled{false};
@@ -610,6 +626,47 @@ TEST(AccountCoroutineSessionHttpTest, TotpStatusIsOptInCookieOnlyAndOwnerBound)
     f.totpForeign = false;
     f.totpMissing = true;
     EXPECT_EQ(f.run(totpCookieRequest()).status(), 404);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeStatusIsCookieOnlyReadAndOwnerBound)
+{
+    auto cookieRequest = [](std::string token = "valid-token") {
+        return gw::HttpRequest::create(
+            gw::HttpMethod::Get, "/account/password/upgrade",
+            {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+            "127.0.0.1", fnd::CorrelationId{"native-password-status-test"}).value();
+    };
+    Fixture disabled;
+    EXPECT_FALSE(disabled.api.nativeEnabledFor(cookieRequest()));
+    Fixture f{false, false, false, true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy, f.api, {},
+        {{"/account/password/upgrade", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(cookieRequest()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get,
+        "/account/password/upgrade", "delegated-oauth")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post,
+        "/account/password/upgrade")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/password/upgrade")).status(), 401);
+    EXPECT_EQ(f.run(cookieRequest("invalid-token")).status(), 401);
+    EXPECT_EQ(f.passwordStatusCalls, 0);
+    for (const auto status : {std::optional<bool>{}, std::optional<bool>{false},
+                              std::optional<bool>{true}}) {
+        f.passwordStatus = status;
+        const auto result = f.run(cookieRequest());
+        ASSERT_EQ(result.status(), 200);
+        const auto body = json::parse(result.body()).as_object();
+        EXPECT_EQ(body.size(), 3U);
+        EXPECT_EQ(body.at("available").as_bool(), status.has_value());
+        EXPECT_EQ(body.at("needs_upgrade").as_bool(), status.value_or(false));
+        EXPECT_EQ(body.at("target_algorithm").as_string(), "argon2id");
+        EXPECT_EQ(result.headers().at("cache-control"), "no-store");
+    }
+    f.passwordStatusForeign = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 503);
+    f.passwordStatusForeign = false;
+    f.passwordStatusMissing = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 404);
     EXPECT_EQ(f.legacy.invoked, 0);
 }
 

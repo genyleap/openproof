@@ -1775,6 +1775,33 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
         complete.get();
         return std::move(value.value());
     };
+    const auto currentStatus = run(store.readPasswordUpgradeStatusAsync(
+        ids::IdentityId{seed.owner}, *passwords.value()));
+    ASSERT_TRUE(currentStatus);
+    EXPECT_EQ(currentStatus->first.value(), seed.owner);
+    ASSERT_TRUE(currentStatus->second.has_value());
+    EXPECT_FALSE(*currentStatus->second);
+    const auto absentStatus = run(store.readPasswordUpgradeStatusAsync(
+        ids::IdentityId{seed.emptyConnectionsOwner}, *passwords.value()));
+    ASSERT_TRUE(absentStatus);
+    EXPECT_FALSE(absentStatus->second.has_value());
+    EXPECT_FALSE(run(store.readPasswordUpgradeStatusAsync(
+        ids::IdentityId{seed.foreignOwner}, *passwords.value())));
+    EXPECT_FALSE(run(store.readPasswordUpgradeStatusAsync(
+        ids::IdentityId{seed.lockedOwner}, *passwords.value())));
+    if (cred::PasswordHasher::supportsArgon2id()) {
+        auto upgradeHasher = cred::PasswordHasher::create(
+            fnd::SecretString{std::string(32U, 'p')}, policy.value(), "argon2id");
+        ASSERT_TRUE(upgradeHasher);
+        auto upgradeWorker = cred::BoundedPasswordExecutor::create(
+            std::move(upgradeHasher).value(), 1U);
+        ASSERT_TRUE(upgradeWorker);
+        const auto needed = run(store.readPasswordUpgradeStatusAsync(
+            ids::IdentityId{seed.owner}, *upgradeWorker.value()));
+        ASSERT_TRUE(needed);
+        ASSERT_TRUE(needed->second.has_value());
+        EXPECT_TRUE(*needed->second);
+    }
     auto proof = [&](std::string password, std::optional<std::string> totp = std::nullopt,
                      std::optional<std::string> recovery = std::nullopt,
                      std::optional<std::string> subject = std::nullopt) {

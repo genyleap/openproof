@@ -4613,3 +4613,17 @@ configuration to the existing E2E, then removes the container and its
 anonymous volume. Use --probe-only to validate creation and cleanup
 without a built executable. This probe is not HTTP acceptance. The
 local workload is for correctness, not comparative throughput.
+
+### Native account password upgrade status
+
+When both the existing native local login and account-session pilots are
+selected, the GET /account/password/upgrade projection uses a tenant-scoped,
+owner-bound native SQL read and metadata-only password policy inspection.
+No KDF is executed, no TOTP material is queried, and no encoded hash is
+returned to HTTP. If Argon2id is not selected, the hash is not retrieved at
+all. A missing local-provider link returns unavailable=false semantics
+(available=false, needs_upgrade=false). First-party cookie authentication
+and owner echo are required; delegated OAuth and POST mutations retain
+legacy behavior. No additional feature flag or schema migration is added.
+Focused HTTP and disposable SQL regressions are included; compiled and
+real HTTP acceptance remains required before changing defaults.

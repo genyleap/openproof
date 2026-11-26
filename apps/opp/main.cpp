@@ -2881,6 +2881,18 @@ addProtectedRoutes(gateway::Router& router,
                     return reader->readTotpStatusAsync(std::move(owner), providerId);
                 };
             }
+            accountHttp::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus passwordStatusReader;
+            if (nativeLocalEnabled) {
+                if (!nativeLocalStore || !nativeLocalPasswords) {
+                    reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                        "Native password status requires local credential storage."});
+                    return ExitCode::ConfigurationError;
+                }
+                passwordStatusReader = [store = nativeLocalStore.get(), worker = nativeLocalPasswords.get()]
+                    (identity::IdentityId owner) {
+                    return store->readPasswordUpgradeStatusAsync(std::move(owner), *worker);
+                };
+            }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
                 healthApi, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
@@ -2892,7 +2904,7 @@ addProtectedRoutes(gateway::Router& router,
                 [service](identity::IdentityId owner, session::SessionId target) {
                     return service->revokeOwned(std::move(owner), std::move(target));
                 }, std::move(profileReader), std::move(connectionsReader),
-                std::move(totpStatusReader));
+                std::move(totpStatusReader), std::move(passwordStatusReader));
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
@@ -3001,6 +3013,9 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountTotpStatusEnabled) {
             nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+        }
+        if (nativeLocalEnabled && nativeAccountEnabled && platform.account().enabled()) {
+            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Get);
         }
         if (nativeAdminReadEnabled) {
             if (!nativeSessions || !nativeCanonical) {
