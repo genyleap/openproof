@@ -27,7 +27,23 @@ test("contact issuance is native in account-enabled runtime with durable reserva
 test("native delivery owns the outgoing request and compensates only its own challenge",()=>{
   const issuer=delivery.slice(delivery.indexOf("CoroutineContactVerificationIssuer::issueAsync("));
   assert.match(delivery,/co_await m_transport->sendAsync\(/);
-  assert.ok(issuer.indexOf("co_await m_reserve(")<issuer.indexOf("m_delivery->deliverAsync("));
+  assert.ok(issuer.indexOf("co_await persist(")<issuer.indexOf("m_delivery->deliverAsync("));
   assert.match(issuer,/co_await m_discard\(std::move\(id\), std::move\(owner\), purpose\)/);
   assert.match(issuer,/dispatch.reset\(\)/);
+});
+
+test("public email issuance uses native eligibility and rechecks owner before replacing a challenge",()=>{
+  const store=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  assert.match(store,/r.verification_id IS NULL AND i.status IN \(0,3\)/);
+  assert.match(store,/i.organization_id=\$4 AND o.state=0/);
+  assert.match(store,/e.external_subject=\$2 OR e.identity_id=i.id/);
+  assert.match(store,/publicOwnerSql\(challenge.purpose\(\),true\)/);
+  assert.match(store,/if \(!exactRow\(eligible,owner\)\)/);
+  const issuer=delivery.slice(delivery.indexOf("CoroutineContactVerificationIssuer::issuePublicEmailAsync("),
+    delivery.indexOf("CoroutineContactVerificationIssuer::deliverPrepared("));
+  assert.match(issuer,/if \(!owner \|\| !owner->has_value\(\)\) co_return foundation::ok\(\)/);
+  assert.match(issuer,/co_await deliverPrepared\(/);
+  assert.match(app,/contactIssuer.configurePublicEmail\(/);
+  for (const route of ["/account/email/resend","/account/password/forgot"])
+    assert.ok(app.includes('nativeMethods.emplace_back("'+route+'",gateway::HttpMethod::Post)'));
 });
