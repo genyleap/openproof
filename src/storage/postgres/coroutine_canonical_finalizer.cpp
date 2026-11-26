@@ -26,6 +26,8 @@ import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.identity.provider;
 import openproof.organization;
+import openproof.policy;
+import openproof.session;
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -658,6 +660,20 @@ CoroutinePostgresCanonicalFinalizer::readMembersAsync(core::IdentityId actor)
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
             "Native tenant membership listing is unavailable.");
     }
+}
+
+asio::awaitable<foundation::Result<policy::AuthorizationRequest>>
+CoroutinePostgresCanonicalFinalizer::readAuthorizationContextAsync(
+    session::AuthenticatedSession authenticated, core::OrganizationId tenant,
+    policy::Action action, policy::Resource resource)
+{
+    if (tenant.empty() || action.empty() || resource.empty())
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto membership = co_await readAuthorizationMembershipAsync(
+        authenticated.session().identity(), tenant);
+    if (!membership) co_return foundation::fail(membership.error());
+    co_return fromActiveMembership(authenticated, tenant, membership.value(),
+                                   std::move(action), std::move(resource));
 }
 
 asio::awaitable<foundation::Status>

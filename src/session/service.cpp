@@ -92,6 +92,16 @@ AuthenticatedSession::AuthenticatedSession(Session session)
 
 const Session& AuthenticatedSession::session() const noexcept { return m_session; }
 
+foundation::Result<AuthenticatedSession> SessionVerificationSource::acceptVerifiedSession(
+    Session verified, foundation::Instant now)
+{
+    if (verified.state() != SessionState::Active || verified.isExpiredAt(now)
+        || verified.authenticatedAt() > now) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    }
+    return AuthenticatedSession{std::move(verified)};
+}
+
 foundation::Result<AuthenticatedSession> AuthenticatedSession::fromDelegatedAccess(
     identity::core::IdentityId identity, identity::provider::ProviderId provider,
     identity::provider::AssuranceLevel assurance,

@@ -77,6 +77,7 @@ public:
 
 private:
     friend class AuthorizationRequest;
+    friend class AuthorizationContextSource;
 
     explicit AuthenticationContext(
         const authentication::VerifiedAuthentication& authentication);
@@ -151,6 +152,7 @@ public:
     [[nodiscard]] bool hasRole(const Role& role) const;
 
 private:
+    friend class AuthorizationContextSource;
     [[nodiscard]] static foundation::Result<AuthorizationRequest>
     createResolved(identity::core::IdentityId authenticatedIdentity,
                    AuthenticationContext authentication,
@@ -173,6 +175,22 @@ private:
     std::vector<Role> m_roles;
     std::vector<Permission> m_permissions;
     std::vector<Entitlement> m_entitlements;
+};
+
+/** Server-owned adapter seam for a native authoritative authorization read.
+ * Implementations must obtain an active identity, active tenant and active
+ * membership in one trusted storage snapshot before calling this helper.
+ * No public AuthorizationRequest factory accepts caller-assembled roles.
+ * The helper rechecks the subject, tenant and effective membership state.
+ */
+class AuthorizationContextSource {
+protected:
+    AuthorizationContextSource() = default;
+    [[nodiscard]] static foundation::Result<AuthorizationRequest>
+    fromActiveMembership(const session::AuthenticatedSession& authenticated,
+                         const identity::core::OrganizationId& tenant,
+                         const organization::Membership& membership,
+                         Action action, Resource resource);
 };
 
 /**
