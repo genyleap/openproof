@@ -4716,3 +4716,15 @@ denial and binding-failure burn. This test establishes the compatibility
 precondition for retiring legacy federation transport without abandoning
 in-flight browser transactions. It does not by itself authorize default
 activation of native callbacks or removal of compatibility handlers.
+
+### Native OAuth2 form_post callback
+
+Native callbacks now admit bounded application/x-www-form-urlencoded POST
+responses (including the Apple user payload), without mixing query and body
+proofs. OAuth1 remains GET-only. Duplicate parameters, malformed encoding,
+oversized inputs, alternate proof families and incomplete cookies are denied.
+The parsed credential values and decoded cookie copies are scrubbed on all
+exits. New provider-neutral callback regressions cover successful form POST,
+provider-selection independence, malformed proof rejection and replay.
+SAML assertion verification and full provider transport retirement remain
+separate work; no default cutover for federation is made by this increment.

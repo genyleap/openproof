@@ -138,7 +138,7 @@ test("both native federation HTTP legs erase raw request secrets on early denial
     ["src/authentication/http/coroutine_federated_callback_http.cpp",
      "SensitiveFederatedCallbackRequestGuard",
      "CoroutineFederatedCallbackAdapter::handleAsync(",
-     "if (request.method() != gateway::HttpMethod::Get)"],
+     "if (request.method() != gateway::HttpMethod::Get"],
   ];
   for (const [file, type, method, firstRejection] of configurations) {
     const source = cppExecutableText(fs.readFileSync(
@@ -196,4 +196,18 @@ test("native redirect proof family and ceremony purpose are checked before provi
   assert.match(callback, /proof.setParameter\("oauth_verifier"/);
   const x = fs.readFileSync(path.join(root, "src/providers/x/x.cppm"), "utf8");
   assert.match(x, /RedirectProofKind::OAuth1/);
+});
+
+test("native form post admits one bounded proof source with exact media type",()=>{
+  const source=fs.readFileSync(path.join(root,
+    "src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+  const parser=block(source,"callbackParameters(","readCookie(");
+  assert.match(parser,/request.method\(\)==gateway::HttpMethod::Post/);
+  assert.match(parser,/\*type!="application\/x-www-form-urlencoded"/);
+  assert.match(parser,/suffix.starts_with\("provider="\)/);
+  assert.match(parser,/input.size\(\)>64U\*1024U/);
+  assert.match(parser,/output.contains\(\*key\)/);
+  assert.match(source,/request.method\(\)==gateway::HttpMethod::Get\s*&& bounded\(oauthToken/);
+  assert.match(source,/CookieCopyGuard wipeContinuation\{continuation\}/);
+  assert.match(source,/CookieCopyGuard wipePrevious\{previous\}/);
 });

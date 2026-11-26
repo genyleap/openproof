@@ -117,10 +117,16 @@ void clearState(gateway::HttpResponse& response)
     output.reserve(source.size());
     for (std::size_t i = 0U; i < source.size(); ++i) {
         if (source[i] == '%') {
-            if (i + 2U >= source.size()) return std::nullopt;
+            if (i + 2U >= source.size()) {
+                foundation::secureWipe(output.data(),output.size());
+                return std::nullopt;
+            }
             const auto high = hexValue(source[i + 1U]);
             const auto low = hexValue(source[i + 2U]);
-            if (!high || !low) return std::nullopt;
+            if (!high || !low) {
+                foundation::secureWipe(output.data(),output.size());
+                return std::nullopt;
+            }
             output.push_back(static_cast<char>((*high << 4U) | *low));
             i += 2U;
         } else if (source[i] == '+') {
@@ -148,13 +154,32 @@ private:
     Parameters* m_values;
 };
 
-[[nodiscard]] std::optional<Parameters> query(const gateway::HttpRequest& request)
+[[nodiscard]] std::optional<Parameters> callbackParameters(const gateway::HttpRequest& request)
 {
     const auto target = request.target();
     const auto question = target.find('?');
-    if (question == std::string_view::npos) return std::nullopt;
-    auto input = target.substr(question + 1U);
-    if (input.empty() || input.size() > 20U * 1024U) return std::nullopt;
+    std::string_view input;
+    if (request.method()==gateway::HttpMethod::Get) {
+        if (question==std::string_view::npos || !request.body().empty()) return std::nullopt;
+        input=target.substr(question+1U);
+    } else if (request.method()==gateway::HttpMethod::Post) {
+        const auto type=request.header("content-type");
+        if (!type || (*type!="application/x-www-form-urlencoded"
+            && !type->starts_with("application/x-www-form-urlencoded;")))
+            return std::nullopt;
+        // Accept configured callback query metadata, never a second proof.
+        if (question!=std::string_view::npos) {
+            const auto suffix=target.substr(question+1U);
+            if (!suffix.starts_with("provider=") || suffix.size()<10U || suffix.size()>137U
+                || !std::ranges::all_of(suffix.substr(9U),[](char c){
+                    return (c>='a' && c<='z') || (c>='A' && c<='Z')
+                        || (c>='0' && c<='9') || c=='-' || c=='_';
+                })) return std::nullopt;
+        }
+        input=request.body();
+    } else return std::nullopt;
+    // A percent-encoded 16 KiB Apple user object can occupy 48 KiB.
+    if (input.empty() || input.size()>64U*1024U) return std::nullopt;
     Parameters output;
     SensitiveParameters wipeOnFailure{output};
     while (!input.empty()) {
@@ -164,8 +189,11 @@ private:
         if (equals == std::string_view::npos) return std::nullopt;
         auto key = decodeQuery(pair.substr(0U, equals));
         auto value = decodeQuery(pair.substr(equals + 1U));
-        if (!key || !value || key->empty() || output.contains(*key))
+        if (!key || !value || key->empty() || key->size()>128U || output.size()>=32U
+            || output.contains(*key)) {
+            if (value) foundation::secureWipe(value->data(),value->size());
             return std::nullopt;
+        }
         output.emplace(std::move(*key), std::move(*value));
         if (amp == std::string_view::npos) break;
         input.remove_prefix(amp + 1U);
@@ -335,16 +363,17 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     }
     SensitiveFederatedCallbackRequestGuard wipeRequestOnExit{request};
 
-    // OAuth2 and OAuth1 use disjoint GET proof shapes; SAML/POST remains disabled.
+    // OAuth2 query and form_post, and OAuth1 query, use disjoint proof shapes.
     // The consumed transaction selects the registered provider, never query input.
-    if (request.method() != gateway::HttpMethod::Get) {
+    if (request.method() != gateway::HttpMethod::Get
+        && request.method() != gateway::HttpMethod::Post) {
         request.wipeTargetQuery();
         request.wipeBody();
         request.wipeCookieHeader();
         co_return denied(foundation::ErrorCode::Unavailable, request);
     }
 
-    auto values = query(request);
+    auto values = callbackParameters(request);
     if (!values) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
@@ -365,7 +394,8 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
             });
     };
     const bool validProof=oauth1
-        ? bounded(oauthToken,values->end(),1024U)
+        ? request.method()==gateway::HttpMethod::Get
+            && bounded(oauthToken,values->end(),1024U)
             && bounded(oauthVerifier,values->end(),1024U)
             && code==values->end() && state==values->end() && user==values->end()
         : bounded(code,values->end(),4096U) && bounded(state,values->end(),512U)
@@ -378,6 +408,17 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
         co_return denied(foundation::ErrorCode::AuthenticationFailed, request);
     }
 
+    class CookieCopyGuard final {
+    public:
+        explicit CookieCopyGuard(std::optional<std::string>& value):m_value(value){}
+        ~CookieCopyGuard(){
+            if (m_value) foundation::secureWipe(m_value->data(),m_value->size());
+        }
+        CookieCopyGuard(const CookieCopyGuard&)=delete;
+        CookieCopyGuard& operator=(const CookieCopyGuard&)=delete;
+    private:
+        std::optional<std::string>& m_value;
+    };
     bool invalidCookie = false;
     auto continuation = readCookie(request, kContinuation, 256U, invalidCookie);
     auto bindingToken = readCookie(request, kBinding, 256U, invalidCookie);
@@ -386,6 +427,13 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto returning = readCookie(request, kReturn, 16U * 1024U, invalidCookie);
     auto mode = readCookie(request, kMode, 16U, invalidCookie);
     auto previous = readCookie(request, kSession, 128U, invalidCookie);
+    CookieCopyGuard wipeContinuation{continuation};
+    CookieCopyGuard wipeBinding{bindingToken};
+    CookieCopyGuard wipeTransaction{transaction};
+    CookieCopyGuard wipeChallenge{challenge};
+    CookieCopyGuard wipeReturn{returning};
+    CookieCopyGuard wipeMode{mode};
+    CookieCopyGuard wipePrevious{previous};
     if (invalidCookie || (mode && *mode!="link") || !continuation || !bindingToken
         || !transaction || !challenge || !returning) {
         request.wipeTargetQuery();
