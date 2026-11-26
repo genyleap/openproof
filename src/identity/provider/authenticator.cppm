@@ -252,6 +252,8 @@ protected:
     AuthenticationProvider() = default;
 };
 
+enum class RedirectProofKind { AuthorizationCode, OAuth1 };
+
 /**
  * @brief Provider-neutral optional capability for asynchronous verification.
  *
@@ -270,6 +272,11 @@ public:
     CoroutineAuthenticationProvider(const CoroutineAuthenticationProvider&) = delete;
     CoroutineAuthenticationProvider& operator=(const CoroutineAuthenticationProvider&) = delete;
     virtual ~CoroutineAuthenticationProvider() = default;
+
+    /** Native redirect providers declare the proof family they verify.
+     * Non-redirect providers do not use this capability. */
+    [[nodiscard]] virtual RedirectProofKind redirectProofKind() const noexcept
+    { return RedirectProofKind::AuthorizationCode; }
 
     [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<AuthenticationChallenge>>
     beginAuthenticationAsync(AuthenticationRequest request) = 0;

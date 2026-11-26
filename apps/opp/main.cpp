@@ -2993,16 +2993,20 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/providers");
         }
         if (nativeFederatedStartEnabled) {
-            if (!nativeAuthentication) {
+            if (!nativeAuthentication || !nativeSessions) {
                 reportStartupFailure(fnd::Error{
                     fnd::ErrorCode::FailedPrecondition,
                     "Native federated start requires a native authentication stack."});
                 return ExitCode::ConfigurationError;
             }
             asyncFederated = std::make_unique<authHttp::CoroutineFederatedStartAdapter>(
-                *nativeAuthentication, providers, limiter.value(), *nativeHandler);
+                *nativeAuthentication, providers, limiter.value(), *nativeHandler,
+                [service=nativeSessions.get()](fnd::SecretString token) {
+                    return service->authenticate(std::move(token));
+                });
             nativeHandler = asyncFederated.get();
             nativePaths.emplace_back("/auth/federated/start");
+
         }
         if (nativeFederatedCallbackEnabled) {
             if (!nativeAuthentication || !nativeSessions) {
@@ -3018,6 +3022,11 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
+        if (nativeFederatedStartEnabled) {
+            nativeMethods.emplace_back("/account/connections/start",gateway::HttpMethod::Get);
+            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get);
+            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Post);
+        }
         if (nativeAccountProfileEnabled) {
             nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
             nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Patch);

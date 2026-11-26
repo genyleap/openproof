@@ -138,7 +138,7 @@ test("both native federation HTTP legs erase raw request secrets on early denial
     ["src/authentication/http/coroutine_federated_callback_http.cpp",
      "SensitiveFederatedCallbackRequestGuard",
      "CoroutineFederatedCallbackAdapter::handleAsync(",
-     "if (request.method() != gateway::HttpMethod::Get)"],
+     "if (request.method() != gateway::HttpMethod::Get"],
   ];
   for (const [file, type, method, firstRejection] of configurations) {
     const source = cppExecutableText(fs.readFileSync(
@@ -171,4 +171,43 @@ test("both native federation HTTP legs erase raw request secrets on early denial
   assert.ok(nativeHandler.indexOf('entry.first != "provider"') <
     nativeHandler.indexOf("co_await m_authentication->beginAsync("),
     "An unsupported native ceremony must fail before its transaction is persisted");
+});
+
+test("native redirect proof family and ceremony purpose are checked before provider exchange", () => {
+  const service = cppExecutableText(fs.readFileSync(path.join(root,
+    "src/authentication/service.cpp"), "utf8"));
+  const native = block(service, "AuthenticationService::completeExchangeAsync(",
+    "AuthenticationService::requireActiveIdentity(");
+  const consume = native.indexOf("nativeTransactions->consumeAsync(");
+  const purpose = native.indexOf("isConnection != requireConnection");
+  const family = native.indexOf("native->redirectProofKind()");
+  const exchange = native.indexOf("native->completeAuthenticationAsync(");
+  assert.ok(consume >= 0 && consume < purpose && purpose < family && family < exchange,
+    "consumption must precede purpose and provider proof-family checks before exchange");
+  const sync = block(service, "AuthenticationService::completeExchange(",
+    "AuthenticationService::completeExchangeAsync(");
+  assert.ok(sync.indexOf("isConnection != requireConnection") >= 0 &&
+    sync.indexOf("isConnection != requireConnection") <
+      sync.indexOf("implementation->completeAuthentication(response)"));
+  const callback = fs.readFileSync(path.join(root,
+    "src/authentication/http/coroutine_federated_callback_http.cpp"), "utf8");
+  assert.match(callback, /code==values->end\(\) && state==values->end\(\) && user==values->end\(\)/);
+  assert.match(callback, /proof.setParameter\("oauth_token"/);
+  assert.match(callback, /proof.setParameter\("oauth_verifier"/);
+  const x = fs.readFileSync(path.join(root, "src/providers/x/x.cppm"), "utf8");
+  assert.match(x, /RedirectProofKind::OAuth1/);
+});
+
+test("native form post admits one bounded proof source with exact media type",()=>{
+  const source=fs.readFileSync(path.join(root,
+    "src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+  const parser=block(source,"callbackParameters(","readCookie(");
+  assert.match(parser,/request.method\(\)==gateway::HttpMethod::Post/);
+  assert.match(parser,/\*type!="application\/x-www-form-urlencoded"/);
+  assert.match(parser,/suffix.starts_with\("provider="\)/);
+  assert.match(parser,/input.size\(\)>64U\*1024U/);
+  assert.match(parser,/output.contains\(\*key\)/);
+  assert.match(source,/request.method\(\)==gateway::HttpMethod::Get\s*&& bounded\(oauthToken/);
+  assert.match(source,/CookieCopyGuard wipeContinuation\{continuation\}/);
+  assert.match(source,/CookieCopyGuard wipePrevious\{previous\}/);
 });

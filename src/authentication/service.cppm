@@ -399,6 +399,14 @@ public:
     [[nodiscard]] foundation::Result<BrowserConnectionTarget>
     consumeBrowserConnectionHandoff(const foundation::SecretString& ticket);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionHandoff>>
+    issueBrowserConnectionHandoffAsync(identity::core::IdentityId identity,
+        provider::ProviderId providerId, std::string returnTarget,
+        foundation::CorrelationId correlation);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
+    consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket);
+
     /**
      * @brief Issues separated publisher/redeemer credentials for mobile wallet login.
      *

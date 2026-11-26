@@ -4680,3 +4680,51 @@ linked avatar eligibility and only writes presentation columns. It does
 not rewrite verified contact fields, ownership, creation time, credentials
 or sessions. No new schema or feature flag. Missing or foreign profiles,
 invalid avatar selection and untrusted adapter owner echoes fail closed.
+
+### Native OAuth2 connection handoff
+
+The paired federation experiment now includes cookie-authenticated direct
+connection start and ticket issuance/redemption. Native transaction storage
+consumes the short-lived handoff atomically, checks its purpose, and verifies
+the active tenant-bound canonical target before starting a native connection
+proof. A link callback completes the server-bound connection transaction
+without issuing or replacing a login session. The mode cookie does not
+authorize a link; the consumed server transaction must match its purpose.
+Delegated Bearer issuance/start remain on compatibility. SAML/POST and
+OAuth1 are not migrated by this change; provider bridges are intentionally
+not removed until all relevant runtime routes are covered.
+
+### Native X OAuth1 callback and pre-provider ceremony validation
+
+Native GET callback admits exactly one proof family (OAuth2 code/state or
+OAuth1 token/verifier), rejects mixed or control-bearing values before
+dispatch, and binds OAuth1 to the registered X transaction provider.
+The coordinator checks the consumed transaction's login/link purpose
+before either synchronous or asynchronous provider invocation. Mismatched
+ceremonies still burn the proof but cannot cause an outbound exchange.
+Tests cover mismatched provider and wire shape, one-time callback, no
+legacy dispatch, and purpose rejection before provider I/O. SAML POST and
+compatibility bridges remain outside this acceptance increment.
+
+### Transaction-store cutover regression
+
+The synchronous and native PostgreSQL repositories use the same durable
+transaction and metadata tables when configured for the same database.
+The disposable PostgreSQL suite now exercises both directions of repository
+cutover, exact provider/connection/challenge metadata, cross-adapter replay
+denial and binding-failure burn. This test establishes the compatibility
+precondition for retiring legacy federation transport without abandoning
+in-flight browser transactions. It does not by itself authorize default
+activation of native callbacks or removal of compatibility handlers.
+
+### Native OAuth2 form_post callback
+
+Native callbacks now admit bounded application/x-www-form-urlencoded POST
+responses (including the Apple user payload), without mixing query and body
+proofs. OAuth1 remains GET-only. Duplicate parameters, malformed encoding,
+oversized inputs, alternate proof families and incomplete cookies are denied.
+The parsed credential values and decoded cookie copies are scrubbed on all
+exits. New provider-neutral callback regressions cover successful form POST,
+provider-selection independence, malformed proof rejection and replay.
+SAML assertion verification and full provider transport retirement remain
+separate work; no default cutover for federation is made by this increment.

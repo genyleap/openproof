@@ -117,10 +117,16 @@ void clearState(gateway::HttpResponse& response)
     output.reserve(source.size());
     for (std::size_t i = 0U; i < source.size(); ++i) {
         if (source[i] == '%') {
-            if (i + 2U >= source.size()) return std::nullopt;
+            if (i + 2U >= source.size()) {
+                foundation::secureWipe(output.data(),output.size());
+                return std::nullopt;
+            }
             const auto high = hexValue(source[i + 1U]);
             const auto low = hexValue(source[i + 2U]);
-            if (!high || !low) return std::nullopt;
+            if (!high || !low) {
+                foundation::secureWipe(output.data(),output.size());
+                return std::nullopt;
+            }
             output.push_back(static_cast<char>((*high << 4U) | *low));
             i += 2U;
         } else if (source[i] == '+') {
@@ -148,13 +154,32 @@ private:
     Parameters* m_values;
 };
 
-[[nodiscard]] std::optional<Parameters> query(const gateway::HttpRequest& request)
+[[nodiscard]] std::optional<Parameters> callbackParameters(const gateway::HttpRequest& request)
 {
     const auto target = request.target();
     const auto question = target.find('?');
-    if (question == std::string_view::npos) return std::nullopt;
-    auto input = target.substr(question + 1U);
-    if (input.empty() || input.size() > 20U * 1024U) return std::nullopt;
+    std::string_view input;
+    if (request.method()==gateway::HttpMethod::Get) {
+        if (question==std::string_view::npos || !request.body().empty()) return std::nullopt;
+        input=target.substr(question+1U);
+    } else if (request.method()==gateway::HttpMethod::Post) {
+        const auto type=request.header("content-type");
+        if (!type || (*type!="application/x-www-form-urlencoded"
+            && !type->starts_with("application/x-www-form-urlencoded;")))
+            return std::nullopt;
+        // Accept configured callback query metadata, never a second proof.
+        if (question!=std::string_view::npos) {
+            const auto suffix=target.substr(question+1U);
+            if (!suffix.starts_with("provider=") || suffix.size()<10U || suffix.size()>137U
+                || !std::ranges::all_of(suffix.substr(9U),[](char c){
+                    return (c>='a' && c<='z') || (c>='A' && c<='Z')
+                        || (c>='0' && c<='9') || c=='-' || c=='_';
+                })) return std::nullopt;
+        }
+        input=request.body();
+    } else return std::nullopt;
+    // A percent-encoded 16 KiB Apple user object can occupy 48 KiB.
+    if (input.empty() || input.size()>64U*1024U) return std::nullopt;
     Parameters output;
     SensitiveParameters wipeOnFailure{output};
     while (!input.empty()) {
@@ -164,8 +189,11 @@ private:
         if (equals == std::string_view::npos) return std::nullopt;
         auto key = decodeQuery(pair.substr(0U, equals));
         auto value = decodeQuery(pair.substr(equals + 1U));
-        if (!key || !value || key->empty() || output.contains(*key))
+        if (!key || !value || key->empty() || key->size()>128U || output.size()>=32U
+            || output.contains(*key)) {
+            if (value) foundation::secureWipe(value->data(),value->size());
             return std::nullopt;
+        }
         output.emplace(std::move(*key), std::move(*value));
         if (amp == std::string_view::npos) break;
         input.remove_prefix(amp + 1U);
@@ -227,6 +255,56 @@ private:
         });
 }
 
+[[nodiscard]] std::string encodeQueryComponent(std::string_view value)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(value.size());
+    for (const char symbol : value) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool unreserved = (byte >= 'A' && byte <= 'Z')
+            || (byte >= 'a' && byte <= 'z')
+            || (byte >= '0' && byte <= '9')
+            || byte == '-' || byte == '_' || byte == '.' || byte == '~';
+        if (unreserved) {
+            output.push_back(static_cast<char>(byte));
+        } else {
+            output.push_back('%');
+            output.push_back(hex[(byte >> 4U) & 0x0fU]);
+            output.push_back(hex[byte & 0x0fU]);
+        }
+    }
+    return output;
+}
+
+[[nodiscard]] std::string appendQueryParameter(
+    std::string target, std::string_view name, std::string_view value)
+{
+    const auto fragment = target.find('#');
+    std::string suffix;
+    if (fragment != std::string::npos) {
+        suffix = target.substr(fragment);
+        target.resize(fragment);
+    }
+    target.push_back(target.contains('?') ? '&' : '?');
+    target.append(name);
+    target.push_back('=');
+    target.append(encodeQueryComponent(value));
+    target.append(suffix);
+    return target;
+}
+
+[[nodiscard]] gateway::HttpResponse connectionDenied(
+    foundation::ErrorCode code, const gateway::HttpRequest& request, std::string target)
+{
+    auto location=appendQueryParameter(std::move(target),"op_error",foundation::errorCodeName(code));
+    location=appendQueryParameter(std::move(location),"op_request",request.correlation().value());
+    gateway::HttpResponse response{302,gateway::Headers{{"location",std::move(location)}},{}};
+    secure(response);
+    clearState(response);
+    return response;
+}
+
 [[nodiscard]] idp::ClientContext context(const gateway::HttpRequest& request)
 {
     idp::ClientContext result;
@@ -285,16 +363,17 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     }
     SensitiveFederatedCallbackRequestGuard wipeRequestOnExit{request};
 
-    // The native opt-in initially supports only OAuth2 GET redirects.
-    // SAML/POST, OAuth1 and account connection ceremonies remain disabled.
-    if (request.method() != gateway::HttpMethod::Get) {
+    // OAuth2 query and form_post, and OAuth1 query, use disjoint proof shapes.
+    // The consumed transaction selects the registered provider, never query input.
+    if (request.method() != gateway::HttpMethod::Get
+        && request.method() != gateway::HttpMethod::Post) {
         request.wipeTargetQuery();
         request.wipeBody();
         request.wipeCookieHeader();
         co_return denied(foundation::ErrorCode::Unavailable, request);
     }
 
-    auto values = query(request);
+    auto values = callbackParameters(request);
     if (!values) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
@@ -304,19 +383,42 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     const auto code = values->find("code");
     const auto state = values->find("state");
     const auto user = values->find("user");
+    const auto oauthToken=values->find("oauth_token");
+    const auto oauthVerifier=values->find("oauth_verifier");
+    const bool oauth1=oauthToken!=values->end() || oauthVerifier!=values->end();
+    const auto bounded=[](const auto& it,const auto& end,std::size_t maximum) {
+        return it!=end && !it->second.empty() && it->second.size()<=maximum
+            && std::ranges::none_of(it->second,[](char c){
+                const auto byte=static_cast<unsigned char>(c);
+                return byte<0x20U || byte==0x7FU;
+            });
+    };
+    const bool validProof=oauth1
+        ? request.method()==gateway::HttpMethod::Get
+            && bounded(oauthToken,values->end(),1024U)
+            && bounded(oauthVerifier,values->end(),1024U)
+            && code==values->end() && state==values->end() && user==values->end()
+        : bounded(code,values->end(),4096U) && bounded(state,values->end(),512U)
+            && (user==values->end() || bounded(user,values->end(),16U*1024U));
     if (values->contains("error") || values->contains("denied")
         || values->contains("SAMLResponse") || values->contains("RelayState")
-        || values->contains("oauth_token") || values->contains("oauth_verifier")
-        || code == values->end() || state == values->end()
-        || code->second.empty() || code->second.size() > 4096U
-        || state->second.empty() || state->second.size() > 512U
-        || (user != values->end() &&
-            (user->second.empty() || user->second.size() > 16U * 1024U))) {
+        || !validProof) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
         co_return denied(foundation::ErrorCode::AuthenticationFailed, request);
     }
 
+    class CookieCopyGuard final {
+    public:
+        explicit CookieCopyGuard(std::optional<std::string>& value):m_value(value){}
+        ~CookieCopyGuard(){
+            if (m_value) foundation::secureWipe(m_value->data(),m_value->size());
+        }
+        CookieCopyGuard(const CookieCopyGuard&)=delete;
+        CookieCopyGuard& operator=(const CookieCopyGuard&)=delete;
+    private:
+        std::optional<std::string>& m_value;
+    };
     bool invalidCookie = false;
     auto continuation = readCookie(request, kContinuation, 256U, invalidCookie);
     auto bindingToken = readCookie(request, kBinding, 256U, invalidCookie);
@@ -325,7 +427,14 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto returning = readCookie(request, kReturn, 16U * 1024U, invalidCookie);
     auto mode = readCookie(request, kMode, 16U, invalidCookie);
     auto previous = readCookie(request, kSession, 128U, invalidCookie);
-    if (invalidCookie || mode || !continuation || !bindingToken
+    CookieCopyGuard wipeContinuation{continuation};
+    CookieCopyGuard wipeBinding{bindingToken};
+    CookieCopyGuard wipeTransaction{transaction};
+    CookieCopyGuard wipeChallenge{challenge};
+    CookieCopyGuard wipeReturn{returning};
+    CookieCopyGuard wipeMode{mode};
+    CookieCopyGuard wipePrevious{previous};
+    if (invalidCookie || (mode && *mode!="link") || !continuation || !bindingToken
         || !transaction || !challenge || !returning) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
@@ -345,10 +454,15 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto client = context(request);
     idp::AuthenticationResponse proof{
         idp::ChallengeId{*challengeText}, client};
-    proof.setParameter("code", idp::CredentialValue{std::move(code->second)});
-    proof.setParameter("state", idp::CredentialValue{std::move(state->second)});
-    if (user != values->end())
-        proof.setParameter("user", idp::CredentialValue{std::move(user->second)});
+    if (oauth1) {
+        proof.setParameter("oauth_token",idp::CredentialValue{std::move(oauthToken->second)});
+        proof.setParameter("oauth_verifier",idp::CredentialValue{std::move(oauthVerifier->second)});
+    } else {
+        proof.setParameter("code", idp::CredentialValue{std::move(code->second)});
+        proof.setParameter("state", idp::CredentialValue{std::move(state->second)});
+        if (user != values->end())
+            proof.setParameter("user", idp::CredentialValue{std::move(user->second)});
+    }
     foundation::SecretString continuationSecret{std::move(*continuation)};
     std::optional<foundation::SecretString> previousSession;
     if (previous) previousSession.emplace(std::move(*previous));
@@ -363,6 +477,23 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     request.wipeBody();
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
+
+    if (mode) {
+        // A link callback is never a login, even if the caller tampers with
+        // the mode cookie: the coordinator consumes and checks server purpose.
+        try {
+            auto linked=co_await m_authentication->completeConnectionAsync(
+                idp::TransactionId{*transactionText},std::move(continuationSecret),
+                binding.value(),std::move(proof));
+            if (!linked) co_return connectionDenied(linked.error().code(),request,*returnTo);
+        } catch (...) {
+            co_return connectionDenied(foundation::ErrorCode::Unavailable,request,*returnTo);
+        }
+        gateway::HttpResponse response{302,gateway::Headers{{"location",*returnTo}},{}};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
 
     foundation::Result<VerifiedAuthentication> verified =
         foundation::fail(foundation::ErrorCode::Unavailable);

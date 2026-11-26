@@ -750,20 +750,20 @@ and `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1` **must be enabled
 together**. A single enabled leg is rejected during startup: otherwise
 native Start would persist a challenge in the native SQL transaction store
 and the legacy Callback would attempt to redeem it from a different store.
-The callback supports OAuth2 **GET** and uses `completeAsync`, validates
+The callback supports OAuth2 GET/form POST and X OAuth1 GET and uses `completeAsync`, validates
 server-bound transaction/binding cookies, clears browser callback state and
 uses PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic session
 replacement. Raw OAuth query credentials are scrubbed before asynchronous
 suspension. Both flags accept only `0` or `1`.
 
-**Scope limitation:** This callback supports OAuth2 authorization-code GET
-responses only. It explicitly does **not** enable SAML/POST, OAuth1 callbacks,
-provider connection ceremonies, or a native login for providers without
-`CoroutineAuthenticationProvider`. These remain on the compatibility path
-when both flags are off; when they are on, unsupported callbacks fail closed
-instead of silently executing a blocking provider on the native route.
-For mixed provider deployments, do not enable the native callback until
-every required browser flow is migrated or separately routed.
+**Scope limitation:** OAuth2 authorization-code GET/form POST and X OAuth1 GET responses
+are supported with disjoint proof shapes and provider-bound transactions.
+Cookie-authenticated account connection start and one-time browser handoff
+issuance/redemption also use the native path. Link callbacks cannot mint a
+login session. SAML and non-native providers remain unsupported by
+the experimental callback. Delegated Bearer connection initiation and
+handoff issuance still use compatibility. Do not enable the paired flags
+for mixed deployments until all required ceremonies have been validated.
 
 Do not enable either experimental flag in production until external provider,
 PostgreSQL and browser-session E2E, full C++26 build, security acceptance and
