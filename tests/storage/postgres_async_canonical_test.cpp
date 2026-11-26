@@ -1746,10 +1746,12 @@ TEST(PostgresCanonicalCoroutineTest, NativeDevicePollingCommitsThrottleAndConsum
         "VALUES($1,$2,'device-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
         "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
-    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_device_authorizations "
-        "(device_digest,user_code_digest,client_id,resource,status,issued_at_ms,expires_at_ms,poll_interval_ms) "
-        "VALUES(decode($1,'hex'),decode($2,'hex'),$3,'urn:device',0,1770000000000,1770000600000,5000)",{device,user,client}));
-    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_device_authorization_scopes(device_digest,scope) VALUES(decode($1,'hex'),'account')",{device}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'account'),($1,'read'),($1,'write')",{client}));
+    const auto resource="device-resource-"+seed.suffix;
+    const auto audience="urn:device:"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resources(id,audience,display_name,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',0,1770000000000,1770000000000)",{resource,audience}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,'read')",{resource}));
     asio::io_context io;
     pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
         ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
@@ -1766,6 +1768,26 @@ TEST(PostgresCanonicalCoroutineTest, NativeDevicePollingCommitsThrottleAndConsum
         auto done=asio::co_spawn(io,std::move(task),asio::use_future);
         io.run(); return done.get();
     };
+    const auto begin=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string digest,
+        std::string human,std::vector<std::string> scopes,std::optional<std::string> target=std::nullopt,
+        std::optional<std::string> proof=std::nullopt) {
+        return run(store.beginOAuthDeviceAsync(client,std::move(proof),std::move(digest),
+            std::move(human),std::move(scopes),std::move(target),kNow,10min,5s));
+    };
+    EXPECT_FALSE(begin(foreign,device,user,{"account"}));
+    EXPECT_FALSE(begin(native,device,user,{"account"},std::nullopt,std::string(64U,'0')));
+    EXPECT_FALSE(begin(native,device,user,{"forbidden"}));
+    EXPECT_FALSE(begin(native,device,user,{"read"})); // API scope requires target
+    EXPECT_FALSE(begin(native,device,user,{"write"},audience)); // resource excludes write
+    EXPECT_FALSE(begin(native,device,user,{"account","account"}));
+    ASSERT_TRUE(begin(native,device,user,{"account"},audience));
+    const auto duplicate=begin(native,fingerprint("-other-device"),user,{"account"});
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(),fnd::ErrorCode::Conflict);
+    const auto persisted=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_device_authorizations WHERE client_id=$1",{client});
+    ASSERT_EQ(PQntuples(persisted.get()),1);
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,0),"1");
     EXPECT_FALSE(run(attempt(foreign,"-foreign",kNow)));
     EXPECT_FALSE(run(attempt(native,"-wrong-secret",kNow,std::string(64U,'0'))));
     auto pending=run(attempt(native,"-pending",kNow));

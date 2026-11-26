@@ -2017,4 +2017,140 @@ CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync(
+    std::string clientId,std::optional<std::string> clientDigest,
+    std::string deviceDigest,std::string userDigest,std::vector<std::string> scopes,
+    std::optional<std::string> resource,foundation::Instant now,
+    foundation::Duration lifetime,foundation::Duration interval)
+{
+    using E=foundation::ErrorCode;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || !validDigest(deviceDigest)
+        || !validDigest(userDigest) || deviceDigest==userDigest
+        || (clientDigest && !validDigest(*clientDigest))
+        || scopes.empty() || scopes.size()>256U
+        || (resource && (resource->empty() || resource->size()>2048U))
+        || lifetime<=foundation::Duration::zero() || lifetime>std::chrono::hours{1}
+        || interval<=foundation::Duration::zero() || interval>=lifetime
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-lifetime.count())
+        co_return foundation::fail(E::InvalidArgument);
+    for (const auto& scope:scopes)
+        if (!client::Scope::create(scope)) co_return foundation::fail(E::InvalidArgument);
+    std::ranges::sort(scopes);
+    if (std::adjacent_find(scopes.begin(),scopes.end())!=scopes.end())
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        Params clientScopeArgs{clientId};
+        const auto permitted=co_await execute(
+            "SELECT scope FROM openproof.oauth_client_scopes WHERE client_id=$1 "
+            "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(clientScopeArgs));
+        if (permitted.rows.size()>256U) throw std::runtime_error{"Oversized client scope set"};
+        std::vector<std::string> allowed;
+        for (const auto& row:permitted.rows) {
+            if (row.size()!=1U) throw std::runtime_error{"Malformed client scope"};
+            allowed.push_back(required(row[0]));
+        }
+        if (!std::ranges::all_of(scopes,[&](const auto& scope){
+            return std::ranges::find(allowed,scope)!=allowed.end();
+        })) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto oidcOnly=[](std::string_view scope) {
+            return scope=="openid" || scope=="profile" || scope=="email"
+                || scope=="phone" || scope=="offline_access" || scope=="account";
+        };
+        if (!resource && !std::ranges::all_of(scopes,oidcOnly)) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (resource) {
+            Params resourceArgs{*resource};
+            const auto target=co_await execute(
+                "SELECT id FROM openproof.oauth_resources WHERE audience=$1 AND status=0 FOR SHARE",
+                std::move(resourceArgs));
+            if (target.rows.size()!=1U || target.rows.front().size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            Params scopeArgs{required(target.rows.front()[0])};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=$1 "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(scopeArgs));
+            if (grants.rows.size()>256U) throw std::runtime_error{"Oversized resource scope set"};
+            std::vector<std::string> resourceScopes;
+            for (const auto& row:grants.rows) {
+                if (row.size()!=1U) throw std::runtime_error{"Malformed resource scope"};
+                resourceScopes.push_back(required(row[0]));
+            }
+            if (!std::ranges::all_of(scopes,[&](const auto& scope){
+                return oidcOnly(scope) || std::ranges::find(resourceScopes,scope)!=resourceScopes.end();
+            })) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+        }
+        Params args{deviceDigest,userDigest,clientId,resource,std::to_string(now.time_since_epoch().count()),
+            std::to_string((now+lifetime).time_since_epoch().count()),std::to_string(interval.count())};
+        const auto inserted=co_await execute(
+            "INSERT INTO openproof.oauth_device_authorizations "
+            "(device_digest,user_code_digest,client_id,resource,status,issued_at_ms,expires_at_ms,poll_interval_ms) "
+            "VALUES(decode($1,'hex'),decode($2,'hex'),$3,$4,0,$5,$6,$7) "
+            "ON CONFLICT DO NOTHING RETURNING client_id",std::move(args));
+        if (inserted.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::Conflict);
+        }
+        if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U || required(inserted.rows.front()[0])!=clientId)
+            throw std::runtime_error{"Device authorization insertion mismatch"};
+        for (const auto& scope:scopes) {
+            Params scopeArgs{deviceDigest,scope};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_device_authorization_scopes(device_digest,scope) "
+                "VALUES(decode($1,'hex'),$2)",std::move(scopeArgs)));
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native device authorization is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

@@ -680,6 +680,11 @@ gateway::HttpResponse OAuthHttpApi::handle(gateway::HttpRequest request)
         request.wipeCookieHeader(); request.wipeTargetQuery();
         return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
     }
+    if (m_nativeTokenReadsRequired && path=="/oauth/device_authorization") {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
     if (request.method() == gateway::HttpMethod::Options
         && (path == "/oauth/token" || path == "/oauth/par"
             || path == "/oauth/device_authorization"

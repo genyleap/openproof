@@ -43,9 +43,14 @@ public:
     using PollDevice=std::function<boost::asio::awaitable<foundation::Result<NativeDevicePollResult>>(
         std::string,std::optional<std::string>,std::string,std::string,std::string,std::string,
         std::optional<session::DelegatedSenderConstraint>)>;
+    using BeginDevice=std::function<boost::asio::awaitable<foundation::Status>(
+        std::string,std::optional<std::string>,std::string,std::string,
+        std::vector<std::string>,std::optional<std::string>)>;
     struct DevicePollContext final {
         foundation::SecretString deviceKey;
         PollDevice poll;
+        BeginDevice begin{};
+        std::string verificationUri{};
     };
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
@@ -81,6 +86,7 @@ private:
     std::optional<CodeExchangeContext> m_codeExchange;
     IssueMachine m_issueMachine;
     std::optional<DevicePollContext> m_devicePoll;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> beginDevice(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pollDevice(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> issueMachine(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> exchangeCode(gateway::HttpRequest);

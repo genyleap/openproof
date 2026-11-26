@@ -1002,9 +1002,13 @@ Approved codes are locked and consumed in the same transaction as initial
 access/refresh family issuance, so a failed insert cannot lose approval.
 All supported token grants now have native paths; the synchronous token
 handler rejects them when native mode is required and denies unknown grants
-without synchronous authentication. Device initiation and browser approval,
-authorization/login and PAR still require separate migration and executable
-acceptance.
+without synchronous authentication. Device initiation is also native:
+the client, requested scopes and resource are validated under transaction
+locks; only HMAC fingerprints of the device and user codes are persisted.
+User code generation uses unbiased sampling and at most three attempts
+on unique-code collisions. The existing ten-minute lifetime and five-second
+poll interval are preserved. Browser approval, authorization/login and PAR
+still require separate migration and executable acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 

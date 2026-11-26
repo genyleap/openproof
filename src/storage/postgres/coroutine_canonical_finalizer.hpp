@@ -135,6 +135,12 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    beginOAuthDeviceAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string deviceDigest,std::string userDigest,std::vector<std::string> scopes,
+        std::optional<std::string> resource,foundation::Instant now,
+        foundation::Duration lifetime,foundation::Duration interval);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeDevicePollResult>>
     pollOAuthDeviceAsync(std::string clientId,std::optional<std::string> clientDigest,
         std::string deviceDigest,std::string family,std::string accessDigest,std::string refreshDigest,

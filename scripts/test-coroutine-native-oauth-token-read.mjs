@@ -211,7 +211,8 @@ test("native device polling commits throttling and atomically consumes approval 
   assert.ok(body.indexOf("co_await m_devicePoll->poll(")<body.indexOf('body.add("access_token",access.expose())'));
   for(const term of ["authorization_pending","slow_down","access_denied","expired_token","invalid_grant"])
     assert.ok(body.includes('"'+term+'"'),term);
-  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync("));
   for(const term of ["FOR SHARE OF c,a,o","if (!authenticated)",
     "WHERE device_digest=decode($1,'hex') AND client_id=$2 FOR UPDATE",
     "state==3","expires<=observed || state==2","observed-last<interval",
@@ -231,4 +232,26 @@ test("native device polling commits throttling and atomically consumes approval 
   assert.ok(guard>=0 && guard<token.indexOf("m_clients->authenticate("));
   assert.ok(token.indexOf("if (m_nativeTokenReadsRequired) {",guard)<token.indexOf("m_clients->authenticate("));
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeDevicePollingCommitsThrottleAndConsumesApprovedCodeExactlyOnce/);
+});
+test("device initiation authenticates and persists only hashed codes within bounded native transactions",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::beginDevice("),http.indexOf("CoroutineTokenReadAdapter::pollDevice("));
+  for(const term of ["input->secret=foundation::SecretString{}","256U-(256U%alphabet.size())","attempt<3U",
+    "security::hmacSha256(m_devicePoll->deviceKey,device.expose())",
+    "security::hmacSha256(m_devicePoll->deviceKey,user.expose())","co_await m_devicePoll->begin(",
+    "case E::Conflict: continue","body.add(\"device_code\",device.expose())"])
+    assert.ok(body.includes(term),term);
+  assert.ok(body.indexOf("co_await m_devicePoll->begin(")<body.indexOf('body.add("device_code",device.expose())'));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync("));
+  for(const term of ["FOR SHARE OF c,a,o","if (!authenticated)","oauth_client_scopes",
+    "std::ranges::find(allowed,scope)!=allowed.end()","!resource && !std::ranges::all_of(scopes,oidcOnly)",
+    "WHERE audience=$1 AND status=0 FOR SHARE","oauth_resource_scopes","oidcOnly(scope) ||",
+    "ON CONFLICT DO NOTHING RETURNING client_id","oauth_device_authorization_scopes"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("if (!authenticated)")<store.indexOf("INSERT INTO openproof.oauth_device_authorizations"));
+  assert.ok(store.indexOf("INSERT INTO openproof.oauth_device_authorization_scopes")<store.lastIndexOf('execute("COMMIT",{})'));
+  assert.match(app,/reader->beginOAuthDeviceAsync/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/device_authorization"\)/);
+  assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && path=="\/oauth\/device_authorization"/);
+  assert.match(read("tests/oauth_native_consent_test.cpp"),/DeviceInitiationRetriesCollisionAndReturnsOnlyCommittedCodes/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/duplicate.error\(\).code\(\),fnd::ErrorCode::Conflict/);
 });

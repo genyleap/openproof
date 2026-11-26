@@ -186,6 +186,8 @@ jobs:
           ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
           cmake --build --preset gcc-release --target openproof_admin_coroutine_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_admin_coroutine_http_tests
+          cmake --build --preset gcc-release --target openproof_admin_lifecycle_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_admin_lifecycle_http_tests
 
       # A dedicated Unix-socket PostgreSQL instance, created and destroyed
       # by the checked-in guard script, validates the new connection SQL

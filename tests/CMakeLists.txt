@@ -937,8 +937,7 @@ gtest_discover_tests(openproof_postgres_async_canonical_tests
     PROPERTIES LABELS "postgres;async;security")
 
 add_executable(openproof_admin_coroutine_http_tests
-    authentication/coroutine_admin_read_http_test.cpp
-    administration/http_test.cpp)
+    authentication/coroutine_admin_read_http_test.cpp)
 target_compile_features(openproof_admin_coroutine_http_tests PRIVATE cxx_std_26)
 set_target_properties(openproof_admin_coroutine_http_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
@@ -948,7 +947,7 @@ target_compile_definitions(openproof_admin_coroutine_http_tests PRIVATE BOOST_HA
 target_link_libraries(openproof_admin_coroutine_http_tests PRIVATE
     openproof_administration_async_http openproof_authentication_http openproof_security GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(authentication/coroutine_admin_read_http_test.cpp administration/http_test.cpp
+    set_source_files_properties(authentication/coroutine_admin_read_http_test.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
@@ -956,6 +955,29 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
 endif()
 gtest_discover_tests(openproof_admin_coroutine_http_tests
     TEST_PREFIX "NativeAdminRead." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
+
+# Keep separate translation units in isolated executables: GCC named modules
+# can emit duplicate Boost.Asio service identifiers when linked together.
+add_executable(openproof_admin_lifecycle_http_tests
+    administration/http_test.cpp)
+target_compile_features(openproof_admin_lifecycle_http_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_admin_lifecycle_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_admin_lifecycle_http_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include" "${PROJECT_SOURCE_DIR}/src/authentication/http")
+target_compile_definitions(openproof_admin_lifecycle_http_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_admin_lifecycle_http_tests PRIVATE
+    openproof_administration_async_http openproof_authentication_http openproof_security GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(administration/http_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_admin_lifecycle_http_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_admin_lifecycle_http_tests
+    TEST_PREFIX "NativeAdminLifecycle." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
 
 # Isolated native delivery regression: keep the Gateway Asio definitions

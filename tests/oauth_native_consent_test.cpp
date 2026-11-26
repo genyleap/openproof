@@ -335,6 +335,68 @@ TEST(NativeOAuthTokenReadTest, DevicePollingReturnsProtocolStatesWithoutLeakingC
     EXPECT_EQ(fallback.asyncCalls,0);
 }
 
+TEST(NativeOAuthTokenReadTest, DeviceInitiationRetriesCollisionAndReturnsOnlyCommittedCodes)
+{
+    namespace sec=openproof::security;
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    fnd::SecretString deviceKey{std::string(32U,'d')};
+    int calls=0;
+    std::string acceptedDevice,acceptedUser;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,
+        fnd::SecretString{std::string(32U,'t')},fnd::SecretString{std::string(32U,'c')},
+        {},{},{},{},{},{},{},15min,std::nullopt,{},
+        http::CoroutineTokenReadAdapter::DevicePollContext{deviceKey.clone(),{},
+            [&](std::string client,std::optional<std::string> proof,std::string device,
+                std::string user,std::vector<std::string> scopes,std::optional<std::string> resource)
+                ->asio::awaitable<fnd::Status> {
+                ++calls;
+                if (client!="fixture-client" || proof) co_return fnd::fail(fnd::ErrorCode::AuthenticationRequired);
+                if (scopes!=std::vector<std::string>{"account"}) co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                if (resource) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                EXPECT_EQ(device.size(),64U); EXPECT_EQ(user.size(),64U);
+                EXPECT_NE(device,user);
+                if (calls==1) co_return fnd::fail(fnd::ErrorCode::Conflict);
+                acceptedDevice=std::move(device); acceptedUser=std::move(user);
+                co_return fnd::ok();
+            },"https://issuer.example.invalid/oauth/device"}};
+    auto run=[&](std::string form){
+        auto input=request(gw::HttpMethod::Post,"/oauth/device_authorization",{},std::move(form));
+        EXPECT_TRUE(api.nativeEnabledFor(input));
+        asio::io_context io;
+        std::optional<gw::HttpResponse> response;
+        auto collect=[&]()->asio::awaitable<void>{response.emplace(co_await api.handleAsync(std::move(input)));};
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(response).value();
+    };
+    const auto result=run("client_id=fixture-client&scope=account");
+    ASSERT_EQ(result.status(),200);
+    EXPECT_EQ(calls,2);
+    const auto field=[&](std::string_view name){
+        const std::string marker="\""+std::string{name}+"\":\"";
+        const auto start=result.body().find(marker);
+        if (start==std::string::npos) return std::string{};
+        const auto pos=start+marker.size();
+        return result.body().substr(pos,result.body().find('"',pos)-pos);
+    };
+    const auto device=field("device_code"),user=field("user_code");
+    EXPECT_TRUE(device.starts_with("opd_"));
+    ASSERT_EQ(user.size(),9U);
+    EXPECT_EQ(user[4],'-');
+    EXPECT_EQ(fnd::toHex(sec::hmacSha256(deviceKey,device).value()),acceptedDevice);
+    EXPECT_EQ(fnd::toHex(sec::hmacSha256(deviceKey,user).value()),acceptedUser);
+    EXPECT_EQ(field("verification_uri_complete"),"https://issuer.example.invalid/oauth/device?user_code="+user);
+    EXPECT_EQ(result.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(run("client_id=wrong&scope=account").status(),401);
+    EXPECT_EQ(run("client_id=fixture-client&scope=write").status(),400);
+    EXPECT_EQ(run("client_id=fixture-client&scope=account&resource=unknown").status(),400);
+    EXPECT_EQ(run("client_id=fixture-client&scope=account&scope=account").status(),400);
+    EXPECT_EQ(calls,5);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
+
 constexpr std::string_view sessionCookie = "__Host-openproof-session=valid-token";
 constexpr std::string_view csrfCookies =
     "__Host-openproof-session=valid-token; __Host-openproof-consent-csrf=proof";

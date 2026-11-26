@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -124,6 +125,10 @@ bool codeRoute(const gateway::HttpRequest& r) noexcept {
     return grantRoute(r,"authorization_code");
 }
 constexpr std::string_view kDeviceGrant="urn:ietf:params:oauth:grant-type:device_code";
+bool beginDeviceRoute(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/oauth/device_authorization" &&
+        (r.method()==Method::Post || r.method()==Method::Options);
+}
 bool deviceRoute(const gateway::HttpRequest& r) noexcept {
     return grantRoute(r,kDeviceGrant);
 }
@@ -186,6 +191,60 @@ foundation::Result<MachineForm> machineForm(gateway::HttpRequest& r) {
     }
     MachineForm result{std::string{id->expose()},std::string{resource->expose()},
         secret?std::move(*secret):foundation::SecretString{},std::move(subject),std::move(scopes)};
+    r.wipeBody();
+    return result;
+}
+struct BeginDeviceForm final {
+    std::string clientId;
+    foundation::SecretString secret;
+    std::vector<std::string> scopes;
+    std::optional<std::string> resource;
+};
+foundation::Result<BeginDeviceForm> beginDeviceForm(gateway::HttpRequest& r) {
+    const auto type=r.header("content-type");
+    if (!type || (*type!="application/x-www-form-urlencoded" &&
+        !type->starts_with("application/x-www-form-urlencoded;"))
+        || r.body().empty() || r.body().size()>16U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    auto input=std::string_view{r.body()};
+    std::optional<foundation::SecretString> id,secret,scope,resource;
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto part=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (part.empty()) continue;
+        const auto eq=part.find('=');
+        if (eq==std::string_view::npos) return foundation::fail(E::InvalidArgument);
+        auto key=decode(part.substr(0,eq),128U);
+        if (!key) return foundation::fail(key.error());
+        const auto name=key->expose();
+        auto* dest=name=="client_id"?&id:name=="client_secret"?&secret:
+            name=="scope"?&scope:name=="resource"?&resource:nullptr;
+        if (!dest || dest->has_value()) return foundation::fail(E::InvalidArgument);
+        auto value=decode(part.substr(eq+1U),name=="scope" || name=="resource"?2048U:
+            name=="client_secret"?512U:256U);
+        if (!value) return foundation::fail(value.error());
+        dest->emplace(std::move(value).value());
+    }
+    if (!id || id->empty() || !scope || scope->empty()) return foundation::fail(E::InvalidArgument);
+    std::vector<std::string> scopes;
+    auto remaining=std::string_view{scope->expose()};
+    while (!remaining.empty()) {
+        const auto space=remaining.find(' ');
+        const auto value=remaining.substr(0,space);
+        if (space==std::string_view::npos) remaining={}; else remaining.remove_prefix(space+1U);
+        if (value.empty()) continue;
+        if (scopes.size()>=256U || !client::Scope::create(std::string{value}))
+            return foundation::fail(E::PermissionDenied);
+        scopes.emplace_back(value);
+    }
+    if (scopes.empty()) return foundation::fail(E::InvalidArgument);
+    std::ranges::sort(scopes);
+    if (std::adjacent_find(scopes.begin(),scopes.end())!=scopes.end())
+        return foundation::fail(E::PermissionDenied);
+    BeginDeviceForm result{std::string{id->expose()},
+        secret?std::move(*secret):foundation::SecretString{},std::move(scopes),
+        resource?std::optional<std::string>{std::string{resource->expose()}}:std::nullopt};
     r.wipeBody();
     return result;
 }
@@ -290,13 +349,14 @@ bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) 
     if (codeRoute(r)) return m_codeExchange && m_codeExchange->exchange && m_prepareSender;
     if (machineRoute(r)) return m_issueMachine && m_prepareSender;
     if (deviceRoute(r)) return m_devicePoll && m_devicePoll->poll && m_prepareSender;
+    if (beginDeviceRoute(r)) return m_devicePoll && m_devicePoll->begin && !m_devicePoll->verificationUri.empty();
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -316,6 +376,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (codeRoute(r)) co_return co_await exchangeCode(std::move(r));
     if (machineRoute(r)) co_return co_await issueMachine(std::move(r));
     if (deviceRoute(r)) co_return co_await pollDevice(std::move(r));
+    if (beginDeviceRoute(r)) co_return co_await beginDevice(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -612,6 +673,73 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(g
         .add("scope",joined(issued->scopes));
     if (exchange) body.add("issued_token_type",kAccessType);
     co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::beginDevice(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    const auto oauthError=[](int status,std::string_view code) {
+        foundation::JsonObjectWriter body;
+        body.add("error",code);
+        return json(status,std::move(body));
+    };
+    auto input=beginDeviceForm(r);
+    if (!input) co_return oauthError(400,input.error().code()==E::PermissionDenied?"invalid_scope":"invalid_request");
+    scrub(r);
+    std::optional<std::string> clientDigest;
+    if (!input->secret.empty()) {
+        auto digest=security::hmacSha256(m_clientKey,input->secret.expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        clientDigest.emplace(foundation::toHex(digest.value()));
+    }
+    input->secret=foundation::SecretString{};
+    // Rejection sampling avoids modulo bias in the human-entered code.
+    constexpr std::string_view alphabet="BCDFGHJKLMNPQRSTVWXYZ23456789";
+    constexpr auto limit=256U-(256U%alphabet.size());
+    for (unsigned attempt=0;attempt<3U;++attempt) {
+        auto raw=security::randomTokenBase64Url(32U);
+        if (!raw) co_return oauthError(503,"temporarily_unavailable");
+        foundation::SecretString device{std::string{"opd_"}+raw.value()};
+        foundation::secureWipe(raw->data(),raw->size());
+        std::string userText;
+        userText.reserve(9U);
+        for (unsigned batch=0;batch<4U && userText.size()<9U;++batch) {
+            auto random=security::randomBytes(16U);
+            if (!random) co_return oauthError(503,"temporarily_unavailable");
+            for (const auto byte:*random) {
+                const auto index=std::to_integer<unsigned int>(byte);
+                if (index>=limit) continue;
+                if (userText.size()==4U) userText.push_back('-');
+                userText.push_back(alphabet[index%alphabet.size()]);
+                if (userText.size()==9U) break;
+            }
+            foundation::secureWipe(random->data(),random->size());
+        }
+        foundation::SecretString user{std::move(userText)};
+        if (user.expose().size()!=9U) co_return oauthError(503,"temporarily_unavailable");
+        const auto deviceDigest=security::hmacSha256(m_devicePoll->deviceKey,device.expose());
+        const auto userDigest=security::hmacSha256(m_devicePoll->deviceKey,user.expose());
+        if (!deviceDigest || !userDigest) co_return oauthError(503,"temporarily_unavailable");
+        auto stored=co_await m_devicePoll->begin(input->clientId,clientDigest,
+            foundation::toHex(deviceDigest.value()),foundation::toHex(userDigest.value()),
+            input->scopes,input->resource);
+        if (!stored) {
+            switch (stored.error().code()) {
+            case E::Conflict: continue;
+            case E::AuthenticationRequired: co_return oauthError(401,"invalid_client");
+            case E::PermissionDenied: co_return oauthError(400,"invalid_scope");
+            case E::NotFound: co_return oauthError(400,"invalid_target");
+            case E::InvalidArgument: co_return oauthError(400,"invalid_request");
+            default: co_return oauthError(503,"temporarily_unavailable");
+            }
+        }
+        foundation::JsonObjectWriter body;
+        body.add("device_code",device.expose()).add("user_code",user.expose())
+            .add("verification_uri",m_devicePoll->verificationUri)
+            .add("verification_uri_complete",m_devicePoll->verificationUri+"?user_code="+std::string{user.expose()})
+            .add("expires_in",static_cast<std::int64_t>(600))
+            .add("interval",static_cast<std::int64_t>(5));
+        co_return json(200,std::move(body));
+    }
+    co_return oauthError(503,"temporarily_unavailable");
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::pollDevice(gateway::HttpRequest r) {
     Scrub wipe{r};
