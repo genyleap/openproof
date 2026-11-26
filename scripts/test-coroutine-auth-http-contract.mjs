@@ -20,15 +20,15 @@ const repositoryInterface =
 
 const method = (source, startToken, nextToken) => {
   const start = source.indexOf(startToken);
-  const end = source.indexOf(nextToken, start + startToken.length);
+  const end = nextToken ? source.indexOf(nextToken, start + startToken.length) : source.length;
   assert.ok(start >= 0 && end > start, "Cannot locate " + startToken);
   return source.slice(start, end);
 };
 
 test("native authentication requires the provider and every durable dependency", () => {
-  assert.match(api, /nativeProviderAuthenticationEnabled\(m_provider\)/);
-  assert.match(api, /static constexpr bool kAllAuthRoutesNative = false/);
-  assert.match(api, /return kAllAuthRoutesNative && m_asyncSessions != nullptr/);
+  assert.match(api, /nativeEnabled\(\) const noexcept override \{ return false; \}/);
+  assert.doesNotMatch(api, /SessionService|RecoveryCodeService|LocalAccountDirectory|kAllAuthRoutesNative/);
+  assert.doesNotMatch(http, /AuthenticationHttpApi::(?:login|verify|rotate|logout|issueRecoveryCodes)\s*\(/);
   const nativeRoute = method(http,
     "AuthenticationHttpApi::nativeEnabledFor(", "AuthenticationHttpApi::handleAsync(");
   const raw = read("src/authentication/http/http.cpp");
@@ -72,7 +72,7 @@ test("native login awaits trusted challenge creation", () => {
 
 test("native verification atomically replaces prior session after the proof", () => {
   const verify = method(http,
-    "AuthenticationHttpApi::verifyAsync(", "gateway::HttpResponse AuthenticationHttpApi::login(");
+    "AuthenticationHttpApi::verifyAsync(");
   assert.match(verify, /co_await\s+m_authentication->completeAsync\(/);
   assert.match(verify, /co_await\s+m_asyncSessions->issueReplacingAsync\(/);
   assert.match(verify, /clearPreauth\(output\)/);
@@ -93,7 +93,7 @@ test("provider-neutral native session port is backed by atomic SQL repository", 
     port.indexOf("class CoroutineReplacingSessionIssuer :"));
   assert.doesNotMatch(originalPort, /issueReplacingAsync\s*\(/);
   assert.match(port, /virtual\s+boost::asio::awaitable<[\s\S]*?issueReplacingAsync\(/);
-  assert.match(api, /session::CoroutineReplacingSessionIssuer\* asyncSessions/);
+  assert.match(api, /session::CoroutineReplacingSessionIssuer& sessions/);
   assert.match(repositoryInterface, /issueReplacingAsync\([\s\S]*?override/);
   const implementation = method(repository,
     "CoroutinePostgresSessionService::issueReplacingAsync(",
@@ -105,6 +105,6 @@ test("provider-neutral native session port is backed by atomic SQL repository", 
 
 test("subject continuation cookie supports the full validated base64url length", () => {
   const matches = http.match(/cookieValue\(request,\s*kSubjectCookie,\s*512U\)/g);
-  assert.equal(matches?.length, 2);
+  assert.equal(matches?.length, 1);
   assert.match(http, /value\.size\(\)\s*>\s*maximumLength/);
 });

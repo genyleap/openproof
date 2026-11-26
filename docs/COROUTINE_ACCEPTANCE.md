@@ -4731,3 +4731,19 @@ them from the library or claim a passing global HTTP authentication gate.
 Default candidate E2E exercises native proof and recovery behavior;
 only the pinned historical benchmark sets OPENPROOF_E2E_EXPECT_LEGACY_AUTH.
 Full compiled and disposable HTTP acceptance is required before release.
+
+### Removal of synchronous first-party authentication HTTP implementation
+
+AuthenticationHttpApi no longer exposes a synchronous constructor or
+login/verify/rotation/logout/recovery implementations. Its synchronous
+entry rejects its namespace and delegates only non-authentication paths.
+The native-only constructor accepts a replacing session issuer; exact
+runtime overlays dispatch session mutation and recovery to their existing
+native adapters. The static gate now requires those actual dependencies,
+mandatory pre-migration configuration checks, strict paths and absence
+of old functions/SPIs, rather than expecting the retired methods to exist.
+The in-memory password HTTP regressions now use native test ports; session
+mutation and recovery eligibility wire semantics remain covered by their
+dedicated native C++/PostgreSQL suites and default identity-platform E2E.
+The gate result is source-level evidence; compiled and runtime approval
+still require exact-head tests and benchmarks.

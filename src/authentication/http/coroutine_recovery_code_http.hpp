@@ -40,8 +40,7 @@ public:
     [[nodiscard]] bool nativeEnabledFor(
         const gateway::HttpRequest& request) const noexcept override;
 
-    // There is NO synchronous recovery-code compatibility path here. Existing
-    // AuthenticationHttpApi still owns legacy routes on their bounded workers.
+    // There is no synchronous recovery-code compatibility path.
     [[nodiscard]] gateway::HttpResponse
     handle(gateway::HttpRequest request) override;
 

@@ -192,8 +192,11 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
     assert.doesNotMatch(args, /recoveryCodes|accounts\.value\(\)/);
   }
   const authHttp = read("src/authentication/http/http.cpp");
-  assert.match(authHttp, /m_sessions\(nullptr\),\s*m_asyncSessions\(&sessions\), m_recoveryCodes\(nullptr\), m_localAccounts\(nullptr\)/);
-  assert.match(authHttp, /if \(m_sessions == nullptr\) \{\s*SensitiveAuthRequestGuard wipeRequestOnExit\{request\};\s*return error\(foundation::Error\{foundation::ErrorCode::Unavailable\},request\)/);
+  assert.match(authHttp, /m_authentication\(&authentication\), m_asyncSessions\(&sessions\)/);
+  assert.doesNotMatch(authHttp, /\b(?:m_sessions|m_recoveryCodes|m_localAccounts)\b/);
+  const sync = authHttp.slice(authHttp.indexOf("AuthenticationHttpApi::handle("),
+    authHttp.indexOf("AuthenticationHttpApi::nativeEnabledFor("));
+  assert.match(sync, /SensitiveAuthRequestGuard wipeRequestOnExit\{request\};\s*return error\(foundation::Error\{foundation::ErrorCode::Unavailable\}, request\)/);
   assert.match(app, /runWithScim\(enterpriseApi, localEnterpriseApi\)/);
   assert.match(app, /runWithScim\(enterpriseApi, localWeb3Api\)/);
   assert.match(cmake, /openproof_postgres_async_local_credentials/);
