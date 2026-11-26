@@ -2830,14 +2830,17 @@ addProtectedRoutes(gateway::Router& router,
         -> boost::asio::awaitable<fnd::Result<session::Session>> {
         if (!nativeSessions || !nativeCanonical)
             co_return fnd::fail(fnd::ErrorCode::Unavailable);
-        auto authenticated=co_await nativeSessions->authenticate(credential.clone());
-        if (authenticated || !nativeWeb3DelegatedKey)
-            co_return std::move(authenticated);
+        if (!nativeWeb3DelegatedKey)
+            co_return co_await nativeSessions->authenticate(std::move(credential));
         if (credential.empty() || credential.expose().size()>256U)
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        // Compute the delegated digest before suspension. The session verifier
+        // consumes the raw credential synchronously before its own SQL await.
         auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
-        credential=fnd::SecretString{};
         if (!fingerprint) co_return fnd::fail(fingerprint.error());
+        auto authenticated=co_await nativeSessions->authenticate(std::move(credential));
+        if (authenticated || authenticated.error().code()!=fnd::ErrorCode::AuthenticationFailed)
+            co_return std::move(authenticated);
         // The native SQL adapter receives only the keyed digest.
         co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
             fnd::toHex(fingerprint.value()),clock.now());
@@ -3012,7 +3015,8 @@ addProtectedRoutes(gateway::Router& router,
                     return service->revokeOwned(std::move(owner), std::move(target));
                 }, std::move(profileReader), std::move(connectionsReader),
                 std::move(totpStatusReader), std::move(passwordStatusReader),
-                std::move(passwordUpgradeConfirm), std::move(profileWriter));
+                std::move(passwordUpgradeConfirm), std::move(profileWriter),
+                authenticateNativeWeb3);
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");

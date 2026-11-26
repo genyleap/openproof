@@ -728,10 +728,14 @@ The response retains the established JSON `connections` array, including
 numeric Farcaster `fid` and `profile_url` fields. No identity, provider
 connection, or authentication transaction is created by the read.
 
-**Compatibility:** OAuth delegated Bearer grants for this endpoint continue
-to use the existing bounded synchronous compatibility worker; the new native
-reader cannot authenticate those grants. Non-GET connection routes remain on
-legacy compatibility handlers. Do not enable the feature in production until
+When native account profile or connections reads are enabled, explicit
+Bearer credentials use the native account-scoped verifier. It checks the
+first-party session first, only tries delegated OAuth after an authentication
+failure, and requires an active, tenant-bound grant with the account scope.
+Sender-constrained tokens are rejected because these routes have no proof
+verification boundary. Cookie-only reads retain first-party verification;
+session and credential mutations do not use the new read verifier.
+Non-GET connection routes are unaffected. Do not enable the feature in production until
 GCC16/CTest and disposable PostgreSQL HTTP E2E have passed, followed by the
 usual global Coroutine migration release gate.
 

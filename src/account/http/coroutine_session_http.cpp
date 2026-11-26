@@ -218,7 +218,8 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
     ReadProfile readProfile, ReadConnections readConnections,
     ReadTotpStatus readTotpStatus, ReadPasswordUpgradeStatus readPasswordUpgradeStatus,
-    ConfirmPasswordUpgrade confirmPasswordUpgrade, UpdateProfile updateProfile)
+    ConfirmPasswordUpgrade confirmPasswordUpgrade, UpdateProfile updateProfile,
+    Authenticate authenticateReadBearer)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
@@ -227,7 +228,8 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
       m_readTotpStatus(std::move(readTotpStatus)),
       m_readPasswordUpgradeStatus(std::move(readPasswordUpgradeStatus)),
       m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade)),
-      m_updateProfile(std::move(updateProfile))
+      m_updateProfile(std::move(updateProfile)),
+      m_authenticateReadBearer(std::move(authenticateReadBearer))
 {
 }
 
@@ -245,11 +247,9 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return m_asyncFallback->nativeEnabledFor(request);
     }
     if (profileReadRoute(request)) {
-        // Legacy AccountHttpApi also accepts delegated OAuth Bearer grants.
-        // Native PostgreSQL session authentication supports first-party
-        // sessions only. Preserve delegated OAuth semantics on the bounded
-        // compatibility worker; do not misclassify Bearer as a session.
-        return !request.header("authorization").has_value()
+        // A separately injected account-scoped verifier admits Bearer reads.
+        // Without it, preserve the standalone adapter's cookie-only contract.
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readProfile);
     }
@@ -258,9 +258,7 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
             && static_cast<bool>(m_authenticate) && static_cast<bool>(m_updateProfile);
     }
     if (connectionsReadRoute(request)) {
-        // Delegated OAuth Bearer grants are still authenticated only by the
-        // compatibility route; native reads accept first-party cookies.
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readConnections);
     }
@@ -438,15 +436,18 @@ CoroutineAccountSessionAdapter::profileRead(gateway::HttpRequest request)
     if (!m_limiter->allow(rateKey)) {
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+    const auto& authenticate = request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value()) {
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
     }
-    // Never authorize a read based only on the requested identity or a
-    // caller-supplied HTTP parameter. The owner must come from the verified
-    // native session and the repository must independently verify tenancy.
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    // Never authorize a read from a caller-supplied identity. The selected
+    // verifier must authenticate the owner before the tenant-scoped lookup.
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto value = co_await m_readProfile(authenticated->identity());
     if (!value) co_return fail(value.error(), request);
@@ -478,12 +479,16 @@ CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+    const auto& authenticate = request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value())
         co_return fail(foundation::Error{
             foundation::ErrorCode::AuthenticationRequired}, request);
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto connections = co_await m_readConnections(authenticated->identity());
     if (!connections) co_return fail(connections.error(), request);

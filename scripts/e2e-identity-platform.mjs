@@ -1544,6 +1544,25 @@ async function main() {
       headers: { authorization: `Bearer ${profileOnlyTokens.access_token}` },
     });
     expectStatus(accountWithoutScope, 403);
+    const connectionsWithoutScope = await edgeRequest("/account/connections", {
+      headers: { authorization: `Bearer ${profileOnlyTokens.access_token}` },
+    });
+    expectStatus(connectionsWithoutScope, 403);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE === "1"
+        && process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"
+        && process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1") {
+      for (const route of ["/account/profile", "/account/connections"]) {
+        const proofWithoutVerifier = await edgeRequest(route, {
+          headers: { authorization: `DPoP ${nativeTokens.access_token}` },
+        });
+        expectStatus(proofWithoutVerifier, 401);
+        const ambiguous = await edgeRequest(route, {
+          jar: ownerJar,
+          headers: { authorization: `Bearer ${nativeTokens.access_token}` },
+        });
+        expectStatus(ambiguous, 401);
+      }
+    }
 
     const firstTokens = await authorizeAndExchange(clientId, clientSecret, ownerJar, initialJwks);
     assert.equal(firstTokens.idHeader.kid, "e2e-old");

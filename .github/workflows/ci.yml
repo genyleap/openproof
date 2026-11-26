@@ -11,10 +11,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Preserve an in-flight full benchmark/E2E on the experimental branch;
-  # otherwise each small follow-up commit cancels its only complete data set.
+  # Preserve a running full build/benchmark on the consolidated migration PR.
+  # A newer head still needs its own successful run; don't discard the only
+  # completed diagnostic data set whenever another migration patch lands.
   # Mainline and ordinary PRs still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' && github.head_ref != 'integration/native-runtime-schema-20261126' && github.ref != 'refs/heads/integration/native-runtime-schema-20261126' }}
 
 jobs:
   static:

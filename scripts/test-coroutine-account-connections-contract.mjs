@@ -45,7 +45,7 @@ test("HTTP validates session and repository owner before disclosure", () => {
   const start = native.indexOf("CoroutineAccountSessionAdapter::connectionsRead(");
   assert.ok(start > 0);
   const body = native.slice(start);
-  const auth = body.indexOf("co_await m_authenticate(std::move(credential->value()))");
+  const auth = body.indexOf("co_await authenticate(std::move(credential->value()))");
   const readIndex = body.indexOf("co_await m_readConnections(authenticated->identity())");
   const validate = body.indexOf("connections->first != authenticated->identity()");
   const serialize = body.indexOf("json::array connectionsJson;");

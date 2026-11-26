@@ -70,7 +70,8 @@ public:
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
         ReadProfile readProfile = {}, ReadConnections readConnections = {},
         ReadTotpStatus readTotpStatus = {}, ReadPasswordUpgradeStatus readPasswordUpgradeStatus = {},
-        ConfirmPasswordUpgrade confirmPasswordUpgrade = {}, UpdateProfile updateProfile = {});
+        ConfirmPasswordUpgrade confirmPasswordUpgrade = {}, UpdateProfile updateProfile = {},
+        Authenticate authenticateReadBearer = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -111,6 +112,8 @@ private:
     ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
     ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
     UpdateProfile m_updateProfile;
+    // Only profile/connection reads may use this scoped bearer verifier.
+    Authenticate m_authenticateReadBearer;
 };
 
 /** Native contact challenge issuance, independent of session-list opt-ins.
