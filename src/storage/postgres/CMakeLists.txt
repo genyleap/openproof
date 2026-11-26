@@ -209,7 +209,8 @@ endif()
 # libpq pool. This is an opt-in adapter for pre-linked identities; production
 # HTTP composition is unchanged until integration acceptance passes.
 add_library(openproof_postgres_async_canonical STATIC
-    coroutine_canonical_finalizer.cpp)
+    coroutine_canonical_finalizer.cpp
+    coroutine_authorization_audit.cpp)
 target_compile_features(openproof_postgres_async_canonical PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_canonical PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -221,10 +222,11 @@ target_link_libraries(openproof_postgres_async_canonical PUBLIC
     openproof_postgres_async_io openproof_authentication
     openproof_identity_core openproof_identity_provider
     openproof_identity_profile openproof_organization openproof_policy openproof_session
+    openproof_audit openproof_security
     openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(coroutine_canonical_finalizer.cpp
+    set_source_files_properties(coroutine_canonical_finalizer.cpp coroutine_authorization_audit.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 
