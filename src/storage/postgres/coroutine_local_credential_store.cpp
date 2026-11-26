@@ -1,0 +1,189 @@
+#include "async_pool.hpp"
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+#include "coroutine_local_credential_store.hpp"
+
+namespace openproof::storage::postgres {
+namespace asio = boost::asio;
+namespace core = identity::core;
+namespace idp = identity::provider;
+namespace {
+using Clock = std::chrono::steady_clock;
+using Params = std::vector<std::optional<std::string>>;
+
+bool bounded(std::string_view value, std::size_t limit)
+{
+    return !value.empty() && value.size() <= limit
+        && value.find('\0') == std::string_view::npos;
+}
+bool decimal(std::string_view value)
+{
+    std::uint64_t parsed{};
+    const auto [end, error] = std::from_chars(value.data(), value.data()+value.size(), parsed);
+    return error == std::errc{} && end == value.data()+value.size()
+        && parsed <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+}
+bool valid(const LocalCredentialSnapshot& value)
+{
+    if (!bounded(value.owner.value(), 200U) || !bounded(value.passwordHash, 4096U)
+        || !decimal(value.passwordChangedAt)) return false;
+    if (!value.encryptedTotpHex)
+        return !value.keyVersion && !value.lastAcceptedStep && !value.totpEnrolledAt;
+    if (!bounded(*value.encryptedTotpHex, 4096U)
+        || value.encryptedTotpHex->size() % 2U != 0U
+        || !value.keyVersion || !decimal(*value.keyVersion) || *value.keyVersion == "0"
+        || !value.totpEnrolledAt || !decimal(*value.totpEnrolledAt)
+        || (value.lastAcceptedStep && !decimal(*value.lastAcceptedStep))) return false;
+    for (char c : *value.encryptedTotpHex)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+foundation::Duration remaining(Clock::time_point deadline)
+{
+    const auto left = std::chrono::duration_cast<foundation::Duration>(deadline - Clock::now());
+    if (left <= foundation::Duration::zero()) throw std::runtime_error{"Credential SQL deadline"};
+    return left;
+}
+foundation::Status confirmed(const async_detail::QueryRows& result, std::string_view owner)
+{
+    if (result.rows.empty())
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    if (result.rows.size() != 1U || result.rows.front().size() != 1U
+        || !result.rows.front().front() || *result.rows.front().front() != owner)
+        return foundation::fail(foundation::ErrorCode::Unavailable);
+    return foundation::ok();
+}
+constexpr std::string_view kUnavailable = "Native credential storage is unavailable.";
+}
+
+class CoroutineLocalCredentialStore::Impl final {
+public:
+    Impl(asio::any_io_executor executor, foundation::SecretString dsn,
+        core::OrganizationId organization, idp::ProviderId providerValue, std::size_t capacity,
+        foundation::Duration acquireTimeout, foundation::Duration connectTimeout,
+        foundation::Duration timeout)
+        : pool(std::move(executor), std::string{dsn.expose()}, capacity, acquireTimeout,
+               connectTimeout), tenant(std::move(organization)), provider(std::move(providerValue)),
+          queryTimeout(timeout)
+    {
+        if (!bounded(tenant.value(), 200U) || !bounded(provider.value(), 200U)
+            || queryTimeout <= foundation::Duration::zero())
+            throw std::invalid_argument{"Invalid native credential store configuration"};
+    }
+    async_detail::AsyncConnectionPool pool;
+    core::OrganizationId tenant;
+    idp::ProviderId provider;
+    foundation::Duration queryTimeout;
+};
+
+CoroutineLocalCredentialStore::CoroutineLocalCredentialStore(asio::any_io_executor executor,
+    foundation::SecretString connectionString, core::OrganizationId tenant,
+    idp::ProviderId provider, std::size_t capacity, foundation::Duration acquireTimeout,
+    foundation::Duration connectTimeout, foundation::Duration queryTimeout)
+    : m_impl(std::make_unique<Impl>(std::move(executor), std::move(connectionString),
+        std::move(tenant), std::move(provider), capacity, acquireTimeout, connectTimeout, queryTimeout))
+{}
+CoroutineLocalCredentialStore::~CoroutineLocalCredentialStore() = default;
+
+asio::awaitable<foundation::Result<std::optional<LocalCredentialSnapshot>>>
+CoroutineLocalCredentialStore::readAsync(idp::ExternalSubject subject)
+{
+    if (!bounded(subject.value(), 1000U))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{m_impl->provider.value()}, std::string{subject.value()},
+                      std::string{m_impl->tenant.value()}};
+        const auto result = co_await lease.connection().query(
+            "SELECT i.id,p.password_hash,CASE WHEN octet_length(t.encrypted_seed)>2048 "
+            "THEN '!' ELSE encode(t.encrypted_seed,'hex') END,t.key_version::text,"
+            "t.last_accepted_step::text,p.changed_at_ms::text,t.enrolled_at_ms::text "
+            "FROM openproof.external_identities e "
+            "JOIN openproof.identities i ON i.id=e.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "LEFT JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+            "WHERE e.provider=$1 AND e.external_subject=$2 AND i.organization_id=$3 "
+            "AND i.status=0 AND o.state=0 LIMIT 2", std::move(params), remaining(deadline));
+        if (result.rows.empty()) co_return std::optional<LocalCredentialSnapshot>{};
+        if (result.rows.size() != 1U || result.rows.front().size() != 7U)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        const auto& row = result.rows.front();
+        if (!row[0] || !row[1] || !row[5])
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        LocalCredentialSnapshot snapshot{core::IdentityId{*row[0]}, *row[1], row[2],
+            row[3], row[4], *row[5], row[6]};
+        if (!valid(snapshot)) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return std::optional<LocalCredentialSnapshot>{std::move(snapshot)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
+asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::confirmPasswordOnlyAsync(
+    idp::ExternalSubject subject, LocalCredentialSnapshot snapshot)
+{
+    if (!bounded(subject.value(), 1000U) || !valid(snapshot) || snapshot.encryptedTotpHex)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{snapshot.owner.value()}, snapshot.passwordHash,
+            snapshot.passwordChangedAt, std::string{m_impl->provider.value()},
+            std::string{subject.value()}, std::string{m_impl->tenant.value()}};
+        const auto result = co_await lease.connection().query(
+            "SELECT i.id FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "WHERE i.id=$1 AND p.password_hash=$2 AND p.changed_at_ms=$3::bigint "
+            "AND e.provider=$4 AND e.external_subject=$5 AND i.organization_id=$6 "
+            "AND i.status=0 AND o.state=0 AND NOT EXISTS "
+            "(SELECT 1 FROM openproof.totp_credentials t WHERE t.identity_id=i.id)",
+            std::move(params), remaining(deadline));
+        co_return confirmed(result, snapshot.owner.value());
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
+asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::consumeTotpAsync(
+    idp::ExternalSubject subject, LocalCredentialSnapshot snapshot, std::uint64_t step)
+{
+    if (!bounded(subject.value(), 1000U) || !valid(snapshot) || !snapshot.encryptedTotpHex
+        || step > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{snapshot.owner.value()}, snapshot.passwordHash,
+            snapshot.passwordChangedAt, std::string{m_impl->provider.value()},
+            std::string{subject.value()}, std::string{m_impl->tenant.value()},
+            snapshot.encryptedTotpHex, snapshot.keyVersion, snapshot.totpEnrolledAt,
+            std::to_string(step)};
+        const auto result = co_await lease.connection().query(
+            "UPDATE openproof.totp_credentials t SET last_accepted_step=$10::bigint "
+            "WHERE t.identity_id=$1 AND t.encrypted_seed=decode($7,'hex') "
+            "AND t.key_version=$8::integer AND t.enrolled_at_ms=$9::bigint "
+            "AND (t.last_accepted_step IS NULL OR t.last_accepted_step<$10::bigint) "
+            "AND EXISTS (SELECT 1 FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "WHERE i.id=t.identity_id AND p.password_hash=$2 AND p.changed_at_ms=$3::bigint "
+            "AND e.provider=$4 AND e.external_subject=$5 AND i.organization_id=$6 "
+            "AND i.status=0 AND o.state=0) RETURNING t.identity_id",
+            std::move(params), remaining(deadline));
+        co_return confirmed(result, snapshot.owner.value());
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
+    }
+}
+
+}

@@ -29,6 +29,7 @@
 #include "coroutine_session_authenticator.hpp"
 #include "coroutine_authorization_audit.hpp"
 #include "coroutine_verification_challenge_store.hpp"
+#include "coroutine_local_credential_store.hpp"
 
 import openproof.account;
 import openproof.authentication;
@@ -1502,6 +1503,107 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     auto untagged = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{"legacy-id"});
     EXPECT_TRUE(untagged && untagged->has_value() && untagged->value() == ownerId);
     ASSERT_TRUE(legacy.releaseSubject(external, ownerId));
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndTotpReplay)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    // These are opaque test markers, not actual password hashes or TOTP keys.
+    // The storage adapter must not perform cryptographic verification.
+    for (const auto& owner : {seed.owner, seed.foreignOwner, seed.lockedOwner, seed.suspendedOwner}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES($1,'fixture-hash',1770000000000)", {owner})));
+    }
+    asio::io_context io;
+    const idp::ProviderId provider{"native-canonical-provider"};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, provider, 2U, 500ms, 1000ms, 3000ms};
+    pg::CoroutineLocalCredentialStore foreign{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg}, provider, 1U, 500ms, 1000ms, 3000ms};
+    pg::CoroutineLocalCredentialStore suspended{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.suspendedOrg}, provider, 1U, 500ms, 1000ms, 3000ms};
+    auto run = [&]<typename T>(asio::awaitable<T> pending) {
+        io.restart();
+        auto complete = asio::co_spawn(io, std::move(pending), asio::use_future);
+        io.run();
+        return complete.get();
+    };
+    const idp::ExternalSubject subject{seed.subject};
+    auto initial = run(store.readAsync(subject));
+    ASSERT_TRUE(initial && initial->has_value());
+    EXPECT_EQ(initial->value().owner, ids::IdentityId{seed.owner});
+    EXPECT_EQ(initial->value().passwordHash, "fixture-hash");
+    EXPECT_FALSE(initial->value().encryptedTotpHex);
+    EXPECT_TRUE(run(store.confirmPasswordOnlyAsync(subject, initial->value())));
+    EXPECT_FALSE(run(foreign.confirmPasswordOnlyAsync(subject, initial->value())));
+    for (const auto& missing : {seed.foreignSubject, seed.lockedSubject, seed.unlinkedSubject}) {
+        auto result = run(store.readAsync(idp::ExternalSubject{missing}));
+        ASSERT_TRUE(result);
+        EXPECT_FALSE(result->has_value());
+    }
+    auto disabled = run(suspended.readAsync(idp::ExternalSubject{seed.suspendedSubject}));
+    ASSERT_TRUE(disabled);
+    EXPECT_FALSE(disabled->has_value());
+
+    // Password generation changes invalidate an in-flight verification.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.password_credentials SET password_hash='replacement-hash',"
+        "changed_at_ms=1770000000001 WHERE identity_id=$1", {seed.owner})));
+    EXPECT_FALSE(run(store.confirmPasswordOnlyAsync(subject, initial->value())));
+    auto current = run(store.readAsync(subject));
+    ASSERT_TRUE(current && current->has_value());
+    EXPECT_TRUE(run(store.confirmPasswordOnlyAsync(subject, current->value())));
+
+    // An MFA enrollment between reading and confirming a password must
+    // not result in a password-only success.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,enrolled_at_ms) "
+        "VALUES($1,decode('010203','hex'),1,1770000000002)", {seed.owner})));
+    EXPECT_FALSE(run(store.confirmPasswordOnlyAsync(subject, current->value())));
+    auto mfa = run(store.readAsync(subject));
+    ASSERT_TRUE(mfa && mfa->has_value());
+    ASSERT_TRUE(mfa->value().encryptedTotpHex);
+    EXPECT_EQ(*mfa->value().encryptedTotpHex, "010203");
+    EXPECT_FALSE(run(store.confirmPasswordOnlyAsync(subject, mfa->value())));
+    EXPECT_FALSE(run(foreign.consumeTotpAsync(subject, mfa->value(), 100U)));
+
+    // Two independent native SQL leases race for the same verified step.
+    io.restart();
+    auto first = asio::co_spawn(io, store.consumeTotpAsync(subject, mfa->value(), 100U), asio::use_future);
+    auto second = asio::co_spawn(io, store.consumeTotpAsync(subject, mfa->value(), 100U), asio::use_future);
+    io.run();
+    const auto one = first.get();
+    const auto two = second.get();
+    EXPECT_NE(static_cast<bool>(one), static_cast<bool>(two));
+    EXPECT_FALSE(run(store.consumeTotpAsync(subject, mfa->value(), 99U)));
+    EXPECT_TRUE(run(store.consumeTotpAsync(subject, mfa->value(), 101U)));
+
+    // Re-enrollment changes the exact credential generation, even if the
+    // encrypted bytes are unchanged. A stale snapshot must not consume it.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.totp_credentials SET enrolled_at_ms=1770000000003,"
+        "last_accepted_step=NULL WHERE identity_id=$1", {seed.owner})));
+    EXPECT_FALSE(run(store.consumeTotpAsync(subject, mfa->value(), 102U)));
+    auto renewed = run(store.readAsync(subject));
+    ASSERT_TRUE(renewed && renewed->has_value());
+    EXPECT_TRUE(run(store.consumeTotpAsync(subject, renewed->value(), 102U)));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.identities SET status=2 WHERE id=$1", {seed.owner})));
+    EXPECT_FALSE(run(store.consumeTotpAsync(subject, renewed->value(), 103U)));
+    auto locked = run(store.readAsync(subject));
+    ASSERT_TRUE(locked);
+    EXPECT_FALSE(locked->has_value());
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)

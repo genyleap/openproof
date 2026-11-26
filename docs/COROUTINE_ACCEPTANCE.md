@@ -4495,3 +4495,23 @@ with both native start/callback switches required together.
 - The strict coroutine static gate remains **NOT_APPROVED** with **17
   findings** and **14/25 areas passing**. The synchronous legacy PostgreSQL,
   provider and HTTP facades still need separate, real nonblocking retirement.
+
+
+### Native local credential storage checkpoint
+
+The native local credential store reads the exact linked active identity,
+tenant, encoded password hash and optional encrypted TOTP generation from
+bounded asynchronous PostgreSQL. It confirms a password-only snapshot
+against the current hash and change timestamp and rejects an intervening
+TOTP enrollment. The TOTP consumption statement compares the password and
+TOTP generation (ciphertext, key version, enrollment timestamp), owner,
+provider, subject and tenant, then atomically advances the replay step.
+
+This is a storage primitive, not an authenticated identity or a complete
+local login implementation. Cryptographic verification, bounded CPU
+admission, recovery-code consumption, password rehash and canonical
+completion/session issuance must be composed before native HTTP activation.
+The dedicated disposable PostgreSQL tests exercise tenant/lifecycle
+isolation, stale credentials, intervening MFA enrollment, concurrent
+same-step consumption and re-enrollment. No runtime route switches changed.
+The full PostgreSQL and authentication coverage gates remain NOT_APPROVED.
