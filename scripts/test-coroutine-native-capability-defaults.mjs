@@ -91,7 +91,7 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   assert.match(app, /nativePaths.emplace_back\("\/account\/sessions"\)/);
   assert.match(app, /nativePaths.emplace_back\("\/account\/sessions\/revoke"\)/);
   assert.match(app, /runListener\(platform, nativeRoutes, logger\)/);
-  assert.match(app, /runWithEvidence\(enterpriseApi, enterpriseApi\)/);
+  assert.match(app, /runWithEvidence\(fallback,localEnterpriseApi\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnreadySecrets\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler\)/);
 });
@@ -206,14 +206,18 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   assert.ok(flag < app.indexOf("postgres::Migrator migrator{*pool.value()}", flag));
   assert.match(app, /BoundedPasswordExecutor::create\(std::move\(hasher\)\.value\(\), 1U\)/);
   assert.match(app, /nativeLocalProviders->registerProvider\(\s*std::make_unique<local::CoroutineLocalAuthenticationProvider>/);
+  assert.match(app, /catalogStatus=providers.registerProvider\(\s*std::make_unique<local::CoroutineLocalAuthenticationProvider>/);
+  assert.doesNotMatch(app, /\bpostgres::(?:PostgresLocalAccountDirectory::create|PostgresSessionRepository\s+\w+\s*\{|PostgresAuthenticationTransactionStore\s+\w+\s*\{|PostgresRecoveryCodeRepository\s+\w+\s*\{)/);
+  assert.doesNotMatch(app, /\b(?:auth::AuthenticationService authentication|local::LocalAuthenticationProvider\s+\w+)\s*\{/);
+  assert.doesNotMatch(app, /std::make_unique<local::LocalAuthenticationProvider>/);
   assert.match(app, /\*nativeLocalProviders, \*nativeTransactions, externalIdentities, clock/);
   assert.match(app, /nativeLocalAuthentication->nativeProviderAuthenticationEnabled\(providerId\)/);
   assert.match(app, /if \(nativeLocalEnabled\) \{\s*nativePaths\.emplace_back\("\/auth\/login"\);\s*nativePaths\.emplace_back\("\/auth\/mfa\/verify"\);\s*\}/);
-  assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication, \*nativeSessions,\s*limiter\.value\(\), providerId, fallback\}/);
+  assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication,\*nativeSessions,limiter\.value\(\),providerId,fallback\}/);
   const constructors = [...app.matchAll(/authHttp::AuthenticationHttpApi \w+\{([\s\S]*?)\};/g)];
-  assert.equal(constructors.length, 3);
+  assert.equal(constructors.length, 1);
   for (const [, args] of constructors) {
-    assert.match(args, /^\s*\*nativeLocalAuthentication, \*nativeSessions,/);
+    assert.match(args, /^\s*\*nativeLocalAuthentication,\s*\*nativeSessions,/);
     assert.doesNotMatch(args, /recoveryCodes|accounts\.value\(\)/);
   }
   const authHttp = read("src/authentication/http/http.cpp");
@@ -222,8 +226,8 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   const sync = authHttp.slice(authHttp.indexOf("AuthenticationHttpApi::handle("),
     authHttp.indexOf("AuthenticationHttpApi::nativeEnabledFor("));
   assert.match(sync, /SensitiveAuthRequestGuard wipeRequestOnExit\{request\};\s*return error\(foundation::Error\{foundation::ErrorCode::Unavailable\}, request\)/);
-  assert.match(app, /runWithEvidence\(enterpriseApi, localEnterpriseApi\)/);
-  assert.match(app, /runWithEvidence\(enterpriseApi, localWeb3Api\)/);
+  assert.match(app, /runWithEvidence\(fallback,localEnterpriseApi\)/);
+  assert.match(app, /runWithEvidence\(fallback,localWeb3Api\)/);
   assert.match(cmake, /openproof_postgres_async_local_credentials/);
 });
 

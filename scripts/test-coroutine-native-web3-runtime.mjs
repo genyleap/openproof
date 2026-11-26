@@ -35,9 +35,9 @@ test("Web3 login gets async transaction, canonical and session services without 
   assert.match(runtime, /CoroutinePostgresAuthenticationTransactionStore/);
   assert.match(runtime, /CoroutinePostgresCanonicalFinalizer/);
   assert.match(runtime, /nativeCanonical\.get\(\)/);
-  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, limiter\.value\(\),\s*enterpriseApi, \*nativeSessions,\s*authenticateNativeWeb3\}/);
-  assert.match(app, /runWithEvidence\(enterpriseApi, nativeWeb3Api\)/);
-  assert.match(app, /runWithEvidence\(enterpriseApi, enterpriseApi\)/);
+  assert.match(app, /authHttp::Web3AuthenticationHttpApi localWeb3Api\{\s*\*nativeAuthentication,providers,limiter\.value\(\),\s*localEnterpriseApi,\*nativeSessions,authenticateNativeWeb3\}/);
+  assert.match(app, /runWithEvidence\(fallback,localWeb3Api\)/);
+  assert.match(app, /runWithEvidence\(fallback,localEnterpriseApi\)/);
 });
 
 test("native route overlay has exact opt-in path gates, never implicit LDAP or Account activation", () => {

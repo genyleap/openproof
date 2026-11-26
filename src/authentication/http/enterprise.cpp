@@ -199,12 +199,17 @@ private:
 } // namespace
 
 EnterpriseAuthenticationHttpApi::EnterpriseAuthenticationHttpApi(
-    AuthenticationService& authentication, session::SessionService& sessions,
+    AuthenticationService& authentication, session::SessionService&,
     gateway::TokenBucketRateLimiter& rateLimiter, gateway::HttpHandler& fallback,
     session::CoroutineReplacingSessionIssuer* asyncSessions)
-    : m_authentication(&authentication), m_sessions(&sessions),
-      m_asyncSessions(asyncSessions),
+    : m_authentication(&authentication), m_asyncSessions(asyncSessions),
       m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
+
+EnterpriseAuthenticationHttpApi::EnterpriseAuthenticationHttpApi(
+    AuthenticationService& authentication,gateway::TokenBucketRateLimiter& rateLimiter,
+    gateway::HttpHandler& fallback,session::CoroutineReplacingSessionIssuer& asyncSessions)
+    : m_authentication(&authentication),m_asyncSessions(&asyncSessions),
+      m_rateLimiter(&rateLimiter),m_fallback(&fallback) {}
 
 gateway::HttpResponse EnterpriseAuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request, bool clear) const

@@ -57,8 +57,9 @@ test("configured native LDAP runtime has a separate, fail-closed transactional s
   assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/);
   assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionService>/);
   assert.match(app,/std::make_unique<auth::AuthenticationService>/);
-  assert.match(app,/nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/);
-  assert.match(app,/fallback, nativeSessions\.get\(\)/);
+  assert.match(app,/localEnterpriseApi\{\s*\*nativeAuthentication,limiter\.value\(\),nativeLocalApi,\*nativeSessions\}/);
+  assert.doesNotMatch(app,/\bpostgres::PostgresSessionRepository sessionRepository\{/);
+  assert.doesNotMatch(app,/\bauth::AuthenticationService authentication\{/);
   assert.match(app,/auto nativeTrust = trust;/);
   assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");

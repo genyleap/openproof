@@ -1219,6 +1219,13 @@ session, policy/audit, delegated-token or proxy interfaces. A direct
 compatibility call on that core fails closed. The trust namespace
 cannot be captured by an operator-defined upstream route.
 
+The authenticated listener no longer constructs synchronous
+AuthenticationService, SessionService, LocalAccountDirectory, recovery
+service or federated HTTP middleware. LDAP and Web3 share the native
+authentication coordinator and session issuer. The native local provider
+is registered in discovery and connection admission as before. Unknown
+or unavailable routes reach a repository-free fail-closed fallback.
+
 The blocking PostgreSQL compatibility implementation still exists.
 Startup, offline administration, and residual compatibility callers
 must be inventoried and retired before the final storage gate can pass.

@@ -207,7 +207,9 @@ const checked = segments.map(([name, relative]) => {
         || (oidc && (native.match(/co_await m_implementation->discoveryAsync\(/g)||[]).length!==2))
       issues.push({line:0,kind:"redirect provider retains a blocking path or misses native exchanges",
         expression:type+" native start and completion"});
-    if ((app.match(/authApi, nullptr, true\}/g)||[]).length!==2
+    if ((app.match(/return runWithAccount\(administrationApi\);/g)||[]).length!==2
+        || /\bFederatedAuthenticationHttpApi\s+\w+\s*\{/.test(app)
+        || /\bauth::AuthenticationService authentication\{/.test(app)
         || /\btoken::TokenService\s+\w+\s*\{/.test(app)
         || /\bclient::ClientManager\s+\w+\s*\{/.test(app)
         || !app.includes('nativePaths.emplace_back("/account/connections/handoff")')
@@ -317,12 +319,13 @@ const checked = segments.map(([name, relative]) => {
       && /std::make_unique<\s*postgres::CoroutinePostgresSessionService>/.test(app)
       && /std::make_unique<auth::AuthenticationService>/.test(app)
       && /nativeCanonical.get\(\)/.test(app)
-      && /nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/.test(app)
-      && /fallback, nativeSessions.get\(\)/.test(app)
+      && /localEnterpriseApi\{\s*\*nativeAuthentication,limiter\.value\(\),nativeLocalApi,\*nativeSessions\}/.test(app)
+      && !/\bauth::AuthenticationService authentication\{/.test(app)
+      && !/\bpostgres::PostgresSessionRepository sessionRepository\{/.test(app)
       && /auto nativeTrust = trust;/.test(app)
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
-      && /runWithEvidence\(enterpriseApi, enterpriseApi\)/.test(app)
+      && /runWithEvidence\(fallback,localEnterpriseApi\)/.test(app)
       // Exact paths must be added ONLY for enabled LDAP configuration.
       // An independent Web3 opt-in must not expose an unconfigured directory.
       && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)
@@ -740,7 +743,7 @@ const checked = segments.map(([name, relative]) => {
         || /\bm_authentication->(?:begin|complete)\s*\(/.test(executable)
         || !/SensitiveAuthRequestGuard\s+wipeRequestOnExit\{request\}/.test(syncEntry)
         || !/return\s+error\(foundation::Error\{foundation::ErrorCode::Unavailable\}/.test(syncEntry)
-        || authConstructors.length !== 3
+        || authConstructors.length !== 1
         || authConstructors.some(([,args]) => !/^\s*\*nativeLocalAuthentication,\s*\*nativeSessions,/.test(args)))
       issues.push({line:0,kind:"synchronous authentication HTTP entry or dependency remains reachable",
         expression:"native-only login leaf and fail-closed synchronous entry"});

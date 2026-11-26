@@ -1931,10 +1931,6 @@ addProtectedRoutes(gateway::Router& router,
     postgres::PostgresIdentityRepository identities{*pool.value()};
     postgres::PostgresExternalIdentityDirectory externalIdentities{*pool.value()};
     postgres::PostgresOrganizationRepository organizations{*pool.value()};
-    postgres::PostgresMembershipRepository memberships{*pool.value()};
-    postgres::PostgresSessionRepository sessionRepository{*pool.value()};
-    postgres::PostgresAuthenticationTransactionStore transactions{*pool.value()};
-    postgres::PostgresRecoveryCodeRepository recoveryRepository{*pool.value()};
 
     auto configuredOrganization = organizations.findById(
         identity::OrganizationId{std::string{platform.auth().organizationId()}});
@@ -1984,40 +1980,19 @@ addProtectedRoutes(gateway::Router& router,
     auto administrationAuditKey = audit::AuditKey::create(auditSecret->clone());
     auto authorizationAuditKey = audit::AuditKey::create(
         std::move(auditSecret).value());
-    auto passwordHasher = credentials::PasswordHasher::create(
-        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
-        std::string{platform.security().passwordHashAlgorithm()});
-    auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
-    if (!passwordHasher || !totpKey || !administrationTotpKey || !administrationAuditKey
-        || !authorizationAuditKey) {
+    if (!administrationTotpKey || !administrationAuditKey || !authorizationAuditKey) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
     const idp::ProviderId providerId{std::string{platform.auth().providerId()}};
-    auto accounts = postgres::PostgresLocalAccountDirectory::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        credentials::TotpPolicy::recommended(), std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        providerId);
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
     std::optional<fnd::SecretString> nativeRecoverySecret;
     if (nativeRecoveryEnabled) nativeRecoverySecret.emplace(recoverySecret->clone());
 #endif
-    auto recoveryCodes = credentials::RecoveryCodeService::create(
-        recoveryRepository, std::move(recoverySecret).value());
-    if (!accounts || !recoveryCodes) {
-        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
-        return ExitCode::InternalError;
-    }
-
     idp::ProviderRegistry providers;
-    auto provider = std::make_unique<local::LocalAuthenticationProvider>(
-        providerId, *accounts.value(), clock, std::chrono::minutes{5},
-        &externalIdentities, &recoveryCodes.value());
-    const fnd::Status registered = providers.registerProvider(std::move(provider));
     auth::ProviderTrustPolicy trust;
     const fnd::Status trusted = trust.trust(providerId, idp::AssuranceLevel::Ial2);
-    if (!registered || !trusted) {
+    if (!trusted) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -2607,18 +2582,9 @@ addProtectedRoutes(gateway::Router& router,
     }
 
     postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
-    // Retain the original synchronous AuthenticationService for the existing
-    // OAuth, account, SAML and other compatibility handlers. LDAP's native
-    // coordinator receives its own identical operator trust policy.
+    // Native coordinators share the operator's trust policy.
     auto nativeTrust = trust;
     auto nativeLocalTrust = trust;
-    auth::AuthenticationService authentication{
-        providers, transactions, externalIdentities, clock, std::move(trust),
-        std::chrono::minutes{5}, &identities,
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        &identityProviderStore};
-    session::SessionService sessions{
-        sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
 
     // Native LDAP is deliberately opt-in until the complete compiler
     // and real-login E2E acceptance criteria have passed.
@@ -2638,7 +2604,7 @@ addProtectedRoutes(gateway::Router& router,
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     // Destroy coordinator and registry before their verifier/store. The
-    // ordinary registry retains the synchronous provider for legacy OAuth.
+    // ordinary registry also advertises the native local provider in discovery.
     std::unique_ptr<postgres::CoroutineLocalCredentialStore> nativeLocalStore;
     std::unique_ptr<postgres::CoroutinePostgresLocalProofVerifier> nativeLocalVerifier;
     std::unique_ptr<idp::ProviderRegistry> nativeLocalProviders;
@@ -2774,6 +2740,13 @@ addProtectedRoutes(gateway::Router& router,
                 reportStartupFailure(status.error());
                 return ExitCode::ConfigurationError;
             }
+            auto catalogStatus=providers.registerProvider(
+                std::make_unique<local::CoroutineLocalAuthenticationProvider>(
+                    providerId,*nativeLocalVerifier,clock,std::chrono::minutes{5}));
+            if (!catalogStatus) {
+                reportStartupFailure(catalogStatus.error());
+                return ExitCode::ConfigurationError;
+            }
             nativeLocalAuthentication = std::make_unique<auth::AuthenticationService>(
                 *nativeLocalProviders, *nativeTransactions, externalIdentities, clock,
                 std::move(nativeLocalTrust), std::chrono::minutes{5}, &identities,
@@ -2791,7 +2764,7 @@ addProtectedRoutes(gateway::Router& router,
     // six endpoints. Validate the complete dependency set before composing
     // any HTTP middleware or starting the listener.
     if (!nativeLocalEnabled || !nativeAuthSessionEnabled || !nativeRecoveryEnabled
-        || !nativeLocalAuthentication || !nativeSessions || !nativeCanonical) {
+        || !nativeLocalAuthentication || !nativeAuthentication || !nativeSessions || !nativeCanonical) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native first-party authentication runtime is incomplete."});
         return ExitCode::ConfigurationError;
@@ -3608,39 +3581,17 @@ addProtectedRoutes(gateway::Router& router,
     };
 
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
-        authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
-            nativeAuthentication ? *nativeAuthentication : authentication,
-            sessions, limiter.value(), fallback, nativeSessions.get()};
-        // The native local handler is a leaf of the native-only chain.
-        // Keep the synchronous compatibility chain unchanged for other routes.
-        if (nativeLocalEnabled) {
-            authHttp::AuthenticationHttpApi nativeLocalApi{
-                *nativeLocalAuthentication, *nativeSessions,
-                limiter.value(), providerId, fallback};
-            authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
-                nativeAuthentication ? *nativeAuthentication : authentication,
-                sessions, limiter.value(), nativeLocalApi, nativeSessions.get()};
-            if (nativeWeb3Enabled) {
-                authHttp::Web3AuthenticationHttpApi localWeb3Api{
-                    *nativeAuthentication, providers, limiter.value(),
-                    localEnterpriseApi, *nativeSessions,
-                    authenticateNativeWeb3};
-                return runWithEvidence(enterpriseApi, localWeb3Api);
-            }
-            return runWithEvidence(enterpriseApi, localEnterpriseApi);
-        }
+        authHttp::AuthenticationHttpApi nativeLocalApi{
+            *nativeLocalAuthentication,*nativeSessions,limiter.value(),providerId,fallback};
+        authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
+            *nativeAuthentication,limiter.value(),nativeLocalApi,*nativeSessions};
         if (nativeWeb3Enabled) {
-            // Compose native Web3 ABOVE the native LDAP adapter. Its guarded
-            // coroutine fallback delegates LDAP without touching the legacy
-            // Web3 handler, and the exact-path overlay decides which opt-ins
-            // actually receive native requests.
-            authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
-                *nativeAuthentication, providers, limiter.value(),
-                enterpriseApi, *nativeSessions,
-                authenticateNativeWeb3};
-            return runWithEvidence(enterpriseApi, nativeWeb3Api);
+            authHttp::Web3AuthenticationHttpApi localWeb3Api{
+                *nativeAuthentication,providers,limiter.value(),
+                localEnterpriseApi,*nativeSessions,authenticateNativeWeb3};
+            return runWithEvidence(fallback,localWeb3Api);
         }
-        return runWithEvidence(enterpriseApi, enterpriseApi);
+        return runWithEvidence(fallback,localEnterpriseApi);
     };
 
     const auto runWithAccount = [&](gateway::HttpHandler& fallback) -> ExitCode {
@@ -3847,12 +3798,7 @@ addProtectedRoutes(gateway::Router& router,
             circuits.value(), signer.value(), std::chrono::seconds{10}};
         nativeGatewayCore = &gatewayCore;
         LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
-        authHttp::AuthenticationHttpApi authApi{
-            *nativeLocalAuthentication, *nativeSessions,
-            limiter.value(), providerId, administrationApi};
-        authHttp::FederatedAuthenticationHttpApi federatedApi{
-            authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
-        return runWithAccount(federatedApi);
+        return runWithAccount(administrationApi);
     }
 
     auto clientSecretMaterial = oauthClientSecretMaterial(platform.security());
@@ -3922,12 +3868,7 @@ addProtectedRoutes(gateway::Router& router,
         circuits.value(), signer.value(), std::chrono::seconds{10}};
     nativeGatewayCore = &gatewayCore;
     LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
-    authHttp::AuthenticationHttpApi authApi{
-        *nativeLocalAuthentication, *nativeSessions,
-        limiter.value(), providerId, administrationApi};
-    authHttp::FederatedAuthenticationHttpApi federatedApi{
-        authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
-    return runWithAccount(federatedApi);
+    return runWithAccount(administrationApi);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
