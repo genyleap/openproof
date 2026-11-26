@@ -3091,7 +3091,12 @@ addProtectedRoutes(gateway::Router& router,
                 }, std::move(profileReader), std::move(connectionsReader),
                 std::move(totpStatusReader), std::move(passwordStatusReader),
                 std::move(passwordUpgradeConfirm), std::move(profileWriter),
-                authenticateNativeWeb3);
+                authenticateNativeWeb3,
+                [reader=nativeCanonical.get(),registered=providers.ids(),&clock](
+                    identity::IdentityId owner,identity::ExternalIdentityRef external) {
+                    return reader->disconnectAsync(std::move(owner),std::move(external),
+                        registered,clock.now());
+                });
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
@@ -3241,6 +3246,7 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountConnectionsEnabled) {
             nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/connections/disconnect");
         }
         if (nativeAccountTotpStatusEnabled) {
             nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);

@@ -82,6 +82,15 @@ public:
                   std::vector<identity::core::ExternalIdentityRef>>>>
     readConnectionsAsync(identity::core::IdentityId owner);
 
+    // Atomically detach an owned, registered authentication connection only
+    // when another registered sign-in method survives. Reset avatar selection
+    // in the same transaction; the provider catalog is an immutable snapshot.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    disconnectAsync(identity::core::IdentityId owner,
+        identity::core::ExternalIdentityRef external,
+        std::vector<identity::provider::ProviderId> authenticationProviders,
+        foundation::Instant now);
+
     // Read-only account-scope authorization of an already HMAC-digested
     // OAuth access credential. Never persists a synthetic session.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>

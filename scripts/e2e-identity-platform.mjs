@@ -1282,6 +1282,17 @@ async function main() {
       subject: String(farcasterFid),
     }, consumerJar);
     expectStatus(disconnected, 200);
+    if (nativeAccountRuntime) {
+      const afterDisconnect=await edgeRequest("/account/connections",{jar:consumerJar});
+      expectStatus(afterDisconnect,200);
+      assert.ok(!jsonBody(afterDisconnect).connections.some(c=>c.provider==="farcaster" && c.subject===String(farcasterFid)));
+      expectStatus(await jsonRequest("/account/connections/disconnect","POST",{
+        provider:"farcaster",subject:String(farcasterFid)
+      },consumerJar),404);
+      expectStatus(await jsonRequest("/account/connections/disconnect","POST",{
+        provider:"local",subject:"consumer@e2e.invalid",identity_id:"e2e-owner"
+      },consumerJar),400);
+    }
     const refusedLastMethod = await jsonRequest("/account/connections/disconnect", "POST", {
       provider: "local",
       subject: "consumer@e2e.invalid",

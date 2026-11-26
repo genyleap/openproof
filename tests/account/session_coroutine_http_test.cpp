@@ -128,7 +128,7 @@ struct Fixture final {
                      bool passwordStatusEnabled = false,
                      bool passwordConfirmEnabled = false,
                      bool profileWriteEnabled = false,
-                     bool scopedBearerReads = false)
+                     bool scopedBearerReads = false, bool disconnectEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -275,7 +275,19 @@ struct Fixture final {
                               co_return fnd::fail(fnd::ErrorCode::Unavailable);
                           co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
                       }}
-                  : http::CoroutineAccountSessionAdapter::Authenticate{})
+                  : http::CoroutineAccountSessionAdapter::Authenticate{},
+              disconnectEnabled
+                  ? http::CoroutineAccountSessionAdapter::Disconnect{
+                      [this](core::IdentityId owner,core::ExternalIdentityRef external)
+                          -> asio::awaitable<fnd::Status> {
+                          ++disconnectCalls;
+                          if (owner.value()!="identity-current" || external.subject().value()=="foreign")
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          if (external.subject().value()=="last")
+                              co_return fnd::fail(fnd::ErrorCode::FailedPrecondition);
+                          co_return fnd::ok();
+                      }}
+                  : http::CoroutineAccountSessionAdapter::Disconnect{})
     {
     }
 
@@ -301,6 +313,7 @@ struct Fixture final {
     int profileReadCalls{};
     int profileWriteCalls{};
     int connectionsReadCalls{};
+    int disconnectCalls{};
     int totpStatusCalls{};
     int passwordStatusCalls{};
     int passwordConfirmCalls{};
@@ -656,6 +669,29 @@ TEST(AccountCoroutineSessionHttpTest, ScopedBearerReadsNeverDelegateSessionOrCre
     EXPECT_EQ(f.scopedBearerCalls, 8);
     EXPECT_EQ(f.listCalls, 0);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack)
+{
+    Fixture f{true,true,true,true,true,true,true,true};
+    const auto call=[&](std::string token,std::string body) {
+        auto input=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/connections/disconnect",
+            {{"authorization","Bearer "+token},{"content-type","application/json"}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"disconnect-fixture"}).value();
+        EXPECT_TRUE(f.api.nativeEnabledFor(input));
+        return f.run(std::move(input));
+    };
+    const std::string good=R"({"provider":"farcaster","subject":"owned"})";
+    EXPECT_EQ(call("no-scope-fixture",good).status(),403);
+    EXPECT_EQ(call("unavailable-fixture",good).status(),503);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"owned","identity_id":"other"})").status(),400);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"foreign"})").status(),403);
+    EXPECT_EQ(call("valid-token",R"({"provider":"local","subject":"last"})").status(),412);
+    const auto result=call("delegated-fixture",good);
+    EXPECT_EQ(result.status(),200);
+    EXPECT_EQ(result.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(f.disconnectCalls,3);
+    EXPECT_EQ(f.legacy.invoked,0);
 }
 
 TEST(AccountCoroutineSessionHttpTest, ConnectionsReadRejectsForeignAndMissingWithoutDisclosure)

@@ -69,6 +69,12 @@ private:
         && request.path() == "/account/connections";
 }
 
+[[nodiscard]] bool disconnectRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && request.path()=="/account/connections/disconnect";
+}
+
 [[nodiscard]] bool totpStatusReadRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
@@ -219,7 +225,7 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     ReadProfile readProfile, ReadConnections readConnections,
     ReadTotpStatus readTotpStatus, ReadPasswordUpgradeStatus readPasswordUpgradeStatus,
     ConfirmPasswordUpgrade confirmPasswordUpgrade, UpdateProfile updateProfile,
-    Authenticate authenticateReadBearer)
+    Authenticate authenticateReadBearer, Disconnect disconnect)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
@@ -229,7 +235,8 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
       m_readPasswordUpgradeStatus(std::move(readPasswordUpgradeStatus)),
       m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade)),
       m_updateProfile(std::move(updateProfile)),
-      m_authenticateReadBearer(std::move(authenticateReadBearer))
+      m_authenticateReadBearer(std::move(authenticateReadBearer)),
+      m_disconnect(std::move(disconnect))
 {
 }
 
@@ -261,6 +268,10 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readConnections);
+    }
+    if (disconnectRoute(request)) {
+        return m_authenticate && m_disconnect
+            && (!request.header("authorization").has_value() || m_authenticateReadBearer);
     }
     if (totpStatusReadRoute(request)) {
         return !request.header("authorization").has_value()
@@ -334,6 +345,9 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (connectionsReadRoute(request)) {
         co_return co_await connectionsRead(std::move(request));
+    }
+    if (disconnectRoute(request)) {
+        co_return co_await disconnect(std::move(request));
     }
     if (totpStatusReadRoute(request)) {
         co_return co_await totpStatusRead(std::move(request));
@@ -531,6 +545,53 @@ CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
     }
     co_return jsonResponse(200,
         json::object{{"connections", std::move(connectionsJson)}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::disconnect(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipe{request};
+    PasswordRequestGuard bodyWipe{request};
+    using E=foundation::ErrorCode;
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{E::RateLimited},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{E::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value()) co_return fail(foundation::Error{E::AuthenticationRequired},request);
+    auto actor=co_await authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    const auto mime=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !mime
+        || (*mime!="application/json" && !mime->starts_with("application/json;")))
+        co_return fail(foundation::Error{E::InvalidArgument},request);
+    boost::system::error_code ec;
+    const auto parsed=json::parse(request.body(),ec);
+    request.wipeBody();
+    if (ec || !parsed.is_object() || parsed.as_object().size()!=2U)
+        co_return fail(foundation::Error{E::InvalidArgument},request);
+    const auto field=[&](std::string_view name,std::size_t maximum)->std::optional<std::string> {
+        const auto* value=parsed.as_object().if_contains(name);
+        if (!value || !value->is_string()) return std::nullopt;
+        const std::string_view text{value->as_string().data(),value->as_string().size()};
+        if (text.empty() || text.size()>maximum || std::ranges::any_of(text,[](char c) {
+            const auto byte=static_cast<unsigned char>(c);
+            return byte<0x20U || byte==0x7fU;
+        })) return std::nullopt;
+        return std::string{text};
+    };
+    auto provider=field("provider",128U);
+    auto subject=field("subject",512U);
+    if (!provider || !subject) co_return fail(foundation::Error{E::InvalidArgument},request);
+    identity::core::ExternalIdentityRef external{
+        identity::provider::ProviderId{std::move(*provider)},
+        identity::provider::ExternalSubject{std::move(*subject)}};
+    auto result=co_await m_disconnect(actor->identity(),std::move(external));
+    if (!result) co_return fail(result.error(),request);
+    co_return jsonResponse(200,json::object{{"disconnected",true}});
 }
 
 asio::awaitable<gateway::HttpResponse>

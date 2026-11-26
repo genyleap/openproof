@@ -746,9 +746,17 @@ failure, and requires an active, tenant-bound grant with the account scope.
 Sender-constrained tokens are rejected because these routes have no proof
 verification boundary. Cookie-only reads retain first-party verification;
 session and credential mutations do not use the new read verifier.
-Non-GET connection routes are unaffected. Do not enable the feature in production until
-GCC16/CTest and disposable PostgreSQL HTTP E2E have passed, followed by the
-usual global Coroutine migration release gate.
+POST `/account/connections/disconnect` also uses the account-scoped verifier
+for explicit Bearer credentials and the first-party verifier for cookies.
+The exact native overlay cannot dispatch to the synchronous detach service.
+One tenant-scoped transaction locks the active identity and a surviving
+registered sign-in method, checks exact external ownership, deletes the
+connection, and resets its selected avatar source to auto. Verification-only
+providers cannot satisfy the last-sign-in-method guard. Concurrent detach
+requests share the existing advisory lock; one cannot remove the last
+registered method. Other connection ceremonies retain their separate
+dispatch contracts. Full GCC16/CTest and disposable PostgreSQL HTTP E2E,
+followed by the global migration release gate, remain mandatory.
 
 ### Native federated browser authentication
 

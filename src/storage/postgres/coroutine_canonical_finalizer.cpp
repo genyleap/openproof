@@ -1102,4 +1102,94 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::disconnectAsync(core::IdentityId owner,
+    core::ExternalIdentityRef external,std::vector<idp::ProviderId> authenticationProviders,
+    foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (owner.empty() || owner.value().size()>200U || external.providerId().empty()
+        || external.providerId().value().size()>128U || external.subject().empty()
+        || external.subject().value().size()>512U || authenticationProviders.empty()
+        || authenticationProviders.size()>256U
+        || std::find(authenticationProviders.begin(),authenticationProviders.end(),
+            external.providerId())==authenticationProviders.end())
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN",{},remaining(deadline)));
+        // Match the legacy detach/merge advisory lock BEFORE taking row locks,
+        // then share the canonical identity lock with linking/profile writes.
+        Params lockParams{std::string{owner.value()}};
+        static_cast<void>(co_await connection.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+            std::move(lockParams),remaining(deadline)));
+        if (!(co_await activeTarget(connection,std::string{owner.value()},
+                std::string{m_impl->organization.value()},deadline,true))) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        Params ownedParams{std::string{external.providerId().value()},std::string{external.subject().value()}};
+        const auto linked=co_await connection.query(
+            "SELECT identity_id FROM openproof.external_identities "
+            "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
+            std::move(ownedParams),remaining(deadline));
+        if (linked.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (linked.rows.size()!=1U || linked.rows.front().size()!=1U)
+            throw std::runtime_error{"Malformed connection ownership"};
+        if (required(linked.rows.front().front())!=owner.value()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        // Lock one different registered authentication connection, excluding
+        // verification-only providers and the exact target. SQL parameters
+        // remain separate from the dynamically generated placeholder list.
+        Params survivorParams{std::string{owner.value()},std::string{external.providerId().value()},
+            std::string{external.subject().value()}};
+        std::string survivorSql=
+            "SELECT identity_id FROM openproof.external_identities WHERE identity_id=$1 "
+            "AND NOT (provider=$2 AND external_subject=$3) AND provider IN (";
+        for (const auto& provider:authenticationProviders) {
+            if (provider.empty() || provider.value().size()>200U)
+                throw std::runtime_error{"Invalid authentication provider snapshot"};
+            if (survivorParams.size()>3U) survivorSql.push_back(',');
+            survivorSql.append("$"+std::to_string(survivorParams.size()+1U));
+            survivorParams.emplace_back(std::string{provider.value()});
+        }
+        survivorSql.append(") ORDER BY provider,external_subject LIMIT 1 FOR UPDATE");
+        const auto survivor=co_await connection.query(std::move(survivorSql),
+            std::move(survivorParams),remaining(deadline));
+        if (survivor.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::FailedPrecondition);
+        }
+        if (survivor.rows.size()!=1U || survivor.rows.front().size()!=1U
+            || required(survivor.rows.front().front())!=owner.value())
+            throw std::runtime_error{"Invalid surviving authentication method"};
+        Params detachParams{std::string{external.providerId().value()},
+            std::string{external.subject().value()},std::string{owner.value()}};
+        const auto removed=co_await connection.query(
+            "DELETE FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2 "
+            "AND identity_id=$3 RETURNING identity_id",std::move(detachParams),remaining(deadline));
+        if (removed.rows.size()!=1U || removed.rows.front().size()!=1U
+            || required(removed.rows.front().front())!=owner.value())
+            throw std::runtime_error{"Connection detach owner mismatch"};
+        Params avatarParams{std::string{owner.value()},std::string{external.providerId().value()},
+            std::to_string(now.time_since_epoch().count())};
+        static_cast<void>(co_await connection.query(
+            "UPDATE openproof.identity_profiles SET avatar_source='auto',"
+            "updated_at_ms=GREATEST(updated_at_ms,$3::bigint) "
+            "WHERE identity_id=$1 AND avatar_source=$2",std::move(avatarParams),remaining(deadline)));
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native account disconnection is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

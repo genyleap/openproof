@@ -58,6 +58,34 @@ test("HTTP validates session and repository owner before disclosure", () => {
   assert.match(cxx, /ConnectionsReadRejectsForeignAndMissingWithoutDisclosure/);
 });
 
+test("native disconnect checks scoped owner and locks a surviving registered method before deletion", () => {
+  const body=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::disconnectAsync("));
+  const ordered=["co_await m_impl->pool.acquire(deadline)",'connection.query("BEGIN"',
+    "pg_advisory_xact_lock(hashtextextended($1::text, 684271993))","co_await activeTarget(",
+    "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
+    "required(linked.rows.front().front())!=owner.value()",
+    "AND NOT (provider=$2 AND external_subject=$3) AND provider IN (",
+    "LIMIT 1 FOR UPDATE","survivor.rows.empty()","DELETE FROM openproof.external_identities",
+    "UPDATE openproof.identity_profiles SET avatar_source='auto'","connection.query(\"COMMIT\""];
+  let previous=-1;
+  for(const term of ordered) {
+    const index=body.indexOf(term,previous+1);
+    assert.ok(index>previous,term);
+    previous=index;
+  }
+  assert.match(body,/std::find\(authenticationProviders.begin\(\),authenticationProviders.end\(\)/);
+  assert.doesNotMatch(body,/\bPQ(?:exec|execParams|connectdb|reset)\s*\(/);
+  assert.match(main,/nativePaths.emplace_back\("\/account\/connections\/disconnect"\)/);
+  assert.match(main,/reader->disconnectAsync\(std::move\(owner\),std::move\(external\),\s*registered,clock.now\(\)\)/);
+  const handler=http.slice(http.indexOf("CoroutineAccountSessionAdapter::disconnect("),
+    http.indexOf("CoroutineAccountSessionAdapter::totpStatusRead("));
+  assert.match(handler,/co_await authenticate\(std::move\(credential->value\(\)\)\)/);
+  assert.match(handler,/co_await m_disconnect\(actor->identity\(\),std::move\(external\)\)/);
+  assert.match(handler,/parsed.as_object\(\).size\(\)!=2U/);
+  assert.match(read("tests/account/session_coroutine_http_test.cpp"),/NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/RealDatabaseDisconnectPreservesLastRegisteredMethodUnderRace/);
+});
+
 test("native connection list preserves Farcaster projection and no-store", () => {
   assert.match(http, /item\["profile_url"\] = "https:\/\/farcaster.xyz\/\~\/profiles\/"/);
   assert.match(http, /std::ranges::all_of\(fid/);

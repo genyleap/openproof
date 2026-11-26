@@ -3092,6 +3092,64 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
     EXPECT_FALSE(proof("fixture-password", {}, "fixture-recovery-code"));
 }
 
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseDisconnectPreservesLastRegisteredMethodUnderRace)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Invalid disposable socket DSN";
+        GTEST_SKIP()<<"Explicit disposable database required";
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const std::string provider="native-canonical-provider";
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+        "VALUES('verification-only',$1,$2,1770000000000)",{seed.newSubject,seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,created_at_ms,updated_at_ms,avatar_source) "
+        "VALUES($1,'Concurrent detach',1770000000000,1770000000000,$2)",{seed.simultaneousOwner,provider})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,std::chrono::milliseconds{500},
+        std::chrono::milliseconds{1000},std::chrono::milliseconds{3000}};
+    const std::vector<idp::ProviderId> registered{idp::ProviderId{provider}};
+    const auto detach=[&](const std::string& owner,const std::string& subject) {
+        return store.disconnectAsync(ids::IdentityId{owner},
+            ids::ExternalIdentityRef{idp::ProviderId{provider},idp::ExternalSubject{subject}},
+            registered,kNow);
+    };
+    auto last=asio::co_spawn(io,detach(seed.owner,seed.subject),asio::use_future);
+    auto foreign=asio::co_spawn(io,detach(seed.owner,seed.foreignSubject),asio::use_future);
+    io.run();
+    auto lastStatus=last.get();
+    ASSERT_FALSE(lastStatus);
+    EXPECT_EQ(lastStatus.error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto foreignStatus=foreign.get();
+    ASSERT_FALSE(foreignStatus);
+    EXPECT_EQ(foreignStatus.error().code(),fnd::ErrorCode::PermissionDenied);
+    io.restart();
+    auto a=asio::co_spawn(io,detach(seed.simultaneousOwner,seed.simultaneousSubjectA),asio::use_future);
+    auto b=asio::co_spawn(io,detach(seed.simultaneousOwner,seed.simultaneousSubjectB),asio::use_future);
+    io.run();
+    auto first=a.get();
+    auto second=b.get();
+    ASSERT_NE(static_cast<bool>(first),static_cast<bool>(second));
+    EXPECT_EQ((first ? second : first).error().code(),fnd::ErrorCode::FailedPrecondition);
+    const auto remaining=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.external_identities WHERE identity_id=$1 AND provider=$2",
+        {seed.simultaneousOwner,provider});
+    ASSERT_EQ(PQntuples(remaining.get()),1);
+    EXPECT_STREQ(PQgetvalue(remaining.get(),0,0),"1");
+    const auto avatar=execute(fixture.get(),
+        "SELECT avatar_source FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.simultaneousOwner});
+    ASSERT_EQ(PQntuples(avatar.get()),1);
+    EXPECT_STREQ(PQgetvalue(avatar.get(),0,0),"auto");
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
 {
     const auto dsn = disposableDsn();
