@@ -24,15 +24,17 @@ def git(*args: str) -> bytes:
     return subprocess.check_output(["git", "-C", str(ROOT), *args])
 
 
-def inventory(tags: list[str]) -> dict:
+def inventory(tags: list[str], ref_prefix: str = "refs/tags/") -> dict:
     if not tags or len(tags) != len(set(tags)) or any(not TAG.fullmatch(t) for t in tags):
         raise ValueError("Expected distinct explicit release tags")
     releases = {}
     files = {}
     hashes = {}
     for tag in sorted(tags):
-        commit = git("rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").decode().strip()
-        releases[tag] = commit
+        ref = f"{ref_prefix}{tag}"
+        tag_object = git("rev-parse", "--verify", ref).decode().strip()
+        commit = git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
+        releases[tag] = {"tag_object": tag_object, "commit": commit}
         seen = set()
         entries = git("ls-tree", "-r", "-z", commit, "--", "migrations")
         for entry in entries.split(b"\0"):
@@ -65,15 +67,18 @@ def inventory(tags: list[str]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
+    parser.add_argument("--audit-refs", action="store_true",
+                        help="Use separately fetched refs/openproof-audit/release-tags/")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--generate", nargs="+", metavar="TAG")
     mode.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    prefix = "refs/openproof-audit/release-tags/" if args.audit_refs else "refs/tags/"
     if args.generate:
-        print(json.dumps(inventory(args.generate), sort_keys=True, indent=2))
+        print(json.dumps(inventory(args.generate, prefix), sort_keys=True, indent=2))
         return
     recorded = json.loads(args.manifest.read_text(encoding="utf-8"))
-    actual = inventory(list(recorded["releases"]))
+    actual = inventory(list(recorded["releases"]), prefix)
     if actual != recorded:
         raise ValueError("Release migration inventory differs from pinned tags")
     # Report filename collisions without confusing numeric prefixes with IDs.
