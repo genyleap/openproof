@@ -82,6 +82,9 @@ class AsyncLdapsClient final {
 public:
     [[nodiscard]] static boost::asio::awaitable<LdapsResult>
     authenticate(LdapsRequest request);
+private:
+    static boost::asio::awaitable<LdapsResult> authenticateSerialized(
+        LdapsRequest request, std::chrono::steady_clock::time_point deadline);
 };
 
 } // namespace openproof::provider::enterprise::async_detail
