@@ -505,7 +505,7 @@ struct Fixture {
         EXPECT_TRUE(trust.trust(idp::ProviderId{"local"}, idp::AssuranceLevel::Ial2));
         authentication = std::make_unique<auth::AuthenticationService>(
             registry, transactions, externalIdentities, clock, std::move(trust),
-            std::chrono::minutes{5}, nullptr, {}, nullptr, &finalizer);
+            std::chrono::minutes{5}, nullptr, core::OrganizationId{}, nullptr, &finalizer);
         api = std::make_unique<authHttp::AuthenticationHttpApi>(
             *authentication, issuer, limiter,idp::ProviderId{"local"},fallback);
     }
@@ -513,9 +513,9 @@ struct Fixture {
     gw::HttpResponse invoke(gw::HttpRequest request) {
         boost::asio::io_context io;
         std::optional<gw::HttpResponse> result;
-        auto capture=[](authHttp::AuthenticationHttpApi& api,gw::HttpRequest input,
+        auto capture=[](authHttp::AuthenticationHttpApi& handler,gw::HttpRequest input,
                         std::optional<gw::HttpResponse>& output)->boost::asio::awaitable<void> {
-            output.emplace(co_await api.handleAsync(std::move(input)));
+            output.emplace(co_await handler.handleAsync(std::move(input)));
         };
         auto done=boost::asio::co_spawn(io,capture(*api,std::move(request),result),boost::asio::use_future);
         io.run();
