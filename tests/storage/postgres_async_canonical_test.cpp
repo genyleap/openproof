@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "async_pool.hpp"
+#include "coroutine_auth_transaction_store.hpp"
 #include "coroutine_canonical_finalizer.hpp"
 #include "coroutine_consent_store.hpp"
 #include "coroutine_session_authenticator.hpp"
@@ -917,6 +918,69 @@ asio::awaitable<bool> concurrentConnectionRead(
     auto linked = co_await canonical.readConnectionsAsync(owner);
     co_return linked && linked->first == owner
         && linked->second.empty() == emptyExpected;
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFederationState)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr) {
+            FAIL()<<"Explicit disposable database has an invalid socket DSN.";
+        }
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    auto config=pg::PoolConfig::create(fnd::SecretString{*dsn},1U,500ms);
+    ASSERT_TRUE(config);
+    auto pool=pg::ConnectionPool::create(std::move(config).value());
+    ASSERT_TRUE(pool);
+    pg::PostgresAuthenticationTransactionStore legacy{*pool.value()};
+    asio::io_context io;
+    pg::CoroutinePostgresAuthenticationTransactionStore native{
+        io.get_executor(),fnd::SecretString{*dsn},2U,500ms,1000ms,2000ms};
+    const Seed seed;
+    const auto binding=openproof::security::sha256("fixture-browser-binding").value();
+    const fnd::SecretString nonce{"fixture-continuation"};
+    const auto pending=[&](const std::string& id) {
+        auto tx=idp::AuthenticationTransaction::create(idp::TransactionId{id},
+            idp::ProviderId{"fixture-provider"},idp::InteractionModel::Redirect,
+            nonce.clone(),binding,fnd::CorrelationId{"native-legacy-cutover"},kNow,5min).value();
+        tx.setMetadata("challenge_id","fixture-challenge");
+        tx.setMetadata("connection_identity",seed.owner);
+        tx.setMetadata("requested_assurance","1");
+        return tx;
+    };
+    auto run=[&]<typename T>(asio::awaitable<T> task) {
+        io.restart();
+        std::optional<T> result;
+        auto capture=[](asio::awaitable<T> operation,std::optional<T>& output)->asio::awaitable<void>{
+            output.emplace(co_await std::move(operation));
+        };
+        auto completion=asio::co_spawn(io,capture(std::move(task),result),asio::use_future);
+        io.run();
+        completion.get();
+        return std::move(result.value());
+    };
+    const auto first="legacy-to-native-"+seed.suffix;
+    ASSERT_TRUE(legacy.begin(pending(first)));
+    auto redeemed=run(native.consumeAsync(idp::TransactionId{first},nonce.clone(),binding,kNow+1s));
+    ASSERT_TRUE(redeemed);
+    EXPECT_EQ(redeemed->provider().value(),"fixture-provider");
+    EXPECT_EQ(redeemed->metadata().at("challenge_id"),"fixture-challenge");
+    EXPECT_EQ(redeemed->metadata().at("connection_identity"),seed.owner);
+    EXPECT_EQ(redeemed->metadata().at("requested_assurance"),"1");
+    EXPECT_FALSE(legacy.consume(idp::TransactionId{first},nonce,binding,kNow+2s));
+    const auto second="native-to-legacy-"+seed.suffix;
+    ASSERT_TRUE(run(native.beginAsync(pending(second))));
+    auto legacyRedeemed=legacy.consume(idp::TransactionId{second},nonce,binding,kNow+1s);
+    ASSERT_TRUE(legacyRedeemed);
+    EXPECT_EQ(legacyRedeemed->metadata().at("connection_identity"),seed.owner);
+    EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{second},nonce.clone(),binding,kNow+2s)));
+    const auto third="cross-store-burn-"+seed.suffix;
+    ASSERT_TRUE(legacy.begin(pending(third)));
+    EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{third},nonce.clone(),
+        idp::BindingDigest{},kNow+1s)));
+    EXPECT_FALSE(legacy.consume(idp::TransactionId{third},nonce,binding,kNow+2s));
 }
 
 TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAndRollsBack)

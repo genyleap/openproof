@@ -4705,3 +4705,14 @@ ceremonies still burn the proof but cannot cause an outbound exchange.
 Tests cover mismatched provider and wire shape, one-time callback, no
 legacy dispatch, and purpose rejection before provider I/O. SAML POST and
 compatibility bridges remain outside this acceptance increment.
+
+### Transaction-store cutover regression
+
+The synchronous and native PostgreSQL repositories use the same durable
+transaction and metadata tables when configured for the same database.
+The disposable PostgreSQL suite now exercises both directions of repository
+cutover, exact provider/connection/challenge metadata, cross-adapter replay
+denial and binding-failure burn. This test establishes the compatibility
+precondition for retiring legacy federation transport without abandoning
+in-flight browser transactions. It does not by itself authorize default
+activation of native callbacks or removal of compatibility handlers.
