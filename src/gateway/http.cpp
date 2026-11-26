@@ -60,8 +60,22 @@ wireResponse(HttpResponse response, unsigned int version, bool headRequest)
     beastHttp::response<beastHttp::string_body> output{status, version};
     for (const auto& [name, value] : response.headers()) output.set(name, value);
     for (const auto& [name, value] : response.repeatedHeaders()) output.insert(name, value);
-    if (!headRequest) output.body() = std::string{response.body()};
     output.keep_alive(false);
+    if (headRequest) {
+        // HEAD carries representation metadata, not an actual message body.
+        // prepare_payload() on an empty string_body would overwrite a valid
+        // upstream Content-Length with zero. Never advertise transfer framing
+        // on this header-only response; preserve the known representation size.
+        output.erase(beastHttp::field::transfer_encoding);
+        if ((response.status() >= 100 && response.status() < 200)
+            || response.status() == 204) {
+            output.erase(beastHttp::field::content_length);
+        } else if (!response.body().empty()) {
+            output.content_length(response.body().size());
+        }
+        return output;
+    }
+    output.body() = std::string{response.body()};
     output.prepare_payload();
     return output;
 }
