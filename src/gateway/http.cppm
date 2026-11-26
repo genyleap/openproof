@@ -140,7 +140,7 @@ public:
     send(const Endpoint& endpoint, const HttpRequest& request,
          foundation::Duration timeout) override;
 
-    /** Native nonblocking transport used by the future async gateway path.
+    /** Native nonblocking transport. The legacy send() ABI denies all calls.
      *  Does not call the synchronous ProxyTransport::send implementation.
      *  Input arguments are owned across suspension; launch on an Asio executor.
      */
@@ -238,8 +238,9 @@ private:
     BeastProxyTransport* m_transport;
 };
 
-/** Native public proxy and opt-in first-party protected proxy. Unsupported
- * protected routes and OAuth credentials retain the compatibility path.
+/** Native public and protected proxy. Configured upstream paths use
+ * asynchronous verification and transport; local protocol middleware
+ * remains authoritative for its reserved namespaces.
  */
 class CoroutineProtectedGatewayAdapter final : public CoroutineHttpHandler,
     private GatewayNativePreparationSource {

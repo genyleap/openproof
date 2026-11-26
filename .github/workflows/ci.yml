@@ -64,6 +64,10 @@ jobs:
           node scripts/test-coroutine-account-totp-status-contract.mjs
           node scripts/test-native-admin-members-contract.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Native gateway transport retirement contract
+        run: |
+          node scripts/test-gateway-translation-unit-split.mjs
+          node scripts/test-native-gateway-tls-completion.mjs
       - name: Mandatory native account credential lifecycle contract
         run: |
           node scripts/test-coroutine-native-contact-runtime.mjs

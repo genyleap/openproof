@@ -788,8 +788,11 @@ if grep -qE '^import[[:space:]]+openproof\.account\.delivery[[:space:]]*;' "${DE
 fi
 grep -q '#include <chrono>' "${DELIVERY_IMPL}" \
     || fail "account.delivery Duration operations require direct <chrono> visibility"
-grep -q 'createWebhookVerificationDelivery' "${ROOT_DIR}/apps/opp/main.cpp" \
-    || fail "opp composition root is not using the account.delivery factory"
+grep -q 'createCoroutineWebhookVerificationDelivery' "${ROOT_DIR}/apps/opp/main.cpp" \
+    || fail "opp composition root is not using the native account.delivery factory"
+if grep -q 'createWebhookVerificationDelivery(' "${ROOT_DIR}/apps/opp/main.cpp"; then
+    fail "opp composition root must not instantiate synchronous webhook delivery"
+fi
 
 # GCC module CMIs must not serialize anonymous-namespace entities.  In a .cppm,
 # non-exported helpers still have module linkage when placed in a named detail

@@ -173,9 +173,14 @@ CoroutineGatewayAdapter::CoroutineGatewayAdapter(
 
 HttpResponse CoroutineGatewayAdapter::handle(HttpRequest request)
 {
-    // Compatibility method for legacy transport-neutral middleware.
-    // Such callers are still blocking and remain subject to the release gate.
-    return m_gateway->handle(std::move(request));
+    request.wipeBody();
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    request.wipeTargetQuery();
+    return HttpResponse{503, Headers{{"cache-control", "no-store"},
+        {"x-content-type-options", "nosniff"}, {"content-type", "application/json"}},
+        foundation::toClientJson(foundation::Error{foundation::ErrorCode::Unavailable},
+                                 request.correlation().value())};
 }
 
 boost::asio::awaitable<HttpResponse>

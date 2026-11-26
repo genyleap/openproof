@@ -573,6 +573,16 @@ extern "C" void requestShutdown(int) noexcept
     g_shutdownRequested = 1;
 }
 
+// The old AccountService still supports non-delivery compatibility reads.
+// Never permit a legacy service to send a verification webhook.
+class RetiredVerificationDelivery final : public account::VerificationDelivery {
+public:
+    [[nodiscard]] fnd::Status deliver(const account::VerificationDispatch&) override
+    {
+        return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+};
+
 class DenyAccess final : public gateway::AccessController {
 public:
     [[nodiscard]] policy::AuthorizationDecision authorize(
@@ -1417,9 +1427,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeProtectedGatewayEnabled = nativeProtectedGatewayFlag
-        ? *nativeProtectedGatewayFlag == "1"
-        : platform.auth().enabled() && !platform.oidc().enabled();
+    if (platform.auth().enabled() && nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Authenticated proxy requires native gateway transport."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeProtectedGatewayEnabled = platform.auth().enabled()
+        || (nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "1");
     if (nativeProtectedGatewayEnabled
         && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3386,17 +3400,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(deliveryTransport.error());
             return ExitCode::ConfigurationError;
         }
-        auto delivery = accountDelivery::createWebhookVerificationDelivery(
-            *deliveryTransport.value(),
-            std::string{platform.account().deliveryHost()},
-            platform.account().deliveryPort(), platform.account().deliveryTls(),
-            std::string{platform.account().deliveryPath()},
-            platform.account().deliveryAuthorization().clone(),
-            std::chrono::seconds{10});
-        if (!delivery) {
-            reportStartupFailure(delivery.error());
-            return ExitCode::ConfigurationError;
-        }
+        RetiredVerificationDelivery delivery;
         auto nativeDelivery=accountDelivery::createCoroutineWebhookVerificationDelivery(
             *deliveryTransport.value(),std::string{platform.account().deliveryHost()},
             platform.account().deliveryPort(),platform.account().deliveryTls(),
@@ -3435,7 +3439,7 @@ addProtectedRoutes(gateway::Router& router,
             idp::ProviderId{std::string{platform.account().phoneProviderId()}},
             identities, externalIdentities, identityProviderStore,
             *accounts.value(), recoveryCodes.value(), accountRepository, sessions, clock,
-            std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
+            std::move(verificationKey).value(), accountPolicy.value(), delivery};
         accountHttp::AccountHttpApi accountApi{
             accountService, authentication, sessions, limiter.value(), fallback, delegated};
         if (nativeSignupEnabled) {

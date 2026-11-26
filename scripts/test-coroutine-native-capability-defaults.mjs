@@ -158,7 +158,7 @@ test("loopback-native test implementations explicitly opt in", () => {
   }
 });
 
-test("native protected proxy defaults on for first-party runtime, with explicit OIDC opt-in", () => {
+test("native protected proxy is mandatory for authenticated and OIDC runtimes", () => {
   const app = read("apps/opp/main.cpp");
   const domain = read("src/gateway/gateway.cpp");
   const implementation = read("src/gateway/http_coroutine.cpp");
@@ -166,11 +166,15 @@ test("native protected proxy defaults on for first-party runtime, with explicit 
   const end = domain.indexOf("HttpResponse GatewayNativePreparationSource::reject(", start);
   assert.ok(start >= 0 && end > start);
   const gate = domain.slice(start, end);
-  assert.match(gate, /m_delegatedAccess != nullptr/);
-  assert.match(gate, /m_senderConstraintVerifier != nullptr/);
-  assert.match(gate, /request\.path\(\) != "\/proxy" && !request\.path\(\)\.starts_with\("\/proxy\/"\)/);
-  assert.match(gate, /route->isProtected\(\)\s*&& \(delegated \|\| \(route->requiredScope\(\)\.empty\(\)/);
-  assert.match(gate, /route->requiredAudience\(\)\.empty\(\)/);
+  assert.match(gate, /localProtocolPath\(request\.path\(\)\)/);
+  assert.match(gate, /route && route->isProtected\(\)/);
+  const local=domain.slice(domain.indexOf("bool localProtocolPath("),start);
+  for(const prefix of ["/auth","/admin","/account","/oauth","/login","/.well-known","/evidence","/scim","/health","/metrics"])
+    assert.ok(local.includes('"'+prefix+'"'),prefix);
+  assert.match(local,/path\[prefix.size\(\)\] == '\/'/);
+  const begin=domain.slice(domain.indexOf("GatewayNativePreparationSource::begin("),domain.indexOf("GatewayNativePreparationSource::admitIdentity("));
+  assert.match(begin,/!delegated && \(gateway.m_delegatedAccess != nullptr/);
+  assert.match(begin,/gateway.m_senderConstraintVerifier != nullptr/);
   const native = implementation.slice(implementation.indexOf("auto started = begin(*m_gateway"));
   assert.ok(native.includes("co_await m_verify"));
   assert.ok(native.includes("co_await m_authorize"));
@@ -179,7 +183,9 @@ test("native protected proxy defaults on for first-party runtime, with explicit 
   assert.ok(native.indexOf("co_await m_authorize") < native.indexOf("co_await m_transport->sendAsync"));
   assert.doesNotMatch(native, /m_gateway->handle\(|m_fallback->handle\(|m_transport->send\(/);
   assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY"\)/);
-  assert.match(app, /nativeProtectedGatewayEnabled = nativeProtectedGatewayFlag\s*\? \*nativeProtectedGatewayFlag == "1"\s*: platform\.auth\(\)\.enabled\(\) && !platform\.oidc\(\)\.enabled\(\)/);
+  assert.match(app, /nativeProtectedGatewayEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "1"\)/);
+  assert.match(app, /platform\.auth\(\)\.enabled\(\) && nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "0"/);
+  assert.match(native,/!delegated \|\| !delegated->permits\(pending.route.requiredScope\(\)\)/);
   assert.match(app, /nativeProtectedGatewayEnabled\s*&& !platform\.auth\(\)\.enabled\(\)/);
   assert.match(app, /co_await reader->readAuthorizationContextAsync/);
   assert.match(app, /co_await sink->recordAsync/);

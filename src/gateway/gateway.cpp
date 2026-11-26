@@ -969,17 +969,28 @@ Gateway::completeForward(HttpRequest request, const Route& route)
         attempts, m_upstreamTimeout};
 }
 
+namespace {
+// The composed application middleware owns these namespaces, even if an
+// operator configures a catch-all upstream route. Match path segments, not
+// string prefixes, so /api and /proxy-other remain ordinary proxy paths.
+bool localProtocolPath(std::string_view path) noexcept
+{
+    for (const std::string_view prefix : {"/auth", "/admin", "/account", "/oauth",
+            "/login", "/.well-known", "/evidence", "/scim", "/health", "/metrics"}) {
+        if (path == prefix || (path.starts_with(prefix) && path.size() > prefix.size()
+            && path[prefix.size()] == '/')) return true;
+    }
+    return false;
+}
+}
+
 bool GatewayNativePreparationSource::eligible(const Gateway& gateway,
-    const HttpRequest& request,bool delegated) noexcept
+    const HttpRequest& request,bool /*delegated*/) noexcept
 {
     try {
-        if ((!delegated && (gateway.m_delegatedAccess != nullptr
-            || gateway.m_senderConstraintVerifier != nullptr))
-            || (request.path() != "/proxy" && !request.path().starts_with("/proxy/")))
-            return false;
+        if (localProtocolPath(request.path())) return false;
         const auto route = gateway.m_router->match(request.method(), request.path());
-        return route && route->isProtected()
-            && (delegated || (route->requiredScope().empty() && route->requiredAudience().empty()));
+        return route && route->isProtected();
     } catch (...) {
         return false;
     }
@@ -989,8 +1000,7 @@ bool GatewayNativePreparationSource::eligiblePublic(const Gateway& gateway,
     const HttpRequest& request) noexcept
 {
     try {
-        if (request.path()!="/proxy" && !request.path().starts_with("/proxy/"))
-            return false;
+        if (localProtocolPath(request.path())) return false;
         const auto route=gateway.m_router->match(request.method(),request.path());
         return route && !route->isProtected() && route->requiredScope().empty()
             && route->requiredAudience().empty();
@@ -1032,9 +1042,12 @@ GatewayNativePreparationSource::begin(Gateway& gateway, HttpRequest request,bool
         return reject(gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                       std::move(request));
     auto route = gateway.m_router->match(request.method(), request.path());
-    if (!route || !route->isProtected() || (!delegated
-        && (!route->requiredScope().empty() || !route->requiredAudience().empty())))
+    if (!route || !route->isProtected())
         return reject(gateway, foundation::Error{foundation::ErrorCode::PermissionDenied},
+                      std::move(request));
+    if (!delegated && (gateway.m_delegatedAccess != nullptr
+            || gateway.m_senderConstraintVerifier != nullptr))
+        return reject(gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                       std::move(request));
     if (!gateway.m_rateLimiter->allow(request.remoteAddress()))
         return reject(gateway, foundation::Error{foundation::ErrorCode::RateLimited},

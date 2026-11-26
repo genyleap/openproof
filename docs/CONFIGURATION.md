@@ -927,18 +927,21 @@ TOTP seed or recovery code is queried or returned. No identity is provisioned.
 
 ### Native protected gateway (coroutine branch only)
 
-Authenticated runtimes without OIDC default to native first-party
-protected reverse proxy. OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY
-accepts 0 or 1. Explicit 0 retains compatibility dispatch. Explicit 1
-requires authentication and also enables native delegated access for OIDC
-runtimes; OIDC stays opt-in until end-to-end executable acceptance.
+Authenticated runtimes require native protected reverse proxy, including
+OIDC delegated access. The historical
+`OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY` flag accepts unset or 1
+when authentication is enabled. Explicit 0 fails startup; explicit 1
+requires authentication.
 
-The flag adds no routes. Native dispatch is limited to the configured
-protected routes under the reserved /proxy segment namespace. In
-non-OIDC mode, scope/audience-constrained routes remain on compatibility
-dispatch. In OIDC opt-in mode, scope and audience requirements are
-checked against the trusted token context; first-party sessions cannot
-satisfy delegated-only grants.
+The flag adds no routes. Native dispatch uses configured method/path
+matches, including /api and /proxy, but preserves local protocol namespaces
+(auth, admin, account, oauth, login, .well-known, evidence, scim, health and
+metrics) for their authoritative middleware. First-party sessions cannot
+satisfy delegated-only scope/audience requirements, even with OIDC disabled.
+No synchronous network fallback exists: BeastProxyTransport::send rejects
+all calls without opening a connection. Account verification webhooks use
+the native asynchronous transport exclusively. Full executable acceptance
+is still required before release.
 
 The native gateway verifies credentials with PostgreSQL asynchronously,
 validates DPoP/mTLS sender binding and consumes the durable replay key,

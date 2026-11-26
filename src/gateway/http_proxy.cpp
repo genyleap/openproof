@@ -169,46 +169,6 @@ public:
         return foundation::ok();
     }
 
-    foundation::Result<HttpResponse> send(
-        const Endpoint& endpoint, const HttpRequest& request,
-        foundation::Duration timeout)
-    {
-        if (timeout <= foundation::Duration::zero()) {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "The upstream timeout must be positive.");
-        }
-        // Retain the legacy synchronous facade for compatibility, but run
-        // the very same native coroutine as the nonblocking gateway path.
-        // The waiting thread is a legacy handler worker, never an Asio
-        // socket-reactor task; no blocking DNS, TCP, TLS or HTTP I/O remains
-        // in this transport. New callers must use sendAsync() directly.
-        try {
-            asio::io_context context;
-            // Boost.Asio 1.88's co_spawn requires a default-constructible
-            // coroutine result for its exception path. HttpResponse is not
-            // default-constructible; an optional around the Result makes the
-            // completion ABI safe without fabricating an HTTP response.
-            auto completion = asio::co_spawn(
-                context, sendResultAsync(endpoint, request, timeout),
-                asio::use_future);
-            context.run();
-            return std::move(completion.get()).value();
-        } catch (...) {
-            // Keep network/credential details out of client-visible errors.
-            return foundation::fail(foundation::ErrorCode::Unavailable,
-                                    "The upstream request failed.");
-        }
-    }
-
-    // Awaitable with a default-constructible completion envelope for Boost
-    // co_spawn's exception handling. The public Result remains unchanged.
-    asio::awaitable<std::optional<foundation::Result<HttpResponse>>> sendResultAsync(
-        Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
-    {
-        co_return std::optional<foundation::Result<HttpResponse>>{
-            co_await sendAsync(std::move(endpoint), std::move(request), timeout)};
-    }
-
     asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
         Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
     {
@@ -409,10 +369,12 @@ BeastProxyTransport::create(ProxyConfig config)
 BeastProxyTransport::~BeastProxyTransport() = default;
 
 foundation::Result<HttpResponse> BeastProxyTransport::send(
-    const Endpoint& endpoint, const HttpRequest& request,
-    foundation::Duration timeout)
+    const Endpoint&, const HttpRequest&, foundation::Duration)
 {
-    return m_implementation->send(endpoint, request, timeout);
+    // Retain only the transport-neutral ABI. No socket, resolver, worker or
+    // nested event loop may be started from the synchronous entry point.
+    return foundation::fail(foundation::ErrorCode::Unavailable,
+                            "Synchronous upstream transport is retired.");
 }
 
 boost::asio::awaitable<foundation::Result<HttpResponse>>

@@ -72,10 +72,21 @@ const checked = segments.map(([name, relative]) => {
     if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabledFor\s*\(\s*operation\s*\)/.test(source))
       issues.push({line:0,kind:"missing request-scoped coroutine dispatch guard",
         expression:"asyncHandler->nativeEnabledFor(operation)"});
-    if(!/asio::co_spawn\s*\(\s*context\s*,\s*sendResultAsync\s*\(/.test(source)
-       || !/co_await\s+sendAsync\s*\(\s*std::move\(endpoint\)/.test(source))
-      issues.push({line:0,kind:"synchronous proxy compatibility bypasses native transport",
-        expression:"co_spawn(context, sendResultAsync(...)) -> co_await sendAsync"});
+    const syncProxy=executable.slice(executable.indexOf("BeastProxyTransport::send("),
+      executable.indexOf("BeastProxyTransport::sendAsync("));
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    // Require a retired synchronous ABI AND actual native runtime wiring.
+    // Removing the nested event loop alone must never pass this boundary.
+    if(!/return foundation::fail\(foundation::ErrorCode::Unavailable,/.test(syncProxy)
+       || /co_spawn|sendAsync|m_implementation->|\.get\s*\(/.test(syncProxy)
+       || !/co_await m_implementation->sendAsync\s*\(/.test(executable)
+       || !/co_await m_transport->sendAsync\s*\(/.test(executable)
+       || !/const bool nativeProtectedGatewayEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\|/.test(app)
+       || !/platform\.auth\(\)\.enabled\(\) && nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "0"/.test(app)
+       || !/createCoroutineWebhookVerificationDelivery\(/.test(app)
+       || /createWebhookVerificationDelivery\(/.test(app))
+      issues.push({line:0,kind:"proxy synchronous ABI or production native wiring is not retired",
+        expression:"deny synchronous send; mandatory native proxy and delivery"});
     // Private io_context.run() still occupies a legacy handler thread.
     // A coroutine-only migration cannot approve this compatibility facade.
     if(/\bcontext\.run\s*\(\s*\)/.test(executable))
