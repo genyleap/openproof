@@ -123,11 +123,12 @@ public:
         fnd::CorrelationId{"recovery-http-test"}).value();
 }
 
-asio::awaitable<gw::HttpResponse> dispatch(
+asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
     auth::CoroutineRecoveryCodeHttpAdapter& adapter,
     gw::HttpRequest input)
 {
-    co_return co_await adapter.handleAsync(std::move(input));
+    co_return std::optional<gw::HttpResponse>{
+        co_await adapter.handleAsync(std::move(input))};
 }
 
 struct Fixture final {
@@ -181,7 +182,7 @@ struct Fixture final {
         auto future = asio::co_spawn(
             io, dispatch(adapter, std::move(input)), asio::use_future);
         io.run();
-        return future.get();
+        return std::move(future.get()).value();
     }
 };
 
