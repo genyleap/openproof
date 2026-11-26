@@ -335,8 +335,8 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     }
     SensitiveFederatedCallbackRequestGuard wipeRequestOnExit{request};
 
-    // The native opt-in initially supports only OAuth2 GET redirects.
-    // SAML/POST and OAuth1 remain disabled; OAuth2 link proof is purpose-bound.
+    // OAuth2 and OAuth1 use disjoint GET proof shapes; SAML/POST remains disabled.
+    // The consumed transaction selects the registered provider, never query input.
     if (request.method() != gateway::HttpMethod::Get) {
         request.wipeTargetQuery();
         request.wipeBody();
@@ -354,14 +354,25 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     const auto code = values->find("code");
     const auto state = values->find("state");
     const auto user = values->find("user");
+    const auto oauthToken=values->find("oauth_token");
+    const auto oauthVerifier=values->find("oauth_verifier");
+    const bool oauth1=oauthToken!=values->end() || oauthVerifier!=values->end();
+    const auto bounded=[](const auto& it,const auto& end,std::size_t maximum) {
+        return it!=end && !it->second.empty() && it->second.size()<=maximum
+            && std::ranges::none_of(it->second,[](char c){
+                const auto byte=static_cast<unsigned char>(c);
+                return byte<0x20U || byte==0x7FU;
+            });
+    };
+    const bool validProof=oauth1
+        ? bounded(oauthToken,values->end(),1024U)
+            && bounded(oauthVerifier,values->end(),1024U)
+            && code==values->end() && state==values->end() && user==values->end()
+        : bounded(code,values->end(),4096U) && bounded(state,values->end(),512U)
+            && (user==values->end() || bounded(user,values->end(),16U*1024U));
     if (values->contains("error") || values->contains("denied")
         || values->contains("SAMLResponse") || values->contains("RelayState")
-        || values->contains("oauth_token") || values->contains("oauth_verifier")
-        || code == values->end() || state == values->end()
-        || code->second.empty() || code->second.size() > 4096U
-        || state->second.empty() || state->second.size() > 512U
-        || (user != values->end() &&
-            (user->second.empty() || user->second.size() > 16U * 1024U))) {
+        || !validProof) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
         co_return denied(foundation::ErrorCode::AuthenticationFailed, request);
@@ -395,10 +406,15 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto client = context(request);
     idp::AuthenticationResponse proof{
         idp::ChallengeId{*challengeText}, client};
-    proof.setParameter("code", idp::CredentialValue{std::move(code->second)});
-    proof.setParameter("state", idp::CredentialValue{std::move(state->second)});
-    if (user != values->end())
-        proof.setParameter("user", idp::CredentialValue{std::move(user->second)});
+    if (oauth1) {
+        proof.setParameter("oauth_token",idp::CredentialValue{std::move(oauthToken->second)});
+        proof.setParameter("oauth_verifier",idp::CredentialValue{std::move(oauthVerifier->second)});
+    } else {
+        proof.setParameter("code", idp::CredentialValue{std::move(code->second)});
+        proof.setParameter("state", idp::CredentialValue{std::move(state->second)});
+        if (user != values->end())
+            proof.setParameter("user", idp::CredentialValue{std::move(user->second)});
+    }
     foundation::SecretString continuationSecret{std::move(*continuation)};
     std::optional<foundation::SecretString> previousSession;
     if (previous) previousSession.emplace(std::move(*previous));

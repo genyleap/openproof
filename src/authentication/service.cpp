@@ -721,6 +721,13 @@ AuthenticationService::completeExchange(
             "server-side transaction."));
     }
 
+    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
+    const bool isConnection = connection != transaction->metadata().end();
+    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
+        return foundation::fail(authenticationFailure(
+            "Authentication completion refused: ceremony purpose does not match the endpoint."));
+    }
+
     provider::AuthenticationProvider* const implementation =
         m_providers.find(transaction->provider());
     if (implementation == nullptr) {
@@ -795,12 +802,6 @@ AuthenticationService::completeExchange(
             "Provider returned a verification timestamp outside the transaction window."));
     }
 
-    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
-    const bool isConnection = connection != transaction->metadata().end();
-    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
-        return foundation::fail(authenticationFailure(
-            "Authentication completion refused: ceremony purpose does not match the endpoint."));
-    }
     std::optional<identity::core::IdentityId> connectionTarget;
     if (isConnection) {
         connectionTarget.emplace(connection->second);
@@ -845,6 +846,13 @@ AuthenticationService::completeExchangeAsync(
             "server-side transaction."));
     }
 
+    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
+    const bool isConnection = connection != transaction->metadata().end();
+    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: ceremony purpose does not match the endpoint."));
+    }
+
     provider::AuthenticationProvider* const implementation =
         m_providers.find(transaction->provider());
     if (implementation == nullptr) {
@@ -868,6 +876,19 @@ AuthenticationService::completeExchangeAsync(
         co_return foundation::fail(authenticationFailure(
             "Authentication provider has no native coroutine capability."));
     }
+    // A provider-neutral redirect capability binds wire proof family to
+    // the implementation selected by the consumed server transaction.
+    const bool oauth1=response.parameters().contains("oauth_token")
+        || response.parameters().contains("oauth_verifier");
+    const bool expectsOAuth1=implementation->interactionModel()==provider::InteractionModel::Redirect
+        && native->redirectProofKind()==provider::RedirectProofKind::OAuth1;
+    if (oauth1!=expectsOAuth1 || (oauth1 &&
+        (!response.parameters().contains("oauth_token")
+        || !response.parameters().contains("oauth_verifier")
+        || response.parameters().contains("code") || response.parameters().contains("state")
+        || response.parameters().contains("user"))))
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: redirect proof family mismatch."));
     foundation::Result<provider::AuthenticationOutcome> outcome =
         foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
@@ -919,12 +940,6 @@ AuthenticationService::completeExchangeAsync(
             "Provider returned a verification timestamp outside the transaction window."));
     }
 
-    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
-    const bool isConnection = connection != transaction->metadata().end();
-    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
-        co_return foundation::fail(authenticationFailure(
-            "Authentication completion refused: ceremony purpose does not match the endpoint."));
-    }
     std::optional<identity::core::IdentityId> connectionTarget;
     if (isConnection) {
         connectionTarget.emplace(connection->second);

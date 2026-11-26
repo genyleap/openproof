@@ -45,7 +45,8 @@ constexpr fnd::Duration kLifetime{std::chrono::minutes{5}};
 
 class ProofProvider : public idp::AuthenticationProvider {
 public:
-    [[nodiscard]] idp::ProviderId id() const override { return idp::ProviderId{"async-test"}; }
+    [[nodiscard]] idp::ProviderId id() const override { return idp::ProviderId{providerName}; }
+    std::string providerName{"async-test"};
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
     { return idp::InteractionModel::Redirect; }
     [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
@@ -69,6 +70,9 @@ public:
 class NativeProofProvider final : public ProofProvider,
                                   public idp::CoroutineAuthenticationProvider {
 public:
+    [[nodiscard]] idp::RedirectProofKind redirectProofKind() const noexcept override
+    { return providerName=="x" ? idp::RedirectProofKind::OAuth1
+                              : idp::RedirectProofKind::AuthorizationCode; }
     [[nodiscard]] asio::awaitable<fnd::Result<idp::AuthenticationChallenge>>
     beginAuthenticationAsync(idp::AuthenticationRequest request) override
     {
@@ -91,11 +95,14 @@ public:
         const bool oauth2 = fields.contains("code") && fields.contains("state")
             && fields.at("code").expose() == "valid-code"
             && fields.at("state").expose() == "matching-state";
-        if (!proof && !oauth2) {
+        const bool oauth1=providerName=="x" && fields.contains("oauth_token")
+            && fields.contains("oauth_verifier") && fields.at("oauth_token").expose()=="fixture-token"
+            && fields.at("oauth_verifier").expose()=="fixture-verifier";
+        if (!proof && !oauth2 && !oauth1) {
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
         co_return idp::AuthenticationOutcome::create(
-            idp::ProviderId{forgedProvider ? "forged" : "async-test"},
+            idp::ProviderId{forgedProvider ? "forged" : providerName},
             idp::ExternalSubject{externalSubject}, idp::VerifiedClaims{},
             idp::AssuranceLevel::Ial2,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
@@ -463,7 +470,7 @@ asio::awaitable<void> wrongPurpose(
         idp::TransactionId{std::string{started->transactionId().value()}},
         started->continuationToken().clone(), bound,
         proof(std::string{started->challenge().id().value()}));
-    denied = !completed && fixture.coroutineProvider->nativeCompleteCalls == 1;
+    denied = !completed && fixture.coroutineProvider->nativeCompleteCalls == 0;
 }
 
 TEST(TrustedAuthenticationCoroutineTest, ConnectionTransactionCannotBecomeLoginSession)
@@ -573,7 +580,7 @@ asio::awaitable<void> loginIsNotConnection(
         idp::TransactionId{std::string{started->transactionId().value()}},
         started->continuationToken().clone(), bound,
         proof(std::string{started->challenge().id().value()}));
-    denied = !connected && fixture.coroutineProvider->nativeCompleteCalls == 1;
+    denied = !connected && fixture.coroutineProvider->nativeCompleteCalls == 0;
 }
 
 TEST(TrustedAuthenticationCoroutineTest, LoginTransactionCannotBecomeConnection)
@@ -1293,6 +1300,53 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedConnectionHandoffIsSingleUseAn
     EXPECT_EQ(fallback.syncCalls,0);
 }
 
+TEST(TrustedAuthenticationCoroutineTest, NativeOAuth1CallbackBindsRegisteredProviderAndConsumesOnce)
+{
+    Fixture fixture;
+    auto x=std::make_unique<NativeProofProvider>();
+    x->providerName="x";
+    auto* nativeX=x.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(x)));
+    ASSERT_TRUE(fixture.policy.trust(idp::ProviderId{"x"},idp::AssuranceLevel::Ial2));
+    auto link=ids::IdentityLink::request(ids::IdentityId{"canonical-identity"},
+        ids::ExternalIdentityRef{idp::ProviderId{"x"},idp::ExternalSubject{"verified-subject"}},
+        kNow,kLifetime);
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(fixture.identities.attach(link.value()));
+    auto service=fixture.service();
+    auto limiter=openproof::gateway::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,fallback};
+    const auto begin=[&](std::string provider){
+        return invokeFederated(start,makeFederatedStart("/auth/federated/start?provider="+provider));
+    };
+    const auto target="/auth/federated/callback?oauth_token=fixture-token&oauth_verifier=fixture-verifier";
+    auto wrong=begin("async-test");
+    ASSERT_EQ(wrong.status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,federatedCookies(wrong))).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    auto wrongShape=begin("x");
+    ASSERT_EQ(wrongShape.status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",federatedCookies(wrongShape))).status(),400);
+    EXPECT_EQ(nativeX->nativeCompleteCalls,0);
+    auto started=begin("x");
+    ASSERT_EQ(started.status(),302);
+    auto cookies=federatedCookies(started);
+    EXPECT_EQ(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),400);
+    EXPECT_EQ(nativeX->nativeCompleteCalls,1);
+    EXPECT_EQ(nativeX->syncCalls,0);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
 TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMissingState)
 {
     Fixture fixture;
@@ -1308,6 +1362,10 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMis
         "/auth/federated/callback?code=valid-code&state=matching-state",
         "/auth/federated/callback?code=valid-code&code=again&state=matching-state",
         "/auth/federated/callback?code=valid-code&state=matching-state&oauth_token=ambiguous",
+        "/auth/federated/callback?oauth_token=only",
+        "/auth/federated/callback?oauth_verifier=only",
+        "/auth/federated/callback?oauth_token=a&oauth_verifier=b&code=c",
+        "/auth/federated/callback?oauth_token=a&oauth_verifier=%00",
         "/auth/federated/callback?code=valid-code&state=matching-state&SAMLResponse=ambiguous",
         "/auth/federated/callback?code=valid-code&state=%ZZ",
         "/auth/federated/callback?code=valid-code"}) {

@@ -68,6 +68,9 @@ public:
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
 
+    [[nodiscard]] identity::provider::RedirectProofKind redirectProofKind() const noexcept override
+    { return identity::provider::RedirectProofKind::OAuth1; }
+
     /** Nonblocking OAuth 1.0a request-token exchange; owns request across awaits. */
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::provider::AuthenticationChallenge>>

@@ -4693,3 +4693,15 @@ authorize a link; the consumed server transaction must match its purpose.
 Delegated Bearer issuance/start remain on compatibility. SAML/POST and
 OAuth1 are not migrated by this change; provider bridges are intentionally
 not removed until all relevant runtime routes are covered.
+
+### Native X OAuth1 callback and pre-provider ceremony validation
+
+Native GET callback admits exactly one proof family (OAuth2 code/state or
+OAuth1 token/verifier), rejects mixed or control-bearing values before
+dispatch, and binds OAuth1 to the registered X transaction provider.
+The coordinator checks the consumed transaction's login/link purpose
+before either synchronous or asynchronous provider invocation. Mismatched
+ceremonies still burn the proof but cannot cause an outbound exchange.
+Tests cover mismatched provider and wire shape, one-time callback, no
+legacy dispatch, and purpose rejection before provider I/O. SAML POST and
+compatibility bridges remain outside this acceptance increment.
