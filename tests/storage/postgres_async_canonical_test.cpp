@@ -1799,9 +1799,39 @@ TEST(PostgresCanonicalCoroutineTest, NativeDevicePollingCommitsThrottleAndConsum
     ASSERT_EQ(PQntuples(throttle.get()),1);
     EXPECT_STREQ(PQgetvalue(throttle.get(),0,0),"10000");
     EXPECT_STREQ(PQgetvalue(throttle.get(),0,1),"1770000001000");
-    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_device_authorizations SET status=1,identity_id=$2,provider='local',"
-        "assurance=1,factors=1,phishing_resistant=false,authenticated_at_ms=1770000001000 "
-        "WHERE device_digest=decode($1,'hex')",{device,seed.owner}));
+    const auto sessionName="device-session-"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',1,1,false,0,decode($3,'hex'),1770000001000,1770000001000,1770000001000,1770003600000,600000)",
+        {sessionName,seed.owner,fingerprint("-session")}));
+    auto readApproval=[&](auto& store, std::string owner) {
+        return run(store.readOAuthDeviceApprovalAsync(user,ids::IdentityId{std::move(owner)},kNow+1s));
+    };
+    EXPECT_FALSE(readApproval(foreign,seed.owner));
+    const auto preview=readApproval(native,seed.owner);
+    ASSERT_TRUE(preview);
+    EXPECT_EQ(preview->clientName,"Fixture");
+    EXPECT_EQ(preview->resource,std::optional<std::string>{audience});
+    EXPECT_EQ(preview->scopes,std::vector<std::string>{"account"});
+    const auto decide=[&](auto& store,std::string owner,bool approve,std::string consent){
+        return run(store.decideOAuthDeviceAsync(user,ids::IdentityId{std::move(owner)},
+            openproof::session::SessionId{sessionName},approve,std::move(consent),kNow+1s));
+    };
+    EXPECT_FALSE(decide(foreign,seed.owner,true,family+"-foreign"));
+    EXPECT_FALSE(decide(native,seed.secondOwner,true,family+"-wrong-owner"));
+    // Force a consent collision; the device must remain pending.
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_consents(id,identity_id,client_id,audience,granted_at_ms) "
+        "VALUES($1,$2,$3,$4,1770000000000)",{family+"-consent-collision",seed.owner,client,audience}));
+    EXPECT_FALSE(decide(native,seed.owner,true,family+"-consent-collision"));
+    EXPECT_TRUE(readApproval(native,seed.owner));
+    ASSERT_TRUE(decide(native,seed.owner,true,family+"-consent"));
+    EXPECT_FALSE(decide(native,seed.owner,false,""));
+    EXPECT_FALSE(readApproval(native,seed.owner));
+    const auto consents=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_consents c JOIN openproof.oauth_consent_scopes s ON s.consent_id=c.id "
+        "WHERE c.identity_id=$1 AND c.client_id=$2 AND c.revoked_at_ms IS NULL AND s.scope='account'",{seed.owner,client});
+    ASSERT_EQ(PQntuples(consents.get()),1);
+    EXPECT_STREQ(PQgetvalue(consents.get(),0,0),"1");
     // A duplicate family insertion must roll back without consuming approval.
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families "
         "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms) "

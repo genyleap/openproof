@@ -1007,8 +1007,15 @@ the client, requested scopes and resource are validated under transaction
 locks; only HMAC fingerprints of the device and user codes are persisted.
 User code generation uses unbiased sampling and at most three attempts
 on unique-code collisions. The existing ten-minute lifetime and five-second
-poll interval are preserved. Browser approval, authorization/login and PAR
-still require separate migration and executable acceptance.
+poll interval are preserved. Device browser approval and denial are native
+and cookie-only. The existing page style and CSP are preserved. The CSRF
+token is bound by HMAC to the session and the specific device code; the
+approval transaction rechecks the active first-party session and tenant.
+Approval records the authentication context and supersedes prior consent
+in the same transaction as the device state change. A failed consent
+write leaves the device pending. Denial is one-time and creates no consent.
+Authorization/login and PAR still require separate migration and executable
+acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 

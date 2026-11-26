@@ -162,6 +162,12 @@ private:
 
 // Committed native authorization-code exchange result. Raw access and
 // refresh credentials stay with the HTTP caller; persistence sees digests.
+struct NativeDeviceApproval final {
+    std::string clientName;
+    std::optional<std::string> resource;
+    std::vector<std::string> scopes;
+};
+
 enum class NativeDevicePollState { Pending, SlowDown, Denied, Expired, Issued };
 struct NativeDevicePollResult final {
     NativeDevicePollState state;

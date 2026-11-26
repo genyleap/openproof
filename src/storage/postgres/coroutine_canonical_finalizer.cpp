@@ -2153,4 +2153,153 @@ CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync(
     }
 }
 
+asio::awaitable<foundation::Result<oauth::NativeDeviceApproval>>
+CoroutinePostgresCanonicalFinalizer::readOAuthDeviceApprovalAsync(std::string userDigest,
+    core::IdentityId owner,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (userDigest.size()!=64U || owner.empty()) co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        Params args{std::move(userDigest),std::string{owner.value()},
+            std::string{m_impl->organization.value()},std::to_string(now.time_since_epoch().count())};
+        const auto rows=co_await lease.connection().query(
+            "SELECT c.display_name,d.resource,s.scope FROM openproof.oauth_device_authorizations d "
+            "JOIN openproof.oauth_clients c ON c.id=d.client_id "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "JOIN openproof.identities i ON i.id=$2 AND i.organization_id=a.organization_id "
+            "JOIN openproof.oauth_device_authorization_scopes s ON s.device_digest=d.device_digest "
+            "WHERE d.user_code_digest=decode($1,'hex') AND a.organization_id=$3 "
+            "AND d.status=0 AND d.issued_at_ms<=$4 AND d.expires_at_ms>$4 "
+            "AND c.status=0 AND a.status=0 AND o.state=0 AND i.status=0 "
+            "ORDER BY s.scope COLLATE \"C\" LIMIT 257",std::move(args),remaining(deadline));
+        if (rows.rows.empty()) co_return foundation::fail(E::NotFound);
+        if (rows.rows.size()>256U || rows.rows.front().size()!=3U)
+            co_return foundation::fail(E::Unavailable);
+        const auto& first=rows.rows.front();
+        oauth::NativeDeviceApproval result{required(first[0]),first[1],{}};
+        for (const auto& row:rows.rows) {
+            if (row.size()!=3U || row[0]!=first[0] || row[1]!=first[1]
+                || !client::Scope::create(required(row[2])))
+                throw std::runtime_error{"Malformed device approval"};
+            result.scopes.push_back(required(row[2]));
+        }
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::decideOAuthDeviceAsync(std::string userDigest,
+    core::IdentityId owner,session::SessionId sessionId,bool approve,std::string consentId,
+    foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (userDigest.size()!=64U || owner.empty() || sessionId.empty()
+        || (approve && (consentId.empty() || consentId.size()>200U)))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()},identityId{owner.value()};
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        // Match client -> device -> identity/session order of native polling.
+        Params clientArgs{userDigest,tenant};
+        const auto client=co_await execute(
+            "SELECT c.id FROM openproof.oauth_device_authorizations d "
+            "JOIN openproof.oauth_clients c ON c.id=d.client_id "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE d.user_code_digest=decode($1,'hex') AND a.organization_id=$2 "
+            "AND c.status=0 AND a.status=0 AND o.state=0 FOR SHARE OF c,a,o",std::move(clientArgs));
+        if (client.rows.size()!=1U || client.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        const auto clientId=required(client.rows.front()[0]);
+        Params deviceArgs{userDigest,clientId,timestamp};
+        const auto locked=co_await execute(
+            "SELECT encode(device_digest,'hex'),resource FROM openproof.oauth_device_authorizations "
+            "WHERE user_code_digest=decode($1,'hex') AND client_id=$2 AND status=0 "
+            "AND issued_at_ms<=$3 AND expires_at_ms>$3 FOR UPDATE",std::move(deviceArgs));
+        if (locked.rows.size()!=1U || locked.rows.front().size()!=2U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        const auto digest=required(locked.rows.front()[0]);
+        const auto resource=locked.rows.front()[1];
+        // Serialize consent supersession and recheck the exact first-party
+        // session under transaction locks. Never trust claims from the form.
+        Params ownerArgs{identityId,tenant,std::string{sessionId.value()},timestamp};
+        const auto actor=co_await execute(
+            "SELECT s.provider,s.assurance,s.factors,s.phishing_resistant,s.authenticated_at_ms "
+            "FROM openproof.identities i JOIN openproof.sessions s ON s.identity_id=i.id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND s.id=$3 AND s.state=0 "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 "
+            "AND s.last_seen_at_ms+s.idle_timeout_ms>$4 FOR UPDATE OF i FOR SHARE OF s",std::move(ownerArgs));
+        if (actor.rows.size()!=1U || actor.rows.front().size()!=5U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (approve) {
+            Params scopeArgs{digest};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.oauth_device_authorization_scopes "
+                "WHERE device_digest=decode($1,'hex') ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",
+                std::move(scopeArgs));
+            if (grants.rows.empty() || grants.rows.size()>256U)
+                throw std::runtime_error{"Invalid device approval scope set"};
+            std::vector<std::string> scopes;
+            for (const auto& row:grants.rows) {
+                if (row.size()!=1U || !client::Scope::create(required(row[0])))
+                    throw std::runtime_error{"Invalid device scope"};
+                scopes.push_back(required(row[0]));
+            }
+            const std::string audience=resource.value_or("urn:openproof:client:"+clientId);
+            Params supersede{identityId,clientId,audience,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_consents SET revoked_at_ms=$4 "
+                "WHERE identity_id=$1 AND client_id=$2 AND audience=$3 AND revoked_at_ms IS NULL "
+                "AND (expires_at_ms IS NULL OR expires_at_ms>$4)",std::move(supersede)));
+            Params consentArgs{consentId,identityId,clientId,audience,timestamp};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_consents(id,identity_id,client_id,audience,granted_at_ms) "
+                "VALUES($1,$2,$3,$4,$5)",std::move(consentArgs)));
+            for (const auto& scope:scopes) {
+                Params args{consentId,scope};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) VALUES($1,$2)",std::move(args)));
+            }
+            const auto& row=actor.rows.front();
+            Params args{digest,identityId,required(row[0]),required(row[1]),required(row[2]),
+                boolean(row[3])?"true":"false",required(row[4])};
+            const auto updated=co_await execute(
+                "UPDATE openproof.oauth_device_authorizations SET status=1,identity_id=$2,provider=$3,"
+                "assurance=$4,factors=$5,phishing_resistant=$6,authenticated_at_ms=$7 "
+                "WHERE device_digest=decode($1,'hex') AND status=0 RETURNING client_id",std::move(args));
+            if (updated.rows.size()!=1U || updated.rows.front().size()!=1U || required(updated.rows.front()[0])!=clientId)
+                throw std::runtime_error{"Device approval update mismatch"};
+        } else {
+            Params args{digest};
+            const auto updated=co_await execute(
+                "UPDATE openproof.oauth_device_authorizations SET status=2 "
+                "WHERE device_digest=decode($1,'hex') AND status=0 RETURNING client_id",std::move(args));
+            if (updated.rows.size()!=1U || updated.rows.front().size()!=1U || required(updated.rows.front()[0])!=clientId)
+                throw std::runtime_error{"Device denial update mismatch"};
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native device decision is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

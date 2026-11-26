@@ -241,7 +241,8 @@ test("device initiation authenticates and persists only hashed codes within boun
     "case E::Conflict: continue","body.add(\"device_code\",device.expose())"])
     assert.ok(body.includes(term),term);
   assert.ok(body.indexOf("co_await m_devicePoll->begin(")<body.indexOf('body.add("device_code",device.expose())'));
-  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::beginOAuthDeviceAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::readOAuthDeviceApprovalAsync("));
   for(const term of ["FOR SHARE OF c,a,o","if (!authenticated)","oauth_client_scopes",
     "std::ranges::find(allowed,scope)!=allowed.end()","!resource && !std::ranges::all_of(scopes,oidcOnly)",
     "WHERE audience=$1 AND status=0 FOR SHARE","oauth_resource_scopes","oidcOnly(scope) ||",
@@ -251,7 +252,35 @@ test("device initiation authenticates and persists only hashed codes within boun
   assert.ok(store.indexOf("INSERT INTO openproof.oauth_device_authorization_scopes")<store.lastIndexOf('execute("COMMIT",{})'));
   assert.match(app,/reader->beginOAuthDeviceAsync/);
   assert.match(app,/nativePaths.emplace_back\("\/oauth\/device_authorization"\)/);
-  assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && path=="\/oauth\/device_authorization"/);
+  assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && \(path=="\/oauth\/device_authorization" \|\| path=="\/oauth\/device"\)/);
   assert.match(read("tests/oauth_native_consent_test.cpp"),/DeviceInitiationRetriesCollisionAndReturnsOnlyCommittedCodes/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/duplicate.error\(\).code\(\),fnd::ErrorCode::Conflict/);
+});
+test("device browser approval binds CSRF to first-party session and commits consent and approval together",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::deviceBrowser("),http.indexOf("CoroutineTokenReadAdapter::beginDevice("));
+  for(const term of ['r.header("authorization")',"browserCookie(r,kBrowserSession)",
+    "security::constantTimeEquals(expected->expose(),input->csrf->expose())",
+    "co_await m_devicePoll->authenticate","deviceCsrf(m_devicePoll->deviceKey,actor.value(),digest",
+    "input->csrf.reset(); input->code.reset();","co_await m_devicePoll->decide",
+    "actor->identity(),actor->id()","co_await m_devicePoll->readApproval",
+    "htmlEscape(grant->clientName)","deviceCsrfCookie(\"\",0)"])
+    assert.ok(body.includes(term),term);
+  assert.ok(body.indexOf("scrub(r);",body.indexOf("const auto login="))<body.indexOf("co_await m_devicePoll->authenticate"));
+  assert.ok(body.indexOf("co_await m_devicePoll->decide")<body.indexOf('input->approve?"Device approved"'));
+  assert.match(http,/device-browser:"\+std::string\{actor.id\(\).value\(\)\}/);
+  assert.match(http,/frame-ancestors 'none'/);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::decideOAuthDeviceAsync("));
+  for(const term of ["a.organization_id=$2","FOR SHARE OF c,a,o",
+    "AND client_id=$2 AND status=0","FOR UPDATE","s.id=$3 AND s.state=0",
+    "s.absolute_expires_at_ms>$4","s.last_seen_at_ms+s.idle_timeout_ms>$4",
+    "FOR UPDATE OF i FOR SHARE OF s","UPDATE openproof.oauth_consents",
+    "INSERT INTO openproof.oauth_consent_scopes","SET status=1,identity_id=$2",
+    "SET status=2"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("INSERT INTO openproof.oauth_consent_scopes")<store.indexOf("SET status=1,identity_id=$2"));
+  assert.ok(store.indexOf("SET status=2")<store.lastIndexOf('execute("COMMIT",{})'));
+  assert.match(app,/reader->decideOAuthDeviceAsync/);
+  assert.match(app,/reader->readOAuthDeviceApprovalAsync/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/device"\)/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Force a consent collision; the device must remain pending/);
 });

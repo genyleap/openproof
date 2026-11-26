@@ -135,6 +135,13 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeDeviceApproval>>
+    readOAuthDeviceApprovalAsync(std::string userDigest,identity::core::IdentityId owner,
+        foundation::Instant now);
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    decideOAuthDeviceAsync(std::string userDigest,identity::core::IdentityId owner,
+        session::SessionId sessionId,bool approve,std::string consentId,foundation::Instant now);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     beginOAuthDeviceAsync(std::string clientId,std::optional<std::string> clientDigest,
         std::string deviceDigest,std::string userDigest,std::vector<std::string> scopes,

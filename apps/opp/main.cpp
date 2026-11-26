@@ -3219,12 +3219,24 @@ addProtectedRoutes(gateway::Router& router,
                         return reader->beginOAuthDeviceAsync(std::move(clientId),std::move(clientDigest),
                             std::move(deviceDigest),std::move(userDigest),std::move(scopes),std::move(resource),
                             clock.now(),std::chrono::minutes{10},std::chrono::seconds{5});
-                    },std::string{nativeOidcProvider->issuer()}+"/oauth/device"});
+                    },std::string{nativeOidcProvider->issuer()}+"/oauth/device",
+                    [service=nativeSessions.get()](fnd::SecretString credential) {
+                        return service->authenticate(std::move(credential));
+                    },
+                    [reader,&clock](std::string digest,identity::IdentityId owner) {
+                        return reader->readOAuthDeviceApprovalAsync(std::move(digest),std::move(owner),clock.now());
+                    },
+                    [reader,&clock](std::string digest,identity::IdentityId owner,session::SessionId sessionId,
+                        bool approve,std::string consentId) {
+                        return reader->decideOAuthDeviceAsync(std::move(digest),std::move(owner),
+                            std::move(sessionId),approve,std::move(consentId),clock.now());
+                    }});
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");
             nativePaths.emplace_back("/oauth/revoke");
             nativePaths.emplace_back("/oauth/device_authorization");
+            nativePaths.emplace_back("/oauth/device");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {

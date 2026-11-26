@@ -680,7 +680,7 @@ gateway::HttpResponse OAuthHttpApi::handle(gateway::HttpRequest request)
         request.wipeCookieHeader(); request.wipeTargetQuery();
         return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
     }
-    if (m_nativeTokenReadsRequired && path=="/oauth/device_authorization") {
+    if (m_nativeTokenReadsRequired && (path=="/oauth/device_authorization" || path=="/oauth/device")) {
         request.wipeBody(); request.wipeAuthorizationHeader();
         request.wipeCookieHeader(); request.wipeTargetQuery();
         return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
