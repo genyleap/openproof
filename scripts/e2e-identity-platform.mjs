@@ -12,10 +12,12 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
 import { startLocalDemoPortal } from "./local-demo-portal.mjs";
+import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
 const databaseAck = process.env.OPENPROOF_E2E_DATABASE_ACK ?? "";
+const nativeLdapFixtureEnabled = process.env.OPENPROOF_E2E_NATIVE_LDAP_FIXTURE === "1";
 const metricsFile = process.env.OPENPROOF_E2E_METRICS_FILE ?? "";
 const mixedLoadRequests = Number.parseInt(
   process.env.OPENPROOF_E2E_LOAD_REQUESTS ?? "600", 10,
@@ -245,6 +247,13 @@ async function main() {
   }
   if (!fs.existsSync(binary)) fail(`opp binary is missing at ${binary}`);
 
+  if (nativeLdapFixtureEnabled) {
+    let url;
+    try { url = new URL(databaseUrl); } catch { fail("invalid LDAPS fixture database URL"); }
+    if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1"
+        || url.pathname !== "/openproof_native_ldap_e2e_ci" || url.search || holdOpen)
+      fail("native LDAP E2E requires the dedicated noninteractive loopback database");
+  }
   const databaseName = command("psql", [databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c", "select current_database()"])
     .trim();
   if (!/(^|_)e2e($|_)/i.test(databaseName)
@@ -766,7 +775,12 @@ async function main() {
   }
 
   let demoPortal;
+  let ldapFixture;
   try {
+    if (nativeLdapFixtureEnabled) {
+      ldapFixture = await startNativeLdapFixture(tempRoot, reservePort);
+      Object.assign(childEnvironment, ldapFixture.environment);
+    }
     if (holdOpen) {
       demoPortal = await startLocalDemoPortal({
         notifications,
@@ -791,6 +805,15 @@ async function main() {
     ], { env: { ...childEnvironment, OPENPROOF_BOOTSTRAP_PASSWORD: ownerPassword } });
     const ownerTotp = bootstrap.match(/TOTP secret \(Base32; shown once\): ([A-Z2-7]+)/)?.[1];
     if (!ownerTotp) fail("bootstrap did not return the one-time TOTP enrollment secret");
+    if (ldapFixture) {
+      // Only the guarded, empty, loopback test database is seeded, with
+      // an explicitly linked directory UUID validated by the fixture.
+      command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
+        "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) " +
+        "SELECT 'e2e-ldap-linked',organization_id,0,0,1770000000000 FROM openproof.identities WHERE id='e2e-owner'; " +
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) VALUES " +
+        "('ldap','" + ldapFixture.subject + "','e2e-ldap-linked',1770000000000)"]);
+    }
 
     await startOpp();
     const live = await edgeRequest("/health/live");
@@ -798,6 +821,54 @@ async function main() {
     expectStatus(live, 200);
     expectStatus(ready, 200);
     assert.equal(live.headers["strict-transport-security"], "max-age=31536000");
+    if (ldapFixture) {
+      const counts = () => command("psql", [databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT (SELECT count(*) FROM openproof.identities), " +
+        "(SELECT count(*) FROM openproof.external_identities), " +
+        "(SELECT count(*) FROM openproof.sessions)"]).trim();
+      async function startLdap(username, jar) {
+        const response = await jsonRequest("/auth/ldap/start", "POST", { username }, jar);
+        expectStatus(response, 202);
+        const challenge = jsonBody(response);
+        return { transaction_id: challenge.transaction_id, challenge_id: challenge.challenge_id,
+          username, username_binding: challenge.username_binding };
+      }
+      async function completeLdap(challenge, password, jar, headers = {}) {
+        return jsonRequest("/auth/ldap/complete", "POST", { ...challenge, password }, jar, headers);
+      }
+      const initialCounts = counts();
+      const wrongJar = new CookieJar();
+      const wrong = await startLdap("linked", wrongJar);
+      expectStatus(await completeLdap(wrong, "intentionally-invalid-fixture-password", wrongJar), 401);
+      const foreignJar = new CookieJar();
+      const bound = await startLdap("linked", foreignJar);
+      expectStatus(await completeLdap(bound, ldapFixture.linkedPassword, new CookieJar()), 401);
+      const substitutedJar = new CookieJar();
+      const substituted = await startLdap("linked", substitutedJar);
+      expectStatus(await completeLdap({ ...substituted, username: "unlinked" },
+        ldapFixture.unlinkedPassword, substitutedJar), 401);
+      const unlinkedJar = new CookieJar();
+      const unlinked = await startLdap("unlinked", unlinkedJar);
+      expectStatus(await completeLdap(unlinked, ldapFixture.unlinkedPassword, unlinkedJar), 401);
+      // A verified but unlinked directory account must NOT create a canonical
+      // identity, external link or session. Test the actual SQL counts.
+      assert.equal(counts(), initialCounts, "denied LDAP proof changed identity/link/session counts");
+      const linkedJar = new CookieJar();
+      const linked = await startLdap("linked", linkedJar);
+      const replayCookie = linkedJar.header();
+      const completed = await completeLdap(linked, ldapFixture.linkedPassword, linkedJar);
+      expectStatus(completed, 200);
+      assert.equal(jsonBody(completed).assurance, "ial1");
+      const profile = await edgeRequest("/account/profile", { jar: linkedJar });
+      expectStatus(profile, 200);
+      assert.equal(jsonBody(profile).identity_id, "e2e-ldap-linked");
+      const afterLogin = counts();
+      expectStatus(await completeLdap(linked, ldapFixture.linkedPassword, undefined,
+        { cookie: replayCookie }), 401);
+      assert.equal(counts(), afterLogin, "replayed LDAP proof changed persistent state");
+      expectStatus(await jsonRequest("/auth/logout", "POST", undefined, linkedJar), 204);
+      console.log("- native LDAPS real directory + PostgreSQL: explicit link, invalid password, binding, replay, and no implicit provisioning");
+    }
 
     const deniedMetrics = await edgeRequest("/metrics");
     expectStatus(deniedMetrics, 401);
@@ -1419,6 +1490,7 @@ async function main() {
     }
   } finally {
     await stopOpp().catch(() => {});
+    await ldapFixture?.close();
     await Promise.all([
       closeServer(edgeServer),
       closeServer(notificationServer),
