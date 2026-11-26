@@ -4668,3 +4668,15 @@ No password-reset timestamp, TOTP, recovery code, or session is mutated.
 The C++ regressions exercise wrong passwords, current hashes, real Argon2id
 upgrade and timestamp preservation; HTTP tests cover origin and policy denial.
 No new schema or runtime flag is introduced.
+
+### Native account profile mutation
+
+The existing experimental native account-profile capability now covers
+GET, PATCH and PUT for first-party sessions. PATCH retains the historical
+replacement semantics for presentation fields; delegated OAuth access
+retains the compatibility path. The SQL transaction locks the active
+identity/tenant and profile, uses the existing domain validation, checks
+linked avatar eligibility and only writes presentation columns. It does
+not rewrite verified contact fields, ownership, creation time, credentials
+or sessions. No new schema or feature flag. Missing or foreign profiles,
+invalid avatar selection and untrusted adapter owner echoes fail closed.

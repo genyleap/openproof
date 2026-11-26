@@ -1267,6 +1267,21 @@ async function main() {
     }, consumerJar);
     expectStatus(updatedProfile, 200);
     assert.equal(jsonBody(updatedProfile).locale, "fa-IR");
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE === "1") {
+      const refused = await jsonRequest("/account/profile", "PATCH", {
+        display_name: "Uncommitted profile", avatar_source: "missing-avatar-provider",
+      }, consumerJar);
+      expectStatus(refused, 400);
+      expectStatus(await jsonRequest("/account/profile", "PUT", {
+        email: "forbidden@e2e.invalid", email_verified: true,
+      }, consumerJar), 400);
+      const preserved = await edgeRequest("/account/profile", { jar: consumerJar });
+      expectStatus(preserved, 200);
+      assert.deepEqual(jsonBody(preserved), jsonBody(updatedProfile));
+      assert.equal(jsonBody(preserved).email, "consumer@e2e.invalid");
+      assert.equal(jsonBody(preserved).email_verified, true);
+      console.log("- native profile mutation: rollback, protected contacts and tenant ownership passed");
+    }
 
     const forgot = await jsonRequest("/account/password/forgot", "POST", {
       email: "consumer@e2e.invalid",

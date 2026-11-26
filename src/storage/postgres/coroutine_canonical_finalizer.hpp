@@ -64,6 +64,14 @@ public:
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::profile::IdentityProfile>>
     readProfileAsync(identity::core::IdentityId owner);
+    // Existing-profile mutation only. Contact verification and ownership
+    // remain unchanged; lifecycle and avatar eligibility share a transaction.
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<identity::profile::IdentityProfile>>
+    updateProfileAsync(identity::core::IdentityId owner,
+        std::optional<std::string> displayName, std::optional<std::string> username,
+        std::optional<std::string> locale, std::optional<std::string> picture,
+        std::optional<std::string> avatarSource, foundation::Instant now);
 
     /** Read-only, tenant-scoped external account enumeration. Returns the
      * verified owner with bounded rows for HTTP defense in depth. No

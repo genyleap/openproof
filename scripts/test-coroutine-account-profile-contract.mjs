@@ -15,7 +15,7 @@ const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 const main = read("apps/opp/main.cpp");
 
-test("native profile route is explicit, read-only and disabled by default", () => {
+test("native profile routes are method scoped and disabled by default", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadProfile readProfile = \{\}/);
   assert.match(header, /nativeEnabled\(\) const noexcept override \{ return false; \}/);
@@ -114,4 +114,21 @@ test("native profile HTTP E2E keeps a separate guard-approved disposable databas
   assert.match(step, /OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
   assert.match(step, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"/);
   assert.match(step, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"/);
+});
+
+test("profile mutation locks the owner and profile and only writes presentation columns", () => {
+  const start = sql.indexOf("CoroutinePostgresCanonicalFinalizer::updateProfileAsync(");
+  const end = sql.indexOf("CoroutinePostgresCanonicalFinalizer::readConnectionsAsync(", start);
+  assert.ok(start >= 0 && end > start);
+  const body = sql.slice(start,end);
+  for (const token of ["activeTarget(", "FOR UPDATE", "FOR SHARE", "updateSelfService(",
+    "setAvatarSource(", "rollback(", "COMMIT", "RETURNING identity_id"])
+    assert.ok(body.includes(token), token);
+  const mutation = body.slice(body.indexOf("UPDATE openproof.identity_profiles SET"),
+    body.indexOf("RETURNING identity_id"));
+  for (const forbidden of ["email", "phone_number", "created_at", "password_hash"])
+    assert.ok(!mutation.includes(forbidden), forbidden);
+  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Patch\)/);
+  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Put\)/);
+  assert.match(account, /co_await m_updateProfile\(authenticated->identity\(\)/);
 });
