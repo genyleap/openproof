@@ -1,7 +1,5 @@
 module;
 
-#include <boost/asio/awaitable.hpp>
-
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -12,7 +10,7 @@ export module openproof.account.delivery;
 import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
-import openproof.gateway.http;
+export import :coroutine;
 import openproof.identity.core;
 import openproof.identity.provider;
 
@@ -43,63 +41,5 @@ createWebhookVerificationDelivery(
     std::string path,
     foundation::SecretString authorization,
     foundation::Duration timeout);
-
-
-/** Native delivery boundary for future coroutine account workflows.
- * The adapter synchronously consumes the borrowed dispatch into an owned
- * HTTP request before returning an awaitable. The dispatch may be destroyed
- * immediately. The adapter and transport must outlive pending operations.
- * A webhook failure is returned to the account workflow; never retry a
- * verification delivery implicitly.
- */
-class CoroutineVerificationDelivery {
-public:
-    CoroutineVerificationDelivery(const CoroutineVerificationDelivery&) = delete;
-    CoroutineVerificationDelivery& operator=(const CoroutineVerificationDelivery&) = delete;
-    virtual ~CoroutineVerificationDelivery() = default;
-    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
-    deliverAsync(const VerificationDispatch& dispatch) = 0;
-protected:
-    CoroutineVerificationDelivery() = default;
-};
-
-[[nodiscard]] foundation::Result<std::unique_ptr<CoroutineVerificationDelivery>>
-createCoroutineWebhookVerificationDelivery(
-    gateway::http::BeastProxyTransport& transport,
-    std::string host, std::uint16_t port, bool tls, std::string path,
-    foundation::SecretString authorization, foundation::Duration timeout);
-
-
-/** Native contact issuance orchestration. Callers MUST have already verified
- * first-party session ownership, assurance, and rate limits. The storage
- * callback must atomically reserve the configured provider's subject and
- * replace the challenge under the tenant/lifecycle lock.
- * All borrowed dependencies must outlive in-flight operations.
- */
-class CoroutineContactVerificationIssuer final {
-public:
-    using Reserve = std::function<boost::asio::awaitable<foundation::Status>(
-        VerificationChallenge, identity::provider::ProviderId)>;
-    using Discard = std::function<boost::asio::awaitable<foundation::Status>(
-        VerificationId, identity::core::IdentityId, VerificationPurpose)>;
-
-    CoroutineContactVerificationIssuer(VerificationKey key, AccountPolicy policy,
-        identity::provider::ProviderId localProvider,
-        identity::provider::ProviderId phoneProvider, const foundation::ClockSource& clock,
-        CoroutineVerificationDelivery& delivery, Reserve reserve, Discard discard);
-
-    [[nodiscard]] boost::asio::awaitable<foundation::Status>
-    issueAsync(identity::core::IdentityId owner, VerificationPurpose purpose,
-               std::string destination);
-private:
-    VerificationKey m_key;
-    AccountPolicy m_policy;
-    identity::provider::ProviderId m_localProvider;
-    identity::provider::ProviderId m_phoneProvider;
-    const foundation::ClockSource* m_clock;
-    CoroutineVerificationDelivery* m_delivery;
-    Reserve m_reserve;
-    Discard m_discard;
-};
 
 }
