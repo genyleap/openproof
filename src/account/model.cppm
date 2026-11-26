@@ -110,6 +110,7 @@ public:
 
 private:
     friend class AccountService;
+    friend class VerificationPreparation;
     VerificationDispatch(VerificationId id, identity::core::IdentityId identity,
                          VerificationPurpose purpose, VerificationChannel channel,
                          std::string destination, foundation::SecretString secret,

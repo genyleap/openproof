@@ -70,7 +70,21 @@ CoroutineVerificationChallengeStore::~CoroutineVerificationChallengeStore() = de
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceAsync(
     account::VerificationChallenge challenge)
 {
-    if (!supported(challenge.purpose()) || challenge.attempts() != 0U
+    return replaceImpl(std::move(challenge), std::nullopt);
+}
+
+asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::reserveAndReplaceAsync(
+    account::VerificationChallenge challenge, identity::provider::ProviderId provider)
+{
+    return replaceImpl(std::move(challenge), std::move(provider));
+}
+
+asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceImpl(
+    account::VerificationChallenge challenge,
+    std::optional<identity::provider::ProviderId> provider)
+{
+    if ((provider && (provider->empty() || provider->value().size() > 200U))
+        || !supported(challenge.purpose()) || challenge.attempts() != 0U
         || challenge.id().value().size() > 200U || challenge.identity().value().size() > 200U
         || (challenge.purpose() == account::VerificationPurpose::ChangeEmail
             && challenge.channel() != account::VerificationChannel::Email)
@@ -101,6 +115,49 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
             co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
         }
         if (!exactRow(locked, owner)) throw std::runtime_error{"Invalid challenge owner"};
+        if (provider) {
+            if (challenge.purpose() == account::VerificationPurpose::ChangeEmail) {
+                Params profileParams{owner};
+                const auto profile = co_await connection.query(
+                    "SELECT identity_id FROM openproof.identity_profiles WHERE identity_id=$1",
+                    std::move(profileParams), remaining(deadline));
+                if (profile.rows.empty()) {
+                    static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
+                    co_return foundation::fail(foundation::ErrorCode::NotFound);
+                }
+                if (!exactRow(profile, owner))
+                    throw std::runtime_error{"Invalid verification profile"};
+            }
+            const std::string providerName{provider->value()};
+            const std::string destination{challenge.destination()};
+            Params externalParams{providerName, destination};
+            const auto external = co_await connection.query(
+                "SELECT identity_id FROM openproof.external_identities "
+                "WHERE provider=$1 AND external_subject=$2",
+                std::move(externalParams), remaining(deadline));
+            if (!external.rows.empty() && !exactRow(external, owner)) {
+                static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+            // The unique subject key arbitrates concurrent reservations
+            // even when no reservation existed when the transaction began.
+            Params reserveParams{providerName, destination, owner,
+                std::to_string(challenge.expiresAt().time_since_epoch().count()),
+                std::to_string(challenge.createdAt().time_since_epoch().count())};
+            const auto reserved = co_await connection.query(
+                "INSERT INTO openproof.pending_external_identity_reservations AS r "
+                "(provider,external_subject,identity_id,expires_at_ms) VALUES($1,$2,$3,$4) "
+                "ON CONFLICT(provider,external_subject) DO UPDATE SET identity_id=EXCLUDED.identity_id,"
+                "expires_at_ms=EXCLUDED.expires_at_ms "
+                "WHERE r.identity_id=EXCLUDED.identity_id OR r.expires_at_ms<=$5 "
+                "RETURNING identity_id", std::move(reserveParams), remaining(deadline));
+            if (reserved.rows.empty()) {
+                static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+            if (!exactRow(reserved, owner))
+                throw std::runtime_error{"Invalid verification reservation"};
+        }
         Params removeParams{owner, purpose};
         static_cast<void>(co_await connection.query(
             "DELETE FROM openproof.account_verification_challenges "

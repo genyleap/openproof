@@ -41,4 +41,37 @@ createCoroutineWebhookVerificationDelivery(
     foundation::SecretString authorization, foundation::Duration timeout);
 
 
+/** Native contact issuance orchestration. Callers MUST have already verified
+ * first-party session ownership, assurance, and rate limits. The storage
+ * callback must atomically reserve the configured provider's subject and
+ * replace the challenge under the tenant/lifecycle lock.
+ * All borrowed dependencies must outlive in-flight operations.
+ */
+class CoroutineContactVerificationIssuer final {
+public:
+    using Reserve = std::function<boost::asio::awaitable<foundation::Status>(
+        VerificationChallenge, identity::provider::ProviderId)>;
+    using Discard = std::function<boost::asio::awaitable<foundation::Status>(
+        VerificationId, identity::core::IdentityId, VerificationPurpose)>;
+
+    CoroutineContactVerificationIssuer(VerificationKey key, AccountPolicy policy,
+        identity::provider::ProviderId localProvider,
+        identity::provider::ProviderId phoneProvider, const foundation::ClockSource& clock,
+        CoroutineVerificationDelivery& delivery, Reserve reserve, Discard discard);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    issueAsync(identity::core::IdentityId owner, VerificationPurpose purpose,
+               std::string destination);
+private:
+    VerificationKey m_key;
+    AccountPolicy m_policy;
+    identity::provider::ProviderId m_localProvider;
+    identity::provider::ProviderId m_phoneProvider;
+    const foundation::ClockSource* m_clock;
+    CoroutineVerificationDelivery* m_delivery;
+    Reserve m_reserve;
+    Discard m_discard;
+};
+
+
 }

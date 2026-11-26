@@ -68,6 +68,23 @@ foundation::Result<VerificationChallenge> InMemoryAccountRepository::consume(
     foundation::Instant now, std::uint32_t maximumAttempts,
     const identity::core::IdentityId* expectedIdentity)
 {
+    return consumeImpl(id, presented, now, maximumAttempts, expectedIdentity, std::nullopt);
+}
+
+foundation::Result<VerificationChallenge> InMemoryAccountRepository::consumeForPurpose(
+    const VerificationId& id, const VerificationDigest& presented,
+    foundation::Instant now, std::uint32_t maximumAttempts,
+    VerificationPurpose expectedPurpose, const identity::core::IdentityId* expectedIdentity)
+{
+    return consumeImpl(id, presented, now, maximumAttempts, expectedIdentity, expectedPurpose);
+}
+
+foundation::Result<VerificationChallenge> InMemoryAccountRepository::consumeImpl(
+    const VerificationId& id, const VerificationDigest& presented,
+    foundation::Instant now, std::uint32_t maximumAttempts,
+    const identity::core::IdentityId* expectedIdentity,
+    std::optional<VerificationPurpose> expectedPurpose)
+{
     if (maximumAttempts == 0U) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "Verification attempt policy is invalid.");
@@ -81,6 +98,10 @@ foundation::Result<VerificationChallenge> InMemoryAccountRepository::consume(
         && found->second.challenge.identity() != *expectedIdentity) {
         return foundation::fail(invalidVerification(
             "Verification challenge does not belong to the authenticated identity."));
+    }
+    if (expectedPurpose && found->second.challenge.purpose() != *expectedPurpose) {
+        return foundation::fail(invalidVerification(
+            "Verification challenge purpose did not match the endpoint."));
     }
     if (found->second.challenge.expiredAt(now) || found->second.attempts >= maximumAttempts) {
         m_impl->challenges.erase(found);

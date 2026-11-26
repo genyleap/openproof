@@ -4117,6 +4117,23 @@ namespace openproof::storage::postgres {
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity)
     {
+        return consumeImpl(id, presented, now, maximumAttempts, expectedIdentity, std::nullopt);
+    }
+
+    foundation::Result<account::VerificationChallenge> PostgresAccountRepository::consumeForPurpose(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        account::VerificationPurpose expectedPurpose, const identity::core::IdentityId* expectedIdentity)
+    {
+        return consumeImpl(id, presented, now, maximumAttempts, expectedIdentity, expectedPurpose);
+    }
+
+    foundation::Result<account::VerificationChallenge> PostgresAccountRepository::consumeImpl(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity,
+        std::optional<account::VerificationPurpose> expectedPurpose)
+    {
         if (maximumAttempts == 0U) {
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                     "Verification attempt policy is invalid.");
@@ -4166,6 +4183,12 @@ namespace openproof::storage::postgres {
                 foundation::ErrorCode::Internal,
                 std::string{foundation::defaultErrorMessage(foundation::ErrorCode::Internal)},
                 "PostgreSQL returned malformed account verification data."});
+        }
+
+        if (expectedPurpose && purpose.value() != static_cast<unsigned int>(*expectedPurpose)) {
+            rollback(connection);
+            return foundation::fail(authenticationFailure(
+                "Verification challenge purpose did not match the endpoint."));
         }
 
         std::array<std::byte, 32> storedBytes{};

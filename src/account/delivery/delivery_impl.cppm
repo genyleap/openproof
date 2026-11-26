@@ -5,6 +5,7 @@ module;
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +18,8 @@ import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
+import openproof.identity.core;
+import openproof.identity.provider;
 import openproof.security;
 
 namespace openproof::account::delivery {
@@ -256,6 +259,64 @@ createCoroutineWebhookVerificationDelivery(
     return std::unique_ptr<CoroutineVerificationDelivery>{
         new detail::CoroutineWebhookVerificationDelivery{
             transport, std::move(config).value(), timeout}};
+}
+
+CoroutineContactVerificationIssuer::CoroutineContactVerificationIssuer(
+    VerificationKey key, AccountPolicy policy, identity::provider::ProviderId localProvider,
+    identity::provider::ProviderId phoneProvider, const foundation::ClockSource& clock,
+    CoroutineVerificationDelivery& delivery, Reserve reserve, Discard discard)
+    : m_key(std::move(key)), m_policy(policy), m_localProvider(std::move(localProvider)),
+      m_phoneProvider(std::move(phoneProvider)), m_clock(&clock), m_delivery(&delivery),
+      m_reserve(std::move(reserve)), m_discard(std::move(discard))
+{
+}
+
+boost::asio::awaitable<foundation::Status> CoroutineContactVerificationIssuer::issueAsync(
+    identity::core::IdentityId owner, VerificationPurpose purpose, std::string destination)
+{
+    if (!m_reserve || !m_discard || m_localProvider.empty() || m_phoneProvider.empty())
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    auto prepared = VerificationPreparation::prepareContact(
+        m_key, m_policy, owner, purpose, std::move(destination), m_clock->now());
+    if (!prepared) co_return foundation::fail(prepared.error());
+    auto id = prepared->first.id();
+    std::optional<VerificationDispatch> dispatch{std::move(prepared->second)};
+    foundation::Status stored = foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        stored = co_await m_reserve(std::move(prepared->first),
+            purpose == VerificationPurpose::ChangeEmail ? m_localProvider : m_phoneProvider);
+    } catch (...) {
+        // The commit may have been ambiguous. Never send a secret in this case.
+    }
+    if (!stored) {
+        dispatch.reset();
+        co_return foundation::fail(stored.error());
+    }
+    foundation::Status delivered = foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        auto pending = m_delivery->deliverAsync(*dispatch);
+        // The delivery ABI owns its request before suspension.
+        dispatch.reset();
+        delivered = co_await std::move(pending);
+    } catch (...) {
+        dispatch.reset();
+    }
+    if (delivered) co_return foundation::ok();
+
+    // Never implicitly retry a possibly delivered proof. Remove only the
+    // specific challenge. The alias reservation remains bounded by its
+    // expiry: legacy release has no generation token and cannot safely
+    // distinguish a newer reservation for the same owner/subject.
+    foundation::Status compensated = foundation::fail(foundation::ErrorCode::Unavailable);
+    try {
+        compensated = co_await m_discard(std::move(id), std::move(owner), purpose);
+    } catch (...) {
+    }
+    if (!compensated)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Verification delivery failed.",
+            "Exact challenge compensation could not be confirmed.");
+    co_return foundation::fail(delivered.error());
 }
 
 } // namespace openproof::account::delivery
