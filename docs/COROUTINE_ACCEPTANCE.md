@@ -4905,3 +4905,18 @@ changes legacy delivery-failure status to prevent direct enumeration;
 latency equivalence is not established. No provisioning, schema change,
 or synchronous delivery fallback. Signup itself and protected gateway
 remain blocking proxy callers; compiled/runtime acceptance is pending.
+
+### Native public proxy in authenticated runtimes
+
+Both OIDC and non-OIDC authenticated compositions now select native
+forwarding for explicitly public, scope/audience-free routes under the
+reserved /proxy namespace. The native preparation rechecks the matched
+route, applies rate limiting and the existing header sanitization and
+context sealing. It never enters synchronous session, delegated-token
+or authorization policy evaluation. Protected routes retain their
+existing opt-in/compatibility policy. Real TCP regression exercises
+public forwarding, segment boundary, protected fallback and synchronous
+dispatch refusal. Delegated account SQL was checked directly against an
+isolated PostgreSQL 16 with the complete migration set; C++ integration
+still fails on a previous head and needs diagnosis before OAuth
+protected cutover. No schema changes.

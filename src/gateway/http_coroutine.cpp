@@ -207,21 +207,23 @@ CoroutineGatewayAdapter::handleAsync(HttpRequest request)
 
 CoroutineProtectedGatewayAdapter::CoroutineProtectedGatewayAdapter(
     Gateway& gateway, BeastProxyTransport& transport, CoroutineHttpHandler& fallback,
-    Verify verify, Authorize authorize)
+    Verify verify, Authorize authorize,bool enableProtected)
     : m_gateway(&gateway), m_transport(&transport), m_fallback(&fallback),
-      m_verify(std::move(verify)), m_authorize(std::move(authorize))
+      m_verify(std::move(verify)), m_authorize(std::move(authorize)),
+      m_enableProtected(enableProtected)
 {
 }
 
 bool CoroutineProtectedGatewayAdapter::nativeEnabledFor(const HttpRequest& request) const noexcept
 {
-    return (m_verify && m_authorize && eligible(*m_gateway, request))
+    return eligiblePublic(*m_gateway,request)
+        || (m_enableProtected && m_verify && m_authorize && eligible(*m_gateway, request))
         || m_fallback->nativeEnabledFor(request);
 }
 
 HttpResponse CoroutineProtectedGatewayAdapter::handle(HttpRequest request)
 {
-    if (eligible(*m_gateway, request))
+    if (eligiblePublic(*m_gateway,request) || (m_enableProtected && eligible(*m_gateway, request)))
         return reject(*m_gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                       std::move(request));
     return m_fallback->handle(std::move(request));
@@ -230,7 +232,21 @@ HttpResponse CoroutineProtectedGatewayAdapter::handle(HttpRequest request)
 asio::awaitable<HttpResponse>
 CoroutineProtectedGatewayAdapter::handleAsync(HttpRequest request)
 {
-    if (!eligible(*m_gateway, request)) {
+    if (eligiblePublic(*m_gateway,request)) {
+        auto prepared=preparePublic(*m_gateway,std::move(request));
+        if (auto* denied=std::get_if<HttpResponse>(&prepared))
+            co_return std::move(*denied);
+        auto& plan=std::get<GatewayForwardPlan>(prepared);
+        while (auto endpoint=m_gateway->nextForwardEndpoint(plan)) {
+            const auto remaining=m_gateway->remainingForwardBudget(plan);
+            if (remaining<=foundation::Duration::zero()) break;
+            auto result=co_await m_transport->sendAsync(*endpoint,plan.request(),remaining);
+            if (auto response=m_gateway->recordForwardResult(plan,*endpoint,std::move(result)))
+                co_return std::move(*response);
+        }
+        co_return m_gateway->finishForward(plan);
+    }
+    if (!m_enableProtected || !eligible(*m_gateway, request)) {
         if (m_fallback->nativeEnabledFor(request))
             co_return co_await m_fallback->handleAsync(std::move(request));
         co_return reject(*m_gateway, foundation::Error{foundation::ErrorCode::Unavailable},

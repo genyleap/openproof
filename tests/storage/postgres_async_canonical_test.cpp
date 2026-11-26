@@ -1356,7 +1356,7 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         return std::move(result.value());
     };
     auto accepted=read(native);
-    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(accepted) << (accepted ? "" : std::string{fnd::errorCodeName(accepted.error().code())});
     EXPECT_EQ(accepted->identity().value(),seed.owner);
     EXPECT_EQ(accepted->id().value(),"delegated-access");
     EXPECT_FALSE(read(foreign));

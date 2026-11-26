@@ -3198,6 +3198,13 @@ addProtectedRoutes(gateway::Router& router,
                 }};
             return runListener(platform, nativeGateway, logger);
         }
+        if (nativeGatewayCore) {
+            // Public upstream routes do not need an authentication verifier.
+            // Protected/OAuth routes remain on the existing compatibility chain.
+            gatewayHttp::CoroutineProtectedGatewayAdapter nativePublicGateway{
+                *nativeGatewayCore,*proxy.value(),nativeRoutes,{},{},false};
+            return runListener(platform,nativePublicGateway,logger);
+        }
         return runListener(platform, nativeRoutes, logger);
     };
 
@@ -3352,7 +3359,7 @@ addProtectedRoutes(gateway::Router& router,
         gateway::Gateway gatewayCore{
             router, sessions, access, limiter.value(), discovery, loadBalancer,
             circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
-        if (nativeProtectedGatewayEnabled) nativeGatewayCore = &gatewayCore;
+        nativeGatewayCore = &gatewayCore;
         adminHttp::AdministrationHttpApi administrationApi{
             sessions, *administrationRepository.value(), identities, memberships,
             limiter.value(),
@@ -3451,6 +3458,7 @@ addProtectedRoutes(gateway::Router& router,
         router, sessions, access, limiter.value(), discovery, loadBalancer,
         circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10},
         &tokenService, &senderProof};
+    nativeGatewayCore = &gatewayCore;
     adminHttp::AdministrationHttpApi administrationApi{
         sessions, *administrationRepository.value(), identities, memberships,
         limiter.value(),
