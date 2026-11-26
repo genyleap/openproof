@@ -4272,7 +4272,7 @@ namespace openproof::storage::postgres {
 
         ResultPointer existing = execParams(
             connection,
-            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "SELECT identity_id,verification_id FROM openproof.pending_external_identity_reservations "
             "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
             {std::string{external.providerId().value()}, std::string{external.subject().value()}});
         if (!tuplesOk(existing.get())) {
@@ -4284,6 +4284,11 @@ namespace openproof::storage::postgres {
                 rollback(connection);
                 return foundation::fail(foundation::ErrorCode::AlreadyExists,
                                         "That account identifier is already reserved.");
+            }
+            if (!PQgetisnull(existing.get(), 0, 1)) {
+                rollback(connection);
+                return foundation::fail(foundation::ErrorCode::Conflict,
+                    "A verification is already in progress.");
             }
             changed = runCommand(
                 connection,
@@ -4332,6 +4337,42 @@ namespace openproof::storage::postgres {
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedOwner)
     {
+        return releaseSubjectImpl(external, expectedOwner, nullptr);
+    }
+
+    foundation::Result<std::optional<identity::core::IdentityId>>
+    PostgresAccountRepository::reservedOwnerForChallenge(
+        const identity::core::ExternalIdentityRef& external,
+        foundation::Instant now, const account::VerificationId& id) const
+    {
+        if (id.empty()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+        auto lease = m_pool->m_implementation->acquire();
+        if (!lease) return foundation::fail(lease.error());
+        ResultPointer result = execParams(lease->get(),
+            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 AND expires_at_ms>$3 "
+            "AND (verification_id IS NULL OR verification_id=$4)",
+            {std::string{external.providerId().value()}, std::string{external.subject().value()},
+             instant(now), std::string{id.value()}});
+        if (!tuplesOk(result.get()))
+            return foundation::fail(databaseError(result.get(), "read verification reservation generation"));
+        if (PQntuples(result.get()) == 0) return std::optional<identity::core::IdentityId>{};
+        return std::optional<identity::core::IdentityId>{
+            identity::core::IdentityId{field(result.get(), 0, 0)}};
+    }
+
+    foundation::Status PostgresAccountRepository::releaseSubjectForChallenge(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner, const account::VerificationId& id)
+    {
+        if (id.empty()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+        return releaseSubjectImpl(external, expectedOwner, &id);
+    }
+
+    foundation::Status PostgresAccountRepository::releaseSubjectImpl(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner, const account::VerificationId* id)
+    {
         auto lease = m_pool->m_implementation->acquire();
         if (!lease) return foundation::fail(lease.error());
         PGconn* connection = lease->get();
@@ -4343,7 +4384,7 @@ namespace openproof::storage::postgres {
         };
         ResultPointer existing = execParams(
             connection,
-            "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "SELECT identity_id,verification_id FROM openproof.pending_external_identity_reservations "
             "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
             {std::string{external.providerId().value()}, std::string{external.subject().value()}});
         if (!tuplesOk(existing.get())) {
@@ -4357,6 +4398,13 @@ namespace openproof::storage::postgres {
             rollback(connection);
             return foundation::fail(foundation::ErrorCode::PermissionDenied,
                                     "That account reservation belongs to another identity.");
+        }
+        // An owner-only cleanup or stale proof must not remove a newer
+        // native generation. An untagged row retains legacy semantics.
+        if (!PQgetisnull(existing.get(), 0, 1)
+            && (id == nullptr || field(existing.get(), 0, 1) != id->value())) {
+            auto committed = commit(connection);
+            return committed ? committed : failTransaction(committed.error());
         }
         auto removed = runCommand(
             connection,

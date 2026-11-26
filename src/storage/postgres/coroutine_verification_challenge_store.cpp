@@ -143,12 +143,12 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
             // even when no reservation existed when the transaction began.
             Params reserveParams{providerName, destination, owner,
                 std::to_string(challenge.expiresAt().time_since_epoch().count()),
-                std::to_string(challenge.createdAt().time_since_epoch().count())};
+                std::to_string(challenge.createdAt().time_since_epoch().count()), id};
             const auto reserved = co_await connection.query(
                 "INSERT INTO openproof.pending_external_identity_reservations AS r "
-                "(provider,external_subject,identity_id,expires_at_ms) VALUES($1,$2,$3,$4) "
+                "(provider,external_subject,identity_id,expires_at_ms,verification_id) VALUES($1,$2,$3,$4,$6) "
                 "ON CONFLICT(provider,external_subject) DO UPDATE SET identity_id=EXCLUDED.identity_id,"
-                "expires_at_ms=EXCLUDED.expires_at_ms "
+                "expires_at_ms=EXCLUDED.expires_at_ms,verification_id=EXCLUDED.verification_id "
                 "WHERE r.identity_id=EXCLUDED.identity_id OR r.expires_at_ms<=$5 "
                 "RETURNING identity_id", std::move(reserveParams), remaining(deadline));
             if (reserved.rows.empty()) {
@@ -160,8 +160,10 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
         }
         Params removeParams{owner, purpose};
         static_cast<void>(co_await connection.query(
-            "DELETE FROM openproof.account_verification_challenges "
-            "WHERE identity_id=$1 AND purpose=$2",
+            "WITH obsolete AS (DELETE FROM openproof.account_verification_challenges "
+            "WHERE identity_id=$1 AND purpose=$2 RETURNING id,identity_id) "
+            "DELETE FROM openproof.pending_external_identity_reservations r USING obsolete c "
+            "WHERE r.verification_id=c.id AND r.identity_id=c.identity_id",
             std::move(removeParams), remaining(deadline)));
         Params insertParams{id, owner, purpose,
             std::to_string(static_cast<unsigned int>(challenge.channel())),
@@ -198,10 +200,13 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::discard
         // Do not match solely on identity/purpose: a newer challenge may
         // have replaced this one while delivery was suspended.
         const auto removed = co_await lease.connection().query(
-            "DELETE FROM openproof.account_verification_challenges c "
+            "WITH removed AS (DELETE FROM openproof.account_verification_challenges c "
             "USING openproof.identities i WHERE c.id=$1 AND c.identity_id=$2 "
             "AND c.purpose=$3 AND i.id=c.identity_id AND i.organization_id=$4 "
-            "RETURNING c.id", std::move(params), remaining(deadline));
+            "RETURNING c.id,c.identity_id), released AS ("
+            "DELETE FROM openproof.pending_external_identity_reservations r USING removed c "
+            "WHERE r.verification_id=c.id AND r.identity_id=c.identity_id RETURNING r.verification_id) "
+            "SELECT id FROM removed", std::move(params), remaining(deadline));
         if (!removed.rows.empty() && !exactRow(removed, id.value()))
             throw std::runtime_error{"Invalid challenge compensation result"};
         co_return foundation::ok();

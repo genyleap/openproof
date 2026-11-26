@@ -57,6 +57,22 @@ public:
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedOwner) = 0;
 
+    /** Generation-aware reservation access for a consumed verification proof.
+     * Untagged adapters retain their legacy behavior.
+     */
+    [[nodiscard]] virtual foundation::Result<std::optional<identity::core::IdentityId>>
+    reservedOwnerForChallenge(const identity::core::ExternalIdentityRef& external,
+                              foundation::Instant now, const VerificationId&) const
+    {
+        return reservedOwner(external, now);
+    }
+    [[nodiscard]] virtual foundation::Status releaseSubjectForChallenge(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner, const VerificationId&)
+    {
+        return releaseSubject(external, expectedOwner);
+    }
+
 protected:
     AccountRepository() = default;
 };

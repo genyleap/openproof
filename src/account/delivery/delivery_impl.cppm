@@ -302,9 +302,8 @@ boost::asio::awaitable<foundation::Status> CoroutineContactVerificationIssuer::i
     if (delivered) co_return foundation::ok();
 
     // Never implicitly retry a possibly delivered proof. Remove only the
-    // specific challenge. The alias reservation remains bounded by its
-    // expiry: legacy release has no generation token and cannot safely
-    // distinguish a newer reservation for the same owner/subject.
+    // specific challenge and its generation-bound reservation. The store
+    // must not remove an untagged or newer reservation.
     foundation::Status compensated = foundation::fail(foundation::ErrorCode::Unavailable);
     try {
         compensated = co_await m_discard(std::move(id), std::move(owner), purpose);
