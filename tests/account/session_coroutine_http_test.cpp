@@ -124,7 +124,8 @@ struct Fixture final {
                      bool connectionsEnabled = false,
                      bool totpStatusEnabled = false,
                      bool passwordStatusEnabled = false,
-                     bool passwordConfirmEnabled = false)
+                     bool passwordConfirmEnabled = false,
+                     bool profileWriteEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -243,7 +244,21 @@ struct Fixture final {
                           co_return std::pair<core::IdentityId,bool>{
                               passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,true};
                       }}
-                  : http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{})
+                  : http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{},
+              profileWriteEnabled
+                  ? http::CoroutineAccountSessionAdapter::UpdateProfile{
+                      [this](core::IdentityId owner,http::CoroutineAccountSessionAdapter::ProfileUpdate change)
+                          -> asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+                          ++profileWriteCalls;
+                          if (profileMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return profile::IdentityProfile::restore(
+                              profileForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              std::move(change.displayName),std::move(change.username),
+                              std::optional<std::string>{"verified@example.invalid"},true,
+                              std::nullopt,false,std::move(change.locale),std::move(change.picture),
+                              kNow,kNow,change.avatarSource.value_or("auto"));
+                      }}
+                  : http::CoroutineAccountSessionAdapter::UpdateProfile{})
     {
     }
 
@@ -266,6 +281,7 @@ struct Fixture final {
     std::size_t generatedSessionCount{};
     int revokeCalls{};
     int profileReadCalls{};
+    int profileWriteCalls{};
     int connectionsReadCalls{};
     int totpStatusCalls{};
     int passwordStatusCalls{};
@@ -718,6 +734,42 @@ TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeConfirmRequiresOriginSessio
     EXPECT_EQ(success.headers().at("cache-control"),"no-store");
     f.passwordStatusForeign=true;
     EXPECT_EQ(f.run(post(origin,"valid-token",valid)).status(),503);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeProfileMutationRequiresOwnerAndPresentationFields)
+{
+    auto mutate=[](gw::HttpMethod method,std::string token,std::string body) {
+        return gw::HttpRequest::create(method,"/account/profile",
+            {{"cookie","__Host-openproof-session="+std::move(token)},
+             {"content-type","application/json"}},std::move(body),
+            "127.0.0.1",fnd::CorrelationId{"profile-write"}).value();
+    };
+    constexpr auto patch=R"({"display_name":"New name","locale":"fa-IR"})";
+    Fixture off{true};
+    EXPECT_FALSE(off.api.nativeEnabledFor(mutate(gw::HttpMethod::Patch,"valid-token",patch)));
+    Fixture f{true,false,false,false,false,true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy,f.api,{},
+        {{"/account/profile",gw::HttpMethod::Patch},{"/account/profile",gw::HttpMethod::Put}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(mutate(gw::HttpMethod::Patch,"valid-token",patch)));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Patch,"/account/profile","delegated-oauth",patch)));
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"wrong-token",patch)).status(),401);
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",
+        R"({"email":"attacker@example.invalid","email_verified":true})")).status(),400);
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",R"({"display_name":42})")).status(),400);
+    EXPECT_EQ(f.profileWriteCalls,0);
+    for (auto method:{gw::HttpMethod::Patch,gw::HttpMethod::Put}) {
+        const auto changed=f.run(mutate(method,"valid-token",patch));
+        ASSERT_EQ(changed.status(),200);
+        const auto body=json::parse(changed.body()).as_object();
+        EXPECT_EQ(body.at("display_name").as_string(),"New name");
+        EXPECT_EQ(body.at("email").as_string(),"verified@example.invalid");
+        EXPECT_TRUE(body.at("email_verified").as_bool());
+        EXPECT_EQ(body.at("locale").as_string(),"fa-IR");
+        EXPECT_EQ(changed.headers().at("cache-control"),"no-store");
+    }
+    f.profileForeign=true;
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",patch)).status(),503);
     EXPECT_EQ(f.legacy.invoked,0);
 }
 

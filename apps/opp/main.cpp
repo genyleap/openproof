@@ -2831,6 +2831,7 @@ addProtectedRoutes(gateway::Router& router,
         if (platform.account().enabled() && nativeAccountEnabled && nativeSessions) {
             auto* service = nativeSessions.get();
             accountHttp::CoroutineAccountSessionAdapter::ReadProfile profileReader;
+            accountHttp::CoroutineAccountSessionAdapter::UpdateProfile profileWriter;
             if (nativeAccountProfileEnabled) {
                 if (!nativeCanonical) {
                     reportStartupFailure(fnd::Error{
@@ -2841,6 +2842,12 @@ addProtectedRoutes(gateway::Router& router,
                 auto* reader = nativeCanonical.get();
                 profileReader = [reader](identity::IdentityId owner) {
                     return reader->readProfileAsync(std::move(owner));
+                };
+                profileWriter=[reader,&clock](identity::IdentityId owner,
+                    accountHttp::CoroutineAccountSessionAdapter::ProfileUpdate change) {
+                    return reader->updateProfileAsync(std::move(owner),std::move(change.displayName),
+                        std::move(change.username),std::move(change.locale),std::move(change.picture),
+                        std::move(change.avatarSource),clock.now());
                 };
             }
             accountHttp::CoroutineAccountSessionAdapter::ReadConnections connectionsReader;
@@ -2910,12 +2917,12 @@ addProtectedRoutes(gateway::Router& router,
                     return service->revokeOwned(std::move(owner), std::move(target));
                 }, std::move(profileReader), std::move(connectionsReader),
                 std::move(totpStatusReader), std::move(passwordStatusReader),
-                std::move(passwordUpgradeConfirm));
+                std::move(passwordUpgradeConfirm), std::move(profileWriter));
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
-            // This read-only route is method scoped below. PATCH/PUT on
-            // /account/profile must keep using the compatibility API.
+            // Profile reads and writes are method scoped below; delegated
+            // OAuth credentials remain on the compatibility worker.
         }
         if (nativeConsentEnabled) {
             if (!nativeSessions || !nativeConsentStore) {
@@ -3013,6 +3020,8 @@ addProtectedRoutes(gateway::Router& router,
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
         if (nativeAccountProfileEnabled) {
             nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
+            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Patch);
+            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Put);
         }
         if (nativeAccountConnectionsEnabled) {
             nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);

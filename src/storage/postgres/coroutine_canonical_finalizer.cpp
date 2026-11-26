@@ -404,6 +404,89 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     }
 }
 
+asio::awaitable<foundation::Result<profile::IdentityProfile>>
+CoroutinePostgresCanonicalFinalizer::updateProfileAsync(core::IdentityId owner,
+    std::optional<std::string> displayName, std::optional<std::string> username,
+    std::optional<std::string> locale, std::optional<std::string> picture,
+    std::optional<std::string> avatarSource, foundation::Instant now)
+{
+    if (owner.empty() || owner.value().size()>200U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline = Clock::now()+m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        auto& connection = lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN",{},remaining(deadline)));
+        if (!(co_await activeTarget(connection,std::string{owner.value()},
+                std::string{m_impl->organization.value()},deadline,true))) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        Params params{std::string{owner.value()}};
+        const auto rows = co_await connection.query(
+            "SELECT display_name,preferred_username,email,email_verified,"
+            "phone_number,phone_number_verified,locale,picture_url,avatar_source,"
+            "created_at_ms,updated_at_ms FROM openproof.identity_profiles "
+            "WHERE identity_id=$1 FOR UPDATE",std::move(params),remaining(deadline));
+        if (rows.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        if (rows.rows.size()!=1U || rows.rows.front().size()!=11U)
+            throw std::runtime_error{"Malformed profile update snapshot"};
+        const auto& row=rows.rows.front();
+        auto value=profile::IdentityProfile::restore(owner,text(row,0),text(row,1),text(row,2),
+            boolean(row[3]),text(row,4),boolean(row[5]),text(row,6),text(row,7),
+            foundation::Instant{foundation::Duration{milliseconds(row[9])}},
+            foundation::Instant{foundation::Duration{milliseconds(row[10])}},required(row[8]));
+        if (!value) throw std::runtime_error{"Invalid stored profile"};
+        auto updated=value->updateSelfService(std::move(displayName),std::move(username),
+            std::move(locale),std::move(picture),now);
+        if (!updated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(updated.error());
+        }
+        if (avatarSource) {
+            bool allowed=*avatarSource=="auto";
+            if (*avatarSource=="profile") allowed=value->pictureUrl().has_value();
+            else if (!allowed && !avatarSource->empty() && avatarSource->size()<=128U
+                && avatarSource->find('\0')==std::string::npos) {
+                Params avatarParams{std::string{owner.value()},*avatarSource};
+                const auto eligible=co_await connection.query(
+                    "SELECT 1 FROM openproof.external_identities WHERE identity_id=$1 "
+                    "AND provider=$2 AND picture_url IS NOT NULL AND picture_url<>'' "
+                    "LIMIT 1 FOR SHARE",std::move(avatarParams),remaining(deadline));
+                allowed=!eligible.rows.empty();
+            }
+            if (!allowed) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+            }
+            auto selected=value->setAvatarSource(std::move(*avatarSource),now);
+            if (!selected) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(selected.error());
+            }
+        }
+        Params write{std::string{owner.value()},value->displayName(),value->preferredUsername(),
+            value->locale(),value->pictureUrl(),std::string{value->avatarSource()},
+            std::to_string(value->updatedAt().time_since_epoch().count())};
+        // Never rewrite verified contacts, created_at or any credential.
+        const auto persisted=co_await connection.query(
+            "UPDATE openproof.identity_profiles SET display_name=$2,preferred_username=$3,"
+            "locale=$4,picture_url=$5,avatar_source=$6,updated_at_ms=$7::bigint "
+            "WHERE identity_id=$1 RETURNING identity_id",std::move(write),remaining(deadline));
+        if (persisted.rows.size()!=1U || persisted.rows.front().size()!=1U
+            || required(persisted.rows.front().front())!=owner.value())
+            throw std::runtime_error{"Profile update owner mismatch"};
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return value;
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native account profile update is unavailable.");
+    }
+}
+
 // The active identity row anchors the LEFT JOIN, so a legitimate account
 // with no linked providers returns an empty list without confusing a missing
 // or cross-tenant identity with an empty result.

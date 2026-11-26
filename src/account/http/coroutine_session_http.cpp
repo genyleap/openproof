@@ -57,6 +57,12 @@ private:
         && request.path() == "/account/profile";
 }
 
+[[nodiscard]] bool profileUpdateRoute(const gateway::HttpRequest& request) noexcept
+{
+    return (request.method()==gateway::HttpMethod::Patch || request.method()==gateway::HttpMethod::Put)
+        && request.path()=="/account/profile";
+}
+
 [[nodiscard]] bool connectionsReadRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
@@ -210,7 +216,7 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
     ReadProfile readProfile, ReadConnections readConnections,
     ReadTotpStatus readTotpStatus, ReadPasswordUpgradeStatus readPasswordUpgradeStatus,
-    ConfirmPasswordUpgrade confirmPasswordUpgrade)
+    ConfirmPasswordUpgrade confirmPasswordUpgrade, UpdateProfile updateProfile)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
@@ -218,7 +224,8 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
       m_readConnections(std::move(readConnections)),
       m_readTotpStatus(std::move(readTotpStatus)),
       m_readPasswordUpgradeStatus(std::move(readPasswordUpgradeStatus)),
-      m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade))
+      m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade)),
+      m_updateProfile(std::move(updateProfile))
 {
 }
 
@@ -236,6 +243,10 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return !request.header("authorization").has_value()
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readProfile);
+    }
+    if (profileUpdateRoute(request)) {
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate) && static_cast<bool>(m_updateProfile);
     }
     if (connectionsReadRoute(request)) {
         // Delegated OAuth Bearer grants are still authenticated only by the
@@ -310,6 +321,9 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (profileReadRoute(request)) {
         co_return co_await profileRead(std::move(request));
+    }
+    if (profileUpdateRoute(request)) {
+        co_return co_await profileUpdate(std::move(request));
     }
     if (connectionsReadRoute(request)) {
         co_return co_await connectionsRead(std::move(request));
@@ -582,6 +596,74 @@ CoroutineAccountSessionAdapter::passwordUpgradeConfirm(gateway::HttpRequest requ
     if (result->first!=authenticated->identity())
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
     co_return jsonResponse(200,json::object{{"upgraded",result->second},{"needs_upgrade",false}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    const std::string rateKey="account:"+std::string{request.remoteAddress()}
+        +":"+std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    auto authenticated=co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(),request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    boost::system::error_code ec;
+    const auto parsed=json::parse(request.body(),ec);
+    if (ec || !parsed.is_object())
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    ProfileUpdate change;
+    // Match legacy replacement semantics: omitted/null/empty fields clear
+    // presentation data; omitted avatar source preserves its existing value.
+    for (const auto& entry:parsed.as_object()) {
+        std::optional<std::string>* target=nullptr;
+        std::size_t maximum=0U;
+        const std::string_view name{entry.key().data(),entry.key().size()};
+        if (name=="display_name") {target=&change.displayName;maximum=256U;}
+        else if (name=="preferred_username") {target=&change.username;maximum=128U;}
+        else if (name=="locale") {target=&change.locale;maximum=64U;}
+        else if (name=="picture") {target=&change.picture;maximum=2048U;}
+        else if (name=="avatar_source") {target=&change.avatarSource;maximum=128U;}
+        else co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto& field=entry.value();
+        if (field.is_null()) continue;
+        if (!field.is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view text{field.as_string().data(),field.as_string().size()};
+        if (text.empty()) continue;
+        if (text.size()>maximum || std::ranges::any_of(text,[](char ch){
+            const auto byte=static_cast<unsigned char>(ch);
+            return byte<0x20U || byte==0x7FU;
+        })) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        *target=std::string{text};
+    }
+    auto result=co_await m_updateProfile(authenticated->identity(),std::move(change));
+    if (!result) co_return fail(result.error(),request);
+    if (result->identity()!=authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    const auto& value=result.value();
+    json::object body;
+    body["identity_id"] = value.identity().value();
+    if (value.displayName()) body["display_name"] = *value.displayName();
+    if (value.preferredUsername()) {
+        body["preferred_username"] = *value.preferredUsername();
+    }
+    if (value.email()) body["email"] = *value.email();
+    body["email_verified"] = value.emailVerified();
+    if (value.phoneNumber()) body["phone_number"] = *value.phoneNumber();
+    body["phone_number_verified"] = value.phoneNumberVerified();
+    if (value.locale()) body["locale"] = *value.locale();
+    if (value.pictureUrl()) body["picture"] = *value.pictureUrl();
+    body["avatar_source"] = value.avatarSource();
+    co_return jsonResponse(200, std::move(body));
 }
 
 } // namespace openproof::account::http

@@ -873,6 +873,33 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
         ids::IdentityId{seed.suspendedOwner});
     checks.suspendedConnectionsDenied = !suspendedLinks
         && suspendedLinks.error().code() == fnd::ErrorCode::NotFound;
+    const auto updatedAt=kNow+std::chrono::milliseconds{1000};
+    auto changed=co_await canonical.updateProfileAsync(ids::IdentityId{seed.owner},
+        std::string{"Native self-service"},std::nullopt,std::string{"fa-IR"},
+        std::string{"https://example.invalid/avatar.png"},std::string{"profile"},updatedAt);
+    EXPECT_TRUE(changed);
+    if (changed && allowed) {
+        EXPECT_EQ(changed->identity().value(),seed.owner);
+        EXPECT_EQ(changed->displayName(),std::optional<std::string>{"Native self-service"});
+        EXPECT_EQ(changed->email(),allowed->email());
+        EXPECT_EQ(changed->emailVerified(),allowed->emailVerified());
+        EXPECT_EQ(changed->createdAt(),allowed->createdAt());
+        EXPECT_EQ(changed->avatarSource(),"profile");
+    }
+    auto denied=co_await canonical.updateProfileAsync(ids::IdentityId{seed.owner},
+        std::string{"Must roll back"},std::nullopt,std::nullopt,std::nullopt,
+        std::string{"missing-avatar-provider"},updatedAt);
+    EXPECT_FALSE(denied);
+    if (!denied) EXPECT_EQ(denied.error().code(),fnd::ErrorCode::InvalidArgument);
+    auto persisted=co_await canonical.readProfileAsync(ids::IdentityId{seed.owner});
+    EXPECT_TRUE(persisted);
+    if (persisted) EXPECT_EQ(persisted->displayName(),std::optional<std::string>{"Native self-service"});
+    auto deniedWrite=co_await wrongTenant.updateProfileAsync(ids::IdentityId{seed.owner},
+        std::string{"foreign"},std::nullopt,std::nullopt,std::nullopt,std::nullopt,updatedAt);
+    EXPECT_FALSE(deniedWrite);
+    auto lockedWrite=co_await canonical.updateProfileAsync(ids::IdentityId{seed.lockedOwner},
+        std::string{"locked"},std::nullopt,std::nullopt,std::nullopt,std::nullopt,updatedAt);
+    EXPECT_FALSE(lockedWrite);
     co_return checks;
 }
 
