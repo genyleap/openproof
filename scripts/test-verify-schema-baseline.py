@@ -94,5 +94,37 @@ class MigrationAdmissionTest(unittest.TestCase):
             self.admit()
 
 
+class RuntimeBaselineTest(unittest.TestCase):
+    def test_dump_session_settings_are_transaction_local(self):
+        raw = (b"SET statement_timeout = 0;\n"
+               b"SELECT pg_catalog.set_config('search_path', '', false);\n"
+               b"CREATE SCHEMA openproof;\n"
+               b"CREATE TABLE openproof.example (id integer);\n")
+        result = baseline.runtime_baseline(raw)
+        self.assertIn(b"SET LOCAL statement_timeout = 0;\n", result)
+        self.assertIn(b"SELECT pg_catalog.set_config('search_path', '', true);\n", result)
+        self.assertIn(b"CREATE SCHEMA IF NOT EXISTS openproof;\n", result)
+        self.assertIn(b"CREATE TABLE openproof.example (id integer);\n", result)
+
+    def test_unknown_dump_prologue_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "Unexpected PostgreSQL baseline prologue"):
+            baseline.runtime_baseline(b"CREATE SCHEMA openproof;\n")
+
+    def test_bundle_records_exact_sql_and_migration_digests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            migration = root / "0001_schema.sql"
+            migration.write_bytes(b"CREATE TABLE example (id integer);\n")
+            sql = b"CREATE SCHEMA IF NOT EXISTS openproof;\n"
+            directory = root / "baseline"
+            baseline.write_bundle(directory, sql, [migration])
+            self.assertEqual((directory / "schema.sql").read_bytes(), sql)
+            self.assertEqual((directory / "checksums.txt").read_text(),
+                f"{hashlib.sha256(sql).hexdigest()} schema.sql\n"
+                f"{hashlib.sha256(migration.read_bytes()).hexdigest()} {migration.name}\n")
+            with self.assertRaises(FileExistsError):
+                baseline.write_bundle(directory, sql, [migration])
+
+
 if __name__ == "__main__":
     unittest.main()

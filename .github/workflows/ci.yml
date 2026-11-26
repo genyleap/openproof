@@ -250,6 +250,18 @@ jobs:
       - name: Test
         run: ctest --preset gcc-release --output-on-failure
 
+      - name: Consolidated fresh schema and legacy-ledger integration
+        env:
+          OPENPROOF_TEST_BASELINE_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_baseline_ci
+          OPENPROOF_TEST_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture
+          OPENPROOF_TEST_BASELINE_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_baseline_ci
+          cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline"
+          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
+
+
       # Paired comparison is deliberately gated on the *full* test suite.
       # The candidate and pinned mainline baseline run on the same runner,
       # with distinct disposable databases and the same E2E workload.

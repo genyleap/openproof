@@ -17,6 +17,7 @@ module;
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -671,6 +672,43 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
                                 "No executable schema migrations were found.");
     }
 
+    // Optional development baseline. All numbered migrations remain
+    // available for upgrades; a baseline must cover their exact current bytes.
+    const auto baselineDirectory = directory / "baseline";
+    std::optional<std::string> baselineSql;
+    const auto baselineStatus = std::filesystem::symlink_status(baselineDirectory, filesystemError);
+    if (filesystemError && filesystemError != std::errc::no_such_file_or_directory)
+        return foundation::fail(foundation::ErrorCode::FailedPrecondition, "Cannot inspect schema baseline.");
+    filesystemError.clear();
+    if (baselineStatus.type() != std::filesystem::file_type::not_found) {
+        if (!std::filesystem::is_directory(baselineStatus))
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition, "Invalid schema baseline directory.");
+        const auto readBaseline = [&](const std::filesystem::path& path) -> foundation::Result<std::string> {
+            const auto status = std::filesystem::symlink_status(path, filesystemError);
+            if (filesystemError || !std::filesystem::is_regular_file(status))
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition, "Invalid baseline artifact.");
+            std::ifstream stream{path, std::ios::binary};
+            std::string bytes{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
+            if (!stream.is_open() || stream.bad() || bytes.empty() || bytes.find('\0') != std::string::npos)
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition, "Unreadable baseline artifact.");
+            return bytes;
+        };
+        auto sql = readBaseline(baselineDirectory / "schema.sql");
+        auto manifest = readBaseline(baselineDirectory / "checksums.txt");
+        if (!sql) return foundation::fail(sql.error());
+        if (!manifest) return foundation::fail(manifest.error());
+        auto digest = security::sha256(sql.value());
+        if (!digest) return foundation::fail(digest.error());
+        std::string expected = foundation::toHex(digest.value()) + " schema.sql\n";
+        for (const auto& migration : migrations) {
+            if (!migration.archived)
+                expected += migration.checksum + " " + migration.version + "\n";
+        }
+        if (manifest.value() != expected)
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition, "Schema baseline checksum mismatch.");
+        baselineSql.emplace(std::move(sql).value());
+    }
+
     auto lease = m_pool->m_implementation->acquire();
     if (!lease) return foundation::fail(lease.error());
     PGconn* connection = lease->get();
@@ -684,6 +722,14 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
     // Serialize the whole batch, including ledger creation and validation.
     ResultPointer lock = exec(connection, "SELECT pg_advisory_xact_lock(1827364512)");
     if (!tuplesOk(lock.get())) return foundation::fail(databaseError(lock.get(), "lock migrations"));
+    bool freshNamespace = false;
+    if (baselineSql) {
+        ResultPointer existingSchema = exec(connection,
+            "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname='openproof')");
+        if (!tuplesOk(existingSchema.get()) || PQntuples(existingSchema.get()) != 1)
+            return foundation::fail(databaseError(existingSchema.get(), "inspect schema namespace"));
+        freshNamespace = field(existingSchema.get(), 0, 0) == "f";
+    }
     ResultPointer bootstrap = exec(connection,
         "CREATE SCHEMA IF NOT EXISTS openproof;"
         "CREATE TABLE IF NOT EXISTS openproof.schema_migrations ("
@@ -709,13 +755,26 @@ foundation::Result<MigrationReport> Migrator::applyDirectory(
         ++report.alreadyApplied;
     }
 
+    bool useBaseline = false;
+    if (baselineSql && PQntuples(ledger.get()) == 0) {
+        if (!freshNamespace)
+            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                    "An empty migration ledger does not identify a fresh schema.");
+        ResultPointer restored = exec(connection, *baselineSql);
+        if (!commandOk(restored.get()) || PQtransactionStatus(connection) != PQTRANS_INTRANS)
+            return foundation::fail(databaseError(restored.get(), "restore schema baseline"));
+        useBaseline = true;
+        report.usedBaseline = true;
+    }
     for (const auto& migration : migrations) {
         if (migration.archived || migration.recorded) continue;
-        ResultPointer applied = exec(connection, migration.sql);
-        if (!commandOk(applied.get())) return foundation::fail(databaseError(applied.get(), "apply migration"));
-        if (PQtransactionStatus(connection) != PQTRANS_INTRANS) {
-            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                    "A migration did not preserve the transaction.");
+        if (!useBaseline) {
+            ResultPointer applied = exec(connection, migration.sql);
+            if (!commandOk(applied.get())) return foundation::fail(databaseError(applied.get(), "apply migration"));
+            if (PQtransactionStatus(connection) != PQTRANS_INTRANS) {
+                return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                        "A migration did not preserve the transaction.");
+            }
         }
         ResultPointer recorded = execParams(connection,
             "INSERT INTO openproof.schema_migrations(version, checksum) VALUES($1, decode($2,'hex'))",

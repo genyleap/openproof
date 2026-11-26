@@ -294,6 +294,54 @@ TEST_F(PostgresIntegrationTest, ConcurrentMigrationChecksShareOneLedger)
     EXPECT_TRUE(pool->healthCheck());
 }
 
+TEST(PostgresMigrationBaselineTest, FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent)
+{
+    const char* dsn = std::getenv("OPENPROOF_TEST_BASELINE_POSTGRES");
+    const char* path = std::getenv("OPENPROOF_TEST_BASELINE_DIRECTORY");
+    const char* ack = std::getenv("OPENPROOF_TEST_BASELINE_ACK");
+    if (dsn == nullptr && path == nullptr && ack == nullptr)
+        GTEST_SKIP() << "Only the dedicated disposable baseline CI fixture is supported.";
+    ASSERT_NE(dsn, nullptr);
+    ASSERT_NE(path, nullptr);
+    ASSERT_NE(ack, nullptr);
+    ASSERT_STREQ(ack, "YES_EXCLUSIVE_DISPOSABLE_DATABASE");
+    auto config = pg::PoolConfig::create(
+        fnd::SecretString{dsn}, 1U, std::chrono::seconds{2});
+    ASSERT_TRUE(config);
+    auto pool = pg::ConnectionPool::create(std::move(config).value());
+    ASSERT_TRUE(pool);
+    pg::Migrator migrator{*pool.value()};
+    auto first = migrator.applyDirectory(std::filesystem::path{path});
+    ASSERT_TRUE(first) << (first ? "" : std::string{first.error().internalDetail()});
+    EXPECT_TRUE(first->usedBaseline);
+    EXPECT_GT(first->applied, 0U);
+    EXPECT_EQ(first->alreadyApplied, 0U);
+    auto repeat = migrator.applyDirectory(std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    ASSERT_TRUE(repeat);
+    EXPECT_FALSE(repeat->usedBaseline);
+    EXPECT_EQ(repeat->applied, 0U);
+    EXPECT_EQ(repeat->alreadyApplied, first->applied);
+    auto again = migrator.applyDirectory(std::filesystem::path{path});
+    ASSERT_TRUE(again);
+    EXPECT_FALSE(again->usedBaseline);
+    EXPECT_EQ(again->applied, 0U);
+    EXPECT_EQ(again->alreadyApplied, first->applied);
+    EXPECT_TRUE(pool.value()->healthCheck());
+}
+
+TEST_F(PostgresIntegrationTest, ExistingSchemaNeverRestoresSnapshot)
+{
+    const char* path = std::getenv("OPENPROOF_TEST_BASELINE_DIRECTORY");
+    if (path == nullptr)
+        GTEST_SKIP() << "No generated runtime baseline fixture.";
+    pg::Migrator migrator{*pool};
+    const auto result = migrator.applyDirectory(std::filesystem::path{path});
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(result->usedBaseline);
+    EXPECT_EQ(result->applied, 0U);
+    EXPECT_GT(result->alreadyApplied, 0U);
+}
+
 TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)
 {
     pg::PostgresPasskeyRepository repository{*pool};

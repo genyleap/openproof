@@ -98,6 +98,7 @@ private:
 struct MigrationReport final {
     std::size_t applied{};
     std::size_t alreadyApplied{};
+    bool usedBaseline{};
 };
 
 class Migrator final {

@@ -95,10 +95,47 @@ def canonical_dump(raw: bytes) -> bytes:
     return b"".join(lines)
 
 
+
+def runtime_baseline(raw: bytes) -> bytes:
+    # The current schema is created by the migrator before restoring the
+    # snapshot. Keep dump connection settings transaction-local.
+    lines = canonical_dump(raw).splitlines(keepends=True)
+    schema = b"CREATE SCHEMA openproof;\n"
+    search = b"SELECT pg_catalog.set_config('search_path', '', false);\n"
+    if lines.count(schema) != 1 or lines.count(search) != 1:
+        raise ValueError("Unexpected PostgreSQL baseline prologue")
+    result = []
+    for line in lines:
+        if line == schema:
+            result.append(b"CREATE SCHEMA IF NOT EXISTS openproof;\n")
+        elif line == search:
+            result.append(b"SELECT pg_catalog.set_config('search_path', '', true);\n")
+        elif line.startswith(b"SET "):
+            result.append(b"SET LOCAL " + line[4:])
+        else:
+            result.append(line)
+    return b"".join(result)
+
+
+def write_bundle(directory: Path, sql: bytes, files: list[Path]) -> None:
+    # A new destination prevents mixing a candidate with an old manifest.
+    directory.mkdir(parents=True, exist_ok=False)
+    (directory / "schema.sql").write_bytes(sql)
+    entries = [(hashlib.sha256(sql).hexdigest(), "schema.sql")]
+    entries.extend((hashlib.sha256(path.read_bytes()).hexdigest(), path.name)
+                   for path in files)
+    (directory / "checksums.txt").write_text(
+        "".join(f"{digest} {name}\n" for digest, name in entries),
+        encoding="ascii")
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--emit", action="store_true",
                         help="Write the validated development candidate SQL to stdout")
+    parser.add_argument("--output-dir", type=Path,
+                        help="Write the validated runtime candidate and checksum manifest")
     args = parser.parse_args()
     files = migration_files()
     # Environment inherited from CI may contain a DSN or PostgreSQL options.
@@ -152,8 +189,8 @@ def main() -> None:
             options = ("--schema-only", "--no-owner")
             # Keep ACLs and comments. Full database dump comparison also
             # catches unexpected schema/extension objects outside openproof.
-            baseline = canonical_dump(client("pg_dump", "reference", *options,
-                                             "--schema=openproof"))
+            baseline = runtime_baseline(client("pg_dump", "reference", *options,
+                                               "--schema=openproof"))
             client("psql", "candidate", "-X", "-q", "-v", "ON_ERROR_STOP=1",
                    "--single-transaction", "-f", "-", input_data=baseline)
             for dump_options in (options, ("--data-only", "--no-owner", "--inserts")):
@@ -164,6 +201,8 @@ def main() -> None:
             checksum = hashlib.sha256(baseline).hexdigest()
             print(f"PASS: {len(files)} migrations; schema and fresh data equivalent; "
                   f"candidate SHA-256={checksum}", file=sys.stderr)
+            if args.output_dir is not None:
+                write_bundle(args.output_dir, baseline, files)
             if args.emit:
                 sys.stdout.buffer.write(baseline)
         finally:
