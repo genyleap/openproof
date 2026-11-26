@@ -2515,6 +2515,138 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndT
     EXPECT_FALSE(locked->has_value());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeTotpCeremonyVerifiesActualSeedAndBurnsEnrollment)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace cred=openproof::credentials;
+    namespace sec=openproof::security;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U);
+    ASSERT_TRUE(policy);
+    auto maker=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    auto worker=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    ASSERT_TRUE(maker && worker);
+    auto hash=maker->hash(fnd::SecretString{"fixture-password"});
+    ASSERT_TRUE(hash);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms)"
+        " VALUES($1,$2,1770000000000)",{seed.owner,std::string{hash->encoded()}})));
+    auto passwords=cred::BoundedPasswordExecutor::create(std::move(worker).value(),1U);
+    auto key=sec::AeadKey::create(fnd::SecretString{std::string(32U,'k')});
+    auto readerKey=sec::AeadKey::create(fnd::SecretString{std::string(32U,'k')});
+    ASSERT_TRUE(passwords && key && readerKey);
+    asio::io_context io;
+    fnd::ManualClockSource clock{kNow};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},idp::ProviderId{"native-canonical-provider"},2U,500ms,1000ms,3000ms};
+    pg::CoroutineTotpEnrollment ceremony{store,*passwords.value(),std::move(key).value(),1U,clock};
+    auto run=[&]<typename T>(asio::awaitable<T> pending){
+        io.restart();
+        std::optional<T> output;
+        auto capture=[](asio::awaitable<T> task,std::optional<T>& target)->asio::awaitable<void>{
+            target.emplace(co_await std::move(task));
+        };
+        auto done=asio::co_spawn(io,capture(std::move(pending),output),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(output.value());
+    };
+    const ids::IdentityId owner{seed.owner};
+    constexpr auto ial1=idp::AssuranceLevel::Ial1,ial2=idp::AssuranceLevel::Ial2;
+    auto begin=[&](idp::AssuranceLevel assurance=idp::AssuranceLevel::Ial1){
+        return run(ceremony.beginAsync(owner,fnd::SecretString{"fixture-password"},assurance));
+    };
+    // Decode the actual enrollment response, as an authenticator would.
+    // The raw seed is neither fixed nor logged by the test.
+    auto codeAt=[](const pg::CoroutineTotpEnrollment::Start& started,fnd::Instant instant)->fnd::Result<std::string>{
+        constexpr std::string_view alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        std::string bytes;
+        std::uint32_t bits=0U,accumulator=0U;
+        for (const char ch:std::get<1>(started).expose()) {
+            const auto index=alphabet.find(ch);
+            if (index==std::string_view::npos) return fnd::fail(fnd::ErrorCode::InvalidArgument);
+            accumulator=(accumulator<<5U)|static_cast<std::uint32_t>(index);
+            bits+=5U;
+            if (bits>=8U) {
+                bits-=8U;
+                bytes.push_back(static_cast<char>((accumulator>>bits)&0xffU));
+            }
+        }
+        auto secret=cred::TotpSecret::create(fnd::SecretString{std::move(bytes)});
+        if (!secret) return fnd::fail(secret.error());
+        return cred::totpAt(secret.value(),cred::TotpPolicy::recommended(),instant);
+    };
+    auto codeFor=[&](const pg::CoroutineTotpEnrollment::Start& started){return codeAt(started,clock.now());};
+    EXPECT_FALSE(run(ceremony.beginAsync(owner,fnd::SecretString{"wrong-password"},ial1)));
+    EXPECT_FALSE(run(ceremony.beginAsync(ids::IdentityId{seed.foreignOwner},fnd::SecretString{"fixture-password"},ial1)));
+    auto expired=begin();
+    ASSERT_TRUE(expired);
+    clock.advance(10min);
+    auto expiredCode=codeFor(expired.value());
+    ASSERT_TRUE(expiredCode);
+    EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*expired),fnd::SecretString{expiredCode.value()},ial1)));
+    auto exhausted=begin();
+    ASSERT_TRUE(exhausted);
+    auto correct=codeFor(exhausted.value());
+    ASSERT_TRUE(correct);
+    auto earlier=codeAt(exhausted.value(),clock.now()-30s);
+    auto later=codeAt(exhausted.value(),clock.now()+30s);
+    ASSERT_TRUE(earlier && later);
+    std::string incorrect="000000";
+    for (char digit='0';digit<='3';++digit) {
+        incorrect.front()=digit;
+        if (incorrect!=correct.value() && incorrect!=earlier.value() && incorrect!=later.value()) break;
+    }
+    for (unsigned int attempt=0;attempt<5U;++attempt) {
+        EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*exhausted),fnd::SecretString{incorrect},ial1)));
+    }
+    EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*exhausted),fnd::SecretString{correct.value()},ial1)));
+    auto first=begin();
+    ASSERT_TRUE(first);
+    auto newest=begin();
+    ASSERT_TRUE(newest);
+    auto firstCode=codeFor(first.value());
+    auto newestCode=codeFor(newest.value());
+    ASSERT_TRUE(firstCode && newestCode);
+    EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*first),fnd::SecretString{firstCode.value()},ial1)));
+    EXPECT_FALSE(run(ceremony.completeAsync(ids::IdentityId{seed.secondOwner},std::get<0>(*newest),
+        fnd::SecretString{newestCode.value()},ial1)));
+    EXPECT_FALSE(std::get<3>(*newest));
+    ASSERT_TRUE(run(ceremony.completeAsync(owner,std::get<0>(*newest),fnd::SecretString{newestCode.value()},ial1)));
+    EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*newest),fnd::SecretString{newestCode.value()},ial1)));
+    auto snapshot=run(store.readAsync(idp::ExternalSubject{seed.subject}));
+    ASSERT_TRUE(snapshot && snapshot->has_value() && snapshot->value().encryptedTotpHex);
+    auto ciphertext=fnd::fromHex(*snapshot->value().encryptedTotpHex);
+    ASSERT_TRUE(ciphertext);
+    auto decrypted=sec::openAes256Gcm(readerKey.value(),ciphertext.value(),"openproof/totp/v1:"+seed.owner);
+    ASSERT_TRUE(decrypted);
+    auto installed=cred::TotpSecret::create(std::move(decrypted).value());
+    ASSERT_TRUE(installed);
+    EXPECT_TRUE(installed->enrollmentBase32().expose()==std::get<1>(*newest).expose());
+    EXPECT_FALSE(begin(ial1));
+    EXPECT_FALSE(run(ceremony.disableAsync(owner,fnd::SecretString{"fixture-password"},ial1)));
+    auto replacement=begin(ial2);
+    ASSERT_TRUE(replacement);
+    EXPECT_TRUE(std::get<3>(*replacement));
+    auto replacementCode=codeFor(replacement.value());
+    ASSERT_TRUE(replacementCode);
+    EXPECT_FALSE(run(ceremony.completeAsync(owner,std::get<0>(*replacement),fnd::SecretString{replacementCode.value()},ial1)));
+    ASSERT_TRUE(run(ceremony.completeAsync(owner,std::get<0>(*replacement),fnd::SecretString{replacementCode.value()},ial2)));
+    ASSERT_TRUE(run(ceremony.disableAsync(owner,fnd::SecretString{"fixture-password"},ial2)));
+    auto removed=run(store.readAsync(idp::ExternalSubject{seed.subject}));
+    ASSERT_TRUE(removed && removed->has_value());
+    EXPECT_FALSE(removed->value().encryptedTotpHex);
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeMfaMutationFencesOldLoginAndRecoveryGenerations)
 {
     const auto dsn=disposableDsn();

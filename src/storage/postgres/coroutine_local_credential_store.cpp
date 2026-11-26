@@ -3,6 +3,9 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <algorithm>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -546,5 +549,127 @@ asio::awaitable<foundation::Result<bool>> CoroutineLocalCredentialStore::rehashA
         co_return foundation::fail(foundation::ErrorCode::Unavailable, std::string{kUnavailable});
     }
 }
+class CoroutineTotpEnrollment::Impl final {
+public:
+    struct Pending final {
+        std::string id;
+        CoroutineLocalCredentialStore::OwnerCredential captured;
+        credentials::TotpSecret seed;
+        foundation::Instant expiresAt;
+        unsigned int attempts{};
+    };
+    Impl(CoroutineLocalCredentialStore& storeValue,credentials::BoundedPasswordExecutor& passwordsValue,
+        security::AeadKey keyValue,unsigned int version,const foundation::ClockSource& clockValue)
+        : store(storeValue),passwords(passwordsValue),key(std::move(keyValue)),keyVersion(version),clock(clockValue)
+    {
+        if (version==0U || version>static_cast<unsigned int>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument{"Invalid TOTP key version"};
+    }
+    CoroutineLocalCredentialStore& store;
+    credentials::BoundedPasswordExecutor& passwords;
+    security::AeadKey key;
+    unsigned int keyVersion;
+    const foundation::ClockSource& clock;
+    std::mutex mutex;
+    std::map<std::string,Pending> pending;
+};
+
+CoroutineTotpEnrollment::CoroutineTotpEnrollment(CoroutineLocalCredentialStore& store,
+    credentials::BoundedPasswordExecutor& passwords,security::AeadKey key,
+    unsigned int keyVersion,const foundation::ClockSource& clock)
+    : m_impl(std::make_unique<Impl>(store,passwords,std::move(key),keyVersion,clock)) {}
+CoroutineTotpEnrollment::~CoroutineTotpEnrollment()=default;
+
+asio::awaitable<foundation::Result<CoroutineTotpEnrollment::Start>>
+CoroutineTotpEnrollment::beginAsync(core::IdentityId owner,foundation::SecretString password,
+    idp::AssuranceLevel assurance)
+{
+    auto captured=co_await m_impl->store.confirmMfaPasswordAsync(owner,std::move(password),m_impl->passwords);
+    if (!captured) co_return foundation::fail(captured.error());
+    const bool replacing=captured->second.encryptedTotpHex.has_value();
+    if (replacing && !idp::meetsAssurance(assurance,idp::AssuranceLevel::Ial2))
+        co_return foundation::fail(foundation::ErrorCode::AssuranceInsufficient);
+    auto seed=credentials::TotpSecret::generate();
+    if (!seed) co_return foundation::fail(seed.error());
+    auto random=security::randomTokenBase64Url(24U);
+    if (!random) co_return foundation::fail(random.error());
+    std::string enrollmentId="opt_"+std::move(random).value();
+    auto base32=seed->enrollmentBase32();
+    constexpr auto lifetime=std::chrono::minutes{10};
+    const auto now=m_impl->clock.now();
+    if (now.time_since_epoch().count()<0 || now>foundation::Instant::max()-lifetime)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    const auto expires=now+lifetime;
+    {
+        const std::lock_guard guard{m_impl->mutex};
+        std::erase_if(m_impl->pending,[now](const auto& entry){return entry.second.expiresAt<=now;});
+        const std::string ownerName{owner.value()};
+        if (!m_impl->pending.contains(ownerName) && m_impl->pending.size()>=256U)
+            co_return foundation::fail(foundation::ErrorCode::RateLimited);
+        m_impl->pending.insert_or_assign(ownerName,Impl::Pending{enrollmentId,
+            std::move(captured).value(),std::move(seed).value(),expires,0U});
+    }
+    co_return Start{std::move(enrollmentId),std::move(base32),expires,replacing};
+}
+
+asio::awaitable<foundation::Status>
+CoroutineTotpEnrollment::completeAsync(core::IdentityId owner,std::string enrollmentId,
+    foundation::SecretString code,idp::AssuranceLevel assurance)
+{
+    if (!bounded(enrollmentId,200U) || code.expose().size()!=6U
+        || !std::ranges::all_of(code.expose(),[](char ch){return ch>='0' && ch<='9';}))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const auto now=m_impl->clock.now();
+    std::optional<CoroutineLocalCredentialStore::OwnerCredential> captured;
+    std::optional<CoroutineLocalCredentialStore::EncryptedTotpEnrollment> enrollment;
+    {
+        const std::lock_guard guard{m_impl->mutex};
+        const auto found=m_impl->pending.find(std::string{owner.value()});
+        if (found==m_impl->pending.end() || found->second.id!=enrollmentId)
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        auto& pending=found->second;
+        if (pending.expiresAt<=now) {
+            m_impl->pending.erase(found);
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        if (pending.captured.second.encryptedTotpHex
+            && !idp::meetsAssurance(assurance,idp::AssuranceLevel::Ial2))
+            co_return foundation::fail(foundation::ErrorCode::AssuranceInsufficient);
+        auto step=credentials::verifyTotp(pending.seed,credentials::TotpPolicy::recommended(),
+            code.expose(),now,std::nullopt);
+        code=foundation::SecretString{};
+        if (!step) {
+            if (++pending.attempts>=5U) m_impl->pending.erase(found);
+            co_return foundation::fail(step.error());
+        }
+        auto sealed=security::sealAes256Gcm(m_impl->key,pending.seed.bytes(),
+            "openproof/totp/v1:"+std::string{owner.value()});
+        if (!sealed) {
+            m_impl->pending.erase(found);
+            co_return foundation::fail(sealed.error());
+        }
+        enrollment.emplace(CoroutineLocalCredentialStore::EncryptedTotpEnrollment{
+            foundation::toHex(sealed.value()),m_impl->keyVersion,step.value()});
+        captured.emplace(std::move(pending.captured));
+        // Burn before suspension. Failure or ambiguous commit requires a
+        // fresh ceremony, never a second use of the same enrollment proof.
+        m_impl->pending.erase(found);
+    }
+    co_return co_await m_impl->store.changeTotpAsync(std::move(*captured),std::move(enrollment),now);
+}
+
+asio::awaitable<foundation::Status>
+CoroutineTotpEnrollment::disableAsync(core::IdentityId owner,foundation::SecretString password,
+    idp::AssuranceLevel assurance)
+{
+    if (!idp::meetsAssurance(assurance,idp::AssuranceLevel::Ial2))
+        co_return foundation::fail(foundation::ErrorCode::AssuranceInsufficient);
+    auto captured=co_await m_impl->store.confirmMfaPasswordAsync(owner,std::move(password),m_impl->passwords);
+    if (!captured) co_return foundation::fail(captured.error());
+    if (!captured->second.encryptedTotpHex)
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    co_return co_await m_impl->store.changeTotpAsync(std::move(captured).value(),std::nullopt,m_impl->clock.now());
+}
+
 
 }

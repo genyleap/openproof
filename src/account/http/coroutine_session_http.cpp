@@ -113,7 +113,7 @@ public:
     explicit ParsedPasswordGuard(json::value& parsed) noexcept : m_parsed(parsed) {}
     ~ParsedPasswordGuard() {
         if (m_parsed.is_object()) {
-            for (const auto name:{"password","secret","new_password"}) {
+            for (const auto name:{"password","secret","new_password","code"}) {
                 if (auto* value=m_parsed.as_object().if_contains(name);value && value->is_string()) {
                     auto& text=value->as_string();
                     foundation::secureWipe(text.data(),text.size());
@@ -676,6 +676,12 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
 }
 
 namespace {
+[[nodiscard]] bool totpMutationRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post &&
+        (request.path()=="/account/totp/start" || request.path()=="/account/totp/complete"
+            || request.path()=="/account/totp/disable");
+}
 [[nodiscard]] bool emailChangeVerifyRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post && request.path()=="/account/email/change/verify";
@@ -707,13 +713,14 @@ namespace {
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone,VerifyEmailChange verifyEmailChange)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone,VerifyEmailChange verifyEmailChange,TotpCallbacks totp)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
       m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
-      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)),m_verifyEmailChange(std::move(verifyEmailChange)) {}
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)),m_verifyEmailChange(std::move(verifyEmailChange)),m_totp(std::move(totp)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
+    if (totpMutationRoute(request) && m_totp) return true;
     if (emailChangeVerifyRoute(request) && m_verifyEmailChange) return static_cast<bool>(m_authenticate);
     if (phoneVerifyRoute(request) && m_verifyPhone) return static_cast<bool>(m_authenticate);
     if (resetRoute(request) && m_resetPassword) return true;
@@ -741,7 +748,7 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 {
     if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup))
         && !(resetRoute(request) && m_resetPassword) && !(phoneVerifyRoute(request) && m_verifyPhone)
-        && !(emailChangeVerifyRoute(request) && m_verifyEmailChange))
+        && !(emailChangeVerifyRoute(request) && m_verifyEmailChange) && !(totpMutationRoute(request) && m_totp))
         return m_fallback->handle(std::move(request));
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
@@ -751,6 +758,7 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 asio::awaitable<gateway::HttpResponse>
 CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
 {
+    if (totpMutationRoute(request) && m_totp) co_return co_await manageTotp(std::move(request));
     if ((phoneVerifyRoute(request) && m_verifyPhone) || (emailChangeVerifyRoute(request) && m_verifyEmailChange))
         co_return co_await verifyPhone(std::move(request));
     if ((signupRoute(request) && (m_signup || m_verifySignup)) || (resetRoute(request) && m_resetPassword))
@@ -814,6 +822,77 @@ CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
         std::move(destination));
     if (!status) co_return fail(status.error(),request);
     co_return jsonResponse(202,json::object{{"accepted",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::manageTotp(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    if (!m_totp) co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const bool completing=request.path()=="/account/totp/complete";
+    const bool starting=request.path()=="/account/totp/start";
+    std::string enrollmentId;
+    foundation::SecretString proof;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object() || parsed.as_object().size()!=(completing?2U:1U))
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto read=[&](const char* name,std::size_t limit)->std::optional<std::string_view>{
+            const auto* value=parsed.as_object().if_contains(name);
+            if (!value || !value->is_string()) return std::nullopt;
+            const std::string_view field{value->as_string().data(),value->as_string().size()};
+            if (field.empty() || field.size()>limit || std::ranges::any_of(field,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);return byte<0x20U || byte==0x7fU;
+            })) return std::nullopt;
+            return field;
+        };
+        const auto supplied=read(completing?"code":"password",completing?6U:1024U);
+        if (!supplied) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (completing) {
+            const auto id=read("enrollment_id",200U);
+            if (!id || supplied->size()!=6U || !std::ranges::all_of(*supplied,[](char ch){return ch>='0' && ch<='9';}))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            enrollmentId.assign(*id);
+        }
+        proof=foundation::SecretString{std::string{*supplied}};
+    }
+    request.wipeBody();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    // Sensitive MFA changes require a first-party session. Do not use the
+    // delegated-account authentication callback.
+    auto actor=co_await m_totp.authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    if (!m_limiter->allow("account:totp:identity:"+std::string{actor->identity().value()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (starting) {
+        auto started=co_await m_totp.begin(actor->identity(),std::move(proof),actor->assurance());
+        if (!started) co_return fail(started.error(),request);
+        auto& [id,seed,expiry,replacing]=started.value();
+        co_return jsonResponse(201,json::object{{"enrollment_id",id},{"secret_base32",seed.expose()},
+            {"expires_at_ms",expiry.time_since_epoch().count()},{"replacing",replacing}});
+    }
+    if (completing) {
+        auto status=co_await m_totp.complete(actor->identity(),std::move(enrollmentId),std::move(proof),actor->assurance());
+        if (!status) co_return fail(status.error(),request);
+        co_return jsonResponse(200,json::object{{"enabled",true}});
+    }
+    if (!identity::provider::meetsAssurance(actor->assurance(),identity::provider::AssuranceLevel::Ial2))
+        co_return fail(foundation::Error{foundation::ErrorCode::AssuranceInsufficient},request);
+    auto status=co_await m_totp.disable(actor->identity(),std::move(proof),actor->assurance());
+    if (!status) co_return fail(status.error(),request);
+    co_return jsonResponse(200,json::object{{"enabled",false},{"recovery_codes_revoked",true}});
 }
 
 asio::awaitable<gateway::HttpResponse>

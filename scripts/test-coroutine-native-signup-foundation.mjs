@@ -182,7 +182,7 @@ test("native password reset HTTP scrubs both secrets and only commits a precompu
   const storage=callback.indexOf("contactStore.resetPasswordAsync(");
   assert.ok(digest>=0 && digest<wipe && wipe<kdf && kdf<storage);
   assert.match(app,/if \(nativeResetPassword\) nativeMethods.emplace_back\("\/account\/password\/reset",gateway::HttpMethod::Post\)/);
-  assert.match(http,/\{"password","secret","new_password"\}/);
+  assert.match(http,/\{"password","secret","new_password","code"\}/);
   const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
   const reset=body.slice(body.indexOf("request.wipeBody();"),body.indexOf("if (signup) {",body.indexOf("request.wipeBody();")));
   assert.match(reset,/co_await m_resetPassword/);
@@ -284,4 +284,37 @@ test("native MFA management releases SQL before KDF and commits generation, seed
   assert.match(change,/factor.rows.front\(\)\[2\]==snapshot.totpEnrolledAt/);
   assert.match(change,/enrolled_at_ms=GREATEST\(t.enrolled_at_ms\+1,EXCLUDED.enrolled_at_ms\)/);
   assert.doesNotMatch(change,/SET password_hash|INSERT INTO openproof.identities/);
+});
+
+test("native TOTP ceremony bounds pending state, verifies code and burns before awaiting storage",()=>{
+  const store=read("src/storage/postgres/coroutine_local_credential_store.cpp");
+  const begin=store.slice(store.indexOf("CoroutineTotpEnrollment::beginAsync("),store.indexOf("CoroutineTotpEnrollment::completeAsync("));
+  assert.match(begin,/confirmMfaPasswordAsync\(/);
+  assert.match(begin,/replacing && !idp::meetsAssurance\(assurance,idp::AssuranceLevel::Ial2\)/);
+  assert.match(begin,/std::chrono::minutes\{10\}/);
+  assert.match(begin,/std::erase_if\(m_impl->pending/);
+  assert.match(begin,/m_impl->pending.size\(\)>=256U/);
+  assert.match(begin,/pending.insert_or_assign\(ownerName/);
+  const complete=store.slice(store.indexOf("CoroutineTotpEnrollment::completeAsync("),store.indexOf("CoroutineTotpEnrollment::disableAsync("));
+  assert.match(complete,/pending.find\(std::string\{owner.value\(\)\}\)/);
+  assert.match(complete,/found->second.id!=enrollmentId/);
+  assert.match(complete,/pending.expiresAt<=now/);
+  assert.match(complete,/\+\+pending.attempts>=5U/);
+  assert.match(complete,/credentials::verifyTotp\(pending.seed/);
+  assert.match(complete,/security::sealAes256Gcm\(m_impl->key,pending.seed.bytes\(\)/);
+  assert.match(complete,/openproof\/totp\/v1:/);
+  assert.match(complete,/pending.erase\(found\);\s*\}\s*co_return co_await m_impl->store.changeTotpAsync/);
+  const disable=store.slice(store.indexOf("CoroutineTotpEnrollment::disableAsync("));
+  assert.ok(disable.indexOf("meetsAssurance")<disable.indexOf("confirmMfaPasswordAsync"));
+  const app=read("apps/opp/main.cpp");
+  assert.match(app,/nativeTotp.authenticate=\[sessions=nativeSessions.get\(\)\]/);
+  for(const path of ["start","complete","disable"])
+    assert.ok(app.includes('nativeMethods.emplace_back("/account/totp/'+path+'",gateway::HttpMethod::Post)'));
+  const http=read("src/account/http/coroutine_session_http.cpp");
+  const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::manageTotp("),
+    http.indexOf("CoroutineContactVerificationAdapter::verifyPhone("));
+  assert.ok(body.indexOf("request.wipeBody();")<body.indexOf("co_await m_totp.authenticate("));
+  assert.doesNotMatch(body,/m_authenticate\(|m_fallback->handle\(/);
+  assert.match(body,/account:totp:identity:/);
+  assert.match(body,/recovery_codes_revoked/);
 });

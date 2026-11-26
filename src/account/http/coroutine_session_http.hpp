@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -132,9 +133,22 @@ public:
         identity::core::IdentityId,VerificationId,foundation::SecretString)>;
     using VerifyEmailChange=std::function<boost::asio::awaitable<foundation::Result<identity::profile::IdentityProfile>>(
         identity::core::IdentityId,VerificationId,foundation::SecretString,std::optional<foundation::SecretString>)>;
+    struct TotpCallbacks final {
+        using Start=std::tuple<std::string,foundation::SecretString,foundation::Instant,bool>;
+        Authenticate authenticate;
+        std::function<boost::asio::awaitable<foundation::Result<Start>>(
+            identity::core::IdentityId,foundation::SecretString,identity::provider::AssuranceLevel)> begin;
+        std::function<boost::asio::awaitable<foundation::Status>(
+            identity::core::IdentityId,std::string,foundation::SecretString,identity::provider::AssuranceLevel)> complete;
+        std::function<boost::asio::awaitable<foundation::Status>(
+            identity::core::IdentityId,foundation::SecretString,identity::provider::AssuranceLevel)> disable;
+        [[nodiscard]] explicit operator bool() const noexcept {
+            return authenticate && begin && complete && disable;
+        }
+    };
     CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue,
-        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={},ResetPassword resetPassword={},VerifyPhone verifyPhone={},VerifyEmailChange verifyEmailChange={});
+        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={},ResetPassword resetPassword={},VerifyPhone verifyPhone={},VerifyEmailChange verifyEmailChange={},TotpCallbacks totp={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
@@ -152,6 +166,8 @@ private:
     ResetPassword m_resetPassword;
     VerifyPhone m_verifyPhone;
     VerifyEmailChange m_verifyEmailChange;
+    TotpCallbacks m_totp;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> manageTotp(gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> verifyPhone(gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> signupOrVerify(gateway::HttpRequest request);
 };
