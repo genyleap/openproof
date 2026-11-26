@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+import openproof.administration;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
@@ -90,6 +91,12 @@ public:
         foundation::Result<organization::Membership>>
     readAuthorizationMembershipAsync(identity::core::IdentityId subject,
                                      identity::core::OrganizationId tenant);
+
+    /** Owner-only administration projection. Authorization and listing share
+     * one SQL snapshot, bound to the configured tenant. No credential reads.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<administration::MemberListing>>
+    readMembersAsync(identity::core::IdentityId actor);
 
     /** Trusted context for native protected-route policy evaluation.
      * All values are owned across suspension; authorization itself is still
