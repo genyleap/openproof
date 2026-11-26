@@ -1020,13 +1020,13 @@ struct SamlPermit final {
 };
 
 template<class Verifier>
-boost::asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+boost::asio::awaitable<std::optional<foundation::Result<idp::AuthenticationOutcome>>>
 verifySamlWorker(SamlPermit permit,const Verifier& provider,
                  idp::AuthenticationResponse response)
 {
     // The frame owns admission even if its waiting HTTP coroutine cancels.
     static_cast<void>(permit);
-    co_return provider.verify(response);
+    co_return std::optional<foundation::Result<idp::AuthenticationOutcome>>{provider.verify(response)};
 }
 }
 
@@ -1052,9 +1052,11 @@ SamlAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationRespo
         co_return foundation::fail(foundation::ErrorCode::RateLimited);
     SamlPermit permit{m_implementation->busy};
     try {
-        co_return co_await boost::asio::co_spawn(m_implementation->worker,
+        auto result=co_await boost::asio::co_spawn(m_implementation->worker,
             verifySamlWorker(std::move(permit),*m_implementation,std::move(response)),
             boost::asio::use_awaitable);
+        if (!result) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return std::move(*result);
     } catch (...) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable);
     }
