@@ -122,6 +122,35 @@ std::size_t ProxyConfig::responseBodyLimitBytes() const noexcept
 { return m_responseBodyLimitBytes; }
 std::string_view ProxyConfig::caFile() const noexcept { return m_caFile; }
 
+namespace {
+void scrubOwnedRequest(HttpRequest& request) noexcept
+{
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    request.wipeBody();
+    request.wipeTargetQuery();
+}
+
+struct OwnedRequestScrub final {
+    HttpRequest& request;
+    ~OwnedRequestScrub() { scrubOwnedRequest(request); }
+};
+
+struct WireRequestScrub final {
+    beastHttp::request<beastHttp::string_body>& request;
+    void clear() const noexcept
+    {
+        // Beast owns a separate string body. Its header allocator does not
+        // provide a secure erase API; removing headers is best effort only.
+        foundation::secureWipe(request.body().data(), request.body().size());
+        request.body().clear();
+        request.erase(beastHttp::field::authorization);
+        request.erase(beastHttp::field::cookie);
+    }
+    ~WireRequestScrub() { clear(); }
+};
+} // namespace
+
 class BeastProxyTransport::Implementation final {
 public:
     explicit Implementation(ProxyConfig config)
@@ -183,6 +212,7 @@ public:
     asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
         Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
     {
+        const OwnedRequestScrub scrub{request};
         if (timeout <= foundation::Duration::zero()) {
             co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                         "The upstream timeout must be positive.");
@@ -219,6 +249,7 @@ private:
         Endpoint endpoint, HttpRequest request,
         std::chrono::steady_clock::time_point deadline)
     {
+        const OwnedRequestScrub scrub{request};
         auto executor = co_await asio::this_coro::executor;
         if (std::chrono::steady_clock::now() >= deadline) {
             co_return foundation::fail(foundation::ErrorCode::Timeout,
@@ -307,11 +338,14 @@ private:
 private:
     template <typename Stream>
     asio::awaitable<foundation::Result<HttpResponse>> exchangeAsync(
-        Stream& stream, const Endpoint& endpoint, const HttpRequest& request,
+        Stream& stream, const Endpoint& endpoint, HttpRequest& request,
         std::chrono::steady_clock::time_point deadline)
     {
         boost::system::error_code error;
+        const bool headRequest = request.method() == HttpMethod::Head;
         auto outgoing = toBeast(endpoint, request);
+        const WireRequestScrub scrub{outgoing};
+        scrubOwnedRequest(request);
         // Framing and copying an outgoing body consume the same budget.
         if (std::chrono::steady_clock::now() >= deadline) {
             co_return foundation::fail(foundation::ErrorCode::Timeout,
@@ -320,6 +354,9 @@ private:
         beast::get_lowest_layer(stream).expires_at(deadline);
         static_cast<void>(co_await beastHttp::async_write(
             stream, outgoing, asio::redirect_error(asio::use_awaitable, error)));
+        // The async writer has completed, so its serialized body is no
+        // longer needed even if the upstream delays its response.
+        scrub.clear();
         // A successful completion may race timer expiry. Do not treat it
         // as permission to start a new read after the request deadline.
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -331,7 +368,7 @@ private:
         beastHttp::response_parser<beastHttp::string_body> parser;
         // HEAD has no response body even if Content-Length advertises the
         // corresponding GET representation. Set this before parsing any bytes.
-        parser.skip(request.method() == HttpMethod::Head);
+        parser.skip(headRequest);
         parser.header_limit(static_cast<std::uint32_t>(
             m_config.responseHeaderLimitBytes()));
         parser.body_limit(m_config.responseBodyLimitBytes());
