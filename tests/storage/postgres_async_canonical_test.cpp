@@ -803,6 +803,13 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
     auto weak=read(Read::Applications,std::nullopt,seed.owner,weakSession);
     ASSERT_FALSE(weak);
     EXPECT_EQ(weak.error().code(),fnd::ErrorCode::AssuranceInsufficient);
+    auto console=read(Read::Console);
+    ASSERT_TRUE(console);
+    EXPECT_EQ(console.value(),"{}");
+    EXPECT_FALSE(read(Read::Console,std::nullopt,seed.secondOwner));
+    auto weakConsole=read(Read::Console,std::nullopt,seed.owner,weakSession);
+    ASSERT_FALSE(weakConsole);
+    EXPECT_EQ(weakConsole.error().code(),fnd::ErrorCode::AssuranceInsufficient);
     EXPECT_FALSE(read(Read::Clients,foreignApp));
     auto clients=read(Read::Clients,app);
     ASSERT_TRUE(clients);
@@ -1090,6 +1097,7 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
+    EXPECT_FALSE(read(Read::Console));
     EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
     EXPECT_FALSE(runMutation(keyTask(client,"denied",pem)));

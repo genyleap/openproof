@@ -1142,10 +1142,19 @@ resource/scope grant. Deactivation remains available for inactive
 parents and does not replace grants or change already-issued token
 lifetime policy.
 
-The remaining PostgreSQL compatibility surfaces include
-the administration console,
-passkey operations, evidence/trust and enabled SCIM operations, as well
-as startup and offline administration.
+The administration console now uses the native first-party owner/IAL2
+session check before rendering. Its existing HTML and operation forms
+are shared with the compatibility renderer, with a fresh per-response
+CSP nonce and no-store caching. Unauthenticated browsers are redirected
+to login and insufficient assurance to account security. The server no
+longer constructs the synchronous application management HTTP API,
+application registry, resource registry, service identity service or JAR
+management service. The legacy client manager is still needed by the
+compatibility token service; it is not used for native management.
+
+The remaining PostgreSQL compatibility surfaces include passkey
+operations, evidence/trust and enabled SCIM operations, as well as
+startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

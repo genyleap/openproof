@@ -2759,6 +2759,9 @@ CoroutinePostgresCanonicalFinalizer::readApplicationManagementAsync(
         std::string query,label;
         Params args;
         switch(operation) {
+        case Read::Console:
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return std::string{"{}"};
         case Read::Applications:
             label="applications"; args={tenant};
             query=

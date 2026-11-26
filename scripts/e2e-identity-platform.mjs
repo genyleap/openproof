@@ -1506,6 +1506,20 @@ async function main() {
     expectStatus(adminConsole, 200);
     assert.match(adminConsole.body, /name="identity_id"/);
     assert.match(adminConsole.body, /identity_id:v\.identity_id/);
+    assert.equal(adminConsole.headers["cache-control"], "no-store");
+    assert.match(adminConsole.headers["content-security-policy"], /frame-ancestors 'none'/);
+    const consoleNonce = adminConsole.body.match(/<script nonce="([^"]+)">/);
+    assert.ok(consoleNonce);
+    assert.ok(adminConsole.headers["content-security-policy"].includes("'nonce-" + consoleNonce[1] + "'"));
+    if (nativeAccountRuntime) {
+      const guestConsole = await edgeRequest("/admin/console");
+      expectStatus(guestConsole, 303);
+      assert.equal(guestConsole.headers.location, "/login?return_to=%2Fadmin%2Fconsole");
+      assert.doesNotMatch(guestConsole.body, /OpenProof Admin Console/);
+      const nonOwnerConsole = await edgeRequest("/admin/console", { jar: consumerJarAfterReset });
+      expectStatus(nonOwnerConsole, 403);
+      assert.doesNotMatch(nonOwnerConsole.body, /OpenProof Admin Console/);
+    }
     const localMemberResponse = await jsonRequest("/admin/local-members", "POST", {
       identity_id: "e2e-dispatcher",
       subject: "dispatcher@e2e.invalid",

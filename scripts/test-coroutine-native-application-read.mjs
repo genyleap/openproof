@@ -10,8 +10,8 @@ const http=read("src/application/http/coroutine_management_read_http.cpp");
 const source=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sql=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::readApplicationManagementAsync("),
   source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateApplicationAsync("));
-test("five management reads exclusively use native first-party IAL2 authentication",()=>{
-  for(const route of ["/admin/applications","/admin/clients","/admin/clients/jar-key","/admin/resources","/admin/service-identities"])
+test("management reads exclusively use native first-party IAL2 authentication",()=>{
+  for(const route of ["/admin/console","/admin/applications","/admin/clients","/admin/clients/jar-key","/admin/resources","/admin/service-identities"])
     assert.ok(http.includes('r.path()=="'+route+'"'),route);
   assert.match(http,/r.method\(\)!=Method::Get/);
   assert.match(app,/nativePaths.emplace_back\(route\)/);
@@ -176,4 +176,32 @@ test("service provisioning and lifecycle commit identity and grants atomically a
   assert.match(fixture,/ASSERT_NE\(serviceA->has_value\(\),serviceB->has_value\(\)\)/);
   assert.match(fixture,/serviceChange\(SOp::Deactivate\)/);
   assert.match(fixture,/serviceChange\(SOp::Activate\)/);
+});
+test("console rendering is gated by native owner authorization and the synchronous management handler is retired",()=>{
+  assert.match(http,/r.path\(\)=="\/admin\/console"\) return ManagementRead::Console/);
+  const handler=http.slice(http.indexOf("CoroutineManagementReadAdapter::handleAsync("));
+  const ordered=["gateway::takeSessionCredential(r)","co_await m_authenticate",
+    "AssuranceLevel::Ial2","co_await m_read","if (!data)","if (console)",
+    "security::randomTokenBase64Url(24U)","renderAdministrationConsole("];
+  let previous=-1;
+  for(const term of ordered){
+    const index=handler.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(http,/\/login\?return_to=%2Fadmin%2Fconsole/);
+  assert.match(http,/\/account\/security/);
+  assert.match(sql,/case Read::Console:\s*static_cast<void>\(co_await execute\("COMMIT",\{\}\)\);\s*co_return std::string\{"\{\}"\}/);
+  assert.ok(sql.indexOf("assurance<2")<sql.indexOf("case Read::Console"));
+  assert.doesNotMatch(app,/\bApplicationManagementHttpApi\s+\w+\s*\{/);
+  assert.doesNotMatch(app,/\b(?:ResourceRegistry|ServiceIdentityService|ApplicationRegistry|JarService)\s+\w+\s*\{/);
+  const renderer=read("src/application/http/http.cpp").split("gateway::HttpResponse renderAdministrationConsole(")[1]
+    .split("gateway::HttpResponse ApplicationManagementHttpApi::listApplications(")[0];
+  assert.match(renderer,/OpenProof Admin Console/);
+  assert.match(renderer,/script-src 'nonce-/);
+  assert.match(renderer,/frame-ancestors 'none'/);
+  assert.match(renderer,/setHeader\("cache-control", "no-store"\)/);
+  assert.doesNotMatch(renderer,/m_\w+->/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/EXPECT_FALSE\(read\(Read::Console\)\)/);
+  assert.match(read("scripts/e2e-identity-platform.mjs"),/expectStatus\(guestConsole, 303\)/);
+  assert.match(read("scripts/e2e-identity-platform.mjs"),/expectStatus\(nonOwnerConsole, 403\)/);
 });

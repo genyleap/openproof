@@ -6,6 +6,7 @@
 
 import openproof.identity.provider;
 import openproof.security;
+import openproof.application.http;
 
 namespace openproof::application::http {
 namespace {
@@ -13,6 +14,7 @@ using E=foundation::ErrorCode;
 using Method=gateway::HttpMethod;
 std::optional<ManagementRead> operation(const gateway::HttpRequest& r) noexcept {
     if (r.method()!=Method::Get) return std::nullopt;
+    if (r.path()=="/admin/console") return ManagementRead::Console;
     if (r.path()=="/admin/applications") return ManagementRead::Applications;
     if (r.path()=="/admin/clients") return ManagementRead::Clients;
     if (r.path()=="/admin/clients/jar-key") return ManagementRead::JarKey;
@@ -300,8 +302,20 @@ gateway::HttpResponse failure(E code,const gateway::HttpRequest& r) {
     if (code==E::AuthenticationRequired) denied.setHeader("www-authenticate","Bearer");
     return denied;
 }
+gateway::HttpResponse consoleFailure(E code,const gateway::HttpRequest& r,bool console) {
+    if (!console || (code!=E::AuthenticationRequired && code!=E::AuthenticationFailed && code!=E::AssuranceInsufficient))
+        return failure(code,r);
+    const bool needsLogin=code!=E::AssuranceInsufficient;
+    gateway::HttpResponse result{303,gateway::Headers{{"location",
+        needsLogin?"/login?return_to=%2Fadmin%2Fconsole":"/account/security"},
+        {"cache-control","no-store"},{"pragma","no-cache"},{"x-content-type-options","nosniff"},
+        {"referrer-policy","no-referrer"}},{}};
+    if (needsLogin) result.addHeader("set-cookie",
+        "__Host-openproof-session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
+    return result;
+}
 foundation::Result<std::optional<std::string>> filter(const gateway::HttpRequest& r,ManagementRead op) {
-    if (op==ManagementRead::Applications || op==ManagementRead::Resources)
+    if (op==ManagementRead::Applications || op==ManagementRead::Resources || op==ManagementRead::Console)
         return std::optional<std::string>{};
     const auto target=r.target();
     const auto q=target.find('?');
@@ -387,14 +401,15 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         if (!parsed) co_return failure(parsed.error().code(),r);
         serviceCommand.emplace(std::move(parsed).value());
     }
+    const bool console=op==ManagementRead::Console;
     auto credential=gateway::takeSessionCredential(r);
-    if (!credential) co_return failure(credential.error().code(),r);
-    if (!credential->has_value()) co_return failure(E::AuthenticationRequired,r);
+    if (!credential) co_return consoleFailure(credential.error().code(),r,console);
+    if (!credential->has_value()) co_return consoleFailure(E::AuthenticationRequired,r,console);
     scrub(r);
     auto actor=co_await m_authenticate(std::move(credential->value()));
-    if (!actor) co_return failure(actor.error().code(),r);
+    if (!actor) co_return consoleFailure(actor.error().code(),r,console);
     if (!identity::provider::meetsAssurance(actor->assurance(),identity::provider::AssuranceLevel::Ial2))
-        co_return failure(E::AssuranceInsufficient,r);
+        co_return consoleFailure(E::AssuranceInsufficient,r,console);
     if (!m_limiter->allow("idp-admin-identity:"+std::string{actor->identity().value()}))
         co_return failure(E::RateLimited,r);
     if (command) {
@@ -490,7 +505,12 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         co_return response(op==Op::Create?201:200,std::move(output));
     }
     auto data=co_await m_read(*op,actor->identity(),actor->id(),std::move(selected));
-    if (!data) co_return failure(data.error().code(),r);
+    if (!data) co_return consoleFailure(data.error().code(),r,console);
+    if (console) {
+        auto nonce=security::randomTokenBase64Url(24U);
+        if (!nonce) co_return failure(nonce.error().code(),r);
+        co_return renderAdministrationConsole(std::move(nonce).value());
+    }
     co_return response(200,std::move(data).value());
 }
 }

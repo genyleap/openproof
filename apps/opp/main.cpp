@@ -579,7 +579,7 @@ extern "C" void requestShutdown(int) noexcept
 
 // Preserve local administration namespace ownership without constructing
 // any legacy SQL-backed HTTP administrator. Application-management routes
-// are handled by the outer application middleware before this boundary.
+// are owned by the native route overlay before this boundary.
 class LocalAdministrationFallback final : public gateway::HttpHandler {
 public:
     LocalAdministrationFallback(gateway::HttpHandler& fallback, gateway::TokenBucketRateLimiter& limiter)
@@ -3492,7 +3492,7 @@ addProtectedRoutes(gateway::Router& router,
                         std::move(sessionId),clock.now());
                 });
             nativeHandler=nativeManagement.get();
-            for (const auto* route : {"/admin/applications","/admin/applications/suspend",
+            for (const auto* route : {"/admin/console","/admin/applications","/admin/applications/suspend",
                 "/admin/applications/activate","/admin/applications/revoke","/admin/clients",
                 "/admin/clients/suspend","/admin/clients/activate","/admin/clients/revoke","/admin/clients/rotate-secret",
                 "/admin/clients/jar-key","/admin/resources","/admin/resources/suspend",
@@ -3890,20 +3890,12 @@ addProtectedRoutes(gateway::Router& router,
 
     nativeOAuthAccessLifetime=tokenPolicy->accessLifetime();
     nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime();
-    postgres::PostgresResourceRepository resourceRepository{*pool.value()};
-    resource::ResourceRegistry resourceRegistry{resourceRepository, clock};
-
-    application::ApplicationRegistry applicationRegistry{identityProviderStore, clock};
     client::ClientManager clientManager{
         identityProviderStore, identityProviderStore, clock,
         std::move(clientSecretKey).value()};
-    resource::ServiceIdentityService serviceIdentityService{
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        identities, resourceRepository, clientManager, clock};
     token::TokenService tokenService{
         identityProviderStore, clientManager, clock, std::move(tokenKey).value(),
         std::move(tokenPolicy).value()};
-    oauth::JarService jarService{identityProviderStore, identityProviderStore, clock};
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
         identityProviderStore, std::move(oidcPolicy).value(),
@@ -3938,13 +3930,7 @@ addProtectedRoutes(gateway::Router& router,
         limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
         authentication, providers, sessions, limiter.value(), authApi, &tokenService, true};
-    applicationHttp::ApplicationManagementHttpApi applicationApi{
-        applicationRegistry, identityProviderStore, clientManager,
-        identityProviderStore, resourceRegistry, serviceIdentityService, jarService,
-        sessions, memberships, limiter.value(),
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        federatedApi};
-    return runWithAccount(applicationApi, &tokenService);
+    return runWithAccount(federatedApi, &tokenService);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */
