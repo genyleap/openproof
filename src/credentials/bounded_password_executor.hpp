@@ -24,6 +24,10 @@ public:
     [[nodiscard]] bool prefersArgon2id() const noexcept;
     [[nodiscard]] foundation::Result<bool> upgradeNeeded(const PasswordHash& hash) const;
 
+    // New enrollment uses the same admission budget as login and upgrade.
+    // No plaintext password is supplied to persistence.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<PasswordHash>>
+    hashAsync(foundation::SecretString password);
     // Unknown accounts use a startup-generated dummy hash and always deny.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<bool>>
     verifyAsync(foundation::SecretString password, std::optional<PasswordHash> expected);

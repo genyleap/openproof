@@ -302,7 +302,18 @@ InMemoryAuthenticationTransactionStore::consumeAsync(
     TransactionId id, foundation::SecretString nonce,
     BindingDigest binding, foundation::Instant now)
 {
-    co_return consume(id, nonce, binding, now);
+    // Match native PostgreSQL: an unknown or non-pending generation is
+    // indistinguishable from an invalid proof. An initially pending but
+    // expired transaction still returns FailedPrecondition. Keep the
+    // legacy synchronous domain contract unchanged.
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const auto position=m_transactions.find(id);
+    if (position==m_transactions.end() || position->second.state()!=TransactionState::Pending)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "The authentication transaction is unknown or already consumed.");
+    auto outcome=position->second.consume(nonce,binding,now);
+    if (!outcome) co_return foundation::fail(outcome.error());
+    co_return position->second;
 }
 
 foundation::Result<std::optional<AuthenticationTransaction>>
