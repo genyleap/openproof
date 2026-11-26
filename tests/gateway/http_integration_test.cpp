@@ -373,9 +373,9 @@ struct DelayedCloseTlsProxyPeer final {
         return acceptor.local_endpoint().port();
     }
 
-    void start()
+    void start(bool headOnly = false)
     {
-        peer = std::thread{[this] {
+        peer = std::thread{[this, headOnly] {
             try {
                 Tcp::socket socket{io};
                 acceptor.accept(socket);
@@ -385,14 +385,21 @@ struct DelayedCloseTlsProxyPeer final {
                 beast::flat_buffer buffer;
                 beastHttp::request<beastHttp::string_body> request;
                 beastHttp::read(stream, buffer, request);
-                observedRequest = request.target() == "/native-tls-proxy";
+                observedRequest = request.target() == "/native-tls-proxy"
+                    && request.method() == (headOnly ? beastHttp::verb::head : beastHttp::verb::get);
 
                 beastHttp::response<beastHttp::string_body> response{
                     beastHttp::status::ok, request.version()};
                 response.set(beastHttp::field::content_type, "text/plain");
-                response.body() = "gateway-tls-complete";
                 response.keep_alive(false);
-                response.prepare_payload();
+                if (headOnly) {
+                    // No body is transmitted for HEAD, despite the nonzero
+                    // representation length. Keep the TLS socket open too.
+                    response.content_length(1024U);
+                } else {
+                    response.body() = "gateway-tls-complete";
+                    response.prepare_payload();
+                }
                 beastHttp::write(stream, response);
                 // Intentionally do not send TLS close_notify yet. The
                 // client must not wait after completing HTTP response framing.
@@ -1078,6 +1085,34 @@ TEST(BeastHttpIntegrationTest, NativeTlsProxyDoesNotWaitForPeerCloseNotify)
     // The peer keeps the TLS socket open for 750ms after sending a complete
     // Content-Length response. Gateway should already have completed.
     EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    if (upstream.peer.joinable()) upstream.peer.join();
+    EXPECT_TRUE(upstream.observedRequest);
+}
+
+TEST(BeastHttpIntegrationTest, NativeTlsHeadProxyCompletesWithoutResponseBody)
+{
+    DelayedCloseTlsProxyPeer upstream;
+    upstream.start(true);
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U, upstream.caFile).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(gw::EndpointId{"head-upstream"},
+        "localhost", upstream.port(), true, 1U);
+    ASSERT_TRUE(endpoint);
+    auto request = gw::HttpRequest::create(gw::HttpMethod::Head,
+        "/native-tls-proxy", {}, {}, "127.0.0.1", fnd::CorrelationId{"head-proxy-test"});
+    ASSERT_TRUE(request);
+    asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> response;
+    auto completion = asio::co_spawn(io, collectAsyncProxyResponse(
+        *proxy.value(), std::move(endpoint).value(), std::move(request).value(),
+        std::chrono::seconds{2}, response), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(completion.get());
+    ASSERT_TRUE(response && response->has_value());
+    EXPECT_EQ(response->value().status(), 200);
+    EXPECT_TRUE(response->value().body().empty());
+    EXPECT_EQ(response->value().headers().at("content-length"), "1024");
     if (upstream.peer.joinable()) upstream.peer.join();
     EXPECT_TRUE(upstream.observedRequest);
 }
