@@ -24,7 +24,6 @@ add_executable(openproof_tests
     authentication/http_test.cpp
     account/account_test.cpp
     administration/administration_test.cpp
-    administration/http_test.cpp
     session/session_test.cpp
     credentials/credentials_test.cpp
     providers/local_test.cpp
@@ -938,7 +937,8 @@ gtest_discover_tests(openproof_postgres_async_canonical_tests
     PROPERTIES LABELS "postgres;async;security")
 
 add_executable(openproof_admin_coroutine_http_tests
-    authentication/coroutine_admin_read_http_test.cpp)
+    authentication/coroutine_admin_read_http_test.cpp
+    administration/http_test.cpp)
 target_compile_features(openproof_admin_coroutine_http_tests PRIVATE cxx_std_26)
 set_target_properties(openproof_admin_coroutine_http_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
@@ -946,9 +946,9 @@ target_include_directories(openproof_admin_coroutine_http_tests BEFORE PRIVATE
     "${googletest_SOURCE_DIR}/googletest/include" "${PROJECT_SOURCE_DIR}/src/authentication/http")
 target_compile_definitions(openproof_admin_coroutine_http_tests PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_admin_coroutine_http_tests PRIVATE
-    openproof_administration_async_http openproof_security GTest::gtest_main openproof_test_compile_options)
+    openproof_administration_async_http openproof_authentication_http openproof_security GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(authentication/coroutine_admin_read_http_test.cpp
+    set_source_files_properties(authentication/coroutine_admin_read_http_test.cpp administration/http_test.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)

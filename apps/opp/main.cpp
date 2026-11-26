@@ -31,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <version>
 
@@ -46,6 +47,7 @@
 #include <boost/json.hpp>
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
 #include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
 #include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
@@ -70,7 +72,6 @@ import openproof.account;
 import openproof.account.delivery;
 import openproof.account.http;
 import openproof.administration;
-import openproof.administration.http;
 import openproof.application;
 import openproof.application.http;
 import openproof.client;
@@ -581,6 +582,33 @@ public:
     {
         return fnd::fail(fnd::ErrorCode::Unavailable);
     }
+};
+
+// Preserve local administration namespace ownership without constructing
+// any legacy SQL-backed HTTP administrator. Application-management routes
+// are handled by the outer application middleware before this boundary.
+class LocalAdministrationFallback final : public gateway::HttpHandler {
+public:
+    LocalAdministrationFallback(gateway::HttpHandler& fallback, gateway::TokenBucketRateLimiter& limiter)
+        : m_fallback(&fallback), m_limiter(&limiter) {}
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override
+    {
+        if (request.path()!="/admin" && !request.path().starts_with("/admin/"))
+            return m_fallback->handle(std::move(request));
+        const auto error=m_limiter->allow("admin-ip:"+std::string{request.remoteAddress()})
+            ? fnd::ErrorCode::NotFound : fnd::ErrorCode::RateLimited;
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return gateway::HttpResponse{fnd::errorHttpStatus(error),
+            gateway::Headers{{"content-type","application/json"},{"cache-control","no-store"},
+                {"pragma","no-cache"},{"x-content-type-options","nosniff"},{"referrer-policy","no-referrer"}},
+            fnd::toClientJson(fnd::Error{error},request.correlation().value())};
+    }
+private:
+    gateway::HttpHandler* m_fallback;
+    gateway::TokenBucketRateLimiter* m_limiter;
 };
 
 class DenyAccess final : public gateway::AccessController {
@@ -1606,7 +1634,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAdminReadEnabled = nativeAdminReadFlag && *nativeAdminReadFlag == "1";
+    if (platform.auth().enabled() && nativeAdminReadFlag && *nativeAdminReadFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Authenticated runtime requires native administration."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAdminReadEnabled = platform.auth().enabled()
+        || (nativeAdminReadFlag && *nativeAdminReadFlag == "1");
     if (nativeAdminReadEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native administration reads require native authentication sessions and authentication API."});
@@ -1952,9 +1986,6 @@ addProtectedRoutes(gateway::Router& router,
         nativeLocalTotpKey.emplace(std::move(key).value());
         nativeLocalRecoveryPepper.emplace(recoverySecret->clone());
     }
-    auto administrationPasswordHasher = credentials::PasswordHasher::create(
-        passwordSecret->clone(), credentials::PasswordPolicy::recommended(),
-        std::string{platform.security().passwordHashAlgorithm()});
     auto administrationTotpKey = security::AeadKey::create(totpSecret->clone());
     auto administrationAuditKey = audit::AuditKey::create(auditSecret->clone());
     auto authorizationAuditKey = audit::AuditKey::create(
@@ -1963,8 +1994,7 @@ addProtectedRoutes(gateway::Router& router,
         std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
         std::string{platform.security().passwordHashAlgorithm()});
     auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
-    if (!passwordHasher || !totpKey || !administrationPasswordHasher
-        || !administrationTotpKey || !administrationAuditKey
+    if (!passwordHasher || !totpKey || !administrationTotpKey || !administrationAuditKey
         || !authorizationAuditKey) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
@@ -1981,12 +2011,7 @@ addProtectedRoutes(gateway::Router& router,
 #endif
     auto recoveryCodes = credentials::RecoveryCodeService::create(
         recoveryRepository, std::move(recoverySecret).value());
-    auto administrationRepository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(administrationPasswordHasher).value(),
-        std::move(administrationTotpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(), providerId,
-        std::move(administrationAuditKey).value());
-    if (!accounts || !recoveryCodes || !administrationRepository) {
+    if (!accounts || !recoveryCodes) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -2617,6 +2642,7 @@ addProtectedRoutes(gateway::Router& router,
         nativeTransactions;
     std::unique_ptr<postgres::CoroutinePostgresCanonicalFinalizer>
         nativeCanonical;
+    std::unique_ptr<postgres::CoroutineAdminStore> nativeAdminStore;
     std::unique_ptr<postgres::CoroutinePostgresSessionRepository>
         nativeSessionRepository;
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
@@ -2669,6 +2695,19 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
+        if (nativeAdminReadEnabled) {
+            if (!nativeLocalPasswords) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native administration requires the bounded password executor."});
+                return ExitCode::ConfigurationError;
+            }
+            nativeAdminStore=std::make_unique<postgres::CoroutineAdminStore>(
+                executor,platform.database().connectionString().clone(),
+                identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                providerId,*nativeLocalPasswords,std::move(administrationTotpKey).value(),
+                platform.security().credentialEncryptionKeyVersion(),std::move(administrationAuditKey).value(),
+                nativeConnections,acquireDeadline,connectDeadline,queryDeadline);
+        }
         if (nativeConsentEnabled) {
             nativeConsentStore = std::make_unique<postgres::CoroutineConsentStore>(
                 executor, platform.database().connectionString().clone(),
@@ -3211,7 +3250,7 @@ addProtectedRoutes(gateway::Router& router,
             nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Post);
         }
         if (nativeAdminReadEnabled) {
-            if (!nativeSessions || !nativeCanonical) {
+            if (!nativeSessions || !nativeCanonical || !nativeAdminStore) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
                     "Native administration reader is unavailable."});
                 return ExitCode::ConfigurationError;
@@ -3225,9 +3264,18 @@ addProtectedRoutes(gateway::Router& router,
                 },
                 [canonical](identity::IdentityId actor) {
                     return canonical->readMembersAsync(std::move(actor));
-                });
+                }, adminHttp::CoroutineAdministrationReadAdapter::MutationContext{
+                    identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                    providerId,&clock,
+                    [store=nativeAdminStore.get()](identity::IdentityId actor,
+                        const adminHttp::CoroutineAdministrationReadAdapter::Command& command) {
+                        return store->mutateAsync(std::move(actor),command);
+                    }});
             nativeHandler = asyncAdminRead.get();
-            nativeMethods.emplace_back("/admin/local-members", gateway::HttpMethod::Get);
+            for (const auto* path : {"/admin/local-members","/admin/local-members/roles",
+                    "/admin/local-members/suspend","/admin/local-members/reinstate",
+                    "/admin/local-members/remove","/admin/local-members/credentials/reset"})
+                nativePaths.emplace_back(path);
         }
         if (nativeRecoveryEnabled) {
             nativePaths.emplace_back("/auth/recovery-codes");
@@ -3583,11 +3631,7 @@ addProtectedRoutes(gateway::Router& router,
             router, sessions, access, limiter.value(), discovery, loadBalancer,
             circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
         nativeGatewayCore = &gatewayCore;
-        adminHttp::AdministrationHttpApi administrationApi{
-            sessions, *administrationRepository.value(), identities, memberships,
-            limiter.value(),
-            identity::OrganizationId{std::string{platform.auth().organizationId()}},
-            providerId, clock, gatewayCore};
+        LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
         authHttp::AuthenticationHttpApi authApi{
             *nativeLocalAuthentication, *nativeSessions,
             limiter.value(), providerId, administrationApi};
@@ -3683,11 +3727,7 @@ addProtectedRoutes(gateway::Router& router,
         circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10},
         &tokenService, &senderProof};
     nativeGatewayCore = &gatewayCore;
-    adminHttp::AdministrationHttpApi administrationApi{
-        sessions, *administrationRepository.value(), identities, memberships,
-        limiter.value(),
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        providerId, clock, gatewayCore};
+    LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
     authHttp::AuthenticationHttpApi authApi{
         *nativeLocalAuthentication, *nativeSessions,
         limiter.value(), providerId, administrationApi};

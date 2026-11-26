@@ -952,18 +952,30 @@ Proof headers are ingress-only and stripped before forwarding. The
 existing retry deadline and circuit-breaker decisions are preserved.
 This is not full migration acceptance.
 
-### Experimental native owner-only member listing
+### Native owner-only local member administration
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS=1` enables only
-`GET /admin/local-members`; default is disabled. Requires the authentication
-API and native authentication sessions. A single asynchronous tenant-scoped
+Authenticated runtimes require the native local-member administration API.
+The historical `OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS` flag accepts
+unset or 1; setting it to 0 rejects startup. A single asynchronous tenant-scoped
 SQL snapshot verifies active owner membership before enumerating members.
 The read preserves identity status, membership state and sorted roles; it
 never selects credential material. Maximum 256 members and 16 roles per
 member; oversized or malformed results fail closed with 503 rather than
-silently truncating. All administrative mutations remain on compatibility
-routes. This bounded experimental projection requires full acceptance before
-default activation.
+silently truncating.
+
+Member creation, role replacement, suspend, reinstate, removal and credential
+reset use the native transaction store. The HTTP boundary requires IAL2 and
+a first-party session. The store rechecks active tenant ownership inside a
+bounded transaction, serializes administrative changes using the shared
+advisory lock, locks a surviving owner before removing an active owner,
+and commits session revocation, audit-chain sealing and security outbox
+records atomically with each mutation. Credential generation uses the shared
+bounded KDF executor outside a SQL lease; secrets are returned only after
+successful commit. The synchronous HTTP administration ABI is retired and
+cannot call storage. Offline bootstrap/rekey operations are unaffected.
+Application and OAuth client administration are separate API boundaries;
+this change does not migrate them. Full executable acceptance remains
+mandatory before release.
 
 ### Native public authentication and OIDC metadata
 

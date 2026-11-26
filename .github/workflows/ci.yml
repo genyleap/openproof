@@ -63,6 +63,7 @@ jobs:
           node scripts/test-coroutine-account-connections-contract.mjs
           node scripts/test-coroutine-account-totp-status-contract.mjs
           node scripts/test-native-admin-members-contract.mjs
+          node scripts/test-coroutine-admin-authorization.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
       - name: Native gateway transport retirement contract
         run: |

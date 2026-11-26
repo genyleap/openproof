@@ -1458,7 +1458,7 @@ async function main() {
     assert.equal(localMember.identity_id, "e2e-dispatcher");
     assert.ok(localMember.initial_password.length >= 32);
     assert.match(localMember.totp_secret_base32, /^[A-Z2-7]+$/);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/admin/local-members"), 401);
       expectStatus(await edgeRequest("/admin/local-members", { jar: consumerJarAfterReset }), 403);
       const listing = await edgeRequest("/admin/local-members", { jar: ownerJar });
@@ -1470,6 +1470,40 @@ async function main() {
       assert.ok(members.some(m => m.identity_id === "e2e-dispatcher" && m.roles.includes("dispatcher")));
       assert.ok(members.every(m => Object.keys(m).sort().join(",")
         === "identity_id,identity_status,membership_state,roles"));
+      const adminTarget = { identity_id: "e2e-dispatcher" };
+      // Protect the last active owner and deny unauthorized mutation before
+      // modifying any member or returning replacement credentials.
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { identity_id: "e2e-owner", roles: ["dispatcher"] }, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        { identity_id: "e2e-owner" }, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, consumerJarAfterReset), 403);
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { ...adminTarget, roles: ["dispatcher", "viewer"] }, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        adminTarget, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        adminTarget, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/reinstate", "POST",
+        adminTarget, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { ...adminTarget, roles: ["dispatcher"] }, ownerJar), 204);
+      const resetMember = await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, ownerJar);
+      expectStatus(resetMember, 200);
+      const replacement = jsonBody(resetMember);
+      assert.equal(replacement.identity_id, localMember.identity_id);
+      assert.notEqual(replacement.initial_password, localMember.initial_password);
+      assert.notEqual(replacement.totp_secret_base32, localMember.totp_secret_base32);
+      assert.equal(resetMember.headers["cache-control"], "no-store");
+      Object.assign(localMember, replacement);
+      const auditCount = command("psql", [databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT count(*) FROM openproof.audit_events a JOIN openproof.security_event_outbox o USING(event_id) WHERE a.category='administration' AND a.identity_id='e2e-dispatcher' AND a.action IN ('local-member.create','local-member.roles.replace','local-member.suspend','local-member.reinstate','local-member.credentials.reset') AND a.event_hash<>decode(repeat('00',32),'hex')"]).trim();
+      assert.equal(auditCount, "6");
+      console.log("- native administration: role/lifecycle/reset, final owner, denied credentials and atomic audit/outbox passed");
     }
 
     const applicationResponse = await jsonRequest("/admin/applications", "POST", {
@@ -1700,9 +1734,11 @@ async function main() {
       initialDispatcherTotp,
     );
     assert.equal(dispatcherGrant.assurance, "ial2");
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/admin/local-members", { jar: dispatcherJar }), 403);
-      console.log("- native owner-only administration listing: IAL2 non-owner denied");
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { identity_id: "e2e-dispatcher", roles: ["owner"] }, dispatcherJar), 403);
+      console.log("- native owner-only administration listing and mutation: IAL2 non-owner denied");
     }
 
     await stopOpp();
@@ -1771,6 +1807,18 @@ async function main() {
     const rotatedTokens = await authorizeAndExchange(
       clientId, clientSecret, ownerJarAfterMasterRotation, rotatedJwks);
     assert.equal(rotatedTokens.idHeader.kid, "e2e-new");
+
+    if (nativeAccountRuntime && !holdOpen) {
+      expectStatus(await jsonRequest("/admin/local-members/remove", "POST",
+        { identity_id: "e2e-dispatcher" }, ownerJarAfterMasterRotation), 204);
+      expectStatus(await edgeRequest("/account/profile", { jar: dispatcherJarAfterMasterRotation }), 401);
+      expectStatus(await jsonRequest("/admin/local-members/reinstate", "POST",
+        { identity_id: "e2e-dispatcher" }, ownerJarAfterMasterRotation), 412);
+      const removed = await edgeRequest("/admin/local-members", { jar: ownerJarAfterMasterRotation });
+      expectStatus(removed, 200);
+      assert.ok(jsonBody(removed).members.some(m => m.identity_id === "e2e-dispatcher"
+        && m.membership_state === "removed" && m.roles.length === 0));
+    }
 
     // Native consent mutation is tested only after the final token exchange,
     // never against the historical benchmark binary or interactive demo.

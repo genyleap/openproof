@@ -136,6 +136,7 @@ target_compile_definitions(openproof_administration_async_http PRIVATE BOOST_HAS
 target_link_libraries(openproof_administration_async_http PUBLIC
     openproof_administration openproof_foundation openproof_gateway openproof_gateway_http
     openproof_identity_core openproof_identity_provider openproof_organization openproof_session
+    openproof_credentials openproof_security
     Boost::headers PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_admin_read_http.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")

@@ -54,7 +54,10 @@ const checked = segments.map(([name, relative]) => {
   const sourcePaths = relative === "src/gateway/http.cpp"
     ? ["src/gateway/http.cpp", "src/gateway/http_proxy.cpp",
        "src/gateway/http_coroutine.cpp"]
-    : [relative];
+    : relative === "src/authentication/http/admin.cpp"
+      ? [relative, "src/authentication/http/coroutine_admin_read_http.cpp",
+         "src/storage/postgres/coroutine_admin_store.cpp"]
+      : [relative];
   const source = sourcePaths.map(file =>
     fs.readFileSync(path.join(root,file),"utf8")).join("\n");
   const executable = cppExecutableText(source);
@@ -1103,19 +1106,46 @@ const checked = segments.map(([name, relative]) => {
         expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
   }
   if(relative==="src/authentication/http/admin.cpp"){
-    // The actual HTTP implementation is under authentication/http/admin.cpp.
-    // administration/administration.cpp is pure command validation and should
-    // not be mistaken for the synchronous administrative HTTP service.
-    const handle = source.slice(
-      source.indexOf("AdministrationHttpApi::handle("),
-      source.indexOf("AdministrationHttpApi::listLocalMembers("));
-    if(!/m_memberships->find\s*\(\s*m_organization\s*,\s*actor\s*\)/.test(handle)
-       || !/membership->value\s*\(\s*\)\.hasRole\s*\(/.test(handle)
-       || !/organization::Role\s*\{\s*"owner"\s*\}/.test(handle)
-       || !/ErrorCode::PermissionDenied/.test(handle)
-       || handle.indexOf("m_memberships->find") > handle.indexOf("listLocalMembers(std::move(request))"))
-      issues.push({line:0,kind:"admin member listing lacks tenant-scoped active owner authorization",
-        expression:"m_memberships->find(m_organization, actor) / hasRole(owner) before listing"});
+    // Scan both the retired ABI and the real HTTP + SQL implementations.
+    // Pure command validation in administration.cpp never counts as I/O.
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    const http=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_admin_read_http.cpp"),"utf8");
+    const sql=fs.readFileSync(path.join(root,"src/storage/postgres/coroutine_admin_store.cpp"),"utf8");
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const runtime=app.slice(app.indexOf("ExitCode runGatewayServer("));
+    const routes=runtime.slice(runtime.indexOf('for (const auto* path : {"/admin/local-members"'),
+      runtime.indexOf("nativePaths.emplace_back(path);",runtime.indexOf('for (const auto* path : {"/admin/local-members"')));
+    const requiredRoutes=["/admin/local-members","/admin/local-members/roles","/admin/local-members/suspend",
+      "/admin/local-members/reinstate","/admin/local-members/remove","/admin/local-members/credentials/reset"];
+    const mutation=sql.slice(sql.indexOf("CoroutineAdminStore::mutateAsync("));
+    const write=mutation.indexOf('execute("BEGIN ISOLATION LEVEL READ COMMITTED"');
+    const authorize=mutation.indexOf('std::string{ownerSql}+" FOR UPDATE OF o,i,m,r"');
+    const record=mutation.indexOf("co_await appendRecords(");
+    const commit=mutation.indexOf('execute("COMMIT"');
+    const auth= http.indexOf("co_await m_authenticate(");
+    const assurance=http.indexOf("idp::AssuranceLevel::Ial2",auth);
+    const read=http.indexOf("co_await m_read(actor)",assurance);
+    const mutate=http.indexOf("co_await m_mutation->mutate(");
+    if(!/ErrorCode::Unavailable/.test(legacy) || /m_sessions->|m_members->|m_memberships->|m_identities->/.test(legacy)
+       || /AdministrationHttpApi administrationApi|PostgresAdministrationRepository::create\(/.test(runtime)
+       || !/const bool nativeAdminReadEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\|/.test(runtime)
+       || !/nativeAdminReadFlag && \*nativeAdminReadFlag == "0"/.test(runtime)
+       || !/store->mutateAsync\(std::move\(actor\),command\)/.test(runtime)
+       || !requiredRoutes.every(route=>routes.includes('"'+route+'"'))
+       || !(auth>=0 && assurance>auth && read>assurance && mutate>read)
+       || !/listing->actor != actor/.test(http) || !/role\.value\(\) == "owner"/.test(http)
+       || /m_fallback->handle\(/.test(http)
+       || !(write>=0 && authorize>write && record>authorize && commit>record)
+       || !/pg_advisory_xact_lock\(7299730475761673315\)/.test(mutation)
+       || !/m\.identity_id<>\$2 AND m\.state=1 AND i\.status=0/.test(mutation)
+       || !/FOR UPDATE OF m,i,r/.test(mutation)
+       || !/UPDATE openproof\.sessions SET state=1/.test(mutation)
+       || !/pg_advisory_xact_lock\(7299730475761673314\)/.test(sql)
+       || !/audit::computeAuditRecordHash/.test(sql)
+       || !/INSERT INTO openproof\.security_event_outbox/.test(sql)
+       || !/co_await m_impl->passwords->hashAsync/.test(mutation))
+      issues.push({line:0,kind:"admin HTTP lifecycle has incomplete native authorization, persistence or retirement",
+        expression:"strict native HTTP -> IAL2/owner -> atomic async mutation, audit and outbox"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().
