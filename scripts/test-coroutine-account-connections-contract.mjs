@@ -231,3 +231,20 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /if \(!returned\) std::terminate\(\)/);
   assert.doesNotMatch(implementation, /std::condition_variable/);
 });
+
+test("native account connections retain legacy registered-provider projection", () => {
+  const start = app.indexOf("connectionsReader = [reader, registered = providers.ids()]");
+  const end = app.indexOf("ReadTotpStatus totpStatusReader", start);
+  assert.ok(start >= 0 && end > start);
+  const adapter = app.slice(start, end);
+  assert.match(adapter, /co_await reader->readConnectionsAsync\(std::move\(owner\)\)/);
+  assert.match(adapter, /std::erase_if\(result->second/);
+  assert.match(adapter, /std::ranges::find\(registered, external\.providerId\(\)\) == registered\.end\(\)/);
+  const e2e = read("scripts/e2e-identity-platform.mjs");
+  const insert = e2e.indexOf("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) \" +");
+  const fixture = e2e.indexOf("fixture-retired-provider", insert);
+  const readList = e2e.indexOf("const connectionsBefore = await edgeRequest", fixture);
+  const stress = e2e.indexOf("const reads = await Promise.all(Array.from({ length: 8 }", readList);
+  const cleanup = e2e.indexOf("DELETE FROM openproof.external_identities WHERE provider='fixture-retired-provider'", stress);
+  assert.ok(insert >= 0 && fixture > insert && readList > fixture && stress > readList && cleanup > stress);
+});
