@@ -113,10 +113,12 @@ public:
     explicit ParsedPasswordGuard(json::value& parsed) noexcept : m_parsed(parsed) {}
     ~ParsedPasswordGuard() {
         if (m_parsed.is_object()) {
-            if (auto* value = m_parsed.as_object().if_contains("password"); value && value->is_string()) {
-                auto& text = value->as_string();
-                foundation::secureWipe(text.data(),text.size());
-                text.clear();
+            for (const auto name:{"password","secret"}) {
+                if (auto* value=m_parsed.as_object().if_contains(name);value && value->is_string()) {
+                    auto& text=value->as_string();
+                    foundation::secureWipe(text.data(),text.size());
+                    text.clear();
+                }
             }
         }
     }
@@ -674,6 +676,11 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
 }
 
 namespace {
+[[nodiscard]] bool signupRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && (request.path()=="/account/signup" || request.path()=="/account/email/verify");
+}
 [[nodiscard]] bool contactIssueRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post
@@ -688,12 +695,14 @@ namespace {
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue,PublicIssue publicIssue)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
-      m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)) {}
+      m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
+    if (signupRoute(request) && (m_signup || m_verifySignup)) return m_signup && m_verifySignup;
     if (contactIssueRoute(request)) return publicEmailIssue(request) ? static_cast<bool>(m_publicIssue)
         : static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
     return m_fallback->nativeEnabledFor(request);
@@ -715,7 +724,8 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
 
 gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
 {
-    if (!contactIssueRoute(request)) return m_fallback->handle(std::move(request));
+    if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup)))
+        return m_fallback->handle(std::move(request));
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
     return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
@@ -724,6 +734,8 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 asio::awaitable<gateway::HttpResponse>
 CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
 {
+    if (signupRoute(request) && (m_signup || m_verifySignup))
+        co_return co_await signupOrVerify(std::move(request));
     if (!contactIssueRoute(request)) {
         if (m_fallback->nativeEnabledFor(request))
             co_return co_await m_fallback->handleAsync(std::move(request));
@@ -783,6 +795,87 @@ CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
         std::move(destination));
     if (!status) co_return fail(status.error(),request);
     co_return jsonResponse(202,json::object{{"accepted",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    if (!m_signup || !m_verifySignup)
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const bool signup=request.path()=="/account/signup";
+    std::string identifier;
+    std::optional<std::string> displayName;
+    foundation::SecretString proof;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        auto& object=parsed.as_object();
+        for (const auto& entry:object) {
+            if (signup ? (entry.key()!="email" && entry.key()!="password" && entry.key()!="display_name")
+                       : (entry.key()!="verification_id" && entry.key()!="secret"))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        }
+        const auto bounded=[&](const char* name,std::size_t maximum)->std::optional<std::string_view>{
+            const auto* field=object.if_contains(name);
+            if (!field || !field->is_string()) return std::nullopt;
+            const std::string_view value{field->as_string().data(),field->as_string().size()};
+            if (value.empty() || value.size()>maximum || std::ranges::any_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7fU;
+            })) return std::nullopt;
+            return value;
+        };
+        const auto name=bounded(signup?"email":"verification_id",signup?320U:200U);
+        const auto secret=bounded(signup?"password":"secret",signup?1024U:512U);
+        if (!name || !secret)
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (signup && object.contains("display_name") && !object.at("display_name").is_null()) {
+            const auto label=bounded("display_name",256U);
+            if (!label) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            displayName=std::string{*label};
+        }
+        identifier.assign(*name);
+        proof=foundation::SecretString{std::string{*secret}};
+    }
+    request.wipeBody();
+    if (signup) {
+        auto owner=co_await m_signup(std::move(identifier),std::move(proof),std::move(displayName));
+        if (!owner) co_return fail(owner.error(),request);
+        if (owner->empty()) co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+        co_return jsonResponse(201,json::object{{"identity_id",owner->value()},{"verification_required",true}});
+    }
+    identity::provider::ClientContext client;
+    client.setRemoteAddress(std::string{request.remoteAddress()});
+    if (const auto agent=request.header("user-agent"))
+        client.setUserAgent(std::string{agent->substr(0U,1024U)});
+    auto issued=co_await m_verifySignup(VerificationId{std::move(identifier)},std::move(proof),std::move(client));
+    if (!issued) co_return fail(issued.error(),request);
+    const auto safe=[](std::string_view value){
+        return !value.empty() && value.size()<=128U && std::ranges::all_of(value,[](char ch){
+            return (ch>='a' && ch<='z') || (ch>='A' && ch<='Z')
+                || (ch>='0' && ch<='9') || ch=='-' || ch=='_';
+        });
+    };
+    if (!safe(issued->id.value()) || !safe(issued->token.expose()))
+        co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+    auto response=jsonResponse(200,json::object{{"verified",true},{"session_id",issued->id.value()},
+        {"assurance",identity::provider::assuranceLevelName(identity::provider::AssuranceLevel::Ial1)}});
+    response.addHeader("set-cookie","__Host-openproof-session="+std::string{issued->token.expose()}
+        +"; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Strict");
+    co_return response;
 }
 
 } // namespace openproof::account::http

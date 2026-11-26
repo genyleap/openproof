@@ -64,7 +64,7 @@ test("signup proof activation binds tenant, owner, purpose and reservation befor
     "security::constantTimeEquals","r.verification_id IS NULL",
     "INSERT INTO openproof.external_identities","UPDATE openproof.identity_profiles",
     "UPDATE openproof.identities SET status=0","const auto consumed=","const auto released=",
-    'connection.query("COMMIT",{},remaining(deadline)));\n        co_return core::ExternalIdentityRef'];
+    'connection.query("COMMIT",{},remaining(deadline)));\n        co_return ActivatedSignup'];
   let previous=-1;
   for(const marker of order){
     const i=body.indexOf(marker);
@@ -85,4 +85,30 @@ test("signup delivery compensation leaves the untagged reservation available for
   assert.match(body,/c.purpose=\$3 AND i.id=c.identity_id AND i.organization_id=\$4/);
   assert.match(body,/r.verification_id=c.id AND r.identity_id=c.identity_id/);
   assert.doesNotMatch(body,/DELETE FROM openproof.password_credentials|DELETE FROM openproof.identities/);
+});
+
+test("native signup pair shares bounded KDF and owner-bound verification before issuing session",()=>{
+  const app=read("apps/opp/main.cpp");
+  const auth=read("src/authentication/service.cpp");
+  const http=read("src/account/http/coroutine_session_http.cpp");
+  const signup=app.slice(app.indexOf("nativeSignup=[&]("),app.indexOf("nativeVerifySignup=[&]("));
+  const verify=app.slice(app.indexOf("nativeVerifySignup=[&]("),app.indexOf("nativeContactIssuer=&contactIssuer;"));
+  const order=(body,markers)=>{
+    let previous=-1;
+    for(const marker of markers){
+      const index=body.indexOf(marker);
+      assert.ok(index>previous,marker);previous=index;
+    }
+  };
+  order(signup,["hashAsync(std::move(password))","provisionSignupAsync(","deliverAsync(","discardAsync(generation,owner"]);
+  order(verify,["VerificationPreparation::digest(","secret=fnd::SecretString{}","activateSignupAsync(",
+    "acceptVerifiedEmailAsync(","std::move(activated->first),std::move(activated->second)","nativeSessions->issueAsync("]);
+  assert.match(auth,/authorizeHandoffOwnerAsync\(expectedOwner,external\)/);
+  assert.match(app,/nativeSignupFlag && \*nativeSignupFlag=="1"/);
+  assert.match(app,/nativeMethods.emplace_back\("\/account\/signup",gateway::HttpMethod::Post\)/);
+  assert.match(app,/nativeMethods.emplace_back\("\/account\/email\/verify",gateway::HttpMethod::Post\)/);
+  const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
+  order(body,["ParsedPasswordGuard wipeParsed","request.wipeBody();","co_await m_signup(","co_await m_verifySignup(",
+    "if (!safe(issued->id.value())","response.addHeader(\"set-cookie\""]);
+  assert.doesNotMatch(body,/m_fallback->handle\(|m_accounts->/);
 });

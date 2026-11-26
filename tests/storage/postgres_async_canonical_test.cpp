@@ -1623,14 +1623,14 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
     const auto existing="existing-"+seed.suffix+"@example.test";
     const auto ambiguous="ambiguous-"+seed.suffix+"@example.test";
     const auto broken="rollback-"+seed.suffix+"@example.test";
-    using Result=fnd::Result<pg::CoroutineVerificationChallengeStore::PendingSignup>;
+    using SignupResult=fnd::Result<pg::CoroutineVerificationChallengeStore::PendingSignup>;
     auto capture=[&](pg::CoroutineVerificationChallengeStore& adapter,std::string destination,
-        std::optional<Result>& result)->asio::awaitable<void> {
+        std::optional<SignupResult>& result)->asio::awaitable<void> {
         result.emplace(co_await adapter.provisionSignupAsync(provider,std::move(destination),
             password.value(),std::string{"Fixture signup"},key.value(),kNow,24h));
     };
     auto run=[&](pg::CoroutineVerificationChallengeStore& adapter,std::string destination){
-        std::optional<Result> result;
+        std::optional<SignupResult> result;
         io.restart();
         auto done=asio::co_spawn(io,capture(adapter,std::move(destination),result),asio::use_future);
         io.run();
@@ -1644,7 +1644,7 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
         auto rows=query(sql,params);
         return std::string{PQgetvalue(rows.get(),0,0)};
     };
-    std::optional<Result> first,second;
+    std::optional<SignupResult> first,second;
     io.restart();
     auto a=asio::co_spawn(io,capture(store,email,first),asio::use_future);
     auto b=asio::co_spawn(io,capture(store,email,second),asio::use_future);
@@ -1670,7 +1670,7 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
         "WHERE id=$1 AND identity_id=$2 AND purpose=0 AND secret_digest=decode($3,'hex')",
         {std::string{winner->dispatch.id().value()},owner,fnd::toHex(digest->bytes())}),"1");
     EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"0");
-    using Activated=fnd::Result<ids::ExternalIdentityRef>;
+    using Activated=fnd::Result<pg::CoroutineVerificationChallengeStore::ActivatedSignup>;
     pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),fnd::SecretString{*dsn},
         ids::OrganizationId{seed.foreignOrg},1U,500ms,1000ms,3000ms};
     const auto activate=[&](pg::CoroutineVerificationChallengeStore& adapter,acc::VerificationId id,

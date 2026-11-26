@@ -333,7 +333,7 @@ CoroutineVerificationChallengeStore::provisionSignupAsync(
     }
 }
 
-asio::awaitable<foundation::Result<core::ExternalIdentityRef>>
+asio::awaitable<foundation::Result<CoroutineVerificationChallengeStore::ActivatedSignup>>
 CoroutineVerificationChallengeStore::activateSignupAsync(
     identity::provider::ProviderId provider,account::VerificationId id,
     account::VerificationDigest presented,foundation::Instant now,std::uint32_t maximumAttempts)
@@ -476,7 +476,8 @@ CoroutineVerificationChallengeStore::activateSignupAsync(
             std::move(releaseParams),remaining(deadline));
         if (!exactRow(released,owner)) throw std::runtime_error{"Signup reservation changed"};
         static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
-        co_return core::ExternalIdentityRef{std::move(provider),identity::provider::ExternalSubject{destination}};
+        co_return ActivatedSignup{core::ExternalIdentityRef{std::move(provider),
+            identity::provider::ExternalSubject{destination}},core::IdentityId{owner}};
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
             "Native signup activation is unavailable.");

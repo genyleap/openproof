@@ -1009,6 +1009,20 @@ async function main() {
       secret: notifications[0].secret,
     });
     expectStatus(verifiedEmail, 200);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+      assert.equal(jsonBody(verifiedEmail).verified, true);
+      assert.ok(jsonBody(verifiedEmail).session_id);
+      const replay = await jsonRequest("/account/email/verify", "POST", {
+        verification_id: notifications[0].verification_id,
+        secret: notifications[0].secret,
+      });
+      expectStatus(replay, 401);
+      assert.equal(replay.headers["set-cookie"], undefined);
+      assert.equal(command("psql", [
+        databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "select count(*) from openproof.pending_external_identity_reservations where provider='local' and external_subject='consumer@e2e.invalid'",
+      ]).trim(), "0");
+    }
     notifications[0].demo_verified = true;
     const consumerIdentityId = command("psql", [
       databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
