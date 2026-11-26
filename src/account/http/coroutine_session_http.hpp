@@ -126,9 +126,11 @@ public:
         std::string,foundation::SecretString,std::optional<std::string>)>;
     using VerifySignup=std::function<boost::asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>(
         VerificationId,foundation::SecretString,identity::provider::ClientContext)>;
+    using ResetPassword=std::function<boost::asio::awaitable<foundation::Status>(
+        VerificationId,foundation::SecretString,foundation::SecretString)>;
     CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue,
-        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={});
+        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={},ResetPassword resetPassword={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
@@ -143,6 +145,7 @@ private:
     PublicIssue m_publicIssue;
     Signup m_signup;
     VerifySignup m_verifySignup;
+    ResetPassword m_resetPassword;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> signupOrVerify(gateway::HttpRequest request);
 };
 

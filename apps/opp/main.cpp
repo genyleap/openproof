@@ -2828,6 +2828,7 @@ addProtectedRoutes(gateway::Router& router,
     accountDelivery::CoroutineContactVerificationIssuer* nativeContactIssuer=nullptr;
     accountHttp::CoroutineContactVerificationAdapter::Signup nativeSignup;
     accountHttp::CoroutineContactVerificationAdapter::VerifySignup nativeVerifySignup;
+    accountHttp::CoroutineContactVerificationAdapter::ResetPassword nativeResetPassword;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -3020,7 +3021,7 @@ addProtectedRoutes(gateway::Router& router,
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
                 },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
                     return issuer->issuePublicEmailAsync(purpose,std::move(destination));
-                },nativeSignup,nativeVerifySignup);
+                },nativeSignup,nativeVerifySignup,nativeResetPassword);
             nativeHandler=asyncContact.get();
         }
         if (nativeConsentEnabled) {
@@ -3126,6 +3127,7 @@ addProtectedRoutes(gateway::Router& router,
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
+            if (nativeResetPassword) nativeMethods.emplace_back("/account/password/reset",gateway::HttpMethod::Post);
             if (nativeSignupEnabled) {
                 nativeMethods.emplace_back("/account/signup",gateway::HttpMethod::Post);
                 nativeMethods.emplace_back("/account/email/verify",gateway::HttpMethod::Post);
@@ -3444,10 +3446,25 @@ addProtectedRoutes(gateway::Router& router,
                 co_return co_await nativeSessions->issueAsync(verified.value(),std::move(client));
             };
         }
+        // Keep reset cutover coupled to the isolated native signup opt-in
+        // until session-generation fencing and live acceptance are verified.
+        if (nativeSignupEnabled) {
+            nativeResetPassword=[&](account::VerificationId id,fnd::SecretString secret,fnd::SecretString password)
+                ->boost::asio::awaitable<fnd::Status> {
+                auto digest=account::VerificationPreparation::digest(signupKey.value(),id,secret);
+                secret=fnd::SecretString{};
+                if (!digest) co_return fnd::fail(digest.error());
+                auto hashed=co_await nativeLocalPasswords->hashAsync(std::move(password));
+                if (!hashed) co_return fnd::fail(hashed.error());
+                co_return co_await contactStore.resetPasswordAsync(providerId,std::move(id),digest.value(),
+                    std::move(hashed).value(),clock.now(),accountPolicy->maximumAttempts());
+            };
+        }
         nativeContactIssuer=&contactIssuer;
         const auto result=runWithPasskey(accountApi,delegated);
         nativeSignup={};
         nativeVerifySignup={};
+        nativeResetPassword={};
         nativeContactIssuer=nullptr;
         return result;
     };

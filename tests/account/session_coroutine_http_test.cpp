@@ -845,7 +845,7 @@ TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOn
     fnd::ManualClockSource clock{kNow};
     NativeFallback fallback;
     auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
-    int signups=0,verifications=0;
+    int signups=0,verifications=0,resets=0;
     bool deliveryFailure=false,invalidGrant=false;
     http::CoroutineContactVerificationAdapter api{
         fallback,limiter,{},{},{},
@@ -866,6 +866,15 @@ TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOn
                 co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
             co_return sess::CoroutineIssuedSession{sess::SessionId{"verified-session"},
                 fnd::SecretString{invalidGrant?"bad;cookie":"session-bearer"}};
+        },
+        [&](account::VerificationId id,fnd::SecretString proof,fnd::SecretString password)
+            ->asio::awaitable<fnd::Status> {
+            ++resets;
+            EXPECT_EQ(id.value(),"fixture-proof");
+            EXPECT_EQ(password.expose(),"replacement-password");
+            if (proof.expose()!="valid-secret")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return fnd::ok();
         }};
     auto run=[&](gw::HttpRequest input){
         asio::io_context io;
@@ -905,6 +914,21 @@ TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOn
     EXPECT_EQ(verified.body().find("session-bearer"),std::string::npos);
     EXPECT_EQ(verified.headers().at("cache-control"),"no-store");
     EXPECT_EQ(verifications,3);
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/password/reset")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/password/reset")));
+    EXPECT_EQ(post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"short"})").status(),400);
+    EXPECT_EQ(post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"replacement-password","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(resets,0);
+    auto deniedReset=post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"wrong-secret","new_password":"replacement-password"})");
+    EXPECT_EQ(deniedReset.status(),401);
+    EXPECT_FALSE(deniedReset.headers().contains("set-cookie"));
+    auto completedReset=post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"replacement-password"})");
+    EXPECT_EQ(completedReset.status(),200);
+    EXPECT_TRUE(json::parse(completedReset.body()).as_object().at("password_reset").as_bool());
+    EXPECT_FALSE(completedReset.headers().contains("set-cookie"));
+    EXPECT_EQ(completedReset.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(resets,2);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/password/reset")).status(),503);
     EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/signup")).status(),503);
     EXPECT_EQ(fallback.invoked,0);
 }
