@@ -85,8 +85,9 @@ set_target_properties(openproof_postgres_async_repository PROPERTIES
 target_compile_definitions(openproof_postgres_async_repository PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_repository
-    PUBLIC openproof_storage_postgres openproof_postgres_async_io
-        openproof_session openproof_foundation Boost::headers
+    PUBLIC openproof_postgres_async_io
+        openproof_session openproof_foundation openproof_security
+        openproof_identity_core openproof_identity_provider Boost::headers
     PRIVATE openproof_compile_options)
 
 # GCC 16.2 misidentifies Boost.Asio's own aligned coroutine-frame

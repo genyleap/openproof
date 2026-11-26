@@ -1234,9 +1234,15 @@ points fail closed when the corresponding synchronous repository is
 absent. Native UserInfo and durable replay handling remain in the
 coroutine PostgreSQL storage layer.
 
-The blocking PostgreSQL compatibility implementation still exists.
-Startup, offline administration, and residual compatibility callers
-must be inventoried and retired before the final storage gate can pass.
+Authenticated startup uses a single temporary blocking connection for
+schema validation/application, master-key verification and organization
+validation. That pool and its repositories are destroyed before native
+I/O workers and listener construction. Native session storage no longer
+imports or links the blocking PostgreSQL module. Offline CLI operations
+still use the compatibility module; the server executable also links it
+for preflight. The strict storage gate therefore remains open until the
+blocking implementation itself is retired, not merely isolated from
+request handling.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must
 also pass.

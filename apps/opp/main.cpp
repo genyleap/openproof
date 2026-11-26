@@ -1903,46 +1903,51 @@ addProtectedRoutes(gateway::Router& router,
         return runListener(platform, asyncGateway, logger);
     }
 
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-    if (!migrations) {
-        reportStartupFailure(migrations.error());
-        return ExitCode::ConfigurationError;
-    }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
-    if (!activeMaster) {
-        reportStartupFailure(activeMaster.error());
-        return ExitCode::ConfigurationError;
-    }
+    // The blocking compatibility pool is an exclusive startup resource.
+    // Destroy its leases, repositories and connections before creating any
+    // native I/O worker or HTTP listener. Sequential preflight needs one slot.
+    {
+        auto poolConfig = postgres::PoolConfig::create(
+            platform.database().connectionString().clone(), 1U,
+            std::chrono::seconds{5});
+        if (!poolConfig) {
+            reportStartupFailure(poolConfig.error());
+            return ExitCode::ConfigurationError;
+        }
+        auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
+        if (!pool) {
+            reportStartupFailure(pool.error());
+            return ExitCode::ConfigurationError;
+        }
+        postgres::Migrator migrator{*pool.value()};
+        auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+        if (!migrations) {
+            reportStartupFailure(migrations.error());
+            return ExitCode::ConfigurationError;
+        }
+        const fnd::Status activeMaster = verifyActiveMasterKey(
+            *pool.value(), platform.security());
+        if (!activeMaster) {
+            reportStartupFailure(activeMaster.error());
+            return ExitCode::ConfigurationError;
+        }
 
-    postgres::PostgresOrganizationRepository organizations{*pool.value()};
+        postgres::PostgresOrganizationRepository organizations{*pool.value()};
 
-    auto configuredOrganization = organizations.findById(
-        identity::OrganizationId{std::string{platform.auth().organizationId()}});
-    if (!configuredOrganization) {
-        reportStartupFailure(configuredOrganization.error());
-        return ExitCode::ConfigurationError;
-    }
-    if (!configuredOrganization->has_value()
-        || !configuredOrganization->value().isUsable()) {
-        reportStartupFailure(fnd::Error{
-            fnd::ErrorCode::FailedPrecondition,
-            "The configured authentication organization is absent or inactive."});
-        return ExitCode::ConfigurationError;
-    }
+        auto configuredOrganization = organizations.findById(
+            identity::OrganizationId{std::string{platform.auth().organizationId()}});
+        if (!configuredOrganization) {
+            reportStartupFailure(configuredOrganization.error());
+            return ExitCode::ConfigurationError;
+        }
+        if (!configuredOrganization->has_value()
+            || !configuredOrganization->value().isUsable()) {
+            reportStartupFailure(fnd::Error{
+                fnd::ErrorCode::FailedPrecondition,
+                "The configured authentication organization is absent or inactive."});
+            return ExitCode::ConfigurationError;
+        }
+    } // End of blocking database preflight.
 
     auto passwordSecret = passwordPepperMaterial(platform.security());
     auto totpSecret = credentialEncryptionMaterial(platform.security());

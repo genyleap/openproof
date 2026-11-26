@@ -172,7 +172,8 @@ jobs:
           # This is a disposable CI runner; never run migrations or seed
           # records against a shared staging or production database.
           sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
-          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests --parallel 2
+          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_native_only_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_postgres_native_only_tests
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
           ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
 

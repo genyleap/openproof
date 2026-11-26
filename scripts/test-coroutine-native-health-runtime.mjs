@@ -18,6 +18,34 @@ test("production health routes exclusively use strict native dispatch",()=>{
   assert.doesNotMatch(app,/operationsHttp::HealthHttpApi\s+\w+\s*\{/);
   assert.doesNotMatch(cppExecutableText(http),/m_fallback->handle\(|PQexec|condition_variable|\.wait_for\(/);
 });
+test("blocking PostgreSQL preflight has no lifetime overlap with the native listener",()=>{
+  const serve=app.slice(app.indexOf("ExitCode runGatewayServer("));
+  const start=serve.indexOf("// The blocking compatibility pool is an exclusive startup resource.");
+  const end=serve.indexOf("} // End of blocking database preflight.",start);
+  assert.ok(start>=0 && end>start);
+  const preflight=serve.slice(start,end);
+  assert.match(preflight,/PoolConfig::create\(\s*platform.database\(\).connectionString\(\).clone\(\), 1U,/);
+  assert.match(preflight,/postgres::Migrator migrator\{\*pool.value\(\)\}/);
+  assert.match(preflight,/verifyActiveMasterKey\(/);
+  assert.match(preflight,/PostgresOrganizationRepository organizations/);
+  const runtime=cppExecutableText(serve.slice(end));
+  assert.doesNotMatch(runtime,/\bpostgres::(?:ConnectionPool|PoolConfig|Migrator|Postgres\w+Repository|Postgres\w+Store)\b/);
+  assert.ok(serve.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>",end)>end);
+  for(const file of ["session_domain.cpp","coroutine_session_repository.cpp"])
+    assert.doesNotMatch(read("src/storage/postgres/"+file),/import openproof.storage.postgres;/);
+  const cmake=read("src/storage/postgres/CMakeLists.txt");
+  const native=cmake.slice(cmake.indexOf("target_link_libraries(openproof_postgres_async_repository"),
+      cmake.indexOf("# GCC 16.2 misidentifies",cmake.indexOf("target_link_libraries(openproof_postgres_async_repository")));
+  assert.match(native,/PUBLIC openproof_postgres_async_io/);
+  assert.doesNotMatch(native,/openproof_storage_postgres/);
+  const tests=read("tests/CMakeLists.txt");
+  const isolated=tests.slice(tests.indexOf("target_link_libraries(openproof_postgres_native_only_tests"),
+      tests.indexOf("# OIDC's native discovery"));
+  assert.match(isolated,/openproof_postgres_async_repository/);
+  assert.doesNotMatch(isolated,/openproof_storage_postgres/);
+  assert.match(read(".github/workflows/ci.yml"),/tests\/openproof_postgres_native_only_tests/);
+  assert.match(read(".github/workflows/native-coroutine.yml"),/tests\/openproof_postgres_native_only_tests/);
+});
 test("liveness has no SQL dependency and readiness is bounded and fail-closed",()=>{
   const body=http.slice(http.indexOf("CoroutineHealthAdapter::handleAsync("));
   const ordered=["scrub(request);","method!=gateway::HttpMethod::Get","if (live) co_return response(200,true)",

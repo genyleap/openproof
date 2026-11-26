@@ -290,6 +290,26 @@ gtest_discover_tests(openproof_postgres_domain_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;domain")
 
+# A link-time isolation check: the same domain and failure-isolation tests
+# must build and execute with no dependency on the blocking storage archive.
+add_executable(openproof_postgres_native_only_tests
+    storage/postgres_async_domain_test.cpp)
+target_compile_features(openproof_postgres_native_only_tests PRIVATE cxx_std_26)
+target_compile_definitions(openproof_postgres_native_only_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_postgres_native_only_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_postgres_native_only_tests PRIVATE
+    openproof_postgres_async_repository openproof_session openproof_foundation
+    openproof_security Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_native_only_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+add_test(NAME NativePostgresOnly.LinkAndDomain
+    COMMAND openproof_postgres_native_only_tests --gtest_filter=PostgresCoroutineDomainTest.*)
+set_tests_properties(NativePostgresOnly.LinkAndDomain PROPERTIES
+    LABELS "postgres;async;domain" TIMEOUT 30)
+
 # OIDC's native discovery and ID-Token verification path must reject
 # malformed callbacks before any remote issuer, JWKS or UserInfo exchange.
 add_executable(openproof_oidc_coroutine_tests
