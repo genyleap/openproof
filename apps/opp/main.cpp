@@ -2604,8 +2604,21 @@ addProtectedRoutes(gateway::Router& router,
                     return ExitCode::ConfigurationError;
                 }
                 auto* reader = nativeCanonical.get();
-                connectionsReader = [reader](identity::IdentityId owner) {
-                    return reader->readConnectionsAsync(std::move(owner));
+                // Match AuthenticationService::connections: the directory can
+                // retain a link after its provider is removed from runtime
+                // configuration. Such a link is not a usable login method
+                // and must not be exposed in the account projection.
+                // The registry is assembled before listener startup; this
+                // immutable snapshot avoids registry locks on IO workers.
+                connectionsReader = [reader, registered = providers.ids()](identity::IdentityId owner)
+                    -> boost::asio::awaitable<fnd::Result<
+                        accountHttp::CoroutineAccountSessionAdapter::ConnectionList>> {
+                    auto result = co_await reader->readConnectionsAsync(std::move(owner));
+                    if (!result) co_return fnd::fail(result.error());
+                    std::erase_if(result->second, [&registered](const auto& external) {
+                        return std::ranges::find(registered, external.providerId()) == registered.end();
+                    });
+                    co_return std::move(result).value();
                 };
             }
             accountHttp::CoroutineAccountSessionAdapter::ReadTotpStatus totpStatusReader;

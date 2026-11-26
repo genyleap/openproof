@@ -991,6 +991,14 @@ async function main() {
         assurance: consumerGrant.assurance });
       assert.equal(status.headers["cache-control"], "no-store");
     }
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Preserve the legacy projection: retired/unregistered provider links
+      // can exist in storage, but cannot appear as available login methods.
+      command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) " +
+        "SELECT 'fixture-retired-provider','fixture-retired-subject',identity_id,1770000000000 " +
+        "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid'"]);
+    }
     const connectionsBefore = await edgeRequest("/account/connections", { jar: consumerJar });
     if (connectionsBefore.status === 502) {
       // Never print upstream stdout/stderr or response bodies: those may hold
@@ -1025,6 +1033,12 @@ async function main() {
           [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
         );
       }
+    }
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+      // Remove only the dedicated fixture before testing last-method policy.
+      command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
+        "DELETE FROM openproof.external_identities WHERE provider='fixture-retired-provider' " +
+        "AND external_subject='fixture-retired-subject'"]);
     }
     const connectionStart = await jsonRequest("/account/connections/web3/start", "POST", {
       provider: "farcaster",
