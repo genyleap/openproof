@@ -4067,8 +4067,9 @@ namespace openproof::storage::postgres {
         auto lease = m_pool->m_implementation->acquire();
         if (!lease) return foundation::fail(lease.error());
         PGconn* connection = lease->get();
-        auto begun = beginTransaction(connection);
-        if (!begun) return begun;
+        ResultPointer begun = exec(connection, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        if (!commandOk(begun.get()))
+            return foundation::fail(databaseError(begun.get(), "begin verification replacement"));
         const auto failTransaction = [&](const foundation::Error& error) {
             rollback(connection);
             return foundation::fail(error);
