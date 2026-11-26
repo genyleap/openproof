@@ -242,13 +242,34 @@
   },
   "format": 1,
   "releases": {
-    "v1.1.0-rc1": "a721091fad79cbdd1c544fea68765c4dcee565b7",
-    "v1.1.0-rc2": "28dae10fb777c627fa15561cc38fab3e768521a9",
-    "v1.1.0-rc3": "45390c08b1de893bbf84097273d83fd66b3601f4",
-    "v1.1.0-rc4": "5a3bf17a620d13c07471e763a4191fa23f5d1ee8",
-    "v1.1.0-rc5": "256f970aba84a406d4f7bb906dbb011252719f2e",
-    "v1.1.0-rc6": "cbc8c9a3520165e34d4a5fd53696533138ceb9f6",
-    "v1.1.0-rc7": "3635f83c1ae683a4f83d3dbd8f0fb1c82b85690c"
+    "v1.1.0-rc1": {
+      "commit": "808372ac34ddcb9fb703056ab1a7e11ed27d671f",
+      "tag_object": "04ee2df5e281ff4edee68f74cf4046bfe5929f4b"
+    },
+    "v1.1.0-rc2": {
+      "commit": "ccc83ca8a279bf33214d4b99698f861777e5e9a6",
+      "tag_object": "59773d71c810210933a9ac4288b148dd3887322c"
+    },
+    "v1.1.0-rc3": {
+      "commit": "45390c08b1de893bbf84097273d83fd66b3601f4",
+      "tag_object": "c67ec71d1f4b743b2b2bcecf01522f8a82dba3a2"
+    },
+    "v1.1.0-rc4": {
+      "commit": "5a3bf17a620d13c07471e763a4191fa23f5d1ee8",
+      "tag_object": "81abcbcba0fc33b462561960d84c24fdbb24af9c"
+    },
+    "v1.1.0-rc5": {
+      "commit": "256f970aba84a406d4f7bb906dbb011252719f2e",
+      "tag_object": "bd199db32b9c93428c4127eada483f10e074075b"
+    },
+    "v1.1.0-rc6": {
+      "commit": "cbc8c9a3520165e34d4a5fd53696533138ceb9f6",
+      "tag_object": "14c3aef47da6db745a19ff2d0dad8888002436cc"
+    },
+    "v1.1.0-rc7": {
+      "commit": "3635f83c1ae683a4f83d3dbd8f0fb1c82b85690c",
+      "tag_object": "c829e56498ab08a66aec65a486b1e4c8fb78dc57"
+    }
   },
   "source": "git-release-tags"
 }
