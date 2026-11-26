@@ -80,11 +80,25 @@ class PostgresIntegrationTest : public testing::Test {
 protected:
     void SetUp() override
     {
-        const char* configured = std::getenv("OPENPROOF_TEST_POSTGRES");
-        if (configured == nullptr || std::string_view{configured}.empty()) {
-            GTEST_SKIP() << "OPENPROOF_TEST_POSTGRES is not configured";
+        const char* configured=std::getenv("OPENPROOF_TEST_POSTGRES_INTEGRATION");
+        const char* ack=std::getenv("OPENPROOF_TEST_POSTGRES_INTEGRATION_ACK");
+        if (!configured && !ack) GTEST_SKIP()<<"Run the private integration fixture.";
+        ASSERT_NE(configured,nullptr);
+        ASSERT_NE(ack,nullptr);
+        ASSERT_STREQ(ack,"YES_EXCLUSIVE_DISPOSABLE_DATABASE");
+        constexpr std::string_view prefix="host=/tmp/openproof-integration-pg.";
+        constexpr std::string_view suffix=" port=55419 user=postgres dbname=openproof_integration_ci";
+        const std::string_view value{configured};
+        ASSERT_TRUE(value.starts_with(prefix) && value.ends_with(suffix));
+        ASSERT_EQ(value.size(),prefix.size()+8U+suffix.size());
+        for (const char c:value.substr(prefix.size(),8U)) {
+            ASSERT_TRUE((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9'));
         }
-        connectionString = configured;
+        // libpq environment defaults must not redirect a private socket DSN.
+        ASSERT_EQ(std::getenv("PGHOSTADDR"),nullptr);
+        ASSERT_EQ(std::getenv("PGSERVICE"),nullptr);
+        ASSERT_EQ(std::getenv("PGOPTIONS"),nullptr);
+        connectionString=configured;
         auto migrated = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
             std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
         ASSERT_TRUE(migrated)
@@ -979,8 +993,7 @@ TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerive
     const auto newFingerprint = sec::hmacSha256(
         fnd::SecretString{std::string(32U, 'n')},
         "openproof/master-key-fingerprint/v1").value();
-    const auto dsn=std::getenv("OPENPROOF_TEST_POSTGRES");
-    ASSERT_NE(dsn,nullptr);
+    const auto* dsn=connectionString.c_str();
     EXPECT_TRUE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},1U,oldFingerprint));
     EXPECT_FALSE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},2U,newFingerprint));
     auto dryRun=pg::rotateMasterKeyOffline(fnd::SecretString{dsn},1U,oldFingerprint,2U,newFingerprint,true);

@@ -72,8 +72,11 @@ jobs:
       - name: Build
         run: cmake --build --preset gcc-release --parallel 2
 
+      - name: Destructive PostgreSQL integration in private socket fixture
+        run: bash scripts/run-disposable-postgres-integration-tests.sh
+
       - name: Test
-        run: ctest --preset gcc-release --output-on-failure
+        run: ctest --preset gcc-release --output-on-failure -E '^PostgresIntegrationTest\.'
 
       - name: Package
         run: |

@@ -300,8 +300,12 @@ jobs:
       - name: Build
         run: cmake --build --preset gcc-release --parallel 2
 
+      - name: Destructive PostgreSQL integration in private socket fixture
+        timeout-minutes: 15
+        run: bash scripts/run-disposable-postgres-integration-tests.sh
+
       - name: Test
-        run: ctest --preset gcc-release --output-on-failure
+        run: ctest --preset gcc-release --output-on-failure -E '^PostgresIntegrationTest\.'
 
       - name: Consolidated fresh schema and legacy-ledger integration
         env:
@@ -313,7 +317,8 @@ jobs:
           cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
           python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
             --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
-          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
+          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent'
+          bash scripts/run-disposable-postgres-integration-tests.sh
 
 
       # Paired comparison is deliberately gated on the *full* test suite.

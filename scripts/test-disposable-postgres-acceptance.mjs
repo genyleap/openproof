@@ -10,6 +10,25 @@ const root = path.resolve(import.meta.dirname, "..");
 const read = file => fs.readFileSync(path.join(root, file), "utf8");
 const auth = read("scripts/run-disposable-postgres-auth-tests.sh");
 const canonical = read("scripts/run-disposable-postgres-canonical-tests.sh");
+const integration = read("scripts/run-disposable-postgres-integration-tests.sh");
+
+test("destructive integration tests require a dedicated acknowledged Unix socket",()=>{
+  const fixture=read("tests/storage/postgres_integration_test.cpp");
+  const setup=fixture.slice(fixture.indexOf("void SetUp()"),fixture.indexOf("struct ConnectionDeleter"));
+  assert.doesNotMatch(setup,/getenv\("OPENPROOF_TEST_POSTGRES"\)/);
+  for(const marker of ['getenv("OPENPROOF_TEST_POSTGRES_INTEGRATION")',
+    'getenv("OPENPROOF_TEST_POSTGRES_INTEGRATION_ACK")','ASSERT_STREQ(ack,"YES_EXCLUSIVE_DISPOSABLE_DATABASE")',
+    'value.starts_with(prefix)','value.ends_with(suffix)','prefix.size()+8U+suffix.size()',
+    'getenv("PGHOSTADDR")','getenv("PGSERVICE")','getenv("PGOPTIONS")'])
+    assert.ok(setup.indexOf(marker)>=0 && setup.indexOf(marker)<setup.indexOf("migrateSchemaBeforeListener"),marker);
+  for(const marker of ['mktemp -d /tmp/openproof-integration-pg.XXXXXXXX','listen_addresses=',
+    'unix_socket_directories=$work','unset "$variable"','--output-junit "$work/test-results.xml"',
+    "grep -q '<skipped'",'OPENPROOF_TEST_POSTGRES_INTEGRATION_ACK=YES_EXCLUSIVE_DISPOSABLE_DATABASE'])
+    assert.ok(integration.includes(marker),marker);
+  assert.ok(integration.indexOf('! runuser -u postgres -- /usr/bin/true')<integration.indexOf('work="$(mktemp -d'));
+  for(const file of [".github/workflows/ci.yml",".github/workflows/release.yml","scripts/qualify-production.sh"])
+    assert.ok(read(file).includes("run-disposable-postgres-integration-tests.sh"),file);
+});
 
 test("native auth SQL runner requires actual non-skipped testcases", () => {
   assert.ok(auth.includes('--output-junit "$work/test-results.xml"'));

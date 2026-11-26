@@ -1269,9 +1269,16 @@ credential-policy upgrades, key rotation, owner protection and OAuth
 replay tests retain their original security invariants. The strict
 source gate requires absence of the retired module, scans every storage
 implementation and retains the global blocking-I/O inventory.
-Static source acceptance does not approve a release: exact-head C++
-build, PostgreSQL integration, executable symbol checks, security and
-E2E regressions and comparative benchmarks remain mandatory.
+Destructive repository integration tests require the dedicated
+`scripts/run-disposable-postgres-integration-tests.sh` runner. It creates
+a private Unix-socket-only PostgreSQL cluster, strips ambient libpq
+environment defaults, runs serially and rejects missing or skipped test
+results. The test fixture refuses arbitrary DSNs before migration or
+TRUNCATE. CI and the release workflow use this runner separately from
+ordinary CTest; the schema-baseline CI step also runs the snapshot-specific
+regression. Static source acceptance does not approve a release:
+exact-head C++ build, PostgreSQL integration, executable symbol checks,
+security and E2E regressions and comparative benchmarks remain mandatory.
 
 ### Native owner-only local member administration
 

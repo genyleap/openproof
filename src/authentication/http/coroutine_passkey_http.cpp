@@ -11,7 +11,7 @@ import openproof.identity.provider;
 
 namespace openproof::authentication::http {
 namespace {
-namespace pk=provider::passkey;
+namespace pk=::openproof::provider::passkey;
 namespace idp=identity::provider;
 using E=foundation::ErrorCode;
 using Method=gateway::HttpMethod;
@@ -232,7 +232,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::ha
     if (!credentials) co_return fail(credentials.error().code(),r);
     if (ceremony) {
         std::vector<std::string> excluded;
-        for (const auto& credential:credentials.value()) excluded.push_back(credential.credentialId);
+        for (const auto& item:credentials.value()) excluded.push_back(item.credentialId);
         auto started=pk::registrationOptions(*m_config,actor->identity(),ceremony->id,excluded);
         if (!started) co_return fail(started.error().code(),r);
         boost::system::error_code error;
@@ -248,10 +248,10 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::ha
         co_return out;
     }
     boost::json::array items;
-    for (const auto& credential:credentials.value()) {
-        items.emplace_back(boost::json::object{{"credential_id",credential.credentialId},
-            {"sign_count",credential.signCount},{"created_at_ms",credential.createdAt.time_since_epoch().count()},
-            {"last_used_at_ms",credential.lastUsedAt.time_since_epoch().count()}});
+    for (const auto& item:credentials.value()) {
+        items.emplace_back(boost::json::object{{"credential_id",item.credentialId},
+            {"sign_count",item.signCount},{"created_at_ms",item.createdAt.time_since_epoch().count()},
+            {"last_used_at_ms",item.lastUsedAt.time_since_epoch().count()}});
     }
     boost::json::object body;
     body["passkeys"]=std::move(items);
@@ -339,7 +339,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::as
     auto verified=co_await m_authentication->completeAsync(idp::TransactionId{*transactionId},
         std::move(*continuationToken),digest.value(),std::move(input));
     if (!verified || verified->outcome().provider()!=idp::ProviderId{"passkey"}
-        || !idp::meetsAssurance(verified->outcome().assurance(),idp::AssuranceLevel::Ial2)) {
+        || !idp::meetsAssurance(verified->outcome().claimedAssurance(),idp::AssuranceLevel::Ial2)) {
         auto out=fail(verified?E::AuthenticationFailed:verified.error().code(),r);
         clear(out);co_return out;
     }
