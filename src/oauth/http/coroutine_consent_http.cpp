@@ -11,6 +11,7 @@
 
 #include "coroutine_consent_http.hpp"
 
+import openproof.client;
 import openproof.security;
 
 namespace openproof::oauth::http {
