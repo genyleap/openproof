@@ -59,6 +59,32 @@ void verifyRejectedCallback(bool includeCode, bool includeState)
     EXPECT_TRUE(denied);
 }
 
+TEST(GitHubCoroutineProviderTest, SynchronousCompletionFailsClosedWithoutOutboundIo)
+{
+    auto configuration=github::GitHubProviderConfig::create(
+        "coroutine-test-id",fnd::SecretString{std::string(32,'s')},
+        "https://identity.example.test/oauth/callback",
+        fnd::SecretString{std::string(32,'k')},std::chrono::minutes{5});
+    ASSERT_TRUE(configuration);
+    fnd::ManualClockSource clock{fnd::Instant{std::chrono::milliseconds{1770000000000}}};
+    github::GitHubAuthenticationProvider provider{std::move(configuration).value(),clock};
+    auto challenge=provider.beginAuthentication(
+        idp::AuthenticationRequest{idp::ProviderId{"github"},idp::ClientContext{}});
+    ASSERT_TRUE(challenge);
+    idp::AuthenticationResponse proof{challenge->id(),idp::ClientContext{}};
+    proof.setParameter("code",idp::CredentialValue{"fixture-code"});
+    // Valid challenge/state still cannot admit any synchronous exchange.
+    const auto& url=challenge->parameters().at("authorization_url");
+    auto start=url.find("state=");
+    ASSERT_NE(start,std::string::npos);
+    start+=6U;
+    const auto end=url.find('&',start);
+    proof.setParameter("state",idp::CredentialValue{url.substr(start,end-start)});
+    auto denied=provider.completeAuthentication(proof);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(),fnd::ErrorCode::Unavailable);
+}
+
 TEST(GitHubCoroutineProviderTest, MissingCodeIsRejectedBeforeOutboundIo)
 {
     verifyRejectedCallback(false, true);

@@ -735,42 +735,18 @@ legacy compatibility handlers. Do not enable the feature in production until
 GCC16/CTest and disposable PostgreSQL HTTP E2E have passed, followed by the
 usual global Coroutine migration release gate.
 
-### Experimental native federated login start (coroutine branch only)
+### Native federated browser authentication
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1` opts in a native
-`GET /auth/federated/start` adapter backed by the registered coroutine
-provider, native authentication transaction repository, and native canonical
-identity finalizer. The adapter uses `co_await AuthenticationService::beginAsync`
-and produces the same browser redirect and bound continuation cookies as the
-legacy start route. It fails closed for a provider lacking native capability;
-it never executes the synchronous provider SPI on the HTTP reactor.
-
-**Default: both disabled.** `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START=1`
-and `OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK=1` **must be enabled
-together**. A single enabled leg is rejected during startup: otherwise
-native Start would persist a challenge in the native SQL transaction store
-and the legacy Callback would attempt to redeem it from a different store.
-The callback supports OAuth2 GET/form POST and X OAuth1 GET and uses `completeAsync`, validates
-server-bound transaction/binding cookies, clears browser callback state and
-uses PostgreSQL-backed `CoroutineReplacingSessionIssuer` for atomic session
-replacement. Raw OAuth query credentials are scrubbed before asynchronous
-suspension. Both flags accept only `0` or `1`.
-
-**Scope limitation:** OAuth2 authorization-code GET/form POST and X OAuth1 GET responses
-are supported with disjoint proof shapes and provider-bound transactions.
-Cookie-authenticated account connection start and one-time browser handoff
-issuance/redemption also use the native path. Link callbacks cannot mint a
-login session. SAML assertion POST also has a native transaction-bound path with a bounded
-XML verification worker. Non-native providers remain unsupported by the
-experimental callback. Delegated Bearer connection initiation and
-handoff issuance still use compatibility. Do not enable the paired flags
-for mixed deployments until all required ceremonies have been validated.
-
-Do not enable either experimental flag in production until external provider,
-PostgreSQL and browser-session E2E, full C++26 build, security acceptance and
-performance comparison are complete. A green focused test is not an approved
-end-to-end coroutine migration. These flags do not alter the deny-only
-self-provisioning or verified-email convergence policies.
+The authenticated executable requires paired native federation start and
+callback. Historical OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START and
+OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK accept unset or 1;
+setting either to 0 rejects startup. Native browser redirects support
+OAuth2 GET/form POST, OAuth1 GET and SAML POST, using the same durable
+transaction schema. GitHub's synchronous completion SPI is retired.
+Delegated Bearer connection start and handoff issuance retain their
+compatibility authorization path; callback completion is native. This
+candidate is not approved for production until compiled, signed-assertion
+and full federation runtime acceptance are complete.
 
 ### Wallet and Farcaster login
 Relay-supplied display name, username and profile-picture metadata are presentation-only; malformed values are discarded before persistence.
