@@ -77,3 +77,13 @@ test("offline LDAPS real TLS fixture covers credential rejection and downgrade p
   assert.match(testSource, /Tcp::endpoint\{/);
   assert.match(testSource, /asio::ssl::stream<Tcp::socket>/);
 });
+
+test("LDAPS timed IO is serialized on the current executor", () => {
+  const start = native.indexOf("AsyncLdapsClient::authenticate(LdapsRequest request)");
+  const end = native.indexOf("AsyncLdapsClient::authenticateSerialized(", start);
+  assert.ok(start >= 0 && end > start);
+  const wrapper = native.slice(start, end);
+  assert.match(wrapper, /const Deadline deadline = Clock::now\(\) \+ request\.timeout/);
+  assert.match(wrapper, /co_await asio::co_spawn\(asio::make_strand\(executor\)/);
+  assert.match(wrapper, /authenticateSerialized\(std::move\(request\), deadline\)/);
+});
