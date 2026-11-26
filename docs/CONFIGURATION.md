@@ -1107,8 +1107,17 @@ Duplicate identifiers are rejected and revoked applications cannot be
 reactivated. Concurrent transitions cannot overwrite each other through
 the native HTTP path.
 
-The remaining PostgreSQL compatibility surfaces include client/resource/
-service-identity mutations and the administration console,
+OAuth client creation, lifecycle transitions and secret rotation now
+also use native owner- and session-locked transactions. Creation locks
+the active parent application and commits the client, redirect URIs
+and scopes together. Mutations lock the tenant-bound client and restore
+the canonical domain model. Only HMAC digests cross the storage boundary;
+the newly generated secret is returned once, after commit, and never
+for a public client. Revoked clients cannot be reactivated or rotated.
+The existing token-family lifetime policy is unchanged.
+
+The remaining PostgreSQL compatibility surfaces include JAR key,
+resource and service-identity mutations and the administration console,
 passkey operations, evidence/trust and enabled SCIM operations, as well
 as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated

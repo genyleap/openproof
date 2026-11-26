@@ -7,6 +7,7 @@
 #include <boost/asio/awaitable.hpp>
 
 import openproof.application;
+import openproof.client;
 import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
@@ -21,8 +22,15 @@ public:
         ManagementRead,identity::core::IdentityId,session::SessionId,std::optional<std::string>)>;
     using Mutate=std::function<boost::asio::awaitable<foundation::Result<Application>>(
         ApplicationMutationCommand,identity::core::IdentityId,session::SessionId)>;
+    using MutateClient=std::function<boost::asio::awaitable<foundation::Result<client::Client>>(
+        client::ManagementMutationCommand,identity::core::IdentityId,session::SessionId)>;
+    struct ClientContext final {
+        foundation::SecretString key;
+        MutateClient mutate;
+    };
     CoroutineManagementReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
-        gateway::TokenBucketRateLimiter& limiter,Authenticate authenticate,Read read,Mutate mutate={});
+        gateway::TokenBucketRateLimiter& limiter,Authenticate authenticate,Read read,Mutate mutate={},
+        std::optional<ClientContext> clients=std::nullopt);
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> handleAsync(gateway::HttpRequest) override;
@@ -32,5 +40,6 @@ private:
     Authenticate m_authenticate;
     Read m_read;
     Mutate m_mutate;
+    std::optional<ClientContext> m_clients;
 };
 }

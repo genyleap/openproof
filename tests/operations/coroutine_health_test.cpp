@@ -32,9 +32,16 @@ gw::HttpRequest request(std::string path,gw::HttpMethod method=gw::HttpMethod::G
 
 gw::HttpResponse run(ops::CoroutineHealthAdapter& api,gw::HttpRequest r) {
     asio::io_context io;
-    auto task=asio::co_spawn(io,api.handleAsync(std::move(r)),asio::use_future);
+    // co_spawn's exception path requires a default-constructible result.
+    // HttpResponse intentionally has no default constructor.
+    std::optional<gw::HttpResponse> response;
+    auto collect=[&]()->asio::awaitable<void> {
+        response.emplace(co_await api.handleAsync(std::move(r)));
+    };
+    auto task=asio::co_spawn(io,collect(),asio::use_future);
     io.run();
-    return task.get();
+    task.get();
+    return std::move(response).value();
 }
 
 TEST(NativeHealthTest, ReadinessAwaitsDependencyAndLivenessNeverTouchesStorage)

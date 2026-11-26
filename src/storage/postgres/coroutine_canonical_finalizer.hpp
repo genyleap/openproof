@@ -13,6 +13,7 @@
 
 import openproof.administration;
 import openproof.application;
+import openproof.client;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
@@ -61,6 +62,10 @@ public:
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<application::Application>>
     mutateApplicationAsync(application::ApplicationMutationCommand command,
+        identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<client::Client>>
+    mutateOAuthClientAsync(client::ManagementMutationCommand command,
         identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now);
 
     // Probe the real native pool, including queue admission and reconnect.

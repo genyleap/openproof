@@ -39,7 +39,8 @@ test("management projection is bounded, owner and session checked in a consisten
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeApplicationReadsRequireCurrentOwnerSessionAndNeverProjectSecrets/);
 });
 test("application lifecycle owns exact routes and commits valid domain transitions under owner and row locks",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateApplicationAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateApplicationAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync("));
   for(const route of ["/admin/applications","/admin/applications/suspend","/admin/applications/activate","/admin/applications/revoke"])
     assert.ok(http.includes('r.path()=="'+route+'"'),route);
   assert.match(app,/nativePaths.emplace_back\(route\)/);
@@ -64,4 +65,31 @@ test("application lifecycle owns exact routes and commits valid domain transitio
   assert.ok(store.indexOf("UPDATE openproof.applications")<store.lastIndexOf('execute("COMMIT",{})'));
   assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/ASSERT_NE\(a.has_value\(\),b.has_value\(\)\)/);
+});
+test("native client lifecycle and secret rotation preserve domain checks and expose raw secrets only after commit",()=>{
+  for(const route of ["/admin/clients","/admin/clients/suspend","/admin/clients/activate","/admin/clients/revoke","/admin/clients/rotate-secret"])
+    assert.ok(http.includes('r.path()=="'+route+'"'),route);
+  assert.match(app,/reader->mutateOAuthClientAsync/);
+  assert.match(app,/nativeOAuthClientKey->clone\(\)/);
+  const ordered=["parseClientMutation(r,*clientWrite)","gateway::takeSessionCredential(r)",
+    "co_await m_authenticate","AssuranceLevel::Ial2","secret.emplace(\"ops_\"+raw.value())",
+    "security::hmacSha256(m_clients->key,secret->expose())","clientCommand->digest.emplace",
+    "co_await m_clients->mutate","if (!changed)","body[\"client_secret_returned_once\"]","append(secret->expose())"];
+  let previous=-1;
+  for(const term of ordered){
+    const index=http.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync("));
+  for(const term of ["pg_advisory_xact_lock(7299730475761673315)","FOR SHARE OF o,i,m,r,s",
+    "assurance<2 || assurance>4","WHERE id=$1 AND organization_id=$2 FOR SHARE",
+    "client::Client::create","INSERT INTO openproof.oauth_clients","INSERT INTO openproof.oauth_client_redirect_uris",
+    "INSERT INTO openproof.oauth_client_scopes","WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",
+    "client::Client::restore","restored->replaceSecret(*command.digest,now)",
+    "UPDATE openproof.oauth_clients SET status=$3,secret_digest=decode($4,'hex')"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("assurance<2")<store.indexOf("INSERT INTO openproof.oauth_clients"));
+  assert.ok(store.indexOf("UPDATE openproof.oauth_clients")<store.lastIndexOf('execute("COMMIT",{})'));
+  assert.doesNotMatch(cppExecutableText(store),/PQexec|SecretString|randomTokenBase64Url/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/ASSERT_NE\(ca.has_value\(\),cb.has_value\(\)\)/);
 });

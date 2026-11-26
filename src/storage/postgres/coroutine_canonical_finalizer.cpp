@@ -2975,4 +2975,181 @@ CoroutinePostgresCanonicalFinalizer::mutateApplicationAsync(
     }
 }
 
+asio::awaitable<foundation::Result<client::Client>>
+CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync(
+    client::ManagementMutationCommand command,core::IdentityId actor,
+    session::SessionId sessionId,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    using Mutation=client::ManagementMutation;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || command.id.empty() || command.id.value().size()>256U || now.time_since_epoch().count()<0
+        || static_cast<unsigned int>(command.operation)>static_cast<unsigned int>(Mutation::RotateSecret))
+        co_return foundation::fail(E::InvalidArgument);
+    const auto tenant=std::string{m_impl->organization.value()};
+    const auto timestamp=std::to_string(now.time_since_epoch().count());
+    std::optional<client::Client> value;
+    if (command.operation==Mutation::Create) {
+        if (!command.applicationId || command.applicationId->empty() || command.applicationId->value().size()>256U
+            || static_cast<unsigned int>(command.kind)>3U)
+            co_return foundation::fail(E::InvalidArgument);
+        auto created=client::Client::create(command.id,*command.applicationId,std::move(command.name),
+            command.kind,std::move(command.redirects),std::move(command.scopes),command.digest,now);
+        if (!created) co_return foundation::fail(created.error());
+        value.emplace(std::move(created).value());
+    } else if (command.applicationId || !command.name.empty() || !command.redirects.empty() || !command.scopes.empty()
+        || command.digest.has_value()!=(command.operation==Mutation::RotateSecret)) {
+        co_return foundation::fail(E::InvalidArgument);
+    }
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        // Serialize against native/legacy owner lifecycle changes. Keep the
+        // authorization rows locked until the application change commits.
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        Params actorArgs{std::string{actor.value()},tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.assurance FROM openproof.organizations o "
+            "JOIN openproof.identities i ON i.organization_id=o.id "
+            "JOIN openproof.memberships m ON m.identity_id=i.id AND m.organization_id=o.id "
+            "JOIN openproof.membership_roles r ON r.identity_id=i.id AND r.organization_id=o.id "
+            "JOIN openproof.sessions s ON s.identity_id=i.id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND o.state=0 AND m.state=1 AND r.role='owner' "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR SHARE OF o,i,m,r,s",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto assurance=milliseconds(permitted.rows.front()[0]);
+        if (assurance<2 || assurance>4) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AssuranceInsufficient);
+        }
+        if (value) {
+            Params appArgs{std::string{value->applicationId().value()},tenant};
+            const auto parent=co_await execute(
+                "SELECT status FROM openproof.applications WHERE id=$1 AND organization_id=$2 FOR SHARE",
+                std::move(appArgs));
+            if (parent.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            if (parent.rows.size()!=1U || parent.rows.front().size()!=1U)
+                throw std::runtime_error{"Malformed client parent"};
+            if (milliseconds(parent.rows.front()[0])!=0) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::FailedPrecondition);
+            }
+            Params args{std::string{value->id().value()},std::string{value->applicationId().value()},
+                std::string{value->displayName()},std::to_string(static_cast<unsigned int>(value->kind())),
+                value->secretDigest()?std::optional<std::string>{foundation::toHex(value->secretDigest()->bytes())}:std::nullopt,
+                timestamp};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+                "VALUES($1,$2,$3,$4,0,decode($5,'hex'),$6,$6) ON CONFLICT DO NOTHING RETURNING id",std::move(args));
+            if (inserted.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AlreadyExists);
+            }
+            if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U
+                || required(inserted.rows.front()[0])!=value->id().value())
+                throw std::runtime_error{"Client insert mismatch"};
+            for (const auto& uri:value->redirectUris()) {
+                Params args{std::string{value->id().value()},std::string{uri.value()}};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) VALUES($1,$2)",std::move(args)));
+            }
+            for (const auto& scope:value->scopes()) {
+                Params args{std::string{value->id().value()},std::string{scope.value()}};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,$2)",std::move(args)));
+            }
+        } else {
+            // Lock parent and client in the same statement as grant admission.
+            Params args{std::string{command.id.value()},tenant};
+            const auto locked=co_await execute(
+                "SELECT c.application_id,c.display_name,c.kind,c.status,encode(c.secret_digest,'hex'),"
+                "c.created_at_ms,c.updated_at_ms FROM openproof.oauth_clients c "
+                "JOIN openproof.applications a ON a.id=c.application_id "
+                "WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",std::move(args));
+            if (locked.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            if (locked.rows.size()!=1U || locked.rows.front().size()!=7U)
+                throw std::runtime_error{"Malformed client row"};
+            const auto& row=locked.rows.front();
+            const auto kind=milliseconds(row[2]),status=milliseconds(row[3]);
+            if (kind>3 || status>2) throw std::runtime_error{"Invalid client state"};
+            const auto clientKind=static_cast<client::ClientKind>(kind);
+            std::optional<client::ClientSecretDigest> digest;
+            if (row[4]) {
+                auto bytes=foundation::fromHex(*row[4]);
+                if (!bytes || bytes->size()!=32U) throw std::runtime_error{"Invalid client digest"};
+                std::array<std::byte,32> data{};
+                std::ranges::copy(*bytes,data.begin());
+                digest.emplace(data);
+            }
+            Params redirectArgs{std::string{command.id.value()}};
+            const auto redirects=co_await execute(
+                "SELECT redirect_uri FROM openproof.oauth_client_redirect_uris WHERE client_id=$1 LIMIT 33 FOR SHARE",
+                std::move(redirectArgs));
+            if (redirects.rows.size()>32U) throw std::runtime_error{"Oversized client redirects"};
+            std::vector<client::RedirectUri> uriValues;
+            for (const auto& uri:redirects.rows) {
+                if (uri.size()!=1U) throw std::runtime_error{"Malformed redirect"};
+                auto parsed=client::RedirectUri::create(required(uri[0]),clientKind);
+                if (!parsed) throw std::runtime_error{"Invalid stored redirect"};
+                uriValues.push_back(std::move(parsed).value());
+            }
+            Params scopeArgs{std::string{command.id.value()}};
+            const auto scopes=co_await execute(
+                "SELECT scope FROM openproof.oauth_client_scopes WHERE client_id=$1 LIMIT 65 FOR SHARE",
+                std::move(scopeArgs));
+            if (scopes.rows.size()>64U) throw std::runtime_error{"Oversized client scopes"};
+            std::vector<client::Scope> scopeValues;
+            for (const auto& scope:scopes.rows) {
+                if (scope.size()!=1U) throw std::runtime_error{"Malformed scope"};
+                auto parsed=client::Scope::create(required(scope[0]));
+                if (!parsed) throw std::runtime_error{"Invalid stored scope"};
+                scopeValues.push_back(std::move(parsed).value());
+            }
+            auto restored=client::Client::restore(command.id,application::ApplicationId{required(row[0])},
+                required(row[1]),clientKind,static_cast<client::ClientStatus>(status),std::move(uriValues),
+                std::move(scopeValues),digest,foundation::Instant{foundation::Duration{milliseconds(row[5])}},
+                foundation::Instant{foundation::Duration{milliseconds(row[6])}});
+            if (!restored) throw std::runtime_error{"Invalid stored client"};
+            auto changed=command.operation==Mutation::Suspend?restored->suspend(now)
+                :command.operation==Mutation::Activate?restored->activate(now)
+                :command.operation==Mutation::Revoke?restored->revoke(now):restored->replaceSecret(*command.digest,now);
+            if (!changed) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(changed.error());
+            }
+            value.emplace(std::move(restored).value());
+            Params updateArgs{std::string{value->id().value()},std::string{value->applicationId().value()},
+                std::to_string(static_cast<unsigned int>(value->status())),
+                value->secretDigest()?std::optional<std::string>{foundation::toHex(value->secretDigest()->bytes())}:std::nullopt,
+                timestamp};
+            const auto updated=co_await execute(
+                "UPDATE openproof.oauth_clients SET status=$3,secret_digest=decode($4,'hex'),updated_at_ms=$5 "
+                "WHERE id=$1 AND application_id=$2 RETURNING id",std::move(updateArgs));
+            if (updated.rows.size()!=1U || updated.rows.front().size()!=1U
+                || required(updated.rows.front()[0])!=value->id().value())
+                throw std::runtime_error{"Client update mismatch"};
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return std::move(*value);
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native OAuth client mutation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

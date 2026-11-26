@@ -824,10 +824,15 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
             ids::IdentityId{actor.empty()?seed.owner:actor},
             openproof::session::SessionId{session.empty()?sessionName:session},when);
     };
+    const auto collect=[](auto task,auto& output)->asio::awaitable<void> {
+        output.emplace(co_await std::move(task));
+    };
     const auto runMutation=[&](auto task) {
         io.restart();
-        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
-        io.run(); return done.get();
+        std::optional<typename decltype(task)::value_type> output;
+        auto done=asio::co_spawn(io,collect(std::move(task),output),asio::use_future);
+        io.run(); done.get();
+        return std::move(output).value();
     };
     const auto createdId="native-created-"+seed.suffix;
     const auto create=[&](std::string id,std::string identifier) {
@@ -851,10 +856,11 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
     ASSERT_FALSE(duplicate);
     EXPECT_EQ(duplicate.error().code(),fnd::ErrorCode::AlreadyExists);
     io.restart();
-    auto suspendA=asio::co_spawn(io,mutate(change(Mutation::Suspend,createdId)),asio::use_future);
-    auto suspendB=asio::co_spawn(io,mutate(change(Mutation::Suspend,createdId)),asio::use_future);
-    io.run();
-    auto a=suspendA.get(),b=suspendB.get();
+    std::optional<fnd::Result<openproof::application::Application>> resultA,resultB;
+    auto suspendA=asio::co_spawn(io,collect(mutate(change(Mutation::Suspend,createdId)),resultA),asio::use_future);
+    auto suspendB=asio::co_spawn(io,collect(mutate(change(Mutation::Suspend,createdId)),resultB),asio::use_future);
+    io.run(); suspendA.get(); suspendB.get();
+    auto a=std::move(resultA).value(),b=std::move(resultB).value();
     ASSERT_NE(a.has_value(),b.has_value());
     EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::FailedPrecondition);
     auto activated=runMutation(mutate(change(Mutation::Activate,createdId)));
@@ -869,10 +875,71 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
         "SELECT status::text FROM openproof.applications WHERE id=$1",{createdId});
     ASSERT_EQ(PQntuples(durable.get()),1);
     EXPECT_STREQ(PQgetvalue(durable.get(),0,0),"2");
+    namespace cli=openproof::client;
+    using COp=cli::ManagementMutation;
+    using CCommand=cli::ManagementMutationCommand;
+    const auto clientDigest=[&](std::string_view label) {
+        return cli::ClientSecretDigest{openproof::security::sha256(seed.suffix+std::string{label}).value()};
+    };
+    const auto createClient=[&](std::string id,std::string parent,cli::ClientKind kind) {
+        std::vector<cli::RedirectUri> redirects;
+        if (kind!=cli::ClientKind::Service)
+            redirects.push_back(cli::RedirectUri::create("https://fixture.example.invalid/callback",kind).value());
+        std::vector<cli::Scope> scopes;
+        scopes.push_back(cli::Scope::create("openid").value());
+        return CCommand{COp::Create,cli::ClientId{std::move(id)},AppId{std::move(parent)},"Client fixture",
+            kind,std::move(redirects),std::move(scopes),
+            cli::clientIsPublic(kind)?std::nullopt:std::optional<cli::ClientSecretDigest>{clientDigest("-initial")}};
+    };
+    const auto clientChange=[&](COp action,std::string id,std::optional<cli::ClientSecretDigest> next=std::nullopt) {
+        return CCommand{action,cli::ClientId{std::move(id)},std::nullopt,{},cli::ClientKind::Web,{},{},next};
+    };
+    const auto clientTask=[&](CCommand command,std::string actor={},std::string session={}) {
+        return native.mutateOAuthClientAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},kNow+3s);
+    };
+    const auto privateId="native-confidential-"+seed.suffix,publicId="native-public-"+seed.suffix;
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,foreignApp,cli::ClientKind::Web))));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,createdId,cli::ClientKind::Web))));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web),seed.owner,weakSession)));
+    auto registered=runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web)));
+    ASSERT_TRUE(registered);
+    EXPECT_EQ(registered->status(),cli::ClientStatus::Active);
+    EXPECT_EQ(registered->secretDigest(),std::optional<cli::ClientSecretDigest>{clientDigest("-initial")});
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web))));
+    auto publicClient=runMutation(clientTask(createClient(publicId,app,cli::ClientKind::Browser)));
+    ASSERT_TRUE(publicClient);
+    EXPECT_FALSE(publicClient->secretDigest());
+    const auto next=clientDigest("-rotated");
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::RotateSecret,publicId,next))));
+    auto rotated=runMutation(clientTask(clientChange(COp::RotateSecret,privateId,next)));
+    ASSERT_TRUE(rotated);
+    EXPECT_EQ(rotated->secretDigest(),std::optional<cli::ClientSecretDigest>{next});
+    const auto persisted=execute(fixture.get(),
+        "SELECT encode(secret_digest,'hex'),(SELECT count(*) FROM openproof.oauth_client_scopes WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_client_redirect_uris WHERE client_id=$1)::text "
+        "FROM openproof.oauth_clients WHERE id=$1",{privateId});
+    ASSERT_EQ(PQntuples(persisted.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(persisted.get(),0,0)},fnd::toHex(next.bytes()));
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,2),"1");
+    io.restart();
+    std::optional<fnd::Result<cli::Client>> clientResultA,clientResultB;
+    auto clientA=asio::co_spawn(io,collect(clientTask(clientChange(COp::Suspend,privateId)),clientResultA),asio::use_future);
+    auto clientB=asio::co_spawn(io,collect(clientTask(clientChange(COp::Suspend,privateId)),clientResultB),asio::use_future);
+    io.run(); clientA.get(); clientB.get();
+    auto ca=std::move(clientResultA).value(),cb=std::move(clientResultB).value();
+    ASSERT_NE(ca.has_value(),cb.has_value());
+    ASSERT_TRUE(runMutation(clientTask(clientChange(COp::Activate,privateId))));
+    ASSERT_TRUE(runMutation(clientTask(clientChange(COp::Revoke,privateId))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::RotateSecret,privateId,next))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Activate,privateId))));
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
     EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)

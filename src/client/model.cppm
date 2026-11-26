@@ -100,6 +100,18 @@ private:
     std::array<std::byte, 32> m_digest{};
 };
 
+enum class ManagementMutation { Create, Suspend, Activate, Revoke, RotateSecret };
+struct ManagementMutationCommand final {
+    ManagementMutation operation;
+    ClientId id;
+    std::optional<application::ApplicationId> applicationId;
+    std::string name;
+    ClientKind kind=ClientKind::Web;
+    std::vector<RedirectUri> redirects;
+    std::vector<Scope> scopes;
+    std::optional<ClientSecretDigest> digest;
+};
+
 /**
  * @brief One independently revocable OAuth/OIDC client registration.
  */

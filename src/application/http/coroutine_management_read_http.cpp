@@ -66,6 +66,76 @@ foundation::Result<ApplicationMutationCommand> parseMutation(gateway::HttpReques
     return ApplicationMutationCommand{op,ApplicationId{std::move(id).value()},std::move(*identifier),
         std::move(*name),parsed};
 }
+std::optional<client::ManagementMutation> clientMutation(const gateway::HttpRequest& r) noexcept {
+    using Op=client::ManagementMutation;
+    if (r.method()!=Method::Post) return std::nullopt;
+    if (r.path()=="/admin/clients") return Op::Create;
+    if (r.path()=="/admin/clients/suspend") return Op::Suspend;
+    if (r.path()=="/admin/clients/activate") return Op::Activate;
+    if (r.path()=="/admin/clients/revoke") return Op::Revoke;
+    if (r.path()=="/admin/clients/rotate-secret") return Op::RotateSecret;
+    return std::nullopt;
+}
+foundation::Result<client::ManagementMutationCommand> parseClientMutation(
+    gateway::HttpRequest& r,client::ManagementMutation op)
+{
+    namespace json=boost::json;
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/json" && !media->starts_with("application/json;"))
+        || r.body().empty() || r.body().size()>80U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    boost::system::error_code error;
+    auto value=json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !value.is_object()) return foundation::fail(E::InvalidArgument);
+    const auto& object=value.as_object();
+    const auto field=[&](std::string_view name,std::size_t limit)->std::optional<std::string> {
+        const auto* item=object.if_contains(name);
+        if (!item || !item->is_string()) return std::nullopt;
+        const auto& text=item->as_string();
+        if (text.empty() || text.size()>limit
+            || std::ranges::any_of(text,[](unsigned char c){return c<0x20U || c==0x7fU;}))
+            return std::nullopt;
+        return std::string{text.data(),text.size()};
+    };
+    if (op!=client::ManagementMutation::Create) {
+        auto id=field("client_id",256U);
+        if (object.size()!=1U || !id) return foundation::fail(E::InvalidArgument);
+        return client::ManagementMutationCommand{op,client::ClientId{std::move(*id)},
+            std::nullopt,{},client::ClientKind::Web,{},{},std::nullopt};
+    }
+    auto app=field("application_id",256U),name=field("name",120U),kind=field("kind",32U);
+    const auto* uris=object.if_contains("redirect_uris");
+    const auto* scopes=object.if_contains("scopes");
+    if (object.size()!=5U || !app || !name || !kind || !uris || !uris->is_array()
+        || uris->as_array().size()>32U || !scopes || !scopes->is_array()
+        || scopes->as_array().empty() || scopes->as_array().size()>64U)
+        return foundation::fail(E::InvalidArgument);
+    client::ClientKind parsed;
+    if (*kind=="web") parsed=client::ClientKind::Web;
+    else if (*kind=="native") parsed=client::ClientKind::Native;
+    else if (*kind=="browser") parsed=client::ClientKind::Browser;
+    else if (*kind=="service") parsed=client::ClientKind::Service;
+    else return foundation::fail(E::InvalidArgument);
+    std::vector<client::RedirectUri> redirects;
+    for (const auto& uri:uris->as_array()) {
+        if (!uri.is_string() || uri.as_string().size()>2048U) return foundation::fail(E::InvalidArgument);
+        auto item=client::RedirectUri::create(std::string{uri.as_string().data(),uri.as_string().size()},parsed);
+        if (!item) return foundation::fail(item.error());
+        redirects.push_back(std::move(item).value());
+    }
+    std::vector<client::Scope> grants;
+    for (const auto& scope:scopes->as_array()) {
+        if (!scope.is_string() || scope.as_string().size()>128U) return foundation::fail(E::InvalidArgument);
+        auto item=client::Scope::create(std::string{scope.as_string().data(),scope.as_string().size()});
+        if (!item) return foundation::fail(item.error());
+        grants.push_back(std::move(item).value());
+    }
+    auto id=security::randomTokenBase64Url(24U);
+    if (!id) return foundation::fail(id.error());
+    return client::ManagementMutationCommand{op,client::ClientId{"opc_"+id.value()},
+        ApplicationId{std::move(*app)},std::move(*name),parsed,std::move(redirects),std::move(grants),std::nullopt};
+}
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeBody(); r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
 }
@@ -102,12 +172,13 @@ foundation::Result<std::optional<std::string>> filter(const gateway::HttpRequest
 
 CoroutineManagementReadAdapter::CoroutineManagementReadAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Read read,Mutate mutate)
+    Authenticate authenticate,Read read,Mutate mutate,std::optional<ClientContext> clients)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),m_read(std::move(read)),
-      m_mutate(std::move(mutate)) {}
+      m_mutate(std::move(mutate)),m_clients(std::move(clients)) {}
 
 bool CoroutineManagementReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
-    return operation(r).has_value() || mutation(r).has_value() || m_fallback->nativeEnabledFor(r);
+    return operation(r).has_value() || mutation(r).has_value() || clientMutation(r).has_value()
+        || m_fallback->nativeEnabledFor(r);
 }
 
 gateway::HttpResponse CoroutineManagementReadAdapter::handle(gateway::HttpRequest r) {
@@ -118,13 +189,15 @@ gateway::HttpResponse CoroutineManagementReadAdapter::handle(gateway::HttpReques
 boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::handleAsync(gateway::HttpRequest r) {
     const auto op=operation(r);
     const auto write=mutation(r);
-    if (!op && !write) {
+    const auto clientWrite=clientMutation(r);
+    if (!op && !write && !clientWrite) {
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r);
         co_return failure(E::Unavailable,r);
     }
     Scrub wipe{r};
-    if (!m_authenticate || (op && !m_read) || (write && !m_mutate))
+    if (!m_authenticate || (op && !m_read) || (write && !m_mutate)
+        || (clientWrite && (!m_clients || !m_clients->mutate)))
         co_return failure(E::Unavailable,r);
     if (!m_limiter->allow("idp-admin-ip:"+std::string{r.remoteAddress()}))
         co_return failure(E::RateLimited,r);
@@ -132,14 +205,19 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         co_return failure(E::AuthenticationFailed,r);
     std::optional<std::string> selected;
     std::optional<ApplicationMutationCommand> command;
+    std::optional<client::ManagementMutationCommand> clientCommand;
     if (op) {
         auto parsed=filter(r,*op);
         if (!parsed) co_return failure(parsed.error().code(),r);
         selected=std::move(parsed).value();
-    } else {
+    } else if (write) {
         auto parsed=parseMutation(r,*write);
         if (!parsed) co_return failure(parsed.error().code(),r);
         command.emplace(std::move(parsed).value());
+    } else {
+        auto parsed=parseClientMutation(r,*clientWrite);
+        if (!parsed) co_return failure(parsed.error().code(),r);
+        clientCommand.emplace(std::move(parsed).value());
     }
     auto credential=gateway::takeSessionCredential(r);
     if (!credential) co_return failure(credential.error().code(),r);
@@ -160,6 +238,47 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             .add("name",changed->displayName()).add("environment",environmentName(changed->environment()))
             .add("status",applicationStatusName(changed->status()));
         co_return response(status,body.build());
+    }
+    if (clientCommand) {
+        using Op=client::ManagementMutation;
+        const auto op=clientCommand->operation;
+        std::optional<foundation::SecretString> secret;
+        if (op==Op::RotateSecret || (op==Op::Create && !client::clientIsPublic(clientCommand->kind))) {
+            auto raw=security::randomTokenBase64Url(32U);
+            if (!raw) co_return failure(E::Unavailable,r);
+            secret.emplace("ops_"+raw.value());
+            foundation::secureWipe(raw->data(),raw->size());
+            auto digest=security::hmacSha256(m_clients->key,secret->expose());
+            if (!digest) co_return failure(E::Unavailable,r);
+            clientCommand->digest.emplace(digest.value());
+        }
+        auto changed=co_await m_clients->mutate(std::move(*clientCommand),actor->identity(),actor->id());
+        if (!changed) co_return failure(changed.error().code(),r);
+        boost::json::object body;
+        if (op==Op::RotateSecret) {
+            body["client_id"]=std::string{changed->id().value()};
+        } else {
+            body["id"]=std::string{changed->id().value()};
+            body["application_id"]=std::string{changed->applicationId().value()};
+            body["name"]=std::string{changed->displayName()};
+            body["kind"]=std::string{client::clientKindName(changed->kind())};
+            body["status"]=std::string{client::clientStatusName(changed->status())};
+            boost::json::array redirects,scopes;
+            for (const auto& uri:changed->redirectUris()) redirects.emplace_back(std::string{uri.value()});
+            for (const auto& scope:changed->scopes()) scopes.emplace_back(std::string{scope.value()});
+            body["redirect_uris"]=std::move(redirects);
+            body["scopes"]=std::move(scopes);
+        }
+        if (op==Op::Create || op==Op::RotateSecret)
+            body["client_secret_returned_once"]=secret.has_value();
+        // Serialize the raw credential only after successful commit, without
+        // copying it into a non-wiping boost::json::value.
+        auto output=boost::json::serialize(body);
+        if (secret) {
+            output.pop_back();
+            output.append(",\"client_secret\":\"").append(secret->expose()).append("\"}");
+        }
+        co_return response(op==Op::Create?201:200,std::move(output));
     }
     auto data=co_await m_read(*op,actor->identity(),actor->id(),std::move(selected));
     if (!data) co_return failure(data.error().code(),r);

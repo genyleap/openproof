@@ -3468,12 +3468,20 @@ addProtectedRoutes(gateway::Router& router,
                     identity::IdentityId actor,session::SessionId sessionId) {
                     return reader->mutateApplicationAsync(std::move(command),std::move(actor),
                         std::move(sessionId),clock.now());
-                });
+                },
+                applicationHttp::CoroutineManagementReadAdapter::ClientContext{
+                    nativeOAuthClientKey->clone(),
+                    [reader=nativeCanonical.get(),&clock](client::ManagementMutationCommand command,
+                        identity::IdentityId actor,session::SessionId sessionId) {
+                        return reader->mutateOAuthClientAsync(std::move(command),std::move(actor),
+                            std::move(sessionId),clock.now());
+                    }});
             nativeHandler=nativeManagement.get();
             for (const auto* route : {"/admin/applications","/admin/applications/suspend",
-                "/admin/applications/activate","/admin/applications/revoke"})
+                "/admin/applications/activate","/admin/applications/revoke","/admin/clients",
+                "/admin/clients/suspend","/admin/clients/activate","/admin/clients/revoke","/admin/clients/rotate-secret"})
                 nativePaths.emplace_back(route);
-            for (const auto* route : {"/admin/clients","/admin/clients/jar-key",
+            for (const auto* route : {"/admin/clients/jar-key",
                 "/admin/resources","/admin/service-identities"})
                 nativeMethods.emplace_back(route,gateway::HttpMethod::Get);
         }
