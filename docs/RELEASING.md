@@ -24,6 +24,22 @@ CI validates:
 - Debian package generation;
 - standalone runtime bundle generation.
 
+## Published schema inventory
+
+`docs/schema-release-inventory.json` pins the release-tag objects, peeled
+commits, exact SQL paths and SHA-256 checksums for v1.1.0-rc1 through rc7.
+It is reproducible using `python3 scripts/inventory-release-schema.py --check`
+from a complete Git checkout. The CI static job verifies those pinned tags.
+
+The inventory includes historical customer-specific migrations solely as
+compatibility evidence, not as authorization to execute them. It records
+source-tag contents, not the independently downloaded release artifacts.
+Before consolidating the fresh-install schema, verify actual supported
+release packages against their tagged inventories using the artifact verifier;
+preserve old ledger checksums and isolate the upgrade path. New published
+tags must be explicitly added to the inventory. Do not silently regenerate
+the recorded history to accommodate moved tags.
+
 ## 2. Tag
 
 For a release candidate:
