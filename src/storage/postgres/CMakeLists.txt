@@ -255,7 +255,7 @@ set_target_properties(openproof_postgres_async_verification PROPERTIES
 target_compile_definitions(openproof_postgres_async_verification PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_verification PUBLIC
     openproof_postgres_async_io openproof_account openproof_identity_core
-    openproof_foundation Boost::headers PRIVATE openproof_compile_options)
+    openproof_credentials openproof_security openproof_foundation Boost::headers PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_verification_challenge_store.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")

@@ -5010,3 +5010,20 @@ unchanged. Exact repaired CTest/E2E are still pending.
 New enrollment KDF API uses the existing shared bounded password worker
 pool and permit, with a fresh salted hash and no SQL lease held. Signup
 HTTP and atomic persistence are not switched over yet. No schema changes.
+
+### Atomic pending signup persistence
+
+Adds a native provisioning operation accepting a precomputed PasswordHash.
+It serializes native same-subject attempts, checks the active tenant,
+globally occupied provider subject/reservation, bounded verified-email
+candidates and local-credential absence, locks the canonical owner, then
+commits deactivated identity/unverified profile (only when needed),
+untagged signup reservation, password hash and digest-only challenge
+together. The existing verified owner is preserved without profile
+mutation. Only a committed operation returns the move-only dispatch.
+No plaintext password or verification secret reaches SQL. Fresh signup
+replaces stale signup proofs under the owner lock. Late errors discard
+the non-idle lease, rolling back the entire unit. No runtime cutover yet:
+delivery failure compensation and verification activation must be
+generation-safe, and cross-path concurrency with legacy signup and
+federated profile updates requires executable acceptance. No schema change.
