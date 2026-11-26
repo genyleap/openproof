@@ -746,6 +746,7 @@ gtest_discover_tests(openproof_postgres_async_auth_transaction_tests
 # checking fail-closed output without requiring production PostgreSQL.
 add_executable(openproof_coroutine_recovery_code_service_tests
     credentials/coroutine_recovery_code_service_test.cpp
+    credentials/bounded_password_executor_test.cpp
     ${PROJECT_SOURCE_DIR}/src/gateway/asio_thread_context.cpp)
 target_compile_features(openproof_coroutine_recovery_code_service_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_coroutine_recovery_code_service_tests PRIVATE

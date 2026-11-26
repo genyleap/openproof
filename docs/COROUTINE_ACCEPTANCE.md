@@ -4532,3 +4532,20 @@ stale password and MFA generations, concurrent single-use redemption,
 preserved unused codes, rehash and locked-account denial. The SQL
 primitives still require bounded cryptographic verification and native
 provider composition before HTTP activation. No production flags changed.
+
+
+### Bounded password cryptographic execution
+
+Password verification and post-factor rehash are isolated from network I/O
+on a dedicated one- or two-worker pool. Admission is immediate and bounded:
+a saturated pool rejects a request rather than queuing unbounded plaintext
+passwords. A permit follows the worker coroutine frame, so cancellation of
+the awaiting HTTP operation cannot prematurely release a running KDF slot.
+Each unknown subject verifies a startup-generated dummy hash and returns
+false even if the dummy password matches. A rehash candidate is generated
+only when requested after factor verification and the original password
+verifies again. The persisted compare-and-swap remains separate.
+
+The worker is an internal credential primitive; native local provider
+composition and HTTP activation are not part of this checkpoint. Callers
+must quiesce before destroying the executor. No Production change.
