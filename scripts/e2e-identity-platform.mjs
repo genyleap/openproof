@@ -981,6 +981,19 @@ async function main() {
     assert.ok(!metrics.body.includes("e2e-owner"));
     assert.ok(!metrics.body.includes(metricsToken));
 
+    const catalogResponse = await edgeRequest("/auth/providers");
+    expectStatus(catalogResponse, 200);
+    assert.equal(catalogResponse.headers["cache-control"], "no-store");
+    const catalog = jsonBody(catalogResponse);
+    assert.ok(Array.isArray(catalog.providers));
+    assert.ok(Array.isArray(catalog.challenge_providers));
+    assert.ok(catalog.challenge_providers.includes("farcaster"));
+    for (const route of ["/.well-known/openid-configuration", "/.well-known/jwks.json"]) {
+      const preflight = await edgeRequest(route, { method: "OPTIONS" });
+      expectStatus(preflight, 204);
+      assert.equal(preflight.headers["access-control-allow-origin"], "*");
+      assert.equal(preflight.headers["cache-control"], "no-store");
+    }
     const discoveryResponse = await edgeRequest("/.well-known/openid-configuration");
     expectStatus(discoveryResponse, 200);
     const discovery = jsonBody(discoveryResponse);

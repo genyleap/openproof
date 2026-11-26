@@ -947,6 +947,23 @@ silently truncating. All administrative mutations remain on compatibility
 routes. This bounded experimental projection requires full acceptance before
 default activation.
 
+### Native public authentication and OIDC metadata
+
+Authenticated runtimes serve GET `/auth/providers` through the immutable
+native provider catalog. OIDC-enabled runtimes serve GET and OPTIONS for
+`/.well-known/openid-configuration` and `/.well-known/jwks.json` through
+the native discovery adapter. Both are built at startup; OIDC key rotation
+through a restart rebuilds the JWKS from the active and retained public keys.
+No provider registry lock, synchronous OAuth facade or database query is
+needed to serve these public documents.
+
+The historical `OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG` and
+`OPENPROOF_EXPERIMENTAL_NATIVE_OIDC_DISCOVERY` flags accept 0 or 1.
+The native route is mandatory when its parent subsystem is enabled; setting
+the corresponding flag to 0 in that case fails startup. Explicitly enabling
+a route when its parent subsystem is disabled also fails startup. Unsupported
+methods on these strict native paths fail closed.
+
 ### Experimental native OAuth consent management
 
 `OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS=1` selects only GET

@@ -49,6 +49,7 @@ gateway::HttpResponse CoroutineOidcDiscoveryAdapter::handle(
     request.wipeBody();
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
+    request.wipeTargetQuery();
     return denied();
 }
 
@@ -61,6 +62,7 @@ CoroutineOidcDiscoveryAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeBody();
         request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
+        request.wipeTargetQuery();
         const bool options = request.method() == gateway::HttpMethod::Options;
         const bool discovery =
             request.path() == "/.well-known/openid-configuration";
@@ -88,6 +90,7 @@ CoroutineOidcDiscoveryAdapter::handleAsync(gateway::HttpRequest request)
         request.wipeBody();
         request.wipeAuthorizationHeader();
         request.wipeCookieHeader();
+        request.wipeTargetQuery();
         co_return denied();
     }
     co_return co_await m_fallback->handleAsync(std::move(request));
