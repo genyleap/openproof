@@ -1268,8 +1268,12 @@ domain and network test binaries no longer link the legacy module;
 the session database fixture uses a historical row and independent
 native pools. Federation state, authorization audit and refresh
 rotation/revocation regressions also exercise independent native
-instances. The remaining legacy-dependent tests are retained until
-their security assertions can be migrated. Native C++ build and
+instances. The canonical test executable no longer links the
+compatibility archive: contact verification now tests native atomic
+completion, generation-scoped compensation and historical tagged and
+untagged reservations against disposable database fixtures. The
+remaining legacy-dependent repository integration tests are retained
+until their security assertions can be migrated. Native C++ build and
 PostgreSQL integration are required before release.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must

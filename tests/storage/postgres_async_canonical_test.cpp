@@ -39,7 +39,6 @@ import openproof.authentication;
 import openproof.audit;
 import openproof.consent;
 import openproof.credentials;
-import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
@@ -3644,11 +3643,15 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U, 500ms, 1000ms, 3000ms};
     pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),
         fnd::SecretString{*dsn}, ids::OrganizationId{seed.foreignOrg}, 1U, 500ms, 1000ms, 3000ms};
-    auto poolConfig = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
-    ASSERT_TRUE(poolConfig);
-    auto pool = pg::ConnectionPool::create(std::move(poolConfig).value());
-    ASSERT_TRUE(pool);
-    pg::PostgresAccountRepository legacy{*pool.value()};
+    pg::CoroutineVerificationChallengeStore peer{io.get_executor(),
+        fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 1U, 500ms, 1000ms, 3000ms};
+    const idp::ProviderId localProvider{"fixture-local-" + seed.suffix};
+    const auto scalar=[&](std::string_view sql,std::initializer_list<std::string> args){
+        auto result=execute(fixture.get(),sql,args);
+        if (PQntuples(result.get())!=1 || PQnfields(result.get())!=1 || PQgetisnull(result.get(),0,0))
+            throw std::runtime_error{"Invalid verification fixture scalar"};
+        return std::string{PQgetvalue(result.get(),0,0)};
+    };
     const auto purpose = acc::VerificationPurpose::ChangeEmail;
     std::array<std::byte, 32> digest{};
     digest[0] = std::byte{42};
@@ -3668,16 +3671,14 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     const auto second = "verification-second-" + seed.suffix;
     const auto third = "verification-third-" + seed.suffix;
     const auto last = "verification-last-" + seed.suffix;
-    // Native and synchronous issuers operate on the same owner/purpose.
-    // A concurrent first issuance cannot leave two redeemable challenges.
-    auto legacyWrite = std::async(std::launch::async, [&] {
-        return legacy.replace(challenge(first, seed.owner));
-    });
+    // Independent native issuers share the same owner/purpose lock.
+    // Concurrent first issuance cannot leave two redeemable challenges.
     io.restart();
+    auto peerWrite = asio::co_spawn(io,peer.replaceAsync(challenge(first,seed.owner)),asio::use_future);
     auto a = asio::co_spawn(io, store.replaceAsync(challenge(second, seed.owner)), asio::use_future);
     auto b = asio::co_spawn(io, store.replaceAsync(challenge(third, seed.owner)), asio::use_future);
     io.run();
-    ASSERT_TRUE(legacyWrite.get());
+    ASSERT_TRUE(peerWrite.get());
     ASSERT_TRUE(a.get());
     ASSERT_TRUE(b.get());
     auto count = execute(fixture.get(),
@@ -3685,7 +3686,7 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         {seed.owner});
     EXPECT_STREQ(PQgetvalue(count.get(), 0, 0), "1");
 
-    ASSERT_TRUE(run(store.replaceAsync(challenge(last, seed.owner))));
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(last, seed.owner),localProvider)));
     for (const auto& previous : {first, second, third})
         EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{previous},
             ids::IdentityId{seed.owner}, purpose)));
@@ -3702,34 +3703,36 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     auto signup = run(store.replaceAsync(challenge("signup-" + seed.suffix,
         seed.owner, acc::VerificationPurpose::SignupEmail)));
     EXPECT_TRUE(!signup && signup.error().code() == fnd::ErrorCode::InvalidArgument);
-    // Wrong-purpose requests must not consume or exhaust the native proof.
+    // Wrong-purpose, wrong-owner and foreign-tenant requests must not
+    // consume or exhaust a valid native proof.
     const ids::IdentityId expectedOwner{seed.owner};
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        auto wrong = legacy.consumeForPurpose(acc::VerificationId{last},
-            acc::VerificationDigest{std::array<std::byte, 32>{}}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
-        EXPECT_TRUE(!wrong && wrong.error().code() == fnd::ErrorCode::AuthenticationFailed);
+    for (int attempt=0;attempt<10;++attempt) {
+        auto wrong=run(peer.verifyPhoneAsync(localProvider,expectedOwner,acc::VerificationId{last},
+            acc::VerificationDigest{std::array<std::byte,32>{}},kNow,8U));
+        EXPECT_TRUE(!wrong && wrong.error().code()==fnd::ErrorCode::AuthenticationFailed);
     }
-    auto wrongPurpose = legacy.consumeForPurpose(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
-    EXPECT_TRUE(!wrongPurpose && wrongPurpose.error().code() == fnd::ErrorCode::AuthenticationFailed);
-    // Legacy consumption must still understand the native-issued digest.
-    auto consumed = legacy.consumeForPurpose(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U, purpose, &expectedOwner);
-    ASSERT_TRUE(consumed);
-    EXPECT_EQ(consumed->identity().value(), seed.owner);
-    EXPECT_EQ(consumed->purpose(), purpose);
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U));
+    EXPECT_FALSE(run(peer.verifyPhoneAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},kNow,8U)));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ids::IdentityId{seed.secondOwner},
+        acc::VerificationId{last},acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_FALSE(run(foreign.changeEmailAsync(localProvider,expectedOwner,
+        acc::VerificationId{last},acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(scalar("SELECT attempts::text FROM openproof.account_verification_challenges WHERE id=$1",{last}),"0");
+    ASSERT_TRUE(run(peer.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(scalar("SELECT email||':'||email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),
+        "contact@example.test:true");
+    EXPECT_FALSE(run(store.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
     const auto failed = "verification-failed-" + seed.suffix;
     ASSERT_TRUE(run(store.replaceAsync(challenge(failed, seed.owner))));
     ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
         ids::IdentityId{seed.owner}, purpose)));
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{failed},
-        acc::VerificationDigest{digest}, kNow, 8U));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{failed},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
     EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
         ids::IdentityId{seed.owner}, purpose)));
 
-    const idp::ProviderId localProvider{"fixture-local-" + seed.suffix};
     const auto reservedId = "reserved-" + seed.suffix;
     ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(reservedId, seed.owner), localProvider)));
     auto reservation = execute(fixture.get(),
@@ -3773,50 +3776,71 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
         {std::string{rollbackProvider.value()}});
     EXPECT_STREQ(PQgetvalue(afterInsertFailure.get(), 0, 0), "0");
-    const ids::ExternalIdentityRef external{localProvider, idp::ExternalSubject{"contact@example.test"}};
     const ids::IdentityId ownerId{seed.owner};
-    auto oldGeneration = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
-    ASSERT_TRUE(oldGeneration && oldGeneration->has_value() && oldGeneration->value() == ownerId);
-    EXPECT_TRUE(legacy.releaseSubject(external, ownerId)); // owner-only must not remove tagged rows
-    auto untaggedRetry = legacy.reserveSubject(external, ownerId, kNow, kNow + 10min);
-    EXPECT_TRUE(!untaggedRetry && untaggedRetry.error().code() == fnd::ErrorCode::Conflict);
-    const auto renewedId = "renewed-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(renewedId, seed.owner), localProvider)));
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId}, ownerId, purpose)));
-    EXPECT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{reservedId}));
-    auto stale = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
-    EXPECT_TRUE(stale && !stale->has_value());
-    auto renewed = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{renewedId});
-    EXPECT_TRUE(renewed && renewed->has_value() && renewed->value() == ownerId);
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{renewedId}, ownerId, purpose)));
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{renewedId},
-        acc::VerificationDigest{digest}, kNow, 8U));
-    auto released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
+    const std::string providerName{localProvider.value()};
+    const auto generation=[&](){
+        return scalar("SELECT COALESCE((SELECT verification_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject='contact@example.test' AND identity_id=$2),'none')",
+            {providerName,seed.owner});
+    };
+    const auto reservationCount=[&](){
+        return scalar("SELECT count(*)::text FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject='contact@example.test'",{providerName});
+    };
+    EXPECT_EQ(generation(),reservedId);
+    const auto renewedId="renewed-"+seed.suffix;
+    ASSERT_TRUE(run(peer.reserveAndReplaceAsync(challenge(renewedId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId},ownerId,purpose)));
+    EXPECT_EQ(generation(),renewedId);
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{reservedId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(generation(),renewedId);
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{renewedId},ownerId,purpose)));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{renewedId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(reservationCount(),"0");
 
-    // A consumed proof's reservation must survive delivery compensation:
-    // completion may still need it; only the matching generation can release it.
-    const auto completingId = "completing-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(completingId, seed.owner), localProvider)));
-    ASSERT_TRUE(legacy.consumeForPurpose(acc::VerificationId{completingId},
-        acc::VerificationDigest{digest}, kNow, 8U, purpose, &ownerId));
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{completingId}, ownerId, purpose)));
-    auto completing = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{completingId});
-    EXPECT_TRUE(completing && completing->has_value() && completing->value() == ownerId);
-    ASSERT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{completingId}));
-    released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
+    // Native completion is atomic: no intermediate consumed-but-reserved
+    // state is published. Late delivery compensation cannot undo the profile.
+    const auto completingId="completing-"+seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(completingId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{completingId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{completingId},ownerId,purpose)));
+    EXPECT_EQ(reservationCount(),"0");
+    EXPECT_EQ(scalar("SELECT email||':'||email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.owner}),"contact@example.test:true");
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{completingId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
 
-    // Replacement by the legacy writer cleans a superseded tagged reservation.
-    const auto supersededId = "superseded-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(supersededId, seed.owner), localProvider)));
-    ASSERT_TRUE(legacy.replace(challenge("legacy-replacement-" + seed.suffix, seed.owner)));
-    released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
-    ASSERT_TRUE(legacy.reserveSubject(external, ownerId, kNow, kNow + 10min));
-    auto untagged = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{"legacy-id"});
-    EXPECT_TRUE(untagged && untagged->has_value() && untagged->value() == ownerId);
-    ASSERT_TRUE(legacy.releaseSubject(external, ownerId));
+    // Historical interrupted completion: a tagged reservation without its
+    // challenge is never accepted as proof; stale compensation is harmless.
+    const auto orphanId="orphan-"+seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.pending_external_identity_reservations(provider,external_subject,identity_id,expires_at_ms,verification_id)"
+        " VALUES($1,'contact@example.test',$2,1770000600000,$3)",{providerName,seed.owner,orphanId})));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{orphanId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{orphanId},ownerId,purpose)));
+    EXPECT_EQ(generation(),orphanId);
+    const auto supersededId="superseded-"+seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(supersededId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(peer.replaceAsync(challenge("peer-replacement-"+seed.suffix,seed.owner))));
+    EXPECT_EQ(reservationCount(),"0");
+
+    // A historical untagged signup reservation cannot be taken over by a
+    // contact-change ceremony, even by its own owner.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.pending_external_identity_reservations(provider,external_subject,identity_id,expires_at_ms)"
+        " VALUES($1,'contact@example.test',$2,1770000600000)",{providerName,seed.owner})));
+    auto untagged=run(peer.reserveAndReplaceAsync(challenge("untagged-"+seed.suffix,seed.owner),localProvider));
+    EXPECT_TRUE(!untagged && untagged.error().code()==fnd::ErrorCode::AlreadyExists);
+    EXPECT_EQ(reservationCount(),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.pending_external_identity_reservations "
+        "WHERE provider=$1 AND verification_id IS NULL",{providerName}),"1");
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.pending_external_identity_reservations WHERE provider=$1 AND verification_id IS NULL",
+        {providerName})));
 }
 
 TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndTotpReplay)

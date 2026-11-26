@@ -142,7 +142,7 @@ test("native migration and session regression suites exercise production SQL wit
   assert.match(session,/run\(peer.use\(digestOf\(0x51\)/);
   assert.match(session,/run\(peer.revoke\(/);
   const cmake=read("tests/CMakeLists.txt");
-  for(const target of ["openproof_postgres_domain_tests","openproof_postgres_network_tests"]){
+  for(const target of ["openproof_postgres_domain_tests","openproof_postgres_network_tests","openproof_postgres_async_canonical_tests"]){
     const start=cmake.indexOf("target_link_libraries("+target);
     const end=cmake.indexOf(")\n",start);
     assert.ok(start>=0 && end>start,target);
@@ -152,7 +152,17 @@ test("native migration and session regression suites exercise production SQL wit
   assert.match(canonical,/IndependentNativeTransactionsShareOneTimeFederationState/);
   assert.match(canonical,/IndependentNativeAuthorizationAuditSharesChainAndRollsBack/);
   assert.match(canonical,/co_spawn\(io,peer.rotateOAuthRefreshAsync/);
-  assert.doesNotMatch(canonical,/pg::(?:PostgresAuthenticationTransactionStore|PostgresAuthorizationDecisionSink|PostgresIdentityProviderStore)\b/);
+  assert.doesNotMatch(canonical,/import openproof.storage.postgres;|pg::(?:PoolConfig|ConnectionPool|Postgres\w+Repository|Postgres\w+Store|PostgresAuthorizationDecisionSink)\b/);
+  const verification=canonical.slice(canonical.indexOf("TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensation"),
+    canonical.indexOf("TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndTotpReplay)"));
+  assert.match(verification,/co_spawn\(io,peer.replaceAsync/);
+  assert.match(verification,/peer.verifyPhoneAsync/);
+  assert.match(verification,/foreign.changeEmailAsync/);
+  assert.match(verification,/SELECT attempts::text FROM openproof.account_verification_challenges/);
+  assert.match(verification,/EXPECT_EQ\(generation\(\),renewedId\)/);
+  assert.match(verification,/peer.changeEmailAsync\(localProvider,ownerId,acc::VerificationId\{orphanId\}/);
+  assert.match(verification,/WHERE provider=\$1 AND verification_id IS NULL/);
+  assert.match(verification,/untagged.error\(\).code\(\)==fnd::ErrorCode::AlreadyExists/);
 });
 test("liveness has no SQL dependency and readiness is bounded and fail-closed",()=>{
   const body=http.slice(http.indexOf("CoroutineHealthAdapter::handleAsync("));
