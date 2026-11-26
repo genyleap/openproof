@@ -465,9 +465,9 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     }
     if (clientCommand) {
         using Op=client::ManagementMutation;
-        const auto op=clientCommand->operation;
+        const auto clientOperation=clientCommand->operation;
         std::optional<foundation::SecretString> secret;
-        if (op==Op::RotateSecret || (op==Op::Create && !client::clientIsPublic(clientCommand->kind))) {
+        if (clientOperation==Op::RotateSecret || (clientOperation==Op::Create && !client::clientIsPublic(clientCommand->kind))) {
             auto raw=security::randomTokenBase64Url(32U);
             if (!raw) co_return failure(E::Unavailable,r);
             secret.emplace("ops_"+raw.value());
@@ -479,7 +479,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         auto changed=co_await m_clients->mutate(std::move(*clientCommand),actor->identity(),actor->id());
         if (!changed) co_return failure(changed.error().code(),r);
         boost::json::object body;
-        if (op==Op::RotateSecret) {
+        if (clientOperation==Op::RotateSecret) {
             body["client_id"]=std::string{changed->id().value()};
         } else {
             body["id"]=std::string{changed->id().value()};
@@ -493,7 +493,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             body["redirect_uris"]=std::move(redirects);
             body["scopes"]=std::move(scopes);
         }
-        if (op==Op::Create || op==Op::RotateSecret)
+        if (clientOperation==Op::Create || clientOperation==Op::RotateSecret)
             body["client_secret_returned_once"]=secret.has_value();
         // Serialize the raw credential only after successful commit, without
         // copying it into a non-wiping boost::json::value.
@@ -502,7 +502,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             output.pop_back();
             output.append(",\"client_secret\":\"").append(secret->expose()).append("\"}");
         }
-        co_return response(op==Op::Create?201:200,std::move(output));
+        co_return response(clientOperation==Op::Create?201:200,std::move(output));
     }
     auto data=co_await m_read(*op,actor->identity(),actor->id(),std::move(selected));
     if (!data) co_return consoleFailure(data.error().code(),r,console);

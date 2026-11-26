@@ -208,7 +208,10 @@ jobs:
           bash scripts/run-disposable-postgres-canonical-tests.sh
 
       - name: Build opp executable
-        run: cmake --build --preset gcc-release --target opp --parallel 2
+        # Keep compiling independent translation units after the first error
+        # so the next migration fix can address every reported blocker.
+        # Ninja still exits nonzero if any compilation or link fails.
+        run: cmake --build --preset gcc-release --target opp --parallel 2 -- -k 0
 
       - name: Verify executable has no blocking PostgreSQL symbols
         run: |
@@ -298,7 +301,7 @@ jobs:
           retention-days: 14
 
       - name: Build
-        run: cmake --build --preset gcc-release --parallel 2
+        run: cmake --build --preset gcc-release --parallel 2 -- -k 0
 
       - name: Destructive PostgreSQL integration in private socket fixture
         timeout-minutes: 15
