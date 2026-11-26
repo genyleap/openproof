@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <span>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -19,6 +21,9 @@
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
+#include <openssl/evp.h>
+#include <openssl/core_names.h>
+#include <openssl/bn.h>
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_recovery_code_repository.hpp"
@@ -26,6 +31,7 @@
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
+#include "../../src/storage/postgres/coroutine_local_proof_verifier.hpp"
 
 import openproof.foundation;
 import openproof.administration;
@@ -44,7 +50,6 @@ import openproof.provider.passkey;
 import openproof.security;
 import openproof.session;
 import openproof.token;
-import openproof.storage.postgres;
 
 namespace {
 
@@ -80,13 +85,6 @@ protected:
             GTEST_SKIP() << "OPENPROOF_TEST_POSTGRES is not configured";
         }
         connectionString = configured;
-        auto config = pg::PoolConfig::create(
-            fnd::SecretString{connectionString}, 4U, std::chrono::seconds{2});
-        ASSERT_TRUE(config);
-        auto created = pg::ConnectionPool::create(std::move(config).value());
-        ASSERT_TRUE(created);
-        pool = std::move(created).value();
-        ASSERT_TRUE(pool->healthCheck());
         auto migrated = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
             std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
         ASSERT_TRUE(migrated)
@@ -155,9 +153,35 @@ protected:
             "VALUES('identity-1',decode('00','hex'),1,NULL,1770000000000)");
     }
 
+    void seedLocalCredentials(const idp::ExternalSubject& subject,const cred::PasswordHasher& hasher,
+        const fnd::SecretString& password,const sec::AeadKey& key,const cred::TotpSecret* seed=nullptr)
+    {
+        auto hash=hasher.hash(password);
+        ASSERT_TRUE(hash);
+        const std::string subjectValue{subject.value()},encoded{hash->encoded()};
+        const char* values[]{subjectValue.c_str(),encoded.c_str()};
+        std::unique_ptr<PGresult,ResultDeleter> link{PQexecParams(direct.get(),
+            "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+            "VALUES('local',$1,'identity-1',1770000000000)",1,nullptr,values,nullptr,nullptr,0)};
+        ASSERT_TRUE(link && PQresultStatus(link.get())==PGRES_COMMAND_OK);
+        std::unique_ptr<PGresult,ResultDeleter> stored{PQexecParams(direct.get(),
+            "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES('identity-1',$1,1770000000000)",1,nullptr,values+1,nullptr,nullptr,0)};
+        ASSERT_TRUE(stored && PQresultStatus(stored.get())==PGRES_COMMAND_OK);
+        if(seed){
+            auto envelope=sec::sealAes256Gcm(key,seed->bytes(),"openproof/totp/v1:identity-1");
+            ASSERT_TRUE(envelope);
+            const auto hex=fnd::toHex(envelope.value());
+            const char* ciphertext[]{hex.c_str()};
+            std::unique_ptr<PGresult,ResultDeleter> enrolled{PQexecParams(direct.get(),
+                "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+                "VALUES('identity-1',decode($1,'hex'),1,NULL,1770000000000)",1,nullptr,ciphertext,nullptr,nullptr,0)};
+            ASSERT_TRUE(enrolled && PQresultStatus(enrolled.get())==PGRES_COMMAND_OK);
+        }
+    }
+
     asio::io_context io;
     std::string connectionString;
-    std::unique_ptr<pg::ConnectionPool> pool;
     std::unique_ptr<PGconn, ConnectionDeleter> direct;
 };
 
@@ -183,7 +207,9 @@ TEST_F(PostgresIntegrationTest, MigrationIsIdempotentAndPoolIsHealthy)
     ASSERT_TRUE(result);
     EXPECT_EQ(result->applied, 0U);
     EXPECT_GE(result->alreadyApplied, 1U);
-    EXPECT_EQ(pool->size(), 4U);
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},2U,2s,2s,4s};
+    EXPECT_TRUE(run(native.healthCheckAsync()));
 }
 
 
@@ -266,7 +292,7 @@ TEST_F(PostgresIntegrationTest, MigrationRejectsUnknownLedgerBeforeNewSql)
     execute("DELETE FROM openproof.schema_migrations WHERE version='9999_future_schema.sql'");
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code(), fnd::ErrorCode::FailedPrecondition);
-    EXPECT_TRUE(pool->healthCheck());
+    EXPECT_EQ(scalar("SELECT 1"),"1");
 }
 
 TEST_F(PostgresIntegrationTest, MigrationBatchRollsBackEarlierSqlAndLedgerOnLaterFailure)
@@ -313,7 +339,7 @@ TEST_F(PostgresIntegrationTest, MigrationBatchRollsBackEarlierSqlAndLedgerOnLate
     ASSERT_EQ(PQresultStatus(ledger.get()), PGRES_TUPLES_OK);
     ASSERT_EQ(PQntuples(ledger.get()), 1);
     EXPECT_STREQ(PQgetvalue(ledger.get(), 0, 0), "0");
-    EXPECT_TRUE(pool->healthCheck());
+    EXPECT_EQ(scalar("SELECT 1"),"1");
     EXPECT_TRUE(pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations"));
 }
@@ -332,7 +358,7 @@ TEST_F(PostgresIntegrationTest, ConcurrentMigrationChecksShareOneLedger)
     first.join();
     second.join();
     EXPECT_EQ(success.load(std::memory_order_relaxed), 2);
-    EXPECT_TRUE(pool->healthCheck());
+    EXPECT_EQ(scalar("SELECT 1"),"1");
 }
 
 TEST(PostgresMigrationBaselineTest, FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent)
@@ -585,45 +611,36 @@ TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
 
 TEST_F(PostgresIntegrationTest, IdentityOrganizationMembershipAndExternalLinksRoundTrip)
 {
-    pg::PostgresOrganizationRepository organizations{*pool};
-    pg::PostgresIdentityRepository identities{*pool};
-    pg::PostgresMembershipRepository memberships{*pool};
-    pg::PostgresExternalIdentityDirectory external{*pool};
-
-    auto organization = organizations.findById(core::OrganizationId{"org"});
-    ASSERT_TRUE(organization);
-    ASSERT_TRUE(organization->has_value());
-    EXPECT_TRUE(organization->value().isUsable());
-    auto identity = identities.findById(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
-    ASSERT_TRUE(identity);
-    ASSERT_TRUE(identity->has_value());
-    EXPECT_TRUE(identity->value().canAuthenticate());
-
-    auto membership = org::Membership::invite(
-        org::OrganizationId{"org"}, org::IdentityId{"identity-1"}, kNow).value();
-    ASSERT_TRUE(membership.grantRole(org::Role{"member"}));
-    ASSERT_TRUE(membership.accept());
-    ASSERT_TRUE(memberships.add(membership));
-    auto persisted = memberships.find(
-        org::OrganizationId{"org"}, org::IdentityId{"identity-1"});
-    ASSERT_TRUE(persisted);
-    ASSERT_TRUE(persisted->has_value());
-    EXPECT_TRUE(persisted->value().hasRole(org::Role{"member"}));
-
-    auto link = core::IdentityLink::request(
-        core::IdentityId{"identity-1"},
-        core::ExternalIdentityRef{idp::ProviderId{"local"},
-                                  idp::ExternalSubject{"alice"}},
-        kNow, std::chrono::minutes{5}).value();
-    ASSERT_TRUE(link.requireVerification(kNow));
-    ASSERT_TRUE(link.markVerified(kNow));
-    ASSERT_TRUE(link.complete(kNow));
-    ASSERT_TRUE(external.attach(link));
-    auto owner = external.ownerOf(link.external());
-    ASSERT_TRUE(owner);
-    ASSERT_TRUE(owner->has_value());
-    EXPECT_EQ(owner->value(), core::IdentityId{"identity-1"});
+    const core::OrganizationId tenant{"org"};
+    const core::IdentityId owner{"identity-1"};
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{connectionString},tenant,2U,2s,2s,4s};
+    EXPECT_TRUE(run(native.healthCheckAsync()));
+    EXPECT_TRUE(run(native.authorizeConnectionTargetAsync(owner)));
+    execute("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+        "VALUES('org','identity-1',1,1770000000000)");
+    execute("INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES('org','identity-1','member')");
+    auto member=run(native.readAuthorizationMembershipAsync(owner,tenant));
+    ASSERT_TRUE(member);
+    EXPECT_TRUE(member->hasRole(org::Role{"member"}));
+    EXPECT_FALSE(run(native.readAuthorizationMembershipAsync(owner,core::OrganizationId{"foreign"})));
+    auto outcome=idp::AuthenticationOutcome::create(idp::ProviderId{"fixture-oidc"},idp::ExternalSubject{"alice"},
+        idp::VerifiedClaims{},idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession,false},idp::ProviderEvidence{},kNow);
+    ASSERT_TRUE(outcome);
+    auto linked=run(native.finishConnectionAsync(outcome.value(),owner,kNow));
+    ASSERT_TRUE(linked);
+    EXPECT_EQ(linked->subject().value(),"alice");
+    auto login=run(native.finishLoginAsync(outcome.value(),kNow));
+    ASSERT_TRUE(login);
+    EXPECT_EQ(login.value(),owner);
+    auto connections=run(native.readConnectionsAsync(owner));
+    ASSERT_TRUE(connections);
+    EXPECT_EQ(connections->first,owner);
+    ASSERT_EQ(connections->second.size(),1U);
+    EXPECT_EQ(connections->second.front(),linked.value());
+    execute("UPDATE openproof.organizations SET state=1 WHERE id='org'");
+    EXPECT_FALSE(run(native.finishLoginAsync(outcome.value(),kNow)));
+    EXPECT_FALSE(run(native.readAuthorizationMembershipAsync(owner,tenant)));
 }
 
 TEST_F(PostgresIntegrationTest, RejectedAuthorizationIsChainedAndPublished)
@@ -681,169 +698,131 @@ TEST_F(PostgresIntegrationTest, PasswordKdfPolicySwitchPreservesAndUpgradesLogin
     if (!cred::PasswordHasher::supportsArgon2id()) {
         GTEST_SKIP() << "libsodium Argon2id is unavailable";
     }
-
-    pg::PostgresExternalIdentityDirectory external{*pool};
     const idp::ExternalSubject subject{"kdf-switch-user"};
-    auto link = core::IdentityLink::request(
-        core::IdentityId{"identity-1"},
-        core::ExternalIdentityRef{idp::ProviderId{"local"}, subject},
-        kNow, std::chrono::minutes{5}).value();
-    ASSERT_TRUE(link.requireVerification(kNow));
-    ASSERT_TRUE(link.markVerified(kNow));
-    ASSERT_TRUE(link.complete(kNow));
-    ASSERT_TRUE(external.attach(link));
-
-    auto policy = cred::PasswordPolicy::create(
-        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
-    auto makeDirectory = [&](std::string algorithm) {
-        auto hasher = cred::PasswordHasher::create(
-            fnd::SecretString{std::string(32U, 'p')}, policy,
-            std::move(algorithm)).value();
-        auto key = sec::AeadKey::create(
-            fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-        return pg::PostgresLocalAccountDirectory::create(
-            *pool, std::move(hasher), cred::TotpPolicy::recommended(),
-            std::move(key), 1U, idp::ProviderId{"local"}).value();
-    };
-
-    auto oldDirectory = makeDirectory("scrypt");
+    const core::IdentityId owner{"identity-1"};
     const fnd::SecretString password{"correct-password"};
-    ASSERT_TRUE(oldDirectory->enroll(subject, password.clone(), std::nullopt));
-    const auto readStored = [&]() {
-        std::unique_ptr<PGresult, ResultDeleter> row{PQexec(direct.get(),
-            "SELECT password_hash, changed_at_ms FROM "
-            "openproof.password_credentials WHERE identity_id='identity-1'")};
-        EXPECT_NE(row.get(), nullptr);
-        if (!row || PQresultStatus(row.get()) != PGRES_TUPLES_OK
-            || PQntuples(row.get()) != 1) return std::pair<std::string, std::string>{};
-        return std::pair<std::string, std::string>{
-            PQgetvalue(row.get(), 0, 0), PQgetvalue(row.get(), 0, 1)};
+    auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U).value();
+    const auto makeHasher=[&](std::string algorithm){
+        return cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy,std::move(algorithm)).value();
     };
-
-    const auto previous = readStored();
+    const auto makeKey=[](){return sec::AeadKey::create(fnd::SecretString{std::string(32U,'k')}).value();};
+    auto initialHasher=makeHasher("scrypt");
+    auto fixtureKey=makeKey();
+    ASSERT_NO_FATAL_FAILURE(seedLocalCredentials(subject,initialHasher,password,fixtureKey));
+    auto oldWorker=cred::BoundedPasswordExecutor::create(makeHasher("scrypt"),1U);
+    auto modernWorker=cred::BoundedPasswordExecutor::create(makeHasher("argon2id"),1U);
+    ASSERT_TRUE(oldWorker && modernWorker);
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},2U,2s,2s,4s};
+    pg::CoroutinePostgresLocalProofVerifier modern{store,*modernWorker.value(),cred::TotpPolicy::recommended(),
+        makeKey(),1U,fnd::SecretString{std::string(32U,'r')}};
+    pg::CoroutinePostgresLocalProofVerifier old{store,*oldWorker.value(),cred::TotpPolicy::recommended(),
+        makeKey(),1U,fnd::SecretString{std::string(32U,'r')}};
+    const auto readStored=[&](){
+        return std::pair{scalar("SELECT password_hash FROM openproof.password_credentials WHERE identity_id='identity-1'"),
+            scalar("SELECT changed_at_ms::text FROM openproof.password_credentials WHERE identity_id='identity-1'")};
+    };
+    const auto previous=readStored();
     ASSERT_TRUE(previous.first.starts_with("scrypt$v1$"));
-
-    auto modernDirectory = makeDirectory("argon2id");
-    EXPECT_FALSE(oldDirectory->passwordUpgradeNeeded(subject).value());
-    EXPECT_TRUE(modernDirectory->passwordUpgradeNeeded(subject).value());
-    EXPECT_FALSE(modernDirectory->confirmPasswordUpgrade(
-        subject, fnd::SecretString{"wrong-password"}));
-    EXPECT_EQ(readStored(), previous);
-    EXPECT_TRUE(modernDirectory->confirmPasswordUpgrade(subject, password.clone()).value());
-    EXPECT_FALSE(modernDirectory->passwordUpgradeNeeded(subject).value());
-    EXPECT_FALSE(modernDirectory->confirmPasswordUpgrade(subject, password.clone()).value());
-
-    auto verified = modernDirectory->verify(
-        subject, password.clone(), std::nullopt, kNow);
+    auto oldStatus=run(store.readPasswordUpgradeStatusAsync(owner,*oldWorker.value()));
+    ASSERT_TRUE(oldStatus && oldStatus->second.has_value());
+    EXPECT_FALSE(*oldStatus->second);
+    auto modernStatus=run(store.readPasswordUpgradeStatusAsync(owner,*modernWorker.value()));
+    ASSERT_TRUE(modernStatus && modernStatus->second.has_value());
+    EXPECT_TRUE(*modernStatus->second);
+    EXPECT_FALSE(run(store.confirmPasswordUpgradeAsync(owner,fnd::SecretString{"wrong-password"},*modernWorker.value())));
+    EXPECT_EQ(readStored(),previous);
+    auto upgraded=run(store.confirmPasswordUpgradeAsync(owner,password.clone(),*modernWorker.value()));
+    ASSERT_TRUE(upgraded);
+    EXPECT_TRUE(upgraded->second);
+    auto current=run(store.readPasswordUpgradeStatusAsync(owner,*modernWorker.value()));
+    ASSERT_TRUE(current && current->second.has_value());
+    EXPECT_FALSE(*current->second);
+    auto repeated=run(store.confirmPasswordUpgradeAsync(owner,password.clone(),*modernWorker.value()));
+    ASSERT_TRUE(repeated);
+    EXPECT_FALSE(repeated->second);
+    auto verified=run(modern.verifyAsync(subject,password.clone(),std::nullopt,std::nullopt,kNow));
     ASSERT_TRUE(verified);
-    EXPECT_EQ(verified.value(), local::LocalVerification::Password);
-    const auto upgraded = readStored();
-    EXPECT_TRUE(upgraded.first.starts_with("$argon2id$v=19$"));
-    // Re-encoding is not a password change; expiration timestamps are preserved.
-    EXPECT_EQ(upgraded.second, previous.second);
-
-    // Reverting the policy keeps Argon2id verification and can rehash to scrypt.
-    verified = oldDirectory->verify(subject, password.clone(), std::nullopt, kNow);
-    ASSERT_TRUE(verified);
+    EXPECT_EQ(verified->verification,local::LocalVerification::Password);
+    EXPECT_TRUE(readStored().first.starts_with("$argon2id$v=19$"));
+    EXPECT_EQ(readStored().second,previous.second);
+    ASSERT_TRUE(run(old.verifyAsync(subject,password.clone(),std::nullopt,std::nullopt,kNow)));
     EXPECT_TRUE(readStored().first.starts_with("scrypt$v1$"));
+    EXPECT_EQ(readStored().second,previous.second);
+    // Complete login also upgrades a valid old hash without an explicit request.
+    ASSERT_TRUE(run(modern.verifyAsync(subject,password.clone(),std::nullopt,std::nullopt,kNow)));
+    EXPECT_TRUE(readStored().first.starts_with("$argon2id$v=19$"));
+    EXPECT_EQ(readStored().second,previous.second);
 }
 
 TEST_F(PostgresIntegrationTest, PersistentLocalTotpIsEncryptedAndConsumedOnce)
 {
-    pg::PostgresExternalIdentityDirectory external{*pool};
-    auto link = core::IdentityLink::request(
-        core::IdentityId{"identity-1"},
-        core::ExternalIdentityRef{idp::ProviderId{"local"},
-                                  idp::ExternalSubject{"alice"}},
-        kNow, std::chrono::minutes{5}).value();
-    ASSERT_TRUE(link.requireVerification(kNow));
-    ASSERT_TRUE(link.markVerified(kNow));
-    ASSERT_TRUE(link.complete(kNow));
-    ASSERT_TRUE(external.attach(link));
-
-    auto passwordPolicy = cred::PasswordPolicy::create(
-        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
-    auto passwordHasher = cred::PasswordHasher::create(
-        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
-    auto encryptionKey = sec::AeadKey::create(
-        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto directory = pg::PostgresLocalAccountDirectory::create(
-        *pool, std::move(passwordHasher), cred::TotpPolicy::recommended(),
-        std::move(encryptionKey), 1U, idp::ProviderId{"local"});
-    ASSERT_TRUE(directory);
-    auto secret = cred::TotpSecret::create(
-        fnd::SecretString{"12345678901234567890"}).value();
-    const std::string code = cred::totpAt(
-        secret, cred::TotpPolicy::recommended(), kNow).value();
-    ASSERT_TRUE(directory.value()->enroll(
-        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
-        std::optional<cred::TotpSecret>{std::move(secret)}));
-
-    std::atomic<unsigned int> winners{0U};
-    auto verify = [&] {
-        auto result = directory.value()->verify(
-            idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
-            code, kNow);
-        if (result.has_value()) winners.fetch_add(1U);
+    const idp::ExternalSubject subject{"alice"};
+    const core::IdentityId owner{"identity-1"};
+    const fnd::SecretString password{"correct-password"};
+    const auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U).value();
+    const auto makeHasher=[&](){return cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy).value();};
+    const auto makeKey=[](){return sec::AeadKey::create(fnd::SecretString{std::string(32U,'k')}).value();};
+    auto hasher=makeHasher();
+    auto key=makeKey();
+    auto secret=cred::TotpSecret::create(fnd::SecretString{"12345678901234567890"}).value();
+    const auto code=cred::totpAt(secret,cred::TotpPolicy::recommended(),kNow).value();
+    ASSERT_NO_FATAL_FAILURE(seedLocalCredentials(subject,hasher,password,key,&secret));
+    EXPECT_EQ(scalar("SELECT (encrypted_seed=convert_to('12345678901234567890','UTF8'))::text FROM openproof.totp_credentials WHERE identity_id='identity-1'"),"false");
+    auto workers=cred::BoundedPasswordExecutor::create(makeHasher(),2U);
+    ASSERT_TRUE(workers);
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},2U,2s,2s,4s};
+    pg::CoroutineLocalCredentialStore peer{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},1U,2s,2s,4s};
+    pg::CoroutinePostgresLocalProofVerifier firstVerifier{store,*workers.value(),cred::TotpPolicy::recommended(),
+        makeKey(),1U,fnd::SecretString{std::string(32U,'r')}};
+    pg::CoroutinePostgresLocalProofVerifier secondVerifier{peer,*workers.value(),cred::TotpPolicy::recommended(),
+        makeKey(),1U,fnd::SecretString{std::string(32U,'r')}};
+    auto verify=[&](pg::CoroutinePostgresLocalProofVerifier& verifier)->asio::awaitable<bool>{
+        auto result=co_await verifier.verifyAsync(subject,password.clone(),
+            std::optional<fnd::SecretString>{fnd::SecretString{code}},std::nullopt,kNow);
+        co_return result && result->verification==local::LocalVerification::PasswordAndTotp;
     };
-    std::thread first{verify};
-    std::thread second{verify};
-    first.join();
-    second.join();
-    EXPECT_EQ(winners.load(), 1U);
-
-    auto enabled = directory.value()->hasTotp(idp::ExternalSubject{"alice"});
-    ASSERT_TRUE(enabled);
-    EXPECT_TRUE(enabled.value());
-    ASSERT_TRUE(directory.value()->removeTotp(idp::ExternalSubject{"alice"}));
-    enabled = directory.value()->hasTotp(idp::ExternalSubject{"alice"});
-    ASSERT_TRUE(enabled);
-    EXPECT_FALSE(enabled.value());
-
-    auto passwordOnly = directory.value()->verify(
-        idp::ExternalSubject{"alice"}, fnd::SecretString{"correct-password"},
-        std::nullopt, kNow);
+    io.restart();
+    auto first=asio::co_spawn(io,verify(firstVerifier),asio::use_future);
+    auto second=asio::co_spawn(io,verify(secondVerifier),asio::use_future);
+    io.run();
+    EXPECT_NE(first.get(),second.get());
+    EXPECT_FALSE(run(verify(firstVerifier)));
+    EXPECT_FALSE(run(firstVerifier.verifyAsync(subject,password.clone(),std::nullopt,std::nullopt,kNow)));
+    fnd::ManualClockSource clock{kNow+1s};
+    pg::CoroutineTotpEnrollment ceremony{store,*workers.value(),makeKey(),1U,clock};
+    EXPECT_FALSE(run(ceremony.disableAsync(owner,password.clone(),idp::AssuranceLevel::Ial1)));
+    ASSERT_TRUE(run(ceremony.disableAsync(owner,password.clone(),idp::AssuranceLevel::Ial2)));
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.totp_credentials WHERE identity_id='identity-1'"),"0");
+    auto passwordOnly=run(firstVerifier.verifyAsync(subject,password.clone(),std::nullopt,std::nullopt,kNow+1s));
     ASSERT_TRUE(passwordOnly);
-
-    auto removedAgain = directory.value()->removeTotp(idp::ExternalSubject{"alice"});
+    EXPECT_EQ(passwordOnly->verification,local::LocalVerification::Password);
+    auto removedAgain=run(ceremony.disableAsync(owner,password.clone(),idp::AssuranceLevel::Ial2));
     ASSERT_FALSE(removedAgain);
-    EXPECT_EQ(removedAgain.error().code(), fnd::ErrorCode::FailedPrecondition);
+    EXPECT_EQ(removedAgain.error().code(),fnd::ErrorCode::FailedPrecondition);
 }
 
 TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnable)
 {
-    pg::PostgresExternalIdentityDirectory external{*pool};
-    auto link = core::IdentityLink::request(
-        core::IdentityId{"identity-1"},
-        core::ExternalIdentityRef{idp::ProviderId{"local"},
-                                  idp::ExternalSubject{"rekey-user"}},
-        kNow, std::chrono::minutes{5}).value();
-    ASSERT_TRUE(link.requireVerification(kNow));
-    ASSERT_TRUE(link.markVerified(kNow));
-    ASSERT_TRUE(link.complete(kNow));
-    ASSERT_TRUE(external.attach(link));
-
-    const auto passwordPolicy = cred::PasswordPolicy::create(
-        1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U).value();
-    auto oldHasher = cred::PasswordHasher::create(
-        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
-    auto oldDirectoryKey = sec::AeadKey::create(
-        fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto oldDirectory = pg::PostgresLocalAccountDirectory::create(
-        *pool, std::move(oldHasher), cred::TotpPolicy::recommended(),
-        std::move(oldDirectoryKey), 1U, idp::ProviderId{"local"});
-    ASSERT_TRUE(oldDirectory);
-    auto seed = cred::TotpSecret::create(
-        fnd::SecretString{"12345678901234567890"}).value();
-    const std::string firstCode = cred::totpAt(
-        seed, cred::TotpPolicy::recommended(), kNow).value();
-    ASSERT_TRUE(oldDirectory.value()->enroll(
-        idp::ExternalSubject{"rekey-user"},
-        fnd::SecretString{"correct-password"},
-        std::optional<cred::TotpSecret>{std::move(seed)}));
-    ASSERT_TRUE(oldDirectory.value()->verify(
-        idp::ExternalSubject{"rekey-user"},
-        fnd::SecretString{"correct-password"}, firstCode, kNow));
+    const idp::ExternalSubject subject{"rekey-user"};
+    const fnd::SecretString password{"correct-password"};
+    const auto passwordPolicy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U).value();
+    const auto makeHasher=[&](){return cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},passwordPolicy).value();};
+    auto oldHasher=makeHasher();
+    auto oldDirectoryKey=sec::AeadKey::create(fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
+    auto seed=cred::TotpSecret::create(fnd::SecretString{"12345678901234567890"}).value();
+    const auto firstCode=cred::totpAt(seed,cred::TotpPolicy::recommended(),kNow).value();
+    ASSERT_NO_FATAL_FAILURE(seedLocalCredentials(subject,oldHasher,password,oldDirectoryKey,&seed));
+    auto worker=cred::BoundedPasswordExecutor::create(makeHasher(),1U);
+    ASSERT_TRUE(worker);
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},2U,2s,2s,4s};
+    pg::CoroutinePostgresLocalProofVerifier oldVerifier{store,*worker.value(),cred::TotpPolicy::recommended(),
+        std::move(oldDirectoryKey),1U,fnd::SecretString{std::string(32U,'r')}};
+    ASSERT_TRUE(run(oldVerifier.verifyAsync(subject,password.clone(),
+        std::optional<fnd::SecretString>{fnd::SecretString{firstCode}},std::nullopt,kNow)));
 
     std::unique_ptr<PGresult, ResultDeleter> before{PQexec(
         direct.get(),
@@ -918,22 +897,20 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
     EXPECT_EQ(PQgetvalue(after.get(), 0, 2), acceptedStep);
     EXPECT_STREQ(PQgetvalue(after.get(), 0, 3), "1");
 
-    auto newHasher = cred::PasswordHasher::create(
-        fnd::SecretString{std::string(32U, 'p')}, passwordPolicy).value();
-    auto newDirectoryKey = sec::AeadKey::create(
+    auto newDirectoryKey=sec::AeadKey::create(
         fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
-    auto newDirectory = pg::PostgresLocalAccountDirectory::create(
-        *pool, std::move(newHasher), cred::TotpPolicy::recommended(),
-        std::move(newDirectoryKey), 2U, idp::ProviderId{"local"});
-    ASSERT_TRUE(newDirectory);
-    auto verifierSeed = cred::TotpSecret::create(
-        fnd::SecretString{"12345678901234567890"}).value();
-    const auto nextInstant = kNow + std::chrono::seconds{30};
-    const std::string nextCode = cred::totpAt(
-        verifierSeed, cred::TotpPolicy::recommended(), nextInstant).value();
-    ASSERT_TRUE(newDirectory.value()->verify(
-        idp::ExternalSubject{"rekey-user"},
-        fnd::SecretString{"correct-password"}, nextCode, nextInstant));
+    pg::CoroutinePostgresLocalProofVerifier newVerifier{store,*worker.value(),cred::TotpPolicy::recommended(),
+        std::move(newDirectoryKey),2U,fnd::SecretString{std::string(32U,'r')}};
+    EXPECT_FALSE(run(newVerifier.verifyAsync(subject,password.clone(),
+        std::optional<fnd::SecretString>{fnd::SecretString{firstCode}},std::nullopt,kNow)));
+    const auto nextInstant=kNow+30s;
+    const auto nextCode=cred::totpAt(seed,cred::TotpPolicy::recommended(),nextInstant).value();
+    EXPECT_FALSE(run(oldVerifier.verifyAsync(subject,password.clone(),
+        std::optional<fnd::SecretString>{fnd::SecretString{nextCode}},std::nullopt,nextInstant)));
+    auto verified=run(newVerifier.verifyAsync(subject,password.clone(),
+        std::optional<fnd::SecretString>{fnd::SecretString{nextCode}},std::nullopt,nextInstant));
+    ASSERT_TRUE(verified);
+    EXPECT_EQ(verified->verification,local::LocalVerification::PasswordAndTotp);
 }
 
 TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState)
@@ -1106,25 +1083,11 @@ TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndO
     ASSERT_FALSE(repeated);
     EXPECT_EQ(repeated.error().code(), fnd::ErrorCode::AlreadyExists);
 
-    pg::PostgresOrganizationRepository organizations{*pool};
-    pg::PostgresIdentityRepository identities{*pool};
-    pg::PostgresMembershipRepository memberships{*pool};
-    pg::PostgresExternalIdentityDirectory external{*pool};
-    auto tenant = organizations.findById(core::OrganizationId{"bootstrap-org"});
-    auto identity = identities.findById(
-        core::OrganizationId{"bootstrap-org"},
-        core::IdentityId{"bootstrap-identity"});
-    auto membership = memberships.find(
-        core::OrganizationId{"bootstrap-org"},
-        core::IdentityId{"bootstrap-identity"});
-    auto owner = external.ownerOf(core::ExternalIdentityRef{
-        idp::ProviderId{"local"}, idp::ExternalSubject{"owner@example.test"}});
-    ASSERT_TRUE(tenant && tenant->has_value());
-    ASSERT_TRUE(identity && identity->has_value());
-    ASSERT_TRUE(membership && membership->has_value());
-    ASSERT_TRUE(owner && owner->has_value());
-    EXPECT_TRUE(membership->value().hasRole(org::Role{"owner"}));
-    EXPECT_EQ(owner->value(), core::IdentityId{"bootstrap-identity"});
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.organizations WHERE id='bootstrap-org' AND state=0"),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.identities WHERE id='bootstrap-identity' AND organization_id='bootstrap-org' AND kind=0 AND status=0"),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.memberships WHERE organization_id='bootstrap-org' AND identity_id='bootstrap-identity' AND state=1"),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.membership_roles WHERE organization_id='bootstrap-org' AND identity_id='bootstrap-identity' AND role='owner'"),"1");
+    EXPECT_EQ(scalar("SELECT identity_id FROM openproof.external_identities WHERE provider='local' AND external_subject='owner@example.test'"),"bootstrap-identity");
 
     std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
         direct.get(),
@@ -1144,17 +1107,18 @@ TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndO
         fnd::SecretString{std::string(32U, 'p')}, policy).value();
     auto verifierKey = sec::AeadKey::create(
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto accounts = pg::PostgresLocalAccountDirectory::create(
-        *pool, std::move(verifierHasher), cred::TotpPolicy::recommended(),
-        std::move(verifierKey), 1U, idp::ProviderId{"local"});
-    ASSERT_TRUE(accounts);
-    const std::string code = cred::totpAt(
-        command->totp(), cred::TotpPolicy::recommended(), kNow).value();
-    auto verified = accounts.value()->verify(
-        idp::ExternalSubject{"owner@example.test"},
-        fnd::SecretString{"correct-bootstrap-password"}, code, kNow);
-    ASSERT_TRUE(verified) << verified.error().internalDetail();
-    EXPECT_EQ(verified.value(), local::LocalVerification::PasswordAndTotp);
+    auto passwords=cred::BoundedPasswordExecutor::create(std::move(verifierHasher),1U);
+    ASSERT_TRUE(passwords);
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"bootstrap-org"},idp::ProviderId{"local"},2U,2s,2s,4s};
+    pg::CoroutinePostgresLocalProofVerifier verifier{store,*passwords.value(),cred::TotpPolicy::recommended(),
+        std::move(verifierKey),1U,fnd::SecretString{std::string(32U,'r')}};
+    const auto code=cred::totpAt(command->totp(),cred::TotpPolicy::recommended(),kNow).value();
+    auto verified=run(verifier.verifyAsync(idp::ExternalSubject{"owner@example.test"},
+        fnd::SecretString{"correct-bootstrap-password"},std::optional<fnd::SecretString>{fnd::SecretString{code}},std::nullopt,kNow));
+    ASSERT_TRUE(verified);
+    EXPECT_EQ(verified->verification,local::LocalVerification::PasswordAndTotp);
+    EXPECT_EQ(verified->canonicalOwner,"bootstrap-identity");
 }
 
 TEST_F(PostgresIntegrationTest, NativeInitialOwnerRepairRequiresActiveIal2AndIsOneTime)
@@ -1211,10 +1175,15 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
     auto auditKey = audit::AuditKey::create(
         fnd::SecretString{"abcdef0123456789abcdef0123456789"}).value();
-    auto administration = pg::PostgresAdministrationRepository::create(
-        *pool, std::move(hasher), std::move(encryptionKey), 1U,
-        idp::ProviderId{"local"}, std::move(auditKey));
-    ASSERT_TRUE(administration);
+    auto passwords=cred::BoundedPasswordExecutor::create(std::move(hasher),1U);
+    ASSERT_TRUE(passwords);
+    pg::CoroutineAdminStore administration{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},*passwords.value(),std::move(encryptionKey),
+        1U,std::move(auditKey),2U,2s,2s,4s};
+    const auto mutate=[&](std::string actor,auto&& command){
+        const pg::CoroutineAdminStore::Command owned{std::move(command)};
+        return run(administration.mutateAsync(core::IdentityId{std::move(actor)},owned));
+    };
 
     const fnd::SecretString password{"generated-member-password-123456"};
     auto memberTotp = cred::TotpSecret::create(
@@ -1225,40 +1194,32 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
         std::vector<org::Role>{org::Role{"viewer"}, org::Role{"member"}},
         password.clone(), std::move(memberTotp), kNow);
     ASSERT_TRUE(enrollment);
-    ASSERT_TRUE(administration.value()->provision(
-        core::IdentityId{"identity-1"}, enrollment.value()));
+    ASSERT_TRUE(mutate("identity-1",enrollment.value()));
 
-    pg::PostgresIdentityRepository identities{*pool};
-    pg::PostgresMembershipRepository memberships{*pool};
-    pg::PostgresExternalIdentityDirectory external{*pool};
-    auto identity = identities.findById(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
-    auto membership = memberships.find(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
-    auto owner = external.ownerOf(core::ExternalIdentityRef{
-        idp::ProviderId{"local"}, idp::ExternalSubject{"bob@example.test"}});
-    ASSERT_TRUE(identity && identity->has_value());
-    ASSERT_TRUE(membership && membership->has_value());
-    ASSERT_TRUE(owner && owner->has_value());
-    EXPECT_EQ(owner->value(), core::IdentityId{"identity-2"});
-    EXPECT_TRUE(membership->value().hasRole(org::Role{"member"}));
-    EXPECT_TRUE(membership->value().hasRole(org::Role{"viewer"}));
-    EXPECT_FALSE(membership->value().hasRole(org::Role{"owner"}));
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.identities WHERE id='identity-2' AND organization_id='org' AND status=0"),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.memberships WHERE organization_id='org' AND identity_id='identity-2' AND state=1"),"1");
+    EXPECT_EQ(scalar("SELECT identity_id FROM openproof.external_identities WHERE provider='local' AND external_subject='bob@example.test'"),"identity-2");
+    EXPECT_EQ(scalar("SELECT string_agg(role,',' ORDER BY role) FROM openproof.membership_roles WHERE identity_id='identity-2' AND organization_id='org'"),"member,viewer");
 
     auto verifierHasher = cred::PasswordHasher::create(
         fnd::SecretString{std::string(32U, 'p')}, policy).value();
     auto verifierKey = sec::AeadKey::create(
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto accounts = pg::PostgresLocalAccountDirectory::create(
-        *pool, std::move(verifierHasher), cred::TotpPolicy::recommended(),
-        std::move(verifierKey), 1U, idp::ProviderId{"local"});
-    ASSERT_TRUE(accounts);
+    auto verifyPasswords=cred::BoundedPasswordExecutor::create(std::move(verifierHasher),1U);
+    ASSERT_TRUE(verifyPasswords);
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},idp::ProviderId{"local"},2U,2s,2s,4s};
+    pg::CoroutinePostgresLocalProofVerifier verifier{store,*verifyPasswords.value(),cred::TotpPolicy::recommended(),
+        std::move(verifierKey),1U,fnd::SecretString{std::string(32U,'r')}};
+    const auto verify=[&](const fnd::SecretString& candidate,const std::string& otp,fnd::Instant when){
+        return run(verifier.verifyAsync(idp::ExternalSubject{"bob@example.test"},candidate.clone(),
+            std::optional<fnd::SecretString>{fnd::SecretString{otp}},std::nullopt,when));
+    };
     auto verifierTotp = cred::TotpSecret::create(
         fnd::SecretString{"12345678901234567890"}).value();
     const std::string code = cred::totpAt(
         verifierTotp, cred::TotpPolicy::recommended(), kNow).value();
-    ASSERT_TRUE(accounts.value()->verify(
-        idp::ExternalSubject{"bob@example.test"}, password, code, kNow));
+    ASSERT_TRUE(verify(password,code,kNow));
 
     auto refused = admin::LocalMemberEnrollment::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-3"},
@@ -1268,14 +1229,10 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
         cred::TotpSecret::create(
             fnd::SecretString{"abcdefghijabcdefghij"}).value(), kNow);
     ASSERT_TRUE(refused);
-    const auto denied = administration.value()->provision(
-        core::IdentityId{"identity-2"}, refused.value());
+    const auto denied=mutate("identity-2",refused.value());
     ASSERT_FALSE(denied);
     EXPECT_EQ(denied.error().code(), fnd::ErrorCode::PermissionDenied);
-    auto absent = identities.findById(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-3"});
-    ASSERT_TRUE(absent);
-    EXPECT_FALSE(absent->has_value());
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.identities WHERE id='identity-3'"),"0");
 
     std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
         direct.get(),
@@ -1294,66 +1251,52 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
         core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
         std::vector<org::Role>{org::Role{"member"}},
         kNow + std::chrono::minutes{1}).value();
-    auto refusedLastOwner = administration.value()->replaceRoles(
-        core::IdentityId{"identity-1"}, finalOwnerRoles);
+    auto refusedLastOwner = mutate("identity-1",finalOwnerRoles);
     ASSERT_FALSE(refusedLastOwner);
     EXPECT_EQ(refusedLastOwner.error().code(), fnd::ErrorCode::FailedPrecondition);
     auto suspendFinalOwner = admin::MemberLifecycleChange::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
         admin::MemberLifecycleAction::Suspend,
         kNow + std::chrono::minutes{1}).value();
-    auto refusedSuspension = administration.value()->changeLifecycle(
-        core::IdentityId{"identity-1"}, suspendFinalOwner);
+    auto refusedSuspension = mutate("identity-1",suspendFinalOwner);
     ASSERT_FALSE(refusedSuspension);
     EXPECT_EQ(refusedSuspension.error().code(), fnd::ErrorCode::FailedPrecondition);
 
-    pg::PostgresSessionRepository sessions{*pool};
-    ASSERT_TRUE(sessions.add(sessionValue(
-        "member-role-token", "member-role-session", "identity-2")));
+    pg::CoroutinePostgresSessionRepository sessions{io.get_executor(),fnd::SecretString{connectionString},2U,2s,2s,4s};
+    ASSERT_TRUE(run(sessions.add(sessionValue(
+        "member-role-token", "member-role-session", "identity-2"))));
     auto promote = admin::MemberRoleReplacement::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
         std::vector<org::Role>{org::Role{"member"}, org::Role{"owner"}},
         kNow + std::chrono::minutes{2}).value();
-    ASSERT_TRUE(administration.value()->replaceRoles(
-        core::IdentityId{"identity-1"}, promote));
-    EXPECT_FALSE(sessions.use(
+    ASSERT_TRUE(mutate("identity-1",promote));
+    EXPECT_FALSE(run(sessions.use(
         sess::TokenDigest{sec::sha256("member-role-token").value()},
-        kNow + std::chrono::minutes{2}));
-    auto promotedMembership = memberships.find(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
-    ASSERT_TRUE(promotedMembership && promotedMembership->has_value());
-    EXPECT_TRUE(promotedMembership->value().hasRole(org::Role{"owner"}));
+        kNow + std::chrono::minutes{2})));
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.membership_roles WHERE organization_id='org' AND identity_id='identity-2' AND role='owner'"),"1");
 
-    ASSERT_TRUE(sessions.add(sessionValue(
-        "owner-lifecycle-token", "owner-lifecycle-session", "identity-1")));
+    ASSERT_TRUE(run(sessions.add(sessionValue(
+        "owner-lifecycle-token", "owner-lifecycle-session", "identity-1"))));
     auto suspendOwner = admin::MemberLifecycleChange::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
         admin::MemberLifecycleAction::Suspend,
         kNow + std::chrono::minutes{3}).value();
-    ASSERT_TRUE(administration.value()->changeLifecycle(
-        core::IdentityId{"identity-2"}, suspendOwner));
-    EXPECT_FALSE(sessions.use(
+    ASSERT_TRUE(mutate("identity-2",suspendOwner));
+    EXPECT_FALSE(run(sessions.use(
         sess::TokenDigest{sec::sha256("owner-lifecycle-token").value()},
-        kNow + std::chrono::minutes{3}));
-    auto suspended = memberships.find(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
-    ASSERT_TRUE(suspended && suspended->has_value());
-    EXPECT_EQ(suspended->value().state(), org::MembershipState::Suspended);
-    EXPECT_FALSE(suspended->value().hasRole(org::Role{"owner"}));
+        kNow + std::chrono::minutes{3})));
+    EXPECT_EQ(scalar("SELECT state::text FROM openproof.memberships WHERE organization_id='org' AND identity_id='identity-1'"),"2");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.memberships m JOIN openproof.membership_roles r USING(organization_id,identity_id) WHERE m.organization_id='org' AND m.identity_id='identity-1' AND m.state=1 AND r.role='owner'"),"0");
 
     auto reinstateOwner = admin::MemberLifecycleChange::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
         admin::MemberLifecycleAction::Reinstate,
         kNow + std::chrono::minutes{4}).value();
-    ASSERT_TRUE(administration.value()->changeLifecycle(
-        core::IdentityId{"identity-2"}, reinstateOwner));
-    auto reinstated = memberships.find(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-1"});
-    ASSERT_TRUE(reinstated && reinstated->has_value());
-    EXPECT_TRUE(reinstated->value().hasRole(org::Role{"owner"}));
+    ASSERT_TRUE(mutate("identity-2",reinstateOwner));
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.memberships m JOIN openproof.membership_roles r USING(organization_id,identity_id) WHERE m.organization_id='org' AND m.identity_id='identity-1' AND m.state=1 AND r.role='owner'"),"1");
 
-    ASSERT_TRUE(sessions.add(sessionValue(
-        "member-reset-token", "member-reset-session", "identity-2")));
+    ASSERT_TRUE(run(sessions.add(sessionValue(
+        "member-reset-token", "member-reset-session", "identity-2"))));
     execute("INSERT INTO openproof.recovery_codes"
             "(identity_id,code_digest,issued_at_ms) "
             "VALUES('identity-2',decode(repeat('ab',32),'hex'),1770000000000)");
@@ -1364,41 +1307,31 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
         cred::TotpSecret::create(
             fnd::SecretString{"abcdefghijabcdefghij"}).value(),
         kNow + std::chrono::minutes{5}).value();
-    ASSERT_TRUE(administration.value()->resetCredentials(
-        core::IdentityId{"identity-1"}, reset));
-    EXPECT_FALSE(sessions.use(
+    ASSERT_TRUE(mutate("identity-1",reset));
+    EXPECT_FALSE(run(sessions.use(
         sess::TokenDigest{sec::sha256("member-reset-token").value()},
-        kNow + std::chrono::minutes{5}));
+        kNow + std::chrono::minutes{5})));
     auto resetTotp = cred::TotpSecret::create(
         fnd::SecretString{"abcdefghijabcdefghij"}).value();
     const std::string resetCode = cred::totpAt(
         resetTotp, cred::TotpPolicy::recommended(),
         kNow + std::chrono::minutes{5}).value();
-    EXPECT_FALSE(accounts.value()->verify(
-        idp::ExternalSubject{"bob@example.test"}, password, resetCode,
-        kNow + std::chrono::minutes{5}));
-    ASSERT_TRUE(accounts.value()->verify(
-        idp::ExternalSubject{"bob@example.test"}, resetPassword, resetCode,
-        kNow + std::chrono::minutes{5}));
+    EXPECT_FALSE(verify(password,resetCode,kNow+5min));
+    ASSERT_TRUE(verify(resetPassword,resetCode,kNow+5min));
 
     auto removeMember = admin::MemberLifecycleChange::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-2"},
         admin::MemberLifecycleAction::Remove,
         kNow + std::chrono::minutes{6}).value();
-    ASSERT_TRUE(administration.value()->changeLifecycle(
-        core::IdentityId{"identity-1"}, removeMember));
-    auto removedMembership = memberships.find(
-        core::OrganizationId{"org"}, core::IdentityId{"identity-2"});
-    ASSERT_TRUE(removedMembership && removedMembership->has_value());
-    EXPECT_EQ(removedMembership->value().state(), org::MembershipState::Removed);
-    EXPECT_TRUE(removedMembership->value().roles().empty());
+    ASSERT_TRUE(mutate("identity-1",removeMember));
+    EXPECT_EQ(scalar("SELECT state::text FROM openproof.memberships WHERE organization_id='org' AND identity_id='identity-2'"),"3");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.membership_roles WHERE organization_id='org' AND identity_id='identity-2'"),"0");
 
     auto removeFinalOwner = admin::MemberLifecycleChange::create(
         core::OrganizationId{"org"}, core::IdentityId{"identity-1"},
         admin::MemberLifecycleAction::Remove,
         kNow + std::chrono::minutes{7}).value();
-    auto finalRemoval = administration.value()->changeLifecycle(
-        core::IdentityId{"identity-1"}, removeFinalOwner);
+    auto finalRemoval = mutate("identity-1",removeFinalOwner);
     ASSERT_FALSE(finalRemoval);
     EXPECT_EQ(finalRemoval.error().code(), fnd::ErrorCode::FailedPrecondition);
 
@@ -1420,19 +1353,24 @@ TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembe
 
 TEST_F(PostgresIntegrationTest, IdentityPlatformPersistenceAndOneTimeOAuthStateAreTransactional)
 {
-    pg::PostgresIdentityProviderStore store{*pool};
-
+    const core::IdentityId owner{"identity-1"};
+    const sess::SessionId sessionId{"session-1"};
+    execute("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) VALUES('org','identity-1',1,1770000000000)");
+    execute("INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES('org','identity-1','owner')");
+    pg::CoroutinePostgresSessionRepository sessions{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
+    ASSERT_TRUE(run(sessions.add(sessionValue("platform-session"))));
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},2U,2s,2s,4s};
     const app::ApplicationId applicationId{"ride-app"};
-    auto application = app::Application::create(
-        applicationId, core::OrganizationId{"org"}, "ride", "Ride",
-        app::Environment::Production, kNow);
+    auto application=run(native.mutateApplicationAsync(
+        app::ApplicationMutationCommand{app::ApplicationMutation::Create,applicationId,"ride","Ride",app::Environment::Production},
+        owner,sessionId,kNow));
     ASSERT_TRUE(application);
-    ASSERT_TRUE(store.add(std::move(application).value()));
-
-    auto loadedApplication = store.findById(applicationId);
-    ASSERT_TRUE(loadedApplication && loadedApplication->has_value());
-    EXPECT_EQ(loadedApplication->value().identifier(), "ride");
-    EXPECT_EQ(loadedApplication->value().environment(), app::Environment::Production);
+    EXPECT_EQ(application->identifier(),"ride");
+    EXPECT_EQ(application->environment(),app::Environment::Production);
+    auto loadedApplication=run(native.readApplicationManagementAsync(app::ManagementRead::Applications,owner,sessionId,std::nullopt,kNow));
+    ASSERT_TRUE(loadedApplication);
+    EXPECT_NE(loadedApplication->find("ride-app"),std::string::npos);
 
     auto redirect = cli::RedirectUri::create(
         "http://127.0.0.1:49152/callback", cli::ClientKind::Native);
@@ -1441,153 +1379,158 @@ TEST_F(PostgresIntegrationTest, IdentityPlatformPersistenceAndOneTimeOAuthStateA
     ASSERT_TRUE(redirect && openid && profileScope);
 
     const cli::ClientId clientId{"ride-native"};
-    auto client = cli::Client::create(
-        clientId, applicationId, "Ride Native", cli::ClientKind::Native,
-        std::vector<cli::RedirectUri>{redirect.value()},
-        std::vector<cli::Scope>{openid.value(), profileScope.value()},
-        std::nullopt, kNow);
+    auto client=run(native.mutateOAuthClientAsync(cli::ManagementMutationCommand{
+        cli::ManagementMutation::Create,clientId,applicationId,"Ride Native",cli::ClientKind::Native,
+        {redirect.value()},{openid.value(),profileScope.value()},std::nullopt},owner,sessionId,kNow));
     ASSERT_TRUE(client);
-    ASSERT_TRUE(store.add(std::move(client).value()));
+    EXPECT_TRUE(client->isPublic());
+    EXPECT_TRUE(client->permitsRedirect("http://127.0.0.1:55001/callback"));
+    auto loadedClient=run(native.readApplicationManagementAsync(app::ManagementRead::Clients,owner,sessionId,
+        std::string{"ride-app"},kNow));
+    ASSERT_TRUE(loadedClient);
+    EXPECT_NE(loadedClient->find("ride-native"),std::string::npos);
 
-    auto loadedClient = store.findById(clientId);
-    ASSERT_TRUE(loadedClient && loadedClient->has_value());
-    EXPECT_TRUE(loadedClient->value().isPublic());
-    EXPECT_TRUE(loadedClient->value().permitsRedirect(
-        "http://127.0.0.1:55001/callback"));
+    execute("INSERT INTO openproof.identity_profiles(identity_id,email,email_verified,created_at_ms,updated_at_ms) "
+        "VALUES('identity-1','rider@example.test',true,1770000000000,1770000000000)");
+    ASSERT_TRUE(run(native.updateProfileAsync(owner,std::string{"Rider One"},std::string{"rider-one"},
+        std::string{"fa-IR"},std::nullopt,std::nullopt,kNow)));
+    auto loadedProfile=run(native.readProfileAsync(owner));
+    ASSERT_TRUE(loadedProfile && loadedProfile->email().has_value());
+    EXPECT_EQ(loadedProfile->email().value(),"rider@example.test");
+    EXPECT_TRUE(loadedProfile->emailVerified());
 
-    auto identityProfile = profile::IdentityProfile::restore(
-        core::IdentityId{"identity-1"}, std::string{"Rider One"},
-        std::string{"rider-one"}, std::string{"rider@example.test"}, true,
-        std::nullopt, false, std::string{"fa-IR"}, std::nullopt, kNow, kNow);
-    ASSERT_TRUE(identityProfile);
-    ASSERT_TRUE(store.save(identityProfile.value()));
-    auto loadedProfile = store.find(core::IdentityId{"identity-1"});
-    ASSERT_TRUE(loadedProfile && loadedProfile->has_value());
-    ASSERT_TRUE(loadedProfile->value().email().has_value());
-    EXPECT_EQ(loadedProfile->value().email().value(), "rider@example.test");
-    EXPECT_TRUE(loadedProfile->value().emailVerified());
-
-    constexpr std::string_view verifier =
-        "0123456789012345678901234567890123456789012";
-    auto verifierDigest = sec::sha256(verifier);
-    ASSERT_TRUE(verifierDigest);
-    auto challenge = oauth::PkceChallenge::create(
-        fnd::toBase64Url(verifierDigest.value()));
-    ASSERT_TRUE(challenge);
-
-    const oauth::CodeDigest codeDigest{sec::sha256("stored-code").value()};
-    auto authorizationCode = oauth::AuthorizationCode::create(
-        codeDigest, clientId, core::IdentityId{"identity-1"},
-        "http://127.0.0.1:55001/callback",
-        std::vector<cli::Scope>{openid.value(), profileScope.value()},
-        challenge.value(), std::string{"nonce-pg"}, idp::ProviderId{"local"},
-        idp::AssuranceLevel::Ial2,
-        idp::AuthenticationStrength{
-            idp::AuthenticationFactor::Knowledge
-                | idp::AuthenticationFactor::Possession,
-            false},
-        kNow, kNow, std::chrono::minutes{2});
-    ASSERT_TRUE(authorizationCode);
-    ASSERT_TRUE(store.add(std::move(authorizationCode).value()));
-
-    const std::string wrongChallenge = fnd::toBase64Url(
-        sec::sha256("1123456789012345678901234567890123456789012").value());
-    EXPECT_FALSE(store.consumeBound(
-        codeDigest, kNow + std::chrono::seconds{10}, clientId.value(),
-        "http://127.0.0.1:55001/callback", wrongChallenge));
-
-    auto consumed = store.consumeBound(
-        codeDigest, kNow + std::chrono::seconds{11}, clientId.value(),
-        "http://127.0.0.1:55001/callback", challenge->value());
+    constexpr std::string_view verifier="0123456789012345678901234567890123456789012";
+    const auto digest=[](std::string_view label){return fnd::toHex(sec::sha256(label).value());};
+    const auto code=digest("stored-code");
+    const auto challenge=fnd::toBase64Url(sec::sha256(verifier).value());
+    const char* values[]{code.c_str(),challenge.c_str()};
+    std::unique_ptr<PGresult,ResultDeleter> grant{PQexecParams(direct.get(),
+        "INSERT INTO openproof.oauth_authorization_codes(code_digest,client_id,identity_id,redirect_uri,code_challenge,"
+        "nonce,provider,assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms) "
+        "VALUES(decode($1,'hex'),'ride-native','identity-1','http://127.0.0.1:55001/callback',$2,"
+        "'nonce-pg','local',2,3,false,1770000000000,1770000000000,1770000120000)",2,nullptr,values,nullptr,nullptr,0)};
+    ASSERT_TRUE(grant && PQresultStatus(grant.get())==PGRES_COMMAND_OK);
+    std::unique_ptr<PGresult,ResultDeleter> scopes{PQexecParams(direct.get(),
+        "INSERT INTO openproof.oauth_authorization_code_scopes(code_digest,scope) "
+        "VALUES(decode($1,'hex'),'openid'),(decode($1,'hex'),'profile')",1,nullptr,values,nullptr,nullptr,0)};
+    ASSERT_TRUE(scopes && PQresultStatus(scopes.get())==PGRES_COMMAND_OK);
+    int signCalls=0;
+    const auto signer=[&](const oauth::AuthorizationCode& accepted)->fnd::Result<std::string>{
+        ++signCalls;
+        EXPECT_EQ(accepted.identity(),owner);
+        EXPECT_EQ(accepted.nonce(),std::optional<std::string>{"nonce-pg"});
+        return std::string{"fixture-signed-id-token"};
+    };
+    const auto exchange=[&](std::string pkce,fnd::Instant when){
+        return run(native.exchangeOAuthCodeAsync("ride-native",std::nullopt,code,
+            "http://127.0.0.1:55001/callback",std::move(pkce),"family-pg",digest("access-pg-0"),
+            digest("refresh-pg-0"),std::nullopt,when,15min,24h*30,signer));
+    };
+    const auto wrong=fnd::toBase64Url(sec::sha256("1123456789012345678901234567890123456789012").value());
+    EXPECT_FALSE(exchange(wrong,kNow+10s));
+    EXPECT_EQ(signCalls,0);
+    auto consumed=exchange(challenge,kNow+11s);
     ASSERT_TRUE(consumed);
-    EXPECT_EQ(consumed->identity(), core::IdentityId{"identity-1"});
-    EXPECT_FALSE(store.consumeBound(
-        codeDigest, kNow + std::chrono::seconds{12}, clientId.value(),
-        "http://127.0.0.1:55001/callback", challenge->value()));
-
-    const tok::TokenFamilyId family{"family-pg"};
-    tok::TokenContext context{
-        clientId, core::IdentityId{"identity-1"}, idp::ProviderId{"local"},
-        idp::AssuranceLevel::Ial2,
-        idp::AuthenticationStrength{
-            idp::AuthenticationFactor::Knowledge
-                | idp::AuthenticationFactor::Possession,
-            false},
-        std::vector<std::string>{"openid", "profile"}, kNow};
-    const tok::TokenDigest accessDigest{sec::sha256("access-pg-0").value()};
-    const tok::TokenDigest refreshDigest{sec::sha256("refresh-pg-0").value()};
-    const auto absoluteRefreshExpiry = kNow + std::chrono::hours{24 * 30};
-    ASSERT_TRUE(store.storeInitial(
-        tok::AccessTokenRecord{
-            accessDigest, family, context, kNow, kNow + std::chrono::minutes{15}},
-        tok::RefreshTokenRecord{
-            refreshDigest, family, 0U, context, kNow, absoluteRefreshExpiry}));
-
-    auto storedAccess = store.findAccess(accessDigest);
-    auto storedRefresh = store.findRefresh(refreshDigest);
-    ASSERT_TRUE(storedAccess && storedRefresh);
-    EXPECT_EQ(storedAccess->context().client(), clientId);
-    EXPECT_EQ(storedRefresh->state(), tok::RefreshTokenState::Active);
-
-    const tok::TokenDigest nextAccessDigest{sec::sha256("access-pg-1").value()};
-    const tok::TokenDigest nextRefreshDigest{sec::sha256("refresh-pg-1").value()};
-    ASSERT_TRUE(store.rotateRefresh(
-        refreshDigest, kNow + std::chrono::minutes{1},
-        tok::AccessTokenRecord{
-            nextAccessDigest, family, context, kNow + std::chrono::minutes{1},
-            kNow + std::chrono::minutes{16}},
-        tok::RefreshTokenRecord{
-            nextRefreshDigest, family, 1U, context,
-            kNow + std::chrono::minutes{1}, absoluteRefreshExpiry}));
-
-    auto usedRefresh = store.findRefresh(refreshDigest);
-    auto rotatedRefresh = store.findRefresh(nextRefreshDigest);
-    ASSERT_TRUE(usedRefresh && rotatedRefresh);
-    EXPECT_EQ(usedRefresh->state(), tok::RefreshTokenState::Used);
-    EXPECT_EQ(rotatedRefresh->state(), tok::RefreshTokenState::Active);
-    EXPECT_EQ(rotatedRefresh->expiresAt(), absoluteRefreshExpiry);
-
-    const auto replay = store.rotateRefresh(
-        refreshDigest, kNow + std::chrono::minutes{2},
-        tok::AccessTokenRecord{
-            tok::TokenDigest{sec::sha256("access-pg-replay").value()}, family,
-            context, kNow + std::chrono::minutes{2},
-            kNow + std::chrono::minutes{17}},
-        tok::RefreshTokenRecord{
-            tok::TokenDigest{sec::sha256("refresh-pg-replay").value()}, family,
-            1U, context, kNow + std::chrono::minutes{2}, absoluteRefreshExpiry});
-    EXPECT_FALSE(replay);
-
-    auto revokedReplacement = store.findRefresh(nextRefreshDigest);
-    ASSERT_TRUE(revokedReplacement);
-    EXPECT_EQ(revokedReplacement->state(), tok::RefreshTokenState::Revoked);
+    EXPECT_EQ(consumed->scopes,(std::vector<std::string>{"openid","profile"}));
+    EXPECT_TRUE(consumed->idToken.has_value());
+    EXPECT_FALSE(exchange(challenge,kNow+12s));
+    EXPECT_EQ(signCalls,1);
+    auto access=run(native.readDelegatedAccessAsync(digest("access-pg-0"),kNow+12s));
+    ASSERT_TRUE(access);
+    const auto refreshState=[&](std::string_view label){
+        const auto hex=digest(label);
+        return scalar(("SELECT state::text FROM openproof.oauth_refresh_tokens WHERE token_digest=decode('"+hex+"','hex')").c_str());
+    };
+    EXPECT_EQ(refreshState("refresh-pg-0"),"0");
+    const auto absolute=scalar("SELECT expires_at_ms::text FROM openproof.oauth_refresh_tokens WHERE family_id='family-pg'");
+    auto rotated=run(native.rotateOAuthRefreshAsync("ride-native",std::nullopt,digest("refresh-pg-0"),
+        digest("access-pg-1"),digest("refresh-pg-1"),std::nullopt,kNow+1min,15min));
+    ASSERT_TRUE(rotated);
+    EXPECT_EQ(rotated.value(),(std::vector<std::string>{"openid","profile"}));
+    EXPECT_EQ(refreshState("refresh-pg-0"),"1");
+    EXPECT_EQ(refreshState("refresh-pg-1"),"0");
+    EXPECT_EQ(scalar("SELECT expires_at_ms::text FROM openproof.oauth_refresh_tokens WHERE family_id='family-pg' AND sequence=1"),absolute);
+    EXPECT_FALSE(run(native.rotateOAuthRefreshAsync("ride-native",std::nullopt,digest("refresh-pg-0"),
+        digest("access-pg-replay"),digest("refresh-pg-replay"),std::nullopt,kNow+2min,15min)));
+    EXPECT_EQ(refreshState("refresh-pg-1"),"2");
+    EXPECT_FALSE(run(native.readDelegatedAccessAsync(digest("access-pg-1"),kNow+2min)));
 }
 
 
 TEST_F(PostgresIntegrationTest, PasskeyZeroCounterUseUpdatesLastUsedAt)
 {
-    pg::PostgresPasskeyRepository repository{*pool};
-    const auto usedAt = kNow + std::chrono::minutes{5};
-
-    ASSERT_TRUE(repository.addCredential(passkey::PasskeyCredential{
-        "zero-counter-credential", core::IdentityId{"identity-1"},
-        "public-x", "public-y", 0U, kNow, kNow}));
-
-    ASSERT_TRUE(repository.advanceCounter(
-        "zero-counter-credential", 0U, 0U, usedAt));
-
-    auto stored = repository.findCredential("zero-counter-credential");
-    ASSERT_TRUE(stored);
-    ASSERT_TRUE(stored->has_value());
-    EXPECT_EQ(stored->value().signCount, 0U);
-    EXPECT_EQ(stored->value().lastUsedAt, usedAt);
-
-    ASSERT_TRUE(repository.advanceCounter(
-        "zero-counter-credential", 0U, 0U, kNow));
-    stored = repository.findCredential("zero-counter-credential");
-    ASSERT_TRUE(stored);
-    ASSERT_TRUE(stored->has_value());
-    EXPECT_EQ(stored->value().lastUsedAt, usedAt);
+    // Exercise a real ES256 assertion rather than bypassing proof validation
+    // with the retired repository's raw counter update.
+    std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> key{
+        EVP_PKEY_Q_keygen(nullptr,nullptr,"EC","prime256v1"),EVP_PKEY_free};
+    ASSERT_TRUE(key);
+    const auto coordinate=[&](const char* name){
+        BIGNUM* raw=nullptr;
+        if(EVP_PKEY_get_bn_param(key.get(),name,&raw)!=1)
+            throw std::runtime_error{"Fixture EC coordinate unavailable"};
+        std::unique_ptr<BIGNUM,decltype(&BN_free)> number{raw,BN_free};
+        std::array<std::byte,32U> bytes{};
+        if(BN_bn2binpad(number.get(),reinterpret_cast<unsigned char*>(bytes.data()),32)!=32)
+            throw std::runtime_error{"Invalid fixture EC coordinate"};
+        return fnd::toBase64Url(bytes);
+    };
+    const auto x=coordinate(OSSL_PKEY_PARAM_EC_PUB_X),y=coordinate(OSSL_PKEY_PARAM_EC_PUB_Y);
+    const auto credentialId=fnd::toBase64Url(sec::sha256("zero-counter-credential").value());
+    const char* values[]{credentialId.c_str(),x.c_str(),y.c_str()};
+    execute("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+        "VALUES('passkey','identity-1','identity-1',1770000000000)");
+    std::unique_ptr<PGresult,ResultDeleter> inserted{PQexecParams(direct.get(),
+        "INSERT INTO openproof.passkey_credentials(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+        "VALUES($1,'identity-1',$2,$3,0,1770000000000,1770000000000)",3,nullptr,values,nullptr,nullptr,0)};
+    ASSERT_TRUE(inserted && PQresultStatus(inserted.get())==PGRES_COMMAND_OK);
+    auto config=passkey::PasskeyConfig::create("identity.example.test","Fixture","https://identity.example.test",
+        fnd::SecretString{std::string(32U,'k')},5min);
+    ASSERT_TRUE(config);
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},2U,2s,2s,4s};
+    const auto assertion=[&](const idp::ChallengeId& ceremony,std::uint32_t counter){
+        const auto challenge=fnd::toBase64Url(sec::hmacSha256(
+            fnd::SecretString{std::string(32U,'k')},"authenticate:"+std::string{ceremony.value()}).value());
+        const std::string client="{\"type\":\"webauthn.get\",\"challenge\":\""+challenge+
+            "\",\"origin\":\"https://identity.example.test\",\"crossOrigin\":false}";
+        const auto rp=sec::sha256("identity.example.test").value();
+        std::vector<std::byte> auth(rp.begin(),rp.end());
+        auth.push_back(std::byte{0x05}); // user presence + user verification
+        for(unsigned shift:{24U,16U,8U,0U}) auth.push_back(static_cast<std::byte>((counter>>shift)&0xffU));
+        const auto hash=sec::sha256(client).value();
+        std::vector<std::byte> payload=auth;
+        payload.insert(payload.end(),hash.begin(),hash.end());
+        std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> context{EVP_MD_CTX_new(),EVP_MD_CTX_free};
+        if(!context || EVP_DigestSignInit(context.get(),nullptr,EVP_sha256(),nullptr,key.get())!=1)
+            throw std::runtime_error{"Fixture signature initialization failed"};
+        std::size_t size{};
+        const auto* message=reinterpret_cast<const unsigned char*>(payload.data());
+        if(EVP_DigestSign(context.get(),nullptr,&size,message,payload.size())!=1)
+            throw std::runtime_error{"Fixture signature sizing failed"};
+        std::vector<std::byte> signature(size);
+        if(EVP_DigestSign(context.get(),reinterpret_cast<unsigned char*>(signature.data()),&size,message,payload.size())!=1)
+            throw std::runtime_error{"Fixture signature failed"};
+        signature.resize(size);
+        return passkey::AssertionResponse{credentialId,
+            fnd::toBase64Url(std::as_bytes(std::span{client.data(),client.size()})),
+            fnd::toBase64Url(auth),fnd::toBase64Url(signature),std::nullopt};
+    };
+    const auto prove=[&](fnd::Instant when,std::uint32_t counter){
+        auto options=passkey::assertionOptions(config.value(),when);
+        if(!options) throw std::runtime_error{"Fixture assertion options failed"};
+        return run(native.verifyPasskeyAssertionAsync(config.value(),options->id(),assertion(options->id(),counter),when));
+    };
+    const auto usedAt=kNow+5min;
+    auto accepted=prove(usedAt,0U);
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->value(),"identity-1");
+    EXPECT_EQ(scalar("SELECT sign_count::text||':'||last_used_at_ms::text FROM openproof.passkey_credentials WHERE identity_id='identity-1'"),"0:1770000300000");
+    ASSERT_TRUE(prove(kNow,0U));
+    EXPECT_EQ(scalar("SELECT sign_count::text||':'||last_used_at_ms::text FROM openproof.passkey_credentials WHERE identity_id='identity-1'"),"0:1770000300000");
+    ASSERT_TRUE(prove(usedAt+1s,1U));
+    EXPECT_FALSE(prove(usedAt+2s,1U));
+    EXPECT_FALSE(prove(usedAt+2s,0U));
+    EXPECT_EQ(scalar("SELECT sign_count::text||':'||last_used_at_ms::text FROM openproof.passkey_credentials WHERE identity_id='identity-1'"),"1:1770000301000");
 }
 
 }

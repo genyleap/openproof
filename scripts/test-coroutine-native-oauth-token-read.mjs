@@ -80,12 +80,12 @@ test("native revocation binds caller and tenant, serializes family mutation and 
   assert.match(app,/reader->revokeOAuthTokenAsync/);
   const legacy=read("src/oauth/http/http.cpp");
   assert.match(legacy,/m_nativeTokenReadsRequired && \(path=="\/oauth\/userinfo"\s*\|\| path=="\/oauth\/introspect" \|\| path=="\/oauth\/revoke"\)/);
-  const pg=read("src/storage/postgres/postgres.cpp");
-  const rotate=pg.slice(pg.indexOf("PostgresIdentityProviderStore::rotateRefresh("),pg.indexOf("PostgresIdentityProviderStore::revokeFamily("));
-  assert.ok(rotate.indexOf("FOR UPDATE OF f")<rotate.indexOf("ResultPointer current="));
-  assert.ok(rotate.indexOf("!PQgetisnull(familyLock.get(),0,1)")<rotate.indexOf("INSERT INTO openproof.oauth_access_tokens"));
-  const revoke=pg.slice(pg.indexOf("PostgresIdentityProviderStore::revokeToken("));
-  assert.equal((revoke.match(/FOR UPDATE OF f/g)??[]).length,2);
+  const rotate=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync("),sql.indexOf("CoroutinePostgresCanonicalFinalizer::exchangeOAuthCodeAsync("));
+  assert.ok(rotate.indexOf("FOR UPDATE OF f")>=0);
+  assert.ok(rotate.indexOf("FOR UPDATE OF f")<rotate.indexOf("const auto current=co_await execute"));
+  assert.ok(rotate.indexOf("if (binding[1] || !senderMatches)")<rotate.indexOf("INSERT INTO openproof.oauth_access_tokens"));
+  assert.ok(rotate.indexOf("state!=0 || expires<=observed")<rotate.indexOf("INSERT INTO openproof.oauth_access_tokens"));
+  assert.match(read("tests/storage/postgres_integration_test.cpp"),/refreshState\("refresh-pg-1"\),"2"/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/co_spawn\(io,peer.rotateOAuthRefreshAsync[\s\S]*?co_spawn\(io,native.revokeOAuthTokenAsync/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/another client's token: no-op/);
 });

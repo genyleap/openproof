@@ -1236,7 +1236,7 @@ coroutine PostgreSQL storage layer.
 
 Authenticated startup now uses native socket-driven libpq for schema
 application, master-key journal validation and organization validation.
-Both migrators share one checksum-validated package loader. Trusted
+The native migrator uses a checksum-validated package loader. Trusted
 deployment SQL artifacts use a startup-only multi-command operation;
 normal request queries remain single-statement and parameterized.
 Schema migration has a five-minute SQL deadline and a shared advisory
@@ -1260,29 +1260,18 @@ native SQL and the shared atomic audit/outbox writer. Repair additionally
 rejects a prior successful repair and requires the qualifying session
 to have already been issued. All database-backed CLI commands and the
 server listener are now composed without the legacy PostgreSQL module.
-The compatibility implementation remains for regression tests; the
-strict storage gate is unchanged and remains open until that code is
-retired. Schema tests now run the native migrator for both historical
-upgrades and concurrent/failed migration batches. The native session
-domain and network test binaries no longer link the legacy module;
-the session database fixture uses a historical row and independent
-native pools. Federation state, authorization audit and refresh
-rotation/revocation regressions also exercise independent native
-instances. The canonical test executable no longer links the
-compatibility archive: contact verification now tests native atomic
-completion, generation-scoped compensation and historical tagged and
-untagged reservations against disposable database fixtures. The
-remaining legacy-dependent repository integration tests are retained
-until their security assertions can be migrated. Session rotation and
-revocation, one-time authentication state (including nonce failure), and
-fenced recovery-code issuance and redemption now run on native repositories
-in that suite as well. Native C++ build and
-PostgreSQL integration are required before release.
-Native route migration is not proof of a fully nonblocking executable;
-the full C++ build, executable regressions, security and E2E gates must
-also pass.
-Their synchronous dependencies must be separately audited and migrated
-before claiming complete native runtime acceptance.
+The synchronous PostgreSQL module and its CMake target are retired.
+All original repository integration test cases now target native
+repositories, with direct SQL restricted to disposable test fixtures
+and persisted-state assertions. The Passkey counter regression uses
+real signed ES256 assertions. Schema, historical reservation,
+credential-policy upgrades, key rotation, owner protection and OAuth
+replay tests retain their original security invariants. The strict
+source gate requires absence of the retired module, scans every storage
+implementation and retains the global blocking-I/O inventory.
+Static source acceptance does not approve a release: exact-head C++
+build, PostgreSQL integration, executable symbol checks, security and
+E2E regressions and comparative benchmarks remain mandatory.
 
 ### Native owner-only local member administration
 

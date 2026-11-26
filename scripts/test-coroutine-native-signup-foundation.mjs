@@ -219,9 +219,10 @@ test("local password proof generation remains fenced through both session persis
     assert.match(body,/AuthenticationFailed/);
   }
   assert.match(reset,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
-  const legacy=read("src/storage/postgres/postgres.cpp");
-  assert.match(legacy,/GREATEST\(p.changed_at_ms\+1,\(extract\(epoch FROM clock_timestamp\(\)\)/);
-  assert.match(legacy,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  const admin=read("src/storage/postgres/coroutine_admin_store.cpp");
+  const mfa=read("src/storage/postgres/coroutine_local_credential_store.cpp");
+  assert.match(admin,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  assert.match(mfa,/GREATEST\(changed_at_ms\+1,\$2::bigint\)/);
   assert.match(read("src/authentication/service.cpp"),/if \(authentication.outcome\(\).passwordGeneration\(\)\)\s*co_return foundation::fail/);
 });
 

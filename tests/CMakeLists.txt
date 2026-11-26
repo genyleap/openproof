@@ -98,11 +98,11 @@ target_link_libraries(openproof_tests
         openproof_gateway
         openproof_gateway_http
         Boost::headers
-        openproof_storage_postgres
         openproof_postgres_async_startup
         openproof_postgres_async_repository
         openproof_postgres_async_auth_repository
         openproof_postgres_async_recovery_repository
+        openproof_postgres_async_local_credentials
         openproof_postgres_async_canonical
         openproof_operations_http
         openproof_credentials
@@ -121,6 +121,7 @@ target_link_libraries(openproof_tests
         openproof_enterprise_scim
         openproof_trust
         openproof_sdk_cpp
+        OpenSSL::Crypto
         GTest::gtest
         GTest::gtest_main
         openproof_test_compile_options

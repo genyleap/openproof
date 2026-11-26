@@ -38,44 +38,8 @@ openproof_add_module(openproof_migration_package
     SOURCES migration_package.cpp
     LINK_PUBLIC openproof_foundation openproof_security)
 
-# Compatibility repository regression fixtures only. Production targets
-# must link the independently built native storage components below.
-if(OPENPROOF_BUILD_TESTS)
-openproof_add_module(openproof_storage_postgres
-    MODULES
-        postgres.cppm
-    SOURCES
-        postgres.cpp
-    LINK_PUBLIC
-        openproof_foundation
-        openproof_account
-        openproof_administration
-        openproof_audit
-        openproof_security
-        openproof_identity_core
-        openproof_identity_provider
-        openproof_identity_profile
-        openproof_application
-        openproof_client
-        openproof_resource
-        openproof_consent
-        openproof_evidence
-        openproof_evidence_verifiers
-        openproof_enterprise_scim
-        openproof_oauth
-        openproof_token
-        openproof_session
-        openproof_credentials
-        openproof_provider_local
-        openproof_provider_passkey
-        openproof_organization
-        openproof_policy
-    LINK_PRIVATE
-        OpenProof::libpq
-        openproof_postgres_async_io
-        openproof_migration_package
-)
-endif()
+# The blocking PostgreSQL implementation has been retired. Every storage
+# target, including integration test dependencies, uses native libpq.
 
 add_library(openproof_postgres_async_startup STATIC coroutine_startup.cpp)
 target_compile_features(openproof_postgres_async_startup PUBLIC cxx_std_26)

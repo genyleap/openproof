@@ -10,7 +10,7 @@ import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 const root = path.resolve(import.meta.dirname, "..");
 const segments = [
   ["HTTP listener + proxy", "src/gateway/http.cpp"],
-  ["PostgreSQL storage", "src/storage/postgres/postgres.cpp"],
+  ["PostgreSQL storage", "src/storage/postgres/coroutine_startup.cpp"],
   ["GitHub OAuth", "src/providers/github/github.cpp"],
   ["OIDC federation", "src/providers/oidc/oidc.cpp"],
   ["X provider", "src/providers/x/x.cpp"],
@@ -37,7 +37,7 @@ const segments = [
 ];
 
 const forbidden = [
-  ["blocking PostgreSQL", /\bPQ(?:exec|execParams|connectdb|reset)\s*\(/g],
+  ["blocking PostgreSQL", /\bPQ(?:exec|execParams|execPrepared|connectdb|connectdbParams|reset|setdbLogin)\s*\(/g],
   ["blocking HTTP transport", /\b(?:beastHttp|http)::(?:read|write)\s*\(/g],
   ["blocking DNS", /\b(?:resolver|m_resolver)\.resolve\s*\(/g],
   ["blocking stream connect", /\b(?:stream|m_stream)\.connect\s*\(/g],
@@ -63,7 +63,11 @@ const checked = segments.map(([name, relative]) => {
       : relative === "src/account/http/http.cpp"
         ? [relative,"src/account/http/coroutine_session_http.cpp","src/account/http/account_pages.cpp",
            "src/authentication/http/coroutine_federated_start_http.cpp"]
-        : [relative];
+        : relative === "src/storage/postgres/coroutine_startup.cpp"
+          ? fs.readdirSync(path.join(root,"src/storage/postgres"))
+              .filter(file=>/\.(?:cpp|cppm|cc|cxx|h|hpp|hxx)$/.test(file))
+              .map(file=>"src/storage/postgres/"+file)
+          : [relative];
   const source = sourcePaths.map(file =>
     fs.readFileSync(path.join(root,file),"utf8")).join("\n");
   const executable = cppExecutableText(source);
@@ -77,6 +81,28 @@ const checked = segments.map(([name, relative]) => {
   const awaitCount=[...executable.matchAll(/\bco_await\b/g)].length;
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
+  if(relative==="src/storage/postgres/coroutine_startup.cpp"){
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const retired=["src/storage/postgres/postgres.cpp","src/storage/postgres/postgres.cppm"];
+    for(const file of retired) if(fs.existsSync(path.join(root,file)))
+      issues.push({line:0,kind:"retired PostgreSQL source still present",expression:file});
+    const cmakes=["src/storage/postgres/CMakeLists.txt","apps/opp/CMakeLists.txt","tests/CMakeLists.txt","src/operations/http/CMakeLists.txt"];
+    for(const file of cmakes) if(/\bopenproof_storage_postgres\b/.test(fs.readFileSync(path.join(root,file),"utf8")))
+      issues.push({line:0,kind:"retired PostgreSQL build target referenced",expression:file});
+    if(/import\s+openproof\.storage\.postgres\s*;/.test(cppExecutableText(app+"\n"+source)))
+      issues.push({line:0,kind:"retired PostgreSQL module imported",expression:"openproof.storage.postgres"});
+    for(const call of ["nativeDatabasePreflight","migrateSchemaBeforeListener","verifyMasterKeyBeforeListener",
+      "rotateMasterKeyOffline","rekeyTotpOffline","initializeAdministratorOffline","repairInitialOwnerOffline"])
+      if(!app.includes("postgres::"+call+"("))
+        issues.push({line:0,kind:"native database entry point missing",expression:call});
+    for(const primitive of ["PQconnectStart","PQconnectPoll","PQsendQueryParams","PQconsumeInput","PQgetResult"])
+      if(!new RegExp("\\b"+primitive+"\\s*\\(").test(executable))
+        issues.push({line:0,kind:"native libpq primitive missing",expression:primitive});
+    if(!/co_await\s+connection->executeMigrationScript/.test(executable)
+       || !/co_await\s+connection->query/.test(executable)
+       || /\bpostgres::(?:PoolConfig|ConnectionPool|Migrator|Postgres\w+Repository|Postgres\w+Store)\b/.test(cppExecutableText(app)))
+      issues.push({line:0,kind:"native startup/CLI SQL or retirement boundary is missing",expression:"native database preflight and mutations"});
+  }
   if(relative==="src/gateway/http.cpp"){
     if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabledFor\s*\(\s*operation\s*\)/.test(source))
       issues.push({line:0,kind:"missing request-scoped coroutine dispatch guard",
@@ -1070,28 +1096,15 @@ const checked = segments.map(([name, relative]) => {
        || /\b(?:DROP|TRUNCATE|DELETE|UPDATE|INSERT|CONCURRENTLY)\b/i.test(activeSessionIndex))
       issues.push({line:0,kind:"active session pagination lacks a matching partial index",
         expression:"additive identity+recency index WHERE state=0, no table rewrites"});
-    // Concurrency can reorder requests after they capture timestamps. Both
-    // native and compatibility SQL must preserve a monotonic idle clock.
-    const legacySessions = fs.readFileSync(
-      path.join(root,"src/storage/postgres/postgres.cpp"),"utf8");
-    for (const [implementationName,sql] of [
-      ["native",source],["compatibility",legacySessions]
-    ]) {
-      const current = sql.slice(
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::useToken(" : "PostgresSessionRepository::use("),
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("));
-      const rotation = sql.slice(
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("),
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::revoke(" : "PostgresSessionRepository::revoke("));
-      if (!current.includes("GREATEST(last_seen_at_ms,$2::bigint)")
-          || !rotation.includes("GREATEST(last_seen_at_ms,$4::bigint)")) {
-        issues.push({line:0,kind:implementationName+" session idle clock can regress",
-          expression:"GREATEST(last_seen_at_ms, request timestamp) on use and rotate"});
-      }
+    // Preserve the monotonic idle clock in the only SQL implementation.
+    const current=source.slice(source.indexOf("AsyncSessionSql::useToken("),
+        source.indexOf("AsyncSessionSql::rotateToken("));
+    const rotation=source.slice(source.indexOf("AsyncSessionSql::rotateToken("),
+        source.indexOf("AsyncSessionSql::revoke("));
+    if (!current.includes("GREATEST(last_seen_at_ms,$2::bigint)")
+        || !rotation.includes("GREATEST(last_seen_at_ms,$4::bigint)")) {
+      issues.push({line:0,kind:"native session idle clock can regress",
+        expression:"GREATEST(last_seen_at_ms, request timestamp) on use and rotate"});
     }
     // An owner check before an unrestricted UPDATE is a TOCTOU security
     // bug: require ownership in the SQL mutation itself, and in the

@@ -51,8 +51,8 @@ grep -q 'CREATE TABLE openproof.master_key_rotations' \
 grep -q 'ADD COLUMN passkey_registrations' \
     "${ROOT_DIR}/migrations/0016_master_rotation_passkey_ceremonies.sql" \
     || fail "master rotation does not journal passkey registration invalidation"
-grep -q 'DELETE FROM openproof.passkey_registration_ceremonies' \
-    "${ROOT_DIR}/src/storage/postgres/postgres.cpp" \
+grep -q 'remove("passkey_registration_ceremonies")' \
+    "${ROOT_DIR}/src/storage/postgres/coroutine_startup.cpp" \
     || fail "master rotation leaves durable passkey ceremonies live"
 grep -q 'rotate-master-key' "${ROOT_DIR}/apps/opp/main.cpp" \
     || fail "offline master key rotation command is missing"
@@ -554,29 +554,17 @@ grep -q 'sameNativeLoopbackRedirect' "${ROOT_DIR}/src/client/model.cpp" \
 grep -q 'host == "127.0.0.1" || host == "\[::1\]"' "${ROOT_DIR}/src/client/model.cpp" \
     || fail "native loopback redirect host restriction regressed"
 
-# The identity-platform PostgreSQL adapter was initially generated in a compressed
-# one-line style that hid -Wshadow and -Wmisleading-indentation defects. Keep the
-# new adapter section statement-separated and reject the specific shadow pattern
-# that failed the GCC 16.1 build.
-python3 - "${ROOT_DIR}" <<'PY_POSTGRES_WARNINGS'
-from pathlib import Path
-import re, sys
-path = Path(sys.argv[1]) / 'src/storage/postgres/postgres.cpp'
-text = path.read_text(encoding='utf-8')
-marker = '[[nodiscard]] foundation::Instant storedInstant'
-start = text.find(marker)
-if start < 0:
-    print('release gate: identity-platform PostgreSQL adapter marker is missing', file=sys.stderr)
-    raise SystemExit(1)
-tail = text[start:]
-if re.search(r';[ \t]*(?:if|for|while|return)\b', tail):
-    print('release gate: compressed adjacent control-flow statements remain in identity-platform PostgreSQL adapter', file=sys.stderr)
-    raise SystemExit(1)
-if re.search(r'\[.*?\]\([^)]*\bvalue\b[^)]*\)', tail):
-    # `value` is a common repository method parameter; lambdas must not shadow it.
-    print('release gate: lambda parameter named value can shadow repository method parameters', file=sys.stderr)
-    raise SystemExit(1)
-PY_POSTGRES_WARNINGS
+# The original blocking implementation is gone. Keep the release check
+# fail-closed if it returns, and require the strict native source gate.
+test ! -e "${ROOT_DIR}/src/storage/postgres/postgres.cpp" \
+    || fail "retired synchronous PostgreSQL implementation returned"
+test ! -e "${ROOT_DIR}/src/storage/postgres/postgres.cppm" \
+    || fail "retired synchronous PostgreSQL module returned"
+node "${ROOT_DIR}/scripts/verify-coroutine-coverage.mjs" \
+    || fail "native coroutine architecture gate failed"
+# The compiler still enforces -Werror, -Wshadow and misleading-indentation
+# on production adapter sources; the deleted adapter-specific heuristics
+# cannot check the retired implementation.
 
 # C++26 runtime facilities must be qualified by an actual configure-time link
 # probe, not just by a feature-test macro. GCC 16.1 currently supplies

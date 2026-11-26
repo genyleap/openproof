@@ -98,7 +98,10 @@ test("all offline CLI mutations and production linking are independent of blocki
   for(const file of ["apps/opp/CMakeLists.txt","src/operations/http/CMakeLists.txt"])
     assert.doesNotMatch(read(file),/\bopenproof_storage_postgres\b/);
   assert.doesNotMatch(read("src/operations/http/http.cppm"),/import openproof.storage.postgres;/);
-  assert.match(read("src/storage/postgres/CMakeLists.txt"),/if\(OPENPROOF_BUILD_TESTS\)\s*openproof_add_module\(openproof_storage_postgres/);
+  assert.doesNotMatch(read("src/storage/postgres/CMakeLists.txt"),/\bopenproof_storage_postgres\b/);
+  for(const file of ["postgres.cpp","postgres.cppm"])
+    assert.equal(fs.existsSync(path.join(root,"src/storage/postgres",file)),false,file);
+  assert.doesNotMatch(read("tests/CMakeLists.txt"),/\bopenproof_storage_postgres\b/);
   const startup=read("src/storage/postgres/coroutine_startup.cpp");
   const rekey=startup.slice(startup.indexOf("rekeyTotpAsync("),startup.indexOf("foundation::Result<NativeCredentialRekeyReport> rekeyTotpOffline("));
   for(const term of ["BEGIN ISOLATION LEVEL SERIALIZABLE","pg_advisory_xact_lock(7299730475761673316)",
@@ -126,7 +129,7 @@ test("all offline CLI mutations and production linking are independent of blocki
 });
 test("native migration and session regression suites exercise production SQL without the old module",()=>{
   const migration=read("tests/storage/postgres_integration_test.cpp");
-  assert.doesNotMatch(migration,/\bpg::Migrator\b|migrator\.applyDirectory/);
+  assert.doesNotMatch(migration,/import openproof.storage.postgres;|\bpg::(?:PoolConfig|ConnectionPool|Migrator|Postgres\w+Repository|Postgres\w+Store)\b|migrator\.applyDirectory/);
   for(const name of ["HistoricalTenantSeedsNeverAutoApply","MigrationRejectsUnknownLedgerBeforeNewSql",
     "MigrationBatchRollsBackEarlierSqlAndLedgerOnLaterFailure","ConcurrentMigrationChecksShareOneLedger",
     "FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent","HistoricalReleaseUpgrade"]){
@@ -143,7 +146,15 @@ test("native migration and session regression suites exercise production SQL wit
     ["RecoveryCodeIsConsumedExactlyOnceAcrossNodes",["captureIssuanceAsync","replaceFencedAsync","consumeAsync","remainingAsync"]],
     ["RecoveryRotationWaitsForNativeTransactionLock",["replaceFencedAsync","pg_locks","consumeAsync"]],
     ["RejectedAuthorizationIsChainedAndPublished",["CoroutineAuthorizationDecisionSink","recordAsync","security_event_outbox"]],
-    ["MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState",["beginAsync","CoroutinePostgresSessionRepository","rotateMasterKeyOffline"]]
+    ["MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState",["beginAsync","CoroutinePostgresSessionRepository","rotateMasterKeyOffline"]],
+    ["IdentityOrganizationMembershipAndExternalLinksRoundTrip",["readAuthorizationMembershipAsync","finishConnectionAsync","finishLoginAsync","readConnectionsAsync"]],
+    ["PasswordKdfPolicySwitchPreservesAndUpgradesLogin",["confirmPasswordUpgradeAsync","readPasswordUpgradeStatusAsync","modern.verifyAsync","changed_at_ms"]],
+    ["PersistentLocalTotpIsEncryptedAndConsumedOnce",["CoroutinePostgresLocalProofVerifier","EXPECT_NE(first.get(),second.get())","disableAsync","encrypted_seed"]],
+    ["TotpCredentialRekeyIsAtomicVersionedAndDryRunnable",["rekeyTotpOffline","oldVerifier.verifyAsync","newVerifier.verifyAsync","last_accepted_step"]],
+    ["InitialAdministratorBootstrapIsAtomicAuditedAndOneTime",["initializeAdministratorOffline","CoroutinePostgresLocalProofVerifier","canonicalOwner"]],
+    ["OwnerProvisioningIsAtomicAuditedAndDeniedToMembers",["CoroutineAdminStore","mutateAsync","refusedLastOwner","finalRemoval","security_event_outbox"]],
+    ["IdentityPlatformPersistenceAndOneTimeOAuthStateAreTransactional",["mutateApplicationAsync","mutateOAuthClientAsync","readProfileAsync","exchangeOAuthCodeAsync","rotateOAuthRefreshAsync","readDelegatedAccessAsync"]],
+    ["PasskeyZeroCounterUseUpdatesLastUsedAt",["EVP_PKEY_Q_keygen","EVP_DigestSign","verifyPasskeyAssertionAsync","prove(kNow,0U)","last_used_at_ms"]]
   ];
   for(const [name,required] of nativeCases){
     const start=migration.indexOf("TEST_F(PostgresIntegrationTest, "+name+")");
