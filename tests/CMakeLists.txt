@@ -870,7 +870,8 @@ gtest_discover_tests(openproof_web3_coroutine_http_tests
 # Isolated canonical async persistence tests. Any SQL fixture must opt in with
 # an exact disposable DB URL and acknowledgement; never touch the live server.
 add_executable(openproof_postgres_async_canonical_tests
-    storage/postgres_async_canonical_test.cpp)
+    storage/postgres_async_canonical_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/authentication/http/boost_json.cpp)
 target_compile_features(openproof_postgres_async_canonical_tests PRIVATE cxx_std_26)
 set_target_properties(openproof_postgres_async_canonical_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
@@ -881,6 +882,7 @@ target_compile_definitions(openproof_postgres_async_canonical_tests PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_canonical openproof_postgres_async_io
+    openproof_postgres_async_verification openproof_storage_postgres openproof_account
     openproof_authentication openproof_identity_core
     openproof_identity_provider openproof_identity_profile
     openproof_security openproof_foundation Boost::headers OpenProof::libpq
