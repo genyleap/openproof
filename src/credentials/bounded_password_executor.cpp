@@ -42,6 +42,14 @@ std::optional<Permit> admit(const std::shared_ptr<State>& state)
     return std::nullopt;
 }
 
+asio::awaitable<foundation::Result<std::optional<PasswordHash>>> hashWorker(
+    Permit permit,foundation::SecretString password)
+{
+    auto result=permit.state->hasher.hash(password);
+    if (!result) co_return foundation::fail(result.error());
+    co_return std::optional<PasswordHash>{std::move(result).value()};
+}
+
 asio::awaitable<foundation::Result<bool>> verifyWorker(
     Permit permit, foundation::SecretString password, std::optional<PasswordHash> expected)
 {
@@ -107,6 +115,24 @@ foundation::Result<bool> BoundedPasswordExecutor::upgradeNeeded(const PasswordHa
 {
     if (!prefersArgon2id()) return false;
     return m_impl->state->hasher.needsRehash(hash);
+}
+
+asio::awaitable<foundation::Result<PasswordHash>> BoundedPasswordExecutor::hashAsync(
+    foundation::SecretString password)
+{
+    auto permit=admit(m_impl->state);
+    if (!permit) co_return foundation::fail(foundation::ErrorCode::RateLimited);
+    try {
+        // Optional completion is default constructible for Asio's exception
+        // path; the public result never reports a successful empty hash.
+        auto result=co_await asio::co_spawn(m_impl->pool,
+            hashWorker(std::move(*permit),std::move(password)),asio::use_awaitable);
+        if (!result) co_return foundation::fail(result.error());
+        if (!result->has_value()) co_return foundation::fail(foundation::ErrorCode::Internal);
+        co_return std::move(result->value());
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
 }
 
 asio::awaitable<foundation::Result<bool>> BoundedPasswordExecutor::verifyAsync(

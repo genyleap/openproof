@@ -78,6 +78,43 @@ TEST(BoundedPasswordExecutorTest, PolicyUpgradeRequiresVerifiedOriginalPassword)
     EXPECT_TRUE(accepted.value());
 }
 
+TEST(BoundedPasswordExecutorTest, EnrollmentHashUsesSharedAdmissionAndFreshSalt)
+{
+    const auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U);
+    ASSERT_TRUE(policy);
+    auto hasher=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    ASSERT_TRUE(hasher);
+    auto executor=cred::BoundedPasswordExecutor::create(std::move(hasher).value(),1U);
+    ASSERT_TRUE(executor);
+    asio::io_context io;
+    auto run=[&](std::string password){
+        std::optional<fnd::Result<cred::PasswordHash>> result;
+        auto capture=[](cred::BoundedPasswordExecutor& worker,fnd::SecretString secret,
+            auto& output)->asio::awaitable<void>{
+            output.emplace(co_await worker.hashAsync(std::move(secret)));
+        };
+        io.restart();
+        auto done=asio::co_spawn(io,capture(*executor.value(),fnd::SecretString{std::move(password)},result),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    auto invalid=run("short");
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error().code(),fnd::ErrorCode::InvalidArgument);
+    auto first=run("fixture-password");
+    auto second=run("fixture-password");
+    ASSERT_TRUE(first && second);
+    EXPECT_NE(first->encoded(),second->encoded());
+    io.restart();
+    auto done=asio::co_spawn(io,executor.value()->verifyAsync(
+        fnd::SecretString{"fixture-password"},first.value()),asio::use_future);
+    io.run();
+    auto verified=done.get();
+    ASSERT_TRUE(verified);
+    EXPECT_TRUE(verified.value());
+}
+
 TEST(BoundedPasswordExecutorTest, RejectsUnboundedWorkerConfiguration)
 {
     auto hasher = cred::PasswordHasher::create(fnd::SecretString{std::string(32U, 'p')},

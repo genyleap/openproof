@@ -4994,3 +4994,19 @@ headers are attached before signing; proof headers are ingress-only.
 First-party default is unchanged. OIDC stays opt-in until compiled and
 live DPoP/mTLS proxy acceptance. No schema change. Signup and legacy
 unmigrated paths still prevent complete synchronous proxy retirement.
+
+### Native transaction replay parity and signup KDF foundation
+
+PR 102's workflow 45856448467 passed the delegated gateway real-TCP
+regression, native mTLS verifier and 21/21 isolated canonical PostgreSQL
+tests. Broad CTest discovered 831 tests and reported two failures: native
+Web3 replay fixtures received 412 from the in-memory store, while the
+PostgreSQL native store returns 401 for unknown/non-pending generations.
+The in-memory native entry now rejects unknown/non-pending state atomically
+under its existing mutex, preserving initially pending expiry handling
+and the synchronous contract. Existing HTTP replay expectations remain
+unchanged. Exact repaired CTest/E2E are still pending.
+
+New enrollment KDF API uses the existing shared bounded password worker
+pool and permit, with a fresh salted hash and no SQL lease held. Signup
+HTTP and atomic persistence are not switched over yet. No schema changes.
