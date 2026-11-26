@@ -1115,23 +1115,31 @@ const checked = segments.map(([name, relative]) => {
         expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
   }
   if(relative==="src/oauth/http/http.cpp"){
-    // Native read-only endpoints are now audited alongside the legacy
-    // implementation, but cannot satisfy the complete OAuth boundary
-    // until all remaining write/authorization paths are native.
+    // Compatibility code may remain for offline tests, but the running
+    // server must not construct the synchronous OAuth handler at all.
     const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");
-    for(const method of ["loginPage","loginSubmit","tokenEndpoint"]){
-      const start=legacy.indexOf("OAuthHttpApi::"+method+"(");
-      const end=legacy.indexOf("\ngateway::HttpResponse OAuthHttpApi::",start+1);
-      const body=legacy.slice(start,end<0?undefined:end);
-      if (/m_(?:authorization|tokens|clients|authentication|sessions|consents|resources|serviceIdentities|devices|pushedAuthorization|jar)->/.test(body))
-        issues.push({line:0,kind:"synchronous OAuth lifecycle remains",expression:method});
-    }
-    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par","/oauth/authorize","/oauth/consent"]){
+    const runtime=app.slice(app.indexOf("ExitCode runGatewayServer("));
+    if (/\bOAuthHttpApi\s+[\w]+\s*\{|make_(?:unique|shared)<[^>]*OAuthHttpApi>/.test(runtime))
+      issues.push({line:0,kind:"synchronous OAuth handler constructed by server",expression:"OAuthHttpApi"});
+    if (!/co_await service->beginAsync\(/.test(runtime) ||
+        !/co_await service->completeAsync\(/.test(runtime) ||
+        !/co_await sessions->issueReplacingAsync\(/.test(runtime))
+      issues.push({line:0,kind:"native OAuth login incomplete",expression:"native authentication and atomic session replacement"});
+    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par","/oauth/authorize","/oauth/consent","/login","/oauth/token"]){
       if(!app.includes('nativePaths.emplace_back("'+route+'")'))
         issues.push({line:0,kind:"native OAuth token operation missing strict dispatch",expression:route});
     }
     const native=fs.readFileSync(path.join(root,"src/oauth/http/coroutine_token_read_http.cpp"),"utf8");
+    if(!/m_nativeTokenReadsRequired && path=="\/login"/.test(legacy)
+       || !/co_await m_login\(/.test(native)
+       || !/if \(tokenRoute\(r\)\) return true/.test(native)
+       || !/unsupported_grant_type/.test(native)
+       || !/co_await refresh\(std::move\(r\)\)/.test(native)
+       || !/co_await exchangeCode\(std::move\(r\)\)/.test(native)
+       || !/co_await issueMachine\(std::move\(r\)\)/.test(native)
+       || !/co_await pollDevice\(std::move\(r\)\)/.test(native))
+      issues.push({line:0,kind:"OAuth native login or complete token dispatch incomplete",expression:"all grants and invalid requests handled natively"});
     if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/authorize" \|\| path=="\/oauth\/consent"\)/.test(legacy)
        || !/co_await m_par->complete\(/.test(native)
        || !/reader->completeOAuthAuthorizationAsync/.test(app))

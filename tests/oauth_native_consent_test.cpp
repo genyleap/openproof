@@ -450,6 +450,67 @@ TEST(NativeOAuthTokenReadTest, ParRejectsMixedAndMalformedRequestsBeforeStorage)
     EXPECT_EQ(fallback.asyncCalls,0);
 }
 
+TEST(NativeOAuthTokenReadTest, LoginBindsReturnTargetAndReplacesPriorSessionNatively)
+{
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    int calls=0;
+    bool reject=false;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,
+        fnd::SecretString{std::string(32U,'t')},fnd::SecretString{std::string(32U,'c')},
+        {},{},{},{},{},{},{},15min,std::nullopt,{},std::nullopt,std::nullopt,
+        [&](std::string subject,fnd::SecretString password,std::optional<fnd::SecretString> totp,
+            std::optional<fnd::SecretString> previous,idp::ClientContext,fnd::CorrelationId)
+            ->asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>> {
+            ++calls;
+            EXPECT_EQ(subject,"fixture-owner");
+            EXPECT_EQ(password.expose(),"fixture-credential");
+            EXPECT_TRUE(totp && totp->expose()=="123456");
+            EXPECT_TRUE(previous && previous->expose()=="previous-session");
+            if (reject) co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return sess::CoroutineIssuedSession{sess::SessionId{"new-session"},fnd::SecretString{"new-session-token"}};
+        }};
+    auto run=[&](gw::HttpRequest input) {
+        EXPECT_TRUE(api.nativeEnabledFor(input));
+        asio::io_context io;
+        std::optional<gw::HttpResponse> response;
+        auto collect=[&]()->asio::awaitable<void>{response.emplace(co_await api.handleAsync(std::move(input)));};
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(response).value();
+    };
+    const auto page=run(request(gw::HttpMethod::Get,"/login?return_to=%2Faccount%2Fsecurity"));
+    ASSERT_EQ(page.status(),200);
+    EXPECT_EQ(page.headers().at("cache-control"),"no-store");
+    const auto marker=std::string{"name=\"csrf\" value=\""};
+    const auto start=page.body().find(marker);
+    ASSERT_NE(start,std::string::npos);
+    const auto pos=start+marker.size();
+    const auto csrf=page.body().substr(pos,page.body().find('"',pos)-pos);
+    const auto cookie="__Host-openproof-login-csrf="+csrf+"; __Host-openproof-session=previous-session";
+    const auto form="&csrf="+csrf+"&subject=fixture-owner&password=fixture-credential&totp=123456";
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/login",cookie,"return_to=%2Fadmin%2Fconsole"+form)).status(),401);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/login",{},"return_to=%2Faccount%2Fsecurity"+form)).status(),401);
+    EXPECT_EQ(calls,0);
+    reject=true;
+    const auto denied=run(request(gw::HttpMethod::Post,"/login",cookie,"return_to=%2Faccount%2Fsecurity"+form));
+    EXPECT_EQ(denied.status(),303);
+    EXPECT_EQ(denied.headers().at("location"),"/login?return_to=%2Faccount%2Fsecurity&error=authentication");
+    EXPECT_FALSE(denied.headers().contains("set-cookie"));
+    reject=false;
+    const auto accepted=run(request(gw::HttpMethod::Post,"/login",cookie,"return_to=%2Faccount%2Fsecurity"+form));
+    EXPECT_EQ(accepted.status(),303);
+    EXPECT_EQ(accepted.headers().at("location"),"/account/security");
+    EXPECT_EQ(accepted.body().find("fixture-credential"),std::string::npos);
+    EXPECT_TRUE(accepted.headers().contains("set-cookie"));
+    EXPECT_EQ(calls,2);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/oauth/token",{},"grant_type=unknown&client_id=fixture")).status(),400);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/oauth/token",{},"grant_type=unknown")).status(),400);
+    EXPECT_EQ(run(request(gw::HttpMethod::Options,"/oauth/token")).status(),204);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
+
 constexpr std::string_view sessionCookie = "__Host-openproof-session=valid-token";
 constexpr std::string_view csrfCookies =
     "__Host-openproof-session=valid-token; __Host-openproof-consent-csrf=proof";

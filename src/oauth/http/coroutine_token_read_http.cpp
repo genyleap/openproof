@@ -22,6 +22,12 @@ namespace asio=boost::asio;
 namespace {
 using E=foundation::ErrorCode;
 using Method=gateway::HttpMethod;
+bool loginRoute(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/login" && (r.method()==Method::Get || r.method()==Method::Post);
+}
+bool tokenRoute(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/oauth/token" && (r.method()==Method::Post || r.method()==Method::Options);
+}
 bool userInfoRoute(const gateway::HttpRequest& r) {
     return r.path()=="/oauth/userinfo" &&
         (r.method()==Method::Get || r.method()==Method::Post || r.method()==Method::Options);
@@ -496,6 +502,111 @@ foundation::Result<Parameters> browserParameters(std::string_view input,std::siz
     }
     return result;
 }
+constexpr std::string_view kLoginCsrfCookie="__Host-openproof-login-csrf";
+std::string loginCookie(std::string_view name,std::string_view value,int age) {
+    return std::string{name}+"="+std::string{value}+
+        "; Path=/; Max-Age="+std::to_string(age)+"; Secure; HttpOnly; SameSite=Lax";
+}
+bool validLoginTarget(std::string_view target) noexcept {
+    return (target.starts_with("/oauth/authorize?") || target=="/oauth/device"
+        || target.starts_with("/oauth/device?") || target=="/admin/console" || target=="/account/security")
+        && target.size()<=8192U
+        && std::ranges::none_of(target,[](unsigned char c){return c<0x20U || c==0x7fU;});
+}
+foundation::Result<std::string> loginCsrf(const foundation::SecretString& key,std::string_view target,std::string_view nonce) {
+    auto digest=security::sha256(target);
+    if (!digest) return foundation::fail(digest.error());
+    auto mac=security::hmacSha256(key,"oauth-login:"+foundation::toHex(digest.value())+":"+std::string{nonce});
+    if (!mac) return foundation::fail(mac.error());
+    return std::string{nonce}+"."+foundation::toHex(mac.value());
+}
+gateway::HttpResponse renderLoginPage(std::string_view target,std::string_view csrf,
+    const std::string& pageNonce,bool totpEnrolled,bool authenticationFailed) {
+    std::string body = R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark"><title>Sign in · OpenProof</title>
+<style nonce=")HTML" + pageNonce + R"HTML(">
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#090b10;color:#f7f7fb}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 15% 0%,rgba(105,92,255,.22),transparent 34rem),linear-gradient(180deg,#10131b,#080a0f);padding:24px}
+.shell{width:min(100%,560px)}.brand{display:flex;align-items:center;gap:13px;margin:0 4px 24px;color:#e5e6ff;font-weight:800;font-size:21px}.brand-mark{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#7478ff,#9c68ff);box-shadow:0 16px 38px rgba(102,92,255,.28)}.brand small{display:block;margin-top:2px;color:#8c91a4;font-size:11px;letter-spacing:.11em;text-transform:uppercase}
+.card{background:rgba(23,26,35,.96);border:1px solid rgba(255,255,255,.09);border-radius:30px;padding:clamp(26px,6vw,40px);box-shadow:0 30px 100px rgba(0,0,0,.4)}.kicker{display:inline-flex;padding:8px 12px;border-radius:999px;background:rgba(111,107,255,.15);color:#c9c9ff;font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}
+h1{font-size:clamp(34px,8vw,50px);line-height:1.02;letter-spacing:-.05em;margin:18px 0 12px}.lead{color:#aeb3c4;line-height:1.65;margin:0 0 25px}.field{display:grid;gap:8px;margin:15px 0}.field>span{font-size:12px;color:#a8adbf;font-weight:750;text-transform:uppercase;letter-spacing:.06em}.field small{font-weight:600;text-transform:none;letter-spacing:0;color:#71778a}
+input{width:100%;border:1px solid rgba(255,255,255,.13);border-radius:15px;background:#0d1016;color:#fff;padding:14px 15px;font:inherit;outline:none}input:focus{border-color:#7d82ff;box-shadow:0 0 0 3px rgba(125,130,255,.15)}.code{font-variant-numeric:tabular-nums;letter-spacing:.14em}
+button{width:100%;appearance:none;border:0;border-radius:14px;background:linear-gradient(135deg,#7076ff,#9568ff);color:#fff;padding:14px 17px;font:750 15px inherit;cursor:pointer;margin-top:10px}.hint{color:#777e91;font-size:12px;line-height:1.6;margin:17px 0 0}.hint strong{color:#aeb3c4}.text-link{color:#b8bbff;text-decoration:none;font-weight:700}.text-link:hover{text-decoration:underline}.notice{margin:0 0 18px;padding:13px 14px;border-radius:14px;font-size:13px;line-height:1.55}.notice.info{background:rgba(99,102,241,.11);border:1px solid rgba(129,140,248,.28);color:#d8dbff}.notice.error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:#fecaca}.footer{text-align:center;color:#666d80;font-size:12px;line-height:1.55;margin:18px 12px 0}
+@media(max-width:560px){body{padding:16px}.card{border-radius:23px}}
+</style></head><body><main class="shell"><div class="brand"><span class="brand-mark">O</span><span>OpenProof<small>Identity security</small></span></div>
+<section class="card"><span class="kicker">Secure sign in</span><h1>Sign in with OpenProof</h1>
+<p class="lead">Use your OpenProof account credentials. If you already enabled an authenticator, enter its current 6-digit code for an IAL2 session.</p>)HTML";
+    if (totpEnrolled) {
+        body += R"HTML(<div class="notice info"><strong>Authenticator enabled.</strong> The 6-digit code used during setup has already been consumed. Wait until your authenticator shows a <strong>new</strong> code, then sign in with that new code.</div>)HTML";
+    }
+    if (authenticationFailed) {
+        body += R"HTML(<div class="notice error"><strong>Sign-in failed.</strong> Use the same account email you used for password recovery, your new password, and the current 6-digit authenticator code. If you just enabled the authenticator, wait for the code to change before trying again.</div>)HTML";
+    }
+    body += R"HTML(<form method="post" action="/login"><input type="hidden" name="return_to" value=")HTML"
+        + htmlEscape(target) + R"HTML("><input type="hidden" name="csrf" value=")HTML"
+        + htmlEscape(csrf) + R"HTML(">
+<label class="field"><span>Account</span><input name="subject" autocomplete="username" required></label>
+<label class="field"><span>Password</span><input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label>
+<label class="field"><span>Authenticator code <small>only if enabled</small></span><input class="code" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000"></label>
+<button type="submit">Sign in securely</button>
+<p class="hint"><strong>No authenticator yet?</strong> Leave the code empty. For owner administration, OpenProof will take you to Account Security to set one up.</p>
+<p class="hint"><strong>Forgot your password?</strong> <a class="text-link" href="/account/recover">Reset it securely</a>.</p>
+</form></section><p class="footer">OpenProof keeps your application sessions separate from your identity-provider session.</p></main></body></html>)HTML";
+
+    gateway::HttpResponse response{
+        200,
+        gateway::Headers{{"content-type", "text/html; charset=utf-8"}},
+        std::move(body)};
+    secure(response);
+    response.setHeader(
+        "content-security-policy",
+        "default-src 'none'; style-src 'nonce-" + pageNonce
+            + "'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    response.addHeader("set-cookie", loginCookie(kLoginCsrfCookie, csrf, 600));
+    return response;
+}
+struct LoginForm final {
+    std::string target,subject;
+    foundation::SecretString csrf,password;
+    std::optional<foundation::SecretString> totp;
+};
+foundation::Result<LoginForm> parseLoginForm(gateway::HttpRequest& r) {
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/x-www-form-urlencoded" &&
+        !media->starts_with("application/x-www-form-urlencoded;")) || r.body().size()>16U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    std::optional<foundation::SecretString> target,subject,csrf,password,totp;
+    auto input=std::string_view{r.body()};
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto part=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (part.empty()) continue;
+        const auto equal=part.find('=');
+        if (equal==std::string_view::npos) return foundation::fail(E::InvalidArgument);
+        auto name=decode(part.substr(0,equal),64U);
+        if (!name) return foundation::fail(name.error());
+        const auto key=name->expose();
+        auto* dest=key=="return_to"?&target:key=="subject"?&subject:key=="csrf"?&csrf:
+            key=="password"?&password:key=="totp"?&totp:nullptr;
+        if (!dest || dest->has_value()) return foundation::fail(E::InvalidArgument);
+        auto value=decode(part.substr(equal+1U),key=="return_to"?8192U:key=="subject"?320U:
+            key=="password"?1024U:key=="csrf"?128U:6U);
+        if (!value) return foundation::fail(value.error());
+        dest->emplace(std::move(value).value());
+    }
+    if (!target || !validLoginTarget(target->expose()) || !subject || subject->empty()
+        || !csrf || csrf->empty() || !password || password->empty())
+        return foundation::fail(E::AuthenticationFailed);
+    if (totp && totp->empty()) totp.reset();
+    if (totp && (totp->expose().size()!=6U || !std::ranges::all_of(totp->expose(),[](char ch){return ch>='0' && ch<='9';})))
+        return foundation::fail(E::AuthenticationFailed);
+    LoginForm result{std::string{target->expose()},std::string{subject->expose()},
+        std::move(*csrf),std::move(*password),std::move(totp)};
+    r.wipeBody();
+    return result;
+}
 bool validAuthorizationTarget(std::string_view target) noexcept {
     return target.starts_with("/oauth/authorize?") && target.size()<=8192U
         && std::ranges::none_of(target,[](unsigned char c){return c<0x20U || c==0x7fU;});
@@ -737,13 +848,13 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
     std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine,
-    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par)
+    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par,Login login)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
       m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)),
-      m_devicePoll(std::move(devicePoll)),m_par(std::move(par)) {}
+      m_devicePoll(std::move(devicePoll)),m_par(std::move(par)),m_login(std::move(login)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
@@ -758,13 +869,15 @@ bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) 
         && m_codeExchange && m_devicePoll && m_devicePoll->authenticate;
     if (deviceBrowserRoute(r)) return m_devicePoll && m_devicePoll->authenticate
         && m_devicePoll->readApproval && m_devicePoll->decide;
+    if (loginRoute(r)) return static_cast<bool>(m_login);
+    if (tokenRoute(r)) return true; // Unknown/malformed grants are locally rejected.
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r) && !parRoute(r) && !authorizationBrowserRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r) && !parRoute(r) && !authorizationBrowserRoute(r) && !loginRoute(r) && !tokenRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -788,6 +901,38 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (deviceBrowserRoute(r)) co_return co_await deviceBrowser(std::move(r));
     if (parRoute(r)) co_return co_await pushAuthorization(std::move(r));
     if (authorizationBrowserRoute(r)) co_return co_await authorizeBrowser(std::move(r));
+    if (loginRoute(r)) co_return co_await loginBrowser(std::move(r));
+    if (tokenRoute(r)) {
+        const auto media=r.header("content-type");
+        bool valid=false;
+        if (media && (*media=="application/x-www-form-urlencoded" ||
+            media->starts_with("application/x-www-form-urlencoded;"))) {
+            auto input=std::string_view{r.body()};
+            std::vector<std::string> names;
+            bool grant=false,client=false;
+            valid=!input.empty() && input.size()<=16U*1024U;
+            while (valid && !input.empty()) {
+                const auto amp=input.find('&');
+                const auto part=input.substr(0,amp);
+                if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+                if (part.empty()) continue;
+                const auto eq=part.find('=');
+                if (eq==std::string_view::npos) { valid=false; break; }
+                auto name=decode(part.substr(0,eq),64U);
+                auto value=decode(part.substr(eq+1U),2048U);
+                if (!name || !value || names.size()>=16U
+                    || std::ranges::find(names,name->expose())!=names.end()) { valid=false; break; }
+                grant=grant || (name->expose()=="grant_type" && !value->empty() && value->expose().size()<=64U);
+                client=client || (name->expose()=="client_id" && !value->empty() && value->expose().size()<=256U);
+                names.emplace_back(name->expose());
+            }
+            valid=valid && grant && client;
+        }
+        scrub(r);
+        foundation::JsonObjectWriter body;
+        body.add("error",std::string_view{valid?"unsupported_grant_type":"invalid_request"});
+        co_return json(400,std::move(body));
+    }
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -1084,6 +1229,62 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(g
         .add("scope",joined(issued->scopes));
     if (exchange) body.add("issued_token_type",kAccessType);
     co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::loginBrowser(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    if (r.header("authorization")) co_return fail(E::AuthenticationFailed,r);
+    if (r.method()==Method::Get) {
+        const auto target=r.target();
+        const auto query=target.find('?');
+        if (query==std::string_view::npos) co_return fail(E::InvalidArgument,r);
+        auto parameters=browserParameters(target.substr(query+1U),16U*1024U);
+        if (!parameters) co_return fail(parameters.error().code(),r);
+        auto back=optionalPar(*parameters,"return_to");
+        if (!back || !validLoginTarget(*back)) co_return fail(E::InvalidArgument,r);
+        auto random=security::randomTokenBase64Url(32U),style=security::randomTokenBase64Url(24U);
+        if (!random || !style) co_return fail(E::Unavailable,r);
+        auto csrf=loginCsrf(m_clientKey,*back,random.value());
+        if (!csrf) co_return fail(E::Unavailable,r);
+        scrub(r);
+        co_return renderLoginPage(*back,csrf.value(),style.value(),
+            optionalPar(*parameters,"notice")==std::optional<std::string>{"totp-enrolled"},
+            optionalPar(*parameters,"error")==std::optional<std::string>{"authentication"});
+    }
+    auto input=parseLoginForm(r);
+    if (!input) co_return fail(input.error().code(),r);
+    auto cookie=browserCookie(r,kLoginCsrfCookie);
+    const auto& token=input->csrf.expose();
+    const auto dot=token.find('.');
+    if (!cookie || dot!=43U || !security::constantTimeEquals(cookie->expose(),token))
+        co_return fail(E::AuthenticationFailed,r);
+    auto expected=loginCsrf(m_clientKey,input->target,token.substr(0,dot));
+    if (!expected || !security::constantTimeEquals(expected.value(),token))
+        co_return fail(E::AuthenticationFailed,r);
+    input->csrf=foundation::SecretString{};
+    cookie.reset();
+    if (!m_limiter->allow("oauth-login:"+input->subject)) co_return fail(E::RateLimited,r);
+    auto prior=browserCookie(r,kBrowserSession);
+    identity::provider::ClientContext client;
+    client.setRemoteAddress(std::string{r.remoteAddress()});
+    if (const auto agent=r.header("user-agent")) client.setUserAgent(std::string{*agent});
+    auto correlation=r.correlation();
+    scrub(r);
+    auto issued=co_await m_login(std::move(input->subject),std::move(input->password),
+        std::move(input->totp),std::move(prior),std::move(client),std::move(correlation));
+    if (!issued) {
+        if (issued.error().code()==E::AuthenticationFailed)
+            co_return browserRedirect("/login?return_to="+percentEncode(input->target)+"&error=authentication",303);
+        co_return fail(issued.error().code(),r);
+    }
+    const auto& bearer=issued->token.expose();
+    if (bearer.empty() || bearer.size()>128U || !std::ranges::all_of(bearer,[](char value) {
+        return (value>='a' && value<='z') || (value>='A' && value<='Z')
+            || (value>='0' && value<='9') || value=='-' || value=='_';
+    })) co_return fail(E::Unavailable,r);
+    auto response=browserRedirect(std::move(input->target),303);
+    response.addHeader("set-cookie",loginCookie(kBrowserSession,bearer,8*60*60));
+    response.addHeader("set-cookie",loginCookie(kLoginCsrfCookie,"",0));
+    co_return response;
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::authorizeBrowser(gateway::HttpRequest r) {
     Scrub wipe{r};

@@ -10,6 +10,7 @@ import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.profile;
+import openproof.identity.provider;
 import openproof.session;
 import openproof.token;
 import openproof.oauth;
@@ -75,6 +76,9 @@ public:
         CompleteAuthorization complete{};
         SignResponse sign{};
     };
+    using Login=std::function<boost::asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>(
+        std::string,foundation::SecretString,std::optional<foundation::SecretString>,
+        std::optional<foundation::SecretString>,identity::provider::ClientContext,foundation::CorrelationId)>;
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
         ExchangeCode exchange;
@@ -87,7 +91,7 @@ public:
         foundation::Duration accessLifetime=foundation::Duration{900000},
         std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={},
         std::optional<DevicePollContext> devicePoll=std::nullopt,
-        std::optional<ParContext> par=std::nullopt);
+        std::optional<ParContext> par=std::nullopt,Login login={});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -111,6 +115,8 @@ private:
     IssueMachine m_issueMachine;
     std::optional<DevicePollContext> m_devicePoll;
     std::optional<ParContext> m_par;
+    Login m_login;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> loginBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> authorizeBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pushAuthorization(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> deviceBrowser(gateway::HttpRequest);

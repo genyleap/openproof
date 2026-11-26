@@ -102,7 +102,7 @@ test("native refresh uses grant-scoped routing, durable proof and atomic family 
   }
   assert.match(http,/value->expose\(\)==grantType/);
   assert.match(http,/grantRoute\(r,"refresh_token"\)/);
-  assert.match(app,/nativeMethods.emplace_back\("\/oauth\/token",gateway::HttpMethod::Post\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/token"\)/);
   assert.match(app,/reader->rotateOAuthRefreshAsync/);
   assert.match(app,/sender->tokenEndpointConstraintAsync/);
   assert.match(app,/nativeOAuthAccessLifetime=tokenPolicy->accessLifetime\(\)/);
@@ -353,4 +353,28 @@ test("browser authorization revalidates session and consent and commits PAR cons
   assert.match(app,/nativePaths.emplace_back\("\/oauth\/consent"\)/);
   assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && \(path=="\/oauth\/authorize" \|\| path=="\/oauth\/consent"\)/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Exercise the actual PAR consumer, including consent and JARM failure/);
+});
+test("native browser login owns credentials, binds return target, replaces sessions and retires synchronous OAuth runtime",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::loginBrowser("),http.indexOf("CoroutineTokenReadAdapter::authorizeBrowser("));
+  const ordered=["parseLoginForm(r)","browserCookie(r,kLoginCsrfCookie)",
+    "loginCsrf(m_clientKey,input->target,token.substr(0,dot))",
+    "input->csrf=foundation::SecretString{}","browserCookie(r,kBrowserSession)",
+    "scrub(r);","co_await m_login(","std::move(input->password)",
+    "std::move(input->totp),std::move(prior)","if (!issued)",
+    "loginCookie(kBrowserSession,bearer,8*60*60)"];
+  let previous=-1;
+  for(const term of ordered){
+    const index=body.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(http,/oauth-login:"\+foundation::toHex\(digest.value\(\)\)/);
+  assert.match(app,/co_await service->beginAsync\(/);
+  assert.match(app,/co_await service->completeAsync\(/);
+  assert.match(app,/co_return co_await sessions->issueReplacingAsync\(/);
+  assert.match(app,/nativePaths.emplace_back\("\/login"\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/token"\)/);
+  assert.doesNotMatch(app,/\bOAuthHttpApi\s+\w+\s*\{/);
+  assert.match(http,/if \(tokenRoute\(r\)\) return true/);
+  assert.match(http,/valid\?"unsupported_grant_type":"invalid_request"/);
+  assert.match(read("tests/oauth_native_consent_test.cpp"),/LoginBindsReturnTargetAndReplacesPriorSessionNatively/);
 });

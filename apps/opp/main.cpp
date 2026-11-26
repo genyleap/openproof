@@ -3254,7 +3254,38 @@ addProtectedRoutes(gateway::Router& router,
                             denied?std::nullopt:std::optional<std::string_view>{code},
                             request.state()?std::optional<std::string_view>{*request.state()}:std::nullopt,
                             denied?std::optional<std::string_view>{"access_denied"}:std::nullopt);
-                    }});
+                    }},
+                [service=nativeLocalAuthentication.get(),sessions=nativeSessions.get(),providerId](
+                    std::string subject,fnd::SecretString password,std::optional<fnd::SecretString> totp,
+                    std::optional<fnd::SecretString> prior,idp::ClientContext client,
+                    fnd::CorrelationId correlation)
+                    ->boost::asio::awaitable<fnd::Result<session::CoroutineIssuedSession>> {
+                    auto raw=security::randomTokenBase64Url(32U);
+                    if (!raw) co_return fnd::fail(raw.error());
+                    fnd::SecretString bindingSecret{std::move(raw).value()};
+                    auto binding=security::sha256(bindingSecret.expose());
+                    if (!binding) co_return fnd::fail(binding.error());
+                    bindingSecret=fnd::SecretString{};
+                    idp::AuthenticationRequest request{providerId,client};
+                    request.setParameter("subject",subject);
+                    request.setRequestedAssurance(totp?idp::AssuranceLevel::Ial2:
+                        idp::AssuranceLevel::Ial1);
+                    auto started=co_await service->beginAsync(std::move(request),binding.value(),correlation);
+                    if (!started) co_return fnd::fail(started.error());
+                    idp::AuthenticationResponse response{started->challenge().id(),client};
+                    response.setParameter("subject",idp::CredentialValue{std::move(subject)});
+                    response.setParameter("password",idp::CredentialValue{password.expose()});
+                    password=fnd::SecretString{};
+                    if (totp) {
+                        response.setParameter("totp",idp::CredentialValue{totp->expose()});
+                        totp.reset();
+                    }
+                    auto verified=co_await service->completeAsync(started->transactionId(),
+                        fnd::SecretString{std::string{started->continuationToken().expose()}},
+                        binding.value(),std::move(response));
+                    if (!verified) co_return fnd::fail(verified.error());
+                    co_return co_await sessions->issueReplacingAsync(verified.value(),std::move(client),std::move(prior));
+                });
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");
@@ -3264,6 +3295,8 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/oauth/par");
             nativePaths.emplace_back("/oauth/authorize");
             nativePaths.emplace_back("/oauth/consent");
+            nativePaths.emplace_back("/login");
+            nativePaths.emplace_back("/oauth/token");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
@@ -3342,10 +3375,6 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
-        // The token endpoint shares its URL across grants. Refresh and code
-        // exchange are native; legacy independently denies migrated grants.
-        if (platform.oidc().enabled())
-            nativeMethods.emplace_back("/oauth/token",gateway::HttpMethod::Post);
         if (nativeSignupEnabled) {
             if (!nativeContactIssuer || !nativeSignup || !nativeVerifySignup
                 || !nativeResetPassword || !nativeVerifyPhone || !nativeVerifyEmailChange || !nativeTotp) {
@@ -3807,9 +3836,7 @@ addProtectedRoutes(gateway::Router& router,
     nativeOAuthAccessLifetime=tokenPolicy->accessLifetime();
     nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime();
     postgres::PostgresResourceRepository resourceRepository{*pool.value()};
-    postgres::PostgresConsentRepository consentRepository{*pool.value()};
     resource::ResourceRegistry resourceRegistry{resourceRepository, clock};
-    consent::ConsentService consentService{consentRepository, clock};
 
     application::ApplicationRegistry applicationRegistry{identityProviderStore, clock};
     client::ClientManager clientManager{
@@ -3818,18 +3845,9 @@ addProtectedRoutes(gateway::Router& router,
     resource::ServiceIdentityService serviceIdentityService{
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
         identities, resourceRepository, clientManager, clock};
-    oauth::AuthorizationService authorizationService{
-        clientManager, identityProviderStore, clock,
-        std::move(authorizationCodeKey).value(), std::chrono::minutes{5}};
     token::TokenService tokenService{
         identityProviderStore, clientManager, clock, std::move(tokenKey).value(),
         std::move(tokenPolicy).value()};
-    oauth::DeviceAuthorizationService deviceAuthorizationService{
-        identityProviderStore, clientManager, clock,
-        std::move(deviceAuthorizationKey).value(), std::chrono::minutes{10},
-        std::chrono::seconds{5}};
-    oauth::PushedAuthorizationService pushedAuthorizationService{
-        identityProviderStore, clock, std::chrono::seconds{90}};
     oauth::JarService jarService{identityProviderStore, identityProviderStore, clock};
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
@@ -3865,17 +3883,12 @@ addProtectedRoutes(gateway::Router& router,
         limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
         authentication, providers, sessions, limiter.value(), authApi, &tokenService, true};
-    oauthHttp::OAuthHttpApi oauthApi{
-        authorizationService, tokenService, openIdProvider, clientManager,
-        authentication, sessions, providerId, consentService, resourceRegistry,
-        serviceIdentityService, deviceAuthorizationService, pushedAuthorizationService,
-        jarService, senderProof, limiter.value(), federatedApi,true};
     applicationHttp::ApplicationManagementHttpApi applicationApi{
         applicationRegistry, identityProviderStore, clientManager,
         identityProviderStore, resourceRegistry, serviceIdentityService, jarService,
         sessions, memberships, limiter.value(),
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        oauthApi};
+        federatedApi};
     return runWithAccount(applicationApi, &tokenService);
 }
 

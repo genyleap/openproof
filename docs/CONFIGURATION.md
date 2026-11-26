@@ -1031,8 +1031,15 @@ bound to the session and complete authorization target. Approval,
 consent supersession, code insertion, and one-time PAR consumption commit
 together. Denial consumes PAR without issuing a code. JARM signing happens
 before commit and failure leaves the PAR and consent unchanged.
-Login submission and final compatibility retirement remain required.
-Executable acceptance is still mandatory.
+Browser login now uses native authentication begin/completion and
+atomic first-party session replacement. Login CSRF is bound to the
+allowlisted return target. Password and optional TOTP remain in wiping
+credential owners, and raw request buffers are cleared before suspension.
+All token grants, unsupported grants, malformed requests and preflight
+requests are owned by the native token endpoint. The server no longer
+constructs the synchronous OAuth HTTP API; the compatibility library
+remains for isolated tests and non-runtime use. Executable acceptance
+is still mandatory.
 
 ### Native account TOTP status (coroutine branch only)
 

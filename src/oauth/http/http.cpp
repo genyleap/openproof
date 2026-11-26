@@ -674,6 +674,11 @@ gateway::HttpResponse OAuthHttpApi::error(
 gateway::HttpResponse OAuthHttpApi::handle(gateway::HttpRequest request)
 {
     const auto path = request.path();
+    if (m_nativeTokenReadsRequired && path=="/login") {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
     if (m_nativeTokenReadsRequired && (path=="/oauth/userinfo"
         || path=="/oauth/introspect" || path=="/oauth/revoke")) {
         request.wipeBody(); request.wipeAuthorizationHeader();
