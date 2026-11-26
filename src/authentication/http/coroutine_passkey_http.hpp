@@ -10,6 +10,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
+import openproof.identity.provider;
 import openproof.provider.passkey;
 import openproof.session;
 
@@ -20,9 +21,12 @@ public:
     using Read=std::function<boost::asio::awaitable<foundation::Result<std::vector<provider::passkey::CredentialSummary>>>(
         identity::core::IdentityId,session::SessionId,foundation::Instant,
         std::optional<provider::passkey::RegistrationCeremony>)>;
+    using Mutate=std::function<boost::asio::awaitable<foundation::Status>(
+        identity::core::IdentityId,session::SessionId,foundation::Instant,std::string,
+        std::optional<identity::provider::ChallengeId>,std::optional<provider::passkey::PasskeyCredential>)>;
     CoroutinePasskeyAccountAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter,const foundation::ClockSource& clock,
-        const provider::passkey::PasskeyConfig& config,Authenticate authenticate,Read read);
+        const provider::passkey::PasskeyConfig& config,Authenticate authenticate,Read read,Mutate mutate={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> handleAsync(gateway::HttpRequest) override;
@@ -33,5 +37,6 @@ private:
     const provider::passkey::PasskeyConfig* m_config;
     Authenticate m_authenticate;
     Read m_read;
+    Mutate m_mutate;
 };
 }

@@ -1,4 +1,6 @@
 #include <boost/json.hpp>
+#include <algorithm>
+#include <string_view>
 #include <chrono>
 #include <string>
 #include <utility>
@@ -17,6 +19,57 @@ bool listing(const gateway::HttpRequest& r) noexcept {
 }
 bool options(const gateway::HttpRequest& r) noexcept {
     return r.path()=="/account/passkeys/options" && r.method()==Method::Post;
+}
+constexpr std::string_view prefix="/account/passkeys/";
+constexpr std::string_view registrationCookie="__Host-openproof-passkey-registration";
+bool owned(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/account/passkeys" || r.path().starts_with(prefix);
+}
+bool encoded(std::string_view value,std::size_t limit) {
+    return !value.empty() && value.size()<=limit && std::ranges::all_of(value,[](char c){
+        return (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9') || c=='-' || c=='_';
+    });
+}
+std::optional<std::string> ceremonyCookie(const gateway::HttpRequest& r) {
+    auto header=r.header("cookie");
+    if (!header) return std::nullopt;
+    auto rest=*header;
+    std::optional<std::string> found;
+    while (!rest.empty()) {
+        const auto end=rest.find(';');
+        auto item=rest.substr(0,end);
+        if (end==std::string_view::npos) rest={}; else rest.remove_prefix(end+1U);
+        while (!item.empty() && (item.front()==' ' || item.front()=='\t')) item.remove_prefix(1U);
+        const auto eq=item.find('=');
+        if (eq!=std::string_view::npos && item.substr(0,eq)==registrationCookie) {
+            auto value=item.substr(eq+1U);
+            if (found || !encoded(value,256U)) return std::nullopt;
+            found=std::string{value};
+        }
+    }
+    return found;
+}
+foundation::Result<pk::RegistrationResponse> parseRegistration(gateway::HttpRequest& r) {
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/json" && !media->starts_with("application/json;"))
+        || r.body().empty() || r.body().size()>128U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    boost::system::error_code error;
+    auto value=boost::json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !value.is_object() || value.as_object().size()!=3U)
+        return foundation::fail(E::InvalidArgument);
+    const auto field=[&](std::string_view name,std::size_t limit)->std::optional<std::string>{
+        const auto* item=value.as_object().if_contains(name);
+        if (!item || !item->is_string()) return std::nullopt;
+        const auto& s=item->as_string();
+        if (!encoded(std::string_view{s.data(),s.size()},limit)) return std::nullopt;
+        return std::string{s.data(),s.size()};
+    };
+    auto id=field("credential_id",4096U),client=field("client_data_json",32U*1024U),
+        attestation=field("attestation_object",128U*1024U);
+    if (!id || !client || !attestation) return foundation::fail(E::InvalidArgument);
+    return pk::RegistrationResponse{std::move(*id),std::move(*client),std::move(*attestation)};
 }
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeBody(); r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
@@ -39,12 +92,12 @@ gateway::HttpResponse fail(E code,const gateway::HttpRequest& r) {
 }
 CoroutinePasskeyAccountAdapter::CoroutinePasskeyAccountAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    const foundation::ClockSource& clock,const pk::PasskeyConfig& config,Authenticate authenticate,Read read)
+    const foundation::ClockSource& clock,const pk::PasskeyConfig& config,Authenticate authenticate,Read read,Mutate mutate)
     :m_fallback(&fallback),m_limiter(&limiter),m_clock(&clock),m_config(&config),
-    m_authenticate(std::move(authenticate)),m_read(std::move(read)) {}
+    m_authenticate(std::move(authenticate)),m_read(std::move(read)),m_mutate(std::move(mutate)) {}
 
 bool CoroutinePasskeyAccountAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
-    return listing(r) || options(r) || m_fallback->nativeEnabledFor(r);
+    return owned(r) || m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutinePasskeyAccountAdapter::handle(gateway::HttpRequest r) {
     scrub(r);
@@ -52,19 +105,38 @@ gateway::HttpResponse CoroutinePasskeyAccountAdapter::handle(gateway::HttpReques
 }
 boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::handleAsync(gateway::HttpRequest r) {
     const bool begin=options(r);
-    if (!begin && !listing(r)) {
+    const bool registration=r.path()=="/account/passkeys" && r.method()==Method::Post;
+    const bool removal=r.path().starts_with(prefix) && r.method()==Method::Delete;
+    if (!owned(r)) {
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
     }
     Scrub wipe{r};
-    if (!m_authenticate || !m_read) co_return fail(E::Unavailable,r);
+    if (!begin && !listing(r) && !registration && !removal)
+        co_return response(405,R"({"error":"method_not_allowed"})");
+    if (!m_authenticate || ((begin || listing(r)) && !m_read) ||
+        ((registration || removal) && !m_mutate)) co_return fail(E::Unavailable,r);
     if (!m_limiter->allow("passkey:"+std::string{r.remoteAddress()}+":"+std::string{r.path()}))
         co_return fail(E::RateLimited,r);
     if (r.header("authorization").value_or("").starts_with("DPoP "))
         co_return fail(E::AuthenticationFailed,r);
-    if (begin) {
+    if (begin || registration || removal) {
         if (auto origin=r.header("origin"); origin && *origin!=m_config->origin())
             co_return fail(E::PermissionDenied,r);
+    }
+    std::optional<identity::provider::ChallengeId> registrationId;
+    std::optional<pk::RegistrationResponse> registrationInput;
+    std::string removeId;
+    if (registration) {
+        auto id=ceremonyCookie(r);
+        auto parsed=parseRegistration(r);
+        if (!id || !parsed) co_return fail(E::InvalidArgument,r);
+        registrationId.emplace(std::move(*id));
+        registrationInput.emplace(std::move(parsed).value());
+    } else if (removal) {
+        const auto id=r.path().substr(prefix.size());
+        if (!encoded(id,4096U)) co_return fail(E::InvalidArgument,r);
+        removeId=std::string{id};
     }
     auto credential=gateway::takeSessionCredential(r);
     if (!credential) co_return fail(credential.error().code(),r);
@@ -73,6 +145,27 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::ha
     auto actor=co_await m_authenticate(std::move(credential->value()));
     if (!actor) co_return fail(actor.error().code(),r);
     const auto now=m_clock->now();
+    if (registration || removal) {
+        std::optional<pk::PasskeyCredential> verified;
+        if (registration) {
+            auto checked=pk::verifyRegistration(*m_config,actor->identity(),*registrationId,*registrationInput,now);
+            registrationInput.reset();
+            if (!checked) {
+                auto out=fail(checked.error().code(),r);
+                out.addHeader("set-cookie",std::string{registrationCookie}+"=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
+                co_return out;
+            }
+            removeId=checked->credentialId;
+            verified.emplace(std::move(checked).value());
+        }
+        auto changed=co_await m_mutate(actor->identity(),actor->id(),now,std::move(removeId),
+            std::move(registrationId),std::move(verified));
+        auto out=changed?response(registration?201:200,registration?R"({"registered":true})":R"({"removed":true})")
+            :fail(changed.error().code(),r);
+        if (registration) out.addHeader("set-cookie",std::string{registrationCookie}+
+            "=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
+        co_return out;
+    }
     std::optional<pk::RegistrationCeremony> ceremony;
     if (begin) {
         auto random=security::randomTokenBase64Url(24U);

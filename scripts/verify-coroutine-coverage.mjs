@@ -1190,7 +1190,7 @@ const checked = segments.map(([name, relative]) => {
        || /account::AccountService accountService|PostgresAccountRepository accountRepository/.test(app)
        || !/AccountHttpApi accountApi\{limiter.value\(\),fallback\}/.test(app)
        || !paths.every(route=>strict.includes('"'+route+'"'))
-       || /nativeMethods\.emplace_back\("\/account\/(?!passkeys",gateway::HttpMethod::Get\))/.test(app)
+       || /nativeMethods\.emplace_back\("\/account\//.test(app)
        || !/co_return renderRecoveryPage\(\)/.test(boundary)
        || !/co_await securityPage\(/.test(boundary)
        || !/co_await m_authenticate\(/.test(security)

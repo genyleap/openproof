@@ -170,6 +170,12 @@ struct CredentialSummary final {
     const identity::provider::ChallengeId& ceremony,
     const std::vector<std::string>& excludedCredentialIds);
 
+// Pure verification shared by the native and compatibility registration paths.
+[[nodiscard]] foundation::Result<PasskeyCredential> verifyRegistration(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const identity::provider::ChallengeId& ceremony,const RegistrationResponse& response,
+    foundation::Instant now);
+
 /** @brief Authenticated self-service WebAuthn registration/removal service. */
 class PasskeyService final {
 public:

@@ -8,13 +8,13 @@ const read=file=>fs.readFileSync(path.join(root,file),"utf8");
 const app=read("apps/opp/main.cpp");
 const http=read("src/authentication/http/coroutine_passkey_http.cpp");
 const source=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
-const sql=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::readPasskeyAccountAsync("));
-test("passkey list and registration options use native first-party authentication without changing completion dispatch",()=>{
+const sql=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::readPasskeyAccountAsync("),
+  source.indexOf("CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync("));
+test("passkey account operations use native first-party authentication",()=>{
   assert.match(http,/r.path\(\)=="\/account\/passkeys" && r.method\(\)==Method::Get/);
   assert.match(http,/r.path\(\)=="\/account\/passkeys\/options" && r.method\(\)==Method::Post/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/passkeys",gateway::HttpMethod::Get\)/);
-  assert.match(app,/nativePaths.emplace_back\("\/account\/passkeys\/options"\)/);
-  assert.doesNotMatch(app,/nativePaths.emplace_back\("\/account\/passkeys"\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/account\/passkeys"\)/);
+  assert.match(app,/passkeyConfig\?std::vector<std::string>\{"\/account\/passkeys\/"\}/);
   assert.match(app,/reader->readPasskeyAccountAsync/);
   assert.match(http,/starts_with\("DPoP "\)/);
   assert.match(http,/origin && \*origin!=m_config->origin\(\)/);
@@ -48,4 +48,27 @@ test("native passkey metadata and challenge transaction enforce tenant session, 
   assert.match(renderer,/"userVerification", "required"/);
   assert.match(renderer,/excludedCredentialIds/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativePasskeyListingAndRegistrationChallengeAreSessionBound/);
+});
+test("registration completion and removal serialize against disconnect and commit credential, ceremony and ownership atomically",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync("));
+  const order=["pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+    "FOR UPDATE OF i FOR SHARE OF o,s","WHERE provider='passkey' AND external_subject=$1 FOR UPDATE",
+    "count(*) FILTER (WHERE credential_id=$2)","UPDATE openproof.passkey_registration_ceremonies",
+    "consumed_at_ms IS NULL AND expires_at_ms>$3 RETURNING id",
+    "INSERT INTO openproof.passkey_credentials","ON CONFLICT DO NOTHING RETURNING credential_id",
+    "INSERT INTO openproof.external_identities","WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id",
+    "if (total<=1 && !link.rows.empty())","DELETE FROM openproof.passkey_credentials",
+    'execute("COMMIT",{})'];
+  let prev=-1;
+  for(const term of order){
+    const index=store.indexOf(term,prev+1);
+    assert.ok(index>prev,term); prev=index;
+  }
+  assert.match(store,/verified->identity!=actor/);
+  assert.match(store,/ceremony.has_value\(\)!=verified.has_value\(\)/);
+  assert.match(http,/pk::verifyRegistration\(\*m_config,actor->identity\(\),\*registrationId,\*registrationInput,now\)/);
+  assert.ok(http.indexOf("pk::verifyRegistration(")<http.indexOf("co_await m_mutate("));
+  assert.match(app,/reader->mutatePasskeyAccountAsync/);
+  assert.match(read("src/gateway/http_coroutine.cpp"),/prefix.back\(\)=='\/' && path.starts_with\(prefix\)/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Passkey mutation rollback and last credential protection/);
 });

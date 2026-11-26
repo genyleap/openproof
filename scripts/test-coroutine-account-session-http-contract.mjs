@@ -37,7 +37,7 @@ test("all account paths fail closed and browser renderers cannot access storage"
   const app=read("apps/opp/main.cpp");
   assert.match(legacy,/E::Unavailable/);
   assert.doesNotMatch(legacy,/m_accounts->|m_sessions->|m_authentication->|m_delegated->/);
-  assert.doesNotMatch(app,/account::AccountService accountService|PostgresAccountRepository accountRepository|nativeMethods\.emplace_back\("\/account\/(?!passkeys",gateway::HttpMethod::Get\))/);
+  assert.doesNotMatch(app,/account::AccountService accountService|PostgresAccountRepository accountRepository|nativeMethods\.emplace_back\("\/account\//);
   assert.match(app,/AccountHttpApi accountApi\{limiter.value\(\),fallback\}/);
   for(const route of ["/account/recover","/account/security","/account/profile",
     "/account/totp","/account/password/upgrade","/account/connections/complete",

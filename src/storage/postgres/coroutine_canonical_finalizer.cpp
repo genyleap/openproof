@@ -3698,4 +3698,126 @@ CoroutinePostgresCanonicalFinalizer::readPasskeyAccountAsync(core::IdentityId ac
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync(core::IdentityId actor,
+    session::SessionId sessionId,foundation::Instant now,std::string credentialId,
+    std::optional<idp::ChallengeId> ceremony,std::optional<provider::passkey::PasskeyCredential> verified)
+{
+    using E=foundation::ErrorCode;
+    const auto encoded=[](std::string_view value,std::size_t limit){
+        return !value.empty() && value.size()<=limit && std::ranges::all_of(value,[](char c){
+            return (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9') || c=='-' || c=='_';
+        });
+    };
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || now.time_since_epoch().count()<0 || !encoded(credentialId,4096U)
+        || ceremony.has_value()!=verified.has_value()
+        || (verified && (verified->identity!=actor || verified->credentialId!=credentialId
+            || !encoded(ceremony->value(),256U) || !encoded(verified->publicKeyX,43U)
+            || !encoded(verified->publicKeyY,43U) || verified->publicKeyX.size()!=43U
+            || verified->publicKeyY.size()!=43U || verified->createdAt!=now || verified->lastUsedAt!=now)))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args){
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string identityId{actor.value()},tenant{m_impl->organization.value()};
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        Params lockArgs{identityId};
+        static_cast<void>(co_await execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",std::move(lockArgs)));
+        Params actorArgs{identityId,tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.id FROM openproof.sessions s JOIN openproof.identities i ON i.id=s.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND i.kind=0 AND o.state=0 "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR UPDATE OF i FOR SHARE OF o,s",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        Params ownerArgs{identityId};
+        const auto link=co_await execute(
+            "SELECT identity_id FROM openproof.external_identities "
+            "WHERE provider='passkey' AND external_subject=$1 FOR UPDATE",std::move(ownerArgs));
+        if (link.rows.size()>1U || (!link.rows.empty() && link.rows.front().size()!=1U))
+            throw std::runtime_error{"Malformed passkey link"};
+        if (!link.rows.empty() && required(link.rows.front()[0])!=identityId) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        Params countArgs{identityId,credentialId};
+        const auto counts=co_await execute(
+            "SELECT count(*),count(*) FILTER (WHERE credential_id=$2) "
+            "FROM openproof.passkey_credentials WHERE identity_id=$1",std::move(countArgs));
+        if (counts.rows.size()!=1U || counts.rows.front().size()!=2U)
+            throw std::runtime_error{"Malformed passkey count"};
+        const auto total=milliseconds(counts.rows.front()[0]),matching=milliseconds(counts.rows.front()[1]);
+        if (verified) {
+            if (total>=256 || matching!=0) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(matching?E::AlreadyExists:E::RateLimited);
+            }
+            Params ceremonyArgs{std::string{ceremony->value()},identityId,timestamp};
+            const auto consumed=co_await execute(
+                "UPDATE openproof.passkey_registration_ceremonies SET consumed_at_ms=$3 "
+                "WHERE id=$1 AND identity_id=$2 AND consumed_at_ms IS NULL AND expires_at_ms>$3 RETURNING id",
+                std::move(ceremonyArgs));
+            if (consumed.rows.size()!=1U || consumed.rows.front().size()!=1U
+                || required(consumed.rows.front()[0])!=ceremony->value()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AuthenticationFailed);
+            }
+            Params credentialArgs{credentialId,identityId,verified->publicKeyX,verified->publicKeyY,
+                std::to_string(verified->signCount),timestamp};
+            const auto added=co_await execute(
+                "INSERT INTO openproof.passkey_credentials"
+                "(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+                "VALUES($1,$2,$3,$4,$5,$6,$6) ON CONFLICT DO NOTHING RETURNING credential_id",std::move(credentialArgs));
+            if (added.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AlreadyExists);
+            }
+            if (added.rows.size()!=1U || added.rows.front().size()!=1U || required(added.rows.front()[0])!=credentialId)
+                throw std::runtime_error{"Passkey insert mismatch"};
+            Params linkArgs{identityId,timestamp};
+            const auto attached=co_await execute(
+                "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+                "VALUES('passkey',$1,$1,$2) ON CONFLICT(provider,external_subject) DO UPDATE SET "
+                "identity_id=EXCLUDED.identity_id WHERE openproof.external_identities.identity_id=EXCLUDED.identity_id "
+                "RETURNING identity_id",std::move(linkArgs));
+            if (attached.rows.size()!=1U || attached.rows.front().size()!=1U
+                || required(attached.rows.front()[0])!=identityId) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::Conflict);
+            }
+        } else {
+            if (matching!=1) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            if (total<=1 && !link.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::FailedPrecondition);
+            }
+            Params args{identityId,credentialId};
+            const auto deleted=co_await execute(
+                "DELETE FROM openproof.passkey_credentials WHERE identity_id=$1 AND credential_id=$2 RETURNING credential_id",
+                std::move(args));
+            if (deleted.rows.size()!=1U || deleted.rows.front().size()!=1U || required(deleted.rows.front()[0])!=credentialId)
+                throw std::runtime_error{"Passkey removal mismatch"};
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native passkey mutation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

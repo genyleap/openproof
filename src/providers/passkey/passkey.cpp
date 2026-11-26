@@ -723,22 +723,31 @@ foundation::Result<RegistrationStart> registrationOptions(
     return RegistrationStart{id, json::serialize(options)};
 }
 
+foundation::Result<PasskeyCredential> verifyRegistration(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const idp::ChallengeId& ceremonyId,const RegistrationResponse& response,foundation::Instant now)
+{
+    auto challenge=challengeFor(config,"register",ceremonyId);
+    if (!challenge) return foundation::fail(challenge.error());
+    auto attestation=verifyAttestation(response,config,challenge.value());
+    if (!attestation) return foundation::fail(attestation.error());
+    return PasskeyCredential{attestation->credentialId,identity,attestation->x,attestation->y,
+        attestation->signCount,now,now};
+}
+
 foundation::Status PasskeyService::completeRegistration(
     const identity::core::IdentityId& identity, const idp::ChallengeId& ceremonyId,
     const RegistrationResponse& response)
 {
-    auto challenge = challengeFor(*m_config, "register", ceremonyId); if (!challenge) return foundation::fail(challenge.error());
-    auto attestation = verifyAttestation(response, *m_config, challenge.value());
-    if (!attestation) return foundation::fail(attestation.error());
+    auto credential=verifyRegistration(*m_config,identity,ceremonyId,response,m_clock->now());
+    if (!credential) return foundation::fail(credential.error());
     auto consumed = m_repository->consumeCeremony(ceremonyId, identity, m_clock->now());
     if (!consumed) return consumed;
     const identity::core::ExternalIdentityRef external{idp::ProviderId{"passkey"}, idp::ExternalSubject{std::string{identity.value()}}};
     auto owner = m_externalIdentities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (owner->has_value() && owner->value() != identity) return foundation::fail(foundation::ErrorCode::Conflict);
-    PasskeyCredential credential{attestation->credentialId, identity, attestation->x, attestation->y,
-        attestation->signCount, m_clock->now(), m_clock->now()};
-    auto added = m_repository->addCredential(credential); if (!added) return added;
+    auto added = m_repository->addCredential(std::move(credential).value()); if (!added) return added;
     if (!owner->has_value()) {
         auto link = identity::core::IdentityLink::request(identity, external, m_clock->now(), std::chrono::minutes{5});
         if (!link || !link->requireVerification(m_clock->now()) || !link->markVerified(m_clock->now()) || !link->complete(m_clock->now())) {

@@ -815,6 +815,57 @@ TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChalleng
     auto capped=read(ceremony("-capped",kNow+300s));
     ASSERT_FALSE(capped);
     EXPECT_EQ(capped.error().code(),fnd::ErrorCode::RateLimited);
+    // Passkey mutation rollback and last credential protection.
+    const auto mutate=[&](std::string id,std::optional<pk::RegistrationCeremony> challenge=std::nullopt,
+        std::string owner={},fnd::Instant now=kNow+2s) {
+        auto identity=ids::IdentityId{owner.empty()?seed.owner:owner};
+        std::optional<pk::PasskeyCredential> verified;
+        std::optional<openproof::identity::provider::ChallengeId> cid;
+        if (challenge) {
+            cid=challenge->id;
+            verified.emplace(pk::PasskeyCredential{id,identity,std::string(43,'A'),std::string(43,'B'),0U,now,now});
+        }
+        return native.mutatePasskeyAccountAsync(identity,openproof::session::SessionId{sessionName},now,
+            std::move(id),std::move(cid),std::move(verified));
+    };
+    const auto runMutation=[&](auto task){
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    EXPECT_FALSE(runMutation(mutate(otherCredential,first)));
+    const auto unconsumed=execute(fixture.get(),
+        "SELECT consumed_at_ms IS NULL FROM openproof.passkey_registration_ceremonies WHERE id=$1",
+        {std::string{first.id.value()}});
+    EXPECT_STREQ(PQgetvalue(unconsumed.get(),0,0),"t");
+    const auto newCredential="native-new-"+seed.suffix;
+    io.restart();
+    auto one=asio::co_spawn(io,mutate(newCredential,first),asio::use_future);
+    auto two=asio::co_spawn(io,mutate(newCredential+"-duplicate",first),asio::use_future);
+    io.run();
+    auto a=one.get(),b=two.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    const auto winner=a?newCredential:newCredential+"-duplicate";
+    EXPECT_FALSE(runMutation(mutate(otherCredential)));
+    EXPECT_FALSE(runMutation(mutate(winner,std::nullopt,seed.secondOwner)));
+    io.restart();
+    auto delA=asio::co_spawn(io,mutate(credentialId),asio::use_future);
+    auto delB=asio::co_spawn(io,mutate(winner),asio::use_future);
+    io.run();
+    auto da=delA.get(),db=delB.get();
+    ASSERT_NE(da.has_value(),db.has_value());
+    EXPECT_EQ((da?db:da).error().code(),fnd::ErrorCode::FailedPrecondition);
+    const auto remaining=read();
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->size(),1U);
+    const auto link=execute(fixture.get(),
+        "SELECT identity_id FROM openproof.external_identities WHERE provider='passkey' AND external_subject=$1",
+        {seed.owner});
+    ASSERT_EQ(PQntuples(link.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(link.get(),0,0)},seed.owner);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.external_identities WHERE provider='passkey' AND external_subject=$1",{seed.owner})));
+    ASSERT_TRUE(runMutation(mutate(remaining->front().credentialId)));
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
         "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
     EXPECT_FALSE(read());

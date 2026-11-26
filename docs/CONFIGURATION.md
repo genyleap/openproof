@@ -1160,11 +1160,17 @@ ceremony under the shared per-identity advisory lock. Expired ceremonies
 are pruned in bounded batches and at most 32 unconsumed, unexpired
 ceremonies are allowed per identity. WebAuthn challenge derivation,
 RP configuration and required user verification are shared with the
-existing provider implementation. Registration completion, removal and
-assertion authentication still use the compatibility path.
+existing provider implementation. Registration completion now verifies
+attestation using the shared verifier and atomically consumes the ceremony,
+inserts the credential and attaches the canonical passkey link. Removal
+uses the same per-identity advisory lock as disconnection and registration;
+the final credential is protected while its authentication link remains.
+Exact and slash-delimited prefix route ownership prevents synchronous
+fallback for account passkey operations. Assertion authentication still
+uses the compatibility path.
 
 The remaining PostgreSQL compatibility surfaces include passkey
-registration completion, removal and assertion operations, evidence/trust
+assertion operations, evidence/trust
 and enabled SCIM operations, as well as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.

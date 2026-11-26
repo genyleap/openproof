@@ -3511,10 +3511,15 @@ addProtectedRoutes(gateway::Router& router,
                 [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
                     fnd::Instant now,std::optional<passkey::RegistrationCeremony> ceremony) {
                     return reader->readPasskeyAccountAsync(std::move(actor),std::move(sessionId),now,std::move(ceremony));
+                },
+                [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                    fnd::Instant now,std::string credentialId,std::optional<idp::ChallengeId> ceremony,
+                    std::optional<passkey::PasskeyCredential> verified) {
+                    return reader->mutatePasskeyAccountAsync(std::move(actor),std::move(sessionId),now,
+                        std::move(credentialId),std::move(ceremony),std::move(verified));
                 });
             nativeHandler=nativePasskeyAccount.get();
-            nativeMethods.emplace_back("/account/passkeys",gateway::HttpMethod::Get);
-            nativePaths.emplace_back("/account/passkeys/options");
+            nativePaths.emplace_back("/account/passkeys");
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
@@ -3522,7 +3527,7 @@ addProtectedRoutes(gateway::Router& router,
         nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             evidenceApi, nativeHealth, std::move(nativePaths),
-            std::move(nativeMethods)};
+            std::move(nativeMethods),passkeyConfig?std::vector<std::string>{"/account/passkeys/"}:std::vector<std::string>{}};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,

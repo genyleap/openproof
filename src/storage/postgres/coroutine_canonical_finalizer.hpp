@@ -87,6 +87,12 @@ public:
     readPasskeyAccountAsync(identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now,
         std::optional<provider::passkey::RegistrationCeremony> ceremony=std::nullopt);
 
+    // A verified registration or a credential removal, never both.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status> mutatePasskeyAccountAsync(
+        identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now,
+        std::string credentialId,std::optional<identity::provider::ChallengeId> ceremony,
+        std::optional<provider::passkey::PasskeyCredential> verified);
+
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
 

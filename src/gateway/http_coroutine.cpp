@@ -23,10 +23,12 @@ namespace asio = boost::asio;
 CoroutineRouteOverlay::CoroutineRouteOverlay(
     HttpHandler& compatibility, CoroutineHttpHandler& native,
     std::vector<std::string> exactNativePaths,
-    std::vector<std::pair<std::string, HttpMethod>> methodScopedNativePaths)
+    std::vector<std::pair<std::string, HttpMethod>> methodScopedNativePaths,
+    std::vector<std::string> strictNativePrefixes)
     : m_compatibility(&compatibility), m_native(&native),
       m_exactNativePaths(std::move(exactNativePaths)),
-      m_methodScopedNativePaths(std::move(methodScopedNativePaths))
+      m_methodScopedNativePaths(std::move(methodScopedNativePaths)),
+      m_strictNativePrefixes(std::move(strictNativePrefixes))
 {
 }
 
@@ -34,6 +36,9 @@ bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
 {
     for (const auto& exact : m_exactNativePaths) {
         if (std::string_view{exact} == path) return true;
+    }
+    for (const auto& prefix:m_strictNativePrefixes) {
+        if (!prefix.empty() && prefix.back()=='/' && path.starts_with(prefix)) return true;
     }
     return false;
 }
