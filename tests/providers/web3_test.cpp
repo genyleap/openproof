@@ -1,4 +1,7 @@
 #include <gtest/gtest.h>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 
 #include <chrono>
 #include <map>
@@ -13,6 +16,7 @@ import openproof.provider.web3;
 
 namespace {
 
+namespace asio=boost::asio;
 namespace fnd = openproof::foundation;
 namespace idp = openproof::identity::provider;
 namespace web3 = openproof::provider::web3;
@@ -21,7 +25,22 @@ constexpr fnd::Instant kNow{std::chrono::milliseconds{1'788'086'400'000LL}};
 constexpr std::string_view kAddress{"0x1111111111111111111111111111111111111111"};
 constexpr std::uint64_t kFid = 6841U;
 
-class FakeFarcasterChain final : public web3::FarcasterChainVerifier {
+template<class T>
+T runNative(asio::awaitable<T> task)
+{
+    asio::io_context io;
+    std::optional<T> result;
+    auto capture=[](asio::awaitable<T> operation,std::optional<T>& output)->asio::awaitable<void>{
+        output.emplace(co_await std::move(operation));
+    };
+    auto done=asio::co_spawn(io,capture(std::move(task),result),asio::use_future);
+    io.run();
+    done.get();
+    return std::move(result.value());
+}
+
+class FakeFarcasterChain final : public web3::FarcasterChainVerifier,
+    public web3::CoroutineFarcasterChainVerifier {
 public:
     fnd::Result<bool> chainMatches() override { return matchingChain; }
 
@@ -44,6 +63,18 @@ public:
         ++authorizationChecks;
         return authorization;
     }
+
+    asio::awaitable<fnd::Result<bool>> chainMatchesAsync(
+        std::chrono::steady_clock::time_point) override
+    { co_return chainMatches(); }
+    asio::awaitable<fnd::Result<bool>> verifySignatureAsync(
+        std::string_view address,std::string_view message,std::string_view signature,
+        std::chrono::steady_clock::time_point) override
+    { co_return verifySignature(address,message,signature); }
+    asio::awaitable<fnd::Result<std::optional<web3::FarcasterSignerKind>>>
+    authorizeSignerAsync(std::uint64_t fid,std::string_view address,
+        std::chrono::steady_clock::time_point) override
+    { co_return authorizeSigner(fid,address); }
 
     bool matchingChain{true};
     bool validSignature{true};
@@ -169,7 +200,7 @@ TEST(WalletProviderTest, ChallengeUsesRequestedEvmChainWithoutRpcDependency)
     baseRequest.setParameter("address", std::string{kAddress});
     baseRequest.setParameter("chain_id", "8453");
 
-    auto baseChallenge = provider.beginAuthentication(baseRequest);
+    auto baseChallenge = runNative(provider.beginAuthenticationAsync(std::move(baseRequest)));
     ASSERT_TRUE(baseChallenge);
     EXPECT_EQ(parameter(*baseChallenge, "chain_id"), "8453");
     EXPECT_NE(parameter(*baseChallenge, "message").find("\nChain ID: 8453\n"),
@@ -180,7 +211,7 @@ TEST(WalletProviderTest, ChallengeUsesRequestedEvmChainWithoutRpcDependency)
     arbitrumRequest.setParameter("address", std::string{kAddress});
     arbitrumRequest.setParameter("chain_id", "42161");
 
-    auto arbitrumChallenge = provider.beginAuthentication(arbitrumRequest);
+    auto arbitrumChallenge = runNative(provider.beginAuthenticationAsync(std::move(arbitrumRequest)));
     ASSERT_TRUE(arbitrumChallenge);
     EXPECT_EQ(parameter(*arbitrumChallenge, "chain_id"), "42161");
     EXPECT_NE(parameter(*arbitrumChallenge, "message").find("\nChain ID: 42161\n"),
@@ -238,7 +269,7 @@ TEST(WalletProviderTest, ChallengeUsesTheWalletsRequestedEvmChain)
     web3::WalletAuthenticationProvider provider{walletConfiguration(), clock};
 
     for (const std::uint64_t chainId : {1U, 8453U, 42161U, 10U, 5042U, 4663U}) {
-        auto challenge = provider.beginAuthentication(walletRequest(chainId));
+        auto challenge = runNative(provider.beginAuthenticationAsync(walletRequest(chainId)));
         ASSERT_TRUE(challenge);
         EXPECT_EQ(parameter(*challenge, "chain_id"), std::to_string(chainId));
         EXPECT_NE(parameter(*challenge, "message").find(
@@ -255,7 +286,7 @@ TEST(WalletProviderTest, ExpiredSiweChallengeFailsBeforeSignatureVerification)
 {
     fnd::ManualClockSource clock{kNow};
     web3::WalletAuthenticationProvider provider{walletConfiguration(), clock};
-    auto challenge = provider.beginAuthentication(walletRequest(1U));
+    auto challenge = runNative(provider.beginAuthenticationAsync(walletRequest(1U)));
     ASSERT_TRUE(challenge);
 
     clock.advance(std::chrono::minutes{5});
@@ -264,7 +295,7 @@ TEST(WalletProviderTest, ExpiredSiweChallengeFailsBeforeSignatureVerification)
         "message", idp::CredentialValue{parameter(*challenge, "message")});
     completion.setParameter("signature", idp::CredentialValue{"0x0102"});
 
-    auto outcome = provider.completeAuthentication(completion);
+    auto outcome = runNative(provider.completeAuthenticationAsync(std::move(completion)));
 
     ASSERT_FALSE(outcome);
     EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -323,7 +354,7 @@ TEST(FarcasterProviderTest, RelayStartPublishesAuthKitConfigurationWithoutRequir
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
 
-    auto challenge = provider.beginAuthentication(request(false));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(false)));
 
     ASSERT_TRUE(challenge);
     EXPECT_EQ(observed->authorizationChecks, 0);
@@ -345,7 +376,7 @@ TEST(FarcasterProviderTest, DirectCustodyFlowUsesCanonicalFip11Message)
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
 
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     const std::string message = parameter(*challenge, "message");
     EXPECT_NE(message.find("\n\nFarcaster Auth\n\n"), std::string::npos);
@@ -354,7 +385,7 @@ TEST(FarcasterProviderTest, DirectCustodyFlowUsesCanonicalFip11Message)
     EXPECT_EQ(message.find("Request ID:"), std::string::npos);
     EXPECT_EQ(parameter(*challenge, "signer_kind"), "custody");
 
-    auto outcome = provider.completeAuthentication(response(*challenge, message));
+    auto outcome = runNative(provider.completeAuthenticationAsync(response(*challenge, message)));
     ASSERT_TRUE(outcome);
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
     EXPECT_EQ(outcome->claims().getExtension("signer_kind"), "custody");
@@ -370,7 +401,7 @@ TEST(FarcasterProviderTest, AcceptsLegacyPluralFidResourceDuringMigration)
     auto chain = std::make_unique<FakeFarcasterChain>();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
     const auto current = message.find("farcaster://fid/");
@@ -378,8 +409,8 @@ TEST(FarcasterProviderTest, AcceptsLegacyPluralFidResourceDuringMigration)
     message.replace(current, std::string_view{"farcaster://fid/"}.size(),
                     "farcaster://fids/");
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, std::move(message))));
 
     ASSERT_TRUE(outcome);
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
@@ -391,7 +422,7 @@ TEST(FarcasterProviderTest, AcceptsCurrentSdkCompatibilityVariants)
     auto chain = std::make_unique<FakeFarcasterChain>();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
 
@@ -405,8 +436,8 @@ TEST(FarcasterProviderTest, AcceptsCurrentSdkCompatibilityVariants)
     message.insert(resource + std::string_view{"farcaster://fid/6841"}.size(), "/");
     message.append("\n- https://example.com/resource");
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, std::move(message))));
 
     ASSERT_TRUE(outcome);
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
@@ -418,7 +449,7 @@ TEST(FarcasterProviderTest, AcceptsOptionalSiweFieldsBeforeResources)
     auto chain = std::make_unique<FakeFarcasterChain>();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
 
@@ -428,8 +459,8 @@ TEST(FarcasterProviderTest, AcceptsOptionalSiweFieldsBeforeResources)
         "\nNot Before: 2025-01-15T12:00:00.000Z"
         "\nRequest ID: openproof-test");
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, std::move(message))));
 
     ASSERT_TRUE(outcome);
     EXPECT_EQ(outcome->subject(), idp::ExternalSubject{"6841"});
@@ -442,7 +473,7 @@ TEST(FarcasterProviderTest, RejectsFutureNotBeforeBeforeSignatureVerification)
     auto* observed = chain.get();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
 
@@ -451,8 +482,8 @@ TEST(FarcasterProviderTest, RejectsFutureNotBeforeBeforeSignatureVerification)
     message.insert(resources,
         "\nNot Before: " + fnd::toIso8601(kNow + std::chrono::minutes{1}));
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, std::move(message))));
 
     ASSERT_FALSE(outcome);
     EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -467,7 +498,7 @@ TEST(FarcasterProviderTest, RejectsDuplicateOptionalSiweFields)
     auto* observed = chain.get();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
 
@@ -475,8 +506,8 @@ TEST(FarcasterProviderTest, RejectsDuplicateOptionalSiweFields)
     ASSERT_NE(resources, std::string::npos);
     message.insert(resources, "\nRequest ID: first\nRequest ID: second");
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, std::move(message))));
 
     ASSERT_FALSE(outcome);
     EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -490,11 +521,11 @@ TEST(FarcasterProviderTest, AuthAddressIsAcceptedAndRecordedDistinctly)
     chain->authorization = web3::FarcasterSignerKind::AuthAddress;
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, parameter(*challenge, "message")));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, parameter(*challenge, "message"))));
 
     ASSERT_TRUE(outcome);
     EXPECT_EQ(outcome->claims().getExtension("signer_kind"), "auth_address");
@@ -509,13 +540,13 @@ TEST(FarcasterProviderTest, RejectsLegacyCustomStatementBeforeSignatureVerificat
     auto* observed = chain.get();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     std::string message = parameter(*challenge, "message");
     message.replace(message.find("Farcaster Auth"), std::string_view{"Farcaster Auth"}.size(),
                     "Sign in to OpenProof with this FID");
 
-    auto outcome = provider.completeAuthentication(response(*challenge, std::move(message)));
+    auto outcome = runNative(provider.completeAuthenticationAsync(response(*challenge, std::move(message))));
 
     EXPECT_FALSE(outcome);
     EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -529,12 +560,12 @@ TEST(FarcasterProviderTest, RechecksAuthorizationAfterSignatureAndFailsClosedOnR
     auto* observed = chain.get();
     web3::FarcasterAuthenticationProvider provider{
         configuration(), clock, std::move(chain)};
-    auto challenge = provider.beginAuthentication(request(true));
+    auto challenge = runNative(provider.beginAuthenticationAsync(request(true)));
     ASSERT_TRUE(challenge);
     observed->authorization.reset();
 
-    auto outcome = provider.completeAuthentication(
-        response(*challenge, parameter(*challenge, "message")));
+    auto outcome = runNative(provider.completeAuthenticationAsync(
+        response(*challenge, parameter(*challenge, "message"))));
 
     EXPECT_FALSE(outcome);
     EXPECT_EQ(observed->signatureChecks, 1);

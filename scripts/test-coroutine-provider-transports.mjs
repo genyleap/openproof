@@ -12,7 +12,7 @@ const cases = [
   {name:"GitHub OAuth",file:"src/providers/github/github.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
   {name:"OIDC federation",file:"src/providers/oidc/oidc.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
   {name:"X OAuth 1.0a",file:"src/providers/x/x.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
-  {name:"Web3 RPC",file:"src/providers/web3/web3.cpp",legacy:"rpc",native:"rpcAsync",client:"NativeRpcClient",limit:"kMaximumRpcResponse"}
+  {name:"Web3 RPC",file:"src/providers/web3/web3.cpp",retired:true,legacy:"rpc",native:"rpcAsync",client:"NativeRpcClient",limit:"kMaximumRpcResponse"}
 ];
 const forbidden = [
   /\b(?:http|beastHttp)::(?:read|write)\s*\(/,
@@ -22,6 +22,16 @@ const forbidden = [
 for (const item of cases) {
   test(item.name+(item.retired?" has only native remote exchanges":" legacy I/O is delegated to native coroutine HTTPS"),()=>{
     const source = fs.readFileSync(path.join(root,item.file),"utf8");
+    if (item.name==="Web3 RPC") {
+      assert.doesNotMatch(source,/\b(?:io\.run|rpc|rpcString|completion\.get)\s*\(/);
+      assert.equal([...source.matchAll(/co_await rpcStringAsync\(/g)].length,6);
+      assert.match(source,/co_await client.exchange\(/);
+      assert.match(source,/co_await universalSignatureValidAsync\(/);
+      assert.match(source,/co_await native->verifySignatureAsync\(/);
+      assert.match(source,/co_await native->authorizeSignerAsync\(/);
+      for (const pattern of forbidden) assert.doesNotMatch(source,pattern);
+      return;
+    }
     if (item.retired) {
       const type=item.name==="GitHub OAuth"?"GitHubAuthenticationProvider":
         item.name==="OIDC federation"?"OidcAuthenticationProvider":"XAuthenticationProvider";

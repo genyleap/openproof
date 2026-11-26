@@ -4861,3 +4861,17 @@ persisted as a session. Existing status/response shapes are preserved for
 authorized clients; inactive identities and revoked families fail closed.
 Strict route overlays prevent blocking fallback. Web3 remains opt-in until
 compiled PostgreSQL/HTTP and external-provider tests confirm parity.
+
+### Web3 RPC retirement
+
+Removed the private synchronous RPC executor and duplicate synchronous
+chain, smart-wallet, and Farcaster registry exchange functions.
+Synchronous network-capable provider methods deny before I/O; Wallet
+local challenge construction remains available. All seven Web3 HTTP
+paths are strict native overlays and authenticated startup rejects the
+historical disable flag. Legacy provider regression tests now exercise
+the native API using test-only in-memory verifiers. Native transport
+retains its shared monotonic deadline and smart-account verification
+fallback semantics. Source gate checks actual native probes and mandatory
+runtime wiring. Exact-head compiled, live RPC and E2E acceptance remain
+required before production approval.
