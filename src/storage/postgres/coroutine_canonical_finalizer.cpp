@@ -4,6 +4,7 @@
 #include <boost/asio/any_io_executor.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +31,7 @@ import openproof.organization;
 import openproof.policy;
 import openproof.session;
 import openproof.security;
+import openproof.client;
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -1473,6 +1475,165 @@ CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync(
         co_return scopes;
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable,"Native OAuth refresh rotation is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<oauth::NativeCodeExchangeResult>>
+CoroutinePostgresCanonicalFinalizer::exchangeOAuthCodeAsync(
+    std::string clientId,std::optional<std::string> clientDigest,
+    std::string codeDigest,std::string redirectUri,std::string challenge,
+    std::string family,std::string accessDigest,std::string refreshDigest,
+    std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+    foundation::Duration accessLifetime,foundation::Duration refreshLifetime,
+    SignCodeIdToken signIdToken)
+{
+    using E=foundation::ErrorCode;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || !validDigest(codeDigest)
+        || !validDigest(accessDigest) || !validDigest(refreshDigest) || accessDigest==refreshDigest
+        || (clientDigest && !validDigest(*clientDigest)) || family.empty() || family.size()>200U
+        || redirectUri.empty() || redirectUri.size()>2048U || challenge.size()!=43U
+        || accessLifetime<=foundation::Duration::zero() || accessLifetime>std::chrono::hours{1}
+        || refreshLifetime<=accessLifetime || refreshLifetime>std::chrono::hours{24*365}
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-refreshLifetime.count()
+        || (sender && (sender->value().empty() || sender->value().size()>256U)))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        auto challengeValue=oauth::PkceChallenge::create(challenge);
+        auto digestBytes=foundation::fromHex(codeDigest);
+        if (!challengeValue || !digestBytes || digestBytes->size()!=32U)
+            co_return foundation::fail(E::InvalidArgument);
+        std::array<std::byte,32> codeBytes{};
+        std::copy(digestBytes->begin(),digestBytes->end(),codeBytes.begin());
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        Params codeArgs{codeDigest,clientId,tenant,redirectUri,challenge,timestamp};
+        // All binding and lifecycle checks precede any destructive write.
+        // The same code row is locked by the old consumeBound implementation.
+        const auto locked=co_await execute(
+            "SELECT g.identity_id,g.provider,g.assurance,g.factors,g.phishing_resistant,"
+            "g.authenticated_at_ms,g.issued_at_ms,g.expires_at_ms,g.nonce,g.resource "
+            "FROM openproof.oauth_authorization_codes g "
+            "JOIN openproof.identities i ON i.id=g.identity_id "
+            "WHERE g.code_digest=decode($1,'hex') AND g.client_id=$2 AND i.organization_id=$3 "
+            "AND g.redirect_uri=$4 AND g.code_challenge=$5 "
+            "AND g.issued_at_ms<=$6 AND g.expires_at_ms>$6 AND i.status=0 "
+            "FOR UPDATE OF g FOR SHARE OF i",std::move(codeArgs));
+        if (locked.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (locked.rows.size()!=1U || locked.rows.front().size()!=10U)
+            throw std::runtime_error{"Malformed authorization code"};
+        const auto& row=locked.rows.front();
+        const auto assurance=milliseconds(row[2]),factors=milliseconds(row[3]);
+        if (assurance>4 || factors>7) throw std::runtime_error{"Malformed authentication context"};
+        Params scopeArgs{codeDigest};
+        const auto grantRows=co_await execute(
+            "SELECT scope FROM openproof.oauth_authorization_code_scopes WHERE code_digest=decode($1,'hex') "
+            "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(scopeArgs));
+        if (grantRows.rows.empty() || grantRows.rows.size()>256U)
+            throw std::runtime_error{"Invalid authorization code scope set"};
+        std::vector<client::Scope> parsedScopes;
+        oauth::NativeCodeExchangeResult result;
+        bool openid=false;
+        for (const auto& grant:grantRows.rows) {
+            if (grant.size()!=1U) throw std::runtime_error{"Malformed authorization code scope"};
+            auto parsed=client::Scope::create(required(grant[0]));
+            if (!parsed) throw std::runtime_error{"Invalid authorization code scope"};
+            openid=openid || parsed->value()=="openid";
+            result.scopes.emplace_back(parsed->value());
+            parsedScopes.emplace_back(std::move(parsed).value());
+        }
+        auto code=oauth::AuthorizationCode::restore(oauth::CodeDigest{codeBytes},
+            client::ClientId{clientId},core::IdentityId{required(row[0])},redirectUri,
+            std::move(parsedScopes),std::move(challengeValue).value(),row[8],
+            idp::ProviderId{required(row[1])},static_cast<idp::AssuranceLevel>(assurance),
+            idp::AuthenticationStrength{static_cast<idp::AuthenticationFactor>(factors),boolean(row[4])},
+            foundation::Instant{foundation::Duration{milliseconds(row[5])}},
+            foundation::Instant{foundation::Duration{milliseconds(row[6])}},
+            foundation::Instant{foundation::Duration{milliseconds(row[7])}},row[9]);
+        if (!code) throw std::runtime_error{"Invalid stored authorization code"};
+        if (openid) {
+            // Signing is pure local CPU work. Keep the JWT in a wiping owner
+            // until COMMIT, so a signing failure cannot consume the code.
+            if (!signIdToken) co_return foundation::fail(E::Unavailable);
+            auto signedToken=signIdToken(code.value());
+            if (!signedToken) co_return foundation::fail(E::Unavailable);
+            result.idToken.emplace(std::move(signedToken).value());
+        }
+        Params familyArgs{family,clientId,std::string{code->identity().value()},
+            std::string{code->provider().value()},std::to_string(assurance),std::to_string(factors),
+            boolean(row[4])?"true":"false",required(row[5]),
+            sender?std::optional<std::string>{std::to_string(static_cast<int>(sender->kind()))}:std::nullopt,
+            sender?std::optional<std::string>{std::string{sender->value()}}:std::nullopt};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_token_families "
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms,sender_constraint_kind,sender_constraint_value) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",std::move(familyArgs)));
+        for (const auto& scope:result.scopes) {
+            Params args{family,scope};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,$2)",std::move(args)));
+        }
+        if (code->resource()) {
+            Params args{family,*code->resource()};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_token_family_audiences(family_id,audience) VALUES($1,$2)",std::move(args)));
+        }
+        Params accessArgs{accessDigest,family,timestamp,std::to_string((now+accessLifetime).time_since_epoch().count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",std::move(accessArgs)));
+        Params refreshArgs{refreshDigest,family,timestamp,std::to_string((now+refreshLifetime).time_since_epoch().count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,0,$3,$4)",std::move(refreshArgs)));
+        Params consumedArgs{codeDigest,clientId};
+        const auto consumed=co_await execute(
+            "DELETE FROM openproof.oauth_authorization_codes WHERE code_digest=decode($1,'hex') "
+            "AND client_id=$2 RETURNING client_id",std::move(consumedArgs));
+        if (consumed.rows.size()!=1U || consumed.rows.front().size()!=1U || required(consumed.rows.front()[0])!=clientId)
+            throw std::runtime_error{"Authorization code consumption mismatch"};
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return std::move(result);
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native OAuth code exchange is unavailable.");
     }
 }
 

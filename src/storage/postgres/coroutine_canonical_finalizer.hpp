@@ -4,6 +4,8 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <cstddef>
+#include <functional>
+#include <string>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -18,6 +20,7 @@ import openproof.identity.profile;
 import openproof.organization;
 import openproof.policy;
 import openproof.session;
+import openproof.oauth;
 
 namespace openproof::storage::postgres {
 
@@ -122,6 +125,15 @@ public:
         std::string presentedDigest,std::string accessDigest,std::string refreshDigest,
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
+
+    using SignCodeIdToken=std::function<foundation::Result<std::string>(const oauth::AuthorizationCode&)>;
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeCodeExchangeResult>>
+    exchangeOAuthCodeAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string codeDigest,std::string redirectUri,std::string challenge,
+        std::string family,std::string accessDigest,std::string refreshDigest,
+        std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+        foundation::Duration accessLifetime,foundation::Duration refreshLifetime,
+        SignCodeIdToken signIdToken);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeSenderReplayAsync(session::DelegatedSenderConstraintKind kind,

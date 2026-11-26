@@ -160,6 +160,13 @@ private:
     std::shared_ptr<const StateData> m_data;
 };
 
+// Committed native authorization-code exchange result. Raw access and
+// refresh credentials stay with the HTTP caller; persistence sees digests.
+struct NativeCodeExchangeResult final {
+    std::vector<std::string> scopes;
+    std::optional<foundation::SecretString> idToken;
+};
+
 class AuthorizationGrant final {
 public:
     ~AuthorizationGrant();

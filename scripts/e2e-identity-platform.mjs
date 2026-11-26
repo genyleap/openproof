@@ -798,6 +798,16 @@ async function main() {
       code_verifier: verifier,
     });
     if (clientSecret) form.set("client_secret", clientSecret);
+    if (nativeAccountRuntime) {
+      const invalid = new URLSearchParams(form);
+      invalid.set("code_verifier", "a".repeat(43));
+      const denied = await edgeRequest("/oauth/token", {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: invalid.toString(),
+      });
+      expectStatus(denied, 400);
+      assert.equal(jsonBody(denied).error, "invalid_grant");
+    }
     const tokenResponse = await edgeRequest("/oauth/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -807,6 +817,14 @@ async function main() {
     const tokens = jsonBody(tokenResponse);
     assert.ok(tokens.access_token && tokens.refresh_token && tokens.id_token);
     const verified = verifyIdToken(tokens.id_token, keySet, { issuer, clientId, nonce });
+    if (nativeAccountRuntime) {
+      const replay = await edgeRequest("/oauth/token", {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      expectStatus(replay, 400);
+      assert.equal(jsonBody(replay).error, "invalid_grant");
+    }
     return { ...tokens, nonce, idHeader: verified.header };
   }
 

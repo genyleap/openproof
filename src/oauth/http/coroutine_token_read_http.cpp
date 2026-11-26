@@ -95,8 +95,8 @@ foundation::Result<foundation::SecretString> decode(std::string_view input,std::
     return foundation::SecretString{std::move(result)};
 }
 // Classify only the grant_type field, without copying other raw credentials.
-// The legacy token endpoint independently denies refresh when native is required.
-bool refreshRoute(const gateway::HttpRequest& r) noexcept {
+// The legacy token endpoint independently denies migrated grants.
+bool grantRoute(const gateway::HttpRequest& r,std::string_view grantType) noexcept {
     if (r.path()!="/oauth/token" || r.method()!=Method::Post || r.body().size()>16U*1024U)
         return false;
     try {
@@ -110,11 +110,56 @@ bool refreshRoute(const gateway::HttpRequest& r) noexcept {
             auto key=decode(part.substr(0,eq),128U);
             if (key && key->expose()=="grant_type") {
                 auto value=decode(part.substr(eq+1U),64U);
-                if (value && value->expose()=="refresh_token") return true;
+                if (value && value->expose()==grantType) return true;
             }
         }
     } catch (...) {}
     return false;
+}
+bool refreshRoute(const gateway::HttpRequest& r) noexcept {
+    return grantRoute(r,"refresh_token");
+}
+bool codeRoute(const gateway::HttpRequest& r) noexcept {
+    return grantRoute(r,"authorization_code");
+}
+struct CodeForm final {
+    std::string clientId,redirectUri;
+    foundation::SecretString secret,code,verifier;
+};
+foundation::Result<CodeForm> codeForm(gateway::HttpRequest& r) {
+    const auto type=r.header("content-type");
+    if (!type || (*type!="application/x-www-form-urlencoded" &&
+        !type->starts_with("application/x-www-form-urlencoded;"))
+        || r.body().empty() || r.body().size()>16U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    auto input=std::string_view{r.body()};
+    std::optional<foundation::SecretString> id,secret,code,verifier,redirect,grant;
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto part=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (part.empty()) continue;
+        const auto eq=part.find('=');
+        if (eq==std::string_view::npos) return foundation::fail(E::InvalidArgument);
+        auto key=decode(part.substr(0,eq),128U);
+        if (!key) return foundation::fail(key.error());
+        const auto name=key->expose();
+        auto* dest=name=="client_id"?&id:name=="client_secret"?&secret:name=="code"?&code:
+            name=="code_verifier"?&verifier:name=="redirect_uri"?&redirect:
+            name=="grant_type"?&grant:nullptr;
+        if (!dest || dest->has_value()) return foundation::fail(E::InvalidArgument);
+        const auto maximum=name=="redirect_uri"?2048U:name=="client_secret"?512U:256U;
+        auto value=decode(part.substr(eq+1U),maximum);
+        if (!value) return foundation::fail(value.error());
+        dest->emplace(std::move(value).value());
+    }
+    if (!id || id->empty() || !code || code->empty() || !verifier || verifier->empty()
+        || !redirect || redirect->empty() || !grant || grant->expose()!="authorization_code")
+        return foundation::fail(E::InvalidArgument);
+    CodeForm result{std::string{id->expose()},std::string{redirect->expose()},
+        secret?std::move(*secret):foundation::SecretString{},std::move(*code),std::move(*verifier)};
+    r.wipeBody();
+    return result;
 }
 struct IntrospectionForm final {
     std::string clientId;
@@ -160,23 +205,26 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     gateway::TokenBucketRateLimiter& limiter,foundation::SecretString tokenKey,
     foundation::SecretString clientKey,ReadAccess access,AuthenticateClient client,
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
-    PrepareSender prepareSender,foundation::Duration accessLifetime)
+    PrepareSender prepareSender,foundation::Duration accessLifetime,
+    std::optional<CodeExchangeContext> codeExchange)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
-      m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime) {}
+      m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
+      m_codeExchange(std::move(codeExchange)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
     if (revokeRoute(r)) return static_cast<bool>(m_revoke);
     if (refreshRoute(r)) return m_rotate && m_prepareSender;
+    if (codeRoute(r)) return m_codeExchange && m_codeExchange->exchange && m_prepareSender;
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -193,6 +241,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (userInfoRoute(r)) co_return co_await userInfo(std::move(r));
     if (revokeRoute(r)) co_return co_await revoke(std::move(r));
     if (refreshRoute(r)) co_return co_await refresh(std::move(r));
+    if (codeRoute(r)) co_return co_await exchangeCode(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -353,6 +402,73 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::refresh(gatewa
             ?"DPoP":"Bearer")
         .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(m_accessLifetime).count()))
         .add("scope",joined(scopes.value()));
+    co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::exchangeCode(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    const auto oauthError=[](int status,std::string_view code) {
+        foundation::JsonObjectWriter body;
+        body.add("error",code);
+        return json(status,std::move(body));
+    };
+    auto input=codeForm(r);
+    if (!input) co_return oauthError(400,"invalid_request");
+    r.wipeAuthorizationHeader(); r.wipeCookieHeader();
+    const auto& verifier=input->verifier.expose();
+    if (verifier.size()<43U || verifier.size()>128U || !std::ranges::all_of(verifier,[](char c) {
+        return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9')
+            || c=='-' || c=='.' || c=='_' || c=='~';
+    })) co_return oauthError(400,"invalid_grant");
+    auto pkce=security::sha256(verifier);
+    auto codeDigest=security::hmacSha256(m_codeExchange->codeKey,input->code.expose());
+    std::optional<std::string> clientDigest;
+    if (!input->secret.empty()) {
+        auto digest=security::hmacSha256(m_clientKey,input->secret.expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        clientDigest.emplace(foundation::toHex(digest.value()));
+    }
+    input->code=foundation::SecretString{};
+    input->verifier=foundation::SecretString{};
+    input->secret=foundation::SecretString{};
+    if (!pkce || !codeDigest) co_return oauthError(503,"temporarily_unavailable");
+    auto proof=m_prepareSender(r);
+    r.wipeTargetQuery();
+    auto sender=co_await std::move(proof);
+    if (!sender) co_return sender.error().code()==E::Unavailable
+        ?oauthError(503,"temporarily_unavailable"):oauthError(400,"invalid_dpop_proof");
+    std::optional<session::DelegatedSenderConstraint> binding;
+    if (sender->has_value())
+        binding.emplace(sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls,
+            std::string{sender->value().value()});
+    auto family=security::randomTokenBase64Url(24U);
+    auto accessRaw=security::randomTokenBase64Url(32U);
+    if (!accessRaw) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString access{std::string{"opa_"}+accessRaw.value()};
+    foundation::secureWipe(accessRaw->data(),accessRaw->size());
+    auto refreshRaw=security::randomTokenBase64Url(32U);
+    if (!refreshRaw) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString replacement{std::string{"opr_"}+refreshRaw.value()};
+    foundation::secureWipe(refreshRaw->data(),refreshRaw->size());
+    const auto accessDigest=security::hmacSha256(m_tokenKey,access.expose());
+    const auto refreshDigest=security::hmacSha256(m_tokenKey,replacement.expose());
+    if (!family || !accessDigest || !refreshDigest) co_return oauthError(503,"temporarily_unavailable");
+    auto exchanged=co_await m_codeExchange->exchange(std::move(input->clientId),std::move(clientDigest),
+        foundation::toHex(codeDigest.value()),std::move(input->redirectUri),foundation::toBase64Url(pkce.value()),
+        std::move(family).value(),foundation::toHex(accessDigest.value()),foundation::toHex(refreshDigest.value()),
+        std::move(binding));
+    if (!exchanged) {
+        if (exchanged.error().code()==E::AuthenticationRequired) co_return oauthError(401,"invalid_client");
+        if (exchanged.error().code()==E::AuthenticationFailed) co_return oauthError(400,"invalid_grant");
+        co_return oauthError(503,"temporarily_unavailable");
+    }
+    foundation::JsonObjectWriter body;
+    body.add("access_token",access.expose()).add("refresh_token",replacement.expose())
+        .add("token_type",sender->has_value() && sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?"DPoP":"Bearer")
+        .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(m_accessLifetime).count()))
+        .add("scope",joined(exchanged->scopes));
+    if (exchanged->idToken) body.add("id_token",exchanged->idToken->expose());
     co_return json(200,std::move(body));
 }
 }

@@ -1462,6 +1462,11 @@ gateway::HttpResponse OAuthHttpApi::tokenEndpoint(gateway::HttpRequest request)
         request.wipeTargetQuery();
         return oauthErrorResponse(503,"temporarily_unavailable","Native refresh rotation is unavailable.");
     }
+    if (m_nativeTokenReadsRequired && grantType.value()=="authorization_code") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native code exchange is unavailable.");
+    }
     client::ClientId clientId{clientIdText.value()};
     std::optional<foundation::SecretString> clientSecret;
     if (const auto rawSecret = optional(form.value(), "client_secret")) {

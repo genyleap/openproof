@@ -100,7 +100,8 @@ test("native refresh uses grant-scoped routing, durable proof and atomic family 
     const index=refresh.indexOf(term,previous+1);
     assert.ok(index>previous,term); previous=index;
   }
-  assert.match(http,/value->expose\(\)=="refresh_token"/);
+  assert.match(http,/value->expose\(\)==grantType/);
+  assert.match(http,/grantRoute\(r,"refresh_token"\)/);
   assert.match(app,/nativeMethods.emplace_back\("\/oauth\/token",gateway::HttpMethod::Post\)/);
   assert.match(app,/reader->rotateOAuthRefreshAsync/);
   assert.match(app,/sender->tokenEndpointConstraintAsync/);
@@ -109,7 +110,8 @@ test("native refresh uses grant-scoped routing, durable proof and atomic family 
   const token=legacy.slice(legacy.indexOf("OAuthHttpApi::tokenEndpoint("));
   assert.ok(token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="refresh_token"')>=0);
   assert.ok(token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="refresh_token"')<token.indexOf("m_clients->authenticate("));
-  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::exchangeOAuthCodeAsync("));
   for(const term of ["FOR SHARE OF c,a,o","security::constantTimeEquals",
     "f.client_id=$2 AND i.organization_id=$3","FOR UPDATE OF f","senderMatches",
     "WHERE token_digest=decode($1,'hex') AND family_id=$2 FOR UPDATE",
@@ -126,4 +128,46 @@ test("native refresh uses grant-scoped routing, durable proof and atomic family 
   assert.doesNotMatch(proof,/m_dpop->consume|m_mtlsReplays->|verifyDpop\(/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Fresh family for native\/native rotation/);
   assert.match(read("tests/oauth_native_consent_test.cpp"),/grant_type=refresh%5Ftoken/);
+});
+test("native code exchange validates PKCE and atomically issues the initial family before responding",()=>{
+  const exchange=http.slice(http.indexOf("CoroutineTokenReadAdapter::exchangeCode("));
+  const ordered=["codeForm(r)","security::sha256(verifier)",
+    "security::hmacSha256(m_codeExchange->codeKey","input->code=foundation::SecretString{}",
+    "input->verifier=foundation::SecretString{}","input->secret=foundation::SecretString{}",
+    "m_prepareSender(r)","co_await std::move(proof)","co_await m_codeExchange->exchange(",
+    "if (!exchanged)",'body.add("access_token",access.expose())'];
+  let previous=-1;
+  for(const term of ordered){
+    const index=exchange.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(http,/grantRoute\(r,"authorization_code"\)/);
+  assert.match(exchange,/verifier.size\(\)<43U \|\| verifier.size\(\)>128U/);
+  assert.match(exchange,/foundation::toBase64Url\(pkce.value\(\)\)/);
+  assert.match(app,/reader->exchangeOAuthCodeAsync/);
+  assert.match(app,/oidc->issueIdTokenForNativeExchange\(code\)/);
+  assert.match(app,/nativeOAuthCodeKey.emplace\(authorizationCodeMaterial->clone\(\)\)/);
+  assert.match(app,/nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime\(\)/);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::exchangeOAuthCodeAsync("));
+  const transaction=['execute("BEGIN ISOLATION LEVEL READ COMMITTED"', "FOR SHARE OF c,a,o",
+    "if (!authenticated)","g.client_id=$2 AND i.organization_id=$3",
+    "g.redirect_uri=$4 AND g.code_challenge=$5","g.issued_at_ms<=$6 AND g.expires_at_ms>$6 AND i.status=0",
+    "FOR UPDATE OF g","oauth::AuthorizationCode::restore","signIdToken(code.value())",
+    "INSERT INTO openproof.oauth_token_families","INSERT INTO openproof.oauth_access_tokens",
+    "INSERT INTO openproof.oauth_refresh_tokens","DELETE FROM openproof.oauth_authorization_codes",
+    'execute("COMMIT",{})',"co_return std::move(result)"];
+  previous=-1;
+  for(const term of transaction){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(store,/INSERT INTO openproof.oauth_token_family_audiences/);
+  assert.match(store,/INSERT INTO openproof.oauth_token_family_scopes/);
+  const legacy=read("src/oauth/http/http.cpp");
+  const token=legacy.slice(legacy.indexOf("OAuthHttpApi::tokenEndpoint("));
+  const guard=token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="authorization_code"');
+  assert.ok(guard>=0 && guard<token.indexOf("m_clients->authenticate("));
+  assert.match(read("src/oidc/service.cpp"),/OpenIdProvider::issueIdTokenForNativeExchange\([\s\S]*?return signIdToken\(/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeCodeExchangeConsumesExactlyOnceAndRollsBackFailedSigning/);
+  assert.match(read("scripts/e2e-identity-platform.mjs"),/invalid.set\("code_verifier", "a".repeat\(43\)\)/);
 });

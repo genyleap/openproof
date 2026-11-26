@@ -10,6 +10,8 @@ export module openproof.oidc:service;
 import openproof.client;
 import openproof.foundation;
 import openproof.identity.profile;
+import openproof.identity.core;
+import openproof.identity.provider;
 import openproof.oauth;
 import openproof.security;
 import openproof.token;
@@ -78,6 +80,12 @@ public:
     [[nodiscard]] foundation::Result<std::string> jwksDocument() const;
     [[nodiscard]] foundation::Result<std::string>
     issueIdToken(const oauth::RedeemedAuthorization& authorization) const;
+    /** Trusted native exchange only: sign validated, locked code state.
+     * The transaction must not release the signed token before committing
+     * code consumption and initial token family insertion.
+     */
+    [[nodiscard]] foundation::Result<std::string>
+    issueIdTokenForNativeExchange(const oauth::AuthorizationCode& authorization) const;
     /** @brief Signs a JARM authorization response for one OAuth client. */
     [[nodiscard]] foundation::Result<std::string> issueAuthorizationResponse(
         const client::ClientId& clientId, std::optional<std::string_view> code,
@@ -88,6 +96,13 @@ public:
     [[nodiscard]] std::string_view issuer() const noexcept;
 
 private:
+    [[nodiscard]] foundation::Result<std::string> signIdToken(
+        const client::ClientId& client, const identity::core::IdentityId& identity,
+        const std::vector<client::Scope>& scopes,
+        const std::optional<std::string>& nonce,
+        identity::provider::AssuranceLevel assurance,
+        const identity::provider::AuthenticationStrength& strength,
+        foundation::Instant authenticatedAt) const;
     Issuer m_issuer;
     const foundation::ClockSource* m_clock;
     security::RsaSha256Signer m_signer;

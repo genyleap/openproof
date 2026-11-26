@@ -970,9 +970,22 @@ Successful rotation consumes the old credential and inserts both new
 token digests in a single transaction while preserving the original
 refresh expiry and scopes. DPoP/mTLS proofs use the shared native replay
 store. The refresh request accepts the existing client and refresh
-credential fields (extra fields are rejected). Authorization, other
-token issuance grants, PAR and device flows still require separate
-migration and executable acceptance.
+credential fields (extra fields are rejected).
+
+Authorization-code exchange also uses native grant-scoped dispatch.
+The code fingerprint is computed with the existing authorization-code
+HMAC key and the PKCE verifier is validated and hashed locally; neither
+raw secret crosses a database suspension. A bounded transaction checks
+client authentication, exact redirect URI, S256 challenge, expiration,
+identity and tenant lifecycle, and locks the one-time code. It preserves
+the code's original scopes, audience, authentication context and nonce,
+signs the ID token for openid using the existing OIDC signer, persists the
+initial access and refresh token family, and consumes the code atomically.
+The signed ID token and raw credentials are released only after commit.
+A signing or persistence failure must not consume the code. Replaying
+the same code after success returns invalid_grant. Other issuance grants,
+authorization/login, PAR and device flows still require separate migration
+and executable acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 
