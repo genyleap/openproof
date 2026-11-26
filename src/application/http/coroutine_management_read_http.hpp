@@ -35,9 +35,11 @@ public:
     };
     using MutateResource=std::function<boost::asio::awaitable<foundation::Result<resource::ResourceServer>>(
         resource::ResourceMutationCommand,identity::core::IdentityId,session::SessionId)>;
+    using MutateService=std::function<boost::asio::awaitable<foundation::Result<resource::ServiceIdentity>>(
+        resource::ServiceMutationCommand,identity::core::IdentityId,session::SessionId)>;
     CoroutineManagementReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter,Authenticate authenticate,Read read,Mutate mutate={},
-        std::optional<ClientContext> clients=std::nullopt,MutateResource resources={});
+        std::optional<ClientContext> clients=std::nullopt,MutateResource resources={},MutateService services={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> handleAsync(gateway::HttpRequest) override;
@@ -49,5 +51,6 @@ private:
     Mutate m_mutate;
     std::optional<ClientContext> m_clients;
     MutateResource m_resources;
+    MutateService m_services;
 };
 }

@@ -1131,8 +1131,19 @@ used by native grant validation and preserve the scope registry instead
 of replacing it. Duplicate audiences, stale status changes and
 reactivation of revoked resources are rejected.
 
+Service identity provisioning, activation and deactivation now use
+native owner/session-locked transactions. Provisioning creates the
+canonical service identity, client mapping, audience grants and scope
+grants in one transaction; failed provisioning leaves no orphan
+identity. The exclusive client lock serializes provisioning and state
+changes with native machine-grant admission. Activation revalidates
+the active client, application, service identity and every registered
+resource/scope grant. Deactivation remains available for inactive
+parents and does not replace grants or change already-issued token
+lifetime policy.
+
 The remaining PostgreSQL compatibility surfaces include
-service-identity mutations and the administration console,
+the administration console,
 passkey operations, evidence/trust and enabled SCIM operations, as well
 as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated

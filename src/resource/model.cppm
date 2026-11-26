@@ -57,6 +57,15 @@ private:
     void detach();
 };
 
+enum class ServiceMutation { Provision, Activate, Deactivate };
+struct ServiceMutationCommand final {
+    ServiceMutation operation;
+    client::ClientId clientId;
+    identity::core::IdentityId identityId;
+    std::vector<std::string> audiences;
+    std::vector<std::string> scopes;
+};
+
 /** @brief Mapping from a confidential service client to one canonical service identity. */
 class ServiceIdentity final {
 public:

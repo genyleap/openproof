@@ -230,6 +230,59 @@ foundation::Result<resource::ResourceMutationCommand> parseResourceMutation(
     return resource::ResourceMutationCommand{op,resource::ResourceId{"opr_"+id.value()},
         std::move(*audience),std::move(*name),std::move(grants)};
 }
+std::optional<resource::ServiceMutation> serviceMutation(const gateway::HttpRequest& r) noexcept {
+    using Op=resource::ServiceMutation;
+    if (r.method()!=Method::Post) return std::nullopt;
+    if (r.path()=="/admin/service-identities") return Op::Provision;
+    if (r.path()=="/admin/service-identities/activate") return Op::Activate;
+    if (r.path()=="/admin/service-identities/deactivate") return Op::Deactivate;
+    return std::nullopt;
+}
+foundation::Result<resource::ServiceMutationCommand> parseServiceMutation(
+    gateway::HttpRequest& r,resource::ServiceMutation op)
+{
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/json" && !media->starts_with("application/json;"))
+        || r.body().empty() || r.body().size()>192U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    boost::system::error_code error;
+    auto value=boost::json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !value.is_object()) return foundation::fail(E::InvalidArgument);
+    const auto& object=value.as_object();
+    const auto* client=object.if_contains("client_id");
+    if (!client || !client->is_string() || client->as_string().empty() || client->as_string().size()>256U
+        || std::ranges::any_of(client->as_string(),[](unsigned char c){return c<0x20U || c==0x7fU;}))
+        return foundation::fail(E::InvalidArgument);
+    client::ClientId id{std::string{client->as_string().data(),client->as_string().size()}};
+    if (op!=resource::ServiceMutation::Provision) {
+        if (object.size()!=1U) return foundation::fail(E::InvalidArgument);
+        return resource::ServiceMutationCommand{op,std::move(id),identity::core::IdentityId{""},{},{}};
+    }
+    const auto* audiences=object.if_contains("audiences");
+    const auto* scopes=object.if_contains("scopes");
+    if (object.size()!=3U || !audiences || !audiences->is_array() || audiences->as_array().empty()
+        || audiences->as_array().size()>64U || !scopes || !scopes->is_array()
+        || scopes->as_array().empty() || scopes->as_array().size()>256U)
+        return foundation::fail(E::InvalidArgument);
+    std::vector<std::string> targets,grants;
+    for (const auto& audience:audiences->as_array()) {
+        if (!audience.is_string() || audience.as_string().empty() || audience.as_string().size()>2048U
+            || std::ranges::any_of(audience.as_string(),[](unsigned char c){return c<=0x20U || c==0x7fU;}))
+            return foundation::fail(E::InvalidArgument);
+        targets.emplace_back(audience.as_string().data(),audience.as_string().size());
+    }
+    for (const auto& scope:scopes->as_array()) {
+        if (!scope.is_string() || scope.as_string().size()>128U) return foundation::fail(E::InvalidArgument);
+        std::string parsed{scope.as_string().data(),scope.as_string().size()};
+        if (!client::Scope::create(parsed)) return foundation::fail(E::InvalidArgument);
+        grants.push_back(std::move(parsed));
+    }
+    auto random=security::randomTokenBase64Url(24U);
+    if (!random) return foundation::fail(random.error());
+    return resource::ServiceMutationCommand{op,std::move(id),identity::core::IdentityId{"opsi_"+random.value()},
+        std::move(targets),std::move(grants)};
+}
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeBody(); r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
 }
@@ -266,13 +319,14 @@ foundation::Result<std::optional<std::string>> filter(const gateway::HttpRequest
 
 CoroutineManagementReadAdapter::CoroutineManagementReadAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Read read,Mutate mutate,std::optional<ClientContext> clients,MutateResource resources)
+    Authenticate authenticate,Read read,Mutate mutate,std::optional<ClientContext> clients,MutateResource resources,MutateService services)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),m_read(std::move(read)),
-      m_mutate(std::move(mutate)),m_clients(std::move(clients)),m_resources(std::move(resources)) {}
+      m_mutate(std::move(mutate)),m_clients(std::move(clients)),m_resources(std::move(resources)),m_services(std::move(services)) {}
 
 bool CoroutineManagementReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     return operation(r).has_value() || mutation(r).has_value() || clientMutation(r).has_value()
-        || jarMutation(r) || resourceMutation(r).has_value() || m_fallback->nativeEnabledFor(r);
+        || jarMutation(r) || resourceMutation(r).has_value() || serviceMutation(r).has_value()
+        || m_fallback->nativeEnabledFor(r);
 }
 
 gateway::HttpResponse CoroutineManagementReadAdapter::handle(gateway::HttpRequest r) {
@@ -286,7 +340,8 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     const auto clientWrite=clientMutation(r);
     const bool jarWrite=jarMutation(r);
     const auto resourceWrite=resourceMutation(r);
-    if (!op && !write && !clientWrite && !jarWrite && !resourceWrite) {
+    const auto serviceWrite=serviceMutation(r);
+    if (!op && !write && !clientWrite && !jarWrite && !resourceWrite && !serviceWrite) {
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r);
         co_return failure(E::Unavailable,r);
@@ -295,7 +350,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     if (!m_authenticate || (op && !m_read) || (write && !m_mutate)
         || (clientWrite && (!m_clients || !m_clients->mutate))
         || (jarWrite && (!m_clients || !m_clients->mutateJarKey))
-        || (resourceWrite && !m_resources))
+        || (resourceWrite && !m_resources) || (serviceWrite && !m_services))
         co_return failure(E::Unavailable,r);
     if (!m_limiter->allow("idp-admin-ip:"+std::string{r.remoteAddress()}))
         co_return failure(E::RateLimited,r);
@@ -306,6 +361,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     std::optional<client::ManagementMutationCommand> clientCommand;
     std::optional<JarCommand> jarCommand;
     std::optional<resource::ResourceMutationCommand> resourceCommand;
+    std::optional<resource::ServiceMutationCommand> serviceCommand;
     if (op) {
         auto parsed=filter(r,*op);
         if (!parsed) co_return failure(parsed.error().code(),r);
@@ -322,10 +378,14 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         auto parsed=parseJarMutation(r);
         if (!parsed) co_return failure(parsed.error().code(),r);
         jarCommand.emplace(std::move(parsed).value());
-    } else {
+    } else if (resourceWrite) {
         auto parsed=parseResourceMutation(r,*resourceWrite);
         if (!parsed) co_return failure(parsed.error().code(),r);
         resourceCommand.emplace(std::move(parsed).value());
+    } else {
+        auto parsed=parseServiceMutation(r,*serviceWrite);
+        if (!parsed) co_return failure(parsed.error().code(),r);
+        serviceCommand.emplace(std::move(parsed).value());
     }
     auto credential=gateway::takeSessionCredential(r);
     if (!credential) co_return failure(credential.error().code(),r);
@@ -346,6 +406,21 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             .add("name",changed->displayName()).add("environment",environmentName(changed->environment()))
             .add("status",applicationStatusName(changed->status()));
         co_return response(status,body.build());
+    }
+    if (serviceCommand) {
+        const auto status=serviceCommand->operation==resource::ServiceMutation::Provision?201:200;
+        auto changed=co_await m_services(std::move(*serviceCommand),actor->identity(),actor->id());
+        if (!changed) co_return failure(changed.error().code(),r);
+        boost::json::object body;
+        body["identity_id"]=std::string{changed->identity().value()};
+        body["client_id"]=std::string{changed->client().value()};
+        body["active"]=changed->active();
+        boost::json::array audiences,scopes;
+        for (const auto& audience:changed->audiences()) audiences.emplace_back(audience);
+        for (const auto& scope:changed->scopes()) scopes.emplace_back(scope);
+        body["audiences"]=std::move(audiences);
+        body["scopes"]=std::move(scopes);
+        co_return response(status,boost::json::serialize(body));
     }
     if (resourceCommand) {
         const auto status=resourceCommand->operation==resource::ResourceMutation::Create?201:200;

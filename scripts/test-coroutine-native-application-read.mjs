@@ -14,7 +14,7 @@ test("five management reads exclusively use native first-party IAL2 authenticati
   for(const route of ["/admin/applications","/admin/clients","/admin/clients/jar-key","/admin/resources","/admin/service-identities"])
     assert.ok(http.includes('r.path()=="'+route+'"'),route);
   assert.match(http,/r.method\(\)!=Method::Get/);
-  assert.match(app,/nativeMethods.emplace_back\(route,gateway::HttpMethod::Get\)/);
+  assert.match(app,/nativePaths.emplace_back\(route\)/);
   assert.match(app,/reader->readApplicationManagementAsync/);
   assert.match(http,/starts_with\("DPoP "\)/);
   const ordered=["gateway::takeSessionCredential(r)","scrub(r);","co_await m_authenticate","AssuranceLevel::Ial2","co_await m_read"];
@@ -118,7 +118,8 @@ test("JAR key management validates one RSA public envelope and preserves durable
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/keyTask\(client,"bad",pem\+pem\)/);
 });
 test("resource lifecycle locks grant admission rows and preserves existing scopes",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateServiceIdentityAsync("));
   for(const route of ["/admin/resources","/admin/resources/suspend","/admin/resources/activate","/admin/resources/revoke"])
     assert.ok(http.includes('r.path()=="'+route+'"'),route);
   assert.match(http,/parseResourceMutation\(r,\*resourceWrite\)/);
@@ -140,4 +141,39 @@ test("resource lifecycle locks grant admission rows and preserves existing scope
   assert.match(fixture,/resourceChange\(ROp::Revoke\)/);
   assert.match(fixture,/resourceChange\(ROp::Activate\)/);
   assert.match(fixture,/staleResource.error\(\).code\(\),fnd::ErrorCode::Conflict/);
+});
+test("service provisioning and lifecycle commit identity and grants atomically and revalidate admission",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateServiceIdentityAsync("));
+  for(const route of ["/admin/service-identities","/admin/service-identities/activate","/admin/service-identities/deactivate"])
+    assert.ok(http.includes('r.path()=="'+route+'"'),route);
+  assert.match(http,/parseServiceMutation\(r,\*serviceWrite\)/);
+  assert.match(http,/co_await m_services\(std::move\(\*serviceCommand\),actor->identity\(\),actor->id\(\)\)/);
+  assert.match(app,/reader->mutateServiceIdentityAsync/);
+  assert.match(app,/nativePaths.emplace_back\(route\)/);
+  for(const term of ["resource::ServiceIdentity::create","pg_advisory_xact_lock(7299730475761673315)",
+    "FOR SHARE OF o,i,m,r,s","assurance<2 || assurance>4",
+    "WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",
+    "milliseconds(clientRow[0])!=3","FOR UPDATE OF s FOR SHARE OF i",
+    "if (value && !existing.rows.empty())","resource::ServiceIdentity::restore",
+    "now<updatedAt","WHERE audience=$1 AND status=0 FOR SHARE",
+    "std::ranges::all_of(value->scopes()","INSERT INTO openproof.identities",
+    "VALUES($1,$2,1,0,$3) ON CONFLICT DO NOTHING RETURNING id",
+    "INSERT INTO openproof.service_identities","INSERT INTO openproof.service_identity_audiences",
+    "INSERT INTO openproof.service_identity_scopes","UPDATE openproof.service_identities SET active=$3"])
+    assert.ok(store.includes(term),term);
+  const ordered=["assurance<2","FOR UPDATE OF c FOR SHARE OF a","WHERE audience=$1 AND status=0 FOR SHARE",
+    "INSERT INTO openproof.identities","INSERT INTO openproof.service_identities",
+    "INSERT INTO openproof.service_identity_audiences","INSERT INTO openproof.service_identity_scopes",
+    'execute("COMMIT",{})'];
+  let previous=-1;
+  for(const term of ordered){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.doesNotMatch(store,/DELETE FROM openproof.service_identity|changeStatus\(/);
+  assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
+  const fixture=read("tests/storage/postgres_async_canonical_test.cpp");
+  assert.match(fixture,/ASSERT_NE\(serviceA->has_value\(\),serviceB->has_value\(\)\)/);
+  assert.match(fixture,/serviceChange\(SOp::Deactivate\)/);
+  assert.match(fixture,/serviceChange\(SOp::Activate\)/);
 });

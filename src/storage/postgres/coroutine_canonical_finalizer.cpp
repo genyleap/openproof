@@ -3396,4 +3396,207 @@ CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync(
     }
 }
 
+asio::awaitable<foundation::Result<resource::ServiceIdentity>>
+CoroutinePostgresCanonicalFinalizer::mutateServiceIdentityAsync(
+    resource::ServiceMutationCommand command,core::IdentityId actor,
+    session::SessionId sessionId,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    using Op=resource::ServiceMutation;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || command.clientId.empty() || command.clientId.value().size()>256U
+        || now.time_since_epoch().count()<0 || static_cast<unsigned int>(command.operation)>2U)
+        co_return foundation::fail(E::InvalidArgument);
+    std::optional<resource::ServiceIdentity> value;
+    if (command.operation==Op::Provision) {
+        if (command.identityId.empty() || command.identityId.value().size()>200U ||
+            std::ranges::any_of(command.audiences,[](const auto& audience) {
+                return std::ranges::any_of(audience,[](unsigned char c){return c<=0x20U || c==0x7fU;});
+            })) co_return foundation::fail(E::InvalidArgument);
+        auto created=resource::ServiceIdentity::create(command.identityId,command.clientId,
+            std::move(command.audiences),std::move(command.scopes),now);
+        if (!created) co_return foundation::fail(created.error());
+        value.emplace(std::move(created).value());
+    } else if (!command.identityId.empty() || !command.audiences.empty() || !command.scopes.empty()) {
+        co_return foundation::fail(E::InvalidArgument);
+    }
+    const auto tenant=std::string{m_impl->organization.value()};
+    const auto timestamp=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        // Serialize against native/legacy owner lifecycle changes. Keep the
+        // authorization rows locked until the application change commits.
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        Params actorArgs{std::string{actor.value()},tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.assurance FROM openproof.organizations o "
+            "JOIN openproof.identities i ON i.organization_id=o.id "
+            "JOIN openproof.memberships m ON m.identity_id=i.id AND m.organization_id=o.id "
+            "JOIN openproof.membership_roles r ON r.identity_id=i.id AND r.organization_id=o.id "
+            "JOIN openproof.sessions s ON s.identity_id=i.id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND o.state=0 AND m.state=1 AND r.role='owner' "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR SHARE OF o,i,m,r,s",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto assurance=milliseconds(permitted.rows.front()[0]);
+        if (assurance<2 || assurance>4) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AssuranceInsufficient);
+        }
+        const std::string clientId{command.clientId.value()};
+        // Exclusive client lock serializes provisioning/activation with
+        // machine grant admission, which takes a SHARE lock on this row.
+        Params clientArgs{clientId,tenant};
+        const auto parent=co_await execute(
+            "SELECT c.kind,c.status,a.status,c.secret_digest IS NOT NULL FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 FOR UPDATE OF c FOR SHARE OF a",std::move(clientArgs));
+        if (parent.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (parent.rows.size()!=1U || parent.rows.front().size()!=4U)
+            throw std::runtime_error{"Malformed service client"};
+        const auto& clientRow=parent.rows.front();
+        if (milliseconds(clientRow[0])!=3 || !boolean(clientRow[3])
+            || (command.operation!=Op::Deactivate &&
+                (milliseconds(clientRow[1])!=0 || milliseconds(clientRow[2])!=0))) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::FailedPrecondition);
+        }
+        Params serviceArgs{clientId};
+        const auto existing=co_await execute(
+            "SELECT s.identity_id,s.active,s.created_at_ms,s.updated_at_ms,i.organization_id,i.kind,i.status "
+            "FROM openproof.service_identities s JOIN openproof.identities i ON i.id=s.identity_id "
+            "WHERE s.client_id=$1 FOR UPDATE OF s FOR SHARE OF i",std::move(serviceArgs));
+        if (value && !existing.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AlreadyExists);
+        }
+        if (!value) {
+            if (existing.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            if (existing.rows.size()!=1U || existing.rows.front().size()!=7U)
+                throw std::runtime_error{"Malformed service identity"};
+            const auto& row=existing.rows.front();
+            if (required(row[4])!=tenant || milliseconds(row[5])!=1 ||
+                (command.operation==Op::Activate && milliseconds(row[6])!=0)) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::FailedPrecondition);
+            }
+            Params audienceArgs{clientId};
+            const auto audiences=co_await execute(
+                "SELECT audience FROM openproof.service_identity_audiences WHERE client_id=$1 "
+                "ORDER BY audience COLLATE \"C\" LIMIT 65 FOR SHARE",std::move(audienceArgs));
+            Params scopeArgs{clientId};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.service_identity_scopes WHERE client_id=$1 "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(scopeArgs));
+            if (audiences.rows.empty() || audiences.rows.size()>64U || grants.rows.empty() || grants.rows.size()>256U)
+                throw std::runtime_error{"Invalid service grant size"};
+            std::vector<std::string> audienceValues,scopeValues;
+            for (const auto& item:audiences.rows) {
+                if (item.size()!=1U) throw std::runtime_error{"Malformed audience"};
+                audienceValues.push_back(required(item[0]));
+            }
+            for (const auto& item:grants.rows) {
+                if (item.size()!=1U) throw std::runtime_error{"Malformed scope"};
+                scopeValues.push_back(required(item[0]));
+            }
+            const auto updatedAt=foundation::Instant{foundation::Duration{milliseconds(row[3])}};
+            if (now<updatedAt) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::Conflict);
+            }
+            auto restored=resource::ServiceIdentity::restore(core::IdentityId{required(row[0])},
+                command.clientId,std::move(audienceValues),std::move(scopeValues),boolean(row[1]),
+                foundation::Instant{foundation::Duration{milliseconds(row[2])}},updatedAt);
+            if (!restored) throw std::runtime_error{"Invalid stored service identity"};
+            auto changed=command.operation==Op::Activate?restored->activate(now):restored->deactivate(now);
+            if (!changed) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(changed.error());
+            }
+            value.emplace(std::move(restored).value());
+        }
+        if (command.operation!=Op::Deactivate) {
+            // Validate every audience against current registry and scope set
+            // under row locks. No widening, even on reactivation.
+            for (const auto& audience:value->audiences()) {
+                Params resourceArgs{audience};
+                const auto target=co_await execute(
+                    "SELECT id FROM openproof.oauth_resources WHERE audience=$1 AND status=0 FOR SHARE",
+                    std::move(resourceArgs));
+                if (target.rows.size()!=1U || target.rows.front().size()!=1U) {
+                    co_await rollback(connection,deadline);
+                    co_return foundation::fail(E::PermissionDenied);
+                }
+                Params grantArgs{required(target.rows.front()[0])};
+                const auto grants=co_await execute(
+                    "SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=$1 LIMIT 257 FOR SHARE",
+                    std::move(grantArgs));
+                if (grants.rows.size()>256U) throw std::runtime_error{"Oversized resource scopes"};
+                if (!std::ranges::all_of(value->scopes(),[&](const auto& scope) {
+                    return std::ranges::any_of(grants.rows,[&](const auto& row) {
+                        return row.size()==1U && required(row[0])==scope;
+                    });
+                })) {
+                    co_await rollback(connection,deadline);
+                    co_return foundation::fail(E::PermissionDenied);
+                }
+            }
+        }
+        if (command.operation==Op::Provision) {
+            const std::string identityId{value->identity().value()};
+            Params identityArgs{identityId,tenant,timestamp};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+                "VALUES($1,$2,1,0,$3) ON CONFLICT DO NOTHING RETURNING id",std::move(identityArgs));
+            if (inserted.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AlreadyExists);
+            }
+            if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U || required(inserted.rows.front()[0])!=identityId)
+                throw std::runtime_error{"Service identity insert mismatch"};
+            Params mappingArgs{clientId,identityId,timestamp};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.service_identities(client_id,identity_id,active,created_at_ms,updated_at_ms) "
+                "VALUES($1,$2,true,$3,$3)",std::move(mappingArgs)));
+            for (const auto& audience:value->audiences()) {
+                Params args{clientId,audience};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.service_identity_audiences(client_id,audience) VALUES($1,$2)",std::move(args)));
+            }
+            for (const auto& scope:value->scopes()) {
+                Params args{clientId,scope};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.service_identity_scopes(client_id,scope) VALUES($1,$2)",std::move(args)));
+            }
+        } else {
+            Params args{clientId,std::string{value->identity().value()},value->active()?"true":"false",timestamp};
+            const auto updated=co_await execute(
+                "UPDATE openproof.service_identities SET active=$3,updated_at_ms=$4 "
+                "WHERE client_id=$1 AND identity_id=$2 RETURNING client_id",std::move(args));
+            if (updated.rows.size()!=1U || updated.rows.front().size()!=1U || required(updated.rows.front()[0])!=clientId)
+                throw std::runtime_error{"Service state update mismatch"};
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return std::move(*value);
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native service identity mutation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

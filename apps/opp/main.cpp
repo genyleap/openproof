@@ -3485,16 +3485,20 @@ addProtectedRoutes(gateway::Router& router,
                     identity::IdentityId actor,session::SessionId sessionId) {
                     return reader->mutateOAuthResourceAsync(std::move(command),std::move(actor),
                         std::move(sessionId),clock.now());
+                },
+                [reader=nativeCanonical.get(),&clock](resource::ServiceMutationCommand command,
+                    identity::IdentityId actor,session::SessionId sessionId) {
+                    return reader->mutateServiceIdentityAsync(std::move(command),std::move(actor),
+                        std::move(sessionId),clock.now());
                 });
             nativeHandler=nativeManagement.get();
             for (const auto* route : {"/admin/applications","/admin/applications/suspend",
                 "/admin/applications/activate","/admin/applications/revoke","/admin/clients",
                 "/admin/clients/suspend","/admin/clients/activate","/admin/clients/revoke","/admin/clients/rotate-secret",
                 "/admin/clients/jar-key","/admin/resources","/admin/resources/suspend",
-                "/admin/resources/activate","/admin/resources/revoke"})
+                "/admin/resources/activate","/admin/resources/revoke","/admin/service-identities",
+                "/admin/service-identities/activate","/admin/service-identities/deactivate"})
                 nativePaths.emplace_back(route);
-            for (const auto* route : {"/admin/service-identities"})
-                nativeMethods.emplace_back(route,gateway::HttpMethod::Get);
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};

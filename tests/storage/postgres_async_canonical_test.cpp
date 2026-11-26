@@ -1023,6 +1023,70 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
     ASSERT_EQ(PQntuples(resourceState.get()),1);
     EXPECT_STREQ(PQgetvalue(resourceState.get(),0,0),"2");
     EXPECT_STREQ(PQgetvalue(resourceState.get(),0,1),"2");
+
+    using SOp=res::ServiceMutation;
+    using SCommand=res::ServiceMutationCommand;
+    const auto serviceClient="native-service-"+seed.suffix;
+    const auto serviceResource="native-service-resource-"+seed.suffix;
+    const auto serviceAudience="urn:fixture:service:"+seed.suffix;
+    const auto serviceIdentity="native-service-identity-"+seed.suffix;
+    ASSERT_TRUE(runMutation(clientTask(createClient(serviceClient,app,cli::ClientKind::Service))));
+    ASSERT_TRUE(runMutation(resourceTask(resourceCreate(serviceResource,serviceAudience,{"openid","read"}))));
+    const auto provision=[&](std::string id,std::string clientId,std::string target,std::vector<std::string> scopes) {
+        return SCommand{SOp::Provision,cli::ClientId{std::move(clientId)},ids::IdentityId{std::move(id)},
+            {std::move(target)},std::move(scopes)};
+    };
+    const auto serviceChange=[&](SOp op) {
+        return SCommand{op,cli::ClientId{serviceClient},ids::IdentityId{""},{},{}};
+    };
+    const auto serviceTask=[&](SCommand command,std::string actor={},std::string session={},fnd::Instant when=kNow+9s) {
+        return native.mutateServiceIdentityAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,publicId,serviceAudience,{"openid"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,audience,{"read"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"forbidden"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"}),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"}),seed.owner,weakSession)));
+    EXPECT_FALSE(runMutation(serviceTask(provision(seed.owner,serviceClient,serviceAudience,{"openid"}))));
+    const auto before=execute(fixture.get(),"SELECT count(*)::text FROM openproof.identities WHERE id=$1",{serviceIdentity});
+    ASSERT_EQ(PQntuples(before.get()),1);
+    EXPECT_STREQ(PQgetvalue(before.get(),0,0),"0");
+    io.restart();
+    std::optional<fnd::Result<res::ServiceIdentity>> serviceA,serviceB;
+    auto sa=asio::co_spawn(io,collect(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"})),serviceA),asio::use_future);
+    auto sb=asio::co_spawn(io,collect(serviceTask(provision(serviceIdentity+"-duplicate",serviceClient,serviceAudience,{"openid"})),serviceB),asio::use_future);
+    io.run(); sa.get(); sb.get();
+    ASSERT_TRUE(serviceA && serviceB);
+    ASSERT_NE(serviceA->has_value(),serviceB->has_value());
+    const auto& registeredService=serviceA->has_value()?serviceA->value():serviceB->value();
+    EXPECT_TRUE(registeredService.active());
+    EXPECT_EQ(registeredService.scopes(),std::vector<std::string>{"openid"});
+    const auto provisioned=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.identities WHERE id IN ($1,$2) AND kind=1)::text,"
+        "(SELECT count(*) FROM openproof.service_identities WHERE client_id=$3)::text",
+        {serviceIdentity,serviceIdentity+"-duplicate",serviceClient});
+    ASSERT_EQ(PQntuples(provisioned.get()),1);
+    EXPECT_STREQ(PQgetvalue(provisioned.get(),0,0),"1");
+    EXPECT_STREQ(PQgetvalue(provisioned.get(),0,1),"1");
+    ASSERT_TRUE(read(Read::ServiceIdentity,serviceClient));
+    auto inactive=runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+10s));
+    ASSERT_TRUE(inactive);
+    EXPECT_FALSE(inactive->active());
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+9s)));
+    ASSERT_TRUE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+11s)));
+    ASSERT_TRUE(runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+12s)));
+    const RCommand stopResource{ROp::Revoke,res::ResourceId{""},serviceAudience,{},{}};
+    ASSERT_TRUE(runMutation(resourceTask(stopResource,{}, {},kNow+13s)));
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+14s)));
+    const auto serviceState=execute(fixture.get(),
+        "SELECT active::text,(SELECT count(*) FROM openproof.service_identity_audiences WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.service_identity_scopes WHERE client_id=$1)::text "
+        "FROM openproof.service_identities WHERE client_id=$1",{serviceClient});
+    ASSERT_EQ(PQntuples(serviceState.get()),1);
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,0),"false");
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,2),"1");
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
@@ -1030,6 +1094,7 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
     EXPECT_FALSE(runMutation(keyTask(client,"denied",pem)));
     EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Revoke),{}, {},kNow+8s)));
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+15s)));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)
