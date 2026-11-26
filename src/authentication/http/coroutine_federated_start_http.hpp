@@ -9,6 +9,7 @@
 #include <boost/asio/awaitable.hpp>
 
 import openproof.authentication;
+import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.provider;

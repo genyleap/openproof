@@ -4747,3 +4747,15 @@ mutation and recovery eligibility wire semantics remain covered by their
 dedicated native C++/PostgreSQL suites and default identity-platform E2E.
 The gate result is source-level evidence; compiled and runtime approval
 still require exact-head tests and benchmarks.
+
+### Native OAuth2 form_post callback
+
+Native callbacks now admit bounded application/x-www-form-urlencoded POST
+responses (including the Apple user payload), without mixing query and body
+proofs. OAuth1 remains GET-only. Duplicate parameters, malformed encoding,
+oversized inputs, alternate proof families and incomplete cookies are denied.
+The parsed credential values and decoded cookie copies are scrubbed on all
+exits. New provider-neutral callback regressions cover successful form POST,
+provider-selection independence, malformed proof rejection and replay.
+SAML assertion verification and full provider transport retirement remain
+separate work; no default cutover for federation is made by this increment.

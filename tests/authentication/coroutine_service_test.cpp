@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
@@ -91,6 +92,7 @@ public:
         ++nativeCompleteCalls;
         co_await asio::post(asio::use_awaitable);
         const auto& fields = response.parameters();
+        if (fields.contains("user")) receivedUser=fields.at("user").expose();
         const bool proof = fields.contains("proof");
         const bool oauth2 = fields.contains("code") && fields.contains("state")
             && fields.at("code").expose() == "valid-code"
@@ -116,6 +118,7 @@ public:
     std::string externalSubject{"verified-subject"};
     std::optional<std::string> requiredOwner;
     bool forgedProvider{};
+    std::string receivedUser;
     int nativeBeginCalls{};
     int nativeCompleteCalls{};
 };
@@ -1343,6 +1346,58 @@ TEST(TrustedAuthenticationCoroutineTest, NativeOAuth1CallbackBindsRegisteredProv
     EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),400);
     EXPECT_EQ(nativeX->nativeCompleteCalls,1);
     EXPECT_EQ(nativeX->syncCalls,0);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeFormPostCallbackPreservesUserAndRejectsAmbiguousProof)
+{
+    namespace gw=openproof::gateway;
+    Fixture fixture;
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,start};
+    const auto begin=[&] {
+        return invokeFederated(start,makeFederatedStart(
+            "/auth/federated/start?provider=async-test&return_to=%2Faccount"));
+    };
+    const auto post=[](std::string body,std::string cookies,
+                       std::string type="application/x-www-form-urlencoded",
+                       std::string target="/auth/federated/callback") {
+        return gw::HttpRequest::create(gw::HttpMethod::Post,std::move(target),
+            {{"cookie",std::move(cookies)},{"content-type",std::move(type)}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"native-form-post"}).value();
+    };
+    auto started=begin();
+    ASSERT_EQ(started.status(),302);
+    const auto cookies=federatedCookies(started);
+    const std::string proof="code=valid-code&state=matching-state&user=%7B%22name%22%3A%22Ada%22%7D";
+    for (const auto& invalid:std::vector<std::string>{
+        "code=valid-code&state=matching-state&state=duplicate",
+        "oauth_token=fixture-token&oauth_verifier=fixture-verifier",
+        "code=valid-code&state=%00",
+        "code=valid-code&state=matching-state&SAMLResponse=ambiguous",
+        "code=valid-code&state=matching-state&user="+std::string(17U*1024U,'x')}) {
+        EXPECT_GE(invokeCallback(callback,post(invalid,cookies)).status(),400);
+    }
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies,
+        "application/x-www-form-urlencoded-invalid")).status(),400);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies,"application/x-www-form-urlencoded",
+        "/auth/federated/callback?code=second&state=second")).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    EXPECT_EQ(issuer.calls,0);
+    auto accepted=invokeCallback(callback,post(proof,cookies,
+        "application/x-www-form-urlencoded; charset=UTF-8","/auth/federated/callback?provider=ignored"));
+    EXPECT_EQ(accepted.status(),302);
+    EXPECT_EQ(accepted.headers().at("location"),"/account");
+    EXPECT_EQ(fixture.coroutineProvider->receivedUser,R"({"name":"Ada"})");
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,1);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies)).status(),400);
     EXPECT_EQ(issuer.calls,1);
     EXPECT_EQ(fallback.syncCalls,0);
 }
