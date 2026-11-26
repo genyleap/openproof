@@ -815,9 +815,64 @@ TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSe
     EXPECT_NE(jar->find("fixture-public-material"),std::string::npos);
     EXPECT_TRUE(read(Read::Resources));
     EXPECT_FALSE(read(Read::ServiceIdentity,client));
+    using Mutation=openproof::application::ApplicationMutation;
+    using Command=openproof::application::ApplicationMutationCommand;
+    using AppId=openproof::application::ApplicationId;
+    using Status=openproof::application::ApplicationStatus;
+    const auto mutate=[&](Command command,std::string actor={},std::string session={},fnd::Instant when=kNow+2s) {
+        return native.mutateApplicationAsync(std::move(command),
+            ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    const auto runMutation=[&](auto task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    const auto createdId="native-created-"+seed.suffix;
+    const auto create=[&](std::string id,std::string identifier) {
+        return Command{Mutation::Create,AppId{std::move(id)},std::move(identifier),"Native fixture",
+            openproof::application::Environment::Staging};
+    };
+    const auto change=[&](Mutation action,std::string id) {
+        return Command{action,AppId{std::move(id)},{},{}};
+    };
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"invalid identifier"))));
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"new-fixture"),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"new-fixture"),seed.owner,weakSession)));
+    auto foreign=runMutation(mutate(change(Mutation::Revoke,foreignApp)));
+    ASSERT_FALSE(foreign);
+    EXPECT_EQ(foreign.error().code(),fnd::ErrorCode::NotFound);
+    auto created=runMutation(mutate(create(createdId,"new-fixture")));
+    ASSERT_TRUE(created);
+    EXPECT_EQ(created->id().value(),createdId);
+    EXPECT_EQ(created->status(),Status::Active);
+    auto duplicate=runMutation(mutate(create(createdId+"-duplicate","new-fixture")));
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(),fnd::ErrorCode::AlreadyExists);
+    io.restart();
+    auto suspendA=asio::co_spawn(io,mutate(change(Mutation::Suspend,createdId)),asio::use_future);
+    auto suspendB=asio::co_spawn(io,mutate(change(Mutation::Suspend,createdId)),asio::use_future);
+    io.run();
+    auto a=suspendA.get(),b=suspendB.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto activated=runMutation(mutate(change(Mutation::Activate,createdId)));
+    ASSERT_TRUE(activated);
+    EXPECT_EQ(activated->status(),Status::Active);
+    auto revoked=runMutation(mutate(change(Mutation::Revoke,createdId)));
+    ASSERT_TRUE(revoked);
+    EXPECT_EQ(revoked->status(),Status::Revoked);
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Activate,createdId))));
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Revoke,createdId))));
+    const auto durable=execute(fixture.get(),
+        "SELECT status::text FROM openproof.applications WHERE id=$1",{createdId});
+    ASSERT_EQ(PQntuples(durable.get()),1);
+    EXPECT_STREQ(PQgetvalue(durable.get(),0,0),"2");
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)

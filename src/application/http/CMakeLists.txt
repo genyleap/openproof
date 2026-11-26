@@ -29,7 +29,8 @@ set_target_properties(openproof_application_async_http PROPERTIES
 target_compile_definitions(openproof_application_async_http PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_application_async_http PUBLIC
     openproof_application openproof_foundation openproof_gateway openproof_gateway_http
-    openproof_identity_core openproof_identity_provider openproof_session Boost::headers
+    openproof_identity_core openproof_identity_provider openproof_session openproof_security
+    openproof_application_http Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_management_read_http.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")

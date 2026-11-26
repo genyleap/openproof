@@ -24,6 +24,15 @@ enum class Environment {
 
 [[nodiscard]] std::string_view environmentName(Environment environment) noexcept;
 
+enum class ApplicationMutation { Create, Suspend, Activate, Revoke };
+struct ApplicationMutationCommand final {
+    ApplicationMutation operation;
+    ApplicationId id;
+    std::string identifier;
+    std::string name;
+    Environment environment=Environment::Development;
+};
+
 enum class ApplicationStatus {
     Active,
     Suspended,

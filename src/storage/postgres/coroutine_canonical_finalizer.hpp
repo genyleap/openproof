@@ -59,6 +59,10 @@ public:
         identity::core::IdentityId actor,session::SessionId sessionId,
         std::optional<std::string> filter,foundation::Instant now);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<application::Application>>
+    mutateApplicationAsync(application::ApplicationMutationCommand command,
+        identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now);
+
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
 

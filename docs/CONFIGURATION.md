@@ -1098,8 +1098,17 @@ visibility remains platform-wide as in the existing schema; applications,
 clients, JAR keys and service identities are tenant-bound. Oversized
 results fail closed rather than returning a misleading truncated list.
 
-The remaining PostgreSQL compatibility surfaces include application/client/
-resource/service-identity mutations and the administration console,
+Application creation, suspension, activation and revocation also run
+natively, with strict ownership of all four endpoint paths. The write
+transaction serializes owner lifecycle changes using the shared advisory
+lock, locks the active session and owner membership, and locks the
+target application before applying the existing domain transitions.
+Duplicate identifiers are rejected and revoked applications cannot be
+reactivated. Concurrent transitions cannot overwrite each other through
+the native HTTP path.
+
+The remaining PostgreSQL compatibility surfaces include client/resource/
+service-identity mutations and the administration console,
 passkey operations, evidence/trust and enabled SCIM operations, as well
 as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
