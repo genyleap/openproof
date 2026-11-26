@@ -229,10 +229,19 @@ TEST(EnterpriseSamlAuthenticationTest, NativeWorkerUsesExistingVerifierAndReject
     enterprise::SamlAuthenticationProvider provider{std::move(config).value(),clock};
     EXPECT_EQ(provider.redirectProofKind(),idp::RedirectProofKind::SamlAssertion);
     asio::io_context io;
-    auto challengeTask=asio::co_spawn(io,provider.beginAuthenticationAsync(
-        idp::AuthenticationRequest{idp::ProviderId{"saml"},idp::ClientContext{}}),asio::use_future);
-    io.run();
-    auto challenge=challengeTask.get();
+    auto run=[&]<class T>(asio::awaitable<T> task) {
+        std::optional<T> result;
+        auto capture=[](asio::awaitable<T> op,std::optional<T>& output)->asio::awaitable<void>{
+            output.emplace(co_await std::move(op));
+        };
+        io.restart();
+        auto completed=asio::co_spawn(io,capture(std::move(task),result),asio::use_future);
+        io.run();
+        completed.get();
+        return std::move(result.value());
+    };
+    auto challenge=run(provider.beginAuthenticationAsync(
+        idp::AuthenticationRequest{idp::ProviderId{"saml"},idp::ClientContext{}}));
     ASSERT_TRUE(challenge);
     const auto& url=challenge->parameters().at("authorization_url");
     const auto marker=url.find("&RelayState=");
@@ -246,10 +255,7 @@ TEST(EnterpriseSamlAuthenticationTest, NativeWorkerUsesExistingVerifierAndReject
     proof.setParameter("RelayState",idp::CredentialValue{relay});
     const auto sync=provider.completeAuthentication(proof);
     ASSERT_FALSE(sync);
-    io.restart();
-    auto native=asio::co_spawn(io,provider.completeAuthenticationAsync(std::move(proof)),asio::use_future);
-    io.run();
-    auto denied=native.get();
+    auto denied=run(provider.completeAuthenticationAsync(std::move(proof)));
     ASSERT_FALSE(denied);
     EXPECT_EQ(denied.error().code(),sync.error().code());
     EXPECT_EQ(denied.error().internalDetail(),sync.error().internalDetail());
