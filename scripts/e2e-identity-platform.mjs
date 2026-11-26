@@ -1140,6 +1140,28 @@ async function main() {
       expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 200);
       assert.equal(active(), beforeActive, "same-browser local login must atomically replace the session");
       console.log("- native local HTTP: unknown/locked subject, invalid password, binding, replay, no provisioning and session replacement passed");
+      if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS === "1") {
+        expectStatus(await edgeRequest("/account/password/upgrade"), 401);
+        const projection = await edgeRequest("/account/password/upgrade", { jar: consumerJar });
+        expectStatus(projection, 200);
+        assert.equal(projection.headers["cache-control"], "no-store");
+        assert.deepEqual(jsonBody(projection), {
+          available: true, needs_upgrade: false, target_algorithm: "argon2id",
+        });
+        const beforeStatus = counts();
+        sql("UPDATE openproof.identities SET status=2 WHERE id=(SELECT identity_id " +
+          "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid')");
+        try {
+          const lockedStatus = await edgeRequest("/account/password/upgrade", { jar: consumerJar });
+          assert.ok([401, 403, 404].includes(lockedStatus.status),
+            "inactive identity must not receive password status");
+        } finally {
+          sql("UPDATE openproof.identities SET status=0 WHERE id=(SELECT identity_id " +
+            "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid')");
+        }
+        assert.equal(counts(), beforeStatus);
+        console.log("- native password upgrade HTTP: owner-bound metadata, no-store and inactive identity denial passed");
+      }
     }
     if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
       expectStatus(await edgeRequest("/account/totp"), 401);

@@ -4627,3 +4627,30 @@ and owner echo are required; delegated OAuth and POST mutations retain
 legacy behavior. No additional feature flag or schema migration is added.
 Focused HTTP and disposable SQL regressions are included; compiled and
 real HTTP acceptance remains required before changing defaults.
+
+
+### Development runtime artifact and independent server acceptance
+
+After successful Build, Test, isolated E2E, benchmarks and packaging, CI
+preserves the already verified amd64 runtime bundle and a development-only
+provenance manifest containing the exact source tree and SHA-256 digest.
+This is not a release, attestation or authorization to install anything.
+Download only from the trusted OpenProof Actions run. For example:
+
+```sh
+gh run download RUN_ID -R genyleap/openproof -n openproof-tested-development-bundle -D /tmp/opp-development-bundle
+python3 -B scripts/ci/development-bundle.py verify /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+python3 -B scripts/ci/development-bundle.py e2e /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+```
+
+Run from the exact candidate source tree (PR merge commit or equivalent
+tree); mismatched/tampered bundles and dirty tracked source for E2E are
+denied. Use the verify command for non-executing archive admission and
+the e2e command to run only the real ELF and bundled libraries in a private
+temporary directory with the existing disposable Docker PostgreSQL fixture.
+Do not run installer or service-manager commands. The host needs a
+compatible Linux amd64 glibc, Node, PostgreSQL client and Docker. The
+manifest is integrity metadata, not a cryptographic signature; trust
+the Actions artifact origin. A separate full native local/account HTTP
+workload now checks password-upgrade status with valid and inactive
+identities. The official coroutine migration gate remains unchanged.
