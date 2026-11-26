@@ -23,7 +23,7 @@ const dispatch = block(executable,
 const login = block(executable,
   "AuthenticationHttpApi::loginAsync(", "AuthenticationHttpApi::verifyAsync(");
 const verify = block(executable,
-  "AuthenticationHttpApi::verifyAsync(", "gateway::HttpResponse AuthenticationHttpApi::login(");
+  "AuthenticationHttpApi::verifyAsync(");
 
 test("native auth rejection always erases raw body, authorization and cookies", () => {
   const guard = block(executable,

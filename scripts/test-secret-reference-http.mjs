@@ -16,7 +16,7 @@ const local = read("src/authentication/http/http.cpp");
 for (const [name, source, start, end, token] of [
   ["evidence challenge", evidence, "Api::issueChallenge(", "Api::verify(", "challenge->token"],
   ["native LDAP session", ldap, "EnterpriseAuthenticationHttpApi::completeLdapAsync(", "} // namespace openproof::authentication::http", "grant->token"],
-  ["native first-party session", local, "AuthenticationHttpApi::verifyAsync(", "gateway::HttpResponse AuthenticationHttpApi::login(", "issued->token"]
+  ["native first-party session", local, "AuthenticationHttpApi::verifyAsync(", "} // namespace openproof::authentication::http", "issued->token"]
 ]) {
   test(name + " inspection must borrow, never clone, the auto-wiping secret", () => {
     const begin = source.indexOf(start);

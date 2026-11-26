@@ -604,23 +604,55 @@ const checked = segments.map(([name, relative]) => {
         expression:"CoroutineSessionListenerAdapter::nativeEnabled() true"});
   }
   if(relative==="src/authentication/http/http.cpp"){
-    const legacy = source.slice(source.indexOf("AuthenticationHttpApi::login("));
-    // co_await on login/verify does not migrate logout, rotation, recovery
-    // issuance, or the legacy public handler. Keep this entire HTTP boundary
-    // blocking until every route and production caller has a native port.
-    // Native capability is per-handler, so partial route migrations must
-    // not be activated for all /auth requests.
+    // The login leaf must have no synchronous credential or session SPI.
+    // The executable must compose all six strict native auth paths, with
+    // no legacy constructor or runtime opt-out in authenticated mode.
     const nativeInterface = fs.readFileSync(
       path.join(root,"src/authentication/http/http.cppm"),"utf8");
-    if(!/static\s+constexpr\s+bool\s+kAllAuthRoutesNative\s*=\s*false/.test(nativeInterface)
-       || !/return\s+kAllAuthRoutesNative\s*&&\s*m_asyncSessions\s*!=\s*nullptr/.test(nativeInterface))
-      issues.push({line:0,kind:"partially native authentication handler enabled before all routes migrate",
-        expression:"kAllAuthRoutesNative=false"});
-    if(/\bm_sessions->(?:issueReplacing|authenticate|rotate|revoke|revokeAll)\s*\(/.test(legacy)
-       || /\bm_recoveryCodes->issue\s*\(/.test(legacy)
-       || /\bm_authentication->(?:begin|complete)\s*\(/.test(legacy))
-      issues.push({line:0,kind:"legacy HTTP authentication routes still use synchronous services",
-        expression:"AuthenticationHttpApi::login/verify/rotate/logout/recoveryCodes"});
+    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const runtime = cppExecutableText(app);
+    const authConstructors = [...runtime.matchAll(/authHttp::AuthenticationHttpApi\s+\w+\s*\{([\s\S]*?)\};/g)];
+    const syncEntry = executable.slice(executable.indexOf("AuthenticationHttpApi::handle("),
+      executable.indexOf("AuthenticationHttpApi::nativeEnabledFor("));
+    if (!/bool\s+nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+false;\s*\}/.test(nativeInterface)
+        || /\b(?:m_sessions|m_recoveryCodes|m_localAccounts)\b/.test(nativeInterface)
+        || /\b(?:session::SessionService|credentials::RecoveryCodeService|LocalAccountDirectory)\b/.test(nativeInterface)
+        || /AuthenticationHttpApi::(?:login|verify|rotate|logout|issueRecoveryCodes)\s*\(/.test(executable)
+        || /\bm_authentication->(?:begin|complete)\s*\(/.test(executable)
+        || !/SensitiveAuthRequestGuard\s+wipeRequestOnExit\{request\}/.test(syncEntry)
+        || !/return\s+error\(foundation::Error\{foundation::ErrorCode::Unavailable\}/.test(syncEntry)
+        || authConstructors.length !== 3
+        || authConstructors.some(([,args]) => !/^\s*\*nativeLocalAuthentication,\s*\*nativeSessions,/.test(args)))
+      issues.push({line:0,kind:"synchronous authentication HTTP entry or dependency remains reachable",
+        expression:"native-only login leaf and fail-closed synchronous entry"});
+    const flagStart=app.indexOf("const auto nativeLocalFlag");
+    const serveMigration=app.indexOf("postgres::Migrator migrator{*pool.value()}",flagStart);
+    const beforeMigration=flagStart>=0 && serveMigration>flagStart
+      ? app.slice(flagStart,serveMigration) : "";
+
+    for (const [enabled,flag] of [["nativeLocalEnabled","nativeLocalFlag"],
+        ["nativeAuthSessionEnabled","nativeAuthSessionFlag"],["nativeRecoveryEnabled","nativeRecoveryFlag"]]) {
+      const declaration="const bool "+enabled+" = platform.auth().enabled()";
+      const rejection=beforeMigration.indexOf("if (platform.auth().enabled() && "+flag+' && *'+flag+' == "0") {');
+      const rejectionEnd=beforeMigration.indexOf("}",beforeMigration.indexOf("return ExitCode::ConfigurationError;",rejection));
+      const rejectBlock=rejection>=0 && rejectionEnd>rejection
+        ? beforeMigration.slice(rejection,rejectionEnd) : "";
+      if (!beforeMigration.includes(declaration)
+          || !rejectBlock.includes("return ExitCode::ConfigurationError;"))
+        issues.push({line:0,kind:"authenticated runtime can disable native auth dependency",expression:enabled});
+    }
+    for (const route of ["/auth/login","/auth/mfa/verify","/auth/session/rotate",
+        "/auth/logout","/auth/logout-all","/auth/recovery-codes"]) {
+      if (!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"missing strict native authentication overlay",expression:route});
+    }
+    if (!runtime.includes("std::make_unique<postgres::CoroutineSessionListenerStack>")
+        || !runtime.includes("std::make_unique<authHttp::CoroutineRecoveryCodeHttpAdapter>")
+        || !runtime.includes("nativeHandler = &asyncAuthSessions->handler()")
+        || !runtime.includes("nativeHandler = asyncRecovery.get()")
+        || !runtime.includes("gatewayHttp::CoroutineRouteOverlay nativeRoutes{"))
+      issues.push({line:0,kind:"native session and recovery handlers missing from runtime composition",
+        expression:"strict native route overlay with session listener and recovery adapter"});
     const preauth=source.slice(source.indexOf("preauthBinding("),
       source.indexOf("decodePreauthSubject(",source.indexOf("preauthBinding(")));
     if(!source.includes("class SensitiveBindingMaterialGuard final")
@@ -630,8 +662,7 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"preauthentication HMAC secret input is not scrubbed on all exits",
         expression:"RAII secureWipe of browser-bound binding HMAC material"});
     const nativeSection = source.slice(
-      source.indexOf("AuthenticationHttpApi::handleAsync("),
-      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+      source.indexOf("AuthenticationHttpApi::handleAsync("));
     for(const [kind,regex] of [
       ["native provider capability guard", /nativeEnabledFor\s*\(request\)/],
       ["native challenge start", /co_await\s+m_authentication->beginAsync\s*\(/],
@@ -649,8 +680,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"reference returned SecretString::expose(), never copy into plain std::string"});
     const localLogin=source.slice(source.indexOf("AuthenticationHttpApi::loginAsync("),
       source.indexOf("AuthenticationHttpApi::verifyAsync("));
-    const localVerify=source.slice(source.indexOf("AuthenticationHttpApi::verifyAsync("),
-      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+    const localVerify=source.slice(source.indexOf("AuthenticationHttpApi::verifyAsync("));
     const awaited=localVerify.indexOf("co_await m_authentication->completeAsync(");
     const rawGuard=source.slice(source.indexOf("class SensitiveAuthRequestGuard final"),
       source.indexOf("class SensitiveParsedAuthSecretsGuard final"));

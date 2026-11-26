@@ -6,10 +6,11 @@ const root = path.resolve(import.meta.dirname, "..");
 const read = p => fs.readFileSync(path.join(root,p), "utf8");
 const app = read("apps/opp/main.cpp");
 const http = read("src/authentication/http/coroutine_recovery_code_http.cpp");
-test("recovery issuance is an independent, disabled-by-default method-scoped capability", () => {
-  assert.match(app, /nativeRecoveryFlag && \*nativeRecoveryFlag == "1"/);
+test("recovery issuance is mandatory with a strict fail-closed runtime route", () => {
+  assert.match(app, /const bool nativeRecoveryEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeRecoveryFlag && \*nativeRecoveryFlag == "1"\)/);
+  assert.match(app, /platform\.auth\(\)\.enabled\(\) && nativeRecoveryFlag && \*nativeRecoveryFlag == "0"/);
   assert.match(app, /nativeRecoveryEnabled && \(!nativeAuthSessionEnabled \|\| !platform\.auth\(\)\.enabled\(\)\)/);
-  assert.match(app, /nativeMethods\.emplace_back\("\/auth\/recovery-codes", gateway::HttpMethod::Post\)/);
+  assert.match(app, /nativePaths\.emplace_back\("\/auth\/recovery-codes"\)/);
   assert.match(app, /#ifndef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP\s+if \(nativeRecoveryEnabled\)/);
   assert.match(app, /if \(nativeRecoveryEnabled\) nativeRecoverySecret\.emplace\(recoverySecret->clone\(\)\)/);
   assert.match(read("apps/opp/CMakeLists.txt"), /if\(TARGET openproof_authentication_async_recovery_http\)/);
@@ -26,7 +27,7 @@ test("runtime injects genuine native session and tenant-scoped eligibility, neve
   assert.doesNotMatch(http, /m_nativeFallback->handle\(/);
   assert.match(read("tests/authentication/coroutine_recovery_code_http_test.cpp"), /OtherNativeAuthCapabilityIsPreserved/);
 });
-test("CI exercises two legacy redemption workloads and the separate native local pilot", () => {
+test("CI exercises native redemption by default, with historic baseline explicitly separated", () => {
   const ci = read(".github/workflows/ci.yml");
   assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/g) ?? []).length, 3);
   const pilot = ci.slice(ci.indexOf("- name: Native LDAP TLS and PostgreSQL HTTP E2E"),
@@ -35,6 +36,8 @@ test("CI exercises two legacy redemption workloads and the separate native local
   assert.match(pilot, /OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/);
   assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"/g) ?? []).length, 1);
   const e2e = read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e, /OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1"/);
+  assert.match(read("scripts/ci/run-paired-e2e-baseline.sh"), /OPENPROOF_E2E_EXPECT_LEGACY_AUTH="1"/);
   assert.match(e2e, /await recover\(old\[0\], 401\)/);
   assert.match(e2e, /await recover\(fresh\[0\], 200\)/);
   assert.match(e2e, /await recover\(fresh\[0\], 401\)/);

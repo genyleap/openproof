@@ -9,6 +9,9 @@
 #include <vector>
 
 #include <boost/json.hpp>
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 
 #include "../../src/authentication/http/web3_presentation.hpp"
 
@@ -395,6 +398,70 @@ void expectHostCookie(const gw::HttpResponse& response, std::string_view name)
     EXPECT_EQ(header.find("; Domain="), std::string::npos);
 }
 
+// Test-only in-memory adapter. Never wrap a blocking provider or repository
+// in this fashion in the executable. Production uses the native PostgreSQL
+// credential verifier and atomic session service.
+class MemoryLocalProvider final : public idp::AuthenticationProvider,
+    public idp::CoroutineAuthenticationProvider {
+public:
+    MemoryLocalProvider(local::LocalAccountDirectory& accounts, const fnd::ClockSource& clock,
+        core::ExternalIdentityDirectory& identities, cred::RecoveryCodeService& recovery)
+        : m_provider(idp::ProviderId{"local"}, accounts, clock, std::chrono::minutes{5},
+            &identities,&recovery) {}
+    idp::ProviderId id() const override { return m_provider.id(); }
+    idp::InteractionModel interactionModel() const noexcept override { return m_provider.interactionModel(); }
+    idp::AssuranceLevel maximumClaimableAssurance() const noexcept override { return m_provider.maximumClaimableAssurance(); }
+    fnd::Result<idp::AuthenticationChallenge> beginAuthentication(const idp::AuthenticationRequest&) override
+    { return fnd::fail(fnd::ErrorCode::Unavailable); }
+    fnd::Result<idp::AuthenticationOutcome> completeAuthentication(const idp::AuthenticationResponse&) override
+    { return fnd::fail(fnd::ErrorCode::Unavailable); }
+    boost::asio::awaitable<fnd::Result<idp::AuthenticationChallenge>>
+    beginAuthenticationAsync(idp::AuthenticationRequest request) override
+    { co_return m_provider.beginAuthentication(request); }
+    boost::asio::awaitable<fnd::Result<idp::AuthenticationOutcome>>
+    completeAuthenticationAsync(idp::AuthenticationResponse proof) override
+    { co_return m_provider.completeAuthentication(proof); }
+private:
+    local::LocalAuthenticationProvider m_provider;
+};
+
+class MemoryLoginFinalizer final : public auth::CoroutineCanonicalIdentityFinalizer {
+public:
+    explicit MemoryLoginFinalizer(core::InMemoryExternalIdentityDirectory& directory) : m_directory(directory) {}
+    boost::asio::awaitable<fnd::Result<core::IdentityId>>
+    finishLoginAsync(const idp::AuthenticationOutcome& outcome,fnd::Instant) override {
+        auto owner=m_directory.ownerOf(core::ExternalIdentityRef{outcome.provider(),outcome.subject()});
+        if (!owner) co_return fnd::fail(owner.error());
+        if (!owner->has_value()) co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return owner->value();
+    }
+    boost::asio::awaitable<fnd::Status> authorizeConnectionTargetAsync(core::IdentityId) override
+    { co_return fnd::fail(fnd::ErrorCode::Unavailable); }
+    boost::asio::awaitable<fnd::Result<core::ExternalIdentityRef>>
+    finishConnectionAsync(const idp::AuthenticationOutcome&,core::IdentityId,fnd::Instant) override
+    { co_return fnd::fail(fnd::ErrorCode::Unavailable); }
+private:
+    core::InMemoryExternalIdentityDirectory& m_directory;
+};
+
+class MemorySessionIssuer final : public sess::CoroutineReplacingSessionIssuer {
+public:
+    explicit MemorySessionIssuer(sess::SessionService& service):m_service(service){}
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueAsync(const auth::VerifiedAuthentication& verified,idp::ClientContext client) override {
+        co_return co_await issueReplacingAsync(verified,std::move(client),std::nullopt);
+    }
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueReplacingAsync(const auth::VerifiedAuthentication& verified,idp::ClientContext client,
+        std::optional<fnd::SecretString> previous) override {
+        auto grant=m_service.issueReplacing(verified,client,previous?&*previous:nullptr);
+        if (!grant) co_return fnd::fail(grant.error());
+        co_return sess::CoroutineIssuedSession{grant->id(),grant->token().clone()};
+    }
+private:
+    sess::SessionService& m_service;
+};
+
 struct Fixture {
     explicit Fixture(std::string subject = "alice")
         : clock(kNow),
@@ -421,9 +488,8 @@ struct Fixture {
         EXPECT_TRUE(accounts->enroll(
             idp::ExternalSubject{subject}, fnd::SecretString{"correct-password"},
             std::optional<cred::TotpSecret>{std::move(totp)}));
-        auto provider = std::make_unique<local::LocalAuthenticationProvider>(
-            idp::ProviderId{"local"}, *accounts, clock, std::chrono::minutes{5},
-            &externalIdentities, &recoveryService);
+        auto provider = std::make_unique<MemoryLocalProvider>(
+            *accounts,clock,externalIdentities,recoveryService);
         EXPECT_TRUE(registry.registerProvider(std::move(provider)));
 
         auto link = core::IdentityLink::request(
@@ -439,19 +505,33 @@ struct Fixture {
         EXPECT_TRUE(trust.trust(idp::ProviderId{"local"}, idp::AssuranceLevel::Ial2));
         authentication = std::make_unique<auth::AuthenticationService>(
             registry, transactions, externalIdentities, clock, std::move(trust),
-            std::chrono::minutes{5});
+            std::chrono::minutes{5}, nullptr, core::OrganizationId{}, nullptr, &finalizer);
         api = std::make_unique<authHttp::AuthenticationHttpApi>(
-            *authentication, sessionService, recoveryService, *accounts, limiter,
-            idp::ProviderId{"local"}, fallback);
+            *authentication, issuer, limiter,idp::ProviderId{"local"},fallback);
+    }
+
+    gw::HttpResponse invoke(gw::HttpRequest request) {
+        boost::asio::io_context io;
+        std::optional<gw::HttpResponse> result;
+        auto capture=[](authHttp::AuthenticationHttpApi& handler,gw::HttpRequest input,
+                        std::optional<gw::HttpResponse>& output)->boost::asio::awaitable<void> {
+            output.emplace(co_await handler.handleAsync(std::move(input)));
+        };
+        auto done=boost::asio::co_spawn(io,capture(*api,std::move(request),result),boost::asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
     }
 
     fnd::ManualClockSource clock;
     idp::ProviderRegistry registry;
     idp::InMemoryAuthenticationTransactionStore transactions;
     core::InMemoryExternalIdentityDirectory externalIdentities;
+    MemoryLoginFinalizer finalizer{externalIdentities};
     std::unique_ptr<local::InMemoryLocalAccountDirectory> accounts;
     sess::InMemorySessionRepository sessionRepository;
     sess::SessionService sessionService;
+    MemorySessionIssuer issuer{sessionService};
     cred::InMemoryRecoveryCodeRepository recoveryRepository;
     cred::RecoveryCodeService recoveryService;
     gw::TokenBucketRateLimiter limiter;
@@ -461,10 +541,43 @@ struct Fixture {
     std::string totpCode;
 };
 
-TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
+class NeverIssueNativeSession final : public sess::CoroutineReplacingSessionIssuer {
+public:
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueAsync(const auth::VerifiedAuthentication&,idp::ClientContext) override {
+        ++calls;
+        co_return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueReplacingAsync(const auth::VerifiedAuthentication&,idp::ClientContext,
+                        std::optional<fnd::SecretString>) override {
+        ++calls;
+        co_return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    int calls{};
+};
+
+TEST(AuthenticationHttpApiTest, NativeRuntimeConstructorCannotDispatchLegacyAuthentication)
 {
     Fixture fixture;
-    const auto started = fixture.api->handle(request(
+    NeverIssueNativeSession issuer;
+    authHttp::AuthenticationHttpApi api{
+        *fixture.authentication,issuer,fixture.limiter,idp::ProviderId{"local"},fixture.fallback};
+    for (const auto route:{"/auth/login","/auth/mfa/verify","/auth/session/rotate",
+                           "/auth/logout","/auth/logout-all","/auth/recovery-codes"}) {
+        EXPECT_EQ(api.handle(request(route,R"({"subject":"alice"})")).status(),503)
+            << route;
+    }
+    EXPECT_EQ(fixture.transactions.size(),0U);
+    EXPECT_EQ(fixture.sessionRepository.size(),0U);
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(api.handle(request("/non-auth",{})).status(),418);
+}
+
+TEST(AuthenticationHttpApiTest, NativeLoginMfaAndRecoveryWithInMemorySessionLifecycle)
+{
+    Fixture fixture;
+    const auto started = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(started.status(), 202);
     const std::string continuation = cookieValue(started, "__Host-openproof-preauth");
@@ -484,7 +597,7 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     completionBody["password"] = "correct-password";
     completionBody["totp"] = fixture.totpCode;
     const std::string preauthCookies = preauthCookieHeader(started);
-    const auto completed = fixture.api->handle(request(
+    const auto completed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(completionBody), preauthCookies));
     ASSERT_EQ(completed.status(), 200) << completed.body();
     const std::string firstToken = cookieValue(completed, "__Host-openproof-session");
@@ -492,29 +605,23 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     expectHostCookie(completed, "__Host-openproof-session");
     EXPECT_EQ(json::parse(completed.body()).as_object().at("assurance"), "ial2");
 
-    const auto recovery = fixture.api->handle(request(
-        "/auth/recovery-codes", {}, "__Host-openproof-session=" + firstToken));
-    ASSERT_EQ(recovery.status(), 201);
-    const auto recoveryBody = json::parse(recovery.body()).as_object();
-    const auto& recoveryCodes = recoveryBody.at("codes").as_array();
-    ASSERT_EQ(recoveryCodes.size(), 10U);
-    const std::string recoveryCode{recoveryCodes.front().as_string()};
+    auto recovery=fixture.recoveryService.issue(core::IdentityId{"identity-1"},10U);
+    ASSERT_TRUE(recovery);
+    ASSERT_EQ(recovery->codes().size(),10U);
+    const std::string recoveryCode{recovery->codes().front().expose()};
 
-    const auto rotated = fixture.api->handle(request(
-        "/auth/session/rotate", {}, "__Host-openproof-session=" + firstToken));
-    ASSERT_EQ(rotated.status(), 200);
-    const std::string replacement = cookieValue(rotated, "__Host-openproof-session");
+    auto rotated=fixture.sessionService.rotate(fnd::SecretString{firstToken});
+    ASSERT_TRUE(rotated);
+    const std::string replacement{rotated->token().expose()};
     ASSERT_FALSE(replacement.empty());
     EXPECT_NE(firstToken, replacement);
     EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{firstToken}));
     EXPECT_TRUE(fixture.sessionService.authenticate(fnd::SecretString{replacement}));
 
-    const auto loggedOut = fixture.api->handle(request(
-        "/auth/logout", {}, "__Host-openproof-session=" + replacement));
-    EXPECT_EQ(loggedOut.status(), 204);
+    ASSERT_TRUE(fixture.sessionService.revoke(rotated->id()));
     EXPECT_FALSE(fixture.sessionService.authenticate(fnd::SecretString{replacement}));
 
-    const auto recoveryStarted = fixture.api->handle(request(
+    const auto recoveryStarted = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(recoveryStarted.status(), 202);
     const auto recoveryStartBody = json::parse(recoveryStarted.body()).as_object();
@@ -524,12 +631,12 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     recoveryCompletion["password"] = "correct-password";
     recoveryCompletion["recovery_code"] = recoveryCode;
     const std::string recoveryPreauth = preauthCookieHeader(recoveryStarted);
-    const auto recovered = fixture.api->handle(request(
+    const auto recovered = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(recoveryCompletion), recoveryPreauth));
     ASSERT_EQ(recovered.status(), 200) << recovered.body();
     EXPECT_EQ(json::parse(recovered.body()).as_object().at("assurance"), "ial2");
 
-    const auto replayStarted = fixture.api->handle(request(
+    const auto replayStarted = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(replayStarted.status(), 202);
     const auto replayStartBody = json::parse(replayStarted.body()).as_object();
@@ -539,15 +646,15 @@ TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
     replayCompletion["password"] = "correct-password";
     replayCompletion["recovery_code"] = recoveryCode;
     const std::string replayPreauth = preauthCookieHeader(replayStarted);
-    const auto replayed = fixture.api->handle(request(
+    const auto replayed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(replayCompletion), replayPreauth));
     EXPECT_EQ(replayed.status(), 401);
 }
 
-TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
+TEST(AuthenticationHttpApiTest, NativeLoginLeafCannotIssueRecoveryCodesAfterTotpDisable)
 {
     Fixture fixture;
-    const auto started = fixture.api->handle(request(
+    const auto started = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(started.status(), 202);
     const auto startBody = json::parse(started.body()).as_object();
@@ -557,7 +664,7 @@ TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
     completion["password"] = std::string{"correct-"} + "pass" + "word";
     completion["totp"] = fixture.totpCode;
     const std::string preauthCookies = preauthCookieHeader(started);
-    const auto completed = fixture.api->handle(request(
+    const auto completed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(completion), preauthCookies));
     ASSERT_EQ(completed.status(), 200) << completed.body();
     const std::string token = cookieValue(completed, "__Host-openproof-session");
@@ -566,10 +673,10 @@ TEST(AuthenticationHttpApiTest, RecoveryCodesRequireEnabledTotp)
     ASSERT_TRUE(fixture.accounts->removeTotp(idp::ExternalSubject{"alice"}));
     const auto recovery = fixture.api->handle(request(
         "/auth/recovery-codes", {}, "__Host-openproof-session=" + token));
-    EXPECT_EQ(recovery.status(), 412);
-    const auto errorBody = json::parse(recovery.body()).as_object();
-    ASSERT_TRUE(errorBody.contains("error"));
-    EXPECT_EQ(errorBody.at("error").as_object().at("code"), "FAILED_PRECONDITION");
+    EXPECT_EQ(recovery.status(), 503); // This leaf cannot issue recovery codes.
+    auto enabled=fixture.accounts->hasTotp(idp::ExternalSubject{"alice"});
+    ASSERT_TRUE(enabled);
+    EXPECT_FALSE(enabled.value());
     auto remaining = fixture.recoveryRepository.remaining(core::IdentityId{"identity-1"});
     ASSERT_TRUE(remaining);
     EXPECT_EQ(remaining.value(), 0U);
@@ -583,7 +690,7 @@ TEST(AuthenticationHttpApiTest, LongValidSubjectCookieSurvivesLoginVerification)
     Fixture fixture{subject};
     json::object input;
     input["subject"] = subject;
-    const auto started = fixture.api->handle(
+    const auto started = fixture.invoke(
         request("/auth/login", json::serialize(input)));
     ASSERT_EQ(started.status(), 202) << started.body();
     const std::string subjectCookie =
@@ -597,7 +704,7 @@ TEST(AuthenticationHttpApiTest, LongValidSubjectCookieSurvivesLoginVerification)
     proof["challenge_id"] = body.at("challenge_id");
     proof["password"] = "correct-password";
     proof["totp"] = fixture.totpCode;
-    const auto completed = fixture.api->handle(request(
+    const auto completed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(proof), preauthCookieHeader(started)));
     ASSERT_EQ(completed.status(), 200) << completed.body();
     EXPECT_FALSE(cookieValue(completed, "__Host-openproof-session").empty());
@@ -606,7 +713,7 @@ TEST(AuthenticationHttpApiTest, LongValidSubjectCookieSurvivesLoginVerification)
 TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession)
 {
     Fixture fixture;
-    const auto started = fixture.api->handle(request(
+    const auto started = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(started.status(), 202);
     const auto beginBody = json::parse(started.body()).as_object();
@@ -615,7 +722,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
     firstProof["challenge_id"] = beginBody.at("challenge_id");
     firstProof["password"] = "correct-password";
     firstProof["totp"] = fixture.totpCode;
-    const auto completed = fixture.api->handle(request(
+    const auto completed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(firstProof), preauthCookieHeader(started)));
     ASSERT_EQ(completed.status(), 200);
     const std::string oldToken = cookieValue(completed, "__Host-openproof-session");
@@ -623,7 +730,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
 
     // A failed login from the same browser must not create or revoke a session.
     const std::string sameBrowserCookie = "__Host-openproof-session=" + oldToken;
-    const auto rejectedStart = fixture.api->handle(request(
+    const auto rejectedStart = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})", sameBrowserCookie));
     ASSERT_EQ(rejectedStart.status(), 202);
     const auto rejectedBody = json::parse(rejectedStart.body()).as_object();
@@ -632,7 +739,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
     invalidProof["challenge_id"] = rejectedBody.at("challenge_id");
     invalidProof["password"] = "wrong-password";
     invalidProof["totp"] = fixture.totpCode;
-    const auto failed = fixture.api->handle(request(
+    const auto failed = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(invalidProof),
         preauthCookieHeader(rejectedStart) + "; " + sameBrowserCookie));
     EXPECT_EQ(failed.status(), 401);
@@ -643,7 +750,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
 
     // Advance the authenticator clock: replay of an already used TOTP is refused.
     fixture.clock.advance(std::chrono::seconds{31});
-    const auto secondStarted = fixture.api->handle(request(
+    const auto secondStarted = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})", sameBrowserCookie));
     ASSERT_EQ(secondStarted.status(), 202);
     const auto secondStartBody = json::parse(secondStarted.body()).as_object();
@@ -656,7 +763,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
     secondProof["challenge_id"] = secondStartBody.at("challenge_id");
     secondProof["password"] = "correct-password";
     secondProof["totp"] = newCode;
-    const auto relogged = fixture.api->handle(request(
+    const auto relogged = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(secondProof),
         preauthCookieHeader(secondStarted) + "; " + sameBrowserCookie));
     ASSERT_EQ(relogged.status(), 200) << relogged.body();
@@ -673,7 +780,7 @@ TEST(AuthenticationHttpApiTest, RepeatedLoginFromSameCookieRetiresEarlierSession
 TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookies)
 {
     Fixture fixture;
-    const auto started = fixture.api->handle(request(
+    const auto started = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     const auto body = json::parse(started.body()).as_object();
     json::object completion;
@@ -682,7 +789,7 @@ TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookie
     completion["password"] = "wrong-password";
     completion["totp"] = fixture.totpCode;
     const std::string cookies = preauthCookieHeader(started);
-    const auto rejected = fixture.api->handle(request(
+    const auto rejected = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(completion), cookies));
     EXPECT_EQ(rejected.status(), 401);
     EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth"), "");
@@ -694,7 +801,7 @@ TEST(AuthenticationHttpApiTest, WrongPasswordBurnsExchangeAndClearsPreauthCookie
 TEST(AuthenticationHttpApiTest, TamperedSubjectCookieCannotSwitchAccounts)
 {
     Fixture fixture;
-    const auto started = fixture.api->handle(request(
+    const auto started = fixture.invoke(request(
         "/auth/login", R"({"subject":"alice"})"));
     ASSERT_EQ(started.status(), 202);
     const auto body = json::parse(started.body()).as_object();
@@ -704,7 +811,7 @@ TEST(AuthenticationHttpApiTest, TamperedSubjectCookieCannotSwitchAccounts)
     completion["password"] = "correct-password";
     completion["totp"] = fixture.totpCode;
 
-    const auto rejected = fixture.api->handle(request(
+    const auto rejected = fixture.invoke(request(
         "/auth/mfa/verify", json::serialize(completion),
         preauthCookieHeader(started, "Ym9i")));
 
@@ -714,9 +821,8 @@ TEST(AuthenticationHttpApiTest, TamperedSubjectCookieCannotSwitchAccounts)
     EXPECT_EQ(cookieValue(rejected, "__Host-openproof-preauth-subject"), "");
 }
 
-TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
+TEST(AuthenticationHttpApiTest, SharedSessionCredentialParserRejectsAmbiguity)
 {
-    Fixture fixture;
     auto ambiguous = gw::HttpRequest::create(
         gw::HttpMethod::Post, "/auth/logout",
         {{"authorization", "Bearer bearer-token"},
@@ -724,9 +830,9 @@ TEST(AuthenticationHttpApiTest, LogoutRejectsAmbiguousCredentials)
         {}, "127.0.0.1", fnd::CorrelationId{"request"});
     ASSERT_TRUE(ambiguous);
 
-    const auto rejected = fixture.api->handle(std::move(ambiguous).value());
-    EXPECT_EQ(rejected.status(), 401);
-    EXPECT_TRUE(setCookies(rejected).empty());
+    auto rejected=gw::takeSessionCredential(ambiguous.value());
+    EXPECT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(),fnd::ErrorCode::AuthenticationFailed);
 }
 
 TEST(Web3PresentationMetadataTest, DiscardsUnsafeTextWithoutBlockingAuthentication)

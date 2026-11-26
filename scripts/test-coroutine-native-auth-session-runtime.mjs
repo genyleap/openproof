@@ -14,10 +14,11 @@ const handler=read("src/storage/postgres/coroutine_session_http.cpp");
 const ctest=read("tests/storage/postgres_coroutine_network_test.cpp");
 const cmake=read("apps/opp/CMakeLists.txt");
 
-test("auth session cutover is independently opt-in and rejected before DB migration when malformed",()=>{
+test("auth session cutover is mandatory and rejects invalid or disabled configuration before migration",()=>{
   assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS"\)/);
   assert.match(app,/nativeAuthSessionFlag && \*nativeAuthSessionFlag != "0"/);
-  assert.match(app,/nativeAuthSessionFlag && \*nativeAuthSessionFlag == "1"/);
+  assert.match(app,/const bool nativeAuthSessionEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeAuthSessionFlag && \*nativeAuthSessionFlag == "1"\)/);
+  assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeAuthSessionFlag && \*nativeAuthSessionFlag == "0"/);
   assert.match(app,/nativeAuthSessionEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const begin=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
   const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",begin);

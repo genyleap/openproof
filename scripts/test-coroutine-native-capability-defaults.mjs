@@ -169,12 +169,13 @@ test("native protected proxy is opt-in, first-party only and confined to its nam
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermittedRequests\)/);
 });
 
-test("native local login is a separate opt-in with strict routes and owner-bound proof verification", () => {
+test("native local login is mandatory in authenticated runtime with owner-bound proof verification", () => {
   const app = read("apps/opp/main.cpp");
   const cmake = read("apps/opp/CMakeLists.txt");
   assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN"\)/);
   assert.match(app, /nativeLocalFlag && \*nativeLocalFlag != "0" && \*nativeLocalFlag != "1"/);
-  assert.match(app, /const bool nativeLocalEnabled = nativeLocalFlag && \*nativeLocalFlag == "1"/);
+  assert.match(app, /const bool nativeLocalEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeLocalFlag && \*nativeLocalFlag == "1"\)/);
+  assert.match(app, /platform\.auth\(\)\.enabled\(\) && nativeLocalFlag && \*nativeLocalFlag == "0"/);
   assert.match(app, /nativeLocalEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const flag = app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN");
   assert.ok(flag < app.indexOf("postgres::Migrator migrator{*pool.value()}", flag));
@@ -183,7 +184,19 @@ test("native local login is a separate opt-in with strict routes and owner-bound
   assert.match(app, /\*nativeLocalProviders, \*nativeTransactions, externalIdentities, clock/);
   assert.match(app, /nativeLocalAuthentication->nativeProviderAuthenticationEnabled\(providerId\)/);
   assert.match(app, /if \(nativeLocalEnabled\) \{\s*nativePaths\.emplace_back\("\/auth\/login"\);\s*nativePaths\.emplace_back\("\/auth\/mfa\/verify"\);\s*\}/);
-  assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication, sessions, recoveryCodes\.value\(\), \*accounts\.value\(\),\s*limiter\.value\(\), providerId, fallback, nativeSessions\.get\(\)\}/);
+  assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication, \*nativeSessions,\s*limiter\.value\(\), providerId, fallback\}/);
+  const constructors = [...app.matchAll(/authHttp::AuthenticationHttpApi \w+\{([\s\S]*?)\};/g)];
+  assert.equal(constructors.length, 3);
+  for (const [, args] of constructors) {
+    assert.match(args, /^\s*\*nativeLocalAuthentication, \*nativeSessions,/);
+    assert.doesNotMatch(args, /recoveryCodes|accounts\.value\(\)/);
+  }
+  const authHttp = read("src/authentication/http/http.cpp");
+  assert.match(authHttp, /m_authentication\(&authentication\), m_asyncSessions\(&sessions\)/);
+  assert.doesNotMatch(authHttp, /\b(?:m_sessions|m_recoveryCodes|m_localAccounts)\b/);
+  const sync = authHttp.slice(authHttp.indexOf("AuthenticationHttpApi::handle("),
+    authHttp.indexOf("AuthenticationHttpApi::nativeEnabledFor("));
+  assert.match(sync, /SensitiveAuthRequestGuard wipeRequestOnExit\{request\};\s*return error\(foundation::Error\{foundation::ErrorCode::Unavailable\}, request\)/);
   assert.match(app, /runWithScim\(enterpriseApi, localEnterpriseApi\)/);
   assert.match(app, /runWithScim\(enterpriseApi, localWeb3Api\)/);
   assert.match(cmake, /openproof_postgres_async_local_credentials/);

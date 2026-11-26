@@ -4717,6 +4717,37 @@ precondition for retiring legacy federation transport without abandoning
 in-flight browser transactions. It does not by itself authorize default
 activation of native callbacks or removal of compatibility handlers.
 
+### Mandatory native first-party authentication runtime
+
+The authenticated executable now requires native local login, native
+session mutations and native recovery issuance. Their historical flags
+may be unset or 1; explicitly disabling any rejects startup before
+migration. All three AuthenticationHttpApi constructions in opp use
+the native-only constructor, which has no synchronous session,
+credential or recovery dependencies. Six exact paths fail closed rather
+than fall back. Existing library compatibility constructor/methods
+remain for the old in-memory regressions; this increment does not remove
+them from the library or claim a passing global HTTP authentication gate.
+Default candidate E2E exercises native proof and recovery behavior;
+only the pinned historical benchmark sets OPENPROOF_E2E_EXPECT_LEGACY_AUTH.
+Full compiled and disposable HTTP acceptance is required before release.
+
+### Removal of synchronous first-party authentication HTTP implementation
+
+AuthenticationHttpApi no longer exposes a synchronous constructor or
+login/verify/rotation/logout/recovery implementations. Its synchronous
+entry rejects its namespace and delegates only non-authentication paths.
+The native-only constructor accepts a replacing session issuer; exact
+runtime overlays dispatch session mutation and recovery to their existing
+native adapters. The static gate now requires those actual dependencies,
+mandatory pre-migration configuration checks, strict paths and absence
+of old functions/SPIs, rather than expecting the retired methods to exist.
+The in-memory password HTTP regressions now use native test ports; session
+mutation and recovery eligibility wire semantics remain covered by their
+dedicated native C++/PostgreSQL suites and default identity-platform E2E.
+The gate result is source-level evidence; compiled and runtime approval
+still require exact-head tests and benchmarks.
+
 ### Native OAuth2 form_post callback
 
 Native callbacks now admit bounded application/x-www-form-urlencoded POST
