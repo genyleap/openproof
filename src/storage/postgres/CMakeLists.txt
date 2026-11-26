@@ -263,7 +263,7 @@ endif()
 
 # Native credential reads and generation-checked second-factor consumption.
 add_library(openproof_postgres_async_local_credentials STATIC
-    coroutine_local_credential_store.cpp)
+    coroutine_local_credential_store.cpp coroutine_local_proof_verifier.cpp)
 target_compile_features(openproof_postgres_async_local_credentials PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_local_credentials PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -272,9 +272,9 @@ set_target_properties(openproof_postgres_async_local_credentials PROPERTIES
 target_compile_definitions(openproof_postgres_async_local_credentials PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_local_credentials PUBLIC
     openproof_postgres_async_io openproof_identity_core openproof_identity_provider
-    openproof_credentials openproof_security
+    openproof_credentials openproof_security openproof_credentials_async openproof_provider_local_async
     openproof_foundation Boost::headers PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(coroutine_local_credential_store.cpp
+    set_source_files_properties(coroutine_local_credential_store.cpp coroutine_local_proof_verifier.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()

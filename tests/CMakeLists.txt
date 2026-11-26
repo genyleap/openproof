@@ -747,6 +747,7 @@ gtest_discover_tests(openproof_postgres_async_auth_transaction_tests
 add_executable(openproof_coroutine_recovery_code_service_tests
     credentials/coroutine_recovery_code_service_test.cpp
     credentials/bounded_password_executor_test.cpp
+    providers/coroutine_local_provider_test.cpp
     ${PROJECT_SOURCE_DIR}/src/gateway/asio_thread_context.cpp)
 target_compile_features(openproof_coroutine_recovery_code_service_tests PRIVATE cxx_std_26)
 target_include_directories(openproof_coroutine_recovery_code_service_tests PRIVATE
@@ -758,6 +759,7 @@ target_compile_definitions(openproof_coroutine_recovery_code_service_tests PRIVA
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_coroutine_recovery_code_service_tests PRIVATE
     openproof_credentials_async openproof_credentials openproof_security
+    openproof_provider_local_async
     openproof_identity_core openproof_foundation Boost::headers
     GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

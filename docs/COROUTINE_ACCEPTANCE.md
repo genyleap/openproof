@@ -4549,3 +4549,22 @@ verifies again. The persisted compare-and-swap remains separate.
 The worker is an internal credential primitive; native local provider
 composition and HTTP activation are not part of this checkpoint. Callers
 must quiesce before destroying the executor. No Production change.
+
+
+### Native local proof provider composition
+
+The independent local coroutine provider now delegates full factor
+verification to a storage-neutral verifier SPI. PostgreSQL implements
+the SPI using the native credential store, bounded password KDF executor,
+authenticated TOTP ciphertext and recovery-code HMAC. No SQL lease is
+held while hashing. Password-only and possession-factor proofs preserve
+IAL1 and IAL2 respectively; the synchronous completion entry fails closed.
+Recovery-code authentication retains the existing no-rehash policy.
+
+Before runtime activation, bind the verified canonical owner to the
+trusted coordinator's finalization/session boundary: a local alias could
+be rebound after SQL proof confirmation but before canonical finalization.
+The provider-neutral canonical lookup must not authenticate the new owner
+of an alias using a proof for its former owner. Also complete runtime
+composition and actual HTTP/password/MFA regression acceptance. No route
+or production flag changes are included here.

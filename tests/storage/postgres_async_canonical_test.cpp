@@ -30,6 +30,7 @@
 #include "coroutine_authorization_audit.hpp"
 #include "coroutine_verification_challenge_store.hpp"
 #include "coroutine_local_credential_store.hpp"
+#include "coroutine_local_proof_verifier.hpp"
 
 import openproof.account;
 import openproof.authentication;
@@ -1719,6 +1720,101 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalRecoveryAndRehashRejectChangedCr
         "UPDATE openproof.identities SET status=0 WHERE id=$1", {seed.owner})));
     EXPECT_TRUE(run(store.consumeRecoveryAsync(subject, updated->value(), secondDigest)));
     EXPECT_EQ(remaining(), "0");
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAndRecovery)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace cred = openproof::credentials;
+    namespace sec = openproof::security;
+    namespace local = openproof::provider::local;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    auto policy = cred::PasswordPolicy::create(1024U, 8U, 1U, 16U, 32U, 2U * 1024U * 1024U);
+    ASSERT_TRUE(policy);
+    auto maker = cred::PasswordHasher::create(fnd::SecretString{std::string(32U, 'p')}, policy.value());
+    auto worker = cred::PasswordHasher::create(fnd::SecretString{std::string(32U, 'p')}, policy.value());
+    ASSERT_TRUE(maker && worker);
+    auto hash = maker->hash(fnd::SecretString{"fixture-password"});
+    ASSERT_TRUE(hash);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,$2,1770000000000)", {seed.owner, std::string{hash->encoded()}})));
+    auto passwords = cred::BoundedPasswordExecutor::create(std::move(worker).value(), 1U);
+    ASSERT_TRUE(passwords);
+    auto key = sec::AeadKey::create(fnd::SecretString{std::string(32U, 'k')});
+    auto fixtureKey = sec::AeadKey::create(fnd::SecretString{std::string(32U, 'k')});
+    ASSERT_TRUE(key && fixtureKey);
+    fnd::SecretString pepper{std::string(32U, 'r')};
+    auto digest = sec::hmacSha256(pepper, "fixture-recovery-code");
+    ASSERT_TRUE(digest);
+    asio::io_context io;
+    fnd::ManualClockSource clock{kNow};
+    const idp::ProviderId id{"native-canonical-provider"};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, id, 2U, 500ms, 1000ms, 3000ms};
+    pg::CoroutinePostgresLocalProofVerifier verifier{store, *passwords.value(),
+        cred::TotpPolicy::recommended(), std::move(key).value(), 1U, std::move(pepper)};
+    local::CoroutineLocalAuthenticationProvider provider{id, verifier, clock, 5min};
+    auto run = [&]<typename T>(asio::awaitable<T> pending) {
+        io.restart();
+        auto complete = asio::co_spawn(io, std::move(pending), asio::use_future);
+        io.run();
+        return complete.get();
+    };
+    auto proof = [&](std::string password, std::optional<std::string> totp = std::nullopt,
+                     std::optional<std::string> recovery = std::nullopt,
+                     std::optional<std::string> subject = std::nullopt) {
+        idp::AuthenticationResponse response{idp::ChallengeId{"disposable-provider-proof"}, idp::ClientContext{}};
+        response.setParameter("subject", idp::CredentialValue{subject.value_or(seed.subject)});
+        response.setParameter("password", idp::CredentialValue{std::move(password)});
+        if (totp) response.setParameter("totp", idp::CredentialValue{std::move(*totp)});
+        if (recovery) response.setParameter("recovery_code", idp::CredentialValue{std::move(*recovery)});
+        return run(provider.completeAuthenticationAsync(std::move(response)));
+    };
+    auto first = proof("fixture-password");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->claimedAssurance(), idp::AssuranceLevel::Ial1);
+    EXPECT_FALSE(proof("incorrect-password"));
+    EXPECT_FALSE(proof("fixture-password", {}, {}, seed.unlinkedSubject));
+    EXPECT_FALSE(proof("fixture-password", {}, {}, seed.foreignSubject));
+    EXPECT_FALSE(proof("fixture-password", {}, "fixture-recovery-code"));
+
+    fnd::SecretString rawSeed{std::string(20U, 't')};
+    auto envelope = sec::sealAes256Gcm(fixtureKey.value(), rawSeed,
+        "openproof/totp/v1:" + seed.owner);
+    ASSERT_TRUE(envelope);
+    auto totpSecret = cred::TotpSecret::create(std::move(rawSeed));
+    ASSERT_TRUE(totpSecret);
+    auto code = cred::totpAt(totpSecret.value(), cred::TotpPolicy::recommended(), kNow);
+    ASSERT_TRUE(code);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,enrolled_at_ms) "
+        "VALUES($1,decode($2,'hex'),1,1770000000000)", {seed.owner, fnd::toHex(envelope.value())})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.recovery_codes(identity_id,code_digest,issued_at_ms) "
+        "VALUES($1,decode($2,'hex'),1770000000000)", {seed.owner, fnd::toHex(digest.value())})));
+    EXPECT_FALSE(proof("fixture-password"));
+    EXPECT_FALSE(proof("incorrect-password", code.value()));
+    EXPECT_FALSE(proof("fixture-password", code.value(), "fixture-recovery-code"));
+    auto mfa = proof("fixture-password", code.value());
+    ASSERT_TRUE(mfa);
+    EXPECT_EQ(mfa->claimedAssurance(), idp::AssuranceLevel::Ial2);
+    EXPECT_TRUE(mfa->strength().isMultiFactor());
+    EXPECT_FALSE(proof("fixture-password", code.value()));
+    EXPECT_FALSE(proof("incorrect-password", {}, "fixture-recovery-code"));
+    auto recovered = proof("fixture-password", {}, "fixture-recovery-code");
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered->claimedAssurance(), idp::AssuranceLevel::Ial2);
+    EXPECT_FALSE(proof("fixture-password", {}, "fixture-recovery-code"));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
