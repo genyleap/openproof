@@ -61,6 +61,34 @@ test("server preflight and listener use no blocking PostgreSQL repository",()=>{
   assert.match(read(".github/workflows/ci.yml"),/tests\/openproof_postgres_native_only_tests/);
   assert.match(read(".github/workflows/native-coroutine.yml"),/tests\/openproof_postgres_native_only_tests/);
 });
+test("offline master key rotation and all CLI schema checks use native libpq",()=>{
+  const cli=app.slice(app.indexOf("ExitCode runTotpRekey("),app.indexOf("ExitCode runListener("));
+  assert.equal([...cli.matchAll(/postgres::migrateSchemaBeforeListener\(/g)].length,4);
+  assert.doesNotMatch(cli,/postgres::Migrator|PostgresMasterKeyRotator/);
+  const master=cli.slice(cli.indexOf("ExitCode runMasterKeyRotation("),cli.indexOf("ExitCode runBootstrapAdmin("));
+  assert.match(master,/postgres::verifyMasterKeyBeforeListener\(/);
+  assert.match(master,/postgres::rotateMasterKeyOffline\(/);
+  assert.doesNotMatch(master,/postgres::ConnectionPool|postgres::PoolConfig/);
+  const startup=read("src/storage/postgres/coroutine_startup.cpp");
+  const rotation=startup.slice(startup.indexOf("rotateMasterAsync("),startup.indexOf("foundation::Result<NativeMasterRotationReport> rotateMasterKeyOffline("));
+  const order=["BEGIN ISOLATION LEVEL SERIALIZABLE","pg_advisory_xact_lock(7299730475761673317)",
+    "IN ACCESS EXCLUSIVE MODE","WHERE to_version=$1","ORDER BY sequence DESC LIMIT 1",
+    "security::constantTimeEquals(std::span","WITH removed AS (DELETE FROM openproof.",
+    'remove("authentication_transactions")','remove("sessions")','remove("account_verification_challenges")',
+    'remove("passkey_registration_ceremonies")','remove("oauth_authorization_codes")',
+    'remove("oauth_token_families")','remove("oauth_device_authorizations")',
+    'remove("oauth_pushed_authorization_requests")','execute("ROLLBACK",{})',
+    "INSERT INTO openproof.master_key_rotations",'execute("COMMIT",{})','committed.commandTag!="COMMIT"'];
+  let previous=-1;
+  for(const term of order){
+    const index=rotation.indexOf(term,previous+1);
+    assert.ok(index>previous,term);previous=index;
+  }
+  assert.doesNotMatch(cppExecutableText(rotation),/PQexec|PQconnectdb|PQreset|condition_variable/);
+  const integration=read("tests/storage/postgres_integration_test.cpp");
+  assert.match(integration,/MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState/);
+  assert.match(integration,/pg::rotateMasterKeyOffline\(fnd::SecretString\{dsn\}/);
+});
 test("liveness has no SQL dependency and readiness is bounded and fail-closed",()=>{
   const body=http.slice(http.indexOf("CoroutineHealthAdapter::handleAsync("));
   const ordered=["scrub(request);","method!=gateway::HttpMethod::Get","if (live) co_return response(200,true)",

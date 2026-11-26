@@ -1245,9 +1245,17 @@ organization checks use a separate bounded read-only snapshot.
 The finite startup event loop completes before the listener is created;
 filesystem loading occurs only before serving requests. Deployment SQL
 files are trusted administrative artifacts, not untrusted request data.
-Offline CLI operations still use the compatibility module, so the server
-executable continues to link that module for CLI subcommands. The strict
-storage gate remains open until the blocking implementation itself is retired.
+All four database-backed CLI subcommands now share the native schema
+migration and master-key journal validation. Offline master-key rotation
+uses a dedicated native libpq connection with a serializable transaction,
+the original advisory lock and exclusive table locks, constant-time
+journal fingerprint validation, exact invalidated-row counts and atomic
+journal insertion. Dry runs roll back; the operation has a five-minute
+SQL deadline. The offline operator contract is unchanged: stop the server
+before rotation and update the configured key before restarting.
+TOTP rekey, bootstrap and initial-owner repair still use the compatibility
+module for their mutations. The strict storage gate remains open until
+the blocking implementation itself is retired.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must
 also pass.

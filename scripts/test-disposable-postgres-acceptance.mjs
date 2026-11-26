@@ -43,6 +43,9 @@ test("canonical SQL runner denies both skipped tests and empty discovery", () =>
 
 test("canonical SQL fixture includes sender constraint schema and supports exact cached build",()=>{
   assert.match(canonical,/0010_oauth_sender_constraints\.sql/);
+  assert.ok(canonical.indexOf("0007_oauth_device_flow.sql")<canonical.indexOf("0008_oauth_par.sql"));
+  assert.ok(canonical.indexOf("0008_oauth_par.sql")<canonical.indexOf("0009_oauth_jar.sql"));
+  assert.ok(canonical.indexOf("0009_oauth_jar.sql")<canonical.indexOf("0010_oauth_sender_constraints.sql"));
   assert.ok(canonical.indexOf("0003_identity_provider.sql")<canonical.indexOf("0010_oauth_sender_constraints.sql"));
   assert.ok(canonical.indexOf("0010_oauth_sender_constraints.sql")<canonical.indexOf("0021_verification_reservation_generation.sql"));
   assert.ok(canonical.includes('build_dir="${1:-$repo/cmake-build-gcc-release}"'));

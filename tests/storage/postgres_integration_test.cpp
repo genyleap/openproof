@@ -1001,10 +1001,11 @@ TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerive
     const auto newFingerprint = sec::hmacSha256(
         fnd::SecretString{std::string(32U, 'n')},
         "openproof/master-key-fingerprint/v1").value();
-    pg::PostgresMasterKeyRotator rotator{*pool};
-    EXPECT_TRUE(rotator.verifyActive(1U, oldFingerprint));
-    EXPECT_FALSE(rotator.verifyActive(2U, newFingerprint));
-    auto dryRun = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, true);
+    const auto dsn=std::getenv("OPENPROOF_TEST_POSTGRES");
+    ASSERT_NE(dsn,nullptr);
+    EXPECT_TRUE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},1U,oldFingerprint));
+    EXPECT_FALSE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},2U,newFingerprint));
+    auto dryRun=pg::rotateMasterKeyOffline(fnd::SecretString{dsn},1U,oldFingerprint,2U,newFingerprint,true);
     ASSERT_TRUE(dryRun) << dryRun.error().internalDetail();
     EXPECT_TRUE(dryRun->dryRun);
     EXPECT_EQ(dryRun->invalidated(), 8U);
@@ -1025,12 +1026,12 @@ TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerive
     EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 0), "8");
     EXPECT_STREQ(PQgetvalue(afterDryRun.get(), 0, 1), "0");
 
-    auto committed = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, false);
+    auto committed=pg::rotateMasterKeyOffline(fnd::SecretString{dsn},1U,oldFingerprint,2U,newFingerprint,false);
     ASSERT_TRUE(committed) << committed.error().internalDetail();
     EXPECT_FALSE(committed->dryRun);
     EXPECT_EQ(committed->invalidated(), 8U);
-    EXPECT_FALSE(rotator.verifyActive(1U, oldFingerprint));
-    EXPECT_TRUE(rotator.verifyActive(2U, newFingerprint));
+    EXPECT_FALSE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},1U,oldFingerprint));
+    EXPECT_TRUE(pg::verifyMasterKeyBeforeListener(fnd::SecretString{dsn},2U,newFingerprint));
 
     std::unique_ptr<PGresult, ResultDeleter> afterCommit{PQexec(
         direct.get(),
@@ -1060,7 +1061,7 @@ TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerive
         EXPECT_STREQ(PQgetvalue(afterCommit.get(), 0, column), "1");
     }
 
-    auto duplicate = rotator.rotate(1U, oldFingerprint, 2U, newFingerprint, false);
+    auto duplicate=pg::rotateMasterKeyOffline(fnd::SecretString{dsn},1U,oldFingerprint,2U,newFingerprint,false);
     ASSERT_FALSE(duplicate);
     EXPECT_EQ(duplicate.error().code(), fnd::ErrorCode::AlreadyExists);
     const auto wrongFingerprint = sec::hmacSha256(
@@ -1069,8 +1070,8 @@ TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerive
     const auto thirdFingerprint = sec::hmacSha256(
         fnd::SecretString{std::string(32U, 'z')},
         "openproof/master-key-fingerprint/v1").value();
-    auto wrongHead = rotator.rotate(
-        2U, wrongFingerprint, 3U, thirdFingerprint, true);
+    auto wrongHead=pg::rotateMasterKeyOffline(fnd::SecretString{dsn},
+        2U,wrongFingerprint,3U,thirdFingerprint,true);
     ASSERT_FALSE(wrongHead);
     EXPECT_EQ(wrongHead.error().code(), fnd::ErrorCode::FailedPrecondition);
 }

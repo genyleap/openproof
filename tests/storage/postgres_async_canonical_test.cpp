@@ -815,7 +815,7 @@ TEST(PostgresCanonicalCoroutineTest, NativeEvidenceChallengesAndBatchesAreSessio
     EXPECT_EQ(listed->front().id(),item.id());
     EXPECT_EQ(listed->front().confidence(),85U);
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
-        "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
+        "UPDATE openproof.sessions SET state=1,revoked_at_ms=1770000002000 WHERE id=$1",{sessionName})));
     EXPECT_FALSE(run(list));
     EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{record(evidenceId+"-revoked",seed.owner)}}));
 }
@@ -955,7 +955,8 @@ TEST(PostgresCanonicalCoroutineTest, NativeScimMutationsAreAtomicAndVersioned)
     groupPatch.expectedVersion=added->rows.front().updatedAt;
     groupPatch.memberChanges.push_back({scim::MemberAction::Add,{ids::IdentityId{second}}});
     auto modified=run(groupPatch);
-    ASSERT_TRUE(modified && modified->rows.size()==1U);
+    ASSERT_TRUE(modified) << (modified ? "" : std::string{modified.error().internalDetail()});
+    ASSERT_EQ(modified->rows.size(),1U);
     EXPECT_NE(modified->rows.front().json.find(second),std::string::npos);
     EXPECT_GT(modified->rows.front().updatedAt,added->rows.front().updatedAt);
     auto stale=run(groupPatch);
@@ -1158,7 +1159,7 @@ TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChalleng
     EXPECT_FALSE(assertProof(remaining->front().credentialId));
     ASSERT_TRUE(runMutation(mutate(remaining->front().credentialId)));
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
-        "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
+        "UPDATE openproof.sessions SET state=1,revoked_at_ms=1770000002000 WHERE id=$1",{sessionName})));
     EXPECT_FALSE(read());
     EXPECT_FALSE(read(ceremony("-revoked",kNow+300s)));
 }

@@ -31,9 +31,9 @@ std::chrono::milliseconds remaining(Clock::time_point deadline)
     return budget;
 }
 asio::awaitable<foundation::Status> validateAsync(foundation::SecretString dsn,
-    identity::core::OrganizationId tenant,unsigned int version,security::Sha256Digest fingerprint)
+    std::optional<identity::core::OrganizationId> tenant,unsigned int version,security::Sha256Digest fingerprint)
 {
-    if (version==0U || tenant.empty()) co_return foundation::fail(E::InvalidArgument);
+    if (version==0U || (tenant && tenant->empty())) co_return foundation::fail(E::InvalidArgument);
     try {
         const auto deadline=Clock::now()+std::chrono::seconds{10};
         auto connection=co_await pg::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
@@ -58,12 +58,14 @@ asio::awaitable<foundation::Status> validateAsync(foundation::SecretString dsn,
                     std::span<const std::byte>{fingerprint.data(),fingerprint.size()}))
                 co_return foundation::fail(E::FailedPrecondition,"Configured master key does not match the committed journal.");
         }
-        Params args{std::string{tenant.value()}};
-        const auto organization=co_await connection->query(
-            "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0",std::move(args),remaining(deadline));
-        if (organization.rows.size()!=1U || organization.rows.front().size()!=1U ||
-            organization.rows.front()[0]!=std::optional<std::string>{std::string{tenant.value()}})
-            co_return foundation::fail(E::FailedPrecondition,"Configured authentication organization is absent or inactive.");
+        if (tenant) {
+            Params args{std::string{tenant->value()}};
+            const auto organization=co_await connection->query(
+                "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0",std::move(args),remaining(deadline));
+            if (organization.rows.size()!=1U || organization.rows.front().size()!=1U ||
+                organization.rows.front()[0]!=std::optional<std::string>{std::string{tenant->value()}})
+                co_return foundation::fail(E::FailedPrecondition,"Configured authentication organization is absent or inactive.");
+        }
         const auto committed=co_await connection->query("COMMIT",{},remaining(deadline));
         if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
         co_return foundation::ok();
@@ -144,6 +146,112 @@ foundation::Result<NativeMigrationReport> migrateSchemaBeforeListener(
         io.run();
         return migrated.get();
     } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Database migration failed.");}
+}
+foundation::Status verifyMasterKeyBeforeListener(foundation::SecretString dsn,
+    unsigned int version,security::Sha256Digest fingerprint)
+{
+    try {
+        asio::io_context io;
+        auto checked=asio::co_spawn(io,validateAsync(std::move(dsn),std::nullopt,version,fingerprint),asio::use_future);
+        io.run();return checked.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Master key validation failed.");}
+}
+
+namespace {
+asio::awaitable<foundation::Result<NativeMasterRotationReport>> rotateMasterAsync(
+    foundation::SecretString dsn,unsigned int currentVersion,security::Sha256Digest currentFingerprint,
+    unsigned int replacementVersion,security::Sha256Digest replacementFingerprint,bool dryRun)
+{
+    if (currentVersion==0U || replacementVersion<=currentVersion || replacementVersion>2147483647U
+        || security::constantTimeEquals(currentFingerprint,replacementFingerprint))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+std::chrono::minutes{5};
+        auto connection=co_await pg::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        const auto execute=[&](std::string sql,Params args){
+            return connection->query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL SERIALIZABLE",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673317)",{}));
+        static_cast<void>(co_await execute(
+            "LOCK TABLE openproof.authentication_transactions,openproof.sessions,"
+            "openproof.account_verification_challenges,openproof.passkey_registration_ceremonies,"
+            "openproof.oauth_authorization_codes,openproof.oauth_token_families,"
+            "openproof.oauth_device_authorizations,openproof.oauth_pushed_authorization_requests IN ACCESS EXCLUSIVE MODE",{}));
+        Params duplicateArgs{std::to_string(replacementVersion)};
+        const auto duplicate=co_await execute("SELECT 1 FROM openproof.master_key_rotations WHERE to_version=$1",std::move(duplicateArgs));
+        if (!duplicate.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+        const auto head=co_await execute(
+            "SELECT to_version,encode(to_fingerprint,'hex') FROM openproof.master_key_rotations ORDER BY sequence DESC LIMIT 1",{});
+        if (head.rows.empty()) {
+            if (currentVersion!=1U) co_return foundation::fail(E::FailedPrecondition);
+        } else {
+            if (head.rows.size()!=1U || head.rows.front().size()!=2U || !head.rows.front()[0] || !head.rows.front()[1]
+                || *head.rows.front()[0]!=std::to_string(currentVersion))
+                co_return foundation::fail(E::FailedPrecondition);
+            auto fingerprint=foundation::fromHex(*head.rows.front()[1]);
+            if (!fingerprint || fingerprint->size()!=currentFingerprint.size() ||
+                !security::constantTimeEquals(std::span<const std::byte>{fingerprint->data(),fingerprint->size()},
+                    std::span<const std::byte>{currentFingerprint.data(),currentFingerprint.size()}))
+                co_return foundation::fail(E::FailedPrecondition);
+        }
+        // All statements are constant, offline-only and return one count
+        // regardless of the number of deleted records.
+        const auto remove=[&](std::string table)->asio::awaitable<std::size_t>{
+            const auto rows=co_await execute("WITH removed AS (DELETE FROM openproof."+table+
+                " RETURNING 1) SELECT count(*)::text FROM removed",{});
+            if (rows.rows.size()!=1U || rows.rows.front().size()!=1U || !rows.rows.front()[0])
+                throw std::runtime_error{"Invalid rotation count"};
+            std::size_t count{};
+            const auto& value=*rows.rows.front()[0];
+            const auto [end,error]=std::from_chars(value.data(),value.data()+value.size(),count);
+            if (error!=std::errc{} || end!=value.data()+value.size())
+                throw std::runtime_error{"Invalid rotation count"};
+            co_return count;
+        };
+        NativeMasterRotationReport report;
+        report.dryRun=dryRun;
+        report.authenticationTransactions=co_await remove("authentication_transactions");
+        report.sessions=co_await remove("sessions");
+        report.accountChallenges=co_await remove("account_verification_challenges");
+        report.passkeyRegistrations=co_await remove("passkey_registration_ceremonies");
+        report.authorizationCodes=co_await remove("oauth_authorization_codes");
+        report.tokenFamilies=co_await remove("oauth_token_families");
+        report.deviceAuthorizations=co_await remove("oauth_device_authorizations");
+        report.pushedRequests=co_await remove("oauth_pushed_authorization_requests");
+        if (dryRun) {
+            const auto rolledBack=co_await execute("ROLLBACK",{});
+            if (rolledBack.commandTag!="ROLLBACK" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+            co_return report;
+        }
+        Params args{std::to_string(currentVersion),std::to_string(replacementVersion),
+            foundation::toHex(currentFingerprint),foundation::toHex(replacementFingerprint),
+            std::to_string(report.authenticationTransactions),std::to_string(report.sessions),
+            std::to_string(report.accountChallenges),std::to_string(report.passkeyRegistrations),
+            std::to_string(report.authorizationCodes),std::to_string(report.tokenFamilies),
+            std::to_string(report.deviceAuthorizations),std::to_string(report.pushedRequests)};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.master_key_rotations"
+            "(from_version,to_version,from_fingerprint,to_fingerprint,authentication_transactions,sessions,account_challenges,"
+            "passkey_registrations,authorization_codes,token_families,device_authorizations,pushed_requests,rotated_at_ms) "
+            "VALUES($1,$2,decode($3,'hex'),decode($4,'hex'),$5,$6,$7,$8,$9,$10,$11,$12,"
+            "(extract(epoch FROM clock_timestamp())*1000)::bigint)",std::move(args)));
+        const auto committed=co_await execute("COMMIT",{});
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return report;
+    } catch (const std::exception&) {co_return foundation::fail(E::Unavailable,"Native master key rotation failed.");}
+}
+}
+foundation::Result<NativeMasterRotationReport> rotateMasterKeyOffline(
+    foundation::SecretString dsn,unsigned int currentVersion,security::Sha256Digest currentFingerprint,
+    unsigned int replacementVersion,security::Sha256Digest replacementFingerprint,bool dryRun)
+{
+    try {
+        asio::io_context io;
+        auto result=asio::co_spawn(io,rotateMasterAsync(std::move(dsn),currentVersion,currentFingerprint,
+            replacementVersion,replacementFingerprint,dryRun),asio::use_future);
+        io.run();return result.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Master key rotation failed.");}
 }
 foundation::Status nativeDatabasePreflight(foundation::SecretString dsn,std::filesystem::path directory,
     identity::core::OrganizationId tenant,unsigned int masterVersion,security::Sha256Digest fingerprint)

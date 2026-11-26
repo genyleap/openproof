@@ -768,13 +768,13 @@ addProtectedRoutes(gateway::Router& router,
 }
 
 [[nodiscard]] fnd::Status verifyActiveMasterKey(
-    postgres::ConnectionPool& pool, const cfg::SecurityConfig& configuration)
+    const cfg::PlatformConfig& platform)
 {
-    auto fingerprint = masterKeyFingerprint(configuration);
+    auto fingerprint=masterKeyFingerprint(platform.security());
     if (!fingerprint) return fnd::fail(fingerprint.error());
-    postgres::PostgresMasterKeyRotator rotator{pool};
-    return rotator.verifyActive(
-        configuration.masterKeyVersion(), fingerprint.value());
+    return postgres::verifyMasterKeyBeforeListener(
+        platform.database().connectionString().clone(),
+        platform.security().masterKeyVersion(),fingerprint.value());
 }
 
 [[nodiscard]] ExitCode runPersistentKeyMaterialization(
@@ -1018,6 +1018,12 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
     auto poolConfig = postgres::PoolConfig::create(
         platform.database().connectionString().clone(), platform.database().poolSize(),
         std::chrono::seconds{5});
@@ -1030,14 +1036,7 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(pool.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-    if (!migrations) {
-        reportStartupFailure(migrations.error());
-        return ExitCode::ConfigurationError;
-    }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
+    const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
@@ -1112,32 +1111,21 @@ addProtectedRoutes(gateway::Router& router,
             "The replacement master key must use different key material."});
         return ExitCode::ConfigurationError;
     }
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
     if (!migrations) {
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresMasterKeyRotator rotator{*pool.value()};
-    const fnd::Status activeMaster = rotator.verifyActive(
-        securityConfig.masterKeyVersion(), currentFingerprint.value());
+    const fnd::Status activeMaster = postgres::verifyMasterKeyBeforeListener(
+        platform.database().connectionString().clone(),
+        securityConfig.masterKeyVersion(),currentFingerprint.value());
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
     }
-    auto report = rotator.rotate(
+    auto report = postgres::rotateMasterKeyOffline(
+        platform.database().connectionString().clone(),
         securityConfig.masterKeyVersion(), currentFingerprint.value(),
         commandLine.newKeyVersion(), replacementFingerprint.value(),
         commandLine.dryRun());
@@ -1183,6 +1171,12 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
     auto poolConfig = postgres::PoolConfig::create(
         platform.database().connectionString().clone(), platform.database().poolSize(),
         std::chrono::seconds{5});
@@ -1195,14 +1189,7 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(pool.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-    if (!migrations) {
-        reportStartupFailure(migrations.error());
-        return ExitCode::ConfigurationError;
-    }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
+    const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
@@ -1274,6 +1261,12 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
+    if (!migrations) {
+        reportStartupFailure(migrations.error());
+        return ExitCode::ConfigurationError;
+    }
     auto poolConfig = postgres::PoolConfig::create(
         platform.database().connectionString().clone(), platform.database().poolSize(),
         std::chrono::seconds{5});
@@ -1286,14 +1279,8 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(pool.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-    if (!migrations) {
-        reportStartupFailure(migrations.error());
-        return ExitCode::ConfigurationError;
-    }
     const fnd::Status activeMaster =
-        verifyActiveMasterKey(*pool.value(), platform.security());
+        verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;

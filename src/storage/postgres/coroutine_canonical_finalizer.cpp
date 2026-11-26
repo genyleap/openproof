@@ -4138,7 +4138,7 @@ CoroutinePostgresCanonicalFinalizer::mutateScimAsync(enterprise::scim::MutationR
                         "updated_at_ms=GREATEST(openproof.identity_profiles.updated_at_ms,EXCLUDED.updated_at_ms)",std::move(profileArgs)));
                     Params metadataArgs{tenant,id,name,request.externalId,stamp,patch?"true":"false"};
                     static_cast<void>(co_await execute(
-                        "UPDATE openproof.scim_users SET user_name=$3,external_id=CASE WHEN $6::boolean AND $4 IS NULL THEN external_id ELSE $4 END,updated_at_ms=$5 "
+                        "UPDATE openproof.scim_users SET user_name=$3,external_id=CASE WHEN $6::boolean AND $4::text IS NULL THEN external_id ELSE $4::text END,updated_at_ms=$5 "
                         "WHERE organization_id=$1 AND identity_id=$2",std::move(metadataArgs)));
                 }
             }
@@ -4156,7 +4156,7 @@ CoroutinePostgresCanonicalFinalizer::mutateScimAsync(enterprise::scim::MutationR
                 Params metadataArgs{tenant,id,request.name,request.externalId,stamp,patch?"true":"false"};
                 static_cast<void>(co_await execute(
                     "UPDATE openproof.scim_groups SET display_name=COALESCE($3,display_name),"
-                    "external_id=CASE WHEN $6::boolean AND $4 IS NULL THEN external_id ELSE $4 END,updated_at_ms=$5 "
+                    "external_id=CASE WHEN $6::boolean AND $4::text IS NULL THEN external_id ELSE $4::text END,updated_at_ms=$5 "
                     "WHERE organization_id=$1 AND id=$2",std::move(metadataArgs)));
             }
             for (const auto& change:request.memberChanges) {
