@@ -1401,9 +1401,9 @@ addProtectedRoutes(gateway::Router& router,
         ? *nativeProtectedGatewayFlag == "1"
         : platform.auth().enabled() && !platform.oidc().enabled();
     if (nativeProtectedGatewayEnabled
-        && (!platform.auth().enabled() || platform.oidc().enabled())) {
+        && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
-            "Native protected gateway requires authentication without delegated OIDC."});
+            "Native protected gateway requires authentication."});
         return ExitCode::ConfigurationError;
     }
     // Authentication-enabled runtimes always use native local credentials.
@@ -2784,6 +2784,7 @@ addProtectedRoutes(gateway::Router& router,
     operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
     gateway::Gateway* nativeGatewayCore = nullptr;
+    oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
 
     std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
     if (nativeWeb3Enabled && platform.oidc().enabled()) {
@@ -3171,6 +3172,33 @@ addProtectedRoutes(gateway::Router& router,
                     "Native protected gateway dependencies are unavailable."});
                 return ExitCode::ConfigurationError;
             }
+            gatewayHttp::CoroutineProtectedGatewayAdapter::VerifyDelegated verifyDelegated;
+            gatewayHttp::CoroutineProtectedGatewayAdapter::VerifySender verifySender;
+            if (platform.oidc().enabled()) {
+                if (!nativeWeb3DelegatedKey || !nativeGatewaySender) {
+                    reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                        "Native delegated gateway dependencies are unavailable."});
+                    return ExitCode::ConfigurationError;
+                }
+                verifyDelegated=[&](fnd::SecretString credential)
+                    ->boost::asio::awaitable<fnd::Result<session::DelegatedAccess>> {
+                    if (credential.empty() || credential.expose().size()>256U)
+                        co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                    auto digest=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
+                    credential=fnd::SecretString{};
+                    if (!digest) co_return fnd::fail(digest.error());
+                    co_return co_await nativeCanonical->readDelegatedAccessAsync(fnd::toHex(digest.value()),clock.now());
+                };
+                verifySender=[&](gateway::HttpRequest& request,session::DelegatedSenderConstraint constraint,
+                    fnd::SecretString credential,bool dpopScheme) {
+                    return nativeGatewaySender->verifyAsync(request,constraint,credential,dpopScheme,
+                        [reader=nativeCanonical.get()](session::DelegatedSenderConstraintKind kind,
+                            std::string thumbprint,std::string identifier,fnd::Instant expires,fnd::Instant observed) {
+                            return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
+                                std::move(identifier),expires,observed);
+                        });
+                };
+            }
             gatewayHttp::CoroutineProtectedGatewayAdapter nativeGateway{
                 *nativeGatewayCore, *proxy.value(), nativeRoutes,
                 [verifier = nativeGatewayVerifier.get()](fnd::SecretString bearer) {
@@ -3196,7 +3224,7 @@ addProtectedRoutes(gateway::Router& router,
                                 "Authorization was denied and its security audit could not be persisted.");
                     }
                     co_return decision;
-                }};
+                },true,std::move(verifyDelegated),std::move(verifySender)};
             return runListener(platform, nativeGateway, logger);
         }
         if (nativeGatewayCore) {
@@ -3454,6 +3482,7 @@ addProtectedRoutes(gateway::Router& router,
     oauthHttp::SenderProofVerifier senderProof{
         dpopService, identityProviderStore, clock, std::string{openIdProvider.issuer()},
         std::move(mtlsForwardingKey)};
+    nativeGatewaySender=&senderProof;
 
     gateway::Gateway gatewayCore{
         router, sessions, access, limiter.value(), discovery, loadBalancer,

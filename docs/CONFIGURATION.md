@@ -910,31 +910,29 @@ identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
 
-### Native first-party protected gateway (coroutine branch only)
+### Native protected gateway (coroutine branch only)
 
-Authenticated runtimes without OIDC default to the native first-party
-protected reverse proxy. The compatibility flag
-OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY accepts 0 or 1.
-Explicit 0 retains the compatibility path during executable acceptance;
-1 requires authentication enabled and OIDC disabled. Other runtime
-configurations default to disabled.
-The flag does not add any route: the existing configured route policy must
-match the HTTP method and path, require authorization, and specify neither
-an OAuth scope nor an audience. Native dispatch is restricted to the
-segment-boundary namespace `/proxy` and `/proxy/...`; all other paths and
-scope/audience-constrained routes retain their existing dispatch. Reserve
-this namespace exclusively for upstream applications, not local HTTP APIs.
+Authenticated runtimes without OIDC default to native first-party
+protected reverse proxy. OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY
+accepts 0 or 1. Explicit 0 retains compatibility dispatch. Explicit 1
+requires authentication and also enables native delegated access for OIDC
+runtimes; OIDC stays opt-in until end-to-end executable acceptance.
 
-The native path uses the existing session HMAC key and verifies the bearer
-against PostgreSQL asynchronously, then resolves authoritative tenant
-membership/roles, evaluates the configured RBAC/assurance policy, and awaits
-rejected-decision audit/outbox persistence. It strips supplied trusted
-identity headers and credentials before sealing the accepted upstream
-context, and uses the existing retry and circuit-breaker decisions with
-native network I/O. DPoP credentials are not supported by this first-party
-slice. The flag is experimental and does not imply full migration acceptance;
-OAuth delegated access, other paths, and legacy synchronous transport
-consumers remain subject to the global release gate.
+The flag adds no routes. Native dispatch is limited to the configured
+protected routes under the reserved /proxy segment namespace. In
+non-OIDC mode, scope/audience-constrained routes remain on compatibility
+dispatch. In OIDC opt-in mode, scope and audience requirements are
+checked against the trusted token context; first-party sessions cannot
+satisfy delegated-only grants.
+
+The native gateway verifies credentials with PostgreSQL asynchronously,
+validates DPoP/mTLS sender binding and consumes the durable replay key,
+checks route grants, identity rate limits, authoritative membership and
+RBAC/assurance policy, and awaits rejected-decision audit persistence.
+Trusted identity/client/scope headers are sealed before forwarding.
+Proof headers are ingress-only and stripped before forwarding. The
+existing retry deadline and circuit-breaker decisions are preserved.
+This is not full migration acceptance.
 
 ### Experimental native owner-only member listing
 

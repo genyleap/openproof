@@ -4981,3 +4981,16 @@ connection paths now defer to that downstream capability. Method and
 dependency guards remain authoritative there; unrelated account paths
 are not enabled. Added HTTP dispatch regression. The repaired full E2E
 still needs execution.
+
+### Native delegated protected proxy opt-in
+
+The existing protected gateway adapter now supports an explicit OIDC
+runtime opt-in through OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY=1.
+It awaits first-party verification, falls back to native delegated access
+only on authentication failure (not storage outage), checks sender binding,
+required scope/audience, identity rate limit, authoritative policy and
+denial audit, then uses native upstream I/O. Trusted client and scope
+headers are attached before signing; proof headers are ingress-only.
+First-party default is unchanged. OIDC stays opt-in until compiled and
+live DPoP/mTLS proxy acceptance. No schema change. Signup and legacy
+unmigrated paths still prevent complete synchronous proxy retirement.

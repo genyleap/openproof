@@ -249,9 +249,14 @@ public:
     using Authorize = std::function<boost::asio::awaitable<policy::AuthorizationDecision>(
         session::AuthenticatedSession, Route, foundation::CorrelationId)>;
 
+    using VerifyDelegated=std::function<boost::asio::awaitable<
+        foundation::Result<session::DelegatedAccess>>(foundation::SecretString)>;
+    using VerifySender=std::function<boost::asio::awaitable<foundation::Status>(
+        HttpRequest&,session::DelegatedSenderConstraint,foundation::SecretString,bool)>;
+
     CoroutineProtectedGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport,
         CoroutineHttpHandler& fallback, Verify verify, Authorize authorize,
-        bool enableProtected = true);
+        bool enableProtected = true,VerifyDelegated verifyDelegated={},VerifySender verifySender={});
     [[nodiscard]] bool nativeEnabledFor(const HttpRequest& request) const noexcept override;
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse> handleAsync(HttpRequest request) override;
@@ -262,6 +267,8 @@ private:
     Verify m_verify;
     Authorize m_authorize;
     bool m_enableProtected;
+    VerifyDelegated m_verifyDelegated;
+    VerifySender m_verifySender;
 };
 
 }

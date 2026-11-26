@@ -207,23 +207,24 @@ CoroutineGatewayAdapter::handleAsync(HttpRequest request)
 
 CoroutineProtectedGatewayAdapter::CoroutineProtectedGatewayAdapter(
     Gateway& gateway, BeastProxyTransport& transport, CoroutineHttpHandler& fallback,
-    Verify verify, Authorize authorize,bool enableProtected)
+    Verify verify, Authorize authorize,bool enableProtected,VerifyDelegated verifyDelegated,VerifySender verifySender)
     : m_gateway(&gateway), m_transport(&transport), m_fallback(&fallback),
       m_verify(std::move(verify)), m_authorize(std::move(authorize)),
-      m_enableProtected(enableProtected)
+      m_enableProtected(enableProtected),m_verifyDelegated(std::move(verifyDelegated)),
+      m_verifySender(std::move(verifySender))
 {
 }
 
 bool CoroutineProtectedGatewayAdapter::nativeEnabledFor(const HttpRequest& request) const noexcept
 {
     return eligiblePublic(*m_gateway,request)
-        || (m_enableProtected && m_verify && m_authorize && eligible(*m_gateway, request))
+        || (m_enableProtected && m_verify && m_authorize && eligible(*m_gateway, request,static_cast<bool>(m_verifyDelegated)))
         || m_fallback->nativeEnabledFor(request);
 }
 
 HttpResponse CoroutineProtectedGatewayAdapter::handle(HttpRequest request)
 {
-    if (eligiblePublic(*m_gateway,request) || (m_enableProtected && eligible(*m_gateway, request)))
+    if (eligiblePublic(*m_gateway,request) || (m_enableProtected && eligible(*m_gateway, request,static_cast<bool>(m_verifyDelegated))))
         return reject(*m_gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                       std::move(request));
     return m_fallback->handle(std::move(request));
@@ -246,7 +247,7 @@ CoroutineProtectedGatewayAdapter::handleAsync(HttpRequest request)
         }
         co_return m_gateway->finishForward(plan);
     }
-    if (!m_enableProtected || !eligible(*m_gateway, request)) {
+    if (!m_enableProtected || !eligible(*m_gateway, request,static_cast<bool>(m_verifyDelegated))) {
         if (m_fallback->nativeEnabledFor(request))
             co_return co_await m_fallback->handleAsync(std::move(request));
         co_return reject(*m_gateway, foundation::Error{foundation::ErrorCode::Unavailable},
@@ -255,19 +256,44 @@ CoroutineProtectedGatewayAdapter::handleAsync(HttpRequest request)
     if (!m_verify || !m_authorize)
         co_return reject(*m_gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                          std::move(request));
-    auto started = begin(*m_gateway, std::move(request));
+    auto started = begin(*m_gateway, std::move(request),static_cast<bool>(m_verifyDelegated));
     if (auto* denied = std::get_if<HttpResponse>(&started))
         co_return std::move(*denied);
     auto pending = std::move(std::get<Pending>(started));
-    auto authenticated = co_await m_verify(std::move(pending.credential));
-    if (!authenticated)
-        co_return reject(*m_gateway, authenticated.error(), std::move(pending.request));
+    std::optional<session::DelegatedAccess> delegated;
+    auto authenticated = co_await m_verify(pending.credential.clone());
+    if (!authenticated) {
+        // Storage outages are not evidence that a credential is delegated.
+        if (!m_verifyDelegated || authenticated.error().code()!=foundation::ErrorCode::AuthenticationFailed)
+            co_return reject(*m_gateway,authenticated.error(),std::move(pending.request));
+        auto access=co_await m_verifyDelegated(pending.credential.clone());
+        if (!access) co_return reject(*m_gateway,access.error(),std::move(pending.request));
+        delegated.emplace(std::move(access).value());
+        if (delegated->senderConstraint()) {
+            if (!m_verifySender)
+                co_return reject(*m_gateway,foundation::Error{foundation::ErrorCode::AuthenticationFailed},std::move(pending.request));
+            auto proof=co_await m_verifySender(pending.request,*delegated->senderConstraint(),
+                std::move(pending.credential),pending.dpopScheme);
+            if (!proof) co_return reject(*m_gateway,proof.error(),std::move(pending.request));
+        } else if (pending.dpopScheme) {
+            co_return reject(*m_gateway,foundation::Error{foundation::ErrorCode::AuthenticationFailed},std::move(pending.request));
+        }
+        authenticated=delegated->authenticated();
+    } else if (pending.dpopScheme) {
+        co_return reject(*m_gateway,foundation::Error{foundation::ErrorCode::AuthenticationFailed},std::move(pending.request));
+    }
+    pending.credential=foundation::SecretString{};
+    if ((!pending.route.requiredScope().empty()
+            && (!delegated || !delegated->permits(pending.route.requiredScope())))
+        || (!pending.route.requiredAudience().empty()
+            && (!delegated || !delegated->permitsAudience(pending.route.requiredAudience()))))
+        co_return reject(*m_gateway,foundation::Error{foundation::ErrorCode::PermissionDenied},std::move(pending.request));
     if (!admitIdentity(*m_gateway, authenticated.value()))
         co_return reject(*m_gateway, foundation::Error{foundation::ErrorCode::RateLimited},
                          std::move(pending.request));
     auto decision = co_await m_authorize(authenticated.value(), pending.route,
                                         pending.request.correlation());
-    auto prepared = finish(*m_gateway, std::move(pending), authenticated.value(), decision);
+    auto prepared = finish(*m_gateway, std::move(pending), authenticated.value(), decision,delegated?&*delegated:nullptr);
     if (auto* denied = std::get_if<HttpResponse>(&prepared))
         co_return std::move(*denied);
     auto& plan = std::get<GatewayForwardPlan>(prepared);
