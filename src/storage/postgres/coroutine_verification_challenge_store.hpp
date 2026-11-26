@@ -82,6 +82,12 @@ public:
         account::VerificationDigest presented,credentials::PasswordHash replacement,
         foundation::Instant now,std::uint32_t maximumAttempts);
 
+    // Owner comes from the authenticated account, never the request body.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    verifyPhoneAsync(identity::provider::ProviderId provider,identity::core::IdentityId owner,
+        account::VerificationId id,account::VerificationDigest presented,
+        foundation::Instant now,std::uint32_t maximumAttempts);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.

@@ -839,6 +839,63 @@ TEST(NativeContactVerificationHttpTest, AuthorizedOwnerAndPurposeArePassedWithou
     EXPECT_EQ(fallback.invoked,0);
 }
 
+TEST(NativeContactVerificationHttpTest, PhoneCompletionUsesAuthenticatedOwnerAndNeverDisclosesForeignProfile)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int verified=0;
+    bool wrongProfile=false;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="valid-token") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return validSession("current");
+        },{},{},{},{},{},
+        [&](core::IdentityId owner,account::VerificationId id,fnd::SecretString secret)
+            ->asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+            ++verified;
+            EXPECT_EQ(owner.value(),"identity-current");
+            EXPECT_EQ(id.value(),"phone-proof");
+            if (secret.expose()!="123456")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return profile::IdentityProfile::restore(
+                wrongProfile?core::IdentityId{"identity-foreign"}:owner,
+                std::optional<std::string>{"Visible Account"},std::nullopt,std::nullopt,false,
+                std::optional<std::string>{"+12025550123"},true,std::nullopt,std::nullopt,kNow,kNow,"auto");
+        }};
+    auto run=[&](std::string token,std::string body){
+        asio::io_context io;
+        auto task=asio::co_spawn(io,dispatch(api,request(gw::HttpMethod::Post,"/account/phone/verify",
+            std::move(token),std::move(body))),asio::use_future);
+        io.run();
+        return std::move(task.get()).value();
+    };
+    const std::string valid=R"({"verification_id":"phone-proof","secret":"123456"})";
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/phone/verify")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/phone/verify")));
+    EXPECT_EQ(run("",valid).status(),401);
+    EXPECT_EQ(run("wrong-token",valid).status(),401);
+    EXPECT_EQ(run("valid-token",R"({"verification_id":"phone-proof","secret":"123456","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(verified,0);
+    EXPECT_EQ(run("valid-token",R"({"verification_id":"phone-proof","secret":"000000"})").status(),401);
+    wrongProfile=true;
+    EXPECT_EQ(run("valid-token",valid).status(),503);
+    wrongProfile=false;
+    auto response=run("valid-token",valid);
+    ASSERT_EQ(response.status(),200);
+    auto body=json::parse(response.body()).as_object();
+    EXPECT_EQ(body.at("identity_id").as_string(),"identity-current");
+    EXPECT_EQ(body.at("phone_number").as_string(),"+12025550123");
+    EXPECT_TRUE(body.at("phone_number_verified").as_bool());
+    EXPECT_EQ(response.headers().at("cache-control"),"no-store");
+    EXPECT_FALSE(response.headers().contains("set-cookie"));
+    EXPECT_EQ(verified,3);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/phone/verify","valid-token",valid)).status(),503);
+    EXPECT_EQ(fallback.invoked,0);
+}
+
 TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOnFailure)
 {
     namespace account=openproof::account;

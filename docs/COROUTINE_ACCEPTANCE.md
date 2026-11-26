@@ -5142,3 +5142,20 @@ insert/replacement, subject mismatch and successful current generation.
 No schema change. This does not yet fence all non-password grants, MFA
 generation transitions or legacy session issuers. Exact compiled/live
 acceptance remains required before enabling signup/reset by default.
+
+### Native owner-bound phone verification completion
+
+The signup opt-in also enables strict POST /account/phone/verify. The
+HTTP handler obtains its owner from native authentication, bounds and
+scrubs the proof before suspension, and never accepts a body owner.
+PostgreSQL independently locks the active tenant owner, exact purpose-2
+SMS proof, checks digest/attempts/expiry and exact generation-tagged
+reservation, inserts only the matching local phone-provider subject,
+updates the existing profile, consumes proof and releases reservation
+in one transaction. Failed/exhausted proof cleanup is generation-scoped.
+Existing same-owner links remain idempotent; historical other phone
+links are retained, matching legacy semantics. Profile response is a
+separate owner-checked native read after commit. No session or identity
+is created. Added compiled regression and source checks. Legacy untagged
+contact reservations are not accepted by native completion. No schema
+change; exact-head executable acceptance pending.
