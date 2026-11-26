@@ -2,6 +2,7 @@
 """Regression tests for source-to-release migration parity checks."""
 
 import io
+import json
 from pathlib import Path
 import runpy
 import tarfile
@@ -103,6 +104,59 @@ class MigrationArtifactTests(unittest.TestCase):
         actual.pop("legacy/0020_historical_client.sql")
         with self.assertRaisesRegex(ValueError, "missing="):
             checker["verify"]("missing legacy checksum archive", expected, actual)
+
+    def release_manifest(self):
+        manifest = self.root / "inventory.json"
+        first = self.expected["0001_initial.sql"]
+        second = self.expected["0002_more.sql"]
+        manifest.write_text(json.dumps({
+            "format": 1, "source": "git-release-tags",
+            "releases": {"v1": {}, "v2": {}},
+            "files": {
+                "migrations/0001_initial.sql": {first: ["v1", "v2"]},
+                "migrations/0002_more.sql": {second: ["v1"]},
+                "migrations/legacy/0002_more.sql": {second: ["v2"]},
+            },
+        }), encoding="utf-8")
+        return manifest
+
+    def test_pinned_release_exact_path_parity(self):
+        manifest = self.release_manifest()
+        expected = checker["release_migrations"](manifest, "v1")
+        checker["verify"]("release v1", expected, self.bundle())
+        moved = checker["release_migrations"](manifest, "v2")
+        self.assertIn("legacy/0002_more.sql", moved)
+        self.assertNotIn("0002_more.sql", moved)
+        with self.assertRaisesRegex(ValueError, "missing="):
+            checker["verify"]("release v2", moved, self.bundle())
+
+    def test_unpinned_release_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not pinned"):
+            checker["release_migrations"](self.release_manifest(), "v3")
+
+    def test_ambiguous_release_checksum_rejected(self):
+        manifest = self.release_manifest()
+        value = json.loads(manifest.read_text())
+        value["files"]["migrations/0001_initial.sql"]["f" * 64] = ["v1"]
+        manifest.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "Ambiguous checksum"):
+            checker["release_migrations"](manifest, "v1")
+
+    def test_release_inventory_rejects_unsafe_path(self):
+        manifest = self.release_manifest()
+        value = json.loads(manifest.read_text())
+        value["files"]["migrations/../0003_extra.sql"] = {"f" * 64: ["v1"]}
+        manifest.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "Invalid release migration path"):
+            checker["release_migrations"](manifest, "v1")
+
+    def test_pinned_release_empty_rejected(self):
+        manifest = self.release_manifest()
+        value = json.loads(manifest.read_text())
+        value["files"] = {}
+        manifest.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "No migrations pinned"):
+            checker["release_migrations"](manifest, "v1")
 
     def test_empty_source_rejected(self):
         for file in self.source.iterdir():

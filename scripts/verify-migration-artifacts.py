@@ -3,8 +3,10 @@
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 import tarfile
@@ -25,6 +27,39 @@ def source_migrations(directory):
     if not source:
         raise ValueError(f"No source migrations found under {directory}")
     return source
+
+
+def release_migrations(manifest_path, tag):
+    """Resolve exact paths and checksums for one independently pinned tag."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest["format"] != 1 or manifest["source"] != "git-release-tags":
+        raise ValueError("Unsupported release migration inventory")
+    if tag not in manifest["releases"]:
+        raise ValueError(f"Release tag not pinned: {tag}")
+    expected = {}
+    for relative, variants in manifest["files"].items():
+        path = PurePosixPath(relative)
+        if (path.as_posix() != relative or not path.parts
+                or path.parts[0] != "migrations"
+                or (len(path.parts) != 2
+                    and not (len(path.parts) == 3 and path.parts[1] == "legacy"))
+                or not re.fullmatch(r"[0-9]{4}_[a-zA-Z0-9_]+\.sql", path.name)):
+            raise ValueError(f"Invalid release migration path: {relative}")
+        selected = []
+        for checksum, tags in variants.items():
+            if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                raise ValueError(f"Invalid release checksum: {relative}")
+            if not isinstance(tags, list) or len(tags) != len(set(tags)):
+                raise ValueError(f"Invalid release tag list: {relative}")
+            if tag in tags:
+                selected.append(checksum)
+        if len(selected) > 1:
+            raise ValueError(f"Ambiguous checksum for {tag}: {relative}")
+        if selected:
+            expected[PurePosixPath(*path.parts[1:]).as_posix()] = selected[0]
+    if not expected:
+        raise ValueError(f"No migrations pinned for {tag}")
+    return expected
 
 
 def archive_migrations(archive):
@@ -91,13 +126,18 @@ def verify(label, expected, actual):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--source", type=Path)
+    mode.add_argument("--release-tag", help="Compare with an exact pinned release tag")
+    parser.add_argument("--manifest", type=Path,
+                        default=Path(__file__).resolve().parent.parent / "docs/schema-release-inventory.json")
     parser.add_argument("--deb", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
     if args.deb is None and args.bundle is None:
         parser.error("At least one of --deb or --bundle is required")
-    expected = source_migrations(args.source)
+    expected = (source_migrations(args.source) if args.source is not None
+                else release_migrations(args.manifest, args.release_tag))
     if args.deb is not None:
         verify("Debian package", expected, read_deb(args.deb))
     if args.bundle is not None:
@@ -107,6 +147,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, tarfile.TarError) as error:
+    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
         print(f"FAIL migration artifact verification: {error}", file=sys.stderr)
         sys.exit(1)

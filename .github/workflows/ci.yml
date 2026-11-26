@@ -77,6 +77,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install PostgreSQL 16 tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+      - name: Verify release artifact inventory matching
+        run: python3 scripts/test-verify-migration-artifacts.py
       - name: Verify baseline migration admission
         run: python3 scripts/test-verify-schema-baseline.py
       - name: Verify disposable baseline reconstruction
