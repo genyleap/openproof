@@ -95,6 +95,16 @@ class MigrationAdmissionTest(unittest.TestCase):
 
 
 class RuntimeBaselineTest(unittest.TestCase):
+    def test_supported_historical_layouts_have_exact_prefixes(self):
+        files = baseline.migration_files()
+        active = {path.name: path.read_bytes() for path in files}
+        layouts = baseline.historical_layouts(baseline.ROOT, active)
+        self.assertEqual([len(neutral) for _, neutral, _ in layouts],
+                         [18, 18, 18, 19, 19, 19, 19])
+        self.assertEqual([len(archived) for _, _, archived in layouts],
+                         [0, 0, 0, 0, 3, 3, 0])
+        self.assertEqual(len(layouts), 7)
+
     def test_dump_session_settings_are_transaction_local(self):
         raw = (b"SET statement_timeout = 0;\n"
                b"SELECT pg_catalog.set_config('search_path', '', false);\n"
@@ -117,13 +127,13 @@ class RuntimeBaselineTest(unittest.TestCase):
             migration.write_bytes(b"CREATE TABLE example (id integer);\n")
             sql = b"CREATE SCHEMA IF NOT EXISTS openproof;\n"
             directory = root / "baseline"
-            baseline.write_bundle(directory, sql, [migration])
+            baseline.write_bundle(directory, sql, {migration.name: migration.read_bytes()})
             self.assertEqual((directory / "schema.sql").read_bytes(), sql)
             self.assertEqual((directory / "checksums.txt").read_text(),
                 f"{hashlib.sha256(sql).hexdigest()} schema.sql\n"
                 f"{hashlib.sha256(migration.read_bytes()).hexdigest()} {migration.name}\n")
             with self.assertRaises(FileExistsError):
-                baseline.write_bundle(directory, sql, [migration])
+                baseline.write_bundle(directory, sql, {migration.name: migration.read_bytes()})
 
 
 if __name__ == "__main__":

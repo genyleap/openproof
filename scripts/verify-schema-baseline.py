@@ -117,17 +117,166 @@ def runtime_baseline(raw: bytes) -> bytes:
     return b"".join(result)
 
 
-def write_bundle(directory: Path, sql: bytes, files: list[Path]) -> None:
+def write_bundle(directory: Path, sql: bytes, files: dict[str, bytes]) -> None:
     # A new destination prevents mixing a candidate with an old manifest.
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "schema.sql").write_bytes(sql)
     entries = [(hashlib.sha256(sql).hexdigest(), "schema.sql")]
-    entries.extend((hashlib.sha256(path.read_bytes()).hexdigest(), path.name)
-                   for path in files)
+    entries.extend((hashlib.sha256(data).hexdigest(), name)
+                   for name, data in sorted(files.items()))
     (directory / "checksums.txt").write_text(
         "".join(f"{digest} {name}\n" for digest, name in entries),
         encoding="ascii")
 
+
+
+def historical_layouts(root: Path, active: dict[str, bytes]) -> list[tuple[str, list[str], dict[str, str]]]:
+    """Resolve each supported release to exact neutral SQL and legacy ledger evidence."""
+    manifest = json.loads((root / "docs/schema-release-inventory.json").read_text())
+    result = []
+    for tag in sorted(manifest["releases"]):
+        neutral = []
+        archived = {}
+        for relative, variants in sorted(manifest["files"].items()):
+            matches = [digest for digest, tags in variants.items() if tag in tags]
+            if not matches:
+                continue
+            if len(matches) != 1:
+                raise ValueError(f"Ambiguous historical release path: {tag}: {relative}")
+            name = PurePosixPath(relative).name
+            digest = matches[0]
+            if name in active:
+                if hashlib.sha256(active[name]).hexdigest() != digest:
+                    raise ValueError(f"Historical active checksum mismatch: {tag}: {name}")
+                neutral.append(name)
+            else:
+                archive = root / "migrations" / "legacy" / name
+                if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+                    raise ValueError(f"Historical archive checksum mismatch: {tag}: {name}")
+                # Only root-level customer SQL could have been executed by
+                # the old migrator. Preserve the record, never execute it.
+                if len(PurePosixPath(relative).parts) == 2:
+                    archived[name] = digest
+        if not neutral or neutral != sorted(active)[:len(neutral)]:
+            raise ValueError(f"Historical schema is not an ordered prefix: {tag}")
+        result.append((tag, neutral, archived))
+    return result
+
+
+UPGRADE_SEED = b"""
+INSERT INTO openproof.organizations(id,name,state,created_at_ms)
+VALUES ('upgrade-org','Upgrade fixture',0,1770000000000);
+INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms)
+VALUES ('upgrade-existing','upgrade-org',0,0,1770000000000),
+       ('upgrade-missing','upgrade-org',0,0,1770000000000);
+INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms)
+VALUES ('upgrade-org','upgrade-existing',1,1770000000000);
+INSERT INTO openproof.membership_roles(organization_id,identity_id,role)
+VALUES ('upgrade-org','upgrade-existing','owner');
+INSERT INTO openproof.identity_profiles(identity_id,display_name,email,email_verified,
+    phone_number,phone_number_verified,created_at_ms,updated_at_ms)
+VALUES ('upgrade-existing','Canonical name','owner@example.invalid',true,
+    '+12025550123',true,1770000000000,1770000000000);
+INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms,
+    display_name,preferred_username,picture_url)
+VALUES ('farcaster','fixture-existing','upgrade-existing',1770000000000,
+        'Provider name','provider-existing','https://example.invalid/existing.png'),
+       ('farcaster','fixture-missing','upgrade-missing',1770000000000,
+        'Backfilled name','provider-missing','https://example.invalid/missing.png');
+INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,
+    state,token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,
+    absolute_expires_at_ms,idle_timeout_ms)
+VALUES ('upgrade-session','upgrade-existing','farcaster',2,2,false,0,decode(repeat('ab',32),'hex'),
+    1770000000000,1770000000000,1770000000001,1770003600000,600000);
+"""
+
+LEDGER_BOOTSTRAP = b"""
+CREATE TABLE openproof.schema_migrations (
+    version text PRIMARY KEY,
+    checksum bytea NOT NULL CHECK (octet_length(checksum)=32),
+    applied_at timestamptz NOT NULL DEFAULT clock_timestamp());
+"""
+
+PROFILE_CHECK = """
+SELECT identity_id,display_name,preferred_username,coalesce(email,''),email_verified,
+       coalesce(phone_number,''),phone_number_verified,picture_url
+FROM openproof.identity_profiles ORDER BY identity_id
+"""
+EXPECTED_PROFILES = (
+    b"upgrade-existing|Canonical name|provider-existing|owner@example.invalid|t|"
+    b"+12025550123|t|https://example.invalid/existing.png\n"
+    b"upgrade-missing|Backfilled name|provider-missing||f||f|https://example.invalid/missing.png\n"
+)
+
+
+def verify_runtime_upgrades(root, active, candidate_directory, binary, work, run, client, env):
+    layouts = historical_layouts(root, active)
+    schema_options = ("--schema-only", "--no-owner", "--exclude-table=openproof.schema_migrations")
+    expected_schema = canonical_dump(client("pg_dump", "reference", *schema_options))
+    checksums = {name: hashlib.sha256(data).hexdigest() for name, data in active.items()}
+    for index, (tag, neutral, archived) in enumerate(layouts):
+        db = f"historical_upgrade_{index}"
+        run("createdb", "-h", str(work), "-p", PORT, "-U", "postgres", "-T", "template0", db)
+        def sql(data: bytes):
+            client("psql", db, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                   "--single-transaction", "-f", "-", input_data=data)
+        def query(statement: str) -> bytes:
+            return client("psql", db, "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", statement)
+        old = {}
+        seeded = False
+        for name in neutral:
+            sql(active[name])
+            old[name] = checksums[name]
+            if name == "0018_profile_avatar_sources.sql":
+                sql(UPGRADE_SEED)
+                seeded = True
+        if not seeded:
+            raise ValueError(f"Fixture incompatible with {tag}")
+        sql(LEDGER_BOOTSTRAP)
+        old.update(archived)
+        # Names and hashes are drawn from validated migration artifacts.
+        for name, digest in sorted(old.items()):
+            if not NAME.fullmatch(name) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("Invalid historical ledger entry")
+            sql(f"INSERT INTO openproof.schema_migrations(version,checksum,applied_at) "
+                f"VALUES ('{name}',decode('{digest}','hex'),'2000-01-01T00:00:00Z');".encode())
+        ledger_query = ("SELECT version,encode(checksum,'hex'),applied_at::text "
+                        "FROM openproof.schema_migrations ORDER BY version")
+        before = set(query(ledger_query).splitlines())
+        test_env = dict(env)
+        # The subprocess receives only the private Unix socket DSN, never the
+        # ambient test/staging/production connection string.
+        test_env["OPENPROOF_TEST_HISTORICAL_POSTGRES"] = (
+            f"host={work} port={PORT} user=postgres dbname={db}")
+        test_env["OPENPROOF_TEST_HISTORICAL_DIRECTORY"] = str(candidate_directory)
+        test_env["OPENPROOF_TEST_HISTORICAL_PENDING"] = str(len(active) - len(neutral))
+        test_env["OPENPROOF_TEST_HISTORICAL_ACK"] = "YES_EXCLUSIVE_DISPOSABLE_DATABASE"
+        if os.environ.get("LD_LIBRARY_PATH"):
+            test_env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+        subprocess.run([str(binary), "--gtest_filter=PostgresMigrationBaselineTest.HistoricalReleaseUpgrade"],
+                       env=test_env, check=True, timeout=120)
+        after = set(query(ledger_query).splitlines())
+        if not before <= after:
+            raise ValueError(f"Historical ledger timestamp or checksum changed: {tag}")
+        expected = checksums | archived
+        actual = dict(line.decode().split("|") for line in
+                      query("SELECT version,encode(checksum,'hex') FROM openproof.schema_migrations").splitlines())
+        if actual != expected:
+            raise ValueError(f"Unexpected upgraded ledger: {tag}")
+        if query(PROFILE_CHECK) != EXPECTED_PROFILES:
+            raise ValueError(f"Historical profile or contact claims changed incorrectly: {tag}")
+        if query("SELECT count(*) FROM openproof.membership_roles WHERE organization_id='upgrade-org' "
+                 "AND identity_id='upgrade-existing' AND role='owner'") != b"1\n":
+            raise ValueError(f"Historical membership lost: {tag}")
+        if query("SELECT state,encode(token_digest,'hex'),last_seen_at_ms FROM openproof.sessions "
+                 "WHERE id='upgrade-session'") != b"0|" + b"ab"*32 + b"|1770000000001\n":
+            raise ValueError(f"Historical session lost or modified: {tag}")
+        actual_schema = canonical_dump(client("pg_dump", db, *schema_options))
+        if actual_schema != expected_schema:
+            raise ValueError(f"Historical upgraded schema differs from fresh schema: {tag}")
+        print(f"PASS historical upgrade {tag}: {len(neutral)} neutral, "
+              f"{len(archived)} archived ledger records, {len(active)-len(neutral)} pending",
+              file=sys.stderr)
 
 
 def main() -> None:
@@ -136,8 +285,13 @@ def main() -> None:
                         help="Write the validated development candidate SQL to stdout")
     parser.add_argument("--output-dir", type=Path,
                         help="Write the validated runtime candidate and checksum manifest")
+    parser.add_argument("--runtime-upgrade-tests", type=Path,
+                        help="Run historical upgrade fixtures with this built C++ test executable")
     args = parser.parse_args()
+    if args.runtime_upgrade_tests is not None and args.output_dir is None:
+        parser.error("--runtime-upgrade-tests requires --output-dir")
     files = migration_files()
+    snapshots = {path.name: path.read_bytes() for path in files}
     # Environment inherited from CI may contain a DSN or PostgreSQL options.
     # Use a minimal environment and explicit private socket for every client.
     env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
@@ -185,7 +339,7 @@ def main() -> None:
                     "-T", "template0", db)
             for path in files:
                 client("psql", "reference", "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                       "--single-transaction", "-f", "-", input_data=path.read_bytes())
+                       "--single-transaction", "-f", "-", input_data=snapshots[path.name])
             options = ("--schema-only", "--no-owner")
             # Keep ACLs and comments. Full database dump comparison also
             # catches unexpected schema/extension objects outside openproof.
@@ -202,7 +356,10 @@ def main() -> None:
             print(f"PASS: {len(files)} migrations; schema and fresh data equivalent; "
                   f"candidate SHA-256={checksum}", file=sys.stderr)
             if args.output_dir is not None:
-                write_bundle(args.output_dir, baseline, files)
+                write_bundle(args.output_dir, baseline, snapshots)
+            if args.runtime_upgrade_tests is not None:
+                verify_runtime_upgrades(ROOT, snapshots, args.output_dir.resolve().parent,
+                    args.runtime_upgrade_tests.resolve(), work, run, client, env)
             if args.emit:
                 sys.stdout.buffer.write(baseline)
         finally:

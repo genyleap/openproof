@@ -18,14 +18,50 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def source_migrations(directory):
+BASELINE_FILES = ("schema.sql", "checksums.txt")
+
+
+def baseline_artifacts(directory, source):
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("Invalid baseline directory")
+    if {path.name for path in directory.iterdir()} != set(BASELINE_FILES):
+        raise ValueError("Baseline must contain exactly schema.sql and checksums.txt")
+    contents = {}
+    for name in BASELINE_FILES:
+        path = directory / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"Invalid baseline artifact: {name}")
+        contents[name] = path.read_bytes()
+        if not contents[name] or b"\0" in contents[name]:
+            raise ValueError(f"Empty or invalid baseline artifact: {name}")
+    expected = f"{digest(contents['schema.sql'])} schema.sql\n"
+    active = sorted(name for name in source if "/" not in name)
+    if not active:
+        raise ValueError("Baseline must cover numbered source migrations")
+    expected += "".join(f"{source[name]} {name}\n" for name in active)
+    if contents["checksums.txt"] != expected.encode("ascii"):
+        raise ValueError("Baseline manifest does not cover exact source migration bytes")
+    return {f"baseline/{name}": digest(data) for name, data in contents.items()}
+
+
+def source_migrations(directory, baseline_directory=None):
     source = {}
     for path in sorted(directory.rglob("*.sql")):
+        relative = path.relative_to(directory).as_posix()
+        if relative.startswith("baseline/"):
+            continue
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"Invalid source migration: {path}")
-        source[path.relative_to(directory).as_posix()] = digest(path.read_bytes())
+        source[relative] = digest(path.read_bytes())
     if not source:
         raise ValueError(f"No source migrations found under {directory}")
+    embedded = directory / "baseline"
+    if embedded.exists() or embedded.is_symlink():
+        if baseline_directory is not None:
+            raise ValueError("Ambiguous baseline source")
+        baseline_directory = embedded
+    if baseline_directory is not None:
+        source.update(baseline_artifacts(baseline_directory, source))
     return source
 
 
@@ -71,7 +107,9 @@ def archive_migrations(archive):
         if len(parts) <= len(TARGET) or parts[:len(TARGET)] != TARGET:
             continue
         relative = PurePosixPath(*parts[len(TARGET):]).as_posix()
-        if not relative.endswith(".sql"):
+        if relative == "baseline" and member.isdir():
+            continue
+        if not relative.endswith(".sql") and not relative.startswith("baseline/") and relative != "baseline":
             continue
         if relative in found:
             raise ValueError(f"Duplicate migration in archive: {relative}")
@@ -151,10 +189,18 @@ def main():
                         default=Path(__file__).resolve().parent.parent / "docs/schema-release-inventory.json")
     parser.add_argument("--sha256sums", type=Path,
                         help="Published SHA256SUMS (required in release-tag mode)")
+    parser.add_argument("--baseline-directory", type=Path,
+                        help="Explicit validated baseline directory for source-mode package checks")
+    parser.add_argument("--check-source", action="store_true",
+                        help="Validate source and baseline bytes without a built package")
     parser.add_argument("--deb", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
-    if args.deb is None and args.bundle is None:
+    if args.baseline_directory is not None and args.source is None:
+        parser.error("--baseline-directory requires --source")
+    if args.check_source and (args.source is None or args.deb or args.bundle or args.sha256sums):
+        parser.error("--check-source requires source mode without packages")
+    if args.deb is None and args.bundle is None and not args.check_source:
         parser.error("At least one of --deb or --bundle is required")
     if args.release_tag is not None and args.sha256sums is None:
         parser.error("--release-tag requires --sha256sums")
@@ -162,8 +208,10 @@ def main():
         for package in (args.deb, args.bundle):
             if package is not None:
                 verify_package_digest(package, args.sha256sums)
-    expected = (source_migrations(args.source) if args.source is not None
+    expected = (source_migrations(args.source, args.baseline_directory) if args.source is not None
                 else release_migrations(args.manifest, args.release_tag))
+    if args.check_source:
+        print(f"PASS source migration artifacts: {len(expected)} checksums verified")
     if args.deb is not None:
         verify("Debian package", expected, read_deb(args.deb))
     if args.bundle is not None:

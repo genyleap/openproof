@@ -258,7 +258,8 @@ jobs:
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_baseline_ci
           cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
-          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
+            --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
           ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
 
 
@@ -329,3 +330,15 @@ jobs:
           ./packaging/build-bundle.sh cmake-build-gcc-release dist amd64
           dpkg-deb --info dist/openproof_*_amd64.deb
           tar -tzf dist/openproof_*_linux_amd64.tar.gz | grep -q './opt/openproof/bin/opp.real'
+
+      - name: Build and verify opt-in schema baseline packages
+        env:
+          OPENPROOF_SCHEMA_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture/baseline
+        run: |
+          mkdir -p dist-baseline
+          ./packaging/build-deb.sh cmake-build-gcc-release dist-baseline amd64
+          ./packaging/build-bundle.sh cmake-build-gcc-release dist-baseline amd64
+          python3 scripts/verify-migration-artifacts.py --source migrations \
+            --baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY" \
+            --deb dist-baseline/openproof_*_amd64.deb \
+            --bundle dist-baseline/openproof_*_linux_amd64.tar.gz

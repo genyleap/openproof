@@ -99,6 +99,16 @@ if [[ -n $OPENSSL_BIN ]]; then runtime_roots+=("$OPENSSL_BIN"); fi
 copy_runtime_closure "${runtime_roots[@]}"
 
 cp -a "$ROOT/migrations/." "$ROOTFS/opt/openproof/migrations/"
+migration_verify_args=(--source "$ROOT/migrations")
+# Opt-in only: CI uses the already round-tripped runtime candidate. Never
+# generate a new schema from a potentially live database during packaging.
+if [[ -n "${OPENPROOF_SCHEMA_BASELINE_DIRECTORY:-}" ]]; then
+  migration_verify_args+=(--baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY")
+  python3 "$ROOT/scripts/verify-migration-artifacts.py" "${migration_verify_args[@]}" --check-source
+  install -d "$ROOTFS/opt/openproof/migrations/baseline"
+  install -m 0644 "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY/schema.sql" "$ROOTFS/opt/openproof/migrations/baseline/schema.sql"
+  install -m 0644 "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY/checksums.txt" "$ROOTFS/opt/openproof/migrations/baseline/checksums.txt"
+fi
 find "$ROOTFS/opt/openproof/migrations" -type d -exec chmod 0755 {} +
 find "$ROOTFS/opt/openproof/migrations" -type f -exec chmod 0644 {} +
 install -m 0644 "$ROOT/docs/OPERATIONS.md" "$ROOTFS/opt/openproof/docs/OPERATIONS.md"
@@ -138,7 +148,7 @@ tar \
   -czf "$ASSET" .
 
 python3 "$ROOT/scripts/verify-migration-artifacts.py" \
-  --source "$ROOT/migrations" --bundle "$ASSET"
+  "${migration_verify_args[@]}" --bundle "$ASSET"
 sha256sum "$ASSET"
 printf 'Built %s\n' "$ASSET"
 printf 'Bundled runtime libraries:\n'
