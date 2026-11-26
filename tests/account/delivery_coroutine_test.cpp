@@ -173,7 +173,9 @@ TEST(NativeVerificationDeliveryTest, DispatchLifetimeAndWebhookStatusOverRealTcp
         ASSERT_NO_THROW(completed.get());
         ASSERT_TRUE(result);
         EXPECT_EQ(result->has_value(), status == 204);
-        if (status != 204 && !*result) EXPECT_EQ(result->error().code(), fnd::ErrorCode::Unavailable);
+        if (status != 204 && !*result) {
+            EXPECT_EQ(result->error().code(), fnd::ErrorCode::Unavailable);
+        }
         EXPECT_TRUE(receiver.accepted.load());
         deferred.pending.reset();
     }
@@ -195,7 +197,10 @@ public:
             if (key) {
                 auto digest = account::VerificationPreparation::digest(
                     key.value(), dispatch.id(), dispatch.secret());
-                EXPECT_TRUE(digest && digest.value() == stored->digest());
+                EXPECT_TRUE(digest);
+                if (digest) {
+                    EXPECT_EQ(digest->bytes(), stored->digest().bytes());
+                }
             }
         }
         if (dispatch.channel() == account::VerificationChannel::Sms) {
