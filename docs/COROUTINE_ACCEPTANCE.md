@@ -5080,3 +5080,18 @@ opportunistic on signup traffic, not a timer; existing verified owners with
 expired pending local enrollment still need a separate retry policy.
 The isolated canonical runner includes the referenced existing schema
 tables. No new migration. Exact-head executable acceptance pending.
+
+### Expired existing-owner enrollment retry
+
+Under the same subject advisory and canonical owner locks, a previously
+verified human owner may retry an expired pending local enrollment only
+when an exact untagged reservation still belongs to that owner and
+provider/subject, no other reservation or live/mismatched verification
+exists, the locked password generation predates reservation expiry, and
+no local link exists. A generation-conditional hash update, renewed
+reservation and replacement proof commit together. Fresh enrollment
+remains insert-only; a bare password row is never overwritten. No
+canonical profile or owner lifecycle mutation occurs. Legacy and native
+cross-path concurrency still requires acceptance. Expired rows whose
+reservation provenance has been lost remain fail closed for operator
+recovery. No migration change.

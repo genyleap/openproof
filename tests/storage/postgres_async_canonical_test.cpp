@@ -1750,6 +1750,53 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
     EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE identity_id=$1 AND verification_id IS NULL",{seed.owner}),"1");
     EXPECT_EQ(count("SELECT count(*) FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),"1");
     EXPECT_EQ(count("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
+    // A live reservation cannot replace the previous hash, even if its
+    // notification failed. Only a fully expired, exact pending enrollment
+    // may be retried with a different password.
+    auto retryPassword=hasher->hash(fnd::SecretString{"replacement-password"});
+    ASSERT_TRUE(retryPassword);
+    const auto retry=[&](fnd::Instant now){
+        std::optional<SignupResult> result;
+        auto retryCapture=[&]()->asio::awaitable<void>{
+            result.emplace(co_await store.provisionSignupAsync(provider,existing,
+                retryPassword.value(),std::string{"Ignored profile name"},key.value(),now,24h));
+        };
+        io.restart();
+        auto done=asio::co_spawn(io,retryCapture(),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    const std::string initialHash{password->encoded()};
+    EXPECT_FALSE(retry(kNow+23h));
+    EXPECT_EQ(count("SELECT password_hash FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),initialHash);
+    // A live proof forbids replacement even when the reservation has expired.
+    const auto futureProof=acc::VerificationPreparation::prepare(key.value(),ids::IdentityId{seed.owner},
+        acc::VerificationPurpose::SignupEmail,acc::VerificationChannel::Email,existing,kNow+23h,24h);
+    ASSERT_TRUE(futureProof);
+    ASSERT_TRUE(runStatus(store.replacePublicEmailAsync(futureProof->first,provider)));
+    EXPECT_FALSE(retry(kNow+24h));
+    ASSERT_TRUE(runStatus(store.discardAsync(futureProof->first.id(),ids::IdentityId{seed.owner},acc::VerificationPurpose::SignupEmail)));
+    // A bare credential must not be treated as a pending enrollment.
+    ASSERT_NO_THROW(static_cast<void>(query("DELETE FROM openproof.pending_external_identity_reservations WHERE identity_id=$1",{seed.owner})));
+    EXPECT_FALSE(retry(kNow+24h));
+    ASSERT_NO_THROW(static_cast<void>(query("INSERT INTO openproof.pending_external_identity_reservations"
+        "(provider,external_subject,identity_id,expires_at_ms) VALUES($1,$2,$3,1770086400000)",
+        {std::string{provider.value()},existing,seed.owner})));
+    auto retried=retry(kNow+24h);
+    ASSERT_TRUE(retried);
+    EXPECT_FALSE(retried->createdIdentity);
+    EXPECT_EQ(retried->dispatch.identity().value(),seed.owner);
+    EXPECT_EQ(count("SELECT password_hash FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),
+        std::string{retryPassword->encoded()});
+    EXPECT_EQ(count("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
+    EXPECT_EQ(count("SELECT status FROM openproof.identities WHERE id=$1",{seed.owner}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE identity_id=$1 AND purpose=0",{seed.owner}),"1");
+    EXPECT_FALSE(retry(kNow+25h));
+    const auto retryDigest=acc::VerificationPreparation::digest(key.value(),retried->dispatch.id(),retried->dispatch.secret());
+    ASSERT_TRUE(retryDigest);
+    ASSERT_TRUE(redeem(store,retried->dispatch.id(),retryDigest.value(),kNow+24h));
+    EXPECT_FALSE(retry(kNow+48h));
     ASSERT_NO_THROW(static_cast<void>(query("INSERT INTO openproof.identity_profiles(identity_id,email,email_verified,created_at_ms,updated_at_ms)"
         " VALUES($1,$3,true,1770000000000,1770000000000),($2,$3,true,1770000000000,1770000000000)",
         {seed.secondOwner,seed.emptyConnectionsOwner,ambiguous})));

@@ -854,7 +854,7 @@ TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOn
             ++signups;
             EXPECT_EQ(email,"new@example.test");
             EXPECT_EQ(password.expose(),"fixture-password");
-            if (name) EXPECT_EQ(*name,"Fixture");
+            if (name) { EXPECT_EQ(*name,"Fixture"); }
             if (deliveryFailure) co_return fnd::fail(fnd::ErrorCode::Unavailable);
             co_return core::IdentityId{"new-owner"};
         },
