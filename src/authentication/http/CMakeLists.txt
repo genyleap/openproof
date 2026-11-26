@@ -124,7 +124,9 @@ endif()
 endif()
 
 # Provider-neutral, read-only owner-authorized administration boundary.
-add_library(openproof_administration_async_http STATIC coroutine_admin_read_http.cpp)
+add_library(openproof_administration_async_http STATIC
+    coroutine_admin_read_http.cpp
+    boost_json.cpp)
 target_compile_features(openproof_administration_async_http PUBLIC cxx_std_26)
 target_include_directories(openproof_administration_async_http PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 set_target_properties(openproof_administration_async_http PROPERTIES
