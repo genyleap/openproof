@@ -238,8 +238,8 @@ private:
     BeastProxyTransport* m_transport;
 };
 
-/** Narrow opt-in native protected proxy. Unsupported routes and OAuth
- * credentials remain with the original compatibility composition.
+/** Native public proxy and opt-in first-party protected proxy. Unsupported
+ * protected routes and OAuth credentials retain the compatibility path.
  */
 class CoroutineProtectedGatewayAdapter final : public CoroutineHttpHandler,
     private GatewayNativePreparationSource {
@@ -250,7 +250,8 @@ public:
         session::AuthenticatedSession, Route, foundation::CorrelationId)>;
 
     CoroutineProtectedGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport,
-        CoroutineHttpHandler& fallback, Verify verify, Authorize authorize);
+        CoroutineHttpHandler& fallback, Verify verify, Authorize authorize,
+        bool enableProtected = true);
     [[nodiscard]] bool nativeEnabledFor(const HttpRequest& request) const noexcept override;
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse> handleAsync(HttpRequest request) override;
@@ -260,6 +261,7 @@ private:
     CoroutineHttpHandler* m_fallback;
     Verify m_verify;
     Authorize m_authorize;
+    bool m_enableProtected;
 };
 
 }

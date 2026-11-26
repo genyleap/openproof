@@ -475,6 +475,10 @@ protected:
     };
     [[nodiscard]] static bool eligible(const Gateway& gateway,
                                        const HttpRequest& request) noexcept;
+    [[nodiscard]] static bool eligiblePublic(const Gateway& gateway,
+        const HttpRequest& request) noexcept;
+    [[nodiscard]] static std::variant<HttpResponse,GatewayForwardPlan>
+    preparePublic(Gateway& gateway,HttpRequest request);
     [[nodiscard]] static std::variant<HttpResponse, Pending>
     begin(Gateway& gateway, HttpRequest request);
     [[nodiscard]] static bool admitIdentity(Gateway& gateway,

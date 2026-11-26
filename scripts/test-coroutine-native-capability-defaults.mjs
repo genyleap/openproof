@@ -153,7 +153,7 @@ test("native protected proxy is opt-in, first-party only and confined to its nam
   assert.match(gate, /request\.path\(\) != "\/proxy" && !request\.path\(\)\.starts_with\("\/proxy\/"\)/);
   assert.match(gate, /route->isProtected\(\) && route->requiredScope\(\)\.empty\(\)/);
   assert.match(gate, /route->requiredAudience\(\)\.empty\(\)/);
-  const native = implementation.slice(implementation.indexOf("CoroutineProtectedGatewayAdapter::handleAsync("));
+  const native = implementation.slice(implementation.indexOf("auto started = begin(*m_gateway"));
   assert.ok(native.includes("co_await m_verify"));
   assert.ok(native.includes("co_await m_authorize"));
   assert.ok(native.includes("co_await m_transport->sendAsync"));
@@ -200,4 +200,26 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   assert.match(app, /runWithScim\(enterpriseApi, localEnterpriseApi\)/);
   assert.match(app, /runWithScim\(enterpriseApi, localWeb3Api\)/);
   assert.match(cmake, /openproof_postgres_async_local_credentials/);
+});
+
+test("authenticated runtimes dispatch explicitly public proxy routes without invoking protected authentication",()=>{
+  const app=read("apps/opp/main.cpp");
+  const domain=read("src/gateway/gateway.cpp");
+  const implementation=read("src/gateway/http_coroutine.cpp");
+  const gate=domain.slice(domain.indexOf("bool GatewayNativePreparationSource::eligiblePublic("),
+    domain.indexOf("HttpResponse GatewayNativePreparationSource::reject("));
+  assert.match(gate,/route && !route->isProtected\(\)/);
+  assert.match(gate,/if \(!route \|\| route->isProtected\(\)/);
+  assert.match(gate,/stripTrustedIdentityHeaders\(request\)/);
+  assert.match(gate,/stripHopByHop\(request\)/);
+  assert.match(gate,/gateway.completeForward\(/);
+  assert.doesNotMatch(gate,/m_sessions->|m_delegatedAccess->|m_access->/);
+  assert.match(app,/CoroutineProtectedGatewayAdapter nativePublicGateway\{/);
+  assert.match(app,/runListener\(platform,nativePublicGateway,logger\)/);
+  assert.equal([...app.matchAll(/nativeGatewayCore = &gatewayCore;/g)].length,2);
+  const native=implementation.slice(implementation.indexOf("CoroutineProtectedGatewayAdapter::handleAsync("),
+    implementation.indexOf("auto started = begin(*m_gateway"));
+  assert.match(native,/eligiblePublic\(/);
+  assert.match(native,/co_await m_transport->sendAsync\(/);
+  assert.doesNotMatch(native,/m_gateway->handle\(|m_transport->send\(/);
 });

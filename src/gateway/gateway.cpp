@@ -985,6 +985,36 @@ bool GatewayNativePreparationSource::eligible(const Gateway& gateway,
     }
 }
 
+bool GatewayNativePreparationSource::eligiblePublic(const Gateway& gateway,
+    const HttpRequest& request) noexcept
+{
+    try {
+        if (request.path()!="/proxy" && !request.path().starts_with("/proxy/"))
+            return false;
+        const auto route=gateway.m_router->match(request.method(),request.path());
+        return route && !route->isProtected() && route->requiredScope().empty()
+            && route->requiredAudience().empty();
+    } catch (...) { return false; }
+}
+
+std::variant<HttpResponse,GatewayForwardPlan>
+GatewayNativePreparationSource::preparePublic(Gateway& gateway,HttpRequest request)
+{
+    // Recheck the matched policy before preparing an upstream request.
+    // Never enter prepareForward's synchronous protected authentication.
+    if (!eligiblePublic(gateway,request))
+        return reject(gateway,foundation::Error{foundation::ErrorCode::Unavailable},std::move(request));
+    const auto route=gateway.m_router->match(request.method(),request.path());
+    if (!route || route->isProtected() || !route->requiredScope().empty()
+        || !route->requiredAudience().empty())
+        return reject(gateway,foundation::Error{foundation::ErrorCode::PermissionDenied},std::move(request));
+    if (!gateway.m_rateLimiter->allow(request.remoteAddress()))
+        return reject(gateway,foundation::Error{foundation::ErrorCode::RateLimited},std::move(request));
+    stripTrustedIdentityHeaders(request);
+    stripHopByHop(request);
+    return gateway.completeForward(std::move(request),route.value());
+}
+
 HttpResponse GatewayNativePreparationSource::reject(const Gateway& gateway,
     const foundation::Error& error, HttpRequest request)
 {

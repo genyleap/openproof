@@ -1427,6 +1427,50 @@ TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermitt
     upstreamServer.stop();
 }
 
+TEST(BeastHttpIntegrationTest, NativePublicProxyDoesNotEnterProtectedAuthentication)
+{
+    namespace ids=openproof::identity::core;
+    CoreFixture core;
+    CountingFastHandler upstream;
+    httpAdapter::BeastHttpServer upstreamServer{upstream,serverConfig()};
+    ASSERT_TRUE(upstreamServer.start());
+    gw::Router router;
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"public-proxy"},gw::HttpMethod::Get,
+        "/proxy",gw::ServiceId{"service"},false,ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"},pol::Resource{"upstream:/proxy"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"protected-proxy"},gw::HttpMethod::Get,
+        "/proxy/protected",gw::ServiceId{"service"},true,ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"},pol::Resource{"upstream:/proxy"}).value()));
+    ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"},{
+        gw::Endpoint::create(gw::EndpointId{"public-upstream"},"127.0.0.1",
+            upstreamServer.boundPort(),false,1U).value()}));
+    auto transport=httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U,4096U).value());
+    ASSERT_TRUE(transport);
+    gw::Gateway gateway{router,core.sessions,core.access,core.limiter,
+        core.discovery,core.balancer,core.circuits,*transport.value(),core.signer,
+        std::chrono::seconds{2}};
+    SelectiveCoroutineHandler fallback;
+    httpAdapter::CoroutineProtectedGatewayAdapter native{gateway,*transport.value(),fallback,{},{},false};
+    httpAdapter::BeastHttpServer server{native,serverConfig()};
+    ASSERT_TRUE(server.start());
+    auto publicResponse=sendRequest(server.boundPort(),beastHttp::verb::get,"/proxy/public");
+    EXPECT_EQ(publicResponse.result_int(),200U);
+    EXPECT_EQ(upstream.received.load(),1);
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/proxy/protected").body(),"legacy");
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/proxy-other").body(),"legacy");
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/native").body(),"native");
+    EXPECT_EQ(fallback.synchronousCalls.load(),2);
+    EXPECT_EQ(fallback.asynchronousCalls.load(),1);
+    auto direct=gw::HttpRequest::create(gw::HttpMethod::Get,"/proxy/public",{},{},"127.0.0.1",
+        fnd::CorrelationId{"native-public-sync-denial"});
+    ASSERT_TRUE(direct);
+    EXPECT_EQ(native.handle(std::move(direct).value()).status(),503);
+    EXPECT_EQ(upstream.received.load(),1);
+    server.stop();
+    upstreamServer.stop();
+}
+
 TEST(BeastHttpIntegrationTest, GatewayRetrySharesOneDeadlineAcrossRealTcpUpstreams)
 {
     CoroutineWaitingHandler slowUpstream;
