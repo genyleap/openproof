@@ -1226,6 +1226,14 @@ authentication coordinator and session issuer. The native local provider
 is registered in discovery and connection admission as before. Unknown
 or unavailable routes reach a repository-free fail-closed fallback.
 
+OIDC signing/discovery, DPoP time-window validation and native sender
+proof verification no longer require synchronous profile or replay
+repositories. Native authentication coordinators likewise receive only
+the coroutine transaction store and canonical finalizer. Legacy entry
+points fail closed when the corresponding synchronous repository is
+absent. Native UserInfo and durable replay handling remain in the
+coroutine PostgreSQL storage layer.
+
 The blocking PostgreSQL compatibility implementation still exists.
 Startup, offline administration, and residual compatibility callers
 must be inventoried and retired before the final storage gate can pass.

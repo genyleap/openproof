@@ -361,7 +361,7 @@ AuthenticationService::AuthenticationService(
     CoroutineCanonicalIdentityFinalizer* asyncCanonical)
     : m_providers(providers)
     , m_transactions(transactions)
-    , m_identities(identities)
+    , m_identities(&identities)
     , m_clock(clock)
     , m_trustPolicy(std::move(trustPolicy))
     , m_maximumTransactionLifetime(maximumTransactionLifetime)
@@ -371,6 +371,19 @@ AuthenticationService::AuthenticationService(
     , m_asyncCanonical(asyncCanonical)
 {
     foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
+}
+
+AuthenticationService::AuthenticationService(provider::ProviderRegistry& providers,
+    provider::AuthenticationTransactionStore& transactions,const foundation::ClockSource& clock,
+    ProviderTrustPolicy trustPolicy,foundation::Duration maximumTransactionLifetime,
+    CoroutineCanonicalIdentityFinalizer& asyncCanonical)
+    :m_providers(providers),m_transactions(transactions),m_clock(clock),
+     m_trustPolicy(std::move(trustPolicy)),m_maximumTransactionLifetime(maximumTransactionLifetime),
+     m_asyncCanonical(&asyncCanonical)
+{
+    foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
+    foundation::requireInvariant(dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&transactions)!=nullptr,
+        "native authentication requires a coroutine transaction store");
 }
 
 std::optional<provider::AssuranceLevel> AuthenticationService::effectiveMaximum(
@@ -481,6 +494,7 @@ foundation::Result<AuthenticationStart> AuthenticationService::beginInternal(
     foundation::CorrelationId correlation,
     const identity::core::IdentityId* connectionTarget)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     provider::AuthenticationProvider* const implementation =
         m_providers.find(request.provider());
     if (implementation == nullptr) {
@@ -706,6 +720,7 @@ AuthenticationService::completeExchange(
     const provider::AuthenticationResponse& response,
     bool requireConnection)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     const foundation::Instant now = m_clock.now();
     foundation::Result<provider::AuthenticationTransaction> transaction =
         m_transactions.consume(transactionId, continuationToken, binding, now);
@@ -955,6 +970,7 @@ AuthenticationService::completeExchangeAsync(
 foundation::Status AuthenticationService::requireActiveIdentity(
     const identity::core::IdentityId& identity) const
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     if (m_lifecycleRepository == nullptr) return foundation::ok();
     if (m_organization.empty()) {
         return foundation::fail(authenticationFailure(
@@ -983,7 +999,8 @@ foundation::Status AuthenticationService::attachVerified(
     if (!verified) return foundation::fail(verified.error());
     auto completed = link->complete(verifiedAt);
     if (!completed) return foundation::fail(completed.error());
-    return m_identities.attach(link.value());
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
+    return m_identities->attach(link.value());
 }
 
 foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
@@ -1043,6 +1060,7 @@ AuthenticationService::completeAsync(
 foundation::Result<VerifiedAuthentication>
 AuthenticationService::finishVerified(CompletedExchange exchange)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto outcome = std::move(exchange.outcome);
     // The legacy path cannot perform atomic owner-bound finalization.
     if (outcome.requiredCanonicalOwner())
@@ -1050,7 +1068,7 @@ AuthenticationService::finishVerified(CompletedExchange exchange)
     const auto completedAt = exchange.completedAt;
     const auto external = externalFromOutcome(outcome);
     foundation::Result<std::optional<identity::core::IdentityId>> owner =
-        m_identities.ownerOf(external);
+        m_identities->ownerOf(external);
     if (!owner.has_value()) {
         return foundation::fail(authenticationFailure(
             "Authentication completion could not resolve the external identity directory."));
@@ -1165,7 +1183,7 @@ AuthenticationService::finishVerified(CompletedExchange exchange)
     }
     auto active = requireActiveIdentity(identity);
     if (!active) return foundation::fail(active.error());
-    auto presentationSaved = m_identities.updatePresentation(external);
+    auto presentationSaved = m_identities->updatePresentation(external);
     if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(identity);
@@ -1192,7 +1210,8 @@ foundation::Result<VerifiedAuthentication>
 AuthenticationService::acceptVerifiedEmail(
     const identity::core::ExternalIdentityRef& external)
 {
-    auto owner = m_identities.ownerOf(external);
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (!owner->has_value()) {
         return foundation::fail(
@@ -1317,7 +1336,7 @@ AuthenticationService::finishConnection(CompletedExchange exchange)
     if (!active) return foundation::fail(active.error());
     const auto external = externalFromOutcome(exchange.outcome);
     const std::lock_guard guard{m_connectionMutex};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (owner->has_value() && owner->value() != target) {
         return foundation::fail(
@@ -1328,7 +1347,7 @@ AuthenticationService::finishConnection(CompletedExchange exchange)
         auto attached = attachVerified(target, external, exchange.completedAt);
         if (!attached) return foundation::fail(attached.error());
     }
-    auto presentationSaved = m_identities.updatePresentation(external);
+    auto presentationSaved = m_identities->updatePresentation(external);
     if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(target);
@@ -1360,8 +1379,9 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     std::optional<std::string> preferredUsername,
     std::optional<std::string> pictureUrl)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     const std::lock_guard guard{m_connectionMutex};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (!owner->has_value()) {
         return foundation::fail(foundation::ErrorCode::NotFound,
@@ -1371,7 +1391,7 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     identity::core::ExternalIdentityRef presented{
         external.providerId(), external.subject(), std::move(displayName),
         std::move(preferredUsername), std::move(pictureUrl)};
-    auto connectionSaved = m_identities.updatePresentation(presented);
+    auto connectionSaved = m_identities->updatePresentation(presented);
     if (!connectionSaved) return connectionSaved;
 
     if (m_profileRepository == nullptr) return foundation::ok();
@@ -1426,7 +1446,7 @@ AuthenticationService::connections(const identity::core::IdentityId& identity) c
     auto active = requireActiveIdentity(identity);
     if (!active) return foundation::fail(active.error());
     const std::lock_guard guard{m_connectionMutex};
-    auto attached = m_identities.externalIdentitiesOf(identity);
+    auto attached = m_identities->externalIdentitiesOf(identity);
     if (!attached) return foundation::fail(attached.error());
     std::vector<identity::core::ExternalIdentityRef> output;
     output.reserve(attached->size());
@@ -1447,7 +1467,7 @@ foundation::Status AuthenticationService::disconnect(
                                 "Only authentication connections can be disconnected here.");
     }
     const std::lock_guard guard{m_connectionMutex};
-    auto detached = m_identities.detachIfAnotherAuthenticationMethod(
+    auto detached = m_identities->detachIfAnotherAuthenticationMethod(
         external, identity, m_providers.ids());
     if (!detached) return detached;
 
@@ -1879,7 +1899,7 @@ AuthenticationService::redeemBrowserAuthenticationHandoff(
     if (!active) return foundation::fail(active.error());
     identity::core::ExternalIdentityRef external{
         providerId, provider::ExternalSubject{subjectMetadata->second}};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner || !owner->has_value() || owner->value() != identity) {
         return foundation::fail(authenticationFailure(
             "Browser authentication handoff redemption refused: identity link changed."));

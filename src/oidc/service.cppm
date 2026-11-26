@@ -75,6 +75,9 @@ public:
                    identity::profile::IdentityProfileRepository& profiles,
                    OidcPolicy policy,
                    std::vector<PublishedVerificationJwk> publishedVerificationJwks = {});
+    OpenIdProvider(Issuer issuer,const foundation::ClockSource& clock,
+                   security::RsaSha256Signer signer,OidcPolicy policy,
+                   std::vector<PublishedVerificationJwk> publishedVerificationJwks = {});
 
     [[nodiscard]] std::string discoveryDocument() const;
     [[nodiscard]] foundation::Result<std::string> jwksDocument() const;
@@ -107,7 +110,7 @@ private:
     const foundation::ClockSource* m_clock;
     security::RsaSha256Signer m_signer;
     std::vector<PublishedVerificationJwk> m_publishedVerificationJwks;
-    identity::profile::IdentityProfileRepository* m_profiles;
+    identity::profile::IdentityProfileRepository* m_profiles{};
     OidcPolicy m_policy;
 };
 

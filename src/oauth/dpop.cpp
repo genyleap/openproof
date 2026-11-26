@@ -15,10 +15,14 @@ DpopService::DpopService(DpopReplayStore& replays, const foundation::ClockSource
 {
 }
 
+DpopService::DpopService(const foundation::ClockSource& clock,foundation::Duration proofLifetime)
+    :m_clock(&clock),m_proofLifetime(proofLifetime) {}
+
 foundation::Status DpopService::consume(
     std::string_view jwkThumbprint, std::string_view jwtId,
     foundation::Instant issuedAt)
 {
+    if (!m_replays) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto window=replayWindow(jwkThumbprint,jwtId,issuedAt);
     if (!window) return foundation::fail(window.error());
     return m_replays->consumeDpopReplay(jwkThumbprint,jwtId,window->first,window->second);

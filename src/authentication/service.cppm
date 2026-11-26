@@ -262,6 +262,12 @@ public:
                           identity::core::OrganizationId organization = {},
                           identity::profile::IdentityProfileRepository* profileRepository = nullptr,
                           CoroutineCanonicalIdentityFinalizer* asyncCanonical = nullptr);
+    // Native-only coordinator: no synchronous identity or profile repositories.
+    AuthenticationService(provider::ProviderRegistry& providers,
+                          provider::AuthenticationTransactionStore& transactions,
+                          const foundation::ClockSource& clock,ProviderTrustPolicy trustPolicy,
+                          foundation::Duration maximumTransactionLifetime,
+                          CoroutineCanonicalIdentityFinalizer& asyncCanonical);
 
     AuthenticationService(const AuthenticationService&) = delete;
     AuthenticationService& operator=(const AuthenticationService&) = delete;
@@ -523,7 +529,7 @@ private:
 
     provider::ProviderRegistry& m_providers;
     provider::AuthenticationTransactionStore& m_transactions;
-    identity::core::ExternalIdentityDirectory& m_identities;
+    identity::core::ExternalIdentityDirectory* m_identities{};
     const foundation::ClockSource& m_clock;
     const ProviderTrustPolicy m_trustPolicy;
     foundation::Duration m_maximumTransactionLifetime;

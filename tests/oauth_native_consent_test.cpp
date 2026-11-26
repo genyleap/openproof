@@ -619,9 +619,10 @@ TEST(NativeSenderProofTest, MtlsProofBindsRequestAndUsesOnlyNativeReplay)
 {
     LegacyReplayProbe legacy;
     fnd::ManualClockSource clock{kNow};
-    openproof::oauth::DpopService dpop{legacy,clock,5min};
+    openproof::oauth::DpopService dpop{clock,5min};
+    EXPECT_FALSE(dpop.consume(std::string(43U,'A'),"native-only",kNow));
     const std::string key(32U,'k'),thumbprint(43U,'A');
-    http::SenderProofVerifier verifier{dpop,legacy,clock,"https://issuer.example.test",
+    http::SenderProofVerifier verifier{dpop,clock,"https://issuer.example.test",
         fnd::SecretString{key}};
     const sess::DelegatedSenderConstraint binding{sess::DelegatedSenderConstraintKind::Mtls,thumbprint};
     const fnd::SecretString token{"fixture-access-token"};

@@ -28,6 +28,8 @@ public:
                         const foundation::ClockSource& clock,
                         std::string publicOrigin,
                         std::optional<foundation::SecretString> mtlsForwardingKey);
+    SenderProofVerifier(DpopService& dpop,const foundation::ClockSource& clock,
+                        std::string publicOrigin,std::optional<foundation::SecretString> mtlsForwardingKey);
 
     /** @brief Returns a sender binding presented at an OAuth token endpoint, if any. */
     [[nodiscard]] foundation::Result<std::optional<token::SenderConstraint>>
@@ -82,7 +84,7 @@ private:
     [[nodiscard]] std::string expectedHtu(const gateway::HttpRequest& request) const;
 
     DpopService* m_dpop;
-    MtlsForwardingReplayStore* m_mtlsReplays;
+    MtlsForwardingReplayStore* m_mtlsReplays{};
     const foundation::ClockSource* m_clock;
     std::string m_publicOrigin;
     std::optional<foundation::SecretString> m_mtlsForwardingKey;

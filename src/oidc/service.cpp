@@ -210,6 +210,12 @@ OpenIdProvider::OpenIdProvider(
       m_publishedVerificationJwks(std::move(publishedVerificationJwks)),
       m_profiles(&profiles), m_policy(policy) {}
 
+OpenIdProvider::OpenIdProvider(Issuer issuer,const foundation::ClockSource& clock,
+    security::RsaSha256Signer signer,OidcPolicy policy,
+    std::vector<PublishedVerificationJwk> publishedVerificationJwks)
+    :m_issuer(std::move(issuer)),m_clock(&clock),m_signer(std::move(signer)),
+     m_publishedVerificationJwks(std::move(publishedVerificationJwks)),m_policy(policy) {}
+
 std::string OpenIdProvider::discoveryDocument() const
 {
     const auto issuer = m_issuer.value();
@@ -335,6 +341,7 @@ foundation::Result<std::string> OpenIdProvider::userInfo(
                                 "The access token cannot access UserInfo.");
     }
     std::string result{"{\"sub\":" + q(claims.context().identity().value())};
+    if (!m_profiles) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto profile = m_profiles->find(claims.context().identity());
     if (!profile.has_value()) return foundation::fail(profile.error());
     if (profile->has_value()) {

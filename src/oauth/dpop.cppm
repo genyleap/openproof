@@ -45,6 +45,7 @@ class DpopService final {
 public:
     DpopService(DpopReplayStore& replays, const foundation::ClockSource& clock,
                 foundation::Duration proofLifetime);
+    DpopService(const foundation::ClockSource& clock,foundation::Duration proofLifetime);
 
     /**
      * @brief Accepts one already-signature-verified proof and consumes its replay identifier.
@@ -63,7 +64,7 @@ public:
         foundation::Instant issuedAt) const;
 
 private:
-    DpopReplayStore* m_replays;
+    DpopReplayStore* m_replays{};
     const foundation::ClockSource* m_clock;
     foundation::Duration m_proofLifetime{};
 };

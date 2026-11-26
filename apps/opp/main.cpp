@@ -1928,8 +1928,6 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    postgres::PostgresIdentityRepository identities{*pool.value()};
-    postgres::PostgresExternalIdentityDirectory externalIdentities{*pool.value()};
     postgres::PostgresOrganizationRepository organizations{*pool.value()};
 
     auto configuredOrganization = organizations.findById(
@@ -2581,7 +2579,6 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
-    postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
     // Native coordinators share the operator's trust policy.
     auto nativeTrust = trust;
     auto nativeLocalTrust = trust;
@@ -2716,12 +2713,8 @@ addProtectedRoutes(gateway::Router& router,
                 }
             }
             nativeAuthentication = std::make_unique<auth::AuthenticationService>(
-                providers, *nativeTransactions, externalIdentities, clock,
-                std::move(nativeTrust), std::chrono::minutes{5},
-                &identities,
-                identity::OrganizationId{
-                    std::string{platform.auth().organizationId()}},
-                &identityProviderStore, nativeCanonical.get());
+                providers,*nativeTransactions,clock,
+                std::move(nativeTrust),std::chrono::minutes{5},*nativeCanonical);
         }
         if (nativeLocalEnabled) {
             nativeLocalStore = std::make_unique<postgres::CoroutineLocalCredentialStore>(
@@ -2748,10 +2741,8 @@ addProtectedRoutes(gateway::Router& router,
                 return ExitCode::ConfigurationError;
             }
             nativeLocalAuthentication = std::make_unique<auth::AuthenticationService>(
-                *nativeLocalProviders, *nativeTransactions, externalIdentities, clock,
-                std::move(nativeLocalTrust), std::chrono::minutes{5}, &identities,
-                identity::OrganizationId{std::string{platform.auth().organizationId()}},
-                &identityProviderStore, nativeCanonical.get());
+                *nativeLocalProviders,*nativeTransactions,clock,
+                std::move(nativeLocalTrust),std::chrono::minutes{5},*nativeCanonical);
             if (!nativeLocalAuthentication->nativeProviderAuthenticationEnabled(providerId)) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
                     "Native local login capability is unavailable."});
@@ -3842,11 +3833,11 @@ addProtectedRoutes(gateway::Router& router,
     nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime();
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
-        identityProviderStore, std::move(oidcPolicy).value(),
+        std::move(oidcPolicy).value(),
         std::move(previousOidcKeys).value()};
     nativeOidcProvider = &openIdProvider;
     oauth::DpopService dpopService{
-        identityProviderStore, clock, std::chrono::minutes{5}};
+        clock, std::chrono::minutes{5}};
     std::optional<fnd::SecretString> mtlsForwardingKey;
     if (auto configuredKey = environment.get("OPENPROOF_MTLS_FORWARDING_KEY");
         configuredKey.has_value()) {
@@ -3859,7 +3850,7 @@ addProtectedRoutes(gateway::Router& router,
         mtlsForwardingKey.emplace(std::move(configuredKey).value());
     }
     oauthHttp::SenderProofVerifier senderProof{
-        dpopService, identityProviderStore, clock, std::string{openIdProvider.issuer()},
+        dpopService, clock, std::string{openIdProvider.issuer()},
         std::move(mtlsForwardingKey)};
     nativeGatewaySender=&senderProof;
 

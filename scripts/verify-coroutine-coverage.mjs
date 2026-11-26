@@ -318,7 +318,7 @@ const checked = segments.map(([name, relative]) => {
       && /std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/.test(app)
       && /std::make_unique<\s*postgres::CoroutinePostgresSessionService>/.test(app)
       && /std::make_unique<auth::AuthenticationService>/.test(app)
-      && /nativeCanonical.get\(\)/.test(app)
+      && /std::move\(nativeTrust\),std::chrono::minutes\{5\},\*nativeCanonical/.test(app)
       && /localEnterpriseApi\{\s*\*nativeAuthentication,limiter\.value\(\),nativeLocalApi,\*nativeSessions\}/.test(app)
       && !/\bauth::AuthenticationService authentication\{/.test(app)
       && !/\bpostgres::PostgresSessionRepository sessionRepository\{/.test(app)

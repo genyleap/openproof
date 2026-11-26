@@ -210,7 +210,7 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   assert.doesNotMatch(app, /\bpostgres::(?:PostgresLocalAccountDirectory::create|PostgresSessionRepository\s+\w+\s*\{|PostgresAuthenticationTransactionStore\s+\w+\s*\{|PostgresRecoveryCodeRepository\s+\w+\s*\{)/);
   assert.doesNotMatch(app, /\b(?:auth::AuthenticationService authentication|local::LocalAuthenticationProvider\s+\w+)\s*\{/);
   assert.doesNotMatch(app, /std::make_unique<local::LocalAuthenticationProvider>/);
-  assert.match(app, /\*nativeLocalProviders, \*nativeTransactions, externalIdentities, clock/);
+  assert.match(app, /\*nativeLocalProviders,\*nativeTransactions,clock,\s*std::move\(nativeLocalTrust\),std::chrono::minutes\{5\},\*nativeCanonical/);
   assert.match(app, /nativeLocalAuthentication->nativeProviderAuthenticationEnabled\(providerId\)/);
   assert.match(app, /if \(nativeLocalEnabled\) \{\s*nativePaths\.emplace_back\("\/auth\/login"\);\s*nativePaths\.emplace_back\("\/auth\/mfa\/verify"\);\s*\}/);
   assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication,\*nativeSessions,limiter\.value\(\),providerId,fallback\}/);

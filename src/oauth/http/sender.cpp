@@ -137,7 +137,14 @@ SenderProofVerifier::SenderProofVerifier(
     DpopService& dpop, MtlsForwardingReplayStore& mtlsReplays,
     const foundation::ClockSource& clock, std::string publicOrigin,
     std::optional<foundation::SecretString> mtlsForwardingKey)
-    : m_dpop(&dpop), m_mtlsReplays(&mtlsReplays), m_clock(&clock),
+    : SenderProofVerifier(dpop,clock,std::move(publicOrigin),std::move(mtlsForwardingKey))
+{
+    m_mtlsReplays=&mtlsReplays;
+}
+
+SenderProofVerifier::SenderProofVerifier(DpopService& dpop,const foundation::ClockSource& clock,
+    std::string publicOrigin,std::optional<foundation::SecretString> mtlsForwardingKey)
+    : m_dpop(&dpop), m_clock(&clock),
       m_publicOrigin(std::move(publicOrigin)),
       m_mtlsForwardingKey(std::move(mtlsForwardingKey))
 {
@@ -290,6 +297,7 @@ foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwa
 {
     auto prepared=prepareMtlsForwarding(request);
     if (!prepared) return foundation::fail(prepared.error());
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto replay=m_mtlsReplays->consumeMtlsForwardingReplay(prepared->binding.value(),
         prepared->identifier,prepared->expiresAt,prepared->now);
     if (!replay) return foundation::fail(replay.error());
@@ -368,6 +376,7 @@ SenderProofVerifier::consumeTokenProofAsync(foundation::Result<std::optional<Rep
 foundation::Result<std::optional<token::SenderConstraint>>
 SenderProofVerifier::tokenEndpointConstraint(gateway::HttpRequest& request)
 {
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
     const bool hasDpop = request.header("dpop").has_value();
     const bool hasMtls = request.header("x-forwarded-client-cert-sha256").has_value()
         || request.header("x-forwarded-client-cert-timestamp").has_value()
