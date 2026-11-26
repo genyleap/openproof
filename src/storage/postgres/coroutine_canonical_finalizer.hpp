@@ -87,6 +87,12 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
     authorizeDelegatedAccountAsync(std::string digestHex,foundation::Instant now);
 
+    // Read the token's complete bounded authorization context in one snapshot.
+    // A returned sender constraint MUST still be verified against the request
+    // before the access context is accepted. No session is persisted.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
+    readDelegatedAccessAsync(std::string digestHex,foundation::Instant now);
+
     /** Read-only TOTP status. nullopt means no configured local-provider link;
      * false means linked but no usable password/TOTP pair. Never read secrets.
      */
