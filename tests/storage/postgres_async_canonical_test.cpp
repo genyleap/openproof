@@ -871,6 +871,47 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         acc::VerificationDigest{digest}, kNow, 8U));
     EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
         ids::IdentityId{seed.owner}, purpose)));
+
+    const idp::ProviderId localProvider{"fixture-local-" + seed.suffix};
+    const auto reservedId = "reserved-" + seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(reservedId, seed.owner), localProvider)));
+    auto reservation = execute(fixture.get(),
+        "SELECT identity_id FROM openproof.pending_external_identity_reservations "
+        "WHERE provider=$1 AND external_subject='contact@example.test'", {std::string{localProvider.value()}});
+    ASSERT_EQ(PQntuples(reservation.get()), 1);
+    EXPECT_EQ(std::string{PQgetvalue(reservation.get(), 0, 0)}, seed.owner);
+    auto noProfile = run(store.reserveAndReplaceAsync(
+        challenge("no-profile-" + seed.suffix, seed.secondOwner), localProvider));
+    EXPECT_TRUE(!noProfile && noProfile.error().code() == fnd::ErrorCode::NotFound);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,created_at_ms,updated_at_ms) VALUES($1,$2,$2)",
+        {seed.secondOwner, "1770000000000"})));
+    auto contested = run(store.reserveAndReplaceAsync(
+        challenge("contested-" + seed.suffix, seed.secondOwner), localProvider));
+    EXPECT_TRUE(!contested && contested.error().code() == fnd::ErrorCode::AlreadyExists);
+    auto deniedCount = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.account_verification_challenges WHERE identity_id=$1",
+        {seed.secondOwner});
+    EXPECT_STREQ(PQgetvalue(deniedCount.get(), 0, 0), "0");
+    // Failed challenge insertion must not commit its alias reservation.
+    const idp::ProviderId rollbackProvider{"rollback-local-" + seed.suffix};
+    auto collision = run(store.reserveAndReplaceAsync(
+        challenge(reservedId, seed.secondOwner), rollbackProvider));
+    EXPECT_TRUE(!collision && collision.error().code() == fnd::ErrorCode::Unavailable);
+    auto rolledBack = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
+        {std::string{rollbackProvider.value()}});
+    EXPECT_STREQ(PQgetvalue(rolledBack.get(), 0, 0), "0");
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId},
+        ids::IdentityId{seed.owner}, purpose)));
+    EXPECT_FALSE(legacy.consume(acc::VerificationId{reservedId},
+        acc::VerificationDigest{digest}, kNow, 8U));
+    // Reservation survives to its existing expiry; exact compensation must
+    // not release a potentially renewed legacy reservation for the same owner.
+    auto retained = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.pending_external_identity_reservations "
+        "WHERE provider=$1 AND identity_id=$2", {std::string{localProvider.value()}, seed.owner});
+    EXPECT_STREQ(PQgetvalue(retained.get(), 0, 0), "1");
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
