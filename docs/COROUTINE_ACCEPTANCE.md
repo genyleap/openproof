@@ -4814,3 +4814,15 @@ removal before redemption, plus wrong-tenant/owner SQL denial. HTTP wiring,
 presentation metadata, connection flows and exact-head executable tests
 remain pending. The old Web3 RPC facade is intentionally retained until
 these runtime paths preserve all existing behavior.
+
+### Native mobile wallet HTTP handoff
+
+The existing native Web3 opt-in now also overlays POST /auth/web3/handoff
+and /auth/web3/handoff/redeem. Login start retains a wiping publisher
+credential, completion publishes only after verified proof, and redemption
+alone issues a session. Pending/replay response shape remains 202; issuance
+201 and publish/redeem success 200 remain unchanged. Stale mode/publisher
+cookies are cleared on start and malformed or duplicate optional cookies
+cannot silently downgrade a handoff to ordinary login. Native connection
+and presentation persistence remain incomplete; the Web3 RPC bridge is
+not retired. Compiled and disposable end-to-end acceptance are pending.

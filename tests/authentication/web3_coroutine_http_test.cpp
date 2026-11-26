@@ -2,6 +2,7 @@
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
+#include <boost/json.hpp>
 
 #include <chrono>
 #include <memory>
@@ -212,6 +213,16 @@ public:
         co_return owner->value();
     }
 
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    authorizeHandoffOwnerAsync(identity::IdentityId owner,identity::ExternalIdentityRef external) override
+    {
+        auto current=m_directory->ownerOf(external);
+        if (!current) co_return fnd::fail(current.error());
+        if (!current->has_value() || current->value()!=owner)
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return fnd::ok();
+    }
+
     [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
         return true;
     }
@@ -321,11 +332,11 @@ asio::awaitable<void> check(
     return status;
 }
 
-TEST(Web3HttpCoroutineTest, UnsupportedHandoffDoesNotFallBackToBlockingStorage)
+TEST(Web3HttpCoroutineTest, MissingProviderAndUnsupportedConnectionHandoffDoNotFallBack)
 {
     Fixture fixture;
     EXPECT_EQ(execute(fixture, request(
-        "/auth/web3/handoff", R"({"provider":"ethereum-wallet"})")), 503);
+        "/auth/web3/handoff", R"({"provider":"ethereum-wallet"})")), 404);
     EXPECT_EQ(execute(fixture, request(
         "/account/connections/web3/handoff", R"({"provider":"ethereum-wallet"})")), 503);
     EXPECT_EQ(fixture.fallback.calls, 0);
@@ -588,7 +599,7 @@ asio::awaitable<void> positiveWalletFlow(
     if (startStatus != 200) co_return;
     std::string cookieHeader;
     const auto collect = [&](std::string_view name, std::string_view value) {
-        if (name != "set-cookie") return;
+        if (name != "set-cookie" || value.find("Max-Age=0")!=std::string_view::npos) return;
         const auto end = value.find(';');
         if (!cookieHeader.empty()) cookieHeader.append("; ");
         cookieHeader.append(value.substr(0U, end));
@@ -703,7 +714,7 @@ TEST(Web3HttpCoroutineTest, MalformedNativeIssuerGrantCannotInjectSessionCookie)
     EXPECT_EQ(fixture.sessionsRepository.size(), 0U);
 }
 
-TEST(Web3HttpCoroutineTest, NativeHandoffStartFailsBeforeCreatingTransaction)
+TEST(Web3HttpCoroutineTest, NativeHandoffStartDoesNotIssueSessionBeforeProof)
 {
     Fixture fixture;
     auto owned = std::make_unique<NativeWalletProvider>();
@@ -711,9 +722,76 @@ TEST(Web3HttpCoroutineTest, NativeHandoffStartFailsBeforeCreatingTransaction)
     ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
     EXPECT_EQ(execute(fixture, request(
         "/auth/web3/start",
-        R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1","handoff_ticket":"test.ticket"})")), 503);
-    EXPECT_EQ(fixture.transactions.size(), 0U);
-    EXPECT_EQ(provider->nativeCalls, 0);
+        R"({"provider":"ethereum-wallet","address":"0x1111111111111111111111111111111111111111","chain_id":"1","handoff_ticket":"test.ticket"})")), 200);
+    EXPECT_EQ(fixture.transactions.size(), 1U);
+    EXPECT_EQ(provider->nativeCalls, 1);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls,0);
+}
+
+asio::awaitable<void> mobileHandoffFlow(Fixture& fixture,bool& passed)
+{
+    namespace json=boost::json;
+    auto issued=co_await fixture.api.handleAsync(request("/auth/web3/handoff",
+        R"({"provider":"ethereum-wallet"})"));
+    if (issued.status()!=201) co_return;
+    auto tickets=json::parse(issued.body()).as_object();
+    std::string publisher{tickets.at("publisher_ticket").as_string()};
+    std::string redeemer{tickets.at("redeem_ticket").as_string()};
+    EXPECT_NE(publisher,redeemer);
+    const std::string redeemBody=json::serialize(json::object{{"redeem_ticket",redeemer}});
+    auto pending=co_await fixture.api.handleAsync(request("/auth/web3/handoff/redeem",redeemBody));
+    EXPECT_EQ(pending.status(),202);
+    auto startBody=json::serialize(json::object{{"provider","ethereum-wallet"},
+        {"address","0x1111111111111111111111111111111111111111"},{"chain_id","1"},
+        {"handoff_ticket",publisher}});
+    auto started=co_await fixture.api.handleAsync(request("/auth/web3/start",startBody));
+    if (started.status()!=200) co_return;
+    std::string cookies;
+    auto collect=[&](std::string_view name,std::string_view value) {
+        if (name!="set-cookie" || value.find("Max-Age=0")!=std::string_view::npos) return;
+        if (!cookies.empty()) cookies.append("; ");
+        cookies.append(value.substr(0,value.find(';')));
+    };
+    for (const auto& [name,value]:started.headers()) collect(name,value);
+    for (const auto& [name,value]:started.repeatedHeaders()) collect(name,value);
+    auto complete=[&](std::string cookieHeader) {
+        return gateway::HttpRequest::create(gateway::HttpMethod::Post,"/auth/web3/complete",
+            {{"content-type","application/json"},{"cookie",std::move(cookieHeader)}},
+            R"({"message":"SIWE test challenge","signature":"test-signed-proof"})",
+            "127.0.0.1",fnd::CorrelationId{"native-mobile-proof"}).value();
+    };
+    auto ambiguous=co_await fixture.api.handleAsync(complete(cookies+"; __Host-openproof-web3-auth-handoff=duplicate"));
+    EXPECT_EQ(ambiguous.status(),401);
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls,0);
+    auto published=co_await fixture.api.handleAsync(complete(cookies));
+    if (published.status()!=200) co_return;
+    EXPECT_TRUE(json::parse(published.body()).as_object().at("published").as_bool());
+    EXPECT_EQ(fixture.nativeSessions.nativeCalls,0);
+    auto redeemed=co_await fixture.api.handleAsync(request("/auth/web3/handoff/redeem",redeemBody));
+    if (redeemed.status()!=200) co_return;
+    EXPECT_EQ(json::parse(redeemed.body()).as_object().at("identity_id").as_string(),
+        "wallet-canonical-identity");
+    auto replay=co_await fixture.api.handleAsync(request("/auth/web3/handoff/redeem",redeemBody));
+    EXPECT_EQ(replay.status(),202);
+    passed=fixture.nativeSessions.nativeCalls==1 && fixture.sessionsRepository.size()==1U;
+}
+
+TEST(Web3HttpCoroutineTest, MobileHandoffPublishesWithoutSessionAndRedeemsOnce)
+{
+    Fixture fixture;
+    auto owned=std::make_unique<NativeWalletProvider>();
+    auto* provider=owned.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(owned)));
+    attachWalletIdentity(fixture);
+    bool passed=false;
+    asio::io_context io;
+    auto done=asio::co_spawn(io,mobileHandoffFlow(fixture,passed),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(passed);
+    EXPECT_EQ(provider->nativeCalls,2);
+    EXPECT_EQ(provider->blockingCalls,0);
+    EXPECT_EQ(fixture.fallback.calls,0);
 }
 
 TEST(Web3HttpCoroutineTest, NativeProfileWriteFailsBeforeReadingCredentials)

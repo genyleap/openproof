@@ -44,6 +44,10 @@ private:
     startAsync(gateway::HttpRequest request, bool connection);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
     completeAsync(gateway::HttpRequest request, bool connection);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    issueAuthenticationHandoffAsync(gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    redeemAuthenticationHandoffAsync(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse issueAuthenticationHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse redeemAuthenticationHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse issueConnectionHandoff(gateway::HttpRequest request);

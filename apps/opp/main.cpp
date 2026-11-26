@@ -2818,6 +2818,8 @@ addProtectedRoutes(gateway::Router& router,
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/auth/web3/start");
             nativePaths.emplace_back("/auth/web3/complete");
+            nativePaths.emplace_back("/auth/web3/handoff");
+            nativePaths.emplace_back("/auth/web3/handoff/redeem");
         }
         if (nativeAuthSessionEnabled && nativeSessions) {
             // The existing coroutine session listener owns the native
