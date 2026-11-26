@@ -744,7 +744,7 @@ foundation::Status AccountService::completePhoneVerification(
     const identity::core::IdentityId& expectedIdentity,
     const VerificationId& id, const foundation::SecretString& secret)
 {
-    auto challenge = consume(id, secret, VerificationPurpose::VerifyPhone);
+    auto challenge = consume(id, secret, VerificationPurpose::VerifyPhone, &expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     if (challenge->identity() != expectedIdentity) {
         return foundation::fail(genericVerificationFailure(
