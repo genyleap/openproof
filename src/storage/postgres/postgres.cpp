@@ -4074,6 +4074,16 @@ namespace openproof::storage::postgres {
             return foundation::fail(error);
         };
 
+        // Serialize replacement even when no previous challenge exists.
+        // Native contact verification acquires the same identity row lock.
+        ResultPointer owner = execParams(connection,
+            "SELECT id FROM openproof.identities WHERE id=$1 FOR UPDATE",
+            {std::string{challenge.identity().value()}});
+        if (!tuplesOk(owner.get()))
+            return failTransaction(databaseError(owner.get(), "lock verification owner"));
+        if (PQntuples(owner.get()) != 1)
+            return failTransaction(foundation::Error{foundation::ErrorCode::NotFound});
+
         auto removed = runCommand(
             connection,
             "DELETE FROM openproof.account_verification_challenges "
