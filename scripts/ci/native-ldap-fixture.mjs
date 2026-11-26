@@ -216,6 +216,7 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
   try {
     const deadline = Date.now() + 15_000;
     let subject;
+    let unlinkedSubject;
     let lastOutcome = "not-ready";
     let tlsOutcome = "not-ready";
     while (Date.now() < deadline && !failed && child.exitCode === null
@@ -230,6 +231,7 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
         const entries = parseFixtureSubjects(result.stdout);
         if (entries) {
           subject = entries.linked;
+          unlinkedSubject = entries.unlinked;
           break;
         }
         lastOutcome = "invalid-entry-set";
@@ -253,7 +255,7 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
         + "; search=" + lastOutcome + "; daemon=" + processState + "/" + daemonOutcome);
     }
     return {
-      subject, linkedPassword, unlinkedPassword, close,
+      subject, unlinkedSubject, linkedPassword, unlinkedPassword, close,
       environment: {
         OPENPROOF_EXPERIMENTAL_NATIVE_LDAP: "1",
         OPENPROOF_LDAP_URI: uri,

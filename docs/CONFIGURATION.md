@@ -921,3 +921,15 @@ compatibility dispatch. A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
+
+#### LDAP certificate trust lifecycle
+
+The LDAP provider prepares its TLS trust context before listener startup. A
+configured private CA file is read once; an invalid/unreadable CA refuses
+startup with a sanitized configuration error. Each authentication opens its
+own TLS connection, verifies the server certificate and hostname, and uses
+its own deadline. Rotate the configured private CA using a normal controlled
+restart; changing the file alone does not alter an already prepared trust
+store. With no private CA, OpenSSL's normal system trust defaults remain in
+use (system certificate-directory lookup is governed by OpenSSL). LDAP native
+routing remains explicitly experimental and default-off.

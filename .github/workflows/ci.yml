@@ -47,6 +47,8 @@ jobs:
           npm audit --audit-level=moderate
           npm run check
           npm test
+      - name: Sanitized disposable E2E startup diagnostics
+        run: node --test scripts/test-e2e-startup-diagnostics.mjs
       - name: Native account profile tenant and capability contract
         run: |
           node scripts/test-coroutine-native-capability-defaults.mjs

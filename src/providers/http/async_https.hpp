@@ -76,6 +76,10 @@ public:
     exchange(HttpsRequest request);
 
 private:
+    [[nodiscard]] boost::asio::awaitable<HttpsResult>
+    exchangeSerialized(HttpsRequest request,
+                       std::chrono::steady_clock::time_point deadline);
+
     boost::asio::ssl::context m_context;
     std::size_t m_maxBodyBytes;
     std::size_t m_maxHeaderBytes;
