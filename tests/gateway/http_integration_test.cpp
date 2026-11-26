@@ -476,9 +476,53 @@ sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
     request.prepare_payload();
     beastHttp::write(stream, request);
     beast::flat_buffer buffer;
-    beastHttp::response<beastHttp::string_body> response;
-    beastHttp::read(stream, buffer, response);
-    return response;
+    beastHttp::response_parser<beastHttp::string_body> parser;
+    parser.skip(method == beastHttp::verb::head);
+    beastHttp::read(stream, buffer, parser);
+    return parser.release();
+}
+
+class NativeHeadMetadataHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        throw std::runtime_error{"unexpected synchronous HEAD handler"};
+    }
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest request) override
+    {
+        if (request.path() == "/metadata") {
+            co_return gw::HttpResponse{200, gw::Headers{{"content-length", "1024"}}, ""};
+        }
+        if (request.path() == "/empty") {
+            co_return gw::HttpResponse{204, gw::Headers{{"content-length", "0"}}, ""};
+        }
+        co_return gw::HttpResponse{200, {}, "hello"};
+    }
+};
+
+TEST(BeastHttpIntegrationTest, NativeHeadPreservesRepresentationLengthAndOmitsBody)
+{
+    NativeHeadMetadataHandler handler;
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto metadata = sendRequest(server.boundPort(), beastHttp::verb::head, "/metadata");
+    EXPECT_EQ(metadata.result_int(), 200U);
+    EXPECT_EQ(metadata[beastHttp::field::content_length], "1024");
+    EXPECT_TRUE(metadata.body().empty());
+    EXPECT_EQ(metadata.count(beastHttp::field::transfer_encoding), 0U);
+    const auto generated = sendRequest(server.boundPort(), beastHttp::verb::head, "/generated");
+    EXPECT_EQ(generated.result_int(), 200U);
+    EXPECT_EQ(generated[beastHttp::field::content_length], "5");
+    EXPECT_TRUE(generated.body().empty());
+    const auto empty = sendRequest(server.boundPort(), beastHttp::verb::head, "/empty");
+    EXPECT_EQ(empty.result_int(), 204U);
+    EXPECT_EQ(empty.count(beastHttp::field::content_length), 0U);
+    const auto get = sendRequest(server.boundPort(), beastHttp::verb::get, "/generated");
+    EXPECT_EQ(get.body(), "hello");
+    EXPECT_EQ(get[beastHttp::field::content_length], "5");
+    server.stop();
 }
 
 TEST(BeastHttpIntegrationTest, BlockingHandlersDoNotOccupySocketEventLoop)
