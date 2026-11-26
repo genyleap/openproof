@@ -995,8 +995,16 @@ source, and cannot extend the source access token's expiry. Both grants
 issue only access tokens, never refresh tokens. As before, an exchanged
 token is a separate family; revocation of the source after a successful
 exchange does not cascade to previously issued families. Native-required
-legacy dispatch rejects these grants. Device-code polling, authorization/login
-and PAR still require separate migration and executable acceptance.
+legacy dispatch rejects these grants. Device-code polling also uses native
+grant dispatch and the existing device authorization HMAC key. Poll
+interval changes and pending polls are committed before their responses.
+Approved codes are locked and consumed in the same transaction as initial
+access/refresh family issuance, so a failed insert cannot lose approval.
+All supported token grants now have native paths; the synchronous token
+handler rejects them when native mode is required and denies unknown grants
+without synchronous authentication. Device initiation and browser approval,
+authorization/login and PAR still require separate migration and executable
+acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 

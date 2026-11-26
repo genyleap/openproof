@@ -1473,6 +1473,18 @@ gateway::HttpResponse OAuthHttpApi::tokenEndpoint(gateway::HttpRequest request)
         request.wipeTargetQuery();
         return oauthErrorResponse(503,"temporarily_unavailable","Native machine grant is unavailable.");
     }
+    if (m_nativeTokenReadsRequired && grantType.value()=="urn:ietf:params:oauth:grant-type:device_code") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native device polling is unavailable.");
+    }
+    // All supported token grants are native. Unknown grants must not
+    // reach even synchronous client authentication.
+    if (m_nativeTokenReadsRequired) {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(400,"unsupported_grant_type","The grant type is not supported.");
+    }
     client::ClientId clientId{clientIdText.value()};
     std::optional<foundation::SecretString> clientSecret;
     if (const auto rawSecret = optional(form.value(), "client_secret")) {

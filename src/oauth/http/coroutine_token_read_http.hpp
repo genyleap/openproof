@@ -40,6 +40,13 @@ public:
     using IssueMachine=std::function<boost::asio::awaitable<foundation::Result<NativeMachineGrantResult>>(
         std::string,std::optional<std::string>,std::optional<std::string>,std::string,
         std::vector<std::string>,std::string,std::string,std::optional<session::DelegatedSenderConstraint>)>;
+    using PollDevice=std::function<boost::asio::awaitable<foundation::Result<NativeDevicePollResult>>(
+        std::string,std::optional<std::string>,std::string,std::string,std::string,std::string,
+        std::optional<session::DelegatedSenderConstraint>)>;
+    struct DevicePollContext final {
+        foundation::SecretString deviceKey;
+        PollDevice poll;
+    };
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
         ExchangeCode exchange;
@@ -50,7 +57,8 @@ public:
         ReadProfile profile,VerifySender sender,Revoke revoke={},
         Rotate rotate={},PrepareSender prepareSender={},
         foundation::Duration accessLifetime=foundation::Duration{900000},
-        std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={});
+        std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={},
+        std::optional<DevicePollContext> devicePoll=std::nullopt);
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -72,6 +80,8 @@ private:
     foundation::Duration m_accessLifetime;
     std::optional<CodeExchangeContext> m_codeExchange;
     IssueMachine m_issueMachine;
+    std::optional<DevicePollContext> m_devicePoll;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pollDevice(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> issueMachine(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> exchangeCode(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> refresh(gateway::HttpRequest);

@@ -162,6 +162,12 @@ private:
 
 // Committed native authorization-code exchange result. Raw access and
 // refresh credentials stay with the HTTP caller; persistence sees digests.
+enum class NativeDevicePollState { Pending, SlowDown, Denied, Expired, Issued };
+struct NativeDevicePollResult final {
+    NativeDevicePollState state;
+    std::vector<std::string> scopes;
+};
+
 struct NativeMachineGrantResult final {
     std::vector<std::string> scopes;
     foundation::Duration expiresIn;

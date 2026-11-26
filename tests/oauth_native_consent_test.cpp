@@ -270,6 +270,71 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
     EXPECT_EQ(fallback.asyncCalls,0);
 }
 
+TEST(NativeOAuthTokenReadTest, DevicePollingReturnsProtocolStatesWithoutLeakingCredentials)
+{
+    namespace sec=openproof::security;
+    namespace oauth=openproof::oauth;
+    using State=oauth::NativeDevicePollState;
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    fnd::SecretString deviceKey{std::string(32U,'d')};
+    const auto expected=fnd::toHex(sec::hmacSha256(deviceKey,"fixture-device").value());
+    auto state=State::Pending;
+    int calls=0;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,
+        fnd::SecretString{std::string(32U,'t')},fnd::SecretString{std::string(32U,'c')},
+        {},{},{},{},{},{},
+        [](gw::HttpRequest&)->asio::awaitable<fnd::Result<std::optional<openproof::token::SenderConstraint>>> {
+            co_return std::optional<openproof::token::SenderConstraint>{};
+        },15min,std::nullopt,{},
+        http::CoroutineTokenReadAdapter::DevicePollContext{deviceKey.clone(),
+            [&](std::string clientId,std::optional<std::string> proof,std::string digest,
+                std::string family,std::string access,std::string refresh,
+                std::optional<sess::DelegatedSenderConstraint> sender)->asio::awaitable<fnd::Result<oauth::NativeDevicePollResult>> {
+                ++calls;
+                if (clientId!="fixture-client" || proof) co_return fnd::fail(fnd::ErrorCode::AuthenticationRequired);
+                if (digest!=expected) co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                EXPECT_FALSE(family.empty());
+                EXPECT_EQ(access.size(),64U);
+                EXPECT_EQ(refresh.size(),64U);
+                EXPECT_NE(access,refresh);
+                EXPECT_FALSE(sender);
+                co_return oauth::NativeDevicePollResult{state,state==State::Issued
+                    ?std::vector<std::string>{"account"}:std::vector<std::string>{}};
+            }}};
+    auto run=[&](std::string body){
+        auto input=request(gw::HttpMethod::Post,"/oauth/token",{},std::move(body));
+        EXPECT_TRUE(api.nativeEnabledFor(input));
+        asio::io_context io;
+        std::optional<gw::HttpResponse> response;
+        auto collect=[&]()->asio::awaitable<void>{response.emplace(co_await api.handleAsync(std::move(input)));};
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(response).value();
+    };
+    const std::string form="grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&client_id=fixture-client&device_code=fixture-device";
+    for (const auto& [next,code]:std::vector<std::pair<State,std::string_view>>{
+        {State::Pending,"authorization_pending"},{State::SlowDown,"slow_down"},
+        {State::Denied,"access_denied"},{State::Expired,"expired_token"}}) {
+        state=next;
+        const auto response=run(form);
+        EXPECT_EQ(response.status(),400);
+        EXPECT_NE(response.body().find(code),std::string::npos);
+        EXPECT_EQ(response.body().find("access_token"),std::string::npos);
+        EXPECT_EQ(response.body().find("fixture-device"),std::string::npos);
+    }
+    state=State::Issued;
+    const auto accepted=run(form);
+    EXPECT_EQ(accepted.status(),200);
+    EXPECT_NE(accepted.body().find("opa_"),std::string::npos);
+    EXPECT_NE(accepted.body().find("opr_"),std::string::npos);
+    EXPECT_EQ(accepted.body().find("id_token"),std::string::npos);
+    EXPECT_EQ(run(form+"&device_code=duplicate").status(),400);
+    EXPECT_EQ(calls,5);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
+
 constexpr std::string_view sessionCookie = "__Host-openproof-session=valid-token";
 constexpr std::string_view csrfCookies =
     "__Host-openproof-session=valid-token; __Host-openproof-consent-csrf=proof";

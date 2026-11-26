@@ -123,6 +123,10 @@ bool refreshRoute(const gateway::HttpRequest& r) noexcept {
 bool codeRoute(const gateway::HttpRequest& r) noexcept {
     return grantRoute(r,"authorization_code");
 }
+constexpr std::string_view kDeviceGrant="urn:ietf:params:oauth:grant-type:device_code";
+bool deviceRoute(const gateway::HttpRequest& r) noexcept {
+    return grantRoute(r,kDeviceGrant);
+}
 constexpr std::string_view kExchangeGrant="urn:ietf:params:oauth:grant-type:token-exchange";
 constexpr std::string_view kAccessType="urn:ietf:params:oauth:token-type:access_token";
 bool machineRoute(const gateway::HttpRequest& r) noexcept {
@@ -228,7 +232,7 @@ struct IntrospectionForm final {
     std::string clientId;
     foundation::SecretString secret,token;
 };
-foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r,bool requireSecret=true,bool refresh=false) {
+foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r,bool requireSecret=true,bool refresh=false,bool device=false) {
     const auto type=r.header("content-type");
     if (!type || (*type!="application/x-www-form-urlencoded" &&
             !type->starts_with("application/x-www-form-urlencoded;"))
@@ -247,16 +251,17 @@ foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r,bool requireS
         if (!key) return foundation::fail(key.error());
         const auto name=key->expose();
         auto* dest=name=="client_id" ? &id : name=="client_secret" ? &secret :
-            name==(refresh?"refresh_token":"token") ? &token :
-            (!refresh && name=="token_type_hint") ? &hint :
-            (refresh && name=="grant_type") ? &grant : nullptr;
+            name==(device?"device_code":refresh?"refresh_token":"token") ? &token :
+            (!refresh && !device && name=="token_type_hint") ? &hint :
+            ((refresh || device) && name=="grant_type") ? &grant : nullptr;
         if (!dest || dest->has_value()) return foundation::fail(E::InvalidArgument);
-        auto value=decode(part.substr(eq+1U),name=="client_secret"?512U:256U);
+        auto value=decode(part.substr(eq+1U),name=="client_secret" || name=="device_code"?512U:256U);
         if (!value) return foundation::fail(value.error());
         dest->emplace(std::move(value).value());
     }
     if (!id || id->empty() || (requireSecret && (!secret || secret->empty())) || !token || token->empty()
-        || (refresh && (!grant || grant->expose()!="refresh_token")))
+        || (refresh && (!grant || grant->expose()!="refresh_token"))
+        || (device && (!grant || grant->expose()!=kDeviceGrant)))
         return foundation::fail(E::InvalidArgument);
     IntrospectionForm result{std::string{id->expose()},
         secret ? std::move(*secret) : foundation::SecretString{},std::move(*token)};
@@ -269,12 +274,14 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     foundation::SecretString clientKey,ReadAccess access,AuthenticateClient client,
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
-    std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine)
+    std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine,
+    std::optional<DevicePollContext> devicePoll)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
-      m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)) {}
+      m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)),
+      m_devicePoll(std::move(devicePoll)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
@@ -282,13 +289,14 @@ bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) 
     if (refreshRoute(r)) return m_rotate && m_prepareSender;
     if (codeRoute(r)) return m_codeExchange && m_codeExchange->exchange && m_prepareSender;
     if (machineRoute(r)) return m_issueMachine && m_prepareSender;
+    if (deviceRoute(r)) return m_devicePoll && m_devicePoll->poll && m_prepareSender;
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -307,6 +315,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (refreshRoute(r)) co_return co_await refresh(std::move(r));
     if (codeRoute(r)) co_return co_await exchangeCode(std::move(r));
     if (machineRoute(r)) co_return co_await issueMachine(std::move(r));
+    if (deviceRoute(r)) co_return co_await pollDevice(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -602,6 +611,72 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(g
         .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(issued->expiresIn).count()))
         .add("scope",joined(issued->scopes));
     if (exchange) body.add("issued_token_type",kAccessType);
+    co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::pollDevice(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    const auto oauthError=[](int status,std::string_view code) {
+        foundation::JsonObjectWriter body;
+        body.add("error",code);
+        return json(status,std::move(body));
+    };
+    auto input=form(r,false,false,true);
+    if (!input) co_return oauthError(400,"invalid_request");
+    r.wipeAuthorizationHeader(); r.wipeCookieHeader();
+    std::optional<std::string> clientDigest;
+    if (!input->secret.empty()) {
+        auto digest=security::hmacSha256(m_clientKey,input->secret.expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        clientDigest.emplace(foundation::toHex(digest.value()));
+    }
+    auto presented=security::hmacSha256(m_devicePoll->deviceKey,input->token.expose());
+    input->secret=foundation::SecretString{};
+    input->token=foundation::SecretString{};
+    if (!presented) co_return oauthError(503,"temporarily_unavailable");
+    auto proof=m_prepareSender(r);
+    r.wipeTargetQuery();
+    auto sender=co_await std::move(proof);
+    if (!sender) co_return sender.error().code()==E::Unavailable
+        ? oauthError(503,"temporarily_unavailable") : oauthError(400,"invalid_dpop_proof");
+    std::optional<session::DelegatedSenderConstraint> binding;
+    if (sender->has_value())
+        binding.emplace(sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls,
+            std::string{sender->value().value()});
+    auto accessRaw=security::randomTokenBase64Url(32U);
+    if (!accessRaw) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString access{std::string{"opa_"}+accessRaw.value()};
+    foundation::secureWipe(accessRaw->data(),accessRaw->size());
+    auto refreshRaw=security::randomTokenBase64Url(32U);
+    if (!refreshRaw) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString replacement{std::string{"opr_"}+refreshRaw.value()};
+    foundation::secureWipe(refreshRaw->data(),refreshRaw->size());
+    const auto accessDigest=security::hmacSha256(m_tokenKey,access.expose());
+    const auto refreshDigest=security::hmacSha256(m_tokenKey,replacement.expose());
+    if (!accessDigest || !refreshDigest) co_return oauthError(503,"temporarily_unavailable");
+    auto family=security::randomTokenBase64Url(24U);
+    if (!family) co_return oauthError(503,"temporarily_unavailable");
+    auto polled=co_await m_devicePoll->poll(std::move(input->clientId),std::move(clientDigest),
+        foundation::toHex(presented.value()),std::move(family).value(),
+        foundation::toHex(accessDigest.value()),foundation::toHex(refreshDigest.value()),std::move(binding));
+    if (!polled) {
+        if (polled.error().code()==E::AuthenticationRequired) co_return oauthError(401,"invalid_client");
+        if (polled.error().code()==E::AuthenticationFailed) co_return oauthError(400,"invalid_grant");
+        co_return oauthError(503,"temporarily_unavailable");
+    }
+    switch (polled->state) {
+    case NativeDevicePollState::Pending: co_return oauthError(400,"authorization_pending");
+    case NativeDevicePollState::SlowDown: co_return oauthError(400,"slow_down");
+    case NativeDevicePollState::Denied: co_return oauthError(400,"access_denied");
+    case NativeDevicePollState::Expired: co_return oauthError(400,"expired_token");
+    case NativeDevicePollState::Issued: break;
+    }
+    foundation::JsonObjectWriter body;
+    body.add("access_token",access.expose()).add("refresh_token",replacement.expose())
+        .add("token_type",sender->has_value() && sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?"DPoP":"Bearer")
+        .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(m_accessLifetime).count()))
+        .add("scope",joined(polled->scopes));
     co_return json(200,std::move(body));
 }
 }

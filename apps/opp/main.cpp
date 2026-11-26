@@ -2883,6 +2883,7 @@ addProtectedRoutes(gateway::Router& router,
     oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
     std::optional<fnd::SecretString> nativeOAuthClientKey;
     std::optional<fnd::SecretString> nativeOAuthCodeKey;
+    std::optional<fnd::SecretString> nativeOAuthDeviceKey;
     fnd::Duration nativeOAuthAccessLifetime{},nativeOAuthRefreshLifetime{};
 
     std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
@@ -3132,7 +3133,7 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (platform.oidc().enabled()) {
             if (!nativeCanonical || !nativeWeb3DelegatedKey || !nativeOAuthClientKey || !nativeGatewaySender
-                || !nativeOAuthCodeKey || !nativeOidcProvider
+                || !nativeOAuthCodeKey || !nativeOAuthDeviceKey || !nativeOidcProvider
                 || nativeOAuthAccessLifetime<=fnd::Duration::zero()
                 || nativeOAuthRefreshLifetime<=nativeOAuthAccessLifetime) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3201,7 +3202,17 @@ addProtectedRoutes(gateway::Router& router,
                     return reader->issueOAuthMachineGrantAsync(std::move(clientId),std::move(clientDigest),
                         std::move(subjectDigest),std::move(audience),std::move(scopes),std::move(family),
                         std::move(accessDigest),std::move(sender),clock.now(),nativeOAuthAccessLifetime);
-                });
+                },
+                oauthHttp::CoroutineTokenReadAdapter::DevicePollContext{
+                    nativeOAuthDeviceKey->clone(),
+                    [reader,&clock,nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime](
+                        std::string clientId,std::optional<std::string> clientDigest,std::string deviceDigest,
+                        std::string family,std::string accessDigest,std::string refreshDigest,
+                        std::optional<session::DelegatedSenderConstraint> sender) {
+                        return reader->pollOAuthDeviceAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(deviceDigest),std::move(family),std::move(accessDigest),std::move(refreshDigest),
+                            std::move(sender),clock.now(),nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime);
+                    }});
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");
@@ -3723,6 +3734,7 @@ addProtectedRoutes(gateway::Router& router,
     }
     nativeOAuthClientKey.emplace(clientSecretMaterial->clone());
     nativeOAuthCodeKey.emplace(authorizationCodeMaterial->clone());
+    nativeOAuthDeviceKey.emplace(deviceAuthorizationMaterial->clone());
     auto clientSecretKey = client::ClientSecretKey::create(
         std::move(clientSecretMaterial).value());
     auto authorizationCodeKey = oauth::AuthorizationCodeKey::create(

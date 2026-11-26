@@ -1720,6 +1720,91 @@ TEST(PostgresCanonicalCoroutineTest, NativeMachineGrantsCannotWidenScopeAudience
     EXPECT_STREQ(PQgetvalue(rows.get(),0,2),"2");
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeDevicePollingCommitsThrottleAndConsumesApprovedCodeExactlyOnce)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="device-app-"+seed.suffix,client="device-client-"+seed.suffix;
+    const auto family="device-family-"+seed.suffix;
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(family+std::string{suffix}).value());
+    };
+    const auto device=fingerprint("-device"),user=fingerprint("-user");
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'device-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_device_authorizations "
+        "(device_digest,user_code_digest,client_id,resource,status,issued_at_ms,expires_at_ms,poll_interval_ms) "
+        "VALUES(decode($1,'hex'),decode($2,'hex'),$3,'urn:device',0,1770000000000,1770000600000,5000)",{device,user,client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_device_authorization_scopes(device_digest,scope) VALUES(decode($1,'hex'),'account')",{device}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    using State=openproof::oauth::NativeDevicePollState;
+    const auto attempt=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string suffix,fnd::Instant now,
+        std::optional<std::string> proof=std::nullopt) {
+        return store.pollOAuthDeviceAsync(client,std::move(proof),device,family+suffix,
+            fingerprint("-access"+suffix),fingerprint("-refresh"+suffix),std::nullopt,now,15min,24h*30);
+    };
+    const auto run=[&](auto task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    EXPECT_FALSE(run(attempt(foreign,"-foreign",kNow)));
+    EXPECT_FALSE(run(attempt(native,"-wrong-secret",kNow,std::string(64U,'0'))));
+    auto pending=run(attempt(native,"-pending",kNow));
+    ASSERT_TRUE(pending); EXPECT_EQ(pending->state,State::Pending);
+    auto slow=run(attempt(native,"-slow",kNow+1s));
+    ASSERT_TRUE(slow); EXPECT_EQ(slow->state,State::SlowDown);
+    const auto throttle=execute(fixture.get(),
+        "SELECT poll_interval_ms::text,last_poll_at_ms::text FROM openproof.oauth_device_authorizations WHERE device_digest=decode($1,'hex')",{device});
+    ASSERT_EQ(PQntuples(throttle.get()),1);
+    EXPECT_STREQ(PQgetvalue(throttle.get(),0,0),"10000");
+    EXPECT_STREQ(PQgetvalue(throttle.get(),0,1),"1770000001000");
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_device_authorizations SET status=1,identity_id=$2,provider='local',"
+        "assurance=1,factors=1,phishing_resistant=false,authenticated_at_ms=1770000001000 "
+        "WHERE device_digest=decode($1,'hex')",{device,seed.owner}));
+    // A duplicate family insertion must roll back without consuming approval.
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families "
+        "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms) "
+        "VALUES($1,$2,$3,'local',1,1,false,1770000001000)",{family+"-collision",client,seed.owner}));
+    EXPECT_FALSE(run(attempt(native,"-collision",kNow+11s)));
+    io.restart();
+    auto first=asio::co_spawn(io,attempt(native,"-first",kNow+11s),asio::use_future);
+    auto second=asio::co_spawn(io,attempt(native,"-second",kNow+11s),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::AuthenticationFailed);
+    const auto& accepted=a?a.value():b.value();
+    EXPECT_EQ(accepted.state,State::Issued);
+    EXPECT_EQ(accepted.scopes,std::vector<std::string>{"account"});
+    const auto state=execute(fixture.get(),
+        "SELECT d.status::text,(SELECT count(*) FROM openproof.oauth_access_tokens t JOIN openproof.oauth_token_families f ON f.id=t.family_id WHERE f.client_id=$2)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r JOIN openproof.oauth_token_families f ON f.id=r.family_id WHERE f.client_id=$2)::text "
+        "FROM openproof.oauth_device_authorizations d WHERE d.device_digest=decode($1,'hex')",{device,client});
+    ASSERT_EQ(PQntuples(state.get()),1);
+    EXPECT_STREQ(PQgetvalue(state.get(),0,0),"3");
+    EXPECT_STREQ(PQgetvalue(state.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(state.get(),0,2),"1");
+}
+
 TEST(PostgresCanonicalCoroutineTest, SenderReplayConsumptionIsAtomicAcrossTenantsAndLegacy)
 {
     const auto dsn=disposableDsn();

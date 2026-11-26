@@ -1852,4 +1852,169 @@ CoroutinePostgresCanonicalFinalizer::issueOAuthMachineGrantAsync(
     }
 }
 
+asio::awaitable<foundation::Result<oauth::NativeDevicePollResult>>
+CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync(
+    std::string clientId,std::optional<std::string> clientDigest,std::string deviceDigest,
+    std::string family,std::string accessDigest,std::string refreshDigest,
+    std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+    foundation::Duration accessLifetime,foundation::Duration refreshLifetime)
+{
+    using E=foundation::ErrorCode;
+    using State=oauth::NativeDevicePollState;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || !validDigest(deviceDigest)
+        || !validDigest(accessDigest) || !validDigest(refreshDigest) || accessDigest==refreshDigest
+        || (clientDigest && !validDigest(*clientDigest)) || family.empty() || family.size()>200U
+        || accessLifetime<=foundation::Duration::zero() || accessLifetime>std::chrono::hours{1}
+        || refreshLifetime<=accessLifetime || refreshLifetime>std::chrono::hours{24*365}
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-refreshLifetime.count()
+        || (sender && (sender->value().empty() || sender->value().size()>256U)))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        const auto observed=now.time_since_epoch().count();
+        const auto timestamp=std::to_string(observed);
+        Params deviceArgs{deviceDigest,clientId};
+        const auto locked=co_await execute(
+            "SELECT status,issued_at_ms,expires_at_ms,poll_interval_ms,last_poll_at_ms,"
+            "identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms,resource "
+            "FROM openproof.oauth_device_authorizations "
+            "WHERE device_digest=decode($1,'hex') AND client_id=$2 FOR UPDATE",std::move(deviceArgs));
+        if (locked.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (locked.rows.size()!=1U || locked.rows.front().size()!=12U)
+            throw std::runtime_error{"Malformed device authorization"};
+        const auto& row=locked.rows.front();
+        const auto state=milliseconds(row[0]),issued=milliseconds(row[1]),expires=milliseconds(row[2]),
+            interval=milliseconds(row[3]);
+        if (issued>observed || interval<=0 || interval>std::numeric_limits<std::int64_t>::max()-5000)
+            throw std::runtime_error{"Invalid device chronology"};
+        if (state==3) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (expires<=observed || state==2) {
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return oauth::NativeDevicePollResult{expires<=observed?State::Expired:State::Denied,{}};
+        }
+        if (state!=0 && state!=1) throw std::runtime_error{"Invalid device status"};
+        const auto last=row[4]?milliseconds(row[4]):0;
+        if (row[4] && (last>observed || observed-last<interval)) {
+            Params args{deviceDigest,std::to_string(interval+5000),timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_device_authorizations SET poll_interval_ms=$2,last_poll_at_ms=GREATEST(last_poll_at_ms,$3::bigint) "
+                "WHERE device_digest=decode($1,'hex')",std::move(args)));
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return oauth::NativeDevicePollResult{State::SlowDown,{}};
+        }
+        if (state==0) {
+            Params args{deviceDigest,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_device_authorizations SET last_poll_at_ms=$2 "
+                "WHERE device_digest=decode($1,'hex') AND status=0",std::move(args)));
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return oauth::NativeDevicePollResult{State::Pending,{}};
+        }
+        // An approved code is still bound to an active identity in the
+        // authenticated client's tenant. No token is minted from stale approval.
+        const auto identityId=required(row[5]);
+        Params ownerArgs{identityId,tenant};
+        const auto owner=co_await execute(
+            "SELECT id FROM openproof.identities WHERE id=$1 AND organization_id=$2 AND status=0 FOR SHARE",
+            std::move(ownerArgs));
+        if (owner.rows.size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (milliseconds(row[7])>4 || milliseconds(row[8])>7 || milliseconds(row[10])>observed)
+            throw std::runtime_error{"Malformed device authentication context"};
+        Params scopeArgs{deviceDigest};
+        const auto grants=co_await execute(
+            "SELECT scope FROM openproof.oauth_device_authorization_scopes WHERE device_digest=decode($1,'hex') "
+            "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(scopeArgs));
+        if (grants.rows.empty() || grants.rows.size()>256U)
+            throw std::runtime_error{"Invalid device grant scopes"};
+        std::vector<std::string> scopes;
+        for (const auto& grant:grants.rows) {
+            if (grant.size()!=1U || !client::Scope::create(required(grant[0])))
+                throw std::runtime_error{"Invalid device scope"};
+            scopes.push_back(required(grant[0]));
+        }
+        Params familyArgs{family,clientId,identityId,required(row[6]),required(row[7]),required(row[8]),
+            boolean(row[9])?"true":"false",required(row[10]),
+            sender?std::optional<std::string>{std::to_string(static_cast<int>(sender->kind()))}:std::nullopt,
+            sender?std::optional<std::string>{std::string{sender->value()}}:std::nullopt};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_token_families "
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms,sender_constraint_kind,sender_constraint_value) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",std::move(familyArgs)));
+        for (const auto& scope:scopes) {
+            Params args{family,scope};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,$2)",std::move(args)));
+        }
+        if (row[11]) {
+            Params args{family,*row[11]};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_token_family_audiences(family_id,audience) VALUES($1,$2)",std::move(args)));
+        }
+        Params accessArgs{accessDigest,family,timestamp,std::to_string((now+accessLifetime).time_since_epoch().count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",std::move(accessArgs)));
+        Params refreshArgs{refreshDigest,family,timestamp,std::to_string((now+refreshLifetime).time_since_epoch().count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,0,$3,$4)",std::move(refreshArgs)));
+        Params consumeArgs{deviceDigest,clientId,timestamp};
+        const auto consumed=co_await execute(
+            "UPDATE openproof.oauth_device_authorizations SET status=3,last_poll_at_ms=$3 "
+            "WHERE device_digest=decode($1,'hex') AND client_id=$2 AND status=1 RETURNING client_id",
+            std::move(consumeArgs));
+        if (consumed.rows.size()!=1U || consumed.rows.front().size()!=1U || required(consumed.rows.front()[0])!=clientId)
+            throw std::runtime_error{"Device code consumption mismatch"};
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return oauth::NativeDevicePollResult{State::Issued,std::move(scopes)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native device polling is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

@@ -135,6 +135,12 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeDevicePollResult>>
+    pollOAuthDeviceAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string deviceDigest,std::string family,std::string accessDigest,std::string refreshDigest,
+        std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+        foundation::Duration accessLifetime,foundation::Duration refreshLifetime);
+
     using SignCodeIdToken=std::function<foundation::Result<std::string>(const oauth::AuthorizationCode&)>;
     [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeCodeExchangeResult>>
     exchangeOAuthCodeAsync(std::string clientId,std::optional<std::string> clientDigest,

@@ -172,14 +172,16 @@ test("native code exchange validates PKCE and atomically issues the initial fami
   assert.match(read("scripts/e2e-identity-platform.mjs"),/invalid.set\("code_verifier", "a".repeat\(43\)\)/);
 });
 test("machine grants authenticate and enforce resource, scope and subject lifetime atomically",()=>{
-  const issue=http.slice(http.indexOf("CoroutineTokenReadAdapter::issueMachine("));
+  const issue=http.slice(http.indexOf("CoroutineTokenReadAdapter::issueMachine("),
+    http.indexOf("CoroutineTokenReadAdapter::pollDevice("));
   assert.match(http,/grantRoute\(r,"client_credentials"\) \|\| grantRoute\(r,kExchangeGrant\)/);
   assert.match(http,/subjectType->expose\(\)!=kAccessType/);
   assert.match(issue,/input->secret=foundation::SecretString\{\};\s*input->subject.reset\(\);\s*auto proof=m_prepareSender\(r\)/);
   assert.ok(issue.indexOf("co_await m_issueMachine(")<issue.indexOf('body.add("access_token",access.expose())'));
   assert.doesNotMatch(issue,/body.add\("refresh_token"/);
   assert.match(app,/reader->issueOAuthMachineGrantAsync/);
-  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::issueOAuthMachineGrantAsync("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::issueOAuthMachineGrantAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync("));
   for(const term of ["FOR SHARE OF c,a,o","security::constantTimeEquals","!subjectDigest && kind!=3",
     "WHERE audience=$1 AND status=0 FOR SHARE","f.client_id=$2 AND i.organization_id=$3",
     "FOR SHARE OF f,i","senderMatches","family_id=$2 AND state=0 AND revoked_at_ms IS NULL",
@@ -199,4 +201,34 @@ test("machine grants authenticate and enforce resource, scope and subject lifeti
   const guard=token.indexOf('m_nativeTokenReadsRequired && (grantType.value()=="client_credentials"');
   assert.ok(guard>=0 && guard<token.indexOf("m_clients->authenticate("));
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeMachineGrantsCannotWidenScopeAudienceOrLifetime/);
+});
+test("native device polling commits throttling and atomically consumes approval with token issuance",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::pollDevice("));
+  assert.match(http,/grantRoute\(r,kDeviceGrant\)/);
+  assert.match(body,/form\(r,false,false,true\)/);
+  assert.match(body,/security::hmacSha256\(m_devicePoll->deviceKey,input->token.expose\(\)\)/);
+  assert.match(body,/input->secret=foundation::SecretString\{\};\s*input->token=foundation::SecretString\{\}/);
+  assert.ok(body.indexOf("co_await m_devicePoll->poll(")<body.indexOf('body.add("access_token",access.expose())'));
+  for(const term of ["authorization_pending","slow_down","access_denied","expired_token","invalid_grant"])
+    assert.ok(body.includes('"'+term+'"'),term);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pollOAuthDeviceAsync("));
+  for(const term of ["FOR SHARE OF c,a,o","if (!authenticated)",
+    "WHERE device_digest=decode($1,'hex') AND client_id=$2 FOR UPDATE",
+    "state==3","expires<=observed || state==2","observed-last<interval",
+    "std::to_string(interval+5000)","State::SlowDown","State::Pending",
+    "organization_id=$2 AND status=0 FOR SHARE",
+    "INSERT INTO openproof.oauth_token_families","INSERT INTO openproof.oauth_access_tokens",
+    "INSERT INTO openproof.oauth_refresh_tokens","SET status=3,last_poll_at_ms=$3",
+    "AND client_id=$2 AND status=1 RETURNING client_id","State::Issued"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("INSERT INTO openproof.oauth_refresh_tokens")<store.indexOf("SET status=3,last_poll_at_ms=$3"));
+  assert.ok(store.lastIndexOf('execute("COMMIT",{})')<store.indexOf("State::Issued"));
+  assert.match(app,/reader->pollOAuthDeviceAsync/);
+  assert.match(app,/nativeOAuthDeviceKey.emplace\(deviceAuthorizationMaterial->clone\(\)\)/);
+  const legacy=read("src/oauth/http/http.cpp");
+  const token=legacy.slice(legacy.indexOf("OAuthHttpApi::tokenEndpoint("));
+  const guard=token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="urn:ietf:params:oauth:grant-type:device_code"');
+  assert.ok(guard>=0 && guard<token.indexOf("m_clients->authenticate("));
+  assert.ok(token.indexOf("if (m_nativeTokenReadsRequired) {",guard)<token.indexOf("m_clients->authenticate("));
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeDevicePollingCommitsThrottleAndConsumesApprovedCodeExactlyOnce/);
 });
