@@ -16,8 +16,7 @@ test("TOTP status is separately gated, read-only and preserves compatibility", (
 });
 test("status SQL is one tenant-scoped coroutine read and does not select secrets", () => {
   const start = sql.indexOf("CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(");
-  // Bound this contract to the TOTP function, not unrelated native SQL
-  // methods inserted between it and the connection-target operation.
+  // Scope the contract to this function, not later unrelated SQL methods.
   const end = sql.indexOf("\n}\n", start);
   assert.ok(start >= 0 && end > start);
   const body = sql.slice(start, end);

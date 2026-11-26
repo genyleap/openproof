@@ -1028,10 +1028,19 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
         "DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org, seed.owner})));
     io.restart();
-    auto refreshed = asio::co_spawn(io, canonical.readAuthorizationMembershipAsync(
-        ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org}), asio::use_future);
+    // Boost.Asio 1.88 co_spawn requires a default-constructible completion
+    // value on exception. Membership intentionally has no default state.
+    // Keep that invariant and transfer the result through a void coroutine.
+    std::optional<fnd::Result<openproof::organization::Membership>> refreshedResult;
+    auto refresh = [&]() -> asio::awaitable<void> {
+        refreshedResult.emplace(co_await canonical.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org}));
+    };
+    auto refreshed = asio::co_spawn(io, refresh(), asio::use_future);
     io.run();
-    auto member = refreshed.get();
+    ASSERT_NO_THROW(refreshed.get());
+    ASSERT_TRUE(refreshedResult);
+    auto& member = *refreshedResult;
     ASSERT_TRUE(member);
     EXPECT_FALSE(member->hasRole(openproof::organization::Role{"owner"}));
     EXPECT_TRUE(member->hasRole(openproof::organization::Role{"auditor"}));
@@ -1053,10 +1062,12 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
         "SELECT $1,$2,'role-' || n::text FROM generate_series(1,257) AS n",
         {seed.org, seed.owner})));
     io.restart();
-    auto overflow = asio::co_spawn(io, canonical.readAuthorizationMembershipAsync(
-        ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org}), asio::use_future);
+    refreshedResult.reset();
+    auto overflow = asio::co_spawn(io, refresh(), asio::use_future);
     io.run();
-    auto bounded = overflow.get();
+    ASSERT_NO_THROW(overflow.get());
+    ASSERT_TRUE(refreshedResult);
+    auto& bounded = *refreshedResult;
     EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
 }
 
