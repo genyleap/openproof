@@ -94,6 +94,7 @@ import openproof.evidence.verifiers;
 import openproof.evidence.http;
 import openproof.trust;
 import openproof.identity.provider;
+import openproof.identity.profile;
 import openproof.observability;
 import openproof.oauth;
 import openproof.oauth.http;
@@ -2829,6 +2830,7 @@ addProtectedRoutes(gateway::Router& router,
     accountHttp::CoroutineContactVerificationAdapter::Signup nativeSignup;
     accountHttp::CoroutineContactVerificationAdapter::VerifySignup nativeVerifySignup;
     accountHttp::CoroutineContactVerificationAdapter::ResetPassword nativeResetPassword;
+    accountHttp::CoroutineContactVerificationAdapter::VerifyPhone nativeVerifyPhone;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -3021,7 +3023,7 @@ addProtectedRoutes(gateway::Router& router,
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
                 },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
                     return issuer->issuePublicEmailAsync(purpose,std::move(destination));
-                },nativeSignup,nativeVerifySignup,nativeResetPassword);
+                },nativeSignup,nativeVerifySignup,nativeResetPassword,nativeVerifyPhone);
             nativeHandler=asyncContact.get();
         }
         if (nativeConsentEnabled) {
@@ -3125,6 +3127,7 @@ addProtectedRoutes(gateway::Router& router,
         if (nativeContactIssuer) {
             nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
+            if (nativeVerifyPhone) nativeMethods.emplace_back("/account/phone/verify",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
             if (nativeResetPassword) nativeMethods.emplace_back("/account/password/reset",gateway::HttpMethod::Post);
@@ -3460,11 +3463,25 @@ addProtectedRoutes(gateway::Router& router,
                     std::move(hashed).value(),clock.now(),accountPolicy->maximumAttempts());
             };
         }
+        if (nativeSignupEnabled) {
+            nativeVerifyPhone=[&](identity::IdentityId owner,account::VerificationId id,fnd::SecretString secret)
+                ->boost::asio::awaitable<fnd::Result<openproof::identity::profile::IdentityProfile>> {
+                auto digest=account::VerificationPreparation::digest(signupKey.value(),id,secret);
+                secret=fnd::SecretString{};
+                if (!digest) co_return fnd::fail(digest.error());
+                auto verified=co_await contactStore.verifyPhoneAsync(
+                    idp::ProviderId{std::string{platform.account().phoneProviderId()}},owner,std::move(id),
+                    digest.value(),clock.now(),accountPolicy->maximumAttempts());
+                if (!verified) co_return fnd::fail(verified.error());
+                co_return co_await nativeCanonical->readProfileAsync(std::move(owner));
+            };
+        }
         nativeContactIssuer=&contactIssuer;
         const auto result=runWithPasskey(accountApi,delegated);
         nativeSignup={};
         nativeVerifySignup={};
         nativeResetPassword={};
+        nativeVerifyPhone={};
         nativeContactIssuer=nullptr;
         return result;
     };

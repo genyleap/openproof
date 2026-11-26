@@ -676,6 +676,10 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
 }
 
 namespace {
+[[nodiscard]] bool phoneVerifyRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/phone/verify";
+}
 [[nodiscard]] bool resetRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post && request.path()=="/account/password/reset";
@@ -699,13 +703,14 @@ namespace {
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
       m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
-      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)) {}
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
+    if (phoneVerifyRoute(request) && m_verifyPhone) return static_cast<bool>(m_authenticate);
     if (resetRoute(request) && m_resetPassword) return true;
     if (signupRoute(request) && (m_signup || m_verifySignup)) return m_signup && m_verifySignup;
     if (contactIssueRoute(request)) return publicEmailIssue(request) ? static_cast<bool>(m_publicIssue)
@@ -730,7 +735,7 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
 gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
 {
     if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup))
-        && !(resetRoute(request) && m_resetPassword))
+        && !(resetRoute(request) && m_resetPassword) && !(phoneVerifyRoute(request) && m_verifyPhone))
         return m_fallback->handle(std::move(request));
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
@@ -740,6 +745,7 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 asio::awaitable<gateway::HttpResponse>
 CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
 {
+    if (phoneVerifyRoute(request) && m_verifyPhone) co_return co_await verifyPhone(std::move(request));
     if ((signupRoute(request) && (m_signup || m_verifySignup)) || (resetRoute(request) && m_resetPassword))
         co_return co_await signupOrVerify(std::move(request));
     if (!contactIssueRoute(request)) {
@@ -801,6 +807,68 @@ CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
         std::move(destination));
     if (!status) co_return fail(status.error(),request);
     co_return jsonResponse(202,json::object{{"accepted",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    if (!m_authenticate || !m_verifyPhone)
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    std::string generation;
+    foundation::SecretString proof;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object() || parsed.as_object().size()!=2U)
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto* id=parsed.as_object().if_contains("verification_id");
+        const auto* secret=parsed.as_object().if_contains("secret");
+        if (!id || !secret || !id->is_string() || !secret->is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view identifier{id->as_string().data(),id->as_string().size()};
+        const std::string_view value{secret->as_string().data(),secret->as_string().size()};
+        const auto valid=[](std::string_view text,std::size_t maximum) {
+            return !text.empty() && text.size()<=maximum && std::ranges::none_of(text,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);return byte<0x20U || byte==0x7fU;
+            });
+        };
+        if (!valid(identifier,200U) || !valid(value,64U))
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        generation.assign(identifier);
+        proof=foundation::SecretString{std::string{value}};
+    }
+    request.wipeBody();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    auto value=co_await m_verifyPhone(actor->identity(),VerificationId{std::move(generation)},std::move(proof));
+    if (!value) co_return fail(value.error(),request);
+    if (value->identity()!=actor->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    json::object body;
+    body["identity_id"]=value->identity().value();
+    if (value->displayName()) body["display_name"]=*value->displayName();
+    if (value->preferredUsername()) body["preferred_username"]=*value->preferredUsername();
+    if (value->email()) body["email"]=*value->email();
+    body["email_verified"]=value->emailVerified();
+    if (value->phoneNumber()) body["phone_number"]=*value->phoneNumber();
+    body["phone_number_verified"]=value->phoneNumberVerified();
+    if (value->locale()) body["locale"]=*value->locale();
+    if (value->pictureUrl()) body["picture"]=*value->pictureUrl();
+    body["avatar_source"]=value->avatarSource();
+    co_return jsonResponse(200,std::move(body));
 }
 
 asio::awaitable<gateway::HttpResponse>

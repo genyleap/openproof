@@ -2058,6 +2058,82 @@ TEST(PostgresCanonicalCoroutineTest, ReapOnlyExpiredUntouchedNativeSignupOwners)
     }
 }
 
+TEST(PostgresCanonicalCoroutineTest, PhoneProofCommitsOwnerLinkProfileAndReservationTogether)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace acc=openproof::account;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},1U,500ms,1000ms,3000ms};
+    const idp::ProviderId provider{"phone-"+seed.suffix};
+    const std::string number="+12025550123";
+    const auto key=acc::VerificationKey::create(fnd::SecretString{std::string(32U,'v')});
+    ASSERT_TRUE(key);
+    auto proof=acc::VerificationPreparation::prepare(key.value(),ids::IdentityId{seed.owner},
+        acc::VerificationPurpose::VerifyPhone,acc::VerificationChannel::Sms,number,kNow,10min);
+    ASSERT_TRUE(proof);
+    const auto generation=proof->first.id();
+    const auto digest=proof->first.digest();
+    const std::string generationName{generation.value()};
+    auto run=[&](asio::awaitable<fnd::Status> task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    auto scalar=[&](std::string_view sql,std::initializer_list<std::string> params){
+        auto result=query(sql,params);
+        return std::string{PQgetvalue(result.get(),0,0)};
+    };
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(proof->first,provider)));
+    EXPECT_FALSE(run(foreign.verifyPhoneAsync(provider,ids::IdentityId{seed.owner},generation,digest,kNow,3U)));
+    EXPECT_FALSE(run(store.verifyPhoneAsync(provider,ids::IdentityId{seed.secondOwner},generation,digest,kNow,3U)));
+    EXPECT_EQ(scalar("SELECT attempts FROM openproof.account_verification_challenges WHERE id=$1",{generationName}),"0");
+    EXPECT_FALSE(run(store.verifyPhoneAsync(provider,ids::IdentityId{seed.owner},generation,
+        acc::VerificationDigest{std::array<std::byte,32>{}},kNow,3U)));
+    EXPECT_EQ(scalar("SELECT attempts FROM openproof.account_verification_challenges WHERE id=$1",{generationName}),"1");
+    const auto verify=[&](){
+        return store.verifyPhoneAsync(provider,ids::IdentityId{seed.owner},generation,digest,kNow,3U);
+    };
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.identity_profiles ADD CONSTRAINT native_phone_fixture_rollback "
+        "CHECK(NOT phone_number_verified) NOT VALID",{})));
+    EXPECT_FALSE(run(verify()));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.identity_profiles DROP CONSTRAINT native_phone_fixture_rollback",{})));
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.external_identities WHERE provider=$1",
+        {std::string{provider.value()}}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{generationName}),"1");
+    io.restart();
+    auto first=asio::co_spawn(io,verify(),asio::use_future);
+    auto second=asio::co_spawn(io,verify(),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ(scalar("SELECT identity_id FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2",
+        {std::string{provider.value()},number}),seed.owner);
+    EXPECT_EQ(scalar("SELECT phone_number||':'||phone_number_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.owner}),number+":true");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{generationName}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE verification_id=$1",{generationName}),"0");
+    EXPECT_FALSE(run(verify()));
+}
+
 TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPreserveLatestOwnerChallenge)
 {
     const auto dsn = disposableDsn();

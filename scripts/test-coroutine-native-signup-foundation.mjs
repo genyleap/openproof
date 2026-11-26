@@ -155,7 +155,7 @@ test("expired enrollment retry requires exact pending provenance and a locked ha
 test("password reset consumes only the exact proof and revokes sessions in the hash transaction",()=>{
   const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
   const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::resetPasswordAsync("),
-    source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+    source.indexOf("CoroutineVerificationChallengeStore::verifyPhoneAsync("));
   const ordered=["BEGIN ISOLATION LEVEL READ COMMITTED","c.purpose=3 AND c.channel=0",
     "i.organization_id=$2 AND i.kind=0 AND i.status=0","FOR UPDATE OF i FOR SHARE OF o",
     "purpose=3 AND channel=0 FOR UPDATE","security::constantTimeEquals",
@@ -219,4 +219,28 @@ test("local password proof generation remains fenced through both session persis
   assert.match(legacy,/GREATEST\(p.changed_at_ms\+1,\(extract\(epoch FROM clock_timestamp\(\)\)/);
   assert.match(legacy,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
   assert.match(read("src/authentication/service.cpp"),/if \(authentication.outcome\(\).passwordGeneration\(\)\)\s*co_return foundation::fail/);
+});
+
+test("phone completion is owner-bound, generation-bound and atomic",()=>{
+  const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::verifyPhoneAsync("),
+    source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+  const markers=["BEGIN ISOLATION LEVEL READ COMMITTED","i.organization_id=$2 AND i.status=0 AND o.state=0",
+    "FOR UPDATE OF i FOR SHARE OF o","identity_id=$2 AND purpose=2 AND channel=1 FOR UPDATE",
+    "security::constantTimeEquals","r.verification_id=$4 AND r.expires_at_ms>$5",
+    "INSERT INTO openproof.external_identities","ON CONFLICT(provider,external_subject) DO NOTHING",
+    "UPDATE openproof.identity_profiles SET phone_number=$2,phone_number_verified=true",
+    "const auto consumed=","const auto released=",'connection.query("COMMIT",{},remaining(deadline)));\n        co_return foundation::ok()'];
+  let previous=-1;
+  for(const marker of markers){const index=body.indexOf(marker);assert.ok(index>previous,marker);previous=index;}
+  assert.match(body,/r.verification_id=c.id AND r.identity_id=c.identity_id/);
+  assert.match(body,/attempts=attempts\+1/);
+  assert.doesNotMatch(body,/UPDATE openproof.external_identities|INSERT INTO openproof.identities/);
+  const http=read("src/account/http/coroutine_session_http.cpp");
+  const route=http.slice(http.indexOf("CoroutineContactVerificationAdapter::verifyPhone("),
+    http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
+  assert.ok(route.indexOf("request.wipeBody();")<route.indexOf("co_await m_authenticate("));
+  assert.match(route,/co_await m_verifyPhone\(actor->identity\(\)/);
+  assert.match(route,/value->identity\(\)!=actor->identity\(\)/);
+  assert.match(read("apps/opp/main.cpp"),/if \(nativeVerifyPhone\) nativeMethods.emplace_back\("\/account\/phone\/verify"/);
 });
