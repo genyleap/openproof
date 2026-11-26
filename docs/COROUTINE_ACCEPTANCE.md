@@ -4613,3 +4613,58 @@ configuration to the existing E2E, then removes the container and its
 anonymous volume. Use --probe-only to validate creation and cleanup
 without a built executable. This probe is not HTTP acceptance. The
 local workload is for correctness, not comparative throughput.
+
+### Native account password upgrade status
+
+When both the existing native local login and account-session pilots are
+selected, the GET /account/password/upgrade projection uses a tenant-scoped,
+owner-bound native SQL read and metadata-only password policy inspection.
+No KDF is executed, no TOTP material is queried, and no encoded hash is
+returned to HTTP. If Argon2id is not selected, the hash is not retrieved at
+all. A missing local-provider link returns unavailable=false semantics
+(available=false, needs_upgrade=false). First-party cookie authentication
+and owner echo are required; delegated OAuth and POST mutations retain
+legacy behavior. No additional feature flag or schema migration is added.
+Focused HTTP and disposable SQL regressions are included; compiled and
+real HTTP acceptance remains required before changing defaults.
+
+
+### Development runtime artifact and independent server acceptance
+
+After successful Build, Test, isolated E2E, benchmarks and packaging, CI
+preserves the already verified amd64 runtime bundle and a development-only
+provenance manifest containing the exact source tree and SHA-256 digest.
+This is not a release, attestation or authorization to install anything.
+Download only from the trusted OpenProof Actions run. For example:
+
+```sh
+gh run download RUN_ID -R genyleap/openproof -n openproof-tested-development-bundle -D /tmp/opp-development-bundle
+python3 -B scripts/ci/development-bundle.py verify /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+python3 -B scripts/ci/development-bundle.py e2e /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+```
+
+Run from the exact candidate source tree (PR merge commit or equivalent
+tree); mismatched/tampered bundles and dirty tracked source for E2E are
+denied. Use the verify command for non-executing archive admission and
+the e2e command to run only the real ELF and bundled libraries in a private
+temporary directory with the existing disposable Docker PostgreSQL fixture.
+Do not run installer or service-manager commands. The host needs a
+compatible Linux amd64 glibc, Node, PostgreSQL client and Docker. The
+manifest is integrity metadata, not a cryptographic signature; trust
+the Actions artifact origin. A separate full native local/account HTTP
+workload now checks password-upgrade status with valid and inactive
+identities. The official coroutine migration gate remains unchanged.
+
+### Native explicit password-policy confirmation
+
+The existing local-login and account-session opt-in also covers POST
+/account/password/upgrade for first-party cookies. Retains HTTPS same-origin
+and identity/IP rate limits, strict JSON, delegated OAuth compatibility, and
+no-store. Raw request and parsed password buffers are scrubbed; password
+verification and optional Argon2id generation share a bounded worker permit.
+The tenant/owner/provider/password-generation snapshot is released before
+KDF and checked again by SQL CAS (including already-current hashes).
+No password-reset timestamp, TOTP, recovery code, or session is mutated.
+The C++ regressions exercise wrong passwords, current hashes, real Argon2id
+upgrade and timestamp preservation; HTTP tests cover origin and policy denial.
+No new schema or runtime flag is introduced.

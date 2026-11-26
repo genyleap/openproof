@@ -122,7 +122,9 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
 struct Fixture final {
     explicit Fixture(bool profileEnabled = false,
                      bool connectionsEnabled = false,
-                     bool totpStatusEnabled = false)
+                     bool totpStatusEnabled = false,
+                     bool passwordStatusEnabled = false,
+                     bool passwordConfirmEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -219,7 +221,29 @@ struct Fixture final {
                               totpForeign ? core::IdentityId{"identity-foreign"} : owner,
                               totpEnabled};
                       }}
-                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{})
+                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{},
+              passwordStatusEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{
+                      [this](core::IdentityId owner) -> asio::awaitable<
+                          fnd::Result<http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus>> {
+                          ++passwordStatusCalls;
+                          if (passwordStatusMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus{
+                              passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              passwordStatus};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{},
+              passwordConfirmEnabled
+                  ? http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{
+                      [this](core::IdentityId owner, fnd::SecretString password) -> asio::awaitable<
+                          fnd::Result<std::pair<core::IdentityId,bool>>> {
+                          ++passwordConfirmCalls;
+                          if (password.expose()!="fixture-password")
+                              co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                          co_return std::pair<core::IdentityId,bool>{
+                              passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,true};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{})
     {
     }
 
@@ -244,6 +268,11 @@ struct Fixture final {
     int profileReadCalls{};
     int connectionsReadCalls{};
     int totpStatusCalls{};
+    int passwordStatusCalls{};
+    int passwordConfirmCalls{};
+    bool passwordStatusForeign{};
+    bool passwordStatusMissing{};
+    std::optional<bool> passwordStatus{false};
     bool totpForeign{};
     bool totpMissing{};
     std::optional<bool> totpEnabled{false};
@@ -611,6 +640,85 @@ TEST(AccountCoroutineSessionHttpTest, TotpStatusIsOptInCookieOnlyAndOwnerBound)
     f.totpMissing = true;
     EXPECT_EQ(f.run(totpCookieRequest()).status(), 404);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeStatusIsCookieOnlyReadAndOwnerBound)
+{
+    auto cookieRequest = [](std::string token = "valid-token") {
+        return gw::HttpRequest::create(
+            gw::HttpMethod::Get, "/account/password/upgrade",
+            {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+            "127.0.0.1", fnd::CorrelationId{"native-password-status-test"}).value();
+    };
+    Fixture disabled;
+    EXPECT_FALSE(disabled.api.nativeEnabledFor(cookieRequest()));
+    Fixture f{false, false, false, true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy, f.api, {},
+        {{"/account/password/upgrade", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(cookieRequest()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get,
+        "/account/password/upgrade", "delegated-oauth")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post,
+        "/account/password/upgrade")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/password/upgrade")).status(), 401);
+    EXPECT_EQ(f.run(cookieRequest("invalid-token")).status(), 401);
+    EXPECT_EQ(f.passwordStatusCalls, 0);
+    for (const auto status : {std::optional<bool>{}, std::optional<bool>{false},
+                              std::optional<bool>{true}}) {
+        f.passwordStatus = status;
+        const auto result = f.run(cookieRequest());
+        ASSERT_EQ(result.status(), 200);
+        const auto body = json::parse(result.body()).as_object();
+        EXPECT_EQ(body.size(), 3U);
+        EXPECT_EQ(body.at("available").as_bool(), status.has_value());
+        EXPECT_EQ(body.at("needs_upgrade").as_bool(), status.value_or(false));
+        EXPECT_EQ(body.at("target_algorithm").as_string(), "argon2id");
+        EXPECT_EQ(result.headers().at("cache-control"), "no-store");
+    }
+    f.passwordStatusForeign = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 503);
+    f.passwordStatusForeign = false;
+    f.passwordStatusMissing = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 404);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeConfirmRequiresOriginSessionAndStrictBody)
+{
+    auto post = [](std::string origin, std::string token, std::string body,
+                   std::string site = "same-origin", std::string contentType = "application/json") {
+        return gw::HttpRequest::create(gw::HttpMethod::Post, "/account/password/upgrade",
+            {{"cookie", "__Host-openproof-session=" + std::move(token)},
+             {"host", "example.invalid"}, {"origin", std::move(origin)},
+             {"sec-fetch-site", std::move(site)}, {"content-type", std::move(contentType)}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"password-confirm-test"}).value();
+    };
+    constexpr auto origin="https://example.invalid";
+    constexpr auto valid=R"({"password":"fixture-password"})";
+    Fixture off;
+    EXPECT_FALSE(off.api.nativeEnabledFor(post(origin,"valid-token",valid)));
+    Fixture f{false,false,false,true,true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy,f.api,{},
+        {{"/account/password/upgrade",gw::HttpMethod::Post}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(post(origin,"valid-token",valid)));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post,
+        "/account/password/upgrade","delegated-oauth",valid)));
+    EXPECT_EQ(f.run(post("https://foreign.invalid","valid-token",valid)).status(),403);
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid,"cross-site")).status(),403);
+    EXPECT_EQ(f.run(post(origin,"invalid-token",valid)).status(),401);
+    EXPECT_EQ(f.run(post(origin,"valid-token",R"({"password":"fixture-password","owner":"foreign"})")).status(),400);
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid,"same-origin","application/jsonp")).status(),400);
+    EXPECT_EQ(f.passwordConfirmCalls,0);
+    EXPECT_EQ(f.run(post(origin,"valid-token",R"({"password":"wrong"})")).status(),401);
+    const auto success=f.run(post(origin,"valid-token",valid));
+    ASSERT_EQ(success.status(),200);
+    const auto body=json::parse(success.body()).as_object();
+    EXPECT_TRUE(body.at("upgraded").as_bool());
+    EXPECT_FALSE(body.at("needs_upgrade").as_bool());
+    EXPECT_EQ(success.headers().at("cache-control"),"no-store");
+    f.passwordStatusForeign=true;
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid)).status(),503);
+    EXPECT_EQ(f.legacy.invoked,0);
 }
 
 } // namespace

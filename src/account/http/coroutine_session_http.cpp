@@ -69,6 +69,80 @@ private:
         && request.path() == "/account/totp";
 }
 
+[[nodiscard]] bool passwordUpgradeStatusReadRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Get
+        && request.path() == "/account/password/upgrade";
+}
+
+[[nodiscard]] bool passwordUpgradeConfirmRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Post
+        && request.path() == "/account/password/upgrade";
+}
+
+[[nodiscard]] bool trustedPasswordUpgradeOrigin(const gateway::HttpRequest& request)
+{
+    const auto origin = request.header("origin");
+    const auto host = request.header("host");
+    if (!origin || !host || host->empty()) return false;
+    if (host->find_first_of("/\\\r\n") != std::string_view::npos) return false;
+    if (*origin != ("https://" + std::string{*host})) return false;
+    const auto site = request.header("sec-fetch-site");
+    return !site || *site == "same-origin";
+}
+
+class PasswordRequestGuard final {
+public:
+    explicit PasswordRequestGuard(gateway::HttpRequest& request) noexcept : m_request(request) {}
+    ~PasswordRequestGuard() { m_request.wipeBody(); }
+    PasswordRequestGuard(const PasswordRequestGuard&) = delete;
+    PasswordRequestGuard& operator=(const PasswordRequestGuard&) = delete;
+private:
+    gateway::HttpRequest& m_request;
+};
+
+class ParsedPasswordGuard final {
+public:
+    explicit ParsedPasswordGuard(json::value& parsed) noexcept : m_parsed(parsed) {}
+    ~ParsedPasswordGuard() {
+        if (m_parsed.is_object()) {
+            if (auto* value = m_parsed.as_object().if_contains("password"); value && value->is_string()) {
+                auto& text = value->as_string();
+                foundation::secureWipe(text.data(),text.size());
+                text.clear();
+            }
+        }
+    }
+    ParsedPasswordGuard(const ParsedPasswordGuard&) = delete;
+    ParsedPasswordGuard& operator=(const ParsedPasswordGuard&) = delete;
+private:
+    json::value& m_parsed;
+};
+
+[[nodiscard]] foundation::Result<foundation::SecretString> passwordUpgradeSecret(gateway::HttpRequest& request)
+{
+    PasswordRequestGuard wipeBody{request};
+    const auto type = request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    boost::system::error_code ec;
+    auto parsed = json::parse(request.body(),ec);
+    ParsedPasswordGuard wipeParsed{parsed};
+    if (ec || !parsed.is_object() || parsed.as_object().size()!=1U)
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto* field = parsed.as_object().if_contains("password");
+    if (!field || !field->is_string())
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const std::string_view value{field->as_string().data(),field->as_string().size()};
+    if (value.empty() || value.size()>1024U || std::ranges::any_of(value,[](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte<0x20U || byte==0x7FU;
+    })) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    return foundation::SecretString{std::string{value}};
+}
+
 [[nodiscard]] bool accountNamespace(const gateway::HttpRequest& request) noexcept
 {
     return request.path() == "/account"
@@ -135,13 +209,16 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     gateway::TokenBucketRateLimiter& limiter,
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
     ReadProfile readProfile, ReadConnections readConnections,
-    ReadTotpStatus readTotpStatus)
+    ReadTotpStatus readTotpStatus, ReadPasswordUpgradeStatus readPasswordUpgradeStatus,
+    ConfirmPasswordUpgrade confirmPasswordUpgrade)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
       m_readProfile(std::move(readProfile)),
       m_readConnections(std::move(readConnections)),
-      m_readTotpStatus(std::move(readTotpStatus))
+      m_readTotpStatus(std::move(readTotpStatus)),
+      m_readPasswordUpgradeStatus(std::move(readPasswordUpgradeStatus)),
+      m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade))
 {
 }
 
@@ -171,6 +248,16 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return !request.header("authorization").has_value()
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readTotpStatus);
+    }
+    if (passwordUpgradeStatusReadRoute(request)) {
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_readPasswordUpgradeStatus);
+    }
+    if (passwordUpgradeConfirmRoute(request)) {
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_confirmPasswordUpgrade);
     }
     return static_cast<bool>(m_authenticate)
         && static_cast<bool>(m_list)
@@ -212,6 +299,7 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     // Check again after dispatch: downstream capability may have been
     // withdrawn, or a caller may have invoked this entry point directly.
     if (!nativeEnabledFor(request)) {
+        if (passwordUpgradeConfirmRoute(request)) request.wipeBody();
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
     if (sessionListRoute(request)) {
@@ -228,6 +316,12 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (totpStatusReadRoute(request)) {
         co_return co_await totpStatusRead(std::move(request));
+    }
+    if (passwordUpgradeStatusReadRoute(request)) {
+        co_return co_await passwordUpgradeStatusRead(std::move(request));
+    }
+    if (passwordUpgradeConfirmRoute(request)) {
+        co_return co_await passwordUpgradeConfirm(std::move(request));
     }
     // Only non-account requests can reach the fallback's native entry.
     // No synchronous AccountHttpApi method executes on the reactor.
@@ -433,6 +527,61 @@ CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
         {"available", status->second.has_value()},
         {"enabled", status->second.value_or(false)},
         {"assurance", identity::provider::assuranceLevelName(authenticated->assurance())}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::passwordUpgradeStatusRead(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(), request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(), request);
+    auto status = co_await m_readPasswordUpgradeStatus(authenticated->identity());
+    if (!status) co_return fail(status.error(), request);
+    if (status->first != authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    co_return jsonResponse(200, json::object{
+        {"available", status->second.has_value()},
+        {"needs_upgrade", status->second.value_or(false)},
+        {"target_algorithm", "argon2id"}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::passwordUpgradeConfirm(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (!trustedPasswordUpgradeOrigin(request))
+        co_return fail(foundation::Error{foundation::ErrorCode::PermissionDenied},request);
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    // Parse/wipe raw password before any asynchronous database work.
+    auto secret = passwordUpgradeSecret(request);
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(),request);
+    if (!m_limiter->allow("account:password-upgrade:identity:"
+            + std::string{authenticated->identity().value()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (!secret) co_return fail(secret.error(),request);
+    auto result = co_await m_confirmPasswordUpgrade(authenticated->identity(),
+                                                   std::move(secret).value());
+    if (!result) co_return fail(result.error(),request);
+    if (result->first!=authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    co_return jsonResponse(200,json::object{{"upgraded",result->second},{"needs_upgrade",false}});
 }
 
 } // namespace openproof::account::http

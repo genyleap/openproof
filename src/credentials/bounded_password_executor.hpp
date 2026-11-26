@@ -20,6 +20,10 @@ public:
     BoundedPasswordExecutor(const BoundedPasswordExecutor&) = delete;
     BoundedPasswordExecutor& operator=(const BoundedPasswordExecutor&) = delete;
 
+    // Metadata-only policy inspection: no KDF, no password, no worker admission.
+    [[nodiscard]] bool prefersArgon2id() const noexcept;
+    [[nodiscard]] foundation::Result<bool> upgradeNeeded(const PasswordHash& hash) const;
+
     // Unknown accounts use a startup-generated dummy hash and always deny.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<bool>>
     verifyAsync(foundation::SecretString password, std::optional<PasswordHash> expected);
@@ -27,6 +31,10 @@ public:
     // before generating a replacement. Persistence uses a separate CAS.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<PasswordHash>>>
     rehashAsync(foundation::SecretString password, PasswordHash verified);
+    // Explicit account upgrade must verify the password even when the hash
+    // already satisfies policy. Both KDF operations share one permit.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<PasswordHash>>>
+    confirmUpgradeAsync(foundation::SecretString password, PasswordHash expected);
 private:
     class Impl;
     explicit BoundedPasswordExecutor(std::unique_ptr<Impl> implementation);

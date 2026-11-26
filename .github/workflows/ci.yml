@@ -51,6 +51,8 @@ jobs:
           npm audit --audit-level=moderate
           npm run check
           npm test
+      - name: Development bundle provenance and isolation regressions
+        run: python3 -B scripts/ci/test-development-bundle.py
       - name: Sanitized disposable E2E startup diagnostics
         run: node --test scripts/test-e2e-startup-diagnostics.mjs
       - name: Native account profile tenant and capability contract
@@ -223,6 +225,7 @@ jobs:
           OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
           OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
@@ -351,3 +354,19 @@ jobs:
             --baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY" \
             --deb dist-baseline/openproof_*_amd64.deb \
             --bundle dist-baseline/openproof_*_linux_amd64.tar.gz
+
+      # A downloadable development candidate, not a published release.
+      # Preserve the tested runtime library closure rather than a bare ELF.
+      - name: Record verified development bundle provenance
+        run: |
+          python3 scripts/ci/development-bundle.py record dist/openproof_*_linux_amd64.tar.gz
+      - name: Preserve verified development bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-tested-development-bundle
+          path: |
+            dist/openproof_*_linux_amd64.tar.gz
+            dist/development-bundle.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
