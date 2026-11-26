@@ -8,7 +8,7 @@
 
 namespace openproof::storage::postgres {
 
-class CoroutineSessionAuthenticator final {
+class CoroutineSessionAuthenticator final : private session::SessionVerificationSource {
 public:
     CoroutineSessionAuthenticator(
         CoroutinePostgresSessionRepository& repository,
@@ -25,7 +25,16 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
     authenticate(foundation::SecretString bearer) const;
 
+    /** Preserve the authoritative first-party verification boundary for
+     * native policy callers. No raw bearer is retained across suspension.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::AuthenticatedSession>>
+    verifyAsync(foundation::SecretString bearer) const;
+
 private:
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::AuthenticatedSession>>
+    wrapVerified(boost::asio::awaitable<foundation::Result<session::Session>> pending) const;
+
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
     authorizeDigest(session::TokenDigest digest,
                     foundation::Instant now) const;

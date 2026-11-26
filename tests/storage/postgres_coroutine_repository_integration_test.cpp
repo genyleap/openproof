@@ -127,6 +127,8 @@ asio::awaitable<void> verifyNewRejectsLegacyRevocation(
 
 struct HmacResults {
     bool accepted{};
+    bool verifiedContext{};
+    bool verifiedRevokedDenied{};
     bool wrongKeyDenied{};
     bool wrongBearerDenied{};
     bool revokedDenied{};
@@ -161,6 +163,10 @@ asio::awaitable<void> verifyRealBearerHmac(
     checks.accepted = accepted
         && accepted->id().value() == "hmac-real-session"
         && accepted->lastSeenAt() == kNow + 1min;
+    auto trusted = co_await authenticator.verifyAsync(fnd::SecretString{rawBearer});
+    checks.verifiedContext = trusted && trusted->session().id().value() == "hmac-real-session"
+        && trusted->session().identity().value() == "coroutine-user-a"
+        && trusted->session().assurance() == idp::AssuranceLevel::Ial2;
     auto wrongBearer = co_await authenticator.authenticate(
         fnd::SecretString{"another-isolated-test-cookie"});
     checks.wrongBearerDenied = !wrongBearer
@@ -180,6 +186,9 @@ asio::awaitable<void> verifyRealBearerHmac(
         fnd::SecretString{rawBearer});
     checks.revokedDenied = revoked && !denied
         && denied.error().code() == fnd::ErrorCode::AuthenticationFailed;
+    auto trustedDenied = co_await authenticator.verifyAsync(fnd::SecretString{rawBearer});
+    checks.verifiedRevokedDenied = !trustedDenied
+        && trustedDenied.error().code() == fnd::ErrorCode::AuthenticationFailed;
 }
 
 struct ServiceChecks final {
@@ -793,6 +802,8 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     io.run();
     ASSERT_NO_THROW(verifiedBearer.get());
     EXPECT_TRUE(hmac.accepted);
+    EXPECT_TRUE(hmac.verifiedContext);
+    EXPECT_TRUE(hmac.verifiedRevokedDenied);
     EXPECT_TRUE(hmac.wrongBearerDenied);
     EXPECT_TRUE(hmac.wrongKeyDenied);
     EXPECT_TRUE(hmac.revokedDenied);

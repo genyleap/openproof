@@ -181,6 +181,23 @@ foundation::Result<AuthorizationRequest> AuthorizationRequest::createResolved(
                                 std::move(resource)};
 }
 
+foundation::Result<AuthorizationRequest> AuthorizationContextSource::fromActiveMembership(
+    const session::AuthenticatedSession& authenticated,
+    const identity::core::OrganizationId& tenant,
+    const organization::Membership& membership, Action action, Resource resource)
+{
+    if (action.empty() || resource.empty() || tenant.empty())
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const auto& subject = authenticated.session().identity();
+    if (subject.empty() || membership.identity() != subject
+        || membership.organization() != tenant
+        || !organization::permitsAccess(membership.state())) {
+        return foundation::fail(foundation::ErrorCode::PermissionDenied);
+    }
+    return AuthorizationRequest{subject, tenant, AuthenticationContext{authenticated},
+        membership.roles(), std::move(action), std::move(resource)};
+}
+
 const identity::core::IdentityId& AuthorizationRequest::subject() const noexcept
 {
     return m_subject;
