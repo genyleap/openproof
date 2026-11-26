@@ -396,11 +396,13 @@ struct DelayedCloseTlsProxyPeer final {
                     // No body is transmitted for HEAD, despite the nonzero
                     // representation length. Keep the TLS socket open too.
                     response.content_length(1024U);
+                    beastHttp::response_serializer<beastHttp::string_body> serializer{response};
+                    beastHttp::write_header(stream, serializer);
                 } else {
                     response.body() = "gateway-tls-complete";
                     response.prepare_payload();
+                    beastHttp::write(stream, response);
                 }
-                beastHttp::write(stream, response);
                 // Intentionally do not send TLS close_notify yet. The
                 // client must not wait after completing HTTP response framing.
                 std::this_thread::sleep_for(std::chrono::milliseconds{750});
@@ -1046,6 +1048,44 @@ TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
     ASSERT_TRUE(result->has_value());
     EXPECT_EQ(result->value().status(), 200);
     EXPECT_EQ(result->value().body(), "127.0.0.1");
+    upstream.stop();
+}
+
+TEST(BeastHttpIntegrationTest, NativeProxySharedTransportCompletesOnFourThreads)
+{
+    ClientIpHandler handler;
+    httpAdapter::BeastHttpServer upstream{handler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(gw::EndpointId{"concurrent-upstream"},
+        "127.0.0.1", upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint);
+
+    asio::io_context io;
+    std::vector<std::optional<fnd::Result<gw::HttpResponse>>> results(8U);
+    std::vector<std::future<void>> completions;
+    for (auto& result : results) {
+        auto request = gw::HttpRequest::create(gw::HttpMethod::Get,
+            "/native-concurrent-proxy", {}, {}, "127.0.0.1",
+            fnd::CorrelationId{"concurrent-proxy-test"});
+        ASSERT_TRUE(request);
+        completions.push_back(asio::co_spawn(io, collectAsyncProxyResponse(
+            *proxy.value(), endpoint.value(), std::move(request).value(),
+            std::chrono::seconds{3}, result), asio::use_future));
+    }
+    std::vector<std::jthread> workers;
+    for (std::size_t index = 0; index < 4U; ++index) {
+        workers.emplace_back([&io] { io.run(); });
+    }
+    for (auto& worker : workers) worker.join();
+    for (auto& completion : completions) ASSERT_NO_THROW(completion.get());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result && result->has_value());
+        EXPECT_EQ(result->value().status(), 200);
+        EXPECT_EQ(result->value().body(), "127.0.0.1");
+    }
     upstream.stop();
 }
 
