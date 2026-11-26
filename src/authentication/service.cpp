@@ -878,15 +878,19 @@ AuthenticationService::completeExchangeAsync(
     }
     // A provider-neutral redirect capability binds wire proof family to
     // the implementation selected by the consumed server transaction.
-    const bool oauth1=response.parameters().contains("oauth_token")
-        || response.parameters().contains("oauth_verifier");
-    const bool expectsOAuth1=implementation->interactionModel()==provider::InteractionModel::Redirect
-        && native->redirectProofKind()==provider::RedirectProofKind::OAuth1;
-    if (oauth1!=expectsOAuth1 || (oauth1 &&
-        (!response.parameters().contains("oauth_token")
-        || !response.parameters().contains("oauth_verifier")
-        || response.parameters().contains("code") || response.parameters().contains("state")
-        || response.parameters().contains("user"))))
+    const auto& fields=response.parameters();
+    const bool oauth1=fields.contains("oauth_token") || fields.contains("oauth_verifier");
+    const bool saml=fields.contains("SAMLResponse") || fields.contains("RelayState");
+    const bool code=fields.contains("code") || fields.contains("state") || fields.contains("user");
+    const bool redirect=implementation->interactionModel()==provider::InteractionModel::Redirect;
+    const auto kind=native->redirectProofKind();
+    const bool expectsOAuth1=redirect && kind==provider::RedirectProofKind::OAuth1;
+    const bool expectsSaml=redirect && kind==provider::RedirectProofKind::SamlAssertion;
+    if (oauth1!=expectsOAuth1 || saml!=expectsSaml
+        || (oauth1 && (saml || code || !fields.contains("oauth_token")
+            || !fields.contains("oauth_verifier")))
+        || (saml && (oauth1 || code || !fields.contains("SAMLResponse")
+            || !fields.contains("RelayState") || fields.size()!=2U)))
         co_return foundation::fail(authenticationFailure(
             "Authentication completion refused: redirect proof family mismatch."));
     foundation::Result<provider::AuthenticationOutcome> outcome =

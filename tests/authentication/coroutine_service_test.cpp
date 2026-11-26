@@ -73,7 +73,8 @@ class NativeProofProvider final : public ProofProvider,
 public:
     [[nodiscard]] idp::RedirectProofKind redirectProofKind() const noexcept override
     { return providerName=="x" ? idp::RedirectProofKind::OAuth1
-                              : idp::RedirectProofKind::AuthorizationCode; }
+        : providerName=="saml" ? idp::RedirectProofKind::SamlAssertion
+                               : idp::RedirectProofKind::AuthorizationCode; }
     [[nodiscard]] asio::awaitable<fnd::Result<idp::AuthenticationChallenge>>
     beginAuthenticationAsync(idp::AuthenticationRequest request) override
     {
@@ -100,7 +101,10 @@ public:
         const bool oauth1=providerName=="x" && fields.contains("oauth_token")
             && fields.contains("oauth_verifier") && fields.at("oauth_token").expose()=="fixture-token"
             && fields.at("oauth_verifier").expose()=="fixture-verifier";
-        if (!proof && !oauth2 && !oauth1) {
+        const bool saml=providerName=="saml" && fields.contains("SAMLResponse")
+            && fields.contains("RelayState") && fields.at("SAMLResponse").expose()=="fixture-assertion"
+            && fields.at("RelayState").expose()=="fixture-relay";
+        if (!proof && !oauth2 && !oauth1 && !saml) {
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
         co_return idp::AuthenticationOutcome::create(
@@ -1346,6 +1350,63 @@ TEST(TrustedAuthenticationCoroutineTest, NativeOAuth1CallbackBindsRegisteredProv
     EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),400);
     EXPECT_EQ(nativeX->nativeCompleteCalls,1);
     EXPECT_EQ(nativeX->syncCalls,0);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeSamlPostIsBoundToItsTransactionProvider)
+{
+    namespace gw=openproof::gateway;
+    Fixture fixture;
+    auto saml=std::make_unique<NativeProofProvider>();
+    saml->providerName="saml";
+    auto* nativeSaml=saml.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(saml)));
+    ASSERT_TRUE(fixture.policy.trust(idp::ProviderId{"saml"},idp::AssuranceLevel::Ial2));
+    auto link=ids::IdentityLink::request(ids::IdentityId{"canonical-identity"},
+        ids::ExternalIdentityRef{idp::ProviderId{"saml"},idp::ExternalSubject{"verified-subject"}},
+        kNow,kLifetime);
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(fixture.identities.attach(link.value()));
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,start};
+    const auto begin=[&](std::string provider){
+        return invokeFederated(start,makeFederatedStart("/auth/federated/start?provider="+provider));
+    };
+    const auto post=[](std::string body,std::string cookies){
+        return gw::HttpRequest::create(gw::HttpMethod::Post,"/auth/federated/callback",
+            {{"cookie",std::move(cookies)},{"content-type","application/x-www-form-urlencoded"}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"native-saml-post"}).value();
+    };
+    const std::string proof="SAMLResponse=fixture-assertion&RelayState=fixture-relay";
+    auto wrong=begin("async-test");
+    ASSERT_EQ(wrong.status(),302);
+    EXPECT_GE(invokeCallback(callback,post(proof,federatedCookies(wrong))).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    auto wrongShape=begin("saml");
+    ASSERT_EQ(wrongShape.status(),302);
+    EXPECT_GE(invokeCallback(callback,post("code=valid-code&state=matching-state",
+        federatedCookies(wrongShape))).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,0);
+    auto started=begin("saml");
+    ASSERT_EQ(started.status(),302);
+    const auto cookies=federatedCookies(started);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?"+proof,cookies)).status(),400);
+    EXPECT_GE(invokeCallback(callback,post(proof+"&code=ambiguous",cookies)).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,0);
+    EXPECT_EQ(invokeCallback(callback,post(proof,cookies)).status(),302);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies)).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,1);
+    EXPECT_EQ(nativeSaml->syncCalls,0);
     EXPECT_EQ(issuer.calls,1);
     EXPECT_EQ(fallback.syncCalls,0);
 }

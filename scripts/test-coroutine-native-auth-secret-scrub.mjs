@@ -205,9 +205,24 @@ test("native form post admits one bounded proof source with exact media type",()
   assert.match(parser,/request.method\(\)==gateway::HttpMethod::Post/);
   assert.match(parser,/\*type!="application\/x-www-form-urlencoded"/);
   assert.match(parser,/suffix.starts_with\("provider="\)/);
-  assert.match(parser,/input.size\(\)>64U\*1024U/);
+  assert.match(parser,/input.size\(\)>\(request.method\(\)==gateway::HttpMethod::Post\s*\? 1024U\*1024U : 64U\*1024U\)/);
   assert.match(parser,/output.contains\(\*key\)/);
   assert.match(source,/request.method\(\)==gateway::HttpMethod::Get\s*&& bounded\(oauthToken/);
   assert.match(source,/CookieCopyGuard wipeContinuation\{continuation\}/);
   assert.match(source,/CookieCopyGuard wipePrevious\{previous\}/);
+});
+
+test("SAML proof is POST-only, transaction-bound, and verified off reactor with bounded admission",()=>{
+  const callback=fs.readFileSync(path.join(root,
+    "src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+  assert.match(callback,/const bool validProof=saml\s*\? request.method\(\)==gateway::HttpMethod::Post/);
+  assert.match(callback,/values->size\(\)==2U && bounded\(assertion,values->end\(\),900U\*1024U\)/);
+  const service=fs.readFileSync(path.join(root,"src/authentication/service.cpp"),"utf8");
+  assert.match(service,/saml!=expectsSaml/);
+  const provider=fs.readFileSync(path.join(root,"src/providers/enterprise/enterprise.cpp"),"utf8");
+  assert.match(provider,/thread_pool worker\{1U\}/);
+  assert.match(provider,/busy.compare_exchange_strong\(expected,true/);
+  assert.match(provider,/co_await boost::asio::co_spawn\(m_implementation->worker,/);
+  assert.match(provider,/verifySamlWorker\(std::move\(permit\),\*m_implementation,std::move\(response\)\)/);
+  assert.match(provider,/~SamlPermit\(\) \{ if \(busy\) busy->store\(false/);
 });

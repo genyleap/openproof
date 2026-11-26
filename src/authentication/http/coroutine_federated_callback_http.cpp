@@ -179,7 +179,8 @@ private:
         input=request.body();
     } else return std::nullopt;
     // A percent-encoded 16 KiB Apple user object can occupy 48 KiB.
-    if (input.empty() || input.size()>64U*1024U) return std::nullopt;
+    if (input.empty() || input.size()>(request.method()==gateway::HttpMethod::Post
+            ? 1024U*1024U : 64U*1024U)) return std::nullopt;
     Parameters output;
     SensitiveParameters wipeOnFailure{output};
     while (!input.empty()) {
@@ -383,6 +384,9 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     const auto code = values->find("code");
     const auto state = values->find("state");
     const auto user = values->find("user");
+    const auto assertion=values->find("SAMLResponse");
+    const auto relay=values->find("RelayState");
+    const bool saml=assertion!=values->end() || relay!=values->end();
     const auto oauthToken=values->find("oauth_token");
     const auto oauthVerifier=values->find("oauth_verifier");
     const bool oauth1=oauthToken!=values->end() || oauthVerifier!=values->end();
@@ -393,7 +397,11 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
                 return byte<0x20U || byte==0x7FU;
             });
     };
-    const bool validProof=oauth1
+    const bool validProof=saml
+        ? request.method()==gateway::HttpMethod::Post
+            && values->size()==2U && bounded(assertion,values->end(),900U*1024U)
+            && bounded(relay,values->end(),512U)
+        : oauth1
         ? request.method()==gateway::HttpMethod::Get
             && bounded(oauthToken,values->end(),1024U)
             && bounded(oauthVerifier,values->end(),1024U)
@@ -401,7 +409,7 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
         : bounded(code,values->end(),4096U) && bounded(state,values->end(),512U)
             && (user==values->end() || bounded(user,values->end(),16U*1024U));
     if (values->contains("error") || values->contains("denied")
-        || values->contains("SAMLResponse") || values->contains("RelayState")
+        || (!saml && request.body().size()>64U*1024U)
         || !validProof) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
@@ -454,7 +462,10 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto client = context(request);
     idp::AuthenticationResponse proof{
         idp::ChallengeId{*challengeText}, client};
-    if (oauth1) {
+    if (saml) {
+        proof.setParameter("SAMLResponse",idp::CredentialValue{std::move(assertion->second)});
+        proof.setParameter("RelayState",idp::CredentialValue{std::move(relay->second)});
+    } else if (oauth1) {
         proof.setParameter("oauth_token",idp::CredentialValue{std::move(oauthToken->second)});
         proof.setParameter("oauth_verifier",idp::CredentialValue{std::move(oauthVerifier->second)});
     } else {
