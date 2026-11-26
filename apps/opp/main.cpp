@@ -2832,6 +2832,7 @@ addProtectedRoutes(gateway::Router& router,
     accountHttp::CoroutineContactVerificationAdapter::ResetPassword nativeResetPassword;
     accountHttp::CoroutineContactVerificationAdapter::VerifyPhone nativeVerifyPhone;
     accountHttp::CoroutineContactVerificationAdapter::VerifyEmailChange nativeVerifyEmailChange;
+    accountHttp::CoroutineContactVerificationAdapter::TotpCallbacks nativeTotp;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -3024,7 +3025,7 @@ addProtectedRoutes(gateway::Router& router,
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
                 },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
                     return issuer->issuePublicEmailAsync(purpose,std::move(destination));
-                },nativeSignup,nativeVerifySignup,nativeResetPassword,nativeVerifyPhone,nativeVerifyEmailChange);
+                },nativeSignup,nativeVerifySignup,nativeResetPassword,nativeVerifyPhone,nativeVerifyEmailChange,nativeTotp);
             nativeHandler=asyncContact.get();
         }
         if (nativeConsentEnabled) {
@@ -3128,6 +3129,11 @@ addProtectedRoutes(gateway::Router& router,
         if (nativeContactIssuer) {
             nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
+            if (nativeTotp) {
+                nativeMethods.emplace_back("/account/totp/start",gateway::HttpMethod::Post);
+                nativeMethods.emplace_back("/account/totp/complete",gateway::HttpMethod::Post);
+                nativeMethods.emplace_back("/account/totp/disable",gateway::HttpMethod::Post);
+            }
             if (nativeVerifyPhone) nativeMethods.emplace_back("/account/phone/verify",gateway::HttpMethod::Post);
             if (nativeVerifyEmailChange) nativeMethods.emplace_back("/account/email/change/verify",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
@@ -3497,6 +3503,38 @@ addProtectedRoutes(gateway::Router& router,
                 co_return co_await nativeCanonical->readProfileAsync(std::move(owner));
             };
         }
+        std::unique_ptr<postgres::CoroutineTotpEnrollment> totpEnrollment;
+        if (nativeSignupEnabled) {
+            if (!nativeLocalStore || !nativeLocalPasswords) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition});
+                return ExitCode::ConfigurationError;
+            }
+            auto material=credentialEncryptionMaterial(platform.security());
+            if (!material) {
+                reportStartupFailure(material.error());
+                return ExitCode::ConfigurationError;
+            }
+            auto key=security::AeadKey::create(std::move(material).value());
+            if (!key) {
+                reportStartupFailure(key.error());
+                return ExitCode::ConfigurationError;
+            }
+            totpEnrollment=std::make_unique<postgres::CoroutineTotpEnrollment>(
+                *nativeLocalStore,*nativeLocalPasswords,std::move(key).value(),
+                platform.security().credentialEncryptionKeyVersion(),clock);
+            nativeTotp.authenticate=[sessions=nativeSessions.get()](fnd::SecretString token){
+                return sessions->authenticate(std::move(token));
+            };
+            nativeTotp.begin=[enrollment=totpEnrollment.get()](identity::IdentityId owner,fnd::SecretString password,idp::AssuranceLevel assurance){
+                return enrollment->beginAsync(std::move(owner),std::move(password),assurance);
+            };
+            nativeTotp.complete=[enrollment=totpEnrollment.get()](identity::IdentityId owner,std::string id,fnd::SecretString code,idp::AssuranceLevel assurance){
+                return enrollment->completeAsync(std::move(owner),std::move(id),std::move(code),assurance);
+            };
+            nativeTotp.disable=[enrollment=totpEnrollment.get()](identity::IdentityId owner,fnd::SecretString password,idp::AssuranceLevel assurance){
+                return enrollment->disableAsync(std::move(owner),std::move(password),assurance);
+            };
+        }
         nativeContactIssuer=&contactIssuer;
         const auto result=runWithPasskey(accountApi,delegated);
         nativeSignup={};
@@ -3504,6 +3542,7 @@ addProtectedRoutes(gateway::Router& router,
         nativeResetPassword={};
         nativeVerifyPhone={};
         nativeVerifyEmailChange={};
+        nativeTotp={};
         nativeContactIssuer=nullptr;
         return result;
     };

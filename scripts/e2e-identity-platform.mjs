@@ -1323,6 +1323,30 @@ async function main() {
     }
     const consumerJarAfterReset = new CookieJar();
     await login("consumer@e2e.invalid", replacementPassword, consumerJarAfterReset);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+      const enrollment = await jsonRequest("/account/totp/start", "POST",
+        { password: replacementPassword }, consumerJarAfterReset);
+      expectStatus(enrollment, 201);
+      const setup = jsonBody(enrollment);
+      assert.equal(setup.replacing, false);
+      assert.equal(enrollment.headers["cache-control"], "no-store");
+      const code = totp(setup.secret_base32);
+      const proof = { enrollment_id: setup.enrollment_id, code };
+      expectStatus(await jsonRequest("/account/totp/complete", "POST", proof, consumerJarAfterReset), 200);
+      expectStatus(await jsonRequest("/account/totp/complete", "POST", proof, consumerJarAfterReset), 401);
+      expectStatus(await jsonRequest("/account/totp/disable", "POST",
+        { password: replacementPassword }, consumerJarAfterReset), 403);
+      const mfaJar = new CookieJar();
+      const mfaGrant = await login("consumer@e2e.invalid", replacementPassword, mfaJar,
+        await nextTotp(setup.secret_base32, code));
+      assert.equal(mfaGrant.assurance, "ial2");
+      const removed = await jsonRequest("/account/totp/disable", "POST",
+        { password: replacementPassword }, mfaJar);
+      expectStatus(removed, 200);
+      assert.deepEqual(jsonBody(removed), { enabled: false, recovery_codes_revoked: true });
+      expectStatus(await jsonRequest("/auth/logout", "POST", undefined, mfaJar), 204);
+      console.log("- native TOTP lifecycle: enrollment, replay denial, IAL2 login and disable");
+    }
 
     const ownerJar = new CookieJar();
     const initialOwnerTotp = totp(ownerTotp);

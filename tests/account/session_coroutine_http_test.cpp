@@ -896,6 +896,79 @@ TEST(NativeContactVerificationHttpTest, PhoneCompletionUsesAuthenticatedOwnerAnd
     EXPECT_EQ(fallback.invoked,0);
 }
 
+TEST(NativeContactVerificationHttpTest, TotpMutationsUseFirstPartyAuthenticationAndAssurance)
+{
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int starts=0,completes=0,disables=0,delegatedCalls=0;
+    using Callbacks=http::CoroutineContactVerificationAdapter::TotpCallbacks;
+    Callbacks callbacks;
+    callbacks.authenticate=[](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>>{
+        if (token.expose()=="first-party") co_return validSession("first-party-session");
+        if (token.expose()!="first-party-ial2") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return sess::Session::create(sess::SessionId{"ial2-session"},core::IdentityId{"identity-current"},
+            idp::ProviderId{"local"},idp::AssuranceLevel::Ial2,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge|idp::AuthenticationFactor::Possession,false},
+            kNow,sess::TokenDigest{sec::sha256("fixture-ial2").value()},kNow,std::chrono::hours{8},std::chrono::minutes{30});
+    };
+    callbacks.begin=[&](core::IdentityId owner,fnd::SecretString proof,idp::AssuranceLevel)
+        ->asio::awaitable<fnd::Result<Callbacks::Start>>{
+        ++starts;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(proof.expose(),"fixture-password");
+        co_return Callbacks::Start{"fixture-enrollment",fnd::SecretString{"FIXTUREBASE32"},
+            kNow+std::chrono::minutes{10},false};
+    };
+    callbacks.complete=[&](core::IdentityId owner,std::string enrollment,fnd::SecretString code,idp::AssuranceLevel)
+        ->asio::awaitable<fnd::Status>{
+        ++completes;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(enrollment,"fixture-enrollment");
+        EXPECT_EQ(code.expose(),"123456");
+        co_return fnd::ok();
+    };
+    callbacks.disable=[&](core::IdentityId owner,fnd::SecretString proof,idp::AssuranceLevel assurance)
+        ->asio::awaitable<fnd::Status>{
+        ++disables;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(proof.expose(),"fixture-password");
+        EXPECT_EQ(assurance,idp::AssuranceLevel::Ial2);
+        co_return fnd::ok();
+    };
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,[&](fnd::SecretString)->asio::awaitable<fnd::Result<sess::Session>>{
+            ++delegatedCalls;co_return validSession("delegated");
+        },{},{},{},{},{},{},{},std::move(callbacks)};
+    auto post=[&](std::string path,std::string token,std::string body){
+        asio::io_context io;
+        auto done=asio::co_spawn(io,dispatch(api,request(gw::HttpMethod::Post,std::move(path),
+            std::move(token),std::move(body))),asio::use_future);
+        io.run();
+        return std::move(done.get()).value();
+    };
+    const std::string password=R"({"password":"fixture-password"})";
+    EXPECT_EQ(post("/account/totp/start","delegated",password).status(),401);
+    EXPECT_EQ(post("/account/totp/start","",password).status(),401);
+    EXPECT_EQ(post("/account/totp/start","first-party",R"({"password":"fixture-password","identity_id":"other"})").status(),400);
+    EXPECT_EQ(starts,0);
+    auto started=post("/account/totp/start","first-party",password);
+    ASSERT_EQ(started.status(),201);
+    EXPECT_EQ(started.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(json::parse(started.body()).as_object().at("enrollment_id").as_string(),"fixture-enrollment");
+    EXPECT_EQ(post("/account/totp/complete","first-party",R"({"enrollment_id":"fixture-enrollment","code":"abcdef"})").status(),400);
+    EXPECT_EQ(completes,0);
+    EXPECT_EQ(post("/account/totp/complete","first-party",R"({"enrollment_id":"fixture-enrollment","code":"123456"})").status(),200);
+    EXPECT_EQ(post("/account/totp/disable","first-party",password).status(),403);
+    EXPECT_EQ(disables,0);
+    auto disabled=post("/account/totp/disable","first-party-ial2",password);
+    ASSERT_EQ(disabled.status(),200);
+    EXPECT_TRUE(json::parse(disabled.body()).as_object().at("recovery_codes_revoked").as_bool());
+    EXPECT_EQ(starts,1);EXPECT_EQ(completes,1);EXPECT_EQ(disables,1);
+    EXPECT_EQ(delegatedCalls,0);EXPECT_EQ(fallback.invoked,0);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/totp/start","first-party",password)).status(),503);
+}
+
 TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOnFailure)
 {
     namespace account=openproof::account;

@@ -5198,3 +5198,25 @@ fencing remains open. Legacy MFA writers do not yet share these locks.
 No schema change. The LDAP implementation applies the existing scoped
 GCC16 no-inlining workaround after PR111's compiler diagnostic; no
 warning is disabled. Exact-head executable acceptance remains pending.
+
+### Native TOTP enrollment ceremony and HTTP composition
+
+The opt-in account workload enables strict POST /account/totp/start,
+/account/totp/complete and /account/totp/disable. First-party native
+sessions only (delegated account tokens are intentionally no longer
+accepted for MFA mutation). Shared per-IP/path and per-identity rate
+admission, bounded body, password/code scrubbing before authentication
+suspension. A process-local enrollment map holds one pending ceremony per
+owner and at most 256 overall, with ten-minute expiry and five code
+attempts. A valid code is verified against the actual generated seed,
+sealed with the existing owner-bound AES-GCM format, and the ceremony is
+burned before durable mutation. The map mutex is not held across I/O or
+KDF. Expired entries are collected on begin or matching completion;
+restart loses pending enrollment, not persisted TOTP. Replacement
+requires IAL2 at both begin and completion; removal requires IAL2 before
+KDF. Existing JSON/status contracts preserved. A failed or ambiguous
+commit requires a new ceremony. Added C++ regressions exercising actual
+generated seed, wrong owner/password, expiry, attempt exhaustion, replay,
+replacement/removal assurance and HTTP first-party routing. No schema
+change. Recovery issuance fencing, legacy MFA writer parity and exact
+compiled/live acceptance remain blockers to default native cutover.

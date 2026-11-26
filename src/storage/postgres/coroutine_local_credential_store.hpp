@@ -7,11 +7,13 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <tuple>
 
 import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
+import openproof.security;
 
 namespace openproof::credentials { class BoundedPasswordExecutor; }
 
@@ -92,6 +94,31 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<bool>>
     rehashAsync(identity::provider::ExternalSubject subject, LocalCredentialSnapshot snapshot,
                 credentials::PasswordHash replacement);
+private:
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+// Process-local, bounded MFA enrollment ceremony. No SQL lease or mutex
+// is held while awaiting a password KDF or a durable factor mutation.
+class CoroutineTotpEnrollment final {
+public:
+    using Start=std::tuple<std::string,foundation::SecretString,foundation::Instant,bool>;
+    CoroutineTotpEnrollment(CoroutineLocalCredentialStore& store,
+        credentials::BoundedPasswordExecutor& passwords,security::AeadKey key,
+        unsigned int keyVersion,const foundation::ClockSource& clock);
+    ~CoroutineTotpEnrollment();
+    CoroutineTotpEnrollment(const CoroutineTotpEnrollment&)=delete;
+    CoroutineTotpEnrollment& operator=(const CoroutineTotpEnrollment&)=delete;
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<Start>>
+    beginAsync(identity::core::IdentityId owner,foundation::SecretString password,
+        identity::provider::AssuranceLevel assurance);
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    completeAsync(identity::core::IdentityId owner,std::string enrollmentId,
+        foundation::SecretString code,identity::provider::AssuranceLevel assurance);
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    disableAsync(identity::core::IdentityId owner,foundation::SecretString password,
+        identity::provider::AssuranceLevel assurance);
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;
