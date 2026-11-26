@@ -6,6 +6,7 @@ openproof_add_module(openproof_oauth_http
         http.cpp
         sender.cpp
         coroutine_discovery_http.cpp
+        coroutine_consent_http.cpp
         boost_json.cpp
     LINK_PUBLIC
         openproof_foundation
@@ -26,3 +27,7 @@ openproof_add_module(openproof_oauth_http
 )
 
 target_compile_definitions(openproof_oauth_http PRIVATE BOOST_HAS_LONG_LONG=1)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_consent_http.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()

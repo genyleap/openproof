@@ -46,6 +46,7 @@ for migration in \
     0002_memberships.sql \
     0003_identity_provider.sql \
     0005_account_lifecycle.sql \
+    0006_resource_consent.sql \
     0017_session_client_metadata.sql \
     0018_profile_avatar_sources.sql; do
     "${as_pg[@]}" "$pgbin/psql" -X -q -v ON_ERROR_STOP=1 \

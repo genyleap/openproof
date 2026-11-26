@@ -53,6 +53,8 @@
 #include "../../src/storage/postgres/coroutine_session_listener.hpp"
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
+#include "../../src/oauth/http/coroutine_consent_http.hpp"
+#include "../../src/storage/postgres/coroutine_consent_store.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
@@ -1563,6 +1565,21 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeOidcDiscoveryEnabled =
         nativeOidcDiscoveryFlag && *nativeOidcDiscoveryFlag == "1";
+    // Browser consent management uses the existing native first-party
+    // session stack, but never turns on any other OAuth endpoint.
+    const auto nativeConsentFlag = environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS");
+    if (nativeConsentFlag && *nativeConsentFlag != "0" && *nativeConsentFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeConsentEnabled = nativeConsentFlag && *nativeConsentFlag == "1";
+    if (nativeConsentEnabled && (!nativeAuthSessionEnabled
+        || !platform.auth().enabled() || !platform.oidc().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native OAuth consent management requires authentication, OIDC and native sessions."});
+        return ExitCode::ConfigurationError;
+    }
     // /auth/providers is a public, in-memory registry projection. It can
     // migrate independently of federated callback/token/session services.
     const auto nativeCatalogFlag =
@@ -2473,6 +2490,7 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     std::unique_ptr<postgres::CoroutineSessionAuthenticator> nativeGatewayVerifier;
     std::unique_ptr<postgres::CoroutineAuthorizationDecisionSink> nativeGatewayAudit;
+    std::unique_ptr<postgres::CoroutineConsentStore> nativeConsentStore;
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
     std::unique_ptr<postgres::CoroutinePostgresRecoveryCodeRepository> nativeRecoveryRepository;
     std::optional<credentials::CoroutineRecoveryCodeService> nativeRecoveryCodes;
@@ -2511,6 +2529,12 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
+        if (nativeConsentEnabled) {
+            nativeConsentStore = std::make_unique<postgres::CoroutineConsentStore>(
+                executor, platform.database().connectionString().clone(),
+                identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+        }
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
             || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
@@ -2659,6 +2683,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
+        std::unique_ptr<oauthHttp::CoroutineConsentAdapter> asyncConsent;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
@@ -2793,6 +2818,27 @@ addProtectedRoutes(gateway::Router& router,
             // This read-only route is method scoped below. PATCH/PUT on
             // /account/profile must keep using the compatibility API.
         }
+        if (nativeConsentEnabled) {
+            if (!nativeSessions || !nativeConsentStore) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native OAuth consent dependencies are unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* sessionService = nativeSessions.get();
+            auto* store = nativeConsentStore.get();
+            asyncConsent = std::make_unique<oauthHttp::CoroutineConsentAdapter>(
+                *nativeHandler, limiter.value(), clock,
+                [sessionService](fnd::SecretString credential) {
+                    return sessionService->authenticate(std::move(credential));
+                },
+                [store](identity::IdentityId owner) {
+                    return store->listAsync(std::move(owner));
+                },
+                [store](consent::ConsentId id, identity::IdentityId owner, fnd::Instant now) {
+                    return store->revokeAsync(std::move(id), std::move(owner), now);
+                });
+            nativeHandler = asyncConsent.get();
+        }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
                 reportStartupFailure(fnd::Error{
@@ -2896,6 +2942,10 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeRecoveryEnabled) {
             nativeMethods.emplace_back("/auth/recovery-codes", gateway::HttpMethod::Post);
+        }
+        if (nativeConsentEnabled) {
+            nativeMethods.emplace_back("/oauth/consents", gateway::HttpMethod::Get);
+            nativeMethods.emplace_back("/oauth/consents/revoke", gateway::HttpMethod::Post);
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),
