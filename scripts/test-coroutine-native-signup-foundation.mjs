@@ -262,3 +262,26 @@ test("native email change keeps existing password, fences alias ABA and never cr
   assert.match(app,/nativeMethods.emplace_back\("\/account\/email\/change\/verify"/);
   assert.match(read("src/account/http/coroutine_session_http.cpp"),/co_await m_verifyEmailChange\(actor->identity\(\)/);
 });
+
+test("native MFA management releases SQL before KDF and commits generation, seed and recovery changes together",()=>{
+  const source=read("src/storage/postgres/coroutine_local_credential_store.cpp");
+  const proof=source.slice(source.indexOf("CoroutineLocalCredentialStore::confirmMfaPasswordAsync("),
+    source.indexOf("CoroutineLocalCredentialStore::changeTotpAsync("));
+  assert.match(proof,/i.id=\$1 AND i.organization_id=\$2 AND e.provider=\$3/);
+  assert.match(proof,/LIMIT 2/);
+  assert.match(proof,/captured.emplace\([\s\S]*?\n        \}\n        auto hash=/);
+  assert.match(proof,/co_await policy.verifyAsync\(std::move\(password\)/);
+  const change=source.slice(source.indexOf("CoroutineLocalCredentialStore::changeTotpAsync("),
+    source.indexOf("CoroutineLocalCredentialStore::confirmPasswordOnlyAsync("));
+  const ordered=["BEGIN ISOLATION LEVEL READ COMMITTED","pg_advisory_xact_lock","FOR UPDATE OF i FOR SHARE OF o",
+    "p.password_hash=$4 AND p.changed_at_ms=$5::bigint","FOR UPDATE OF p FOR SHARE OF e",
+    "FROM openproof.totp_credentials WHERE identity_id=$1 FOR UPDATE","if (!sameFactor)",
+    "INSERT INTO openproof.totp_credentials AS t","DELETE FROM openproof.totp_credentials",
+    "DELETE FROM openproof.recovery_codes","SET changed_at_ms=GREATEST(changed_at_ms+1,$2::bigint)",
+    'connection.query("COMMIT"'];
+  let previous=-1;
+  for(const marker of ordered){const index=change.indexOf(marker);assert.ok(index>previous,marker);previous=index;}
+  assert.match(change,/factor.rows.front\(\)\[2\]==snapshot.totpEnrolledAt/);
+  assert.match(change,/enrolled_at_ms=GREATEST\(t.enrolled_at_ms\+1,EXCLUDED.enrolled_at_ms\)/);
+  assert.doesNotMatch(change,/SET password_hash|INSERT INTO openproof.identities/);
+});

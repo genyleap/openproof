@@ -53,6 +53,25 @@ public:
         std::pair<identity::core::IdentityId, bool>>>
     confirmPasswordUpgradeAsync(identity::core::IdentityId owner,
         foundation::SecretString password, credentials::BoundedPasswordExecutor& policy);
+    // Internal owner-bound MFA management proof. The KDF runs after the
+    // read lease is released; the mutation rechecks every captured generation.
+    using OwnerCredential=std::pair<identity::provider::ExternalSubject,LocalCredentialSnapshot>;
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<OwnerCredential>>
+    confirmMfaPasswordAsync(identity::core::IdentityId owner,foundation::SecretString password,
+        credentials::BoundedPasswordExecutor& policy);
+
+    struct EncryptedTotpEnrollment final {
+        std::string ciphertextHex;
+        unsigned int keyVersion;
+        std::uint64_t acceptedStep;
+    };
+    // Caller must enforce IAL2 for replacement/removal, and verify the
+    // fresh TOTP code and encrypt the seed before invoking this operation.
+    // nullopt removes an existing factor. Existing sessions are unchanged.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    changeTotpAsync(OwnerCredential captured,std::optional<EncryptedTotpEnrollment> enrollment,
+        foundation::Instant now);
+
     // Only for password-only authentication, after verification of the
     // captured hash. An intervening MFA enrollment must deny the proof.
     [[nodiscard]] boost::asio::awaitable<foundation::Status>

@@ -2515,6 +2515,96 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndT
     EXPECT_FALSE(locked->has_value());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeMfaMutationFencesOldLoginAndRecoveryGenerations)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    auto scalar=[&](std::string_view sql,std::initializer_list<std::string> params){
+        auto rows=query(sql,params);
+        return std::string{PQgetvalue(rows.get(),0,0)};
+    };
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+        "VALUES($1,'fixture-hash',1770000000000)",{seed.owner})));
+    asio::io_context io;
+    const idp::ProviderId provider{"native-canonical-provider"};
+    pg::CoroutineLocalCredentialStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},provider,2U,500ms,1000ms,3000ms};
+    pg::CoroutineLocalCredentialStore foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},provider,1U,500ms,1000ms,3000ms};
+    auto run=[&]<typename T>(asio::awaitable<T> pending){
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(pending),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    const idp::ExternalSubject subject{seed.subject};
+    auto initial=run(store.readAsync(subject));
+    ASSERT_TRUE(initial && initial->has_value());
+    using OwnerCredential=pg::CoroutineLocalCredentialStore::OwnerCredential;
+    using Enrollment=pg::CoroutineLocalCredentialStore::EncryptedTotpEnrollment;
+    const OwnerCredential captured{subject,initial->value()};
+    EXPECT_FALSE(run(foreign.changeTotpAsync(captured,Enrollment{"010203",1U,100U},kNow)));
+    EXPECT_FALSE(run(store.changeTotpAsync(captured,std::nullopt,kNow)));
+    auto enroll=[&]{
+        return store.changeTotpAsync(captured,Enrollment{"010203",1U,100U},kNow);
+    };
+    io.restart();
+    auto first=asio::co_spawn(io,enroll(),asio::use_future);
+    auto second=asio::co_spawn(io,enroll(),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_FALSE(run(store.confirmPasswordOnlyAsync(subject,captured.second)));
+    auto current=run(store.readAsync(subject));
+    ASSERT_TRUE(current && current->has_value());
+    EXPECT_EQ(current->value().passwordChangedAt,"1770000000001");
+    EXPECT_EQ(current->value().lastAcceptedStep,std::optional<std::string>{"100"});
+    EXPECT_FALSE(run(store.consumeTotpAsync(subject,current->value(),100U)));
+    const OwnerCredential enrolled{subject,current->value()};
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.recovery_codes(identity_id,code_digest,issued_at_ms) "
+        "VALUES($1,decode(repeat('11',32),'hex'),1770000000000)",{seed.owner})));
+    // Force a failure at the final generation advance after the factor
+    // and recovery mutations; the entire transaction must roll back.
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.password_credentials ADD CONSTRAINT native_mfa_fixture_rollback "
+        "CHECK(changed_at_ms<=1770000000001) NOT VALID",{})));
+    EXPECT_FALSE(run(store.changeTotpAsync(enrolled,Enrollment{"040506",1U,101U},kNow)));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.password_credentials DROP CONSTRAINT native_mfa_fixture_rollback",{})));
+    EXPECT_EQ(scalar("SELECT encode(encrypted_seed,'hex') FROM openproof.totp_credentials WHERE identity_id=$1",{seed.owner}),"010203");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.recovery_codes WHERE identity_id=$1",{seed.owner}),"1");
+    ASSERT_TRUE(run(store.changeTotpAsync(enrolled,Enrollment{"040506",1U,101U},kNow)));
+    EXPECT_FALSE(run(store.changeTotpAsync(enrolled,std::nullopt,kNow)));
+    EXPECT_FALSE(run(store.consumeTotpAsync(subject,enrolled.second,102U)));
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.recovery_codes WHERE identity_id=$1",{seed.owner}),"0");
+    auto rotated=run(store.readAsync(subject));
+    ASSERT_TRUE(rotated && rotated->has_value());
+    EXPECT_EQ(rotated->value().passwordChangedAt,"1770000000002");
+    EXPECT_EQ(rotated->value().totpEnrolledAt,std::optional<std::string>{"1770000000001"});
+    ASSERT_TRUE(run(store.changeTotpAsync(OwnerCredential{subject,rotated->value()},std::nullopt,kNow)));
+    auto removed=run(store.readAsync(subject));
+    ASSERT_TRUE(removed && removed->has_value());
+    EXPECT_FALSE(removed->value().encryptedTotpHex);
+    EXPECT_EQ(removed->value().passwordHash,"fixture-hash");
+    EXPECT_EQ(removed->value().passwordChangedAt,"1770000000003");
+    EXPECT_FALSE(run(store.confirmPasswordOnlyAsync(subject,captured.second)));
+    EXPECT_TRUE(run(store.confirmPasswordOnlyAsync(subject,removed->value())));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeLocalRecoveryAndRehashRejectChangedCredentialGeneration)
 {
     const auto dsn = disposableDsn();
