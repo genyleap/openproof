@@ -5027,3 +5027,22 @@ the non-idle lease, rolling back the entire unit. No runtime cutover yet:
 delivery failure compensation and verification activation must be
 generation-safe, and cross-path concurrency with legacy signup and
 federated profile updates requires executable acceptance. No schema change.
+
+### Native signup proof activation
+
+Introduces tenant-bound digest-only signup activation. Locate the owner,
+lock the canonical identity before its proof, enforce purpose/channel,
+expiry and maximum attempts, and compare the keyed digest in constant
+time. Under the same transaction, revalidate the live untagged
+reservation, password row, existing local link absence and unchanged
+profile email; atomically attach the local subject, mark email verified,
+activate the owner and consume both proof and reservation. A late error
+rolls back the whole promotion. No session is issued by the persistence
+operation. Native HTTP verification and session issuance still require
+wiring. Compensation deliberately retains pending enrollment and the
+untagged reservation for resend, removing only the exact failed delivery
+challenge. This differs from legacy fresh-signup rollback; expired
+pending-enrollment cleanup and cross-path legacy concurrency remain
+open. Added compiled regressions for wrong tenant, wrong proof, locked
+owner, rollback, concurrent redemption, and stale compensation.
+No migration changes.
