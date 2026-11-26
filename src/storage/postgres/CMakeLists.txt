@@ -227,3 +227,17 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_canonical_finalizer.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
+
+add_library(openproof_postgres_async_consent STATIC coroutine_consent_store.cpp)
+target_compile_features(openproof_postgres_async_consent PUBLIC cxx_std_26)
+target_include_directories(openproof_postgres_async_consent PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_postgres_async_consent PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_consent PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_consent PUBLIC
+    openproof_postgres_async_io openproof_consent openproof_client
+    openproof_identity_core openproof_foundation Boost::headers
+    PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_consent_store.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
