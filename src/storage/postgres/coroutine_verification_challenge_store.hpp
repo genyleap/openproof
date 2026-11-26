@@ -61,6 +61,12 @@ public:
         credentials::PasswordHash passwordHash,std::optional<std::string> displayName,
         const account::VerificationKey& key,foundation::Instant now,foundation::Duration lifetime);
 
+    // Consume only a signup proof; promote the pending identity and local
+    // link in the same transaction. Does not issue an authentication grant.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::core::ExternalIdentityRef>>
+    activateSignupAsync(identity::provider::ProviderId provider,account::VerificationId id,
+        account::VerificationDigest presented,foundation::Instant now,std::uint32_t maximumAttempts);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.

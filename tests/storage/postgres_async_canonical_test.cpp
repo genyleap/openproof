@@ -1670,12 +1670,85 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
         "WHERE id=$1 AND identity_id=$2 AND purpose=0 AND secret_digest=decode($3,'hex')",
         {std::string{winner->dispatch.id().value()},owner,fnd::toHex(digest->bytes())}),"1");
     EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"0");
+    using Activated=fnd::Result<ids::ExternalIdentityRef>;
+    pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},1U,500ms,1000ms,3000ms};
+    const auto activate=[&](pg::CoroutineVerificationChallengeStore& adapter,acc::VerificationId id,
+        acc::VerificationDigest proof,fnd::Instant now,std::optional<Activated>& result)->asio::awaitable<void>{
+        result.emplace(co_await adapter.activateSignupAsync(provider,std::move(id),proof,now,3U));
+    };
+    const auto redeem=[&](pg::CoroutineVerificationChallengeStore& adapter,acc::VerificationId id,
+        acc::VerificationDigest proof,fnd::Instant now=kNow){
+        std::optional<Activated> result;
+        io.restart();
+        auto done=asio::co_spawn(io,activate(adapter,std::move(id),proof,now,result),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    const auto proofId=winner->dispatch.id();
+    const std::string proofName{proofId.value()};
+    EXPECT_FALSE(redeem(foreign,proofId,digest.value()));
+    EXPECT_EQ(count("SELECT attempts FROM openproof.account_verification_challenges WHERE id=$1",{proofName}),"0");
+    EXPECT_FALSE(redeem(store,proofId,acc::VerificationDigest{std::array<std::byte,32>{}}));
+    EXPECT_EQ(count("SELECT attempts FROM openproof.account_verification_challenges WHERE id=$1",{proofName}),"1");
+    EXPECT_EQ(count("SELECT status FROM openproof.identities WHERE id=$1",{owner}),"3");
+    ASSERT_NO_THROW(static_cast<void>(query("UPDATE openproof.identities SET status=2 WHERE id=$1",{owner})));
+    EXPECT_FALSE(redeem(store,proofId,digest.value()));
+    ASSERT_NO_THROW(static_cast<void>(query("UPDATE openproof.identities SET status=3 WHERE id=$1",{owner})));
+    // A failure after writing the local link must restore the entire proof
+    // and pending state; a subsequent correct retry may still succeed.
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.identity_profiles ADD CONSTRAINT "
+        "native_signup_fixture_activation CHECK(NOT email_verified) NOT VALID",{})));
+    EXPECT_FALSE(redeem(store,proofId,digest.value()));
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.identity_profiles "
+        "DROP CONSTRAINT native_signup_fixture_activation",{})));
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{proofName}),"1");
+    std::optional<Activated> one,two;
+    io.restart();
+    auto redeemOne=asio::co_spawn(io,activate(store,proofId,digest.value(),kNow,one),asio::use_future);
+    auto redeemTwo=asio::co_spawn(io,activate(store,proofId,digest.value(),kNow,two),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(redeemOne.get());
+    ASSERT_NO_THROW(redeemTwo.get());
+    ASSERT_TRUE(one && two);
+    ASSERT_NE(one->has_value(),two->has_value());
+    EXPECT_EQ(count("SELECT status FROM openproof.identities WHERE id=$1",{owner}),"0");
+    EXPECT_EQ(count("SELECT email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",{owner}),"true");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{proofName}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE identity_id=$1",{owner}),"0");
+    EXPECT_FALSE(redeem(store,proofId,digest.value()));
     ASSERT_NO_THROW(static_cast<void>(query("UPDATE openproof.identity_profiles SET email=$2,email_verified=true WHERE identity_id=$1",
         {seed.owner,existing})));
     auto linked=run(store,existing);
     ASSERT_TRUE(linked);
     EXPECT_FALSE(linked->createdIdentity);
     EXPECT_EQ(linked->dispatch.identity().value(),seed.owner);
+    EXPECT_EQ(count("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
+    const auto failedId=linked->dispatch.id();
+    const auto replacement=acc::VerificationPreparation::prepare(key.value(),ids::IdentityId{seed.owner},
+        acc::VerificationPurpose::SignupEmail,acc::VerificationChannel::Email,existing,kNow,24h);
+    ASSERT_TRUE(replacement);
+    auto runStatus=[&](asio::awaitable<fnd::Status> task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    ASSERT_TRUE(runStatus(store.replacePublicEmailAsync(replacement->first,provider)));
+    ASSERT_TRUE(runStatus(store.discardAsync(failedId,ids::IdentityId{seed.owner},acc::VerificationPurpose::SignupEmail)));
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",
+        {std::string{replacement->first.id().value()}}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE identity_id=$1 AND verification_id IS NULL",
+        {seed.owner}),"1");
+    // Discarding the latest failed delivery leaves the pending enrollment
+    // available for explicit resend but no usable proof.
+    ASSERT_TRUE(runStatus(store.discardAsync(replacement->first.id(),ids::IdentityId{seed.owner},acc::VerificationPurpose::SignupEmail)));
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE identity_id=$1 AND purpose=0",{seed.owner}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE identity_id=$1 AND verification_id IS NULL",{seed.owner}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),"1");
     EXPECT_EQ(count("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
     ASSERT_NO_THROW(static_cast<void>(query("INSERT INTO openproof.identity_profiles(identity_id,email,email_verified,created_at_ms,updated_at_ms)"
         " VALUES($1,$3,true,1770000000000,1770000000000),($2,$3,true,1770000000000,1770000000000)",
