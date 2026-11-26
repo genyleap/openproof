@@ -854,6 +854,16 @@ Gateway::Gateway(const Router& router, session::SessionService& sessions,
 {
 }
 
+Gateway::Gateway(const Router& router,TokenBucketRateLimiter& rateLimiter,
+    ServiceDiscovery& discovery,WeightedRoundRobin& loadBalancer,
+    CircuitBreaker& circuits,TrustedContextSigner& contextSigner,
+    foundation::Duration upstreamTimeout)
+    :m_router(&router),m_rateLimiter(&rateLimiter),m_discovery(&discovery),
+     m_loadBalancer(&loadBalancer),m_circuits(&circuits),m_contextSigner(&contextSigner),
+     m_upstreamTimeout(upstreamTimeout)
+{
+}
+
 HttpResponse Gateway::errorResponse(const foundation::Error& error,
                                     const HttpRequest& request) const
 {
@@ -870,6 +880,14 @@ Gateway::prepareForward(HttpRequest request)
     const auto route = m_router->match(request.method(), request.path());
     if (!route.has_value()) {
         return errorResponse(foundation::Error{foundation::ErrorCode::NotFound}, request);
+    }
+    if (!m_sessions || !m_access || !m_proxy) {
+        // Native-only gateways never use the compatibility forwarding path.
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        request.wipeBody();
+        request.wipeTargetQuery();
+        return errorResponse(foundation::Error{foundation::ErrorCode::Unavailable},request);
     }
     if (!m_rateLimiter->allow(request.remoteAddress())) {
         return errorResponse(foundation::Error{foundation::ErrorCode::RateLimited}, request);
@@ -976,7 +994,7 @@ namespace {
 bool localProtocolPath(std::string_view path) noexcept
 {
     for (const std::string_view prefix : {"/auth", "/admin", "/account", "/oauth",
-            "/login", "/.well-known", "/evidence", "/scim", "/health", "/metrics"}) {
+            "/login", "/.well-known", "/evidence", "/trust", "/scim", "/health", "/metrics"}) {
         if (path == prefix || (path.starts_with(prefix) && path.size() > prefix.size()
             && path[prefix.size()] == '/')) return true;
     }

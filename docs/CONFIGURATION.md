@@ -1211,6 +1211,11 @@ share a bounded consistent snapshot and the existing trust policy.
 The server no longer constructs the synchronous evidence HTTP API,
 challenge store, evidence service or trust engine.
 
+Authenticated gateway forwarding is composed without the synchronous
+session, policy/audit, delegated-token or proxy interfaces. A direct
+compatibility call on that core fails closed. The trust namespace
+cannot be captured by an operator-defined upstream route.
+
 The blocking PostgreSQL compatibility implementation still exists.
 Startup, offline administration, and residual compatibility callers
 must be inventoried and retired before the final storage gate can pass.

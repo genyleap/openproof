@@ -2815,12 +2815,6 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(memberPolicy.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresAuthorizationDecisionSink authorizationAudit{
-        *pool.value(), std::move(authorizationAuditKey).value(), clock};
-    gateway::PolicyAccessController access{
-        memberPolicy->get(), organizations, identities, memberships,
-        &authorizationAudit};
-
     std::vector<std::unique_ptr<evidence::EvidenceVerifier>> evidenceVerifiers;
 
     if (const auto publicKey = environment.get("OPENPROOF_EVIDENCE_JWT_PUBLIC_KEY_PEM");
@@ -3857,8 +3851,8 @@ addProtectedRoutes(gateway::Router& router,
 
     if (!platform.oidc().enabled()) {
         gateway::Gateway gatewayCore{
-            router, sessions, access, limiter.value(), discovery, loadBalancer,
-            circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+            router, limiter.value(), discovery, loadBalancer,
+            circuits.value(), signer.value(), std::chrono::seconds{10}};
         nativeGatewayCore = &gatewayCore;
         LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
         authHttp::AuthenticationHttpApi authApi{
@@ -3938,9 +3932,8 @@ addProtectedRoutes(gateway::Router& router,
     nativeGatewaySender=&senderProof;
 
     gateway::Gateway gatewayCore{
-        router, sessions, access, limiter.value(), discovery, loadBalancer,
-        circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10},
-        &tokenService, &senderProof};
+        router, limiter.value(), discovery, loadBalancer,
+        circuits.value(), signer.value(), std::chrono::seconds{10}};
     nativeGatewayCore = &gatewayCore;
     LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
     authHttp::AuthenticationHttpApi authApi{

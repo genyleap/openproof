@@ -170,7 +170,7 @@ test("native protected proxy is mandatory for authenticated and OIDC runtimes", 
   assert.match(gate, /localProtocolPath\(request\.path\(\)\)/);
   assert.match(gate, /route && route->isProtected\(\)/);
   const local=domain.slice(domain.indexOf("bool localProtocolPath("),start);
-  for(const prefix of ["/auth","/admin","/account","/oauth","/login","/.well-known","/evidence","/scim","/health","/metrics"])
+  for(const prefix of ["/auth","/admin","/account","/oauth","/login","/.well-known","/evidence","/trust","/scim","/health","/metrics"])
     assert.ok(local.includes('"'+prefix+'"'),prefix);
   assert.match(local,/path\[prefix.size\(\)\] == '\/'/);
   const begin=domain.slice(domain.indexOf("GatewayNativePreparationSource::begin("),domain.indexOf("GatewayNativePreparationSource::admitIdentity("));
@@ -265,6 +265,10 @@ test("authenticated runtimes dispatch explicitly public proxy routes without inv
   assert.match(app,/CoroutineProtectedGatewayAdapter nativePublicGateway\{/);
   assert.match(app,/runListener\(platform,nativePublicGateway,logger\)/);
   assert.equal([...app.matchAll(/nativeGatewayCore = &gatewayCore;/g)].length,2);
+  assert.equal([...app.matchAll(/gateway::Gateway gatewayCore\{\s*router, limiter.value\(\), discovery, loadBalancer,/g)].length,2);
+  assert.doesNotMatch(app,/\bpostgres::PostgresAuthorizationDecisionSink\s+authorizationAudit/);
+  assert.doesNotMatch(app,/\bgateway::PolicyAccessController\s+access\{/);
+  assert.match(domain,/if \(!m_sessions \|\| !m_access \|\| !m_proxy\)/);
   const native=implementation.slice(implementation.indexOf("CoroutineProtectedGatewayAdapter::handleAsync("),
     implementation.indexOf("auto started = begin(*m_gateway"));
   assert.match(native,/eligiblePublic\(/);
