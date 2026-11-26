@@ -9,12 +9,15 @@ const app=read("apps/opp/main.cpp");
 const http=read("src/enterprise/scim/http/coroutine_read_http.cpp");
 const wire=read("src/enterprise/scim/http/http.cpp");
 const source=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
-const sql=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::readScimAsync("));
-test("SCIM read ownership preserves write dispatch and fails closed if native reads are unavailable",()=>{
-  assert.match(app,/strictMethodPrefixes.emplace_back\("\/scim\/v2\/",gateway::HttpMethod::Get\)/);
+const sql=source.slice(source.indexOf("std::string scimProjection("),
+  source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateScimAsync("));
+test("SCIM read and mutation ownership fails closed if native storage is unavailable",()=>{
+  assert.match(app,/strictNativePrefixes.emplace_back\("\/scim\/v2\/"\)/);
+  assert.match(app,/reader->mutateScimAsync/);
+  assert.doesNotMatch(app,/\b(?:PostgresScimDirectoryRepository|scim::Service|scimHttp::Api)\s+\w+\s*\{/);
   assert.match(app,/reader->readScimAsync/);
   assert.match(app,/scimBearerToken->clone\(\)/);
-  assert.match(http,/r.method\(\)==gateway::HttpMethod::Get && r.path\(\).starts_with\("\/scim\/v2\/"\)/);
+  assert.match(http,/r.path\(\)=="\/scim\/v2" \|\| r.path\(\).starts_with\("\/scim\/v2\/"\)/);
   const order=["m_limiter->allow","security::constantTimeEquals","r.wipeAuthorizationHeader();",
     "renderDiscovery(r)","parseReadRequest(r)","co_await m_read","renderReadResult"];
   let previous=http.indexOf("CoroutineReadAdapter::handleAsync(");
@@ -45,4 +48,32 @@ test("SCIM user and group reads are tenant-scoped consistent bounded projections
   assert.match(wire,/response.setHeader\("etag",versionTag\(result.rows.front\(\).updatedAt\)\)/);
   assert.match(wire,/renderDiscovery\(const gateway::HttpRequest& request\)/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeScimReadsPreserveTenantAndCanonicalState/);
+});
+test("SCIM native writes serialize owner, identity and metadata changes, preserving tenant and version invariants",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateScimAsync("));
+  const order=["BEGIN ISOLATION LEVEL READ COMMITTED","pg_advisory_xact_lock(7299730475761673315)",
+    "WHERE id=$1 AND state=0 FOR SHARE","pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+    "WHERE u.organization_id=$1 AND u.identity_id=$2 AND i.kind=0 FOR UPDATE OF u,i,m",
+    "request.expectedVersion","timestamp=std::max(timestamp,previous+1)","INSERT INTO openproof.identities",
+    "INSERT INTO openproof.memberships","INSERT INTO openproof.identity_profiles","INSERT INTO openproof.scim_users",
+    "FOR UPDATE OF m,i,r","UPDATE openproof.sessions SET state=1","UPDATE openproof.oauth_token_families SET revoked_at_ms",
+    "DELETE FROM openproof.scim_users","scimProjection(users,scim::ReadSelector::Id)",'execute("COMMIT",{})'];
+  let previous=-1;
+  for(const term of order){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term);previous=index;
+  }
+  for(const term of ["status>=4","status==2 || membership==0","WHERE organization_id=$1 AND identity_id=$2",
+    "UPDATE openproof.scim_groups g SET updated_at_ms=GREATEST(g.updated_at_ms+1",
+    "JOIN openproof.scim_users u ON u.organization_id=$1 AND u.identity_id=v.id",
+    "DELETE FROM openproof.scim_group_members WHERE organization_id=$1 AND group_id=$2",
+    "INSERT INTO openproof.scim_group_members(organization_id,group_id,identity_id)"])
+    assert.ok(store.includes(term),term);
+  assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
+  assert.match(http,/parseMutationRequest\(r\);\s*scrub\(r\)/);
+  assert.match(http,/co_await m_mutate\(std::move\(command\).value\(\)\)/);
+  assert.match(wire,/command.expectedVersion=foundation::Instant/);
+  assert.match(wire,/MemberAction::Remove/);
+  assert.match(wire,/response.setHeader\("location"/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeScimMutationsAreAtomicAndVersioned/);
 });

@@ -102,6 +102,9 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
     readScimAsync(enterprise::scim::ReadRequest request);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
+    mutateScimAsync(enterprise::scim::MutationRequest request,foundation::Instant now);
+
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
 

@@ -3894,6 +3894,52 @@ CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync(const provider:
     }
 }
 
+namespace {
+std::string scimProjection(bool users,enterprise::scim::ReadSelector selector)
+{
+    namespace scim=enterprise::scim;
+        std::string projection=users?
+            "SELECT u.user_name AS sort_name,u.identity_id AS id,u.updated_at_ms AS updated,"
+            "jsonb_strip_nulls(jsonb_build_object('schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:User'),"
+            "'id',u.identity_id,'externalId',u.external_id,'userName',u.user_name,'active',i.status=0,"
+            "'displayName',p.display_name,'emails',CASE WHEN p.email IS NOT NULL THEN "
+            "jsonb_build_array(jsonb_build_object('value',p.email,'primary',true)) END,"
+            "'meta',jsonb_build_object('resourceType','User','created',"
+            "to_char(to_timestamp(u.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'lastModified',to_char(to_timestamp(u.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'location','/scim/v2/Users/'||u.identity_id,'version','W/\"'||u.updated_at_ms::text||'\"')))::text AS value "
+            "FROM openproof.scim_users u JOIN openproof.identities i ON i.id=u.identity_id AND i.organization_id=u.organization_id "
+            "LEFT JOIN openproof.identity_profiles p ON p.identity_id=i.id WHERE u.organization_id=$1 AND i.kind=0"
+            :
+            "SELECT g.display_name AS sort_name,g.id,g.updated_at_ms AS updated,"
+            "CASE WHEN children.total<=10000 THEN jsonb_strip_nulls(jsonb_build_object("
+            "'schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:Group'),"
+            "'id',g.id,'externalId',g.external_id,'displayName',g.display_name,'members',children.members,"
+            "'meta',jsonb_build_object('resourceType','Group','created',"
+            "to_char(to_timestamp(g.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'lastModified',to_char(to_timestamp(g.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
+            "'location','/scim/v2/Groups/'||g.id,'version','W/\"'||g.updated_at_ms::text||'\"')))::text END AS value "
+            "FROM openproof.scim_groups g CROSS JOIN LATERAL (SELECT count(*) AS total,"
+            "COALESCE(jsonb_agg(jsonb_build_object('value',m.identity_id,'$ref','/scim/v2/Users/'||m.identity_id) "
+            "ORDER BY m.identity_id COLLATE \"C\"),'[]'::jsonb) AS members FROM "
+            "(SELECT identity_id FROM openproof.scim_group_members WHERE organization_id=g.organization_id "
+            "AND group_id=g.id ORDER BY identity_id COLLATE \"C\" LIMIT 10001) m) children WHERE g.organization_id=$1";
+        if (selector!=scim::ReadSelector::All) {
+            if (selector==scim::ReadSelector::Id)
+                projection+=users?" AND u.identity_id=$2":" AND g.id=$2";
+            else projection+=users?" AND u.user_name=$2":" AND g.display_name=$2";
+        }
+        projection+=" ORDER BY sort_name,id LIMIT 10001";
+        return "WITH projected AS MATERIALIZED ("+projection+"), "
+            "bounds AS (SELECT count(*)<=10000 AND count(value)=count(*) AND "
+            "COALESCE(sum(octet_length(value)),0)<=8380000 AS ok FROM projected) "
+            "SELECT value,updated::text FROM (SELECT sort_name,id,value,updated FROM projected,bounds WHERE ok "
+            "UNION ALL SELECT NULL::text,NULL::text,NULL::text,NULL::bigint FROM bounds WHERE NOT ok) bounded "
+            "ORDER BY sort_name,id";
+
+}
+}
+
 asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
 CoroutinePostgresCanonicalFinalizer::readScimAsync(enterprise::scim::ReadRequest request)
 {
@@ -3922,46 +3968,9 @@ CoroutinePostgresCanonicalFinalizer::readScimAsync(enterprise::scim::ReadRequest
         if (permitted.rows.size()!=1U) co_return foundation::fail(E::PermissionDenied);
         // Bound SQL materialization before libpq transfers it. Do not silently
         // truncate directory lists or individual group membership.
-        std::string projection=users?
-            "SELECT u.user_name AS sort_name,u.identity_id AS id,u.updated_at_ms AS updated,"
-            "jsonb_strip_nulls(jsonb_build_object('schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:User'),"
-            "'id',u.identity_id,'externalId',u.external_id,'userName',u.user_name,'active',i.status=0,"
-            "'displayName',p.display_name,'emails',CASE WHEN p.email IS NOT NULL THEN "
-            "jsonb_build_array(jsonb_build_object('value',p.email,'primary',true)) END,"
-            "'meta',jsonb_build_object('resourceType','User','created',"
-            "to_char(to_timestamp(u.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
-            "'lastModified',to_char(to_timestamp(u.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
-            "'location','/scim/v2/Users/'||u.identity_id,'version','W/\"'||u.updated_at_ms::text||'\"')))::text AS value "
-            "FROM openproof.scim_users u JOIN openproof.identities i ON i.id=u.identity_id AND i.organization_id=u.organization_id "
-            "LEFT JOIN openproof.identity_profiles p ON p.identity_id=i.id WHERE u.organization_id=$1 AND i.kind=0"
-            :
-            "SELECT g.display_name AS sort_name,g.id,g.updated_at_ms AS updated,"
-            "CASE WHEN children.total<=10000 THEN jsonb_strip_nulls(jsonb_build_object("
-            "'schemas',jsonb_build_array('urn:ietf:params:scim:schemas:core:2.0:Group'),"
-            "'id',g.id,'externalId',g.external_id,'displayName',g.display_name,'members',children.members,"
-            "'meta',jsonb_build_object('resourceType','Group','created',"
-            "to_char(to_timestamp(g.created_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
-            "'lastModified',to_char(to_timestamp(g.updated_at_ms/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),"
-            "'location','/scim/v2/Groups/'||g.id,'version','W/\"'||g.updated_at_ms::text||'\"')))::text END AS value "
-            "FROM openproof.scim_groups g CROSS JOIN LATERAL (SELECT count(*) AS total,"
-            "COALESCE(jsonb_agg(jsonb_build_object('value',m.identity_id,'$ref','/scim/v2/Users/'||m.identity_id) "
-            "ORDER BY m.identity_id COLLATE \"C\"),'[]'::jsonb) AS members FROM "
-            "(SELECT identity_id FROM openproof.scim_group_members WHERE organization_id=g.organization_id "
-            "AND group_id=g.id ORDER BY identity_id COLLATE \"C\" LIMIT 10001) m) children WHERE g.organization_id=$1";
         Params args{tenant};
-        if (request.selector!=scim::ReadSelector::All) {
-            if (request.selector==scim::ReadSelector::Id)
-                projection+=users?" AND u.identity_id=$2":" AND g.id=$2";
-            else projection+=users?" AND u.user_name=$2":" AND g.display_name=$2";
-            args.push_back(*request.value);
-        }
-        projection+=" ORDER BY sort_name,id LIMIT 10001";
-        const auto sql="WITH projected AS MATERIALIZED ("+projection+"), "
-            "bounds AS (SELECT count(*)<=10000 AND count(value)=count(*) AND "
-            "COALESCE(sum(octet_length(value)),0)<=8380000 AS ok FROM projected) "
-            "SELECT value,updated::text FROM (SELECT sort_name,id,value,updated FROM projected,bounds WHERE ok "
-            "UNION ALL SELECT NULL::text,NULL::text,NULL::text,NULL::bigint FROM bounds WHERE NOT ok) bounded "
-            "ORDER BY sort_name,id";
+        if (request.value) args.push_back(*request.value);
+        const auto sql=scimProjection(users,request.selector);
         const auto rows=co_await execute(sql,std::move(args));
         if (request.selector==scim::ReadSelector::Id && rows.rows.empty())
             co_return foundation::fail(E::NotFound);
@@ -3979,6 +3988,224 @@ CoroutinePostgresCanonicalFinalizer::readScimAsync(enterprise::scim::ReadRequest
         co_return result;
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable,"Native SCIM read is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<enterprise::scim::ReadResult>>
+CoroutinePostgresCanonicalFinalizer::mutateScimAsync(enterprise::scim::MutationRequest request,foundation::Instant now)
+{
+    namespace scim=enterprise::scim;
+    using E=foundation::ErrorCode;
+    using Op=scim::MutationKind;
+    const bool users=request.kind==scim::ReadKind::Users;
+    const bool create=request.operation==Op::Create,remove=request.operation==Op::Remove,
+        patch=request.operation==Op::Patch;
+    const auto valid=[](std::string_view v,std::size_t max) {
+        return !v.empty() && v.size()<=max && std::ranges::none_of(v,[](unsigned char c){return c<32U || c==127U;});
+    };
+    const auto optional=[&](const std::optional<std::string>& v,std::size_t max){return !v || valid(*v,max);};
+    if ((!users && request.kind!=scim::ReadKind::Groups) ||
+        static_cast<unsigned>(request.operation)>static_cast<unsigned>(Op::Remove)
+        || !valid(request.id,256U) || now.time_since_epoch().count()<0
+        || (!remove && !patch && !request.name) || !optional(request.name,users?128U:512U)
+        || !optional(request.externalId,1024U) || !optional(request.displayName,256U)
+        || !optional(request.email,320U) || request.memberChanges.size()>128U
+        || (users && !request.memberChanges.empty()) || (!users && (request.active || request.email || request.displayName)))
+        co_return foundation::fail(E::InvalidArgument);
+    std::size_t totalMembers=0;
+    for (const auto& change:request.memberChanges) {
+        if (static_cast<unsigned>(change.action)>2U || change.members.size()>10000U
+            || totalMembers>10000U-change.members.size()) co_return foundation::fail(E::InvalidArgument);
+        totalMembers+=change.members.size();
+        if (std::ranges::any_of(change.members,[&](const auto& member){return !valid(member.value(),256U);}))
+            co_return foundation::fail(E::InvalidArgument);
+    }
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args){return connection.query(std::move(sql),std::move(args),remaining(deadline));};
+        const std::string tenant{m_impl->organization.value()},id=request.id;
+        std::int64_t timestamp=now.time_since_epoch().count();
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        Params tenantArgs{tenant};
+        const auto org=co_await execute("SELECT id FROM openproof.organizations WHERE id=$1 AND state=0 FOR SHARE",std::move(tenantArgs));
+        if (org.rows.size()!=1U) co_return foundation::fail(E::PermissionDenied);
+        if (users && !create) {
+            Params lockArgs{id};
+            static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",std::move(lockArgs)));
+        }
+        Params targetArgs{tenant,id};
+        const auto current=co_await execute(users?
+            "SELECT u.updated_at_ms,u.user_name,i.status,m.state,"
+            "EXISTS(SELECT 1 FROM openproof.membership_roles r WHERE r.organization_id=u.organization_id AND r.identity_id=u.identity_id AND r.role='owner') "
+            "FROM openproof.scim_users u JOIN openproof.identities i ON i.id=u.identity_id AND i.organization_id=u.organization_id "
+            "JOIN openproof.memberships m ON m.organization_id=u.organization_id AND m.identity_id=u.identity_id "
+            "WHERE u.organization_id=$1 AND u.identity_id=$2 AND i.kind=0 FOR UPDATE OF u,i,m":
+            "SELECT updated_at_ms,display_name FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2 FOR UPDATE",std::move(targetArgs));
+        if (create && !current.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+        if (!create && current.rows.empty()) co_return foundation::fail(E::NotFound);
+        if (!create) {
+            if (current.rows.size()!=1U || current.rows.front().size()!=(users?5U:2U))
+                throw std::runtime_error{"Malformed SCIM target"};
+            const auto previous=milliseconds(current.rows.front()[0]);
+            if (request.expectedVersion && request.expectedVersion->time_since_epoch().count()!=previous)
+                co_return foundation::fail(E::FailedPrecondition);
+            if (previous==std::numeric_limits<std::int64_t>::max()) co_return foundation::fail(E::Unavailable);
+            timestamp=std::max(timestamp,previous+1);
+        }
+        const auto stamp=std::to_string(timestamp);
+        if (request.name && !remove) {
+            Params nameArgs{tenant,*request.name,id};
+            const auto duplicate=co_await execute(users?
+                "SELECT identity_id FROM openproof.scim_users WHERE organization_id=$1 AND user_name=$2 AND identity_id<>$3":
+                "SELECT id FROM openproof.scim_groups WHERE organization_id=$1 AND display_name=$2 AND id<>$3",std::move(nameArgs));
+            if (!duplicate.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+        }
+        if (users) {
+            if (create) {
+                const bool active=request.active.value_or(true);
+                Params identityArgs{id,tenant,active?"0":"1",stamp};
+                const auto inserted=co_await execute(
+                    "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+                    "VALUES($1,$2,0,$3,$4) ON CONFLICT DO NOTHING RETURNING id",std::move(identityArgs));
+                if (inserted.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+                Params memberArgs{tenant,id,active?"1":"2",stamp};
+                static_cast<void>(co_await execute("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,$3,$4)",std::move(memberArgs)));
+                Params profileArgs{id,request.displayName,request.name,request.email,stamp};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.identity_profiles(identity_id,display_name,preferred_username,email,email_verified,created_at_ms,updated_at_ms) "
+                    "VALUES($1,$2,$3,$4,false,$5,$5)",std::move(profileArgs)));
+                Params recordArgs{id,tenant,*request.name,request.externalId,stamp};
+                const auto record=co_await execute(
+                    "INSERT INTO openproof.scim_users(identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms) "
+                    "VALUES($1,$2,$3,$4,$5,$5) ON CONFLICT DO NOTHING RETURNING identity_id",std::move(recordArgs));
+                if (record.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+            } else {
+                const auto& row=current.rows.front();
+                const auto status=milliseconds(row[2]),membership=milliseconds(row[3]);
+                const bool owner=boolean(row[4]);
+                // SCIM may not reactivate locked, terminal or removed identities.
+                if (status>=4 || membership>3 || (!remove && (status==3 || membership==3))
+                    || (request.active.value_or(false) && (status==2 || membership==0)))
+                    co_return foundation::fail(E::FailedPrecondition);
+                const bool disable=remove || (request.active && !*request.active);
+                if (disable && owner && status==0 && membership==1) {
+                    Params survivorArgs{tenant,id};
+                    const auto survivor=co_await execute(
+                        "SELECT m.identity_id FROM openproof.memberships m JOIN openproof.identities i ON i.id=m.identity_id AND i.organization_id=m.organization_id "
+                        "JOIN openproof.membership_roles r ON r.organization_id=m.organization_id AND r.identity_id=m.identity_id AND r.role='owner' "
+                        "WHERE m.organization_id=$1 AND m.identity_id<>$2 AND m.state=1 AND i.status=0 ORDER BY m.identity_id LIMIT 1 FOR UPDATE OF m,i,r",
+                        std::move(survivorArgs));
+                    if (survivor.rows.empty()) co_return foundation::fail(E::FailedPrecondition);
+                }
+                if (remove || request.active) {
+                    // Never downgrade a security lock to a reversible suspension.
+                    const auto nextStatus=remove?3:(*request.active?0:(status==2?2:1));
+                    const auto nextMember=remove?3:(*request.active?1:(membership==0?0:2));
+                    Params stateArgs{tenant,id,std::to_string(nextStatus)};
+                    static_cast<void>(co_await execute("UPDATE openproof.identities SET status=$3 WHERE organization_id=$1 AND id=$2",std::move(stateArgs)));
+                    Params membershipArgs{tenant,id,std::to_string(nextMember)};
+                    static_cast<void>(co_await execute("UPDATE openproof.memberships SET state=$3 WHERE organization_id=$1 AND identity_id=$2",std::move(membershipArgs)));
+                }
+                if (disable) {
+                    Params sessionArgs{id,stamp};
+                    static_cast<void>(co_await execute("UPDATE openproof.sessions SET state=1,revoked_at_ms=$2 WHERE identity_id=$1 AND state=0",std::move(sessionArgs)));
+                    Params familyArgs{id,stamp};
+                    static_cast<void>(co_await execute("UPDATE openproof.oauth_token_families SET revoked_at_ms=$2 WHERE identity_id=$1 AND revoked_at_ms IS NULL",std::move(familyArgs)));
+                }
+                if (remove) {
+                    Params roleArgs{tenant,id};
+                    static_cast<void>(co_await execute("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2",std::move(roleArgs)));
+                    Params groupArgs{tenant,id,stamp};
+                    static_cast<void>(co_await execute(
+                        "UPDATE openproof.scim_groups g SET updated_at_ms=GREATEST(g.updated_at_ms+1,$3::bigint) "
+                        "WHERE g.organization_id=$1 AND EXISTS(SELECT 1 FROM openproof.scim_group_members m WHERE m.organization_id=$1 AND m.group_id=g.id AND m.identity_id=$2)",
+                        std::move(groupArgs)));
+                    Params deleteArgs{tenant,id};
+                    static_cast<void>(co_await execute("DELETE FROM openproof.scim_users WHERE organization_id=$1 AND identity_id=$2",std::move(deleteArgs)));
+                } else {
+                    const std::string name=request.name.value_or(required(row[1]));
+                    if (!valid(name,128U)) co_return foundation::fail(E::InvalidArgument);
+                    Params profileArgs{id,request.displayName,name,request.email,stamp,patch?"true":"false"};
+                    static_cast<void>(co_await execute(
+                        "INSERT INTO openproof.identity_profiles(identity_id,display_name,preferred_username,email,email_verified,created_at_ms,updated_at_ms) "
+                        "VALUES($1,$2,$3,$4,false,$5,$5) ON CONFLICT(identity_id) DO UPDATE SET "
+                        "display_name=CASE WHEN $6::boolean AND EXCLUDED.display_name IS NULL THEN openproof.identity_profiles.display_name ELSE EXCLUDED.display_name END,"
+                        "preferred_username=EXCLUDED.preferred_username,email=COALESCE(EXCLUDED.email,openproof.identity_profiles.email),"
+                        "email_verified=CASE WHEN EXCLUDED.email IS NULL THEN openproof.identity_profiles.email_verified ELSE false END,"
+                        "updated_at_ms=GREATEST(openproof.identity_profiles.updated_at_ms,EXCLUDED.updated_at_ms)",std::move(profileArgs)));
+                    Params metadataArgs{tenant,id,name,request.externalId,stamp,patch?"true":"false"};
+                    static_cast<void>(co_await execute(
+                        "UPDATE openproof.scim_users SET user_name=$3,external_id=CASE WHEN $6::boolean AND $4 IS NULL THEN external_id ELSE $4 END,updated_at_ms=$5 "
+                        "WHERE organization_id=$1 AND identity_id=$2",std::move(metadataArgs)));
+                }
+            }
+        } else if (remove) {
+            Params deleteArgs{tenant,id};
+            static_cast<void>(co_await execute("DELETE FROM openproof.scim_groups WHERE organization_id=$1 AND id=$2",std::move(deleteArgs)));
+        } else {
+            if (create) {
+                Params createArgs{id,tenant,*request.name,request.externalId,stamp};
+                const auto added=co_await execute(
+                    "INSERT INTO openproof.scim_groups(id,organization_id,display_name,external_id,created_at_ms,updated_at_ms) "
+                    "VALUES($1,$2,$3,$4,$5,$5) ON CONFLICT DO NOTHING RETURNING id",std::move(createArgs));
+                if (added.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+            } else {
+                Params metadataArgs{tenant,id,request.name,request.externalId,stamp,patch?"true":"false"};
+                static_cast<void>(co_await execute(
+                    "UPDATE openproof.scim_groups SET display_name=COALESCE($3,display_name),"
+                    "external_id=CASE WHEN $6::boolean AND $4 IS NULL THEN external_id ELSE $4 END,updated_at_ms=$5 "
+                    "WHERE organization_id=$1 AND id=$2",std::move(metadataArgs)));
+            }
+            for (const auto& change:request.memberChanges) {
+                std::vector<std::string> members;
+                for (const auto& member:change.members) members.emplace_back(member.value());
+                std::ranges::sort(members);
+                if (std::ranges::adjacent_find(members)!=members.end()) co_return foundation::fail(E::InvalidArgument);
+                std::string encoded="[";
+                for (const auto& member:members) {
+                    if (encoded.size()>1U) encoded+=",";
+                    encoded+="\""+foundation::escapeJsonString(member)+"\"";
+                }
+                encoded+="]";
+                if (change.action!=scim::MemberAction::Remove) {
+                    Params validationArgs{tenant,encoded};
+                    const auto validMembers=co_await execute(
+                        "SELECT count(*) FROM jsonb_array_elements_text($2::jsonb) v(id) "
+                        "JOIN openproof.scim_users u ON u.organization_id=$1 AND u.identity_id=v.id",std::move(validationArgs));
+                    if (validMembers.rows.size()!=1U || milliseconds(validMembers.rows.front()[0])!=static_cast<std::int64_t>(members.size()))
+                        co_return foundation::fail(E::NotFound);
+                }
+                if (change.action==scim::MemberAction::Replace) {
+                    Params clearArgs{tenant,id};
+                    static_cast<void>(co_await execute("DELETE FROM openproof.scim_group_members WHERE organization_id=$1 AND group_id=$2",std::move(clearArgs)));
+                }
+                Params memberArgs{tenant,id,encoded};
+                if (change.action==scim::MemberAction::Remove)
+                    static_cast<void>(co_await execute(
+                        "DELETE FROM openproof.scim_group_members WHERE organization_id=$1 AND group_id=$2 "
+                        "AND identity_id IN(SELECT jsonb_array_elements_text($3::jsonb))",std::move(memberArgs)));
+                else
+                    static_cast<void>(co_await execute(
+                        "INSERT INTO openproof.scim_group_members(organization_id,group_id,identity_id) "
+                        "SELECT $1,$2,v.id FROM jsonb_array_elements_text($3::jsonb) v(id) ON CONFLICT DO NOTHING",std::move(memberArgs)));
+            }
+        }
+        scim::ReadResult result;
+        if (!remove) {
+            Params resultArgs{tenant,id};
+            const auto projected=co_await execute(scimProjection(users,scim::ReadSelector::Id),std::move(resultArgs));
+            if (projected.rows.size()!=1U || projected.rows.front().size()!=2U || !projected.rows.front()[0])
+                co_return foundation::fail(E::Unavailable);
+            result.rows.push_back(scim::ReadRow{required(projected.rows.front()[0]),
+                foundation::Instant{foundation::Duration{milliseconds(projected.rows.front()[1])}}});
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native SCIM mutation is unavailable.");
     }
 }
 

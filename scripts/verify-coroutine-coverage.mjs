@@ -321,7 +321,7 @@ const checked = segments.map(([name, relative]) => {
       && /auto nativeTrust = trust;/.test(app)
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
-      && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
+      && /runWithEvidence\(enterpriseApi, enterpriseApi\)/.test(app)
       // Exact paths must be added ONLY for enabled LDAP configuration.
       // An independent Web3 opt-in must not expose an unconfigured directory.
       && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)

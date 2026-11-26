@@ -134,6 +134,25 @@ struct ReadResult final {
     std::vector<ReadRow> rows;
 };
 
+enum class MutationKind { Create, Replace, Patch, Remove };
+enum class MemberAction { Replace, Add, Remove };
+struct MemberChange final {
+    MemberAction action;
+    std::vector<identity::core::IdentityId> members;
+};
+struct MutationRequest final {
+    ReadKind kind;
+    MutationKind operation;
+    std::string id;
+    std::optional<foundation::Instant> expectedVersion;
+    std::optional<std::string> name;
+    std::optional<std::string> externalId;
+    std::optional<bool> active;
+    std::optional<std::string> displayName;
+    std::optional<std::string> email;
+    std::vector<MemberChange> memberChanges;
+};
+
 struct UserView final {
     UserRecord record;
     identity::core::IdentityStatus status{identity::core::IdentityStatus::Active};

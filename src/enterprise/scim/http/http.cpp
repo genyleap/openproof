@@ -1,6 +1,7 @@
 module;
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -747,6 +748,137 @@ gateway::HttpResponse renderReadResult(const ReadRequest& request,ReadResult res
     }
     const auto total=resources.size();
     return scimResponse(200,listResponse(std::move(resources),total));
+}
+
+foundation::Result<MutationRequest> parseMutationRequest(const gateway::HttpRequest& request)
+{
+    using E=foundation::ErrorCode;
+    using Op=MutationKind;
+    constexpr std::string_view users="/scim/v2/Users",groups="/scim/v2/Groups";
+    const auto path=request.path();
+    const bool user=path==users || path.starts_with("/scim/v2/Users/");
+    if (!user && path!=groups && !path.starts_with("/scim/v2/Groups/")) return foundation::fail(E::NotFound);
+    const auto base=user?users:groups;
+    const auto method=request.method();
+    const bool collection=path==base;
+    if ((collection && method!=gateway::HttpMethod::Post) ||
+        (!collection && method!=gateway::HttpMethod::Put && method!=gateway::HttpMethod::Patch && method!=gateway::HttpMethod::Delete))
+        return foundation::fail(E::NotFound);
+    const auto op=collection?Op::Create:method==gateway::HttpMethod::Put?Op::Replace:
+        method==gateway::HttpMethod::Patch?Op::Patch:Op::Remove;
+    MutationRequest command{user?ReadKind::Users:ReadKind::Groups,op,{},std::nullopt,
+        std::nullopt,std::nullopt,std::nullopt,std::nullopt,std::nullopt,{}};
+    if (collection) {
+        auto random=security::randomTokenBase64Url(24U);
+        if (!random) return foundation::fail(random.error());
+        command.id=(user?"scim_":"scim_group_")+random.value();
+    } else {
+        auto id=path.substr(base.size()+1U);
+        if (id.empty() || id.size()>256U || id.contains('/')) return foundation::fail(E::InvalidArgument);
+        command.id=std::string{id};
+        if (const auto tag=request.header("if-match");tag && *tag!="*") {
+            if (!tag->starts_with("W/\"") || !tag->ends_with('"') || tag->size()<5U)
+                return foundation::fail(E::FailedPrecondition);
+            auto number=tag->substr(3U,tag->size()-4U);
+            std::int64_t version{};
+            const auto [end,error]=std::from_chars(number.data(),number.data()+number.size(),version);
+            if (error!=std::errc{} || end!=number.data()+number.size() || version<0 ||
+                versionTag(foundation::Instant{foundation::Duration{version}})!=*tag)
+                return foundation::fail(E::FailedPrecondition);
+            command.expectedVersion=foundation::Instant{foundation::Duration{version}};
+        }
+    }
+    if (op==Op::Remove) return command;
+    auto parsed=parseObject(request);
+    if (!parsed) return foundation::fail(parsed.error());
+    const auto& body=parsed.value();
+    const auto assign=[&](const json::object& object,bool partial)->foundation::Status {
+        auto name=optionalString(object,user?"userName":"displayName",user?320U:512U);
+        auto external=optionalString(object,"externalId",1024U);
+        if (!name || !external || (!partial && !name->has_value())) return foundation::fail(E::InvalidArgument);
+        if (name->has_value()) command.name=std::move(name).value();
+        if (external->has_value()) command.externalId=std::move(external).value();
+        if (user) {
+            auto display=optionalString(object,"displayName",512U);
+            auto email=primaryEmail(object);
+            auto active=booleanValue(object,"active",true);
+            if (!display || !email || !active) return foundation::fail(E::InvalidArgument);
+            if (display->has_value()) command.displayName=std::move(display).value();
+            if (email->has_value()) command.email=std::move(email).value();
+            if (!partial || (object.if_contains("active") && !object.at("active").is_null()))
+                command.active=active.value();
+        } else {
+            auto groupMembers=members(object);
+            if (!groupMembers) return foundation::fail(groupMembers.error());
+            if (!partial || object.if_contains("members"))
+                command.memberChanges.push_back(MemberChange{MemberAction::Replace,std::move(groupMembers).value()});
+        }
+        return foundation::ok();
+    };
+    if (op!=Op::Patch) {
+        auto status=assign(body,false);
+        if (!status) return foundation::fail(status.error());
+        return command;
+    }
+    const auto* operations=body.if_contains("Operations");
+    if (!containsSchema(body.if_contains("schemas"),kPatchSchema) || !operations || !operations->is_array()
+        || operations->as_array().empty() || operations->as_array().size()>128U) return foundation::fail(E::InvalidArgument);
+    for (const auto& item:operations->as_array()) {
+        if (!item.is_object()) return foundation::fail(E::InvalidArgument);
+        const auto& operation=item.as_object();
+        auto action=requiredString(operation,"op",16U);
+        auto field=optionalString(operation,"path",256U);
+        if (!action || !field) return foundation::fail(E::InvalidArgument);
+        const bool replace=action.value()=="replace" || action.value()=="Replace";
+        const bool add=action.value()=="add" || action.value()=="Add";
+        const bool remove=action.value()=="remove" || action.value()=="Remove";
+        const auto* value=operation.if_contains("value");
+        if (user && replace && !field->has_value() && value && value->is_object()) {
+            auto status=assign(value->as_object(),true);
+            if (!status) return foundation::fail(status.error());
+            continue;
+        }
+        if (!field->has_value()) return foundation::fail(E::InvalidArgument);
+        const auto& name=field->value();
+        if (replace && value && value->is_string() && (name=="externalId" || name=="displayName" || (user && name=="userName"))) {
+            const std::string content{value->as_string()};
+            if (name=="externalId") command.externalId=content;
+            else if (user && name=="displayName") command.displayName=content;
+            else command.name=content;
+        } else if (user && replace && name=="active" && value && value->is_bool()) {
+            command.active=value->as_bool();
+        } else if (!user && (replace || add) && name=="members" && value && value->is_array()) {
+            json::object wrapper;wrapper["members"]=*value;
+            auto parsedMembers=members(wrapper);
+            if (!parsedMembers) return foundation::fail(parsedMembers.error());
+            command.memberChanges.push_back(MemberChange{replace?MemberAction::Replace:MemberAction::Add,std::move(parsedMembers).value()});
+        } else if (!user && remove && name.starts_with("members[value eq \"") && name.ends_with("\"]")) {
+            auto member=std::string_view{name};
+            member.remove_prefix(std::string_view{"members[value eq \""}.size());
+            member.remove_suffix(2U);
+            if (member.empty() || member.contains('"') || member.contains('\\')) return foundation::fail(E::InvalidArgument);
+            command.memberChanges.push_back(MemberChange{MemberAction::Remove,{identity::core::IdentityId{std::string{member}}}});
+        } else return foundation::fail(E::InvalidArgument);
+    }
+    return command;
+}
+
+gateway::HttpResponse renderMutationResult(const MutationRequest& request,ReadResult result)
+{
+    if (request.operation==MutationKind::Remove) {
+        gateway::HttpResponse response{204,{},{}};
+        secure(response);
+        return response;
+    }
+    if (result.rows.size()!=1U) return renderScimError(foundation::Error{foundation::ErrorCode::Unavailable});
+    boost::system::error_code ec;
+    auto value=json::parse(result.rows.front().json,ec);
+    if (ec || !value.is_object()) return renderScimError(foundation::Error{foundation::ErrorCode::Unavailable});
+    const bool created=request.operation==MutationKind::Create;
+    auto response=scimResponse(created?201:200,std::move(value));
+    response.setHeader("etag",versionTag(result.rows.front().updatedAt));
+    if (created) response.setHeader("location",std::string{request.kind==ReadKind::Users?"/scim/v2/Users/":"/scim/v2/Groups/"}+request.id);
+    return response;
 }
 
 } // namespace openproof::enterprise::scim::http

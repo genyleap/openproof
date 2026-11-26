@@ -1184,11 +1184,21 @@ profile and group membership. It preserves SCIM JSON, ETags and
 discovery responses. Results beyond 10,000 resources/members or the
 8,380,000-byte aggregate projection budget fail closed rather than
 silently truncating. Existing list behavior is preserved; pagination
-is not introduced by this migration. Mutations remain on the compatibility
-worker until their atomic transaction boundaries are migrated.
+is not introduced by this migration. User creation, replacement, patch
+and removal, group creation/replacement/patch/removal and member changes
+now use native transactions. Provisioning commits identity, membership,
+profile and SCIM metadata together. Writes check If-Match inside the
+locked transaction; versions advance monotonically even for same-tick
+updates. Deactivation revokes first-party sessions and OAuth token
+families; removed or security-locked identities cannot be reactivated
+by SCIM, and the last active tenant owner is protected. Removing a SCIM
+user removes its group membership and advances the affected group ETags.
+Group additions are idempotent; membership validation and mutation are
+atomic. The synchronous SCIM service and directory repository are no
+longer constructed by the server.
 
-The remaining PostgreSQL compatibility surfaces include evidence/trust
-and enabled SCIM mutations, as well as startup and offline administration.
+The remaining PostgreSQL compatibility surfaces include evidence/trust,
+as well as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

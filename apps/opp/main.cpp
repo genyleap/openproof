@@ -2877,10 +2877,6 @@ addProtectedRoutes(gateway::Router& router,
     }
     trustModel::TrustEngine evidenceTrust{identityProviderStore, clock, std::move(evidenceTrustPolicy)};
 
-    postgres::PostgresScimDirectoryRepository scimDirectory{*pool.value()};
-    scim::Service scimService{
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        scimDirectory, identities, identityProviderStore, memberships, clock};
     std::optional<fnd::SecretString> scimBearerToken;
     if (auto configuredScimToken = environment.get("OPENPROOF_SCIM_BEARER_TOKEN");
         configuredScimToken && !configuredScimToken->empty()) {
@@ -3536,16 +3532,20 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/passkey/verify");
         }
         std::unique_ptr<scimHttp::CoroutineReadAdapter> nativeScimRead;
-        std::vector<std::pair<std::string,gateway::HttpMethod>> strictMethodPrefixes;
+        std::vector<std::string> strictNativePrefixes;
+        if (passkeyConfig) strictNativePrefixes.emplace_back("/account/passkeys/");
         if (scimBearerToken) {
             nativeScimRead=std::make_unique<scimHttp::CoroutineReadAdapter>(
                 *nativeHandler,limiter.value(),scimBearerToken->clone(),
                 [reader=nativeCanonical.get()](scim::ReadRequest request) {
                     return reader->readScimAsync(std::move(request));
+                },
+                [reader=nativeCanonical.get(),&clock](scim::MutationRequest request) {
+                    return reader->mutateScimAsync(std::move(request),clock.now());
                 });
             nativeHandler=nativeScimRead.get();
             nativePaths.emplace_back("/scim/v2");
-            strictMethodPrefixes.emplace_back("/scim/v2/",gateway::HttpMethod::Get);
+            strictNativePrefixes.emplace_back("/scim/v2/");
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
@@ -3553,8 +3553,7 @@ addProtectedRoutes(gateway::Router& router,
         nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             evidenceApi, nativeHealth, std::move(nativePaths),
-            std::move(nativeMethods),passkeyConfig?std::vector<std::string>{"/account/passkeys/"}:std::vector<std::string>{},
-            std::move(strictMethodPrefixes)};
+            std::move(nativeMethods),std::move(strictNativePrefixes)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3626,15 +3625,6 @@ addProtectedRoutes(gateway::Router& router,
         return runListener(platform, nativeRoutes, logger);
     };
 
-    const auto runWithScim = [&](
-        gateway::HttpHandler& fallback,
-        gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
-        if (!scimBearerToken) return runWithEvidence(fallback, nativeEnterprise);
-        scimHttp::Api scimApi{
-            scimService, scimBearerToken->clone(), limiter.value(), fallback};
-        return runWithEvidence(scimApi, nativeEnterprise);
-    };
-
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             nativeAuthentication ? *nativeAuthentication : authentication,
@@ -3653,9 +3643,9 @@ addProtectedRoutes(gateway::Router& router,
                     *nativeAuthentication, providers, sessions, limiter.value(),
                     localEnterpriseApi, nullptr, nativeSessions.get(),
                     authenticateNativeWeb3};
-                return runWithScim(enterpriseApi, localWeb3Api);
+                return runWithEvidence(enterpriseApi, localWeb3Api);
             }
-            return runWithScim(enterpriseApi, localEnterpriseApi);
+            return runWithEvidence(enterpriseApi, localEnterpriseApi);
         }
         if (nativeWeb3Enabled) {
             // Compose native Web3 ABOVE the native LDAP adapter. Its guarded
@@ -3666,9 +3656,9 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeAuthentication, providers, sessions, limiter.value(),
                 enterpriseApi, nullptr, nativeSessions.get(),
                 authenticateNativeWeb3};
-            return runWithScim(enterpriseApi, nativeWeb3Api);
+            return runWithEvidence(enterpriseApi, nativeWeb3Api);
         }
-        return runWithScim(enterpriseApi, enterpriseApi);
+        return runWithEvidence(enterpriseApi, enterpriseApi);
     };
 
     const auto runWithWeb3 = [&](gateway::HttpHandler& fallback,

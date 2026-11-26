@@ -14,7 +14,7 @@ test("passkey account operations use native first-party authentication",()=>{
   assert.match(http,/r.path\(\)=="\/account\/passkeys" && r.method\(\)==Method::Get/);
   assert.match(http,/r.path\(\)=="\/account\/passkeys\/options" && r.method\(\)==Method::Post/);
   assert.match(app,/nativePaths.emplace_back\("\/account\/passkeys"\)/);
-  assert.match(app,/passkeyConfig\?std::vector<std::string>\{"\/account\/passkeys\/"\}/);
+  assert.match(app,/if \(passkeyConfig\) strictNativePrefixes.emplace_back\("\/account\/passkeys\/"\)/);
   assert.match(app,/reader->readPasskeyAccountAsync/);
   assert.match(http,/starts_with\("DPoP "\)/);
   assert.match(http,/origin && \*origin!=m_config->origin\(\)/);

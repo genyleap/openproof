@@ -820,6 +820,120 @@ TEST(PostgresCanonicalCoroutineTest, NativeScimReadsPreserveTenantAndCanonicalSt
     EXPECT_EQ(disabled.error().code(),fnd::ErrorCode::PermissionDenied);
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeScimMutationsAreAtomicAndVersioned)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace scim=openproof::enterprise::scim;
+    using Op=scim::MutationKind;
+    using Kind=scim::ReadKind;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto command=[](Kind kind,Op op,std::string id) {
+        return scim::MutationRequest{kind,op,std::move(id),std::nullopt,
+            std::nullopt,std::nullopt,std::nullopt,std::nullopt,std::nullopt,{}};
+    };
+    const auto run=[&](scim::MutationRequest input) {
+        io.restart();
+        auto done=asio::co_spawn(io,native.mutateScimAsync(std::move(input),kNow+1s),asio::use_future);
+        io.run();return done.get();
+    };
+    const auto user="scim-user-"+seed.suffix,second=user+"-2",group="scim-group-"+seed.suffix;
+    auto create=command(Kind::Users,Op::Create,user);
+    create.name="fixture-user";create.displayName="Fixture User";create.email="fixture@example.invalid";
+    auto created=run(create);
+    ASSERT_TRUE(created && created->rows.size()==1U);
+    EXPECT_EQ(created->rows.front().updatedAt,kNow+1s);
+    auto duplicate=create;duplicate.id=second;
+    auto denied=run(duplicate);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(),fnd::ErrorCode::AlreadyExists);
+    const auto missing=execute(fixture.get(),"SELECT count(*)::text FROM openproof.identities WHERE id=$1",{second});
+    EXPECT_STREQ(PQgetvalue(missing.get(),0,0),"0");
+    duplicate.name="fixture-second";
+    ASSERT_TRUE(run(duplicate));
+    EXPECT_FALSE(run(command(Kind::Users,Op::Remove,seed.owner)));
+    EXPECT_FALSE(run(command(Kind::Users,Op::Remove,seed.foreignOwner)));
+    auto newGroup=command(Kind::Groups,Op::Create,group);
+    newGroup.name="Fixture Group";
+    newGroup.memberChanges.push_back({scim::MemberAction::Replace,{ids::IdentityId{seed.foreignOwner}}});
+    EXPECT_FALSE(run(newGroup));
+    const auto absent=execute(fixture.get(),"SELECT count(*)::text FROM openproof.scim_groups WHERE id=$1",{group});
+    EXPECT_STREQ(PQgetvalue(absent.get(),0,0),"0");
+    newGroup.memberChanges.front().members={ids::IdentityId{user}};
+    auto added=run(newGroup);
+    ASSERT_TRUE(added && added->rows.size()==1U);
+    auto groupPatch=command(Kind::Groups,Op::Patch,group);
+    groupPatch.expectedVersion=added->rows.front().updatedAt;
+    groupPatch.memberChanges.push_back({scim::MemberAction::Add,{ids::IdentityId{second}}});
+    auto modified=run(groupPatch);
+    ASSERT_TRUE(modified && modified->rows.size()==1U);
+    EXPECT_NE(modified->rows.front().json.find(second),std::string::npos);
+    EXPECT_GT(modified->rows.front().updatedAt,added->rows.front().updatedAt);
+    auto stale=run(groupPatch);
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto groupRemove=command(Kind::Groups,Op::Patch,group);
+    groupRemove.memberChanges.push_back({scim::MemberAction::Remove,{ids::IdentityId{second}}});
+    auto reduced=run(groupRemove);
+    ASSERT_TRUE(reduced && reduced->rows.size()==1U);
+    EXPECT_EQ(reduced->rows.front().json.find(second),std::string::npos);
+    const auto session="scim-session-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(session).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {session,user,digest})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",{seed.org,user})));
+    auto disable=command(Kind::Users,Op::Patch,user);
+    disable.active=false;
+    auto protectedOwner=run(disable);
+    ASSERT_FALSE(protectedOwner);
+    EXPECT_EQ(protectedOwner.error().code(),fnd::ErrorCode::FailedPrecondition);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",{seed.org,second})));
+    auto disabled=run(disable);
+    ASSERT_TRUE(disabled && disabled->rows.size()==1U);
+    EXPECT_NE(disabled->rows.front().json.find("false"),std::string::npos);
+    const auto sessionState=execute(fixture.get(),"SELECT state::text FROM openproof.sessions WHERE id=$1",{session});
+    EXPECT_STREQ(PQgetvalue(sessionState.get(),0,0),"1");
+    disable.active=true;
+    ASSERT_TRUE(run(disable));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),"UPDATE openproof.identities SET status=2 WHERE id=$1",{user})));
+    EXPECT_FALSE(run(disable));
+    disable.active=false;
+    ASSERT_TRUE(run(disable));
+    disable.active=true;
+    EXPECT_FALSE(run(disable));
+    ASSERT_TRUE(run(command(Kind::Users,Op::Remove,user)));
+    const auto retired=execute(fixture.get(),
+        "SELECT i.status::text,m.state::text,(SELECT count(*) FROM openproof.scim_users WHERE identity_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.scim_group_members WHERE identity_id=$1)::text "
+        "FROM openproof.identities i JOIN openproof.memberships m ON m.identity_id=i.id WHERE i.id=$1",{user});
+    ASSERT_EQ(PQntuples(retired.get()),1);
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,0),"3");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,1),"3");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,2),"0");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,3),"0");
+    EXPECT_FALSE(run(disable));
+    auto oldGroupDelete=command(Kind::Groups,Op::Remove,group);
+    oldGroupDelete.expectedVersion=reduced->rows.front().updatedAt;
+    EXPECT_FALSE(run(oldGroupDelete));
+    ASSERT_TRUE(run(command(Kind::Groups,Op::Remove,group)));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChallengeAreSessionBound)
 {
     const auto dsn=disposableDsn();

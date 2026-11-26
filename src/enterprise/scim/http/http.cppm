@@ -14,6 +14,8 @@ export namespace openproof::enterprise::scim::http {
 // Shared wire helpers for the native read path. No repository calls.
 [[nodiscard]] foundation::Result<ReadRequest> parseReadRequest(const gateway::HttpRequest& request);
 [[nodiscard]] gateway::HttpResponse renderReadResult(const ReadRequest& request,ReadResult result);
+[[nodiscard]] foundation::Result<MutationRequest> parseMutationRequest(const gateway::HttpRequest& request);
+[[nodiscard]] gateway::HttpResponse renderMutationResult(const MutationRequest& request,ReadResult result);
 [[nodiscard]] gateway::HttpResponse renderScimError(const foundation::Error& failure);
 [[nodiscard]] std::optional<gateway::HttpResponse> renderDiscovery(const gateway::HttpRequest& request);
 
