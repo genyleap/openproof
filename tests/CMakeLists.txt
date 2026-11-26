@@ -269,7 +269,7 @@ set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
     openproof_postgres_async_http openproof_postgres_async_repository
-    openproof_storage_postgres openproof_session openproof_foundation
+    openproof_postgres_async_startup openproof_session openproof_foundation
     Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 # GCC 16's inlined Boost.Asio aligned coroutine-frame allocator produces a
 # false-positive mismatched-new-delete diagnostic inside large TEST bodies.
@@ -621,7 +621,7 @@ target_include_directories(openproof_postgres_network_tests BEFORE PRIVATE
 target_link_libraries(openproof_postgres_network_tests PRIVATE
     openproof_postgres_async_listener
     openproof_postgres_async_http openproof_postgres_async_repository
-    openproof_gateway_http openproof_gateway openproof_storage_postgres
+    openproof_gateway_http openproof_gateway
     openproof_session openproof_foundation openproof_security
     Boost::headers OpenProof::libpq GTest::gtest_main
     openproof_test_compile_options)

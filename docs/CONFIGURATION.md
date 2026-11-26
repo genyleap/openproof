@@ -1262,8 +1262,15 @@ to have already been issued. All database-backed CLI commands and the
 server listener are now composed without the legacy PostgreSQL module.
 The compatibility implementation remains for regression tests; the
 strict storage gate is unchanged and remains open until that code is
-retired. Native C++ build and PostgreSQL integration are required before
-release.
+retired. Schema tests now run the native migrator for both historical
+upgrades and concurrent/failed migration batches. The native session
+domain and network test binaries no longer link the legacy module;
+the session database fixture uses a historical row and independent
+native pools. Federation state, authorization audit and refresh
+rotation/revocation regressions also exercise independent native
+instances. The remaining legacy-dependent tests are retained until
+their security assertions can be migrated. Native C++ build and
+PostgreSQL integration are required before release.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must
 also pass.

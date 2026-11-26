@@ -86,7 +86,7 @@ test("native revocation binds caller and tenant, serializes family mutation and 
   assert.ok(rotate.indexOf("!PQgetisnull(familyLock.get(),0,1)")<rotate.indexOf("INSERT INTO openproof.oauth_access_tokens"));
   const revoke=pg.slice(pg.indexOf("PostgresIdentityProviderStore::revokeToken("));
   assert.equal((revoke.match(/FOR UPDATE OF f/g)??[]).length,2);
-  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Race native family revocation against the still-legacy rotation/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/co_spawn\(io,peer.rotateOAuthRefreshAsync[\s\S]*?co_spawn\(io,native.revokeOAuthTokenAsync/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/another client's token: no-op/);
 });
 test("native refresh uses grant-scoped routing, durable proof and atomic family rotation",()=>{

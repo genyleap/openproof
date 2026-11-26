@@ -1760,7 +1760,7 @@ asio::awaitable<bool> concurrentConnectionRead(
         && linked->second.empty() == emptyExpected;
 }
 
-TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFederationState)
+TEST(PostgresCanonicalCoroutineTest, IndependentNativeTransactionsShareOneTimeFederationState)
 {
     const auto dsn=disposableDsn();
     if (!dsn) {
@@ -1770,12 +1770,9 @@ TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFede
         GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
     }
     using namespace std::chrono_literals;
-    auto config=pg::PoolConfig::create(fnd::SecretString{*dsn},1U,500ms);
-    ASSERT_TRUE(config);
-    auto pool=pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(pool);
-    pg::PostgresAuthenticationTransactionStore legacy{*pool.value()};
     asio::io_context io;
+    pg::CoroutinePostgresAuthenticationTransactionStore peer{
+        io.get_executor(),fnd::SecretString{*dsn},1U,500ms,1000ms,2000ms};
     pg::CoroutinePostgresAuthenticationTransactionStore native{
         io.get_executor(),fnd::SecretString{*dsn},2U,500ms,1000ms,2000ms};
     const Seed seed;
@@ -1802,28 +1799,28 @@ TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFede
         return std::move(result.value());
     };
     const auto first="legacy-to-native-"+seed.suffix;
-    ASSERT_TRUE(legacy.begin(pending(first)));
+    ASSERT_TRUE(run(peer.beginAsync(pending(first))));
     auto redeemed=run(native.consumeAsync(idp::TransactionId{first},nonce.clone(),binding,kNow+1s));
     ASSERT_TRUE(redeemed);
     EXPECT_EQ(redeemed->provider().value(),"fixture-provider");
     EXPECT_EQ(redeemed->metadata().at("challenge_id"),"fixture-challenge");
     EXPECT_EQ(redeemed->metadata().at("connection_identity"),seed.owner);
     EXPECT_EQ(redeemed->metadata().at("requested_assurance"),"1");
-    EXPECT_FALSE(legacy.consume(idp::TransactionId{first},nonce,binding,kNow+2s));
+    EXPECT_FALSE(run(peer.consumeAsync(idp::TransactionId{first},nonce.clone(),binding,kNow+2s)));
     const auto second="native-to-legacy-"+seed.suffix;
     ASSERT_TRUE(run(native.beginAsync(pending(second))));
-    auto legacyRedeemed=legacy.consume(idp::TransactionId{second},nonce,binding,kNow+1s);
+    auto legacyRedeemed=run(peer.consumeAsync(idp::TransactionId{second},nonce.clone(),binding,kNow+1s));
     ASSERT_TRUE(legacyRedeemed);
     EXPECT_EQ(legacyRedeemed->metadata().at("connection_identity"),seed.owner);
     EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{second},nonce.clone(),binding,kNow+2s)));
     const auto third="cross-store-burn-"+seed.suffix;
-    ASSERT_TRUE(legacy.begin(pending(third)));
+    ASSERT_TRUE(run(peer.beginAsync(pending(third))));
     EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{third},nonce.clone(),
         idp::BindingDigest{},kNow+1s)));
-    EXPECT_FALSE(legacy.consume(idp::TransactionId{third},nonce,binding,kNow+2s));
+    EXPECT_FALSE(run(peer.consumeAsync(idp::TransactionId{third},nonce.clone(),binding,kNow+2s)));
 }
 
-TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAndRollsBack)
+TEST(PostgresCanonicalCoroutineTest, IndependentNativeAuthorizationAuditSharesChainAndRollsBack)
 {
     const auto dsn = disposableDsn();
     if (!dsn) {
@@ -1849,12 +1846,10 @@ TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAn
     const auto makeKey = [] {
         return aud::AuditKey::create(fnd::SecretString{std::string(32U, 'A')}).value();
     };
-    auto config = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
-    ASSERT_TRUE(config);
-    auto legacyPool = pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(legacyPool);
-    pg::PostgresAuthorizationDecisionSink legacy{*legacyPool.value(), makeKey(), clock};
     asio::io_context io;
+    pg::CoroutineAuthorizationDecisionSink peer{
+        io.get_executor(), fnd::SecretString{*dsn}, makeKey(), clock,
+        1U, 500ms, 1000ms, 2000ms};
     pg::CoroutineAuthorizationDecisionSink native{
         io.get_executor(), fnd::SecretString{*dsn}, makeKey(), clock,
         2U, 500ms, 1000ms, 2000ms};
@@ -1862,22 +1857,21 @@ TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAn
     const pol::Action action{"protected.read"};
     const pol::Resource resource{"protected-resource"};
     const auto denial = pol::AuthorizationDecision::deny("fixture policy denied");
-    const auto record = [&](const std::string& correlation) {
+    const auto recordOn = [&](pg::CoroutineAuthorizationDecisionSink& sink,const std::string& correlation) {
         io.restart();
-        auto completion = asio::co_spawn(io, native.recordAsync(
+        auto completion = asio::co_spawn(io, sink.recordAsync(
             authenticated.value(), tenant, action, resource, denial,
             fnd::CorrelationId{correlation}), asio::use_future);
         io.run();
         return completion.get();
     };
-    const std::string first = "legacy-audit-" + seed.suffix;
+    const auto record=[&](const std::string& correlation){return recordOn(native,correlation);};
+    const std::string first = "peer-audit-" + seed.suffix;
     const std::string second = "native-audit-" + seed.suffix;
     const std::string third = "legacy-tail-" + seed.suffix;
-    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
-        denial, fnd::CorrelationId{first}));
+    ASSERT_TRUE(recordOn(peer,first));
     ASSERT_TRUE(record(second));
-    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
-        denial, fnd::CorrelationId{third}));
+    ASSERT_TRUE(recordOn(peer,third));
     auto chain = execute(fixture.get(),
         "SELECT a.sequence,a.event_id,a.correlation_id,encode(a.previous_hash,'hex'),"
         "encode(a.event_hash,'hex'),o.payload->>'type',o.payload->>'identity_id',"
@@ -2265,27 +2259,18 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         "SELECT (revoked_at_ms IS NULL)::text FROM openproof.oauth_token_families WHERE id=$1",{family});
     ASSERT_EQ(PQntuples(liveFamily.get()),1);
     EXPECT_STREQ(PQgetvalue(liveFamily.get(),0,0),"true");
-    // Race native family revocation against the still-legacy rotation.
-    // Both possible orders must leave no live successor after revocation.
-    namespace tok=openproof::token;
-    namespace cli=openproof::client;
-    auto config=pg::PoolConfig::create(fnd::SecretString{*dsn},1U,500ms);
-    ASSERT_TRUE(config);
-    auto pool=pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(pool);
-    pg::PostgresIdentityProviderStore legacy{*pool.value()};
-    const tok::TokenContext tokenContext{cli::ClientId{client},ids::IdentityId{seed.owner},
-        idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
-        idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},{"account"},kNow};
-    const tok::TokenFamilyId familyId{family};
-    const auto nextAccess=tok::TokenDigest{openproof::security::sha256(family+"-next-access").value()};
-    const auto nextRefresh=tok::TokenDigest{openproof::security::sha256(family+"-next-refresh").value()};
-    auto rotate=std::async(std::launch::async,[&] {
-        return legacy.rotateRefresh(tok::TokenDigest{refreshDigest},kNow+1s,
-            tok::AccessTokenRecord{nextAccess,familyId,tokenContext,kNow+1s,kNow+30s},
-            tok::RefreshTokenRecord{nextRefresh,familyId,1U,tokenContext,kNow+1s,kNow+60s});
-    });
-    const auto revoked=revoke(native,client,std::nullopt,refreshHex);
+    // Race two independent native storage instances. Both possible orders
+    // must leave no live successor after revocation.
+    pg::CoroutinePostgresCanonicalFinalizer peer{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},1U,500ms,1000ms,3000ms};
+    const auto nextAccess=fnd::toHex(openproof::security::sha256(family+"-next-access").value());
+    const auto nextRefresh=fnd::toHex(openproof::security::sha256(family+"-next-refresh").value());
+    io.restart();
+    auto rotate=asio::co_spawn(io,peer.rotateOAuthRefreshAsync(client,std::nullopt,refreshHex,
+        nextAccess,nextRefresh,std::nullopt,kNow+1s,30s),asio::use_future);
+    auto revokeRace=asio::co_spawn(io,native.revokeOAuthTokenAsync(client,std::nullopt,refreshHex,kNow+1s),asio::use_future);
+    io.run();
+    const auto revoked=revokeRace.get();
     const auto rotated=rotate.get();
     ASSERT_TRUE(revoked);
     if (!rotated) {

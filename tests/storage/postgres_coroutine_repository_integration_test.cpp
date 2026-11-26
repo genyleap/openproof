@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "coroutine_session_repository.hpp"
+#include "coroutine_startup.hpp"
 
 import openproof.authentication;
 import openproof.foundation;
@@ -28,7 +29,7 @@ import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
 import openproof.session;
-import openproof.storage.postgres;
+
 
 namespace {
 namespace asio = boost::asio;
@@ -723,13 +724,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
                         .starts_with("/tmp/pg_virtualenv."));
     }
 
-    auto config = pg::PoolConfig::create(
-        fnd::SecretString{uri}, 2U, 2s);
-    ASSERT_TRUE(config);
-    auto syncPool = pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(syncPool);
-    pg::Migrator migrator{*syncPool.value()};
-    auto migration = migrator.applyDirectory(
+    auto migration = pg::migrateSchemaBeforeListener(fnd::SecretString{uri},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(migration);
     ASSERT_NO_THROW(seedOrganizationAndIdentities(uri));
@@ -751,13 +746,33 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(results.identityScoped);
     EXPECT_TRUE(results.purged);
 
-    // Migration compatibility is bidirectional: a session written by the
-    // deployed synchronous repository must still be valid to the new
-    // nonblocking repository, and a revoke by the new path must be visible
-    // immediately to the old one. All changes stay in this disposable DB.
-    pg::PostgresSessionRepository legacy{*syncPool.value()};
-    ASSERT_TRUE(legacy.add(
-        createSession("legacy-interop", "coroutine-user-a", 0x51)));
+    // Seed the historical on-disk session layout directly, rather than
+    // depending on the removed production repository. Exercise cross-node
+    // visibility through independently owned native pools.
+    std::unique_ptr<PGconn,PqDeleter> fixture{PQconnectdb(uri)};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    std::unique_ptr<PGresult,PqResultDeleter> historical{PQexec(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES('legacy-interop','coroutine-user-a','test-oidc',2,3,false,0,decode(repeat('51',32),'hex'),"
+        "1770000000000,1770000000000,1770000000000,1770007200000,900000)")};
+    ASSERT_TRUE(historical && PQresultStatus(historical.get())==PGRES_COMMAND_OK);
+    pg::CoroutinePostgresSessionRepository peer{
+        io.get_executor(),fnd::SecretString{uri},1U,2s,2s,4s};
+    const auto run=[&]<typename T>(asio::awaitable<T> task){
+        io.restart();
+        std::optional<T> output;
+        const auto capture=[](asio::awaitable<T> operation,std::optional<T>& result)->asio::awaitable<void>{
+            result.emplace(co_await std::move(operation));
+        };
+        auto done=asio::co_spawn(io,capture(std::move(task),output),asio::use_future);
+        io.run();done.get();return std::move(output).value();
+    };
+    const auto purge=[&](fnd::Instant now,std::size_t expected){
+        auto result=run(peer.purgeExpired(now));
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.value(),expected);
+    };
     io.restart();
     bool crossReadable = false, crossRevoked = false;
     auto interoperability = asio::co_spawn(
@@ -767,7 +782,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     ASSERT_NO_THROW(interoperability.get());
     EXPECT_TRUE(crossReadable);
     EXPECT_TRUE(crossRevoked);
-    const auto deniedByOld = legacy.use(digestOf(0x51), kNow + 3min);
+    const auto deniedByOld = run(peer.use(digestOf(0x51), kNow + 3min));
     EXPECT_FALSE(deniedByOld);
     if (!deniedByOld) {
         EXPECT_EQ(deniedByOld.error().code(),
@@ -780,11 +795,11 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
         asio::use_future);
     io.run();
     ASSERT_TRUE(asyncInsert.get());
-    const auto acceptedByOld = legacy.use(digestOf(0x61), kNow + 1min);
+    const auto acceptedByOld = run(peer.use(digestOf(0x61), kNow + 1min));
     ASSERT_TRUE(acceptedByOld);
     EXPECT_EQ(acceptedByOld->id().value(), "async-interop");
-    ASSERT_TRUE(legacy.revoke(
-        ses::SessionId{"async-interop"}, kNow + 2min));
+    ASSERT_TRUE(run(peer.revoke(
+        ses::SessionId{"async-interop"}, kNow + 2min)));
     io.restart();
     bool rejected = false;
     auto deniedByNew = asio::co_spawn(
@@ -793,7 +808,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     io.run();
     ASSERT_NO_THROW(deniedByNew.get());
     EXPECT_TRUE(rejected);
-    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 2U);
+    purge(kNow + 3h,2U);
 
     io.restart();
     HmacResults hmac;
@@ -807,7 +822,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(hmac.wrongBearerDenied);
     EXPECT_TRUE(hmac.wrongKeyDenied);
     EXPECT_TRUE(hmac.revokedDenied);
-    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 1U);
+    purge(kNow + 3h,1U);
 
     io.restart();
     ServiceChecks serviceChecks;
@@ -823,7 +838,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(serviceChecks.replayDenied);
     EXPECT_TRUE(serviceChecks.revoked);
     EXPECT_TRUE(serviceChecks.listEmptyAfterRevoke);
-    EXPECT_EQ(legacy.purgeExpired(kNow + 3h), 1U);
+    purge(kNow + 3h,1U);
 
     // Verify genuine trusted AuthenticationService outputs, not a forged
     // VerifiedAuthentication, and browser replacement semantics end-to-end.
@@ -840,7 +855,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(loginChecks.onlyOldRevoked);
     EXPECT_TRUE(loginChecks.staleCookieIgnored);
     EXPECT_TRUE(loginChecks.noCrossIdentityRevoke);
-    EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
+    purge(kNow + 9h,4U);
 
     io.restart();
     HttpRouteResults httpChecks;
@@ -856,7 +871,7 @@ TEST(PostgresCoroutineRealDatabaseTest, DomainRepositoryFullLifecycleAndIsolatio
     EXPECT_TRUE(httpChecks.logoutCleared);
     EXPECT_TRUE(httpChecks.logoutRevoked);
     EXPECT_TRUE(httpChecks.logoutAllScoped);
-    EXPECT_EQ(legacy.purgeExpired(kNow + 9h), 4U);
+    purge(kNow + 9h,4U);
 
     // The replacement failpoint uses real unique/FK constraints and verifies
     // rollback from a DIFFERENT physical pooled connection after the failed

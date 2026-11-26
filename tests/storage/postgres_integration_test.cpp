@@ -76,8 +76,7 @@ protected:
         ASSERT_TRUE(created);
         pool = std::move(created).value();
         ASSERT_TRUE(pool->healthCheck());
-        pg::Migrator migrator{*pool};
-        auto migrated = migrator.applyDirectory(
+        auto migrated = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
             std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
         ASSERT_TRUE(migrated)
             << (migrated ? "" : std::string{migrated.error().internalDetail()});
@@ -134,8 +133,7 @@ protected:
 
 TEST_F(PostgresIntegrationTest, MigrationIsIdempotentAndPoolIsHealthy)
 {
-    pg::Migrator migrator{*pool};
-    auto result = migrator.applyDirectory(
+    auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(result);
     EXPECT_EQ(result->applied, 0U);
@@ -154,8 +152,7 @@ TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
             "'0022_tegra_cms_browser_client.sql')");
     execute("INSERT INTO openproof.organizations(id,name,state,created_at_ms) "
             "VALUES('genyleap','Historical tenant',0,1770000000000)");
-    pg::Migrator migrator{*pool};
-    auto result = migrator.applyDirectory(
+    auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(result)
         << (result ? "" : std::string{result.error().internalDetail()});
@@ -190,7 +187,7 @@ TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
     ASSERT_EQ(PQresultStatus(current.get()), PGRES_TUPLES_OK);
     EXPECT_STREQ(PQgetvalue(current.get(), 0, 0), "1");
 
-    auto repeated = migrator.applyDirectory(
+    auto repeated = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(repeated);
     EXPECT_EQ(repeated->applied, 0U);
@@ -200,14 +197,14 @@ TEST_F(PostgresIntegrationTest, HistoricalTenantSeedsNeverAutoApply)
     execute("INSERT INTO openproof.schema_migrations(version,checksum) VALUES "
             "('0020_genycaster_native_client.sql', "
             "decode('b94bd75abaf5b1afc0ea740804d04a5c7518358321df5734b3e6084d4af97fa1','hex'))");
-    auto historical = migrator.applyDirectory(
+    auto historical = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(historical);
     EXPECT_EQ(historical->applied, 0U);
     execute("UPDATE openproof.schema_migrations "
             "SET checksum=decode(repeat('00',32),'hex') "
             "WHERE version='0020_genycaster_native_client.sql'");
-    auto mismatched = migrator.applyDirectory(
+    auto mismatched = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     EXPECT_FALSE(mismatched);
     execute("DELETE FROM openproof.schema_migrations "
@@ -219,8 +216,7 @@ TEST_F(PostgresIntegrationTest, MigrationRejectsUnknownLedgerBeforeNewSql)
     // A newer database cannot be silently opened by an older package.
     execute("INSERT INTO openproof.schema_migrations(version,checksum) VALUES "
             "('9999_future_schema.sql',decode(repeat('ab',32),'hex'))");
-    pg::Migrator migrator{*pool};
-    auto result = migrator.applyDirectory(
+    auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     execute("DELETE FROM openproof.schema_migrations WHERE version='9999_future_schema.sql'");
     ASSERT_FALSE(result);
@@ -252,8 +248,7 @@ TEST_F(PostgresIntegrationTest, MigrationBatchRollsBackEarlierSqlAndLedgerOnLate
         second << "SELECT * FROM openproof.nonexistent_migration_fixture;";
         ASSERT_TRUE(second);
     }
-    pg::Migrator migrator{*pool};
-    const auto result = migrator.applyDirectory(directory);
+    const auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},directory);
     // Read and clean any unexpected writes before assertions, so a failing
     // regression cannot poison subsequent tests on the disposable database.
     std::unique_ptr<PGresult, ResultDeleter> name{PQexec(direct.get(),
@@ -274,7 +269,7 @@ TEST_F(PostgresIntegrationTest, MigrationBatchRollsBackEarlierSqlAndLedgerOnLate
     ASSERT_EQ(PQntuples(ledger.get()), 1);
     EXPECT_STREQ(PQgetvalue(ledger.get(), 0, 0), "0");
     EXPECT_TRUE(pool->healthCheck());
-    EXPECT_TRUE(migrator.applyDirectory(
+    EXPECT_TRUE(pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},
         std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations"));
 }
 
@@ -283,8 +278,7 @@ TEST_F(PostgresIntegrationTest, ConcurrentMigrationChecksShareOneLedger)
     std::atomic<int> success{0};
     const auto directory = std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations";
     const auto check = [&] {
-        pg::Migrator migrator{*pool};
-        const auto result = migrator.applyDirectory(directory);
+        const auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},directory);
         if (result && result->applied == 0U && result->alreadyApplied > 0U)
             success.fetch_add(1, std::memory_order_relaxed);
     };
@@ -307,28 +301,21 @@ TEST(PostgresMigrationBaselineTest, FreshSnapshotRecordsHistoricalChecksumsAndIs
     ASSERT_NE(path, nullptr);
     ASSERT_NE(ack, nullptr);
     ASSERT_STREQ(ack, "YES_EXCLUSIVE_DISPOSABLE_DATABASE");
-    auto config = pg::PoolConfig::create(
-        fnd::SecretString{dsn}, 1U, std::chrono::seconds{2});
-    ASSERT_TRUE(config);
-    auto pool = pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(pool);
-    pg::Migrator migrator{*pool.value()};
     auto first = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{path});
     ASSERT_TRUE(first) << (first ? "" : std::string{first.error().internalDetail()});
     EXPECT_TRUE(first->usedBaseline);
     EXPECT_GT(first->applied, 0U);
     EXPECT_EQ(first->alreadyApplied, 0U);
-    auto repeat = migrator.applyDirectory(std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
+    auto repeat = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{OPENPROOF_SOURCE_DIR} / "migrations");
     ASSERT_TRUE(repeat);
     EXPECT_FALSE(repeat->usedBaseline);
     EXPECT_EQ(repeat->applied, 0U);
     EXPECT_EQ(repeat->alreadyApplied, first->applied);
-    auto again = migrator.applyDirectory(std::filesystem::path{path});
+    auto again = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{path});
     ASSERT_TRUE(again);
     EXPECT_FALSE(again->usedBaseline);
     EXPECT_EQ(again->applied, 0U);
     EXPECT_EQ(again->alreadyApplied, first->applied);
-    EXPECT_TRUE(pool.value()->healthCheck());
 }
 
 TEST(PostgresMigrationBaselineTest, HistoricalReleaseUpgrade)
@@ -345,23 +332,16 @@ TEST(PostgresMigrationBaselineTest, HistoricalReleaseUpgrade)
     ASSERT_NE(ack, nullptr);
     ASSERT_STREQ(ack, "YES_EXCLUSIVE_DISPOSABLE_DATABASE");
     ASSERT_TRUE(std::string_view{dsn}.starts_with("host=/tmp/openproof-baseline-pg."));
-    auto config = pg::PoolConfig::create(
-        fnd::SecretString{dsn}, 1U, std::chrono::seconds{2});
-    ASSERT_TRUE(config);
-    auto pool = pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(pool);
-    pg::Migrator migrator{*pool.value()};
     auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{directory});
     ASSERT_TRUE(result) << (result ? "" : std::string{result.error().internalDetail()});
     EXPECT_FALSE(result->usedBaseline);
     EXPECT_EQ(result->applied, std::stoull(pending));
     EXPECT_GT(result->alreadyApplied, 0U);
-    auto again = migrator.applyDirectory(std::filesystem::path{directory});
+    auto again = pg::migrateSchemaBeforeListener(fnd::SecretString{dsn},std::filesystem::path{directory});
     ASSERT_TRUE(again);
     EXPECT_FALSE(again->usedBaseline);
     EXPECT_EQ(again->applied, 0U);
     EXPECT_EQ(again->alreadyApplied, result->alreadyApplied + result->applied);
-    EXPECT_TRUE(pool.value()->healthCheck());
 }
 
 TEST_F(PostgresIntegrationTest, ExistingSchemaNeverRestoresSnapshot)
@@ -369,8 +349,7 @@ TEST_F(PostgresIntegrationTest, ExistingSchemaNeverRestoresSnapshot)
     const char* path = std::getenv("OPENPROOF_TEST_BASELINE_DIRECTORY");
     if (path == nullptr)
         GTEST_SKIP() << "No generated runtime baseline fixture.";
-    pg::Migrator migrator{*pool};
-    const auto result = migrator.applyDirectory(std::filesystem::path{path});
+    const auto result = pg::migrateSchemaBeforeListener(fnd::SecretString{connectionString},std::filesystem::path{path});
     ASSERT_TRUE(result);
     EXPECT_FALSE(result->usedBaseline);
     EXPECT_EQ(result->applied, 0U);

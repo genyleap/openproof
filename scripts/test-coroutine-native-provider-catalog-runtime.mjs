@@ -14,7 +14,7 @@ const old=read("src/authentication/http/federated.cpp");
 
 test("catalog is mandatory for enabled authentication and validated before database setup",()=>{
   const flag=app.indexOf('environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_PROVIDER_CATALOG")');
-  const migrations=app.indexOf("postgres::Migrator migrator",flag);
+  const migrations=app.indexOf("postgres::nativeDatabasePreflight(",flag);
   assert.ok(flag>0 && migrations>flag);
   assert.match(app,/nativeCatalogFlag && \*nativeCatalogFlag != "0"/);
   assert.match(app,/const bool nativeCatalogEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeCatalogFlag && \*nativeCatalogFlag == "1"\)/);

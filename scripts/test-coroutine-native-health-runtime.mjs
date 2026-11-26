@@ -124,6 +124,36 @@ test("all offline CLI mutations and production linking are independent of blocki
   for(const call of ["rekeyTotpOffline","initializeAdministratorOffline","repairInitialOwnerOffline"])
     assert.ok(integration.includes("pg::"+call+"("),call);
 });
+test("native migration and session regression suites exercise production SQL without the old module",()=>{
+  const migration=read("tests/storage/postgres_integration_test.cpp");
+  assert.doesNotMatch(migration,/\bpg::Migrator\b|migrator\.applyDirectory/);
+  for(const name of ["HistoricalTenantSeedsNeverAutoApply","MigrationRejectsUnknownLedgerBeforeNewSql",
+    "MigrationBatchRollsBackEarlierSqlAndLedgerOnLaterFailure","ConcurrentMigrationChecksShareOneLedger",
+    "FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent","HistoricalReleaseUpgrade"]){
+    const start=migration.indexOf(name);
+    assert.ok(start>=0,name);
+    const end=migration.indexOf("\nTEST",start);
+    assert.match(migration.slice(start,end<0?undefined:end),/pg::migrateSchemaBeforeListener/);
+  }
+  const session=read("tests/storage/postgres_coroutine_repository_integration_test.cpp");
+  assert.doesNotMatch(session,/import openproof.storage.postgres;|pg::(?:PoolConfig|ConnectionPool|Migrator|PostgresSessionRepository)\b/);
+  assert.match(session,/pg::CoroutinePostgresSessionRepository peer\{/);
+  assert.match(session,/INSERT INTO openproof.sessions/);
+  assert.match(session,/run\(peer.use\(digestOf\(0x51\)/);
+  assert.match(session,/run\(peer.revoke\(/);
+  const cmake=read("tests/CMakeLists.txt");
+  for(const target of ["openproof_postgres_domain_tests","openproof_postgres_network_tests"]){
+    const start=cmake.indexOf("target_link_libraries("+target);
+    const end=cmake.indexOf(")\n",start);
+    assert.ok(start>=0 && end>start,target);
+    assert.doesNotMatch(cmake.slice(start,end),/openproof_storage_postgres/);
+  }
+  const canonical=read("tests/storage/postgres_async_canonical_test.cpp");
+  assert.match(canonical,/IndependentNativeTransactionsShareOneTimeFederationState/);
+  assert.match(canonical,/IndependentNativeAuthorizationAuditSharesChainAndRollsBack/);
+  assert.match(canonical,/co_spawn\(io,peer.rotateOAuthRefreshAsync/);
+  assert.doesNotMatch(canonical,/pg::(?:PostgresAuthenticationTransactionStore|PostgresAuthorizationDecisionSink|PostgresIdentityProviderStore)\b/);
+});
 test("liveness has no SQL dependency and readiness is bounded and fail-closed",()=>{
   const body=http.slice(http.indexOf("CoroutineHealthAdapter::handleAsync("));
   const ordered=["scrub(request);","method!=gateway::HttpMethod::Get","if (live) co_return response(200,true)",
