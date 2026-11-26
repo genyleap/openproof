@@ -45,7 +45,8 @@ for migration in \
     0001_identity_auth_gateway.sql \
     0003_identity_provider.sql \
     0005_account_lifecycle.sql \
-    0018_profile_avatar_sources.sql; do
+    0018_profile_avatar_sources.sql \
+    0021_verification_reservation_generation.sql; do
     "${as_pg[@]}" "$pgbin/psql" -X -q -v ON_ERROR_STOP=1 \
         -h "$work" -p "$port" -U postgres -d openproof_coroutine_ci \
         -f "$repo/migrations/$migration"

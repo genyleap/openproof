@@ -489,7 +489,18 @@ public:
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedOwner) override;
 
+    [[nodiscard]] foundation::Result<std::optional<identity::core::IdentityId>>
+    reservedOwnerForChallenge(const identity::core::ExternalIdentityRef& external,
+                              foundation::Instant now, const account::VerificationId& id) const override;
+    [[nodiscard]] foundation::Status releaseSubjectForChallenge(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner,
+        const account::VerificationId& id) override;
 private:
+    [[nodiscard]] foundation::Status releaseSubjectImpl(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner,
+        const account::VerificationId* id);
     [[nodiscard]] foundation::Result<account::VerificationChallenge> consumeImpl(
         const account::VerificationId& id, const account::VerificationDigest& presented,
         foundation::Instant now, std::uint32_t maximumAttempts,

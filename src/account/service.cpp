@@ -580,10 +580,10 @@ foundation::Status AccountService::completeEmailChange(
     const identity::core::ExternalIdentityRef newExternal{
         m_localProvider, identity::provider::ExternalSubject{replacement}};
     const auto releaseReservation = [&]() {
-        static_cast<void>(m_repository->releaseSubject(
-            newExternal, challenge->identity()));
+        static_cast<void>(m_repository->releaseSubjectForChallenge(
+            newExternal, challenge->identity(), challenge->id()));
     };
-    auto reservedOwner = m_repository->reservedOwner(newExternal, m_clock->now());
+    auto reservedOwner = m_repository->reservedOwnerForChallenge(newExternal, m_clock->now(), challenge->id());
     if (!reservedOwner.has_value()) {
         return foundation::fail(reservedOwner.error());
     }
@@ -644,7 +644,7 @@ foundation::Status AccountService::completeEmailChange(
                 releaseReservation();
                 return saved;
             }
-            return m_repository->releaseSubject(newExternal, challenge->identity());
+            return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
         }
 
         auto set = profile->setEmail(replacement, true, m_clock->now());
@@ -657,7 +657,7 @@ foundation::Status AccountService::completeEmailChange(
             releaseReservation();
             return saved;
         }
-        return m_repository->releaseSubject(newExternal, challenge->identity());
+        return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
     }
 
     const std::string previous{local->subject().value()};
@@ -672,7 +672,7 @@ foundation::Status AccountService::completeEmailChange(
             releaseReservation();
             return saved;
         }
-        return m_repository->releaseSubject(newExternal, challenge->identity());
+        return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
     }
 
     const identity::core::ExternalIdentityRef oldExternal{
@@ -713,7 +713,7 @@ foundation::Status AccountService::completeEmailChange(
         releaseReservation();
         return detached;
     }
-    return m_repository->releaseSubject(newExternal, challenge->identity());
+    return m_repository->releaseSubjectForChallenge(newExternal, challenge->identity(), challenge->id());
 }
 
 foundation::Status AccountService::beginPhoneVerification(
@@ -753,6 +753,11 @@ foundation::Status AccountService::completePhoneVerification(
     const identity::core::ExternalIdentityRef external{
         m_phoneProvider, identity::provider::ExternalSubject{
             std::string{challenge->destination()}}};
+    auto reservation = m_repository->reservedOwnerForChallenge(
+        external, m_clock->now(), challenge->id());
+    if (!reservation) return foundation::fail(reservation.error());
+    if (!reservation->has_value() || reservation->value() != expectedIdentity)
+        return foundation::fail(genericVerificationFailure("Phone reservation is absent or superseded."));
     auto attached = attachVerified(challenge->identity(), external);
     if (!attached.has_value()) return attached;
     auto profile = requireProfile(challenge->identity());
@@ -768,7 +773,7 @@ foundation::Status AccountService::completePhoneVerification(
         static_cast<void>(m_externalIdentities->detach(external, challenge->identity()));
         return saved;
     }
-    return m_repository->releaseSubject(external, challenge->identity());
+    return m_repository->releaseSubjectForChallenge(external, challenge->identity(), challenge->id());
 }
 
 foundation::Status AccountService::beginPasswordReset(std::string email)

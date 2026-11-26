@@ -907,21 +907,69 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     const idp::ProviderId rollbackProvider{"rollback-local-" + seed.suffix};
     auto collision = run(store.reserveAndReplaceAsync(
         challenge(reservedId, seed.secondOwner), rollbackProvider));
-    EXPECT_TRUE(!collision && collision.error().code() == fnd::ErrorCode::Unavailable);
+    EXPECT_TRUE(!collision && collision.error().code() == fnd::ErrorCode::Conflict);
     auto rolledBack = execute(fixture.get(),
         "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
         {std::string{rollbackProvider.value()}});
     EXPECT_STREQ(PQgetvalue(rolledBack.get(), 0, 0), "0");
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId},
-        ids::IdentityId{seed.owner}, purpose)));
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{reservedId},
+    // Force an insert failure after reservation to test actual rollback.
+    const auto impossibleId = "rejected-insert-" + seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.account_verification_challenges ADD CONSTRAINT fixture_reject_insert "
+        "CHECK (id NOT LIKE 'rejected-insert-%') NOT VALID", {})));
+    auto rejectedInsert = run(store.reserveAndReplaceAsync(
+        challenge(impossibleId, seed.secondOwner), rollbackProvider));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.account_verification_challenges DROP CONSTRAINT fixture_reject_insert", {})));
+    EXPECT_TRUE(!rejectedInsert && rejectedInsert.error().code() == fnd::ErrorCode::Unavailable);
+    auto afterInsertFailure = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
+        {std::string{rollbackProvider.value()}});
+    EXPECT_STREQ(PQgetvalue(afterInsertFailure.get(), 0, 0), "0");
+    const ids::ExternalIdentityRef external{localProvider, idp::ExternalSubject{"contact@example.test"}};
+    const ids::IdentityId ownerId{seed.owner};
+    auto oldGeneration = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
+    ASSERT_TRUE(oldGeneration && oldGeneration->has_value() && oldGeneration->value() == ownerId);
+    EXPECT_TRUE(legacy.releaseSubject(external, ownerId)); // owner-only must not remove tagged rows
+    auto untaggedRetry = legacy.reserveSubject(external, ownerId, kNow, kNow + 10min);
+    EXPECT_TRUE(!untaggedRetry && untaggedRetry.error().code() == fnd::ErrorCode::Conflict);
+    const auto renewedId = "renewed-" + seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(renewedId, seed.owner), localProvider)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId}, ownerId, purpose)));
+    EXPECT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{reservedId}));
+    auto stale = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
+    EXPECT_TRUE(stale && !stale->has_value());
+    auto renewed = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{renewedId});
+    EXPECT_TRUE(renewed && renewed->has_value() && renewed->value() == ownerId);
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{renewedId}, ownerId, purpose)));
+    EXPECT_FALSE(legacy.consume(acc::VerificationId{renewedId},
         acc::VerificationDigest{digest}, kNow, 8U));
-    // Reservation survives to its existing expiry; exact compensation must
-    // not release a potentially renewed legacy reservation for the same owner.
-    auto retained = execute(fixture.get(),
-        "SELECT count(*) FROM openproof.pending_external_identity_reservations "
-        "WHERE provider=$1 AND identity_id=$2", {std::string{localProvider.value()}, seed.owner});
-    EXPECT_STREQ(PQgetvalue(retained.get(), 0, 0), "1");
+    auto released = legacy.reservedOwner(external, kNow);
+    EXPECT_TRUE(released && !released->has_value());
+
+    // A consumed proof's reservation must survive delivery compensation:
+    // completion may still need it; only the matching generation can release it.
+    const auto completingId = "completing-" + seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(completingId, seed.owner), localProvider)));
+    ASSERT_TRUE(legacy.consumeForPurpose(acc::VerificationId{completingId},
+        acc::VerificationDigest{digest}, kNow, 8U, purpose, &ownerId));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{completingId}, ownerId, purpose)));
+    auto completing = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{completingId});
+    EXPECT_TRUE(completing && completing->has_value() && completing->value() == ownerId);
+    ASSERT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{completingId}));
+    released = legacy.reservedOwner(external, kNow);
+    EXPECT_TRUE(released && !released->has_value());
+
+    // Replacement by the legacy writer cleans a superseded tagged reservation.
+    const auto supersededId = "superseded-" + seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(supersededId, seed.owner), localProvider)));
+    ASSERT_TRUE(legacy.replace(challenge("legacy-replacement-" + seed.suffix, seed.owner)));
+    released = legacy.reservedOwner(external, kNow);
+    EXPECT_TRUE(released && !released->has_value());
+    ASSERT_TRUE(legacy.reserveSubject(external, ownerId, kNow, kNow + 10min));
+    auto untagged = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{"legacy-id"});
+    EXPECT_TRUE(untagged && untagged->has_value() && untagged->value() == ownerId);
+    ASSERT_TRUE(legacy.releaseSubject(external, ownerId));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
