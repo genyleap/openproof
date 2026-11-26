@@ -409,8 +409,9 @@ TEST(NativeOAuthTokenReadTest, ParRejectsMixedAndMalformedRequestsBeforeStorage)
         {},{},{},{},{},{},{},15min,std::nullopt,{},std::nullopt,
         http::CoroutineTokenReadAdapter::ParContext{"https://issuer.example.invalid",
             [&](std::string id,std::optional<std::string> proof,std::string digest,
-                std::optional<oauth::AuthorizationRequest> direct,http::CoroutineTokenReadAdapter::VerifyJar verify)
+                std::optional<oauth::AuthorizationRequest> direct,http::CoroutineTokenReadAdapter::VerifyJar verify,bool frontChannel)
                 ->asio::awaitable<fnd::Status> {
+                EXPECT_FALSE(frontChannel);
                 ++calls;
                 if (id!="fixture-client" || proof) co_return fnd::fail(fnd::ErrorCode::AuthenticationRequired);
                 EXPECT_EQ(digest.size(),64U);

@@ -1120,19 +1120,22 @@ const checked = segments.map(([name, relative]) => {
     // until all remaining write/authorization paths are native.
     const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");
-    for(const method of ["loginPage","loginSubmit","authorize","consentSubmit",
-      "tokenEndpoint"]){
+    for(const method of ["loginPage","loginSubmit","tokenEndpoint"]){
       const start=legacy.indexOf("OAuthHttpApi::"+method+"(");
       const end=legacy.indexOf("\ngateway::HttpResponse OAuthHttpApi::",start+1);
       const body=legacy.slice(start,end<0?undefined:end);
       if (/m_(?:authorization|tokens|clients|authentication|sessions|consents|resources|serviceIdentities|devices|pushedAuthorization|jar)->/.test(body))
         issues.push({line:0,kind:"synchronous OAuth lifecycle remains",expression:method});
     }
-    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par"]){
+    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par","/oauth/authorize","/oauth/consent"]){
       if(!app.includes('nativePaths.emplace_back("'+route+'")'))
         issues.push({line:0,kind:"native OAuth token operation missing strict dispatch",expression:route});
     }
     const native=fs.readFileSync(path.join(root,"src/oauth/http/coroutine_token_read_http.cpp"),"utf8");
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/authorize" \|\| path=="\/oauth\/consent"\)/.test(legacy)
+       || !/co_await m_par->complete\(/.test(native)
+       || !/reader->completeOAuthAuthorizationAsync/.test(app))
+      issues.push({line:0,kind:"OAuth browser authorization incomplete",expression:"strict authorization and consent completion"});
     if(!/m_nativeTokenReadsRequired && path=="\/oauth\/par"/.test(legacy)
        || !/co_await m_par->push\(/.test(native)
        || !/reader->pushOAuthAuthorizationAsync/.test(app))

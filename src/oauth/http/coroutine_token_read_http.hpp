@@ -63,10 +63,17 @@ public:
     using VerifyJar=std::function<foundation::Result<NativeJarAuthorization>(
         std::string_view,std::string_view,foundation::Instant)>;
     using PushAuthorization=std::function<boost::asio::awaitable<foundation::Status>(
-        std::string,std::optional<std::string>,std::string,std::optional<AuthorizationRequest>,VerifyJar)>;
+        std::string,std::optional<std::string>,std::string,std::optional<AuthorizationRequest>,VerifyJar,bool)>;
+    using SignResponse=std::function<foundation::Result<std::string>(const AuthorizationRequest&,bool,std::string_view)>;
+    using CompleteAuthorization=std::function<boost::asio::awaitable<foundation::Result<NativeAuthorizationResult>>(
+        std::string,std::optional<std::string>,std::optional<AuthorizationRequest>,identity::core::IdentityId,
+        session::SessionId,NativeAuthorizationDecision,std::string,std::string,
+        std::function<foundation::Result<std::string>(const AuthorizationRequest&,bool)>)>;
     struct ParContext final {
         std::string issuer;
         PushAuthorization push;
+        CompleteAuthorization complete{};
+        SignResponse sign{};
     };
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
@@ -104,6 +111,7 @@ private:
     IssueMachine m_issueMachine;
     std::optional<DevicePollContext> m_devicePoll;
     std::optional<ParContext> m_par;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> authorizeBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pushAuthorization(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> deviceBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> beginDevice(gateway::HttpRequest);

@@ -755,6 +755,20 @@ async function main() {
       const csrf = response.body.match(/name="csrf" value="([^"]+)"/)?.[1];
       if (!csrf) fail("consent page did not contain its CSRF value");
       const form = new URLSearchParams({ return_to: authorizePath, csrf, decision: "approve" });
+      if (nativeAccountRuntime) {
+        // A valid cookie and form CSRF must not authorize a modified target.
+        const substituted = new URLSearchParams(query);
+        substituted.set("state", base64Url(crypto.randomBytes(18)));
+        const rejected = await edgeRequest("/oauth/consent", {
+          method: "POST",
+          jar: ownerJar,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            return_to: `/oauth/authorize?${substituted}`, csrf, decision: "approve",
+          }).toString(),
+        });
+        expectStatus(rejected, 401);
+      }
       response = await edgeRequest("/oauth/consent", {
         method: "POST",
         jar: ownerJar,

@@ -3235,10 +3235,25 @@ addProtectedRoutes(gateway::Router& router,
                     std::string{nativeOidcProvider->issuer()},
                     [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
                         std::string requestDigest,std::optional<oauth::AuthorizationRequest> direct,
-                        oauthHttp::CoroutineTokenReadAdapter::VerifyJar verify) {
+                        oauthHttp::CoroutineTokenReadAdapter::VerifyJar verify,bool signedFrontChannel) {
                         return reader->pushOAuthAuthorizationAsync(std::move(clientId),std::move(clientDigest),
                             std::move(requestDigest),std::move(direct),std::move(verify),
-                            clock.now(),std::chrono::seconds{90});
+                            clock.now(),std::chrono::seconds{90},signedFrontChannel);
+                    },
+                    [reader,&clock](std::string clientId,std::optional<std::string> parDigest,
+                        std::optional<oauth::AuthorizationRequest> direct,identity::IdentityId owner,
+                        session::SessionId sessionId,oauth::NativeAuthorizationDecision decision,
+                        std::string consentId,std::string codeDigest,
+                        postgres::CoroutinePostgresCanonicalFinalizer::SignAuthorizationResponse sign) {
+                        return reader->completeOAuthAuthorizationAsync(std::move(clientId),std::move(parDigest),
+                            std::move(direct),std::move(owner),std::move(sessionId),decision,
+                            std::move(consentId),std::move(codeDigest),clock.now(),std::chrono::minutes{5},std::move(sign));
+                    },
+                    [oidc=nativeOidcProvider](const oauth::AuthorizationRequest& request,bool denied,std::string_view code) {
+                        return oidc->issueAuthorizationResponse(request.clientId(),
+                            denied?std::nullopt:std::optional<std::string_view>{code},
+                            request.state()?std::optional<std::string_view>{*request.state()}:std::nullopt,
+                            denied?std::optional<std::string_view>{"access_denied"}:std::nullopt);
                     }});
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
@@ -3247,6 +3262,8 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/oauth/device_authorization");
             nativePaths.emplace_back("/oauth/device");
             nativePaths.emplace_back("/oauth/par");
+            nativePaths.emplace_back("/oauth/authorize");
+            nativePaths.emplace_back("/oauth/consent");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {

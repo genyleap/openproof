@@ -162,6 +162,14 @@ private:
 
 // Committed native authorization-code exchange result. Raw access and
 // refresh credentials stay with the HTTP caller; persistence sees digests.
+enum class NativeAuthorizationDecision { ExistingConsent, Approve, Deny };
+struct NativeAuthorizationResult final {
+    AuthorizationRequest request;
+    std::string clientName;
+    bool consentRequired;
+    std::optional<foundation::SecretString> signedResponse;
+};
+
 struct NativeJarAuthorization final {
     AuthorizationRequest request;
     std::string jwtId;

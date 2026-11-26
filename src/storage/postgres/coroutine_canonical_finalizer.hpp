@@ -135,12 +135,23 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    using SignAuthorizationResponse=std::function<foundation::Result<std::string>(const oauth::AuthorizationRequest&,bool)>;
+    // Browser-only completion. Revalidate the session, registry and consent
+    // under locks; PAR is consumed only with a committed terminal decision.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeAuthorizationResult>>
+    completeOAuthAuthorizationAsync(std::string clientId,std::optional<std::string> parDigest,
+        std::optional<oauth::AuthorizationRequest> direct,identity::core::IdentityId owner,
+        session::SessionId sessionId,oauth::NativeAuthorizationDecision decision,
+        std::string consentId,std::string codeDigest,foundation::Instant now,
+        foundation::Duration lifetime,SignAuthorizationResponse signResponse);
+
     using VerifyJar=std::function<foundation::Result<oauth::NativeJarAuthorization>(
         std::string_view,std::string_view,foundation::Instant)>;
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     pushOAuthAuthorizationAsync(std::string clientId,std::optional<std::string> clientDigest,
         std::string requestDigest,std::optional<oauth::AuthorizationRequest> direct,
-        VerifyJar verifyJar,foundation::Instant now,foundation::Duration lifetime);
+        VerifyJar verifyJar,foundation::Instant now,foundation::Duration lifetime,
+        bool signedFrontChannel=false);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeDeviceApproval>>
     readOAuthDeviceApprovalAsync(std::string userDigest,identity::core::IdentityId owner,

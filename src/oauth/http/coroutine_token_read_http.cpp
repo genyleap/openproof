@@ -473,6 +473,58 @@ std::optional<std::string> jsonString(const boost::json::object& object,std::str
 }
 
 
+bool authorizationBrowserRoute(const gateway::HttpRequest& r) noexcept {
+    return (r.path()=="/oauth/authorize" && r.method()==Method::Get)
+        || (r.path()=="/oauth/consent" && r.method()==Method::Post);
+}
+foundation::Result<Parameters> browserParameters(std::string_view input,std::size_t maximum) {
+    if (input.empty() || input.size()>maximum) return foundation::fail(E::InvalidArgument);
+    Parameters result;
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto item=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (item.empty()) continue;
+        const auto eq=item.find('=');
+        if (eq==std::string_view::npos) return foundation::fail(E::InvalidArgument);
+        auto key=decode(item.substr(0,eq),64U);
+        auto value=decode(item.substr(eq+1U),key && key->expose()=="request"?24U*1024U:
+            key && key->expose()=="return_to"?8192U:2048U);
+        if (!key || !value || result.size()>=16U ||
+            !result.emplace(std::string{key->expose()},std::string{value->expose()}).second)
+            return foundation::fail(E::InvalidArgument);
+    }
+    return result;
+}
+bool validAuthorizationTarget(std::string_view target) noexcept {
+    return target.starts_with("/oauth/authorize?") && target.size()<=8192U
+        && std::ranges::none_of(target,[](unsigned char c){return c<0x20U || c==0x7fU;});
+}
+std::string authorizationCookie(std::string_view value,int age) {
+    return "__Host-openproof-consent-csrf="+std::string{value}+
+        "; Path=/; Max-Age="+std::to_string(age)+"; Secure; HttpOnly; SameSite=Lax";
+}
+foundation::Result<std::string> authorizationCsrf(const foundation::SecretString& key,
+    const session::Session& actor,std::string_view target,std::string_view nonce) {
+    auto digest=security::sha256(target);
+    if (!digest) return foundation::fail(digest.error());
+    auto mac=security::hmacSha256(key,"authorization-browser:"+std::string{actor.id().value()}+
+        ":"+foundation::toHex(digest.value())+":"+std::string{nonce});
+    if (!mac) return foundation::fail(mac.error());
+    return std::string{nonce}+"."+foundation::toHex(mac.value());
+}
+gateway::HttpResponse browserRedirect(std::string location,int status=302) {
+    gateway::HttpResponse response{status,gateway::Headers{{"location",std::move(location)},
+        {"cache-control","no-store"},{"pragma","no-cache"},{"referrer-policy","no-referrer"},
+        {"x-content-type-options","nosniff"}},{}};
+    return response;
+}
+std::string authorizationParameter(std::string uri,std::string_view name,std::string_view value) {
+    uri.push_back(uri.contains('?')?'&':'?');
+    uri.append(percentEncode(name)).push_back('=');
+    uri.append(percentEncode(value));
+    return uri;
+}
 bool parRoute(const gateway::HttpRequest& r) noexcept {
     return r.path()=="/oauth/par" && (r.method()==Method::Post || r.method()==Method::Options);
 }
@@ -702,6 +754,8 @@ bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) 
     if (deviceRoute(r)) return m_devicePoll && m_devicePoll->poll && m_prepareSender;
     if (beginDeviceRoute(r)) return m_devicePoll && m_devicePoll->begin && !m_devicePoll->verificationUri.empty();
     if (parRoute(r)) return m_par && m_par->push && !m_par->issuer.empty();
+    if (authorizationBrowserRoute(r)) return m_par && m_par->push && m_par->complete && m_par->sign
+        && m_codeExchange && m_devicePoll && m_devicePoll->authenticate;
     if (deviceBrowserRoute(r)) return m_devicePoll && m_devicePoll->authenticate
         && m_devicePoll->readApproval && m_devicePoll->decide;
     return m_fallback->nativeEnabledFor(r);
@@ -710,7 +764,7 @@ gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) 
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r) && !parRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r) && !parRoute(r) && !authorizationBrowserRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -733,6 +787,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (beginDeviceRoute(r)) co_return co_await beginDevice(std::move(r));
     if (deviceBrowserRoute(r)) co_return co_await deviceBrowser(std::move(r));
     if (parRoute(r)) co_return co_await pushAuthorization(std::move(r));
+    if (authorizationBrowserRoute(r)) co_return co_await authorizeBrowser(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -1030,6 +1085,157 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(g
     if (exchange) body.add("issued_token_type",kAccessType);
     co_return json(200,std::move(body));
 }
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::authorizeBrowser(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    using Decision=NativeAuthorizationDecision;
+    const bool post=r.method()==Method::Post;
+    std::string target{r.target()};
+    std::optional<foundation::SecretString> submittedCsrf;
+    Decision decision=Decision::ExistingConsent;
+    if (r.header("authorization")) co_return fail(E::AuthenticationFailed,r);
+    if (post) {
+        const auto media=r.header("content-type");
+        if (!media || (*media!="application/x-www-form-urlencoded" &&
+            !media->starts_with("application/x-www-form-urlencoded;")))
+            co_return fail(E::InvalidArgument,r);
+        auto form=browserParameters(r.body(),32U*1024U);
+        if (!form || form->size()!=3U) co_return fail(E::InvalidArgument,r);
+        auto back=optionalPar(*form,"return_to"),csrf=optionalPar(*form,"csrf"),choice=optionalPar(*form,"decision");
+        auto expected=browserCookie(r,"__Host-openproof-consent-csrf");
+        if (!back || !csrf || !choice || !expected || csrf->size()>128U
+            || !security::constantTimeEquals(expected->expose(),*csrf)
+            || (*choice!="approve" && *choice!="deny"))
+            co_return fail(E::AuthenticationFailed,r);
+        target=std::move(*back);
+        submittedCsrf.emplace(std::move(*csrf));
+        decision=*choice=="approve"?Decision::Approve:Decision::Deny;
+    }
+    if (!target.starts_with("/oauth/authorize?") || target.size()>32U*1024U
+        || std::ranges::any_of(target,[](unsigned char c){return c<0x20U || c==0x7fU;}))
+        co_return fail(E::InvalidArgument,r);
+    auto parameters=browserParameters(std::string_view{target}.substr(std::string_view{"/oauth/authorize?"}.size()),32U*1024U);
+    if (!parameters) co_return fail(parameters.error().code(),r);
+    auto id=optionalPar(*parameters,"client_id");
+    if (!id || id->size()>256U) co_return fail(E::InvalidArgument,r);
+    auto credential=browserCookie(r,kBrowserSession);
+    scrub(r);
+    if (auto jwt=optionalPar(*parameters,"request")) {
+        if (post || parameters->size()!=2U) co_return fail(E::InvalidArgument,r);
+        auto signedRequest=std::make_shared<foundation::SecretString>(std::move(*jwt));
+        foundation::secureWipe(parameters->at("request").data(),parameters->at("request").size());
+        parameters->clear();
+        foundation::secureWipe(target.data(),target.size());
+        credential.reset();
+        VerifyJar verify=[signedRequest,id=*id,issuer=m_par->issuer](std::string_view kid,std::string_view pem,foundation::Instant now) {
+            auto result=verifyNativeJar(signedRequest->expose(),client::ClientId{id},issuer,kid,pem,now);
+            *signedRequest=foundation::SecretString{};
+            return result;
+        };
+        auto random=security::randomTokenBase64Url(32U);
+        if (!random) co_return fail(E::Unavailable,r);
+        foundation::SecretString uri{"urn:ietf:params:oauth:request_uri:opar_"+random.value()};
+        foundation::secureWipe(random->data(),random->size());
+        auto digest=security::sha256(uri.expose());
+        if (!digest) co_return fail(E::Unavailable,r);
+        auto stored=co_await m_par->push(*id,std::nullopt,foundation::toHex(digest.value()),
+            std::nullopt,std::move(verify),true);
+        if (!stored) co_return fail(stored.error().code(),r);
+        co_return browserRedirect("/oauth/authorize?client_id="+percentEncode(*id)+
+            "&request_uri="+percentEncode(uri.expose()),303);
+    }
+    if (!validAuthorizationTarget(target)) co_return fail(E::InvalidArgument,r);
+    std::optional<AuthorizationRequest> direct;
+    std::optional<std::string> parDigest;
+    if (auto uri=optionalPar(*parameters,"request_uri")) {
+        if (parameters->size()!=2U || !uri->starts_with("urn:ietf:params:oauth:request_uri:opar_")
+            || uri->size()>256U) co_return fail(E::InvalidArgument,r);
+        auto digest=security::sha256(*uri);
+        if (!digest) co_return fail(E::Unavailable,r);
+        parDigest.emplace(foundation::toHex(digest.value()));
+    } else {
+        constexpr std::string_view allowed[]{"response_type","client_id","redirect_uri","scope",
+            "code_challenge","code_challenge_method","state","nonce","max_age","resource","response_mode"};
+        for (const auto& [name,value]:*parameters) {
+            (void)value;
+            if (std::ranges::find(allowed,name)==std::ranges::end(allowed))
+                co_return fail(E::InvalidArgument,r);
+        }
+        auto parsed=parseParAuthorization(*parameters);
+        if (!parsed) co_return fail(parsed.error().code(),r);
+        direct.emplace(std::move(parsed).value());
+    }
+    if (!credential) {
+        if (post) co_return fail(E::AuthenticationRequired,r);
+        co_return browserRedirect("/login?return_to="+percentEncode(target));
+    }
+    auto actor=co_await m_devicePoll->authenticate(std::move(*credential));
+    if (!actor) {
+        if (!post && (actor.error().code()==E::AuthenticationFailed || actor.error().code()==E::AuthenticationRequired))
+            co_return browserRedirect("/login?return_to="+percentEncode(target));
+        co_return fail(actor.error().code(),r);
+    }
+    if (post) {
+        const auto token=submittedCsrf->expose();
+        const auto dot=token.find('.');
+        if (dot!=43U) co_return fail(E::AuthenticationFailed,r);
+        const auto expected=authorizationCsrf(m_codeExchange->codeKey,actor.value(),target,token.substr(0,dot));
+        if (!expected || !security::constantTimeEquals(expected.value(),token))
+            co_return fail(E::AuthenticationFailed,r);
+        submittedCsrf.reset();
+    }
+    auto random=security::randomTokenBase64Url(32U);
+    if (!random) co_return fail(E::Unavailable,r);
+    foundation::SecretString code{"opa_"+random.value()};
+    foundation::secureWipe(random->data(),random->size());
+    auto digest=security::hmacSha256(m_codeExchange->codeKey,code.expose());
+    auto consent=security::randomTokenBase64Url(18U);
+    if (!digest || !consent) co_return fail(E::Unavailable,r);
+    auto completed=co_await m_par->complete(*id,std::move(parDigest),std::move(direct),
+        actor->identity(),actor->id(),decision,"opcns_"+consent.value(),foundation::toHex(digest.value()),
+        [this,&code](const AuthorizationRequest& request,bool denied) {
+            return m_par->sign(request,denied,code.expose());
+        });
+    if (!completed) co_return fail(completed.error().code(),r);
+    if (completed->consentRequired) {
+        auto nonce=security::randomTokenBase64Url(32U);
+        if (!nonce) co_return fail(E::Unavailable,r);
+        auto csrf=authorizationCsrf(m_codeExchange->codeKey,actor.value(),target,nonce.value());
+        if (!csrf) co_return fail(E::Unavailable,r);
+        std::string scopeList;
+        for (const auto& scope:completed->request.scopes()) {
+            if (!scopeList.empty()) scopeList.append(", ");
+            scopeList.append(htmlEscape(scope.value()));
+        }
+        std::string body="<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>Authorize access</title></head><body><main><h1>Authorize "+
+            htmlEscape(completed->clientName)+"</h1><p>Requested access: "+scopeList+
+            "</p><form method=\"post\" action=\"consent\"><input type=\"hidden\" name=\"return_to\" value=\""+
+            htmlEscape(target)+"\"><input type=\"hidden\" name=\"csrf\" value=\""+htmlEscape(csrf.value())+
+            "\"><button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>"
+            "<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form></main></body></html>";
+        gateway::HttpResponse response{200,gateway::Headers{{"content-type","text/html; charset=utf-8"},
+            {"cache-control","no-store"},{"pragma","no-cache"},{"x-content-type-options","nosniff"},
+            {"referrer-policy","no-referrer"},
+            {"content-security-policy","default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}},std::move(body)};
+        response.addHeader("set-cookie",authorizationCookie(csrf.value(),600));
+        co_return response;
+    }
+    const auto& request=completed->request;
+    std::string location{request.redirectUri()};
+    if (completed->signedResponse) {
+        location=authorizationParameter(std::move(location),"response",completed->signedResponse->expose());
+    } else {
+        location=decision==Decision::Deny
+            ?authorizationParameter(std::move(location),"error","access_denied")
+            :authorizationParameter(std::move(location),"code",code.expose());
+        if (request.state()) location=authorizationParameter(std::move(location),"state",*request.state());
+        if (decision!=Decision::Deny) location=authorizationParameter(std::move(location),"iss",m_par->issuer);
+    }
+    auto response=browserRedirect(std::move(location),post?303:302);
+    if (post) response.addHeader("set-cookie",authorizationCookie("",0));
+    co_return response;
+}
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::pushAuthorization(gateway::HttpRequest r) {
     Scrub wipe{r};
     const auto oauthError=[](int status,std::string_view code) {
@@ -1102,7 +1308,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::pushAuthorizat
     auto digest=security::sha256(uri.expose());
     if (!digest) co_return oauthError(503,"temporarily_unavailable");
     auto stored=co_await m_par->push(std::move(*id),std::move(clientDigest),foundation::toHex(digest.value()),
-        std::move(direct),std::move(verifier));
+        std::move(direct),std::move(verifier),false);
     if (!stored) {
         if (stored.error().code()==E::AuthenticationRequired) co_return oauthError(401,"invalid_client");
         if (stored.error().code()==E::InvalidArgument || stored.error().code()==E::PermissionDenied)

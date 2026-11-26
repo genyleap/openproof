@@ -1021,10 +1021,18 @@ claims, checks redirect URI (including native loopback port matching),
 client scopes and resource scope restrictions. JTI consumption and PAR
 storage commit together; a failed insert does not permanently consume the
 JTI. Request URIs use the existing SHA-256 fingerprint and 90-second
-lifetime. Browser authorization still reads and consumes those records
-through the compatibility service; migrating this consumer, front-channel
-JAR, consent submission and login remains required. Executable acceptance
-is still mandatory.
+lifetime. Browser authorization and consent submission now use native
+transactions for both direct and pushed requests. Front-channel JAR is
+converted to PAR after pinned-signature validation, without accepting
+client secrets in the browser. The exact browser session and current
+client/resource registrations are rechecked inside the transaction.
+Consent prompts preserve the unconsumed PAR record; the CSRF token is
+bound to the session and complete authorization target. Approval,
+consent supersession, code insertion, and one-time PAR consumption commit
+together. Denial consumes PAR without issuing a code. JARM signing happens
+before commit and failure leaves the PAR and consent unchanged.
+Login submission and final compatibility retirement remain required.
+Executable acceptance is still mandatory.
 
 ### Native account TOTP status (coroutine branch only)
 

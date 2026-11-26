@@ -1626,6 +1626,71 @@ TEST(PostgresCanonicalCoroutineTest, NativeParPreservesLoopbackAndCommitsJarRepl
     ASSERT_EQ(PQntuples(rows.get()),1);
     EXPECT_STREQ(PQgetvalue(rows.get(),0,0),"2");
     EXPECT_STREQ(PQgetvalue(rows.get(),0,1),"1");
+
+    // Exercise the actual PAR consumer, including consent and JARM failure.
+    const auto sessionName="par-session-"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',1,1,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,fingerprint("-session")}));
+    using Decision=oauth::NativeAuthorizationDecision;
+    bool failSign=false;
+    int signedCalls=0;
+    const auto sign=[&](const oauth::AuthorizationRequest& request,bool denied)->fnd::Result<std::string>{
+        ++signedCalls;
+        EXPECT_EQ(request.redirectUri(),redirect);
+        EXPECT_EQ(request.state(),std::optional<std::string>{"fixture-state"});
+        if (failSign) return fnd::fail(fnd::ErrorCode::Unavailable);
+        return std::string{denied?"fixture-denial":"fixture-response"};
+    };
+    auto complete=[&](auto& store,std::string par,std::string suffix,Decision decision,
+        fnd::Instant now=kNow+1s,std::string owner={}) {
+        return store.completeOAuthAuthorizationAsync(client,fingerprint(par),std::nullopt,
+            ids::IdentityId{owner.empty()?seed.owner:owner},openproof::session::SessionId{sessionName},
+            decision,client+suffix,fingerprint("-code"+suffix),now,5min,sign);
+    };
+    EXPECT_FALSE(run(complete(foreign,"-direct","-foreign",Decision::Approve)));
+    EXPECT_FALSE(run(complete(native,"-direct","-wrong-owner",Decision::Approve,kNow+1s,seed.secondOwner)));
+    EXPECT_FALSE(run(complete(native,"-direct","-stale",Decision::Approve,kNow+61s)));
+    auto preview=run(complete(native,"-direct","-preview",Decision::ExistingConsent));
+    ASSERT_TRUE(preview);
+    EXPECT_TRUE(preview->consentRequired);
+    EXPECT_EQ(signedCalls,0);
+    failSign=true;
+    EXPECT_FALSE(run(complete(native,"-direct","-sign-failed",Decision::Approve)));
+    failSign=false;
+    auto afterFailure=run(complete(native,"-direct","-preview-after",Decision::ExistingConsent));
+    ASSERT_TRUE(afterFailure);
+    EXPECT_TRUE(afterFailure->consentRequired);
+    io.restart();
+    auto approveA=asio::co_spawn(io,complete(native,"-direct","-approve-a",Decision::Approve),asio::use_future);
+    auto approveB=asio::co_spawn(io,complete(native,"-direct","-approve-b",Decision::Approve),asio::use_future);
+    io.run();
+    auto approvedA=approveA.get(),approvedB=approveB.get();
+    ASSERT_NE(approvedA.has_value(),approvedB.has_value());
+    const auto& approved=approvedA?approvedA.value():approvedB.value();
+    ASSERT_TRUE(approved.signedResponse);
+    EXPECT_EQ(approved.signedResponse->expose(),"fixture-response");
+    EXPECT_FALSE(approved.consentRequired);
+    ASSERT_TRUE(push(native,"-covered",makeRequest(redirect,"openid")));
+    auto covered=run(complete(native,"-covered","-covered",Decision::ExistingConsent));
+    ASSERT_TRUE(covered);
+    EXPECT_FALSE(covered->consentRequired);
+    const std::string jarPar=a?"-jar-first":"-jar-second";
+    auto denied=run(complete(native,jarPar,"-denied",Decision::Deny));
+    ASSERT_TRUE(denied);
+    ASSERT_TRUE(denied->signedResponse);
+    EXPECT_EQ(denied->signedResponse->expose(),"fixture-denial");
+    EXPECT_FALSE(run(complete(native,jarPar,"-replay-denied",Decision::Approve)));
+    const auto finalState=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_pushed_authorization_requests WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_authorization_codes WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_consents WHERE client_id=$1 AND revoked_at_ms IS NULL)::text",
+        {client});
+    ASSERT_EQ(PQntuples(finalState.get()),1);
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,0),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,1),"2");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,2),"1");
 }
 
 TEST(PostgresCanonicalCoroutineTest, NativeCodeExchangeConsumesExactlyOnceAndRollsBackFailedSigning)

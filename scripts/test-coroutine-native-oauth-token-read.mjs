@@ -297,7 +297,8 @@ test("PAR authenticates and validates request parameters and pinned JAR before a
     "std::string{expectedKeyId}","std::string{expectedClient.value()}","audienceMatches",
     "expiresAt<=now","expiresAt-issuedAt>std::chrono::minutes{10}","parseParAuthorization(parameters)"])
     assert.ok(jar.includes(term),term);
-  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pushOAuthAuthorizationAsync("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pushOAuthAuthorizationAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync("));
   const ordered=["FOR SHARE OF c,a,o","if (!authenticated)","oauth_client_request_signing_keys",
     "WHERE client_id=$1 FOR SHARE","verifyJar(required","client::matchesRegisteredRedirect",
     "oauth_client_scopes","oauth_resource_scopes","INSERT INTO openproof.oauth_jar_replays",
@@ -315,4 +316,41 @@ test("PAR authenticates and validates request parameters and pinned JAR before a
   assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && path=="\/oauth\/par"/);
   assert.match(read("src/client/model.cpp"),/return matchesRegisteredRedirect\(m_state->kind,item.value\(\),redirectUri\)/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeParPreservesLoopbackAndCommitsJarReplayAtomically/);
+});
+test("browser authorization revalidates session and consent and commits PAR consumption with code issuance",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::authorizeBrowser("),http.indexOf("CoroutineTokenReadAdapter::pushAuthorization("));
+  for(const term of ["browserCookie(r,kBrowserSession)","browserCookie(r,\"__Host-openproof-consent-csrf\")",
+    "security::constantTimeEquals(expected->expose(),*csrf)","co_await m_devicePoll->authenticate",
+    "authorizationCsrf(m_codeExchange->codeKey,actor.value(),target","submittedCsrf.reset()",
+    "co_await m_par->complete(","actor->identity(),actor->id(),decision",
+    "security::hmacSha256(m_codeExchange->codeKey,code.expose())",
+    "completed->consentRequired","htmlEscape(completed->clientName)","completed->signedResponse",
+    "authorizationCookie(\"\",0)"])
+    assert.ok(body.includes(term),term);
+  assert.ok(body.indexOf("submittedCsrf.reset()")<body.indexOf("co_await m_par->complete("));
+  assert.ok(body.indexOf("co_await m_par->complete(")<body.indexOf("completed->signedResponse"));
+  assert.match(body,/std::nullopt,std::move\(verify\),true\)/);
+  assert.match(http,/authorization-browser:"\+std::string\{actor.id\(\).value\(\)\}/);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync("));
+  const ordered=["FOR SHARE OF c,a,o","FROM openproof.oauth_pushed_authorization_requests",
+    "AND issued_at_ms<=$3 AND expires_at_ms>$3 FOR UPDATE","client::matchesRegisteredRedirect",
+    "oauth_client_scopes","oauth_resource_scopes","s.id=$3 AND s.state=0",
+    "FOR UPDATE OF i FOR SHARE OF s","observed-authenticatedAt>=request.maximumAuthenticationAge()->count()",
+    "FROM openproof.oauth_consents","if (!covered)","signResponse(request,decision==Decision::Deny)",
+    "INSERT INTO openproof.oauth_consents","INSERT INTO openproof.oauth_authorization_codes",
+    "INSERT INTO openproof.oauth_authorization_code_scopes",
+    "DELETE FROM openproof.oauth_pushed_authorization_requests","AND client_id=$2 RETURNING client_id",
+    'execute("COMMIT",{})',"co_return std::move(result)"];
+  let previous=-1;
+  for(const term of ordered){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(store,/co_return oauth::NativeAuthorizationResult\{request,clientName,true,std::nullopt\}/);
+  assert.match(store,/if \(decision!=Decision::Deny\)/);
+  assert.match(app,/reader->completeOAuthAuthorizationAsync/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/authorize"\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/consent"\)/);
+  assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && \(path=="\/oauth\/authorize" \|\| path=="\/oauth\/consent"\)/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Exercise the actual PAR consumer, including consent and JARM failure/);
 });
