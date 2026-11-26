@@ -439,7 +439,6 @@ SensitiveString::~SensitiveString() noexcept
 
 asio::awaitable<LdapsResult> AsyncLdapsClient::authenticate(LdapsRequest request)
 {
-    const Deadline deadline = Clock::now() + request.timeout;
     const auto endpoint = parseLdapsUri(request.uri);
     if (!endpoint || !printable(request.baseDn, 2048U)
         || !printable(request.username, 320U)
@@ -451,7 +450,26 @@ asio::awaitable<LdapsResult> AsyncLdapsClient::authenticate(LdapsRequest request
         || request.usernameAttribute.empty() || request.subjectAttribute.empty()) {
         co_return LdapsResult{LdapsFailure::InvalidConfiguration};
     }
+    // cancel_after's timer, resolver and socket completions must be
+    // serialized even if HTTP handler workers share a multithreaded executor.
+    // Start the absolute budget before dispatch, not after a queued wait.
+    const Deadline deadline = Clock::now() + request.timeout;
+    auto executor = co_await asio::this_coro::executor;
+    try {
+        co_return co_await asio::co_spawn(asio::make_strand(executor),
+            authenticateSerialized(std::move(request), deadline), asio::use_awaitable);
+    } catch (const std::exception&) {
+        co_return LdapsResult{Clock::now() >= deadline
+            ? LdapsFailure::Timeout : LdapsFailure::Connection};
+    }
+}
 
+asio::awaitable<LdapsResult> AsyncLdapsClient::authenticateSerialized(
+    LdapsRequest request, Deadline deadline)
+{
+    const auto endpoint = parseLdapsUri(request.uri);
+    if (!endpoint) co_return LdapsResult{LdapsFailure::InvalidConfiguration};
+    if (Clock::now() >= deadline) co_return LdapsResult{LdapsFailure::Timeout};
     try {
         // Constructing the SSL context performs no socket operations; all
         // server I/O is dispatched asynchronously with the same deadline.
@@ -463,6 +481,7 @@ asio::awaitable<LdapsResult> AsyncLdapsClient::authenticate(LdapsRequest request
         auto executor = co_await asio::this_coro::executor;
         Tcp::resolver resolver{executor};
         boost::system::error_code error;
+        if (Clock::now() >= deadline) co_return LdapsResult{LdapsFailure::Timeout};
         auto endpoints = co_await resolver.async_resolve(
             endpoint->first, std::to_string(endpoint->second),
             asio::cancel_after(deadline - Clock::now(),
