@@ -61,7 +61,8 @@ endif()
 # compatibility worker until native callback + session issuance are E2E tested.
 add_library(openproof_authentication_async_federated_start_http STATIC
     coroutine_federated_start_http.cpp
-    coroutine_federated_callback_http.cpp)
+    coroutine_federated_callback_http.cpp
+    boost_json.cpp)
 target_compile_features(openproof_authentication_async_federated_start_http PUBLIC cxx_std_26)
 target_include_directories(openproof_authentication_async_federated_start_http PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
