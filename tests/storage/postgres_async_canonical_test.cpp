@@ -1590,6 +1590,119 @@ TEST(PostgresCanonicalCoroutineTest, NativeConsentListAndRevokeAreTenantScopedAn
     ASSERT_TRUE(list(owner));
 }
 
+TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDuplicateVerifiedOwner)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace acc=openproof::account;
+    namespace cred=openproof::credentials;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutineVerificationChallengeStore disabled{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.suspendedOrg},1U,500ms,1000ms,3000ms};
+    const auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U);
+    ASSERT_TRUE(policy);
+    auto hasher=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    ASSERT_TRUE(hasher);
+    auto password=hasher->hash(fnd::SecretString{"fixture-password"});
+    ASSERT_TRUE(password);
+    auto key=acc::VerificationKey::create(fnd::SecretString{std::string(32U,'v')});
+    ASSERT_TRUE(key);
+    const idp::ProviderId provider{"signup-"+seed.suffix};
+    const auto email="fresh-"+seed.suffix+"@example.test";
+    const auto existing="existing-"+seed.suffix+"@example.test";
+    const auto ambiguous="ambiguous-"+seed.suffix+"@example.test";
+    const auto broken="rollback-"+seed.suffix+"@example.test";
+    using Result=fnd::Result<pg::CoroutineVerificationChallengeStore::PendingSignup>;
+    auto capture=[&](pg::CoroutineVerificationChallengeStore& adapter,std::string destination,
+        std::optional<Result>& result)->asio::awaitable<void> {
+        result.emplace(co_await adapter.provisionSignupAsync(provider,std::move(destination),
+            password.value(),std::string{"Fixture signup"},key.value(),kNow,24h));
+    };
+    auto run=[&](pg::CoroutineVerificationChallengeStore& adapter,std::string destination){
+        std::optional<Result> result;
+        io.restart();
+        auto done=asio::co_spawn(io,capture(adapter,std::move(destination),result),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    auto count=[&](std::string_view sql,std::initializer_list<std::string> params){
+        auto rows=query(sql,params);
+        return std::string{PQgetvalue(rows.get(),0,0)};
+    };
+    std::optional<Result> first,second;
+    io.restart();
+    auto a=asio::co_spawn(io,capture(store,email,first),asio::use_future);
+    auto b=asio::co_spawn(io,capture(store,email,second),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(a.get());
+    ASSERT_NO_THROW(b.get());
+    ASSERT_TRUE(first && second);
+    ASSERT_NE(first->has_value(),second->has_value());
+    auto& winner=first->has_value()?first.value():second.value();
+    auto& loser=first->has_value()?second.value():first.value();
+    EXPECT_EQ(loser.error().code(),fnd::ErrorCode::AlreadyExists);
+    ASSERT_TRUE(winner->createdIdentity);
+    const std::string owner{winner->dispatch.identity().value()};
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.identities i JOIN openproof.identity_profiles p ON p.identity_id=i.id "
+        "WHERE i.organization_id=$1 AND p.email=$2 AND i.status=3 AND NOT p.email_verified",{seed.org,email}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.password_credentials WHERE identity_id=$1",{owner}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations "
+        "WHERE provider=$1 AND external_subject=$2 AND identity_id=$3 AND verification_id IS NULL",
+        {std::string{provider.value()},email,owner}),"1");
+    const auto digest=acc::VerificationPreparation::digest(key.value(),winner->dispatch.id(),winner->dispatch.secret());
+    ASSERT_TRUE(digest);
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges "
+        "WHERE id=$1 AND identity_id=$2 AND purpose=0 AND secret_digest=decode($3,'hex')",
+        {std::string{winner->dispatch.id().value()},owner,fnd::toHex(digest->bytes())}),"1");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"0");
+    ASSERT_NO_THROW(static_cast<void>(query("UPDATE openproof.identity_profiles SET email=$2,email_verified=true WHERE identity_id=$1",
+        {seed.owner,existing})));
+    auto linked=run(store,existing);
+    ASSERT_TRUE(linked);
+    EXPECT_FALSE(linked->createdIdentity);
+    EXPECT_EQ(linked->dispatch.identity().value(),seed.owner);
+    EXPECT_EQ(count("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
+    ASSERT_NO_THROW(static_cast<void>(query("INSERT INTO openproof.identity_profiles(identity_id,email,email_verified,created_at_ms,updated_at_ms)"
+        " VALUES($1,$3,true,1770000000000,1770000000000),($2,$3,true,1770000000000,1770000000000)",
+        {seed.secondOwner,seed.emptyConnectionsOwner,ambiguous})));
+    auto conflict=run(store,ambiguous);
+    ASSERT_FALSE(conflict);
+    EXPECT_EQ(conflict.error().code(),fnd::ErrorCode::Conflict);
+    EXPECT_FALSE(run(disabled,"disabled-"+seed.suffix+"@example.test"));
+    // Inject a late insertion failure, after identity/profile/reservation/
+    // password writes, using an isolated fixture-only CHECK constraint.
+    // suffix is generated by Seed; use a fixed name in the disposable runner
+    // and quote the fixture email with libpq to avoid interpolating SQL data.
+    const auto quoted=PQescapeLiteral(fixture.get(),broken.data(),broken.size());
+    ASSERT_NE(quoted,nullptr);
+    const std::string escaped{quoted};
+    PQfreemem(quoted);
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.account_verification_challenges ADD CONSTRAINT "
+        "native_signup_fixture_rollback CHECK(destination<>"+escaped+")",{})));
+    auto failed=run(store,broken);
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.account_verification_challenges "
+        "DROP CONSTRAINT native_signup_fixture_rollback",{})));
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.identity_profiles WHERE email=$1",{broken}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE external_subject=$1",{broken}),"0");
+    EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE destination=$1",{broken}),"0");
+}
+
 TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPreserveLatestOwnerChallenge)
 {
     const auto dsn = disposableDsn();

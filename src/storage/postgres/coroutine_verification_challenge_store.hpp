@@ -6,18 +6,18 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 
 import openproof.account;
+import openproof.credentials;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
 
 namespace openproof::storage::postgres {
 
-/** Tenant-bound native challenge persistence for existing active accounts.
- * Only contact verification purposes are supported; signup/reset and
- * their separate authorization/lifecycle requirements remain legacy.
- * No raw verification secret is stored or accepted by this adapter.
+/** Tenant-bound native challenge persistence and pending signup provisioning.
+ * No plaintext password or raw verification secret is supplied to SQL.
  */
 class CoroutineVerificationChallengeStore final {
 public:
@@ -49,6 +49,17 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     replacePublicEmailAsync(account::VerificationChallenge challenge,
         identity::provider::ProviderId provider);
+
+    struct PendingSignup final {
+        account::VerificationDispatch dispatch;
+        bool createdIdentity;
+    };
+    // The caller completes its bounded KDF before entering this method.
+    // The verification key must outlive the awaited operation.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<PendingSignup>>
+    provisionSignupAsync(identity::provider::ProviderId provider,std::string email,
+        credentials::PasswordHash passwordHash,std::optional<std::string> displayName,
+        const account::VerificationKey& key,foundation::Instant now,foundation::Duration lifetime);
 
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.

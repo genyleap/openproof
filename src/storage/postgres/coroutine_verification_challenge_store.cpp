@@ -1,6 +1,7 @@
 #include "async_pool.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,8 @@
 #include <vector>
 
 #include "coroutine_verification_challenge_store.hpp"
+
+import openproof.security;
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -141,6 +144,191 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
     account::VerificationChallenge challenge,identity::provider::ProviderId provider)
 {
     return replaceImpl(std::move(challenge),std::move(provider),true);
+}
+
+asio::awaitable<foundation::Result<CoroutineVerificationChallengeStore::PendingSignup>>
+CoroutineVerificationChallengeStore::provisionSignupAsync(
+    identity::provider::ProviderId provider,std::string email,credentials::PasswordHash passwordHash,
+    std::optional<std::string> displayName,const account::VerificationKey& key,
+    foundation::Instant now,foundation::Duration lifetime)
+{
+    auto normalized=account::VerificationPreparation::normalizePublicEmail(std::move(email));
+    const auto valid=[](std::string_view value,std::size_t maximum) {
+        return !value.empty() && value.size()<=maximum
+            && std::ranges::none_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7fU;
+            });
+    };
+    if (!normalized || !valid(normalized.value(),320U)
+        || !valid(provider.value(),200U)
+        || (displayName && !valid(*displayName,256U))
+        || passwordHash.encoded().empty() || passwordHash.encoded().size()>4096U
+        || lifetime<=foundation::Duration::zero() || lifetime>std::chrono::hours{48}
+        || now.time_since_epoch().count()<0
+        || now>foundation::Instant::max()-lifetime)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const std::string destination=std::move(normalized).value();
+    const std::string providerName{provider.value()};
+    const std::string tenant{m_impl->tenant.value()};
+    const auto observed=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+        // Same-subject native signups serialize. The global reservation PK
+        // remains the final arbiter with compatibility writers.
+        Params subjectLock{"openproof/signup/v1:"+std::to_string(providerName.size())+":"+providerName+destination};
+        static_cast<void>(co_await connection.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            std::move(subjectLock),remaining(deadline)));
+        Params tenantParams{tenant};
+        const auto organization=co_await connection.query(
+            "SELECT id FROM openproof.organizations WHERE id=$1 AND state=0 FOR SHARE",
+            std::move(tenantParams),remaining(deadline));
+        if (!exactRow(organization,tenant)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        }
+        Params subjectParams{providerName,destination,observed};
+        const auto occupied=co_await connection.query(
+            "SELECT identity_id FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2 "
+            "UNION ALL SELECT identity_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject=$2 AND expires_at_ms>$3 LIMIT 1",
+            std::move(subjectParams),remaining(deadline));
+        if (!occupied.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+        }
+        // At most two nonterminal candidates are needed to detect ambiguity.
+        // Lock canonical rows before revalidating the selected profile and
+        // local link. No caller-selected identity may receive a credential.
+        Params matchesParams{tenant,destination};
+        const auto matches=co_await connection.query(
+            "SELECT i.id,i.status FROM openproof.identities i JOIN openproof.identity_profiles p ON p.identity_id=i.id "
+            "WHERE i.organization_id=$1 AND p.email_verified=true AND lower(p.email)=lower($2) "
+            "AND i.status NOT IN (4,5) ORDER BY i.status,i.id LIMIT 2 FOR UPDATE OF i",
+            std::move(matchesParams),remaining(deadline));
+        if (matches.rows.size()>1U) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            // Active candidates sort before blocked candidates. Two blocked
+            // matches retain the legacy AlreadyExists response.
+            const auto& first=matches.rows.front();
+            if (first.size()!=2U || !first[1])
+                throw std::runtime_error{"Invalid signup identity row"};
+            co_return foundation::fail(*first[1]=="0"?foundation::ErrorCode::Conflict
+                :foundation::ErrorCode::AlreadyExists);
+        }
+        const bool createdIdentity=matches.rows.empty();
+        std::string owner;
+        if (!createdIdentity) {
+            const auto& row=matches.rows.front();
+            if (row.size()!=2U || !row[0] || !row[1])
+                throw std::runtime_error{"Invalid signup identity row"};
+            if (*row[1]!="0") {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+            owner=*row[0];
+            Params eligibilityParams{owner,destination,providerName};
+            const auto eligible=co_await connection.query(
+                "SELECT p.identity_id FROM openproof.identity_profiles p "
+                "WHERE p.identity_id=$1 AND p.email_verified=true AND lower(p.email)=lower($2) "
+                "AND NOT EXISTS(SELECT 1 FROM openproof.external_identities e "
+                "WHERE e.identity_id=$1 AND e.provider=$3) "
+                "AND NOT EXISTS(SELECT 1 FROM openproof.password_credentials c WHERE c.identity_id=$1) "
+                "FOR SHARE OF p",std::move(eligibilityParams),remaining(deadline));
+            if (!exactRow(eligible,owner)) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+        } else {
+            auto random=security::randomTokenBase64Url(24U);
+            if (!random) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(random.error());
+            }
+            owner="opi_"+std::move(random).value();
+            Params identityParams{owner,tenant,observed};
+            const auto inserted=co_await connection.query(
+                "INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) "
+                "VALUES($1,$2,0,3,$3) RETURNING id",std::move(identityParams),remaining(deadline));
+            if (!exactRow(inserted,owner)) throw std::runtime_error{"Invalid signup identity insert"};
+            Params profileParams{owner,std::move(displayName),destination,observed};
+            const auto profile=co_await connection.query(
+                "INSERT INTO openproof.identity_profiles(identity_id,display_name,email,email_verified,created_at_ms,updated_at_ms) "
+                "VALUES($1,$2,$3,false,$4,$4) RETURNING identity_id",
+                std::move(profileParams),remaining(deadline));
+            if (!exactRow(profile,owner)) throw std::runtime_error{"Invalid signup profile insert"};
+        }
+        auto prepared=account::VerificationPreparation::prepare(key,core::IdentityId{owner},
+            account::VerificationPurpose::SignupEmail,account::VerificationChannel::Email,
+            destination,now,lifetime);
+        if (!prepared) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(prepared.error());
+        }
+        const auto& challenge=prepared->first;
+        const std::string expires=std::to_string(challenge.expiresAt().time_since_epoch().count());
+        const std::string challengeId{challenge.id().value()};
+        // Do not tag signup reservations as contact-change generations:
+        // existing signup verification and resend require an untagged row.
+        Params reserveParams{providerName,destination,owner,expires,observed};
+        const auto reserved=co_await connection.query(
+            "INSERT INTO openproof.pending_external_identity_reservations AS r "
+            "(provider,external_subject,identity_id,expires_at_ms,verification_id) "
+            "VALUES($1,$2,$3,$4,NULL) ON CONFLICT(provider,external_subject) DO UPDATE "
+            "SET identity_id=EXCLUDED.identity_id,expires_at_ms=EXCLUDED.expires_at_ms,verification_id=NULL "
+            "WHERE r.expires_at_ms<=$5 RETURNING identity_id",
+            std::move(reserveParams),remaining(deadline));
+        if (!exactRow(reserved,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+        }
+        // Recheck external ownership after obtaining the reservation. No
+        // provisioned credential may overwrite an existing provider link.
+        Params linkParams{providerName,destination,owner};
+        const auto linked=co_await connection.query(
+            "SELECT identity_id FROM openproof.external_identities WHERE provider=$1 "
+            "AND (external_subject=$2 OR identity_id=$3) LIMIT 1",
+            std::move(linkParams),remaining(deadline));
+        if (!linked.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+        }
+        Params credentialParams{owner,std::string{passwordHash.encoded()},observed};
+        const auto credential=co_await connection.query(
+            "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES($1,$2,$3) ON CONFLICT(identity_id) DO NOTHING RETURNING identity_id",
+            std::move(credentialParams),remaining(deadline));
+        if (!exactRow(credential,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+        }
+        // A stale, previously issued signup secret cannot activate this
+        // new password generation. Only the newly persisted proof survives.
+        Params oldChallengeParams{owner};
+        static_cast<void>(co_await connection.query(
+            "WITH obsolete AS (DELETE FROM openproof.account_verification_challenges "
+            "WHERE identity_id=$1 AND purpose=0 RETURNING id,identity_id) "
+            "DELETE FROM openproof.pending_external_identity_reservations r USING obsolete c "
+            "WHERE r.verification_id=c.id AND r.identity_id=c.identity_id",
+            std::move(oldChallengeParams),remaining(deadline)));
+        Params challengeParams{challengeId,owner,destination,foundation::toHex(challenge.digest().bytes()),observed,expires};
+        const auto stored=co_await connection.query(
+            "INSERT INTO openproof.account_verification_challenges "
+            "(id,identity_id,purpose,channel,destination,secret_digest,attempts,created_at_ms,expires_at_ms) "
+            "VALUES($1,$2,0,0,$3,decode($4,'hex'),0,$5,$6) RETURNING id",
+            std::move(challengeParams),remaining(deadline));
+        if (!exactRow(stored,challengeId)) throw std::runtime_error{"Invalid signup challenge insert"};
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        // Delivery begins only after the durable transaction has committed.
+        co_return PendingSignup{std::move(prepared->second),createdIdentity};
+    } catch (const std::exception&) {
+        // Pool drops a non-idle lease; an ambiguous commit is never retried.
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native signup persistence is unavailable.");
+    }
 }
 
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceImpl(
