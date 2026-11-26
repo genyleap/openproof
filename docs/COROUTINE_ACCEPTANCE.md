@@ -4654,3 +4654,17 @@ manifest is integrity metadata, not a cryptographic signature; trust
 the Actions artifact origin. A separate full native local/account HTTP
 workload now checks password-upgrade status with valid and inactive
 identities. The official coroutine migration gate remains unchanged.
+
+### Native explicit password-policy confirmation
+
+The existing local-login and account-session opt-in also covers POST
+/account/password/upgrade for first-party cookies. Retains HTTPS same-origin
+and identity/IP rate limits, strict JSON, delegated OAuth compatibility, and
+no-store. Raw request and parsed password buffers are scrubbed; password
+verification and optional Argon2id generation share a bounded worker permit.
+The tenant/owner/provider/password-generation snapshot is released before
+KDF and checked again by SQL CAS (including already-current hashes).
+No password-reset timestamp, TOTP, recovery code, or session is mutated.
+The C++ regressions exercise wrong passwords, current hashes, real Argon2id
+upgrade and timestamp preservation; HTTP tests cover origin and policy denial.
+No new schema or runtime flag is introduced.

@@ -1160,7 +1160,17 @@ async function main() {
             "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid')");
         }
         assert.equal(counts(), beforeStatus);
-        console.log("- native password upgrade HTTP: owner-bound metadata, no-store and inactive identity denial passed");
+        const postOrigin = { origin: issuer, "sec-fetch-site": "same-origin" };
+        expectStatus(await jsonRequest("/account/password/upgrade", "POST",
+          { password: consumerPassword }, consumerJar, { origin: "https://foreign.invalid" }), 403);
+        expectStatus(await jsonRequest("/account/password/upgrade", "POST",
+          { password: consumerPassword, owner: "foreign" }, consumerJar, postOrigin), 400);
+        // Default test policy is scrypt: explicit Argon2id upgrade must
+        // refuse instead of silently changing the policy or credential.
+        expectStatus(await jsonRequest("/account/password/upgrade", "POST",
+          { password: consumerPassword }, consumerJar, postOrigin), 412);
+        assert.equal(counts(), beforeStatus);
+        console.log("- native password upgrade HTTP: owner-bound metadata, no-store, inactive identity denial, origin and policy enforcement passed");
       }
     }
     if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {

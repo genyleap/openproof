@@ -31,6 +31,10 @@ public:
     // before generating a replacement. Persistence uses a separate CAS.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<PasswordHash>>>
     rehashAsync(foundation::SecretString password, PasswordHash verified);
+    // Explicit account upgrade must verify the password even when the hash
+    // already satisfies policy. Both KDF operations share one permit.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<PasswordHash>>>
+    confirmUpgradeAsync(foundation::SecretString password, PasswordHash expected);
 private:
     class Impl;
     explicit BoundedPasswordExecutor(std::unique_ptr<Impl> implementation);

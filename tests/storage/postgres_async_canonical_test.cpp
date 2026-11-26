@@ -1801,6 +1801,31 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
         ASSERT_TRUE(needed);
         ASSERT_TRUE(needed->second.has_value());
         EXPECT_TRUE(*needed->second);
+        auto bad = run(store.confirmPasswordUpgradeAsync(ids::IdentityId{seed.owner},
+            fnd::SecretString{"wrong-password"}, *upgradeWorker.value()));
+        ASSERT_FALSE(bad);
+        EXPECT_EQ(bad.error().code(), fnd::ErrorCode::AuthenticationFailed);
+        EXPECT_FALSE(run(store.confirmPasswordUpgradeAsync(ids::IdentityId{seed.foreignOwner},
+            fnd::SecretString{"fixture-password"}, *upgradeWorker.value())));
+        auto upgraded = run(store.confirmPasswordUpgradeAsync(ids::IdentityId{seed.owner},
+            fnd::SecretString{"fixture-password"}, *upgradeWorker.value()));
+        ASSERT_TRUE(upgraded);
+        EXPECT_EQ(upgraded->first.value(),seed.owner);
+        EXPECT_TRUE(upgraded->second);
+        auto snapshot = run(store.readAsync(idp::ExternalSubject{seed.subject}));
+        ASSERT_TRUE(snapshot && snapshot->has_value());
+        EXPECT_TRUE(snapshot->value().passwordHash.starts_with("$argon2id$"));
+        EXPECT_EQ(snapshot->value().passwordChangedAt,"1770000000000");
+        EXPECT_FALSE(run(store.confirmPasswordUpgradeAsync(ids::IdentityId{seed.owner},
+            fnd::SecretString{"wrong-password"}, *upgradeWorker.value())));
+        auto unchanged = run(store.confirmPasswordUpgradeAsync(ids::IdentityId{seed.owner},
+            fnd::SecretString{"fixture-password"}, *upgradeWorker.value()));
+        ASSERT_TRUE(unchanged);
+        EXPECT_FALSE(unchanged->second);
+        // Restore the original fixture for the separate scrypt login proofs.
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "UPDATE openproof.password_credentials SET password_hash=$2 WHERE identity_id=$1",
+            {seed.owner,std::string{hash->encoded()}})));
     }
     auto proof = [&](std::string password, std::optional<std::string> totp = std::nullopt,
                      std::optional<std::string> recovery = std::nullopt,

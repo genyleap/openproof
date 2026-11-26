@@ -2882,6 +2882,7 @@ addProtectedRoutes(gateway::Router& router,
                 };
             }
             accountHttp::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus passwordStatusReader;
+            accountHttp::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade passwordUpgradeConfirm;
             if (nativeLocalEnabled) {
                 if (!nativeLocalStore || !nativeLocalPasswords) {
                     reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -2891,6 +2892,10 @@ addProtectedRoutes(gateway::Router& router,
                 passwordStatusReader = [store = nativeLocalStore.get(), worker = nativeLocalPasswords.get()]
                     (identity::IdentityId owner) {
                     return store->readPasswordUpgradeStatusAsync(std::move(owner), *worker);
+                };
+                passwordUpgradeConfirm = [store = nativeLocalStore.get(), worker = nativeLocalPasswords.get()]
+                    (identity::IdentityId owner, fnd::SecretString password) {
+                    return store->confirmPasswordUpgradeAsync(std::move(owner),std::move(password),*worker);
                 };
             }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
@@ -2904,7 +2909,8 @@ addProtectedRoutes(gateway::Router& router,
                 [service](identity::IdentityId owner, session::SessionId target) {
                     return service->revokeOwned(std::move(owner), std::move(target));
                 }, std::move(profileReader), std::move(connectionsReader),
-                std::move(totpStatusReader), std::move(passwordStatusReader));
+                std::move(totpStatusReader), std::move(passwordStatusReader),
+                std::move(passwordUpgradeConfirm));
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
@@ -3016,6 +3022,7 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeLocalEnabled && nativeAccountEnabled && platform.account().enabled()) {
             nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Get);
+            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Post);
         }
         if (nativeAdminReadEnabled) {
             if (!nativeSessions || !nativeCanonical) {

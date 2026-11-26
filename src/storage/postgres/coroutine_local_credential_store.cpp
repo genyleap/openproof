@@ -176,6 +176,85 @@ CoroutineLocalCredentialStore::readPasswordUpgradeStatusAsync(
     }
 }
 
+asio::awaitable<foundation::Result<std::pair<core::IdentityId, bool>>>
+CoroutineLocalCredentialStore::confirmPasswordUpgradeAsync(core::IdentityId owner,
+    foundation::SecretString password, credentials::BoundedPasswordExecutor& policy)
+{
+    using Output = std::pair<core::IdentityId, bool>;
+    if (!bounded(owner.value(), 200U) || password.empty() || password.expose().size()>1024U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    if (!policy.prefersArgon2id())
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    try {
+        std::string subject;
+        std::string encoded;
+        std::string changedAt;
+        {
+            const auto deadline = Clock::now() + m_impl->queryTimeout;
+            auto lease = co_await m_impl->pool.acquire(deadline);
+            Params params{std::string{owner.value()}, std::string{m_impl->tenant.value()},
+                          std::string{m_impl->provider.value()}};
+            const auto rows = co_await lease.connection().query(
+                "SELECT e.external_subject,CASE WHEN octet_length(p.password_hash)<=4096 "
+                "THEN p.password_hash END,p.changed_at_ms::text FROM openproof.identities i "
+                "JOIN openproof.organizations o ON o.id=i.organization_id "
+                "JOIN openproof.external_identities e ON e.identity_id=i.id AND e.provider=$3 "
+                "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+                "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 LIMIT 2",
+                std::move(params), remaining(deadline));
+            if (rows.rows.empty())
+                co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+            if (rows.rows.size()!=1U || rows.rows.front().size()!=3U)
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            const auto& row = rows.rows.front();
+            if (!row[0] || !bounded(*row[0],1000U) || !row[1] || !bounded(*row[1],4096U)
+                || !row[2] || !decimal(*row[2]))
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            subject=*row[0]; encoded=*row[1]; changedAt=*row[2];
+        }
+        // The lease was destroyed before dispatching any memory-hard KDF.
+        auto hash = credentials::PasswordHash::parse(encoded);
+        if (!hash) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        auto replacement = co_await policy.confirmUpgradeAsync(std::move(password),
+                                                               std::move(hash).value());
+        if (!replacement) co_return foundation::fail(replacement.error());
+        const auto deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{owner.value()}, encoded, changedAt,
+            std::string{m_impl->provider.value()}, subject, std::string{m_impl->tenant.value()}};
+        // Even an already-current hash requires a fresh generation check.
+        // No TOTP state or changed_at_ms mutation is part of a rehash.
+        constexpr std::string_view predicate =
+            " WHERE p.identity_id=$1 AND p.password_hash=$2 AND p.changed_at_ms=$3::bigint "
+            "AND EXISTS(SELECT 1 FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "WHERE i.id=p.identity_id AND e.provider=$4 AND e.external_subject=$5 "
+            "AND i.organization_id=$6 AND i.status=0 AND o.state=0)";
+        std::string sql;
+        const bool upgraded = replacement->has_value();
+        if (upgraded) {
+            if (!bounded(replacement->value().encoded(),4096U))
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            params.emplace_back(std::string{replacement->value().encoded()});
+            sql = "UPDATE openproof.password_credentials p SET password_hash=$7";
+            sql += predicate;
+            sql += " RETURNING p.identity_id";
+        } else {
+            sql = "SELECT p.identity_id FROM openproof.password_credentials p";
+            sql += predicate;
+        }
+        const auto rows = co_await lease.connection().query(sql, std::move(params), remaining(deadline));
+        if (rows.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+        auto status = confirmed(rows,owner.value());
+        if (!status) co_return foundation::fail(status.error());
+        co_return Output{std::move(owner),upgraded};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,std::string{kUnavailable});
+    }
+}
+
 asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::confirmPasswordOnlyAsync(
     idp::ExternalSubject subject, LocalCredentialSnapshot snapshot)
 {

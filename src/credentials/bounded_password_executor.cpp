@@ -52,14 +52,15 @@ asio::awaitable<foundation::Result<bool>> verifyWorker(
 }
 
 asio::awaitable<foundation::Result<std::optional<PasswordHash>>> rehashWorker(
-    Permit permit, foundation::SecretString password, PasswordHash verified)
+    Permit permit, foundation::SecretString password, PasswordHash verified, bool requireProof)
 {
     auto needed = permit.state->hasher.needsRehash(verified);
     if (!needed) co_return foundation::fail(needed.error());
-    if (!needed.value()) co_return std::optional<PasswordHash>{};
+    if (!needed.value() && !requireProof) co_return std::optional<PasswordHash>{};
     auto matches = permit.state->hasher.verify(password, verified);
     if (!matches) co_return foundation::fail(matches.error());
     if (!matches.value()) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    if (!needed.value()) co_return std::optional<PasswordHash>{};
     auto replacement = permit.state->hasher.hash(password);
     if (!replacement) co_return foundation::fail(replacement.error());
     co_return std::optional<PasswordHash>{std::move(replacement).value()};
@@ -129,7 +130,23 @@ asio::awaitable<foundation::Result<std::optional<PasswordHash>>> BoundedPassword
     if (!permit) co_return foundation::fail(foundation::ErrorCode::RateLimited);
     try {
         co_return co_await asio::co_spawn(m_impl->pool,
-            rehashWorker(std::move(*permit), std::move(password), std::move(verified)),
+            rehashWorker(std::move(*permit), std::move(password), std::move(verified), false),
+            asio::use_awaitable);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Result<std::optional<PasswordHash>>> BoundedPasswordExecutor::confirmUpgradeAsync(
+    foundation::SecretString password, PasswordHash expected)
+{
+    if (!prefersArgon2id())
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    auto permit = admit(m_impl->state);
+    if (!permit) co_return foundation::fail(foundation::ErrorCode::RateLimited);
+    try {
+        co_return co_await asio::co_spawn(m_impl->pool,
+            rehashWorker(std::move(*permit), std::move(password), std::move(expected), true),
             asio::use_awaitable);
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable);

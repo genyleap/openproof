@@ -49,13 +49,18 @@ public:
     using ReadPasswordUpgradeStatus = std::function<boost::asio::awaitable<
         foundation::Result<PasswordUpgradeStatus>>(identity::core::IdentityId)>;
 
+    using ConfirmPasswordUpgrade = std::function<boost::asio::awaitable<
+        foundation::Result<std::pair<identity::core::IdentityId, bool>>>(
+            identity::core::IdentityId, foundation::SecretString)>;
+
     CoroutineAccountSessionAdapter(
         gateway::HttpHandler& legacyAccount,
         gateway::http::CoroutineHttpHandler& asyncFallback,
         gateway::TokenBucketRateLimiter& limiter,
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
         ReadProfile readProfile = {}, ReadConnections readConnections = {},
-        ReadTotpStatus readTotpStatus = {}, ReadPasswordUpgradeStatus readPasswordUpgradeStatus = {});
+        ReadTotpStatus readTotpStatus = {}, ReadPasswordUpgradeStatus readPasswordUpgradeStatus = {},
+        ConfirmPasswordUpgrade confirmPasswordUpgrade = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -78,6 +83,8 @@ private:
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> passwordUpgradeStatusRead(
         gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> passwordUpgradeConfirm(
+        gateway::HttpRequest request);
     [[nodiscard]] static gateway::HttpResponse fail(
         const foundation::Error& failure, const gateway::HttpRequest& request);
     gateway::HttpHandler* m_legacyAccount;
@@ -90,6 +97,7 @@ private:
     ReadConnections m_readConnections;
     ReadTotpStatus m_readTotpStatus;
     ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
+    ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
 };
 
 } // namespace openproof::account::http
