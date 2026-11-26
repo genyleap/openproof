@@ -63,6 +63,12 @@ private:
         && request.path() == "/account/connections";
 }
 
+[[nodiscard]] bool totpStatusReadRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Get
+        && request.path() == "/account/totp";
+}
+
 [[nodiscard]] bool accountNamespace(const gateway::HttpRequest& request) noexcept
 {
     return request.path() == "/account"
@@ -128,12 +134,14 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     gateway::http::CoroutineHttpHandler& asyncFallback,
     gateway::TokenBucketRateLimiter& limiter,
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
-    ReadProfile readProfile, ReadConnections readConnections)
+    ReadProfile readProfile, ReadConnections readConnections,
+    ReadTotpStatus readTotpStatus)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
       m_readProfile(std::move(readProfile)),
-      m_readConnections(std::move(readConnections))
+      m_readConnections(std::move(readConnections)),
+      m_readTotpStatus(std::move(readTotpStatus))
 {
 }
 
@@ -158,6 +166,11 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         return !request.header("authorization").has_value()
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readConnections);
+    }
+    if (totpStatusReadRoute(request)) {
+        return !request.header("authorization").has_value()
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_readTotpStatus);
     }
     return static_cast<bool>(m_authenticate)
         && static_cast<bool>(m_list)
@@ -212,6 +225,9 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     }
     if (connectionsReadRoute(request)) {
         co_return co_await connectionsRead(std::move(request));
+    }
+    if (totpStatusReadRoute(request)) {
+        co_return co_await totpStatusRead(std::move(request));
     }
     // Only non-account requests can reach the fallback's native entry.
     // No synchronous AccountHttpApi method executes on the reactor.
@@ -393,6 +409,30 @@ CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
     }
     co_return jsonResponse(200,
         json::object{{"connections", std::move(connectionsJson)}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(), request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(), request);
+    auto status = co_await m_readTotpStatus(authenticated->identity());
+    if (!status) co_return fail(status.error(), request);
+    if (status->first != authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    co_return jsonResponse(200, json::object{
+        {"available", status->second.has_value()},
+        {"enabled", status->second.value_or(false)},
+        {"assurance", identity::provider::assuranceLevelName(authenticated->assurance())}});
 }
 
 } // namespace openproof::account::http

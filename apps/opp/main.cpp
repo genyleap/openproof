@@ -1444,6 +1444,24 @@ addProtectedRoutes(gateway::Router& router,
             "Native account connections require enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
+    // Status is read-only and independently gated; enrollment and disable
+    // remain on the compatibility implementation until migrated separately.
+    const auto nativeAccountTotpStatusFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS");
+    if (nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag != "0"
+        && *nativeAccountTotpStatusFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountTotpStatusEnabled =
+        nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "1";
+    if (nativeAccountTotpStatusEnabled
+        && (!nativeAccountEnabled || !platform.account().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native TOTP status requires enabled account sessions and account API."});
+        return ExitCode::ConfigurationError;
+    }
     // Wallet/Farcaster already expose native verification coroutines, but
     // their synchronous browser-handoff APIs are not yet migrated. Select
     // only the direct native start/complete pair with a separate opt-in.
@@ -2403,7 +2421,8 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
-            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled) {
+            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
+            || nativeAccountTotpStatusEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2589,6 +2608,18 @@ addProtectedRoutes(gateway::Router& router,
                     return reader->readConnectionsAsync(std::move(owner));
                 };
             }
+            accountHttp::CoroutineAccountSessionAdapter::ReadTotpStatus totpStatusReader;
+            if (nativeAccountTotpStatusEnabled) {
+                if (!nativeCanonical) {
+                    reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                        "Native TOTP status requires a canonical reader."});
+                    return ExitCode::ConfigurationError;
+                }
+                auto* reader = nativeCanonical.get();
+                totpStatusReader = [reader, providerId](identity::IdentityId owner) {
+                    return reader->readTotpStatusAsync(std::move(owner), providerId);
+                };
+            }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
                 healthApi, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
@@ -2599,7 +2630,8 @@ addProtectedRoutes(gateway::Router& router,
                 },
                 [service](identity::IdentityId owner, session::SessionId target) {
                     return service->revokeOwned(std::move(owner), std::move(target));
-                }, std::move(profileReader), std::move(connectionsReader));
+                }, std::move(profileReader), std::move(connectionsReader),
+                std::move(totpStatusReader));
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
@@ -2684,6 +2716,9 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountConnectionsEnabled) {
             nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);
+        }
+        if (nativeAccountTotpStatusEnabled) {
+            nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),

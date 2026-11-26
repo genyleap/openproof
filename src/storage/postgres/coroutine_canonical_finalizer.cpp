@@ -449,6 +449,50 @@ CoroutinePostgresCanonicalFinalizer::readConnectionsAsync(core::IdentityId owner
     }
 }
 
+asio::awaitable<foundation::Result<std::pair<core::IdentityId, std::optional<bool>>>>
+CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(
+    core::IdentityId owner, idp::ProviderId localProvider)
+{
+    using Output = std::pair<core::IdentityId, std::optional<bool>>;
+    if (owner.empty() || localProvider.empty() || localProvider.value().size() > 200U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{owner.value()}, std::string{m_impl->organization.value()},
+                      std::string{localProvider.value()}};
+        // The one-statement snapshot binds both eligibility and enrollment
+        // to the current active identity, tenant and configured provider.
+        // Do not fetch password hashes, encrypted seeds or recovery codes.
+        const auto rows = co_await lease.connection().query(
+            "SELECT i.id,"
+            "EXISTS(SELECT 1 FROM openproof.external_identities e "
+            "WHERE e.identity_id=i.id AND e.provider=$3),"
+            "EXISTS(SELECT 1 FROM openproof.external_identities e "
+            "JOIN openproof.password_credentials p ON p.identity_id=e.identity_id "
+            "JOIN openproof.totp_credentials t ON t.identity_id=e.identity_id "
+            "WHERE e.identity_id=i.id AND e.provider=$3) "
+            "FROM openproof.identities i "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 LIMIT 2",
+            std::move(params), remaining(deadline));
+        if (rows.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        if (rows.rows.size() != 1U || rows.rows.front().size() != 3U
+            || required(rows.rows.front()[0]) != owner.value())
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        const bool available = boolean(rows.rows.front()[1]);
+        const bool enabled = boolean(rows.rows.front()[2]);
+        if (enabled && !available)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return Output{std::move(owner), available ? std::optional<bool>{enabled}
+                                                     : std::nullopt};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native TOTP status lookup is unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Status>
 CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
     core::IdentityId target)

@@ -982,7 +982,15 @@ async function main() {
     expectStatus(await jsonRequest("/auth/logout", "POST", undefined, authAddressJar), 204);
 
     const consumerJar = new CookieJar();
-    await login("consumer@e2e.invalid", consumerPassword, consumerJar);
+    const consumerGrant = await login("consumer@e2e.invalid", consumerPassword, consumerJar);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+      expectStatus(await edgeRequest("/account/totp"), 401);
+      const status = await edgeRequest("/account/totp", { jar: consumerJar });
+      expectStatus(status, 200);
+      assert.deepEqual(jsonBody(status), { available: true, enabled: false,
+        assurance: consumerGrant.assurance });
+      assert.equal(status.headers["cache-control"], "no-store");
+    }
     const connectionsBefore = await edgeRequest("/account/connections", { jar: consumerJar });
     if (connectionsBefore.status === 502) {
       // Never print upstream stdout/stderr or response bodies: those may hold
@@ -1073,6 +1081,12 @@ async function main() {
     const ownerGrant = await login(
       "owner@e2e.invalid", ownerPassword, ownerJar, initialOwnerTotp);
     assert.equal(ownerGrant.assurance, "ial2");
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+      const status = await edgeRequest("/account/totp", { jar: ownerJar });
+      expectStatus(status, 200);
+      assert.deepEqual(jsonBody(status), { available: true, enabled: true, assurance: "ial2" });
+      assert.equal(status.headers["cache-control"], "no-store");
+    }
     const adminConsole = await edgeRequest("/admin/console", { jar: ownerJar });
     expectStatus(adminConsole, 200);
     assert.match(adminConsole.body, /name="identity_id"/);
