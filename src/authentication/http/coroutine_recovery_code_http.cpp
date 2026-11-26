@@ -36,11 +36,6 @@ private:
     return request.method() == gateway::HttpMethod::Post
         && request.path() == "/auth/recovery-codes";
 }
-[[nodiscard]] bool authNamespace(const gateway::HttpRequest& request) noexcept
-{
-    return request.path() == "/auth"
-        || request.path().starts_with("/auth/");
-}
 
 [[nodiscard]] gateway::HttpResponse jsonResponse(int status, json::object body)
 {
@@ -69,7 +64,7 @@ CoroutineRecoveryCodeHttpAdapter::CoroutineRecoveryCodeHttpAdapter(
 bool CoroutineRecoveryCodeHttpAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
-    if (authNamespace(request)) {
+    if (request.path() == "/auth/recovery-codes") {
         return isRecoveryRoute(request)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_eligible);
@@ -115,7 +110,8 @@ CoroutineRecoveryCodeHttpAdapter::handleAsync(gateway::HttpRequest request)
     if (isRecoveryRoute(request)) {
         co_return co_await issue(std::move(request));
     }
-    // Only non-auth routes are delegated, and only to native fallback.
+    // Other explicitly native auth routes (session rotation, LDAP, Web3)
+    // must retain their own capability checks. Never dispatch them synchronously.
     if (!m_nativeFallback->nativeEnabledFor(request)) {
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }

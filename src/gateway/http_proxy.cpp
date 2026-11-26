@@ -187,8 +187,43 @@ public:
             co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                         "The upstream timeout must be positive.");
         }
+        // Include strand admission in the same absolute request budget.
         const auto deadline = detail::saturatingSteadyDeadline(timeout);
         auto executor = co_await asio::this_coro::executor;
+        try {
+            auto result = co_await asio::co_spawn(
+                asio::make_strand(executor),
+                sendSerialized(std::move(endpoint), std::move(request), deadline),
+                asio::use_awaitable);
+            if (result) co_return std::move(*result);
+        } catch (...) {
+            // Never propagate transport exception details to the caller.
+        }
+        co_return foundation::fail(
+            std::chrono::steady_clock::now() >= deadline
+                ? foundation::ErrorCode::Timeout : foundation::ErrorCode::Unavailable);
+    }
+
+private:
+    // Optional completion envelope satisfies Boost.Asio 1.88 co_spawn
+    // exception-path construction without inventing an HTTP response.
+    asio::awaitable<std::optional<foundation::Result<HttpResponse>>> sendSerialized(
+        Endpoint endpoint, HttpRequest request,
+        std::chrono::steady_clock::time_point deadline)
+    {
+        co_return std::optional<foundation::Result<HttpResponse>>{
+            co_await sendOnStrand(std::move(endpoint), std::move(request), deadline)};
+    }
+
+    asio::awaitable<foundation::Result<HttpResponse>> sendOnStrand(
+        Endpoint endpoint, HttpRequest request,
+        std::chrono::steady_clock::time_point deadline)
+    {
+        auto executor = co_await asio::this_coro::executor;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                        "The upstream request timed out.");
+        }
         auto resolver = std::make_shared<Tcp::resolver>(executor);
         asio::steady_timer resolverDeadline{executor};
         resolverDeadline.expires_at(deadline);
@@ -294,6 +329,9 @@ private:
         if (error) co_return foundation::fail(networkError("write upstream request", error));
 
         beastHttp::response_parser<beastHttp::string_body> parser;
+        // HEAD has no response body even if Content-Length advertises the
+        // corresponding GET representation. Set this before parsing any bytes.
+        parser.skip(request.method() == HttpMethod::Head);
         parser.header_limit(static_cast<std::uint32_t>(
             m_config.responseHeaderLimitBytes()));
         parser.body_limit(m_config.responseBodyLimitBytes());

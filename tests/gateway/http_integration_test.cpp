@@ -374,9 +374,9 @@ struct DelayedCloseTlsProxyPeer final {
         return acceptor.local_endpoint().port();
     }
 
-    void start()
+    void start(bool headOnly = false)
     {
-        peer = std::thread{[this] {
+        peer = std::thread{[this, headOnly] {
             try {
                 Tcp::socket socket{io};
                 acceptor.accept(socket);
@@ -386,15 +386,24 @@ struct DelayedCloseTlsProxyPeer final {
                 beast::flat_buffer buffer;
                 beastHttp::request<beastHttp::string_body> request;
                 beastHttp::read(stream, buffer, request);
-                observedRequest = request.target() == "/native-tls-proxy";
+                observedRequest = request.target() == "/native-tls-proxy"
+                    && request.method() == (headOnly ? beastHttp::verb::head : beastHttp::verb::get);
 
                 beastHttp::response<beastHttp::string_body> response{
                     beastHttp::status::ok, request.version()};
                 response.set(beastHttp::field::content_type, "text/plain");
-                response.body() = "gateway-tls-complete";
                 response.keep_alive(false);
-                response.prepare_payload();
-                beastHttp::write(stream, response);
+                if (headOnly) {
+                    // No body is transmitted for HEAD, despite the nonzero
+                    // representation length. Keep the TLS socket open too.
+                    response.content_length(1024U);
+                    beastHttp::response_serializer<beastHttp::string_body> serializer{response};
+                    beastHttp::write_header(stream, serializer);
+                } else {
+                    response.body() = "gateway-tls-complete";
+                    response.prepare_payload();
+                    beastHttp::write(stream, response);
+                }
                 // Intentionally do not send TLS close_notify yet. The
                 // client must not wait after completing HTTP response framing.
                 std::this_thread::sleep_for(std::chrono::milliseconds{750});
@@ -468,9 +477,53 @@ sendRequest(std::uint16_t port, beastHttp::verb method, std::string target,
     request.prepare_payload();
     beastHttp::write(stream, request);
     beast::flat_buffer buffer;
-    beastHttp::response<beastHttp::string_body> response;
-    beastHttp::read(stream, buffer, response);
-    return response;
+    beastHttp::response_parser<beastHttp::string_body> parser;
+    parser.skip(method == beastHttp::verb::head);
+    beastHttp::read(stream, buffer, parser);
+    return parser.release();
+}
+
+class NativeHeadMetadataHandler final : public httpAdapter::CoroutineHttpHandler {
+public:
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    {
+        throw std::runtime_error{"unexpected synchronous HEAD handler"};
+    }
+    [[nodiscard]] asio::awaitable<gw::HttpResponse>
+    handleAsync(gw::HttpRequest request) override
+    {
+        if (request.path() == "/metadata") {
+            co_return gw::HttpResponse{200, gw::Headers{{"content-length", "1024"}}, ""};
+        }
+        if (request.path() == "/empty") {
+            co_return gw::HttpResponse{204, gw::Headers{{"content-length", "0"}}, ""};
+        }
+        co_return gw::HttpResponse{200, {}, "hello"};
+    }
+};
+
+TEST(BeastHttpIntegrationTest, NativeHeadPreservesRepresentationLengthAndOmitsBody)
+{
+    NativeHeadMetadataHandler handler;
+    httpAdapter::BeastHttpServer server{handler, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto metadata = sendRequest(server.boundPort(), beastHttp::verb::head, "/metadata");
+    EXPECT_EQ(metadata.result_int(), 200U);
+    EXPECT_EQ(metadata[beastHttp::field::content_length], "1024");
+    EXPECT_TRUE(metadata.body().empty());
+    EXPECT_EQ(metadata.count(beastHttp::field::transfer_encoding), 0U);
+    const auto generated = sendRequest(server.boundPort(), beastHttp::verb::head, "/generated");
+    EXPECT_EQ(generated.result_int(), 200U);
+    EXPECT_EQ(generated[beastHttp::field::content_length], "5");
+    EXPECT_TRUE(generated.body().empty());
+    const auto empty = sendRequest(server.boundPort(), beastHttp::verb::head, "/empty");
+    EXPECT_EQ(empty.result_int(), 204U);
+    EXPECT_EQ(empty.count(beastHttp::field::content_length), 0U);
+    const auto get = sendRequest(server.boundPort(), beastHttp::verb::get, "/generated");
+    EXPECT_EQ(get.body(), "hello");
+    EXPECT_EQ(get[beastHttp::field::content_length], "5");
+    server.stop();
 }
 
 TEST(BeastHttpIntegrationTest, BlockingHandlersDoNotOccupySocketEventLoop)
@@ -1043,6 +1096,44 @@ TEST(BeastHttpIntegrationTest, NativeCoroutineProxyRoundTrip)
     upstream.stop();
 }
 
+TEST(BeastHttpIntegrationTest, NativeProxySharedTransportCompletesOnFourThreads)
+{
+    ClientIpHandler handler;
+    httpAdapter::BeastHttpServer upstream{handler, serverConfig()};
+    ASSERT_TRUE(upstream.start());
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(gw::EndpointId{"concurrent-upstream"},
+        "127.0.0.1", upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(endpoint);
+
+    asio::io_context io;
+    std::vector<std::optional<fnd::Result<gw::HttpResponse>>> results(8U);
+    std::vector<std::future<void>> completions;
+    for (auto& result : results) {
+        auto request = gw::HttpRequest::create(gw::HttpMethod::Get,
+            "/native-concurrent-proxy", {}, {}, "127.0.0.1",
+            fnd::CorrelationId{"concurrent-proxy-test"});
+        ASSERT_TRUE(request);
+        completions.push_back(asio::co_spawn(io, collectAsyncProxyResponse(
+            *proxy.value(), endpoint.value(), std::move(request).value(),
+            std::chrono::seconds{3}, result), asio::use_future));
+    }
+    std::vector<std::jthread> workers;
+    for (std::size_t index = 0; index < 4U; ++index) {
+        workers.emplace_back([&io] { io.run(); });
+    }
+    for (auto& worker : workers) worker.join();
+    for (auto& completion : completions) ASSERT_NO_THROW(completion.get());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result && result->has_value());
+        EXPECT_EQ(result->value().status(), 200);
+        EXPECT_EQ(result->value().body(), "127.0.0.1");
+    }
+    upstream.stop();
+}
+
 TEST(BeastHttpIntegrationTest, NativeTlsProxyDoesNotWaitForPeerCloseNotify)
 {
     DelayedCloseTlsProxyPeer upstream;
@@ -1079,6 +1170,34 @@ TEST(BeastHttpIntegrationTest, NativeTlsProxyDoesNotWaitForPeerCloseNotify)
     // The peer keeps the TLS socket open for 750ms after sending a complete
     // Content-Length response. Gateway should already have completed.
     EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    if (upstream.peer.joinable()) upstream.peer.join();
+    EXPECT_TRUE(upstream.observedRequest);
+}
+
+TEST(BeastHttpIntegrationTest, NativeTlsHeadProxyCompletesWithoutResponseBody)
+{
+    DelayedCloseTlsProxyPeer upstream;
+    upstream.start(true);
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U, upstream.caFile).value());
+    ASSERT_TRUE(proxy);
+    auto endpoint = gw::Endpoint::create(gw::EndpointId{"head-upstream"},
+        "localhost", upstream.port(), true, 1U);
+    ASSERT_TRUE(endpoint);
+    auto request = gw::HttpRequest::create(gw::HttpMethod::Head,
+        "/native-tls-proxy", {}, {}, "127.0.0.1", fnd::CorrelationId{"head-proxy-test"});
+    ASSERT_TRUE(request);
+    asio::io_context io;
+    std::optional<fnd::Result<gw::HttpResponse>> response;
+    auto completion = asio::co_spawn(io, collectAsyncProxyResponse(
+        *proxy.value(), std::move(endpoint).value(), std::move(request).value(),
+        std::chrono::seconds{2}, response), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(completion.get());
+    ASSERT_TRUE(response && response->has_value());
+    EXPECT_EQ(response->value().status(), 200);
+    EXPECT_TRUE(response->value().body().empty());
+    EXPECT_EQ(response->value().headers().at("content-length"), "1024");
     if (upstream.peer.joinable()) upstream.peer.join();
     EXPECT_TRUE(upstream.observedRequest);
 }

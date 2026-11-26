@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -379,4 +380,48 @@ TEST(AsyncProviderHttpsTest, AbsoluteDeadlineCapsLongPerHopTimeout)
     EXPECT_FALSE(result.success);
     EXPECT_EQ(result.failure, pghttp::HttpsFailure::Timeout);
     EXPECT_LT(elapsed, 200ms);
+}
+
+// The real transport is also called from a shared multithreaded executor.
+// Exercise simultaneous DNS, handshake, framed HTTP response and already
+// expired absolute deadlines without external network dependencies.
+TEST(AsyncProviderHttpsTest, ConcurrentExchangesOnFourThreadsPreserveDeadline)
+{
+    asio::io_context io;
+    std::vector<std::unique_ptr<LocalTlsServer>> servers;
+    std::vector<std::unique_ptr<pghttp::AsyncHttpsClient>> clients;
+    std::vector<std::future<pghttp::HttpsResult>> completed;
+    std::vector<std::future<pghttp::HttpsResult>> expired;
+    for (std::size_t index = 0; index < 8U; ++index) {
+        servers.push_back(std::make_unique<LocalTlsServer>());
+        auto& server = *servers.back();
+        clients.push_back(std::make_unique<pghttp::AsyncHttpsClient>(server.caFile));
+        auto& client = *clients.back();
+        auto request = loopback(server.port());
+        request.timeout = 3000ms;
+        completed.push_back(asio::co_spawn(
+            io, client.exchange(request), asio::use_future));
+        request.absoluteDeadline = std::chrono::steady_clock::now() - 1ms;
+        expired.push_back(asio::co_spawn(
+            io, client.exchange(std::move(request)), asio::use_future));
+        server.start();
+    }
+    std::vector<std::jthread> workers;
+    for (std::size_t index = 0; index < 4U; ++index) {
+        workers.emplace_back([&io] { io.run(); });
+    }
+    for (auto& worker : workers) worker.join();
+    for (auto& future : completed) {
+        const auto result = future.get();
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.failure, pghttp::HttpsFailure::None);
+        EXPECT_EQ(result.response.status, 200U);
+        EXPECT_EQ(result.response.body, "{\"provider\":\"isolated\"}");
+    }
+    for (auto& future : expired) {
+        const auto result = future.get();
+        EXPECT_FALSE(result.success);
+        EXPECT_EQ(result.failure, pghttp::HttpsFailure::Timeout);
+        EXPECT_TRUE(result.response.body.empty());
+    }
 }

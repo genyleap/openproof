@@ -89,3 +89,10 @@ target_link_libraries(opp
         openproof_policy
         openproof_compile_options
 )
+
+if(TARGET openproof_authentication_async_recovery_http)
+    target_link_libraries(opp PRIVATE
+        openproof_authentication_async_recovery_http
+        openproof_postgres_async_recovery_repository)
+    target_compile_definitions(opp PRIVATE OPENPROOF_HAS_NATIVE_RECOVERY_HTTP=1)
+endif()

@@ -56,6 +56,10 @@
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+#include "../../src/authentication/http/coroutine_recovery_code_http.hpp"
+#include "../../src/storage/postgres/coroutine_recovery_code_repository.hpp"
+#endif
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1507,6 +1511,30 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeAuthSessionEnabled =
         nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    // Recovery-code issuance is separately opted in and uses only native
+    // session authentication and tenant-scoped canonical eligibility reads.
+    const auto nativeRecoveryFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES");
+    if (nativeRecoveryFlag && *nativeRecoveryFlag != "0"
+        && *nativeRecoveryFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeRecoveryEnabled =
+        nativeRecoveryFlag && *nativeRecoveryFlag == "1";
+    if (nativeRecoveryEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native recovery-code issuance requires native authentication sessions and authentication API."});
+        return ExitCode::ConfigurationError;
+    }
+#ifndef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+    if (nativeRecoveryEnabled) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native recovery-code HTTP capability was excluded from this build."});
+        return ExitCode::ConfigurationError;
+    }
+#endif
     // Public OIDC discovery/JWKS are memory-only and can be served without
     // the synchronous OAuth handler. Keep all state-changing OAuth routes
     // on the existing compatibility chain until their SQL SPI is migrated.
@@ -1783,6 +1811,10 @@ addProtectedRoutes(gateway::Router& router,
         credentials::TotpPolicy::recommended(), std::move(totpKey).value(),
         platform.security().credentialEncryptionKeyVersion(),
         providerId);
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+    std::optional<fnd::SecretString> nativeRecoverySecret;
+    if (nativeRecoveryEnabled) nativeRecoverySecret.emplace(recoverySecret->clone());
+#endif
     auto recoveryCodes = credentials::RecoveryCodeService::create(
         recoveryRepository, std::move(recoverySecret).value());
     auto administrationRepository = postgres::PostgresAdministrationRepository::create(
@@ -2326,8 +2358,14 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(ldapConfig.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = providers.registerProvider(std::make_unique<enterprise::LdapAuthenticationProvider>(
-            std::move(ldapConfig).value(), clock));
+        auto ldapProvider = std::make_unique<enterprise::LdapAuthenticationProvider>(
+            std::move(ldapConfig).value(), clock);
+        if (!ldapProvider->nativeTrustReady()) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "LDAP certificate trust could not be prepared."});
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(std::move(ldapProvider));
         if (status) status = trust.trust(idp::ProviderId{"ldap"}, idp::AssuranceLevel::Ial1, true);
         if (!status) {
             reportStartupFailure(status.error());
@@ -2421,6 +2459,10 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     std::unique_ptr<postgres::CoroutineSessionAuthenticator> nativeGatewayVerifier;
     std::unique_ptr<postgres::CoroutineAuthorizationDecisionSink> nativeGatewayAudit;
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+    std::unique_ptr<postgres::CoroutinePostgresRecoveryCodeRepository> nativeRecoveryRepository;
+    std::optional<credentials::CoroutineRecoveryCodeService> nativeRecoveryCodes;
+#endif
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
         || nativeAuthSessionEnabled || nativeFederatedStartEnabled
         || nativeProtectedGatewayEnabled) {
@@ -2457,7 +2499,7 @@ addProtectedRoutes(gateway::Router& router,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
-            || nativeAccountTotpStatusEnabled || nativeProtectedGatewayEnabled) {
+            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2465,6 +2507,21 @@ addProtectedRoutes(gateway::Router& router,
                         std::string{platform.auth().organizationId()}},
                     nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
         }
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+        if (nativeRecoveryEnabled) {
+            nativeRecoveryRepository = std::make_unique<
+                postgres::CoroutinePostgresRecoveryCodeRepository>(
+                    executor, platform.database().connectionString().clone(),
+                    nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+            auto created = credentials::CoroutineRecoveryCodeService::create(
+                *nativeRecoveryRepository, std::move(*nativeRecoverySecret));
+            if (!created) {
+                reportStartupFailure(created.error());
+                return ExitCode::ConfigurationError;
+            }
+            nativeRecoveryCodes.emplace(std::move(created).value());
+        }
+#endif
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {
             nativeTransactions = std::make_unique<
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
@@ -2591,6 +2648,9 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+        std::unique_ptr<authHttp::CoroutineRecoveryCodeHttpAdapter> asyncRecovery;
+#endif
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2616,6 +2676,37 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/logout");
             nativePaths.emplace_back("/auth/logout-all");
         }
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+        if (nativeRecoveryEnabled) {
+            if (!nativeSessions || !nativeCanonical || !nativeRecoveryCodes) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native recovery-code service is unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* service = nativeSessions.get();
+            auto* canonical = nativeCanonical.get();
+            asyncRecovery = std::make_unique<authHttp::CoroutineRecoveryCodeHttpAdapter>(
+                *nativeHandler, limiter.value(), *nativeRecoveryCodes,
+                [service](fnd::SecretString bearer) {
+                    return service->authenticate(std::move(bearer));
+                },
+                [canonical, providerId](identity::IdentityId owner)
+                    -> boost::asio::awaitable<fnd::Result<bool>> {
+                    // Both adapter eligibility calls use fresh, tenant-bound
+                    // reads of canonical ownership and local credential state.
+                    auto status = co_await canonical->readTotpStatusAsync(owner, providerId);
+                    if (!status) {
+                        if (status.error().code() == fnd::ErrorCode::NotFound)
+                            co_return false;
+                        co_return fnd::fail(status.error());
+                    }
+                    if (status->first != owner)
+                        co_return fnd::fail(fnd::ErrorCode::Unavailable);
+                    co_return status->second.value_or(false);
+                });
+            nativeHandler = asyncRecovery.get();
+        }
+#endif
         if (platform.account().enabled() && nativeAccountEnabled && nativeSessions) {
             auto* service = nativeSessions.get();
             accountHttp::CoroutineAccountSessionAdapter::ReadProfile profileReader;
@@ -2640,8 +2731,21 @@ addProtectedRoutes(gateway::Router& router,
                     return ExitCode::ConfigurationError;
                 }
                 auto* reader = nativeCanonical.get();
-                connectionsReader = [reader](identity::IdentityId owner) {
-                    return reader->readConnectionsAsync(std::move(owner));
+                // Match AuthenticationService::connections: the directory can
+                // retain a link after its provider is removed from runtime
+                // configuration. Such a link is not a usable login method
+                // and must not be exposed in the account projection.
+                // The registry is assembled before listener startup; this
+                // immutable snapshot avoids registry locks on IO workers.
+                connectionsReader = [reader, registered = providers.ids()](identity::IdentityId owner)
+                    -> boost::asio::awaitable<fnd::Result<
+                        accountHttp::CoroutineAccountSessionAdapter::ConnectionList>> {
+                    auto result = co_await reader->readConnectionsAsync(std::move(owner));
+                    if (!result) co_return fnd::fail(result.error());
+                    std::erase_if(result->second, [&registered](const auto& external) {
+                        return std::ranges::find(registered, external.providerId()) == registered.end();
+                    });
+                    co_return std::move(result).value();
                 };
             }
             accountHttp::CoroutineAccountSessionAdapter::ReadTotpStatus totpStatusReader;
@@ -2755,6 +2859,9 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountTotpStatusEnabled) {
             nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+        }
+        if (nativeRecoveryEnabled) {
+            nativeMethods.emplace_back("/auth/recovery-codes", gateway::HttpMethod::Post);
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),

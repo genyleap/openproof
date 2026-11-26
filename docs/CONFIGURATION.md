@@ -944,3 +944,30 @@ native network I/O. DPoP credentials are not supported by this first-party
 slice. The flag is experimental and does not imply full migration acceptance;
 OAuth delegated access, other paths, and legacy synchronous transport
 consumers remain subject to the global release gate.
+
+### Experimental native recovery-code issuance
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` enables only
+`POST /auth/recovery-codes` with a valid first-party session at IAL2 or
+higher. Default is disabled; native authentication sessions and the
+active authentication API are mandatory. Builds explicitly configured with
+`OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=OFF` reject the runtime opt-in.
+Native eligibility reads use the configured organization and local provider;
+issuance and the legacy repository share the same identity-scoped transaction
+lock and key material. Before returning plaintext, the native HTTP adapter
+rechecks eligibility and revokes codes on a failed recheck. The existing login
+and MFA verification paths redeem the same digests once. This capability is
+experimental, not approval of the remaining migration or concurrent TOTP
+lifecycle acceptance.
+
+#### LDAP certificate trust lifecycle
+
+The LDAP provider prepares its TLS trust context before listener startup. A
+configured private CA file is read once; an invalid/unreadable CA refuses
+startup with a sanitized configuration error. Each authentication opens its
+own TLS connection, verifies the server certificate and hostname, and uses
+its own deadline. Rotate the configured private CA using a normal controlled
+restart; changing the file alone does not alter an already prepared trust
+store. With no private CA, OpenSSL's normal system trust defaults remain in
+use (system certificate-directory lookup is governed by OpenSSL). LDAP native
+routing remains explicitly experimental and default-off.
