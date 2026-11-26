@@ -18,9 +18,25 @@ test("recovery issuance is mandatory with a strict fail-closed runtime route", (
 test("runtime injects genuine native session and tenant-scoped eligibility, never synchronous stores", () => {
   const body = app.slice(app.indexOf("asyncRecovery = std::make_unique<"), app.indexOf("nativeHandler = asyncRecovery.get()"));
   assert.match(body, /return service->authenticate\(std::move\(bearer\)\)/);
-  assert.match(body, /co_await canonical->readTotpStatusAsync\(owner, providerId\)/);
-  assert.match(body, /status->first != owner/);
-  assert.match(body, /status->second\.value_or\(false\)/);
+  assert.match(body, /\*nativeHandler, limiter\.value\(\), \*nativeRecoveryCodes/);
+  assert.doesNotMatch(body, /readTotpStatusAsync|eligibleAsync/);
+  const wiring = app.slice(app.indexOf("nativeRecoveryRepository = std::make_unique<"), app.indexOf("nativeRecoveryCodes.emplace"));
+  assert.match(wiring, /CoroutinePostgresRecoveryCodeRepository/);
+  assert.match(wiring, /platform\.auth\(\)\.organizationId\(\)\}\},\s*providerId/);
+  assert.match(wiring, /CoroutineRecoveryCodeService::create\(\s*\*nativeRecoveryRepository/);
+  assert.match(http, /co_await m_recoveryCodes->issueFenced\(authenticated->identity\(\), 10U\)/);
+  assert.doesNotMatch(http, /m_recoveryCodes->issue\(/);
+  const service = read("src/credentials/coroutine_recovery_codes.cpp");
+  assert.match(service, /co_await m_repository->captureIssuanceAsync\(identity\)/);
+  assert.match(service, /co_await m_repository->replaceFencedAsync\(/);
+  const repo = read("src/storage/postgres/coroutine_recovery_code_repository.cpp");
+  assert.match(repo, /i\.id=\$1 AND i\.organization_id=\$2 AND e\.provider=\$3/);
+  assert.match(repo, /co_await m_impl->sql\.replaceFenced\(/);
+  const sql = read("src/storage/postgres/async_recovery_code.cpp");
+  assert.match(sql, /p\.changed_at_ms=\$4::bigint AND t\.enrolled_at_ms=\$5::bigint/);
+  assert.ok(sql.indexOf("FOR SHARE OF p,e,t") >= 0 && sql.indexOf("FOR SHARE OF p,e,t") < sql.indexOf('"DELETE FROM "'));
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"), /RecoveryIssuanceFenceRejectsChangedFactorWithoutDeletingNewBatch/);
+  assert.match(read("tests/authentication/coroutine_recovery_code_http_test.cpp"), /FailedFencedWriteCannotLeakPlaintext/);
   assert.match(http, /if \(request\.path\(\) == "\/auth\/recovery-codes"\)/);
   assert.match(http, /m_nativeFallback->nativeEnabledFor\(request\)/);
   assert.match(http, /co_await m_nativeFallback->handleAsync\(std::move\(request\)\)/);
