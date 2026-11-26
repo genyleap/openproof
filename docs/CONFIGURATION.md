@@ -922,6 +922,31 @@ identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
 
+### Experimental native OAuth consent management
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS=1` selects only GET
+`/oauth/consents` and POST `/oauth/consents/revoke`. Default is disabled.
+It requires enabled authentication, OIDC and native authentication sessions
+(`OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS=1`). Values other than 0 or 1,
+or missing dependencies, fail startup before database changes.
+
+The adapter uses the first-party browser session cookie (not delegated OAuth
+Bearer credentials), the same OAuth IP rate-limit namespace, constant-time
+CSRF comparison and existing Secure/HttpOnly/SameSite=Lax consent cookie.
+Success responses are not CORS-enabled. Request-owned body, cookies,
+Authorization and query are scrubbed before suspending for authentication.
+Malformed/duplicate form fields are rejected; the complete form media type
+token is required, optionally followed by parameters.
+
+The bounded native SQL store independently checks active identity and tenant,
+rejects malformed or oversized grants rather than truncating the response,
+and revokes only the exact owner/consent/application tenant. Repeated
+revocations retain the original timestamp. No schema migration is needed.
+Authorization, token issuance, introspection, token revocation, device flow
+and other OAuth methods retain the existing compatibility path. Do not
+enable this experimental option before exact-head compiled and real
+PostgreSQL/HTTP acceptance has passed.
+
 ### Experimental native recovery-code issuance
 
 `OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` enables only
