@@ -936,6 +936,25 @@ service; caller-provided scope headers are removed at the gateway boundary.
 
 See `examples/openproof.toml` for a complete deployment sample.
 
+### Native OAuth UserInfo and introspection
+
+OIDC-enabled runtimes use strict native overlays for `/oauth/userinfo` (GET,
+POST and OPTIONS) and `/oauth/introspect` (POST). No synchronous token
+repository is called on these paths. UserInfo requires the openid scope
+and discloses presentation claims only with profile scope, email only
+with email scope. Sender-constrained tokens use the native DPoP/mTLS
+verifier and shared durable replay store.
+
+Introspection authenticates an active confidential client in the configured
+tenant using the same server-keyed client-secret digest as token issuance.
+It reads the access-token context, issued/expiry timestamps and scopes
+from a bounded SQL snapshot. Unknown/inactive tokens return active=false;
+storage failures are reported as unavailable, not inactive. Raw form
+credentials are erased before database suspension. The existing same-tenant
+confidential-client introspection policy is preserved; public clients are
+denied. Authorization, token issuance/rotation, revocation, PAR and device
+flows still require separate migration and executable acceptance.
+
 ### Native account TOTP status (coroutine branch only)
 
 `GET /account/totp` defaults to the native first-party cookie verifier in

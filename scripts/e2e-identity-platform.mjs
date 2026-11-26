@@ -1656,6 +1656,33 @@ async function main() {
     });
     expectStatus(introspection, 200);
     assert.equal(jsonBody(introspection).active, true);
+    if (nativeAccountRuntime) {
+      const claims = jsonBody(introspection);
+      assert.equal(claims.client_id,clientId);
+      assert.equal(claims.sub,"e2e-owner");
+      assert.ok(Number.isInteger(claims.iat) && Number.isInteger(claims.exp) && claims.exp>claims.iat);
+      const inspect = async (form) => edgeRequest("/oauth/introspect",{
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:form.toString(),
+      });
+      const invalid = new URLSearchParams(introspectionForm);
+      invalid.set("token","unknown-fixture-token");
+      const inactive=await inspect(invalid);
+      expectStatus(inactive,200);
+      assert.deepEqual(jsonBody(inactive),{active:false});
+      invalid.set("client_secret","invalid-fixture-proof");
+      expectStatus(await inspect(invalid),401);
+      const publicCaller=new URLSearchParams(introspectionForm);
+      publicCaller.set("client_id",nativeClientId);
+      expectStatus(await inspect(publicCaller),401);
+      const malformed=new URLSearchParams(introspectionForm);
+      malformed.append("token","duplicate");
+      expectStatus(await inspect(malformed),400);
+      const anonymous=await edgeRequest("/oauth/userinfo");
+      expectStatus(anonymous,401);
+      assert.match(anonymous.headers["www-authenticate"],/invalid_token/);
+      const preflight=await edgeRequest("/oauth/userinfo",{method:"OPTIONS"});
+      expectStatus(preflight,204);
+    }
 
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([

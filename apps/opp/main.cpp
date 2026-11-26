@@ -57,6 +57,7 @@
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
 #include "../../src/oauth/http/coroutine_consent_http.hpp"
+#include "../../src/oauth/http/coroutine_token_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_consent_store.hpp"
 #include "../../src/storage/postgres/coroutine_local_proof_verifier.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
@@ -2880,6 +2881,7 @@ addProtectedRoutes(gateway::Router& router,
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
     gateway::Gateway* nativeGatewayCore = nullptr;
     oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
+    std::optional<fnd::SecretString> nativeOAuthClientKey;
 
     std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
     if (nativeWeb3Enabled && platform.oidc().enabled()) {
@@ -2936,6 +2938,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<accountHttp::CoroutineContactVerificationAdapter> asyncContact;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         std::unique_ptr<oauthHttp::CoroutineConsentAdapter> asyncConsent;
+        std::unique_ptr<oauthHttp::CoroutineTokenReadAdapter> asyncTokenRead;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
@@ -3124,6 +3127,37 @@ addProtectedRoutes(gateway::Router& router,
                     return store->revokeAsync(std::move(id), std::move(owner), now);
                 });
             nativeHandler = asyncConsent.get();
+        }
+        if (platform.oidc().enabled()) {
+            if (!nativeCanonical || !nativeWeb3DelegatedKey || !nativeOAuthClientKey || !nativeGatewaySender) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native OAuth token reads require native storage and sender verification."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* reader=nativeCanonical.get();
+            asyncTokenRead=std::make_unique<oauthHttp::CoroutineTokenReadAdapter>(
+                *nativeHandler,limiter.value(),nativeWeb3DelegatedKey->clone(),nativeOAuthClientKey->clone(),
+                [reader,&clock](std::string digest,fnd::Instant* issued) {
+                    return reader->readDelegatedAccessAsync(std::move(digest),clock.now(),issued);
+                },
+                [reader](std::string clientId,std::string digest) {
+                    return reader->authenticateConfidentialClientAsync(std::move(clientId),std::move(digest));
+                },
+                [reader](identity::IdentityId owner) {
+                    return reader->readProfileAsync(std::move(owner));
+                },
+                [reader,sender=nativeGatewaySender](gateway::HttpRequest& request,
+                    session::DelegatedSenderConstraint constraint,fnd::SecretString token,bool dpop) {
+                    return sender->verifyAsync(request,constraint,token,dpop,
+                        [reader](session::DelegatedSenderConstraintKind kind,std::string thumbprint,
+                            std::string identifier,fnd::Instant expires,fnd::Instant observed) {
+                            return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
+                                std::move(identifier),expires,observed);
+                        });
+                });
+            nativeHandler=asyncTokenRead.get();
+            nativePaths.emplace_back("/oauth/userinfo");
+            nativePaths.emplace_back("/oauth/introspect");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
@@ -3635,6 +3669,7 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
+    nativeOAuthClientKey.emplace(clientSecretMaterial->clone());
     auto clientSecretKey = client::ClientSecretKey::create(
         std::move(clientSecretMaterial).value());
     auto authorizationCodeKey = oauth::AuthorizationCodeKey::create(

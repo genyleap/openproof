@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include "../src/oauth/http/coroutine_consent_http.hpp"
+#include "../src/oauth/http/coroutine_token_read_http.hpp"
 
 import openproof.client;
 import openproof.consent;
@@ -116,6 +117,105 @@ struct Fixture {
         return std::move(result).value();
     }
 };
+
+TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverUseLegacy)
+{
+    namespace sec=openproof::security;
+    namespace profile=openproof::identity::profile;
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    fnd::SecretString tokenKey{std::string(32U,'t')},clientKey{std::string(32U,'c')};
+    const auto fingerprint=[&](std::string_view raw){return fnd::toHex(sec::hmacSha256(tokenKey,raw).value());};
+    const auto valid=fingerprint("fixture-access"),restricted=fingerprint("fixture-restricted"),
+        bound=fingerprint("fixture-bound"),unavailable=fingerprint("fixture-unavailable");
+    const auto clientDigest=fnd::toHex(sec::hmacSha256(clientKey,"fixture-client-proof").value());
+    int accessCalls=0,clientCalls=0,profileCalls=0,senderCalls=0;
+    bool foreign=false;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,tokenKey.clone(),clientKey.clone(),
+        [&](std::string digest,fnd::Instant* issued)->asio::awaitable<fnd::Result<sess::DelegatedAccess>> {
+            ++accessCalls;
+            if (digest==unavailable) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            if (digest!=valid && digest!=restricted && digest!=bound)
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            if (issued) *issued=kNow-10s;
+            auto authenticated=sess::AuthenticatedSession::fromDelegatedAccess(
+                core::IdentityId{"owner"},idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},kNow-20s,kNow,kNow+60s);
+            std::vector<std::string> scopes{"openid"};
+            if (digest!=restricted) scopes.emplace_back("profile");
+            std::optional<sess::DelegatedSenderConstraint> sender;
+            if (digest==bound) sender.emplace(sess::DelegatedSenderConstraintKind::Dpop,"fixture-thumbprint");
+            co_return sess::DelegatedAccess{std::move(authenticated).value(),"fixture-client",
+                std::move(scopes),{"urn:fixture"},std::move(sender)};
+        },
+        [&](std::string id,std::string digest)->asio::awaitable<fnd::Status> {
+            ++clientCalls;
+            if (id!="fixture-client" || digest!=clientDigest)
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return fnd::ok();
+        },
+        [&](core::IdentityId owner)->asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+            ++profileCalls;
+            if (foreign) owner=core::IdentityId{"foreign"};
+            co_return profile::IdentityProfile::restore(std::move(owner),
+                std::optional<std::string>{"Visible"},std::nullopt,
+                std::optional<std::string>{"private@example.invalid"},true,
+                std::nullopt,false,std::nullopt,std::nullopt,kNow,kNow,"auto");
+        },
+        [&](gw::HttpRequest&,sess::DelegatedSenderConstraint constraint,
+            fnd::SecretString token,bool dpop)->asio::awaitable<fnd::Status> {
+            ++senderCalls;
+            if (!dpop || constraint.value()!="fixture-thumbprint" || token.expose()!="fixture-bound")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return fnd::ok();
+        }};
+    auto run=[&](gw::HttpRequest input) {
+        asio::io_context io;
+        std::optional<gw::HttpResponse> response;
+        auto collect=[&]()->asio::awaitable<void>{response.emplace(co_await api.handleAsync(std::move(input)));};
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(response).value();
+    };
+    EXPECT_EQ(run(request(gw::HttpMethod::Get,"/oauth/userinfo")).status(),401);
+    EXPECT_EQ(accessCalls,0);
+    auto visible=run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-access"));
+    ASSERT_EQ(visible.status(),200);
+    EXPECT_NE(visible.body().find("\"name\":\"Visible\""),std::string::npos);
+    EXPECT_EQ(visible.body().find("private@example.invalid"),std::string::npos);
+    EXPECT_EQ(visible.headers().at("cache-control"),"no-store");
+    auto minimal=run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-restricted"));
+    EXPECT_EQ(minimal.body(),R"({"sub":"owner"})");
+    EXPECT_EQ(profileCalls,1);
+    foreign=true;
+    EXPECT_EQ(run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-access")).status(),503);
+    foreign=false;
+    EXPECT_EQ(run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-bound")).status(),401);
+    auto proof=gw::HttpRequest::create(gw::HttpMethod::Get,"/oauth/userinfo",
+        {{"authorization","DPoP fixture-bound"}},{},"127.0.0.1",fnd::CorrelationId{"fixture"}).value();
+    EXPECT_EQ(run(std::move(proof)).status(),200);
+    EXPECT_EQ(senderCalls,2);
+    auto inspect=[&](std::string proof,std::string token){
+        return run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
+            "client_id=fixture-client&client_secret="+proof+"&token="+token));
+    };
+    const auto before=accessCalls;
+    EXPECT_EQ(inspect("wrong","fixture-access").status(),401);
+    EXPECT_EQ(accessCalls,before);
+    auto active=inspect("fixture-client-proof","fixture-access");
+    ASSERT_EQ(active.status(),200);
+    EXPECT_NE(active.body().find("\"active\":true"),std::string::npos);
+    EXPECT_NE(active.body().find("\"iat\":1769999990"),std::string::npos);
+    EXPECT_NE(active.body().find("\"exp\":1770000060"),std::string::npos);
+    EXPECT_EQ(inspect("fixture-client-proof","unknown").body(),R"({"active":false})");
+    EXPECT_EQ(inspect("fixture-client-proof","fixture-unavailable").status(),503);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
+        "client_id=fixture-client&client_secret=fixture-client-proof&token=a&token=b")).status(),400);
+    EXPECT_EQ(clientCalls,4);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Get,"/oauth/userinfo")).status(),503);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
 
 constexpr std::string_view sessionCookie = "__Host-openproof-session=valid-token";
 constexpr std::string_view csrfCookies =

@@ -28,6 +28,7 @@ import openproof.identity.provider;
 import openproof.organization;
 import openproof.policy;
 import openproof.session;
+import openproof.security;
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -802,7 +803,7 @@ CoroutinePostgresCanonicalFinalizer::authorizeDelegatedAccountAsync(
 
 asio::awaitable<foundation::Result<session::DelegatedAccess>>
 CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
-    std::string digestHex,foundation::Instant now)
+    std::string digestHex,foundation::Instant now,foundation::Instant* issuedAt)
 {
     constexpr std::size_t maximumGrants=256U;
     if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
@@ -819,7 +820,7 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
         const auto result=co_await lease.connection().query(
             "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
             "f.authenticated_at_ms,t.expires_at_ms,c.id,"
-            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value "
+            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,t.issued_at_ms "
             "FROM openproof.oauth_access_tokens t "
             "JOIN openproof.oauth_token_families f ON f.id=t.family_id "
             "JOIN openproof.oauth_clients c ON c.id=f.client_id "
@@ -840,7 +841,7 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
             std::move(params),remaining(deadline));
         if (result.rows.empty())
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
-        if (result.rows.size()>maximumGrants || result.rows.front().size()!=12U)
+        if (result.rows.size()>maximumGrants || result.rows.front().size()!=13U)
             co_return foundation::fail(foundation::ErrorCode::Unavailable);
         const auto& row=result.rows.front();
         const auto assurance=milliseconds(row[2]);
@@ -857,7 +858,8 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
         }
         std::vector<std::string> scopes,audiences;
         for (const auto& grant:result.rows) {
-            if (grant.size()!=12U || !std::equal(row.begin(),row.begin()+10,grant.begin()))
+            if (grant.size()!=13U || !std::equal(row.begin(),row.begin()+10,grant.begin())
+                || grant[12]!=row[12])
                 co_return foundation::fail(foundation::ErrorCode::Unavailable);
             if (!grant[10] && !grant[11]) {
                 if (result.rows.size()!=1U) co_return foundation::fail(foundation::ErrorCode::Unavailable);
@@ -889,6 +891,10 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
             foundation::Instant{foundation::Duration{milliseconds(row[5])}},now,
             foundation::Instant{foundation::Duration{milliseconds(row[6])}});
         if (!authorized) co_return foundation::fail(authorized.error());
+        const auto issued=foundation::Instant{foundation::Duration{milliseconds(row[12])}};
+        if (issued>now || issued>=foundation::Instant{foundation::Duration{milliseconds(row[6])}})
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        if (issuedAt) *issuedAt=issued;
         co_return session::DelegatedAccess{std::move(authorized).value(),required(row[7]),
             std::move(scopes),std::move(audiences),std::move(sender)};
     } catch (const std::exception&) {
@@ -1189,6 +1195,39 @@ CoroutinePostgresCanonicalFinalizer::disconnectAsync(core::IdentityId owner,
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable,"Native account disconnection is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientAsync(
+    std::string clientId,std::string digestHex)
+{
+    using E=foundation::ErrorCode;
+    if (clientId.empty() || clientId.size()>256U || digestHex.size()!=64U)
+        co_return foundation::fail(E::AuthenticationFailed);
+    auto presented=foundation::fromHex(digestHex);
+    if (!presented || presented->size()!=32U) co_return foundation::fail(E::AuthenticationFailed);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        Params params{std::move(clientId),std::string{m_impl->organization.value()}};
+        const auto result=co_await lease.connection().query(
+            "SELECT encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 AND c.kind IN (0,3) LIMIT 2",
+            std::move(params),remaining(deadline));
+        if (result.rows.empty()) co_return foundation::fail(E::AuthenticationFailed);
+        if (result.rows.size()!=1U || result.rows.front().size()!=1U)
+            co_return foundation::fail(E::Unavailable);
+        auto stored=foundation::fromHex(required(result.rows.front().front()));
+        if (!stored || stored->size()!=32U) co_return foundation::fail(E::Unavailable);
+        if (!security::constantTimeEquals(*presented,*stored))
+            co_return foundation::fail(E::AuthenticationFailed);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
     }
 }
 

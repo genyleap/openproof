@@ -1356,19 +1356,33 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         done.get();
         return std::move(result.value());
     };
+    const auto clientProof=fnd::toHex(openproof::security::sha256("confidential-fixture").value());
+    const auto authenticateClient=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string proof){
+        io.restart();
+        auto pending=asio::co_spawn(io,store.authenticateConfidentialClientAsync(client,std::move(proof)),asio::use_future);
+        io.run(); return pending.get();
+    };
+    EXPECT_FALSE(authenticateClient(native,clientProof)); // public client
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET kind=0,secret_digest=decode($2,'hex') WHERE id=$1",{client,clientProof}));
+    EXPECT_TRUE(authenticateClient(native,clientProof));
+    EXPECT_FALSE(authenticateClient(foreign,clientProof));
+    EXPECT_FALSE(authenticateClient(native,std::string(64U,'0')));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET kind=1,secret_digest=NULL WHERE id=$1",{client}));
     auto accepted=read(native);
     ASSERT_TRUE(accepted) << (accepted ? "" : std::string{fnd::errorCodeName(accepted.error().code())});
     EXPECT_EQ(accepted->identity().value(),seed.owner);
     EXPECT_EQ(accepted->id().value(),"delegated-access");
     const auto readContext=[&]{
         std::optional<fnd::Result<openproof::session::DelegatedAccess>> result;
-        auto capture=[](auto& adapter,std::string fingerprint,auto& output)->asio::awaitable<void>{
-            output.emplace(co_await adapter.readDelegatedAccessAsync(std::move(fingerprint),kNow));
+        fnd::Instant issued{};
+        auto capture=[](auto& adapter,std::string fingerprint,auto& output,fnd::Instant& observed)->asio::awaitable<void>{
+            output.emplace(co_await adapter.readDelegatedAccessAsync(std::move(fingerprint),kNow,&observed));
         };
         io.restart();
-        auto done=asio::co_spawn(io,capture(native,digest,result),asio::use_future);
+        auto done=asio::co_spawn(io,capture(native,digest,result,issued),asio::use_future);
         io.run();
         done.get();
+        if (result && *result) EXPECT_EQ(issued,kNow);
         return std::move(result.value());
     };
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'gateway.read')",{family}));

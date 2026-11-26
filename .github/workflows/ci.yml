@@ -77,6 +77,8 @@ jobs:
           node scripts/test-coroutine-native-auth-secret-scrub.mjs
           node scripts/test-native-http-credential-erasure.mjs
           node scripts/test-coroutine-provider-transports.mjs
+      - name: Native OAuth token read contract
+        run: node scripts/test-coroutine-native-oauth-token-read.mjs
       - name: Mandatory native public discovery and provider catalog contract
         run: |
           node scripts/test-coroutine-native-oidc-discovery-runtime.mjs

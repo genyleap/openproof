@@ -100,7 +100,14 @@ public:
     // A returned sender constraint MUST still be verified against the request
     // before the access context is accepted. No session is persisted.
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
-    readDelegatedAccessAsync(std::string digestHex,foundation::Instant now);
+    readDelegatedAccessAsync(std::string digestHex,foundation::Instant now,
+        foundation::Instant* issuedAt=nullptr);
+
+    // Confidential client authentication for native introspection. Only
+    // a server-keyed digest crosses the asynchronous SQL boundary.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    authenticateConfidentialClientAsync(std::string clientId,
+        std::string digestHex);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeSenderReplayAsync(session::DelegatedSenderConstraintKind kind,

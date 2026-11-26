@@ -57,6 +57,9 @@ const checked = segments.map(([name, relative]) => {
     : relative === "src/authentication/http/admin.cpp"
       ? [relative, "src/authentication/http/coroutine_admin_read_http.cpp",
          "src/storage/postgres/coroutine_admin_store.cpp"]
+      : relative === "src/oauth/http/http.cpp"
+        ? [relative,"src/oauth/http/coroutine_token_read_http.cpp",
+           "src/oauth/http/coroutine_consent_http.cpp","src/oauth/http/coroutine_discovery_http.cpp"]
       : relative === "src/account/http/http.cpp"
         ? [relative,"src/account/http/coroutine_session_http.cpp","src/account/http/account_pages.cpp",
            "src/authentication/http/coroutine_federated_start_http.cpp"]
@@ -1110,6 +1113,25 @@ const checked = segments.map(([name, relative]) => {
        || /revokeOwnedSession\s*\(/.test(service))
       issues.push({line:0,kind:"native owned revocation still checks then revokes across await",
         expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
+  }
+  if(relative==="src/oauth/http/http.cpp"){
+    // Native read-only endpoints are now audited alongside the legacy
+    // implementation, but cannot satisfy the complete OAuth boundary
+    // until all remaining write/authorization paths are native.
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    for(const method of ["loginPage","loginSubmit","authorize","consentSubmit",
+      "pushedAuthorization","deviceAuthorization","deviceVerification","tokenEndpoint","revoke"]){
+      const start=legacy.indexOf("OAuthHttpApi::"+method+"(");
+      const end=legacy.indexOf("\ngateway::HttpResponse OAuthHttpApi::",start+1);
+      const body=legacy.slice(start,end<0?undefined:end);
+      if (/m_(?:authorization|tokens|clients|authentication|sessions|consents|resources|serviceIdentities|devices|pushedAuthorization|jar)->/.test(body))
+        issues.push({line:0,kind:"synchronous OAuth lifecycle remains",expression:method});
+    }
+    for(const route of ["/oauth/userinfo","/oauth/introspect"]){
+      if(!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"native OAuth read missing strict dispatch",expression:route});
+    }
   }
   if(relative==="src/account/http/http.cpp"){
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");
