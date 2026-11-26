@@ -676,6 +676,10 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
 }
 
 namespace {
+[[nodiscard]] bool emailChangeVerifyRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/email/change/verify";
+}
 [[nodiscard]] bool phoneVerifyRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post && request.path()=="/account/phone/verify";
@@ -703,13 +707,14 @@ namespace {
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone,VerifyEmailChange verifyEmailChange)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
       m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
-      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)) {}
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)),m_verifyEmailChange(std::move(verifyEmailChange)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
+    if (emailChangeVerifyRoute(request) && m_verifyEmailChange) return static_cast<bool>(m_authenticate);
     if (phoneVerifyRoute(request) && m_verifyPhone) return static_cast<bool>(m_authenticate);
     if (resetRoute(request) && m_resetPassword) return true;
     if (signupRoute(request) && (m_signup || m_verifySignup)) return m_signup && m_verifySignup;
@@ -735,7 +740,8 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
 gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
 {
     if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup))
-        && !(resetRoute(request) && m_resetPassword) && !(phoneVerifyRoute(request) && m_verifyPhone))
+        && !(resetRoute(request) && m_resetPassword) && !(phoneVerifyRoute(request) && m_verifyPhone)
+        && !(emailChangeVerifyRoute(request) && m_verifyEmailChange))
         return m_fallback->handle(std::move(request));
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
@@ -745,7 +751,8 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 asio::awaitable<gateway::HttpResponse>
 CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
 {
-    if (phoneVerifyRoute(request) && m_verifyPhone) co_return co_await verifyPhone(std::move(request));
+    if ((phoneVerifyRoute(request) && m_verifyPhone) || (emailChangeVerifyRoute(request) && m_verifyEmailChange))
+        co_return co_await verifyPhone(std::move(request));
     if ((signupRoute(request) && (m_signup || m_verifySignup)) || (resetRoute(request) && m_resetPassword))
         co_return co_await signupOrVerify(std::move(request));
     if (!contactIssueRoute(request)) {
@@ -814,7 +821,8 @@ CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
 {
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
-    if (!m_authenticate || !m_verifyPhone)
+    const bool email=emailChangeVerifyRoute(request);
+    if (!m_authenticate || (email ? !m_verifyEmailChange : !m_verifyPhone))
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
     if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
@@ -824,12 +832,18 @@ CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
         co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
     std::string generation;
     foundation::SecretString proof;
+    std::optional<foundation::SecretString> enrollment;
     {
         boost::system::error_code ec;
         auto parsed=json::parse(request.body(),ec);
         ParsedPasswordGuard wipeParsed{parsed};
-        if (ec || !parsed.is_object() || parsed.as_object().size()!=2U)
+        if (ec || !parsed.is_object() || parsed.as_object().size()<2U
+            || parsed.as_object().size()>(email?3U:2U))
             co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        for (const auto& entry:parsed.as_object()) {
+            if (entry.key()!="verification_id" && entry.key()!="secret" && !(email && entry.key()=="password"))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        }
         const auto* id=parsed.as_object().if_contains("verification_id");
         const auto* secret=parsed.as_object().if_contains("secret");
         if (!id || !secret || !id->is_string() || !secret->is_string())
@@ -841,8 +855,18 @@ CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
                 const auto byte=static_cast<unsigned char>(ch);return byte<0x20U || byte==0x7fU;
             });
         };
-        if (!valid(identifier,200U) || !valid(value,64U))
+        if (!valid(identifier,200U) || !valid(value,email?512U:64U))
             co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (email) {
+            if (const auto* field=parsed.as_object().if_contains("password");field && !field->is_null()) {
+                if (!field->is_string())
+                    co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+                const std::string_view supplied{field->as_string().data(),field->as_string().size()};
+                if (!valid(supplied,1024U) || supplied.size()<8U)
+                    co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+                enrollment.emplace(std::string{supplied});
+            }
+        }
         generation.assign(identifier);
         proof=foundation::SecretString{std::string{value}};
     }
@@ -853,7 +877,9 @@ CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
     auto actor=co_await m_authenticate(std::move(credential->value()));
     if (!actor) co_return fail(actor.error(),request);
-    auto value=co_await m_verifyPhone(actor->identity(),VerificationId{std::move(generation)},std::move(proof));
+    foundation::Result<identity::profile::IdentityProfile> value=foundation::fail(foundation::ErrorCode::Unavailable);
+    if (email) value=co_await m_verifyEmailChange(actor->identity(),VerificationId{std::move(generation)},std::move(proof),std::move(enrollment));
+    else value=co_await m_verifyPhone(actor->identity(),VerificationId{std::move(generation)},std::move(proof));
     if (!value) co_return fail(value.error(),request);
     if (value->identity()!=actor->identity())
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);

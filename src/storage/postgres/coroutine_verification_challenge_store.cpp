@@ -910,6 +910,210 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::verifyP
     }
 }
 
+asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::changeEmailAsync(
+    identity::provider::ProviderId provider,core::IdentityId expectedOwner,
+    account::VerificationId id,account::VerificationDigest presented,
+    std::optional<credentials::PasswordHash> enrollment,
+    foundation::Instant now,std::uint32_t maximumAttempts)
+{
+    const auto valid=[](std::string_view value) {
+        return !value.empty() && value.size()<=200U
+            && value.find('\0')==std::string_view::npos;
+    };
+    if (!valid(provider.value()) || !valid(expectedOwner.value()) || !valid(id.value())
+        || maximumAttempts==0U || maximumAttempts>20U || now.time_since_epoch().count()<0)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    const std::string generation{id.value()},providerName{provider.value()},tenant{m_impl->tenant.value()};
+    const std::string owner{expectedOwner.value()};
+    const std::string observed=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+        Params lockParams{owner,tenant};
+        const auto locked=co_await connection.query(
+            "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 "
+            "FOR UPDATE OF i FOR SHARE OF o",std::move(lockParams),remaining(deadline));
+        if (!exactRow(locked,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        // Wrong-owner/purpose proofs cannot consume another owner's attempts.
+        Params proofParams{generation,owner};
+        const auto proof=co_await connection.query(
+            "SELECT destination,encode(secret_digest,'hex'),attempts,created_at_ms,expires_at_ms "
+            "FROM openproof.account_verification_challenges "
+            "WHERE id=$1 AND identity_id=$2 AND purpose=1 AND channel=0 FOR UPDATE",
+            std::move(proofParams),remaining(deadline));
+        if (proof.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        if (proof.rows.size()!=1U || proof.rows.front().size()!=5U
+            || std::ranges::any_of(proof.rows.front(),[](const auto& value){return !value.has_value();}))
+            throw std::runtime_error{"Malformed email change proof"};
+        const auto& row=proof.rows.front();
+        const auto parse=[](const std::string& text) {
+            std::int64_t value{};
+            const auto result=std::from_chars(text.data(),text.data()+text.size(),value);
+            if (result.ec!=std::errc{} || result.ptr!=text.data()+text.size() || value<0)
+                throw std::runtime_error{"Malformed email change integer"};
+            return value;
+        };
+        const auto attempts=parse(*row[2]),created=parse(*row[3]),expires=parse(*row[4]);
+        const auto time=now.time_since_epoch().count();
+        const auto digest=foundation::fromHex(*row[1]);
+        const std::string destination=*row[0];
+        if (!digest || digest->size()!=32U || expires<=created)
+            throw std::runtime_error{"Malformed email change digest/window"};
+        const auto normalized=account::VerificationPreparation::normalizePublicEmail(destination);
+        if (!normalized || normalized.value()!=destination || destination.find('\0')!=std::string::npos
+            || created>time) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        const bool expired=expires<=time || attempts>=maximumAttempts;
+        const bool matches=security::constantTimeEquals(digest.value(),presented.bytes());
+        if (expired || !matches) {
+            Params mismatch{generation,owner};
+            if (expired || attempts+1>=maximumAttempts) {
+                // Release only this generation's reservation, not a renewal.
+                static_cast<void>(co_await connection.query(
+                    "WITH obsolete AS (DELETE FROM openproof.account_verification_challenges "
+                    "WHERE id=$1 AND identity_id=$2 AND purpose=1 RETURNING id,identity_id) "
+                    "DELETE FROM openproof.pending_external_identity_reservations r USING obsolete c "
+                    "WHERE r.verification_id=c.id AND r.identity_id=c.identity_id",
+                    std::move(mismatch),remaining(deadline)));
+            } else {
+                static_cast<void>(co_await connection.query(
+                    "UPDATE openproof.account_verification_challenges SET attempts=attempts+1 "
+                    "WHERE id=$1 AND identity_id=$2 AND purpose=1",
+                    std::move(mismatch),remaining(deadline)));
+            }
+            static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        Params reservationParams{providerName,destination,owner,generation,observed};
+        const auto reservation=co_await connection.query(
+            "SELECT r.identity_id FROM openproof.pending_external_identity_reservations r "
+            "WHERE r.provider=$1 AND r.external_subject=$2 AND r.identity_id=$3 "
+            "AND r.verification_id=$4 AND r.expires_at_ms>$5 FOR UPDATE OF r",
+            std::move(reservationParams),remaining(deadline));
+        if (!exactRow(reservation,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        // Passwords belong to the canonical owner, not the email alias.
+        // Reject ambiguous local links instead of choosing one arbitrarily.
+        Params localParams{providerName,owner};
+        const auto local=co_await connection.query(
+            "SELECT external_subject FROM openproof.external_identities "
+            "WHERE provider=$1 AND identity_id=$2 ORDER BY external_subject LIMIT 2 FOR UPDATE",
+            std::move(localParams),remaining(deadline));
+        if (local.rows.size()>1U) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::Conflict);
+        }
+        std::optional<std::string> previous;
+        if (!local.rows.empty()) {
+            if (local.rows.front().size()!=1U || !local.rows.front().front())
+                throw std::runtime_error{"Malformed local subject"};
+            previous=*local.rows.front().front();
+        }
+        if (previous || enrollment) {
+            // First enrollment is insert-only. Existing local accounts
+            // retain their hash even when a password was supplied.
+            if (!previous) {
+                if (enrollment->encoded().empty() || enrollment->encoded().size()>4096U)
+                    throw std::runtime_error{"Invalid enrollment hash"};
+                Params enrollParams{owner,std::string{enrollment->encoded()},observed};
+                const auto enrolled=co_await connection.query(
+                    "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+                    "VALUES($1,$2,$3) ON CONFLICT(identity_id) DO NOTHING RETURNING identity_id",
+                    std::move(enrollParams),remaining(deadline));
+                if (!exactRow(enrolled,owner)) {
+                    static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                    co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+                }
+            } else {
+                Params credentialParams{owner};
+                const auto credential=co_await connection.query(
+                    "SELECT identity_id FROM openproof.password_credentials WHERE identity_id=$1 FOR UPDATE",
+                    std::move(credentialParams),remaining(deadline));
+                if (!exactRow(credential,owner)) {
+                    static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                    co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+                }
+            }
+            Params attachParams{providerName,destination,owner,observed};
+            static_cast<void>(co_await connection.query(
+                "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+                "VALUES($1,$2,$3,$4) ON CONFLICT(provider,external_subject) DO NOTHING",
+                std::move(attachParams),remaining(deadline)));
+            Params linkParams{providerName,destination,owner};
+            const auto linked=co_await connection.query(
+                "SELECT identity_id FROM openproof.external_identities WHERE provider=$1 "
+                "AND external_subject=$2 AND identity_id=$3 FOR SHARE",
+                std::move(linkParams),remaining(deadline));
+            if (!exactRow(linked,owner)) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+            if (previous && *previous!=destination) {
+                Params detachParams{providerName,*previous,owner};
+                const auto detached=co_await connection.query(
+                    "DELETE FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2 "
+                    "AND identity_id=$3 RETURNING identity_id",std::move(detachParams),remaining(deadline));
+                if (!exactRow(detached,owner)) throw std::runtime_error{"Local subject changed"};
+                // Fence old local login proofs even if the alias is later
+                // changed back (ABA). Keep the existing hash unchanged.
+                Params advanceParams{owner,observed};
+                const auto advanced=co_await connection.query(
+                    "UPDATE openproof.password_credentials SET changed_at_ms=GREATEST(changed_at_ms+1,$2::bigint) "
+                    "WHERE identity_id=$1 RETURNING identity_id",std::move(advanceParams),remaining(deadline));
+                if (!exactRow(advanced,owner)) throw std::runtime_error{"Local credential disappeared"};
+            }
+        } else {
+            // Profile-only verification must also reject a subject now
+            // owned by somebody else, without creating a local credential.
+            Params subjectParams{providerName,destination};
+            const auto occupied=co_await connection.query(
+                "SELECT identity_id FROM openproof.external_identities WHERE provider=$1 AND external_subject=$2 FOR SHARE",
+                std::move(subjectParams),remaining(deadline));
+            if (!occupied.rows.empty()) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AlreadyExists);
+            }
+        }
+        Params profileParams{owner,destination,observed};
+        const auto updated=co_await connection.query(
+            "UPDATE openproof.identity_profiles SET email=$2,email_verified=true,"
+            "updated_at_ms=GREATEST(updated_at_ms,$3) WHERE identity_id=$1 RETURNING identity_id",
+            std::move(profileParams),remaining(deadline));
+        if (!exactRow(updated,owner)) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::NotFound);
+        }
+        Params consumeParams{generation,owner};
+        const auto consumed=co_await connection.query(
+            "DELETE FROM openproof.account_verification_challenges WHERE id=$1 AND identity_id=$2 "
+            "AND purpose=1 RETURNING id",std::move(consumeParams),remaining(deadline));
+        if (!exactRow(consumed,generation)) throw std::runtime_error{"Email proof changed"};
+        Params releaseParams{providerName,destination,owner,generation};
+        const auto released=co_await connection.query(
+            "DELETE FROM openproof.pending_external_identity_reservations WHERE provider=$1 AND external_subject=$2 "
+            "AND identity_id=$3 AND verification_id=$4 RETURNING identity_id",
+            std::move(releaseParams),remaining(deadline));
+        if (!exactRow(released,owner)) throw std::runtime_error{"Email reservation changed"};
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,"Native email change unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceImpl(
     account::VerificationChallenge challenge,
     std::optional<identity::provider::ProviderId> provider,bool publicEmail)
@@ -1005,7 +1209,7 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
                 "(provider,external_subject,identity_id,expires_at_ms,verification_id) VALUES($1,$2,$3,$4,$6) "
                 "ON CONFLICT(provider,external_subject) DO UPDATE SET identity_id=EXCLUDED.identity_id,"
                 "expires_at_ms=EXCLUDED.expires_at_ms,verification_id=EXCLUDED.verification_id "
-                "WHERE r.identity_id=EXCLUDED.identity_id OR r.expires_at_ms<=$5 "
+                "WHERE (r.identity_id=EXCLUDED.identity_id AND r.verification_id IS NOT NULL) OR r.expires_at_ms<=$5 "
                 "RETURNING identity_id", std::move(reserveParams), remaining(deadline));
             if (reserved.rows.empty()) {
                 static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));

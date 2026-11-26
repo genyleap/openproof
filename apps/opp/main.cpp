@@ -2831,6 +2831,7 @@ addProtectedRoutes(gateway::Router& router,
     accountHttp::CoroutineContactVerificationAdapter::VerifySignup nativeVerifySignup;
     accountHttp::CoroutineContactVerificationAdapter::ResetPassword nativeResetPassword;
     accountHttp::CoroutineContactVerificationAdapter::VerifyPhone nativeVerifyPhone;
+    accountHttp::CoroutineContactVerificationAdapter::VerifyEmailChange nativeVerifyEmailChange;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -3023,7 +3024,7 @@ addProtectedRoutes(gateway::Router& router,
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
                 },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
                     return issuer->issuePublicEmailAsync(purpose,std::move(destination));
-                },nativeSignup,nativeVerifySignup,nativeResetPassword,nativeVerifyPhone);
+                },nativeSignup,nativeVerifySignup,nativeResetPassword,nativeVerifyPhone,nativeVerifyEmailChange);
             nativeHandler=asyncContact.get();
         }
         if (nativeConsentEnabled) {
@@ -3128,6 +3129,7 @@ addProtectedRoutes(gateway::Router& router,
             nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
             if (nativeVerifyPhone) nativeMethods.emplace_back("/account/phone/verify",gateway::HttpMethod::Post);
+            if (nativeVerifyEmailChange) nativeMethods.emplace_back("/account/email/change/verify",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
             if (nativeResetPassword) nativeMethods.emplace_back("/account/password/reset",gateway::HttpMethod::Post);
@@ -3476,12 +3478,32 @@ addProtectedRoutes(gateway::Router& router,
                 co_return co_await nativeCanonical->readProfileAsync(std::move(owner));
             };
         }
+        if (nativeSignupEnabled) {
+            nativeVerifyEmailChange=[&](identity::IdentityId owner,account::VerificationId id,
+                fnd::SecretString secret,std::optional<fnd::SecretString> enrollment)
+                ->boost::asio::awaitable<fnd::Result<openproof::identity::profile::IdentityProfile>> {
+                auto digest=account::VerificationPreparation::digest(signupKey.value(),id,secret);
+                secret=fnd::SecretString{};
+                if (!digest) co_return fnd::fail(digest.error());
+                std::optional<credentials::PasswordHash> hashed;
+                if (enrollment) {
+                    auto result=co_await nativeLocalPasswords->hashAsync(std::move(*enrollment));
+                    if (!result) co_return fnd::fail(result.error());
+                    hashed.emplace(std::move(result).value());
+                }
+                auto verified=co_await contactStore.changeEmailAsync(providerId,owner,std::move(id),
+                    digest.value(),std::move(hashed),clock.now(),accountPolicy->maximumAttempts());
+                if (!verified) co_return fnd::fail(verified.error());
+                co_return co_await nativeCanonical->readProfileAsync(std::move(owner));
+            };
+        }
         nativeContactIssuer=&contactIssuer;
         const auto result=runWithPasskey(accountApi,delegated);
         nativeSignup={};
         nativeVerifySignup={};
         nativeResetPassword={};
         nativeVerifyPhone={};
+        nativeVerifyEmailChange={};
         nativeContactIssuer=nullptr;
         return result;
     };

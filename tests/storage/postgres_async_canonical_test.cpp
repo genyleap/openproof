@@ -2058,6 +2058,92 @@ TEST(PostgresCanonicalCoroutineTest, ReapOnlyExpiredUntouchedNativeSignupOwners)
     }
 }
 
+TEST(PostgresCanonicalCoroutineTest, EmailChangePreservesOwnerAndExistingPasswordAndSupportsFirstEnrollment)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace acc=openproof::account;
+    namespace cred=openproof::credentials;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const idp::ProviderId provider{"email-change-"+seed.suffix};
+    auto key=acc::VerificationKey::create(fnd::SecretString{std::string(32U,'v')});
+    ASSERT_TRUE(key);
+    auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U);
+    ASSERT_TRUE(policy);
+    auto hasher=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    ASSERT_TRUE(hasher);
+    auto initial=hasher->hash(fnd::SecretString{"original-password"});
+    auto replacement=hasher->hash(fnd::SecretString{"replacement-password"});
+    ASSERT_TRUE(initial && replacement);
+    auto run=[&](asio::awaitable<fnd::Status> task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    auto scalar=[&](std::string_view sql,std::initializer_list<std::string> params){
+        auto result=query(sql,params);
+        return std::string{PQgetvalue(result.get(),0,0)};
+    };
+    const auto prepare=[&](std::string email){
+        return acc::VerificationPreparation::prepare(key.value(),ids::IdentityId{seed.owner},
+            acc::VerificationPurpose::ChangeEmail,acc::VerificationChannel::Email,std::move(email),kNow,10min);
+    };
+    auto profileOnly=prepare("profile-"+seed.suffix+"@example.test");
+    ASSERT_TRUE(profileOnly);
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(profileOnly->first,provider)));
+    ASSERT_TRUE(run(store.changeEmailAsync(provider,ids::IdentityId{seed.owner},profileOnly->first.id(),
+        profileOnly->first.digest(),std::nullopt,kNow,3U)));
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.external_identities WHERE provider=$1",{std::string{provider.value()}}),"0");
+    const std::string firstEmail="first-"+seed.suffix+"@example.test";
+    auto enroll=prepare(firstEmail);
+    ASSERT_TRUE(enroll);
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(enroll->first,provider)));
+    ASSERT_TRUE(run(store.changeEmailAsync(provider,ids::IdentityId{seed.owner},enroll->first.id(),
+        enroll->first.digest(),initial.value(),kNow,3U)));
+    const std::string nextEmail="next-"+seed.suffix+"@example.test";
+    auto rebind=prepare(nextEmail);
+    ASSERT_TRUE(rebind);
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(rebind->first,provider)));
+    auto complete=[&] {
+        return store.changeEmailAsync(provider,ids::IdentityId{seed.owner},rebind->first.id(),
+            rebind->first.digest(),replacement.value(),kNow,3U);
+    };
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.identity_profiles ADD CONSTRAINT native_email_fixture_rollback "
+        "CHECK(NOT email_verified) NOT VALID",{})));
+    EXPECT_FALSE(run(complete()));
+    ASSERT_NO_THROW(static_cast<void>(query("ALTER TABLE openproof.identity_profiles DROP CONSTRAINT native_email_fixture_rollback",{})));
+    EXPECT_EQ(scalar("SELECT external_subject FROM openproof.external_identities WHERE provider=$1",{std::string{provider.value()}}),firstEmail);
+    EXPECT_EQ(scalar("SELECT changed_at_ms FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),"1770000000000");
+    io.restart();
+    auto first=asio::co_spawn(io,complete(),asio::use_future);
+    auto second=asio::co_spawn(io,complete(),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ(scalar("SELECT external_subject FROM openproof.external_identities WHERE provider=$1",{std::string{provider.value()}}),nextEmail);
+    EXPECT_EQ(scalar("SELECT password_hash FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),std::string{initial->encoded()});
+    EXPECT_EQ(scalar("SELECT changed_at_ms FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),"1770000000001");
+    EXPECT_EQ(scalar("SELECT email||':'||email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),nextEmail+":true");
+    EXPECT_EQ(scalar("SELECT display_name FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),"User-chosen name");
+    EXPECT_FALSE(run(complete()));
+}
+
 TEST(PostgresCanonicalCoroutineTest, PhoneProofCommitsOwnerLinkProfileAndReservationTogether)
 {
     const auto dsn=disposableDsn();
