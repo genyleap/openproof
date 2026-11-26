@@ -113,7 +113,7 @@ public:
     explicit ParsedPasswordGuard(json::value& parsed) noexcept : m_parsed(parsed) {}
     ~ParsedPasswordGuard() {
         if (m_parsed.is_object()) {
-            for (const auto name:{"password","secret"}) {
+            for (const auto name:{"password","secret","new_password"}) {
                 if (auto* value=m_parsed.as_object().if_contains(name);value && value->is_string()) {
                     auto& text=value->as_string();
                     foundation::secureWipe(text.data(),text.size());
@@ -676,6 +676,10 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
 }
 
 namespace {
+[[nodiscard]] bool resetRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/password/reset";
+}
 [[nodiscard]] bool signupRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post
@@ -695,13 +699,14 @@ namespace {
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
       m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
-      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)) {}
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
+    if (resetRoute(request) && m_resetPassword) return true;
     if (signupRoute(request) && (m_signup || m_verifySignup)) return m_signup && m_verifySignup;
     if (contactIssueRoute(request)) return publicEmailIssue(request) ? static_cast<bool>(m_publicIssue)
         : static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
@@ -724,7 +729,8 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
 
 gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
 {
-    if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup)))
+    if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup))
+        && !(resetRoute(request) && m_resetPassword))
         return m_fallback->handle(std::move(request));
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
@@ -734,7 +740,7 @@ gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpR
 asio::awaitable<gateway::HttpResponse>
 CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
 {
-    if (signupRoute(request) && (m_signup || m_verifySignup))
+    if ((signupRoute(request) && (m_signup || m_verifySignup)) || (resetRoute(request) && m_resetPassword))
         co_return co_await signupOrVerify(std::move(request));
     if (!contactIssueRoute(request)) {
         if (m_fallback->nativeEnabledFor(request))
@@ -804,7 +810,8 @@ CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request
     PasswordRequestGuard wipeBody{request};
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
-    if (!m_signup || !m_verifySignup)
+    const bool reset=resetRoute(request);
+    if (reset ? !m_resetPassword : (!m_signup || !m_verifySignup))
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
     if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
@@ -816,6 +823,7 @@ CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request
     std::string identifier;
     std::optional<std::string> displayName;
     foundation::SecretString proof;
+    foundation::SecretString newPassword;
     {
         boost::system::error_code ec;
         auto parsed=json::parse(request.body(),ec);
@@ -825,7 +833,8 @@ CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request
         auto& object=parsed.as_object();
         for (const auto& entry:object) {
             if (signup ? (entry.key()!="email" && entry.key()!="password" && entry.key()!="display_name")
-                       : (entry.key()!="verification_id" && entry.key()!="secret"))
+                       : (entry.key()!="verification_id" && entry.key()!="secret"
+                          && !(reset && entry.key()=="new_password")))
                 co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
         }
         const auto bounded=[&](const char* name,std::size_t maximum)->std::optional<std::string_view>{
@@ -847,10 +856,22 @@ CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request
             if (!label) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
             displayName=std::string{*label};
         }
+        if (reset) {
+            const auto password=bounded("new_password",1024U);
+            if (!password || password->size()<8U)
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            newPassword=foundation::SecretString{std::string{*password}};
+        }
         identifier.assign(*name);
         proof=foundation::SecretString{std::string{*secret}};
     }
     request.wipeBody();
+    if (reset) {
+        auto changed=co_await m_resetPassword(VerificationId{std::move(identifier)},
+            std::move(proof),std::move(newPassword));
+        if (!changed) co_return fail(changed.error(),request);
+        co_return jsonResponse(200,json::object{{"password_reset",true}});
+    }
     if (signup) {
         auto owner=co_await m_signup(std::move(identifier),std::move(proof),std::move(displayName));
         if (!owner) co_return fail(owner.error(),request);

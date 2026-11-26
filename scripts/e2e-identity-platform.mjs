@@ -1309,6 +1309,18 @@ async function main() {
       new_password: replacementPassword,
     });
     expectStatus(reset, 200);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+      assert.equal(jsonBody(reset).password_reset, true);
+      assert.equal(reset.headers["set-cookie"], undefined);
+      const resetReplay = await jsonRequest("/account/password/reset", "POST", {
+        verification_id: notifications[1].verification_id,
+        secret: notifications[1].secret,
+        new_password: replacementPassword,
+      });
+      expectStatus(resetReplay, 401);
+      assert.equal(resetReplay.headers["set-cookie"], undefined);
+      expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 401);
+    }
     const consumerJarAfterReset = new CookieJar();
     await login("consumer@e2e.invalid", replacementPassword, consumerJarAfterReset);
 

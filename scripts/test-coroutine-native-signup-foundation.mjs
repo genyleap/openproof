@@ -171,3 +171,21 @@ test("password reset consumes only the exact proof and revokes sessions in the h
   assert.match(body,/WHERE identity_id=\$1 AND state=0/);
   assert.doesNotMatch(body,/purpose=0|hasher.hash\(|issueAsync\(/);
 });
+
+test("native password reset HTTP scrubs both secrets and only commits a precomputed hash",()=>{
+  const app=read("apps/opp/main.cpp");
+  const http=read("src/account/http/coroutine_session_http.cpp");
+  const callback=app.slice(app.indexOf("nativeResetPassword=[&]("),app.indexOf("nativeContactIssuer=&contactIssuer;"));
+  const digest=callback.indexOf("VerificationPreparation::digest");
+  const wipe=callback.indexOf("secret=fnd::SecretString{}");
+  const kdf=callback.indexOf("hashAsync(std::move(password))");
+  const storage=callback.indexOf("contactStore.resetPasswordAsync(");
+  assert.ok(digest>=0 && digest<wipe && wipe<kdf && kdf<storage);
+  assert.match(app,/if \(nativeResetPassword\) nativeMethods.emplace_back\("\/account\/password\/reset",gateway::HttpMethod::Post\)/);
+  assert.match(http,/\{"password","secret","new_password"\}/);
+  const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
+  const reset=body.slice(body.indexOf("request.wipeBody();"),body.indexOf("if (signup) {",body.indexOf("request.wipeBody();")));
+  assert.match(reset,/co_await m_resetPassword/);
+  assert.match(reset,/password_reset/);
+  assert.doesNotMatch(reset,/set-cookie|m_verifySignup/);
+});

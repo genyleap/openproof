@@ -5111,3 +5111,15 @@ The HTTP route remains compatibility until native KDF and callback wiring
 and executable acceptance. Concurrent session creation from an already
 verified login requires separate end-to-end generation fencing.
 No new schema.
+
+### Native password reset HTTP composition
+
+The existing opt-in signup workload now also selects strict POST
+/account/password/reset. It bounds and scrubs both submitted secrets,
+derives the proof digest, hashes the new password on the shared bounded
+KDF worker before taking a SQL lease, and invokes the atomic reset.
+Success returns the existing password_reset JSON shape with no session
+or cookie. Added HTTP and live E2E checks for replay denial and old-cookie
+revocation. The route remains opt-in: a previously verified local login
+can still race reset before final session persistence, so credential
+generation fencing is a prerequisite for default cutover.
