@@ -3326,20 +3326,20 @@ addProtectedRoutes(gateway::Router& router,
         accountDelivery::CoroutineContactVerificationIssuer contactIssuer{
             std::move(nativeVerificationKey).value(),accountPolicy.value(),providerId,
             idp::ProviderId{std::string{platform.account().phoneProviderId()}},clock,*nativeDelivery.value(),
-            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId provider) {
-                return contactStore.reserveAndReplaceAsync(std::move(challenge),std::move(provider));
+            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId verificationProvider) {
+                return contactStore.reserveAndReplaceAsync(std::move(challenge),std::move(verificationProvider));
             },
             [&contactStore](account::VerificationId id,identity::IdentityId owner,account::VerificationPurpose purpose) {
                 return contactStore.discardAsync(std::move(id),std::move(owner),purpose);
             }};
         contactIssuer.configurePublicEmail(
-            [&contactStore](idp::ProviderId provider,account::VerificationPurpose purpose,
+            [&contactStore](idp::ProviderId verificationProvider,account::VerificationPurpose purpose,
                 std::string destination,fnd::Instant now) {
-                return contactStore.findPublicEmailOwnerAsync(std::move(provider),purpose,
+                return contactStore.findPublicEmailOwnerAsync(std::move(verificationProvider),purpose,
                     std::move(destination),now);
             },
-            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId provider) {
-                return contactStore.replacePublicEmailAsync(std::move(challenge),std::move(provider));
+            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId verificationProvider) {
+                return contactStore.replacePublicEmailAsync(std::move(challenge),std::move(verificationProvider));
             });
         account::AccountService accountService{
             identity::OrganizationId{std::string{platform.auth().organizationId()}},

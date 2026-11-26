@@ -4937,3 +4937,9 @@ during executable acceptance. Namespace, configured protection, scope,
 audience, policy and denied-decision audit checks remain unchanged.
 Delegated OAuth and proof-of-possession proxy paths are not cut over.
 The source gate remains incomplete; real compiled acceptance is required.
+
+PR 99's workflow 45849207493 passed all 20 isolated canonical
+PostgreSQL tests and the native public proxy real-TCP regression.
+The subsequent opp build failed on three contact-issuer lambda parameters
+shadowing an enclosing provider. Renamed those parameters without disabling
+-Werror=shadow; exact repaired executable acceptance remains pending.
