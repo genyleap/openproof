@@ -907,11 +907,25 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     const idp::ProviderId rollbackProvider{"rollback-local-" + seed.suffix};
     auto collision = run(store.reserveAndReplaceAsync(
         challenge(reservedId, seed.secondOwner), rollbackProvider));
-    EXPECT_TRUE(!collision && collision.error().code() == fnd::ErrorCode::Unavailable);
+    EXPECT_TRUE(!collision && collision.error().code() == fnd::ErrorCode::Conflict);
     auto rolledBack = execute(fixture.get(),
         "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
         {std::string{rollbackProvider.value()}});
     EXPECT_STREQ(PQgetvalue(rolledBack.get(), 0, 0), "0");
+    // Force an insert failure after reservation to test actual rollback.
+    const auto impossibleId = "rejected-insert-" + seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.account_verification_challenges ADD CONSTRAINT fixture_reject_insert "
+        "CHECK (id NOT LIKE 'rejected-insert-%') NOT VALID", {})));
+    auto rejectedInsert = run(store.reserveAndReplaceAsync(
+        challenge(impossibleId, seed.secondOwner), rollbackProvider));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.account_verification_challenges DROP CONSTRAINT fixture_reject_insert", {})));
+    EXPECT_TRUE(!rejectedInsert && rejectedInsert.error().code() == fnd::ErrorCode::Unavailable);
+    auto afterInsertFailure = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
+        {std::string{rollbackProvider.value()}});
+    EXPECT_STREQ(PQgetvalue(afterInsertFailure.get(), 0, 0), "0");
     const ids::ExternalIdentityRef external{localProvider, idp::ExternalSubject{"contact@example.test"}};
     const ids::IdentityId ownerId{seed.owner};
     auto oldGeneration = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
