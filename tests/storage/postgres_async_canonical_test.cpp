@@ -874,7 +874,9 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     ASSERT_EQ(PQntuples(loginProfile.get()), 1);
     EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 0), "first@example.test");
     EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 1), "t");
-    EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 2), "later-user");
+    // Presentation refresh fills missing fields; it never overwrites the
+    // preferred username established by the first linked login.
+    EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 2), "initial-user");
 
     const auto profile = execute(fixture.get(),
         "SELECT display_name,preferred_username FROM openproof.identity_profiles "
