@@ -1752,6 +1752,33 @@ async function main() {
       clientId, clientSecret, ownerJarAfterMasterRotation, rotatedJwks);
     assert.equal(rotatedTokens.idHeader.kid, "e2e-new");
 
+    // Native consent mutation is tested only after the final token exchange,
+    // never against the historical benchmark binary or interactive demo.
+    if (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1" && !holdOpen) {
+      expectStatus(await edgeRequest("/oauth/consents"), 401);
+      expectStatus(await edgeRequest("/oauth/consents", {
+        headers: { authorization: `Bearer ${rotatedTokens.access_token}` },
+      }), 401);
+      const listed = await edgeRequest("/oauth/consents", { jar: ownerJarAfterMasterRotation });
+      expectStatus(listed, 200);
+      assert.equal(listed.headers["cache-control"], "no-store");
+      const document = jsonBody(listed);
+      const grant = document.consents.find(item => item.client_id === clientId && item.active);
+      assert.ok(grant, "active grant must be present before revocation");
+      assert.ok(document.csrf);
+      const revoke = (csrf) => edgeRequest("/oauth/consents/revoke", {
+        method: "POST",
+        jar: ownerJarAfterMasterRotation,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ consent_id: grant.id, csrf }).toString(),
+      });
+      expectStatus(await revoke("invalid"), 401);
+      expectStatus(await revoke(document.csrf), 204);
+      const afterRevoke = await edgeRequest("/oauth/consents", { jar: ownerJarAfterMasterRotation });
+      expectStatus(afterRevoke, 200);
+      assert.equal(jsonBody(afterRevoke).consents.find(item => item.id === grant.id)?.active, false);
+    }
+
     const logout = await jsonRequest("/auth/logout", "POST", undefined, consumerJarAfterReset);
     expectStatus(logout, 204);
     const afterLogout = await edgeRequest("/account/profile", { jar: consumerJarAfterReset });

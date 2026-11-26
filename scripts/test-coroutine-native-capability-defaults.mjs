@@ -202,6 +202,29 @@ test("native local login is mandatory in authenticated runtime with owner-bound 
   assert.match(cmake, /openproof_postgres_async_local_credentials/);
 });
 
+test("OIDC requires native tenant-bound consent management with no synchronous downgrade",()=> {
+  const app=read("apps/opp/main.cpp");
+  const http=read("src/oauth/http/coroutine_consent_http.cpp");
+  const store=read("src/storage/postgres/coroutine_consent_store.cpp");
+  assert.match(app,/const bool nativeConsentEnabled = platform\.oidc\(\)\.enabled\(\)\s*\|\| \(nativeConsentFlag && \*nativeConsentFlag == "1"\)/);
+  assert.match(app,/platform\.oidc\(\)\.enabled\(\) && nativeConsentFlag && \*nativeConsentFlag == "0"[\s\S]*?return ExitCode::ConfigurationError;/);
+  const flag=app.indexOf('environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS")');
+  assert.ok(flag>=0 && flag<app.indexOf("postgres::Migrator migrator",flag));
+  assert.match(app,/if \(nativeConsentEnabled\) \{\s*nativePaths\.emplace_back\("\/oauth\/consents"\);\s*nativePaths\.emplace_back\("\/oauth\/consents\/revoke"\);/);
+  assert.match(app,/std::make_unique<postgres::CoroutineConsentStore>/);
+  assert.match(app,/std::make_unique<oauthHttp::CoroutineConsentAdapter>/);
+  assert.match(app,/return store->listAsync\(std::move\(owner\)\)/);
+  assert.match(app,/return store->revokeAsync\(std::move\(id\), std::move\(owner\), now\)/);
+  assert.match(http,/co_await m_authenticate\(std::move\(\*credential\)\)/);
+  assert.match(http,/co_await m_list\(current->identity\(\)\)/);
+  assert.match(http,/co_await m_revoke\(std::move\(target\).value\(\), current->identity\(\), m_clock->now\(\)\)/);
+  assert.doesNotMatch(http,/m_fallback->handle\(/);
+  assert.match(store,/i\.id=\$1 AND i\.organization_id=\$2 AND i\.status=0 AND o\.state=0/);
+  assert.match(store,/c\.id=\$1 AND c\.identity_id=\$2/);
+  assert.match(store,/app\.organization_id=\$4/);
+  assert.match(store,/COALESCE\(c\.revoked_at_ms,\$3\)/);
+});
+
 test("authenticated runtimes dispatch explicitly public proxy routes without invoking protected authentication",()=>{
   const app=read("apps/opp/main.cpp");
   const domain=read("src/gateway/gateway.cpp");

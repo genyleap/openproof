@@ -964,13 +964,15 @@ the corresponding flag to 0 in that case fails startup. Explicitly enabling
 a route when its parent subsystem is disabled also fails startup. Unsupported
 methods on these strict native paths fail closed.
 
-### Experimental native OAuth consent management
+### Native OAuth consent management
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS=1` selects only GET
-`/oauth/consents` and POST `/oauth/consents/revoke`. Default is disabled.
-It requires enabled authentication, OIDC and native authentication sessions
-(`OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS=1`). Values other than 0 or 1,
-or missing dependencies, fail startup before database changes.
+OIDC-enabled runtimes require native GET `/oauth/consents` and POST
+`/oauth/consents/revoke`. The historical flag
+`OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS` accepts 0 or 1; setting it to
+0 when OIDC is enabled fails startup rather than restoring blocking SQL.
+Explicit enablement requires authentication, OIDC and native sessions.
+Invalid flags or missing configuration dependencies fail before database
+changes. Other methods on these two strict native paths fail closed.
 
 The adapter uses the first-party browser session cookie (not delegated OAuth
 Bearer credentials), the same OAuth IP rate-limit namespace, constant-time
@@ -985,9 +987,8 @@ rejects malformed or oversized grants rather than truncating the response,
 and revokes only the exact owner/consent/application tenant. Repeated
 revocations retain the original timestamp. No schema migration is needed.
 Authorization, token issuance, introspection, token revocation, device flow
-and other OAuth methods retain the existing compatibility path. Do not
-enable this experimental option before exact-head compiled and real
-PostgreSQL/HTTP acceptance has passed.
+and other OAuth methods retain the existing compatibility path. Release
+still requires exact-head compiled and real PostgreSQL/HTTP acceptance.
 
 ### Native recovery-code issuance
 

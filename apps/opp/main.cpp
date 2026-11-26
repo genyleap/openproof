@@ -1631,7 +1631,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeConsentEnabled = nativeConsentFlag && *nativeConsentFlag == "1";
+    if (platform.oidc().enabled() && nativeConsentFlag && *nativeConsentFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled OIDC requires native browser consent management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeConsentEnabled = platform.oidc().enabled()
+        || (nativeConsentFlag && *nativeConsentFlag == "1");
     if (nativeConsentEnabled && (!nativeAuthSessionEnabled
         || !platform.auth().enabled() || !platform.oidc().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3188,8 +3194,8 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/recovery-codes");
         }
         if (nativeConsentEnabled) {
-            nativeMethods.emplace_back("/oauth/consents", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/oauth/consents/revoke", gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/oauth/consents");
+            nativePaths.emplace_back("/oauth/consents/revoke");
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),
