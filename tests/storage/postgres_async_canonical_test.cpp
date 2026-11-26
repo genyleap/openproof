@@ -147,6 +147,8 @@ struct Seed final {
     std::string newSubject = "nc-new-" + suffix;
     std::string racingSubject = "nc-race-" + suffix;
     std::string invalidSubject = "nc-rollback-" + suffix;
+    std::string unlinkedSubject = "nc-unlinked-" + suffix;
+    std::string matchingEmailSubject = "nc-email-match-" + suffix;
 
     void install(PGconn* connection) const
     {
@@ -200,6 +202,7 @@ struct IntegrationResult {
     bool wrongTenantDenied{};
     bool inactiveDenied{};
     bool unlinkedDenied{};
+    bool matchingVerifiedEmailDenied{};
     bool targetAuthorized{};
     bool inactiveTargetDenied{};
     bool foreignTargetDenied{};
@@ -241,9 +244,16 @@ asio::awaitable<void> checkRealDatabase(
         && locked.error().code() == fnd::ErrorCode::AuthenticationFailed;
 
     auto missing = co_await canonical.finishLoginAsync(
-        verified("unlinked-canonical-proof"), kNow);
+        verified(seed.unlinkedSubject), kNow);
     checks.unlinkedDenied = !missing
         && missing.error().code() == fnd::ErrorCode::AuthenticationFailed;
+
+    // A verified email matching an existing native profile is not an
+    // external identity link and cannot authorize implicit provisioning.
+    auto matchingEmail = co_await canonical.finishLoginAsync(
+        verified(seed.matchingEmailSubject, "must-not-update", "first@example.test"), kNow);
+    checks.matchingVerifiedEmailDenied = !matchingEmail
+        && matchingEmail.error().code() == fnd::ErrorCode::AuthenticationFailed;
 
     auto target = co_await canonical.authorizeConnectionTargetAsync(
         ids::IdentityId{seed.secondOwner});
@@ -779,6 +789,12 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     Seed seed;
     ASSERT_NO_THROW(seed.install(fixture.get()));
 
+    const auto identitiesBefore = execute(fixture.get(),
+        "SELECT COUNT(*)::text FROM openproof.identities WHERE organization_id=$1",
+        {seed.org});
+    ASSERT_EQ(PQntuples(identitiesBefore.get()), 1);
+    const std::string initialIdentityCount{PQgetvalue(identitiesBefore.get(), 0, 0)};
+
     asio::io_context io;
     pg::CoroutinePostgresCanonicalFinalizer canonical{
         io.get_executor(), fnd::SecretString{*dsn},
@@ -809,6 +825,7 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(checks.wrongTenantDenied);
     EXPECT_TRUE(checks.inactiveDenied);
     EXPECT_TRUE(checks.unlinkedDenied);
+    EXPECT_TRUE(checks.matchingVerifiedEmailDenied);
     EXPECT_TRUE(checks.targetAuthorized);
     EXPECT_TRUE(checks.inactiveTargetDenied);
     EXPECT_TRUE(checks.foreignTargetDenied);
@@ -818,6 +835,19 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_TRUE(checks.connectionAttached);
     EXPECT_TRUE(checks.ownerConflictDenied);
     EXPECT_TRUE(checks.invalidProfileDenied);
+
+    const auto identitiesAfter = execute(fixture.get(),
+        "SELECT COUNT(*)::text FROM openproof.identities WHERE organization_id=$1",
+        {seed.org});
+    ASSERT_EQ(PQntuples(identitiesAfter.get()), 1);
+    EXPECT_STREQ(PQgetvalue(identitiesAfter.get(), 0, 0), initialIdentityCount.c_str());
+
+    const auto implicitLinks = execute(fixture.get(),
+        "SELECT COUNT(*)::text FROM openproof.external_identities "
+        "WHERE provider='native-canonical-provider' AND external_subject IN ($1,$2)",
+        {seed.unlinkedSubject, seed.matchingEmailSubject});
+    ASSERT_EQ(PQntuples(implicitLinks.get()), 1);
+    EXPECT_STREQ(PQgetvalue(implicitLinks.get(), 0, 0), "0");
 
     const auto notCommitted = execute(fixture.get(),
         "SELECT COUNT(*)::text FROM openproof.external_identities "
@@ -839,11 +869,12 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProf
     EXPECT_STREQ(PQgetvalue(linkedProfile.get(), 0, 2), "linked-user");
 
     const auto loginProfile = execute(fixture.get(),
-        "SELECT email,email_verified FROM openproof.identity_profiles "
+        "SELECT email,email_verified,preferred_username FROM openproof.identity_profiles "
         "WHERE identity_id=$1", {seed.freshLoginOwner});
     ASSERT_EQ(PQntuples(loginProfile.get()), 1);
     EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 0), "first@example.test");
     EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 1), "t");
+    EXPECT_STREQ(PQgetvalue(loginProfile.get(), 0, 2), "later-user");
 
     const auto profile = execute(fixture.get(),
         "SELECT display_name,preferred_username FROM openproof.identity_profiles "
