@@ -1,8 +1,8 @@
 openproof_add_module(openproof_account_delivery
     MODULES
         delivery.cppm
-    PRIVATE_MODULES
-        delivery_impl.cppm
+    SOURCES
+        delivery_impl.cpp
     LINK_PUBLIC
         openproof_account
         openproof_foundation
@@ -18,5 +18,5 @@ target_compile_definitions(openproof_account_delivery PRIVATE BOOST_HAS_LONG_LON
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
    CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
-    set_source_files_properties(delivery_impl.cppm PROPERTIES COMPILE_OPTIONS "-fno-inline")
+    set_source_files_properties(delivery_impl.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()

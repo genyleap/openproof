@@ -9,7 +9,7 @@ module;
 #include <utility>
 #include <vector>
 
-module openproof.account.delivery:implementation;
+module openproof.account.delivery;
 
 import openproof.account;
 import openproof.foundation;
