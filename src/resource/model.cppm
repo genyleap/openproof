@@ -18,6 +18,15 @@ using ResourceId = foundation::StrongId<ResourceIdTag>;
 
 enum class ResourceStatus { Active, Suspended, Revoked };
 
+enum class ResourceMutation { Create, Suspend, Activate, Revoke };
+struct ResourceMutationCommand final {
+    ResourceMutation operation;
+    ResourceId id;
+    std::string audience;
+    std::string name;
+    std::vector<std::string> scopes;
+};
+
 /** @brief Registered OAuth resource server and its audience/scope boundary. */
 class ResourceServer final {
 public:

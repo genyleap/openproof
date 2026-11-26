@@ -13,6 +13,7 @@ import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.session;
+import openproof.resource;
 
 namespace openproof::application::http {
 class CoroutineManagementReadAdapter final : public gateway::http::CoroutineHttpHandler {
@@ -32,9 +33,11 @@ public:
         MutateClient mutate;
         MutateJarKey mutateJarKey{};
     };
+    using MutateResource=std::function<boost::asio::awaitable<foundation::Result<resource::ResourceServer>>(
+        resource::ResourceMutationCommand,identity::core::IdentityId,session::SessionId)>;
     CoroutineManagementReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter,Authenticate authenticate,Read read,Mutate mutate={},
-        std::optional<ClientContext> clients=std::nullopt);
+        std::optional<ClientContext> clients=std::nullopt,MutateResource resources={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> handleAsync(gateway::HttpRequest) override;
@@ -45,5 +48,6 @@ private:
     Read m_read;
     Mutate m_mutate;
     std::optional<ClientContext> m_clients;
+    MutateResource m_resources;
 };
 }

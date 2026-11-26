@@ -3259,4 +3259,141 @@ CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync(client::ClientId id,
     }
 }
 
+asio::awaitable<foundation::Result<resource::ResourceServer>>
+CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync(
+    resource::ResourceMutationCommand command,core::IdentityId actor,
+    session::SessionId sessionId,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    using Op=resource::ResourceMutation;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || now.time_since_epoch().count()<0 || command.audience.empty() || command.audience.size()>2048U
+        || std::ranges::any_of(command.audience,[](unsigned char c){return c<=0x20U || c==0x7fU;})
+        || static_cast<unsigned int>(command.operation)>static_cast<unsigned int>(Op::Revoke))
+        co_return foundation::fail(E::InvalidArgument);
+    std::optional<resource::ResourceServer> value;
+    if (command.operation==Op::Create) {
+        if (command.id.empty() || command.id.value().size()>200U
+            || std::ranges::any_of(command.name,[](unsigned char c){return c<0x20U || c==0x7fU;}))
+            co_return foundation::fail(E::InvalidArgument);
+        auto created=resource::ResourceServer::create(command.id,std::move(command.audience),
+            std::move(command.name),std::move(command.scopes),now);
+        if (!created) co_return foundation::fail(created.error());
+        value.emplace(std::move(created).value());
+    } else if (!command.id.empty() || !command.name.empty() || !command.scopes.empty()) {
+        co_return foundation::fail(E::InvalidArgument);
+    }
+    const auto tenant=std::string{m_impl->organization.value()};
+    const auto timestamp=std::to_string(now.time_since_epoch().count());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        // Serialize against native/legacy owner lifecycle changes. Keep the
+        // authorization rows locked until the application change commits.
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        Params actorArgs{std::string{actor.value()},tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.assurance FROM openproof.organizations o "
+            "JOIN openproof.identities i ON i.organization_id=o.id "
+            "JOIN openproof.memberships m ON m.identity_id=i.id AND m.organization_id=o.id "
+            "JOIN openproof.membership_roles r ON r.identity_id=i.id AND r.organization_id=o.id "
+            "JOIN openproof.sessions s ON s.identity_id=i.id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND o.state=0 AND m.state=1 AND r.role='owner' "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR SHARE OF o,i,m,r,s",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto assurance=milliseconds(permitted.rows.front()[0]);
+        if (assurance<2 || assurance>4) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AssuranceInsufficient);
+        }
+        // Resources are platform-wide in the current schema; the actor is
+        // still authorized against the configured tenant. Grant issuance
+        // takes a SHARE lock on these same resource rows.
+        if (value) {
+            Params args{std::string{value->id().value()},std::string{value->audience()},
+                std::string{value->displayName()},timestamp};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.oauth_resources(id,audience,display_name,status,created_at_ms,updated_at_ms) "
+                "VALUES($1,$2,$3,0,$4,$4) ON CONFLICT DO NOTHING RETURNING id",std::move(args));
+            if (inserted.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AlreadyExists);
+            }
+            if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U
+                || required(inserted.rows.front()[0])!=value->id().value())
+                throw std::runtime_error{"Resource insert mismatch"};
+            for (const auto& scope:value->scopes()) {
+                Params args{std::string{value->id().value()},scope};
+                static_cast<void>(co_await execute(
+                    "INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,$2)",std::move(args)));
+            }
+        } else {
+            Params args{command.audience};
+            const auto locked=co_await execute(
+                "SELECT id,display_name,status,created_at_ms,updated_at_ms "
+                "FROM openproof.oauth_resources WHERE audience=$1 FOR UPDATE",std::move(args));
+            if (locked.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            if (locked.rows.size()!=1U || locked.rows.front().size()!=5U)
+                throw std::runtime_error{"Malformed resource row"};
+            const auto& row=locked.rows.front();
+            const auto status=milliseconds(row[2]);
+            if (status>2) throw std::runtime_error{"Invalid resource status"};
+            Params scopeArgs{required(row[0])};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=$1 "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(scopeArgs));
+            if (grants.rows.empty() || grants.rows.size()>256U)
+                throw std::runtime_error{"Invalid resource scopes"};
+            std::vector<std::string> scopes;
+            for (const auto& grant:grants.rows) {
+                if (grant.size()!=1U) throw std::runtime_error{"Malformed resource scope"};
+                scopes.push_back(required(grant[0]));
+            }
+            const auto updatedAt=foundation::Instant{foundation::Duration{milliseconds(row[4])}};
+            auto restored=resource::ResourceServer::restore(resource::ResourceId{required(row[0])},
+                command.audience,required(row[1]),std::move(scopes),static_cast<resource::ResourceStatus>(status),
+                foundation::Instant{foundation::Duration{milliseconds(row[3])}},updatedAt);
+            if (!restored) throw std::runtime_error{"Invalid stored resource"};
+            if (now<updatedAt) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::Conflict);
+            }
+            const auto target=command.operation==Op::Suspend?resource::ResourceStatus::Suspended:
+                command.operation==Op::Activate?resource::ResourceStatus::Active:resource::ResourceStatus::Revoked;
+            auto changed=restored->setStatus(target,now);
+            if (!changed) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(changed.error());
+            }
+            value.emplace(std::move(restored).value());
+            Params updateArgs{std::string{value->id().value()},command.audience,
+                std::to_string(static_cast<unsigned int>(value->status())),timestamp};
+            // A lifecycle change never deletes or replaces scope grants.
+            const auto updated=co_await execute(
+                "UPDATE openproof.oauth_resources SET status=$3,updated_at_ms=$4 "
+                "WHERE id=$1 AND audience=$2 RETURNING id",std::move(updateArgs));
+            if (updated.rows.size()!=1U || updated.rows.front().size()!=1U
+                || required(updated.rows.front()[0])!=value->id().value())
+                throw std::runtime_error{"Resource update mismatch"};
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return std::move(*value);
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native resource mutation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

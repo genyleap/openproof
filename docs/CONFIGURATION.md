@@ -1123,8 +1123,16 @@ keys, trailing material, stale updates and registration on revoked clients
 are rejected. Removal remains idempotent and replay records are retained
 across key rotation and removal.
 
+Resource creation, suspension, activation and revocation now use native
+transactions. The registry remains platform-wide; its administrative
+actor must hold an active owner session with IAL2 assurance in the
+configured tenant. Resource lifecycle changes lock the resource row
+used by native grant validation and preserve the scope registry instead
+of replacing it. Duplicate audiences, stale status changes and
+reactivation of revoked resources are rejected.
+
 The remaining PostgreSQL compatibility surfaces include
-resource and service-identity mutations and the administration console,
+service-identity mutations and the administration console,
 passkey operations, evidence/trust and enabled SCIM operations, as well
 as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated

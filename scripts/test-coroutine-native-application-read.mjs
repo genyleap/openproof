@@ -95,7 +95,8 @@ test("native client lifecycle and secret rotation preserve domain checks and exp
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/ASSERT_NE\(ca.has_value\(\),cb.has_value\(\)\)/);
 });
 test("JAR key management validates one RSA public envelope and preserves durable replay protection",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthJarKeyAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync("));
   assert.match(http,/r.path\(\)=="\/admin\/clients\/jar-key"\s*&& \(r.method\(\)==Method::Post \|\| r.method\(\)==Method::Delete\)/);
   assert.match(http,/parseJarMutation\(r\)/);
   assert.match(http,/co_await m_clients->mutateJarKey/);
@@ -115,4 +116,28 @@ test("JAR key management validates one RSA public envelope and preserves durable
   assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/keyTask\(client,"stale",pem/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/keyTask\(client,"bad",pem\+pem\)/);
+});
+test("resource lifecycle locks grant admission rows and preserves existing scopes",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync("));
+  for(const route of ["/admin/resources","/admin/resources/suspend","/admin/resources/activate","/admin/resources/revoke"])
+    assert.ok(http.includes('r.path()=="'+route+'"'),route);
+  assert.match(http,/parseResourceMutation\(r,\*resourceWrite\)/);
+  assert.match(http,/co_await m_resources\(std::move\(\*resourceCommand\),actor->identity\(\),actor->id\(\)\)/);
+  assert.match(app,/reader->mutateOAuthResourceAsync/);
+  assert.match(app,/nativePaths.emplace_back\(route\)/);
+  for(const term of ["resource::ResourceServer::create","pg_advisory_xact_lock(7299730475761673315)",
+    "FOR SHARE OF o,i,m,r,s","assurance<2 || assurance>4","INSERT INTO openproof.oauth_resources",
+    "ON CONFLICT DO NOTHING RETURNING id","INSERT INTO openproof.oauth_resource_scopes",
+    "FROM openproof.oauth_resources WHERE audience=$1 FOR UPDATE",
+    "resource::ResourceServer::restore","now<updatedAt","restored->setStatus(target,now)",
+    "UPDATE openproof.oauth_resources SET status=$3,updated_at_ms=$4"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("assurance<2")<store.indexOf("INSERT INTO openproof.oauth_resources"));
+  assert.ok(store.indexOf("UPDATE openproof.oauth_resources")<store.lastIndexOf('execute("COMMIT",{})'));
+  assert.doesNotMatch(store,/DELETE FROM openproof.oauth_resource_scopes/);
+  assert.doesNotMatch(cppExecutableText(store),/PQexec|PQconnectdb/);
+  const fixture=read("tests/storage/postgres_async_canonical_test.cpp");
+  assert.match(fixture,/resourceChange\(ROp::Revoke\)/);
+  assert.match(fixture,/resourceChange\(ROp::Activate\)/);
+  assert.match(fixture,/staleResource.error\(\).code\(\),fnd::ErrorCode::Conflict/);
 });

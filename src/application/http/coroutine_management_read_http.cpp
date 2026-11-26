@@ -177,6 +177,59 @@ foundation::Result<JarCommand> parseJarMutation(gateway::HttpRequest& r) {
     if (object.size()!=3U || !id || !kid || !pem) return foundation::fail(E::InvalidArgument);
     return JarCommand{client::ClientId{std::move(*id)},std::move(kid),std::move(pem)};
 }
+std::optional<resource::ResourceMutation> resourceMutation(const gateway::HttpRequest& r) noexcept {
+    using Op=resource::ResourceMutation;
+    if (r.method()!=Method::Post) return std::nullopt;
+    if (r.path()=="/admin/resources") return Op::Create;
+    if (r.path()=="/admin/resources/suspend") return Op::Suspend;
+    if (r.path()=="/admin/resources/activate") return Op::Activate;
+    if (r.path()=="/admin/resources/revoke") return Op::Revoke;
+    return std::nullopt;
+}
+foundation::Result<resource::ResourceMutationCommand> parseResourceMutation(
+    gateway::HttpRequest& r,resource::ResourceMutation op)
+{
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/json" && !media->starts_with("application/json;"))
+        || r.body().empty() || r.body().size()>48U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    boost::system::error_code error;
+    auto value=boost::json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !value.is_object()) return foundation::fail(E::InvalidArgument);
+    const auto& object=value.as_object();
+    const auto field=[&](std::string_view name,std::size_t maximum)->std::optional<std::string> {
+        const auto* item=object.if_contains(name);
+        if (!item || !item->is_string()) return std::nullopt;
+        const auto& s=item->as_string();
+        if (s.empty() || s.size()>maximum || std::ranges::any_of(s,[](unsigned char c){
+            return c<0x20U || c==0x7fU;
+        })) return std::nullopt;
+        return std::string{s.data(),s.size()};
+    };
+    auto audience=field("audience",2048U);
+    if (!audience) return foundation::fail(E::InvalidArgument);
+    if (op!=resource::ResourceMutation::Create) {
+        if (object.size()!=1U) return foundation::fail(E::InvalidArgument);
+        return resource::ResourceMutationCommand{op,resource::ResourceId{""},std::move(*audience),{},{}};
+    }
+    auto name=field("name",120U);
+    const auto* scopes=object.if_contains("scopes");
+    if (object.size()!=3U || !name || !scopes || !scopes->is_array()
+        || scopes->as_array().empty() || scopes->as_array().size()>256U)
+        return foundation::fail(E::InvalidArgument);
+    std::vector<std::string> grants;
+    for (const auto& scope:scopes->as_array()) {
+        if (!scope.is_string() || scope.as_string().size()>128U) return foundation::fail(E::InvalidArgument);
+        std::string parsed{scope.as_string().data(),scope.as_string().size()};
+        if (!client::Scope::create(parsed)) return foundation::fail(E::InvalidArgument);
+        grants.push_back(std::move(parsed));
+    }
+    auto id=security::randomTokenBase64Url(18U);
+    if (!id) return foundation::fail(id.error());
+    return resource::ResourceMutationCommand{op,resource::ResourceId{"opr_"+id.value()},
+        std::move(*audience),std::move(*name),std::move(grants)};
+}
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeBody(); r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
 }
@@ -213,13 +266,13 @@ foundation::Result<std::optional<std::string>> filter(const gateway::HttpRequest
 
 CoroutineManagementReadAdapter::CoroutineManagementReadAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Read read,Mutate mutate,std::optional<ClientContext> clients)
+    Authenticate authenticate,Read read,Mutate mutate,std::optional<ClientContext> clients,MutateResource resources)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),m_read(std::move(read)),
-      m_mutate(std::move(mutate)),m_clients(std::move(clients)) {}
+      m_mutate(std::move(mutate)),m_clients(std::move(clients)),m_resources(std::move(resources)) {}
 
 bool CoroutineManagementReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     return operation(r).has_value() || mutation(r).has_value() || clientMutation(r).has_value()
-        || jarMutation(r) || m_fallback->nativeEnabledFor(r);
+        || jarMutation(r) || resourceMutation(r).has_value() || m_fallback->nativeEnabledFor(r);
 }
 
 gateway::HttpResponse CoroutineManagementReadAdapter::handle(gateway::HttpRequest r) {
@@ -232,7 +285,8 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     const auto write=mutation(r);
     const auto clientWrite=clientMutation(r);
     const bool jarWrite=jarMutation(r);
-    if (!op && !write && !clientWrite && !jarWrite) {
+    const auto resourceWrite=resourceMutation(r);
+    if (!op && !write && !clientWrite && !jarWrite && !resourceWrite) {
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r);
         co_return failure(E::Unavailable,r);
@@ -240,7 +294,8 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     Scrub wipe{r};
     if (!m_authenticate || (op && !m_read) || (write && !m_mutate)
         || (clientWrite && (!m_clients || !m_clients->mutate))
-        || (jarWrite && (!m_clients || !m_clients->mutateJarKey)))
+        || (jarWrite && (!m_clients || !m_clients->mutateJarKey))
+        || (resourceWrite && !m_resources))
         co_return failure(E::Unavailable,r);
     if (!m_limiter->allow("idp-admin-ip:"+std::string{r.remoteAddress()}))
         co_return failure(E::RateLimited,r);
@@ -250,6 +305,7 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
     std::optional<ApplicationMutationCommand> command;
     std::optional<client::ManagementMutationCommand> clientCommand;
     std::optional<JarCommand> jarCommand;
+    std::optional<resource::ResourceMutationCommand> resourceCommand;
     if (op) {
         auto parsed=filter(r,*op);
         if (!parsed) co_return failure(parsed.error().code(),r);
@@ -262,10 +318,14 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
         auto parsed=parseClientMutation(r,*clientWrite);
         if (!parsed) co_return failure(parsed.error().code(),r);
         clientCommand.emplace(std::move(parsed).value());
-    } else {
+    } else if (jarWrite) {
         auto parsed=parseJarMutation(r);
         if (!parsed) co_return failure(parsed.error().code(),r);
         jarCommand.emplace(std::move(parsed).value());
+    } else {
+        auto parsed=parseResourceMutation(r,*resourceWrite);
+        if (!parsed) co_return failure(parsed.error().code(),r);
+        resourceCommand.emplace(std::move(parsed).value());
     }
     auto credential=gateway::takeSessionCredential(r);
     if (!credential) co_return failure(credential.error().code(),r);
@@ -286,6 +346,21 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutineManagementReadAdapter::ha
             .add("name",changed->displayName()).add("environment",environmentName(changed->environment()))
             .add("status",applicationStatusName(changed->status()));
         co_return response(status,body.build());
+    }
+    if (resourceCommand) {
+        const auto status=resourceCommand->operation==resource::ResourceMutation::Create?201:200;
+        auto changed=co_await m_resources(std::move(*resourceCommand),actor->identity(),actor->id());
+        if (!changed) co_return failure(changed.error().code(),r);
+        boost::json::object body;
+        body["id"]=std::string{changed->id().value()};
+        body["audience"]=std::string{changed->audience()};
+        body["name"]=std::string{changed->displayName()};
+        body["status"]=changed->status()==resource::ResourceStatus::Active?"active":
+            changed->status()==resource::ResourceStatus::Suspended?"suspended":"revoked";
+        boost::json::array scopes;
+        for (const auto& scope:changed->scopes()) scopes.emplace_back(scope);
+        body["scopes"]=std::move(scopes);
+        co_return response(status,boost::json::serialize(body));
     }
     if (jarCommand) {
         const bool registration=jarCommand->kid.has_value();

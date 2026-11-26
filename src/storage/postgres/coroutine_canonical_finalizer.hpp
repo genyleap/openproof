@@ -23,6 +23,7 @@ import openproof.organization;
 import openproof.policy;
 import openproof.session;
 import openproof.oauth;
+import openproof.resource;
 
 namespace openproof::storage::postgres {
 
@@ -72,6 +73,10 @@ public:
     mutateOAuthJarKeyAsync(client::ClientId id,std::optional<std::string> keyId,
         std::optional<std::string> publicKeyPem,identity::core::IdentityId actor,
         session::SessionId sessionId,foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<resource::ResourceServer>>
+    mutateOAuthResourceAsync(resource::ResourceMutationCommand command,
+        identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now);
 
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();

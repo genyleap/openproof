@@ -975,12 +975,61 @@ MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
         "SELECT count(*)::text FROM openproof.oauth_jar_replays WHERE client_id=$1 AND jwt_id='fixture-replay'",{client});
     ASSERT_EQ(PQntuples(replay.get()),1);
     EXPECT_STREQ(PQgetvalue(replay.get(),0,0),"1");
+    namespace res=openproof::resource;
+    using ROp=res::ResourceMutation;
+    using RCommand=res::ResourceMutationCommand;
+    const auto resourceId="native-resource-"+seed.suffix;
+    const auto audience="urn:fixture:resource:"+seed.suffix;
+    const auto resourceCreate=[&](std::string id,std::string target,std::vector<std::string> scopes) {
+        return RCommand{ROp::Create,res::ResourceId{std::move(id)},std::move(target),"Resource fixture",std::move(scopes)};
+    };
+    const auto resourceChange=[&](ROp op) {
+        return RCommand{op,res::ResourceId{""},audience,{},{}};
+    };
+    const auto resourceTask=[&](RCommand command,std::string actor={},std::string session={},
+        fnd::Instant when=kNow+5s) {
+        return native.mutateOAuthResourceAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,"invalid audience",{"read"}))));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{}))));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{"read"}),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{"read"}),seed.owner,weakSession)));
+    auto createdResource=runMutation(resourceTask(resourceCreate(resourceId,audience,{"write","read","read"})));
+    ASSERT_TRUE(createdResource);
+    EXPECT_EQ(createdResource->scopes(),(std::vector<std::string>{"read","write"}));
+    EXPECT_EQ(createdResource->status(),res::ResourceStatus::Active);
+    auto duplicateResource=runMutation(resourceTask(resourceCreate(resourceId+"-duplicate",audience,{"read"})));
+    ASSERT_FALSE(duplicateResource);
+    EXPECT_EQ(duplicateResource.error().code(),fnd::ErrorCode::AlreadyExists);
+    auto suspendedResource=runMutation(resourceTask(resourceChange(ROp::Suspend),{}, {},kNow+6s));
+    ASSERT_TRUE(suspendedResource);
+    EXPECT_EQ(suspendedResource->status(),res::ResourceStatus::Suspended);
+    auto staleResource=runMutation(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+5s));
+    ASSERT_FALSE(staleResource);
+    EXPECT_EQ(staleResource.error().code(),fnd::ErrorCode::Conflict);
+    io.restart();
+    std::optional<fnd::Result<res::ResourceServer>> revokeResult,activateResult;
+    auto revokeTask=asio::co_spawn(io,collect(resourceTask(resourceChange(ROp::Revoke),{}, {},kNow+7s),revokeResult),asio::use_future);
+    auto activateTask=asio::co_spawn(io,collect(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+7s),activateResult),asio::use_future);
+    io.run(); revokeTask.get(); activateTask.get();
+    ASSERT_TRUE(revokeResult && revokeResult->has_value());
+    ASSERT_TRUE(activateResult.has_value());
+    if (!activateResult->has_value()) EXPECT_EQ(activateResult->error().code(),fnd::ErrorCode::FailedPrecondition);
+    EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+8s)));
+    const auto resourceState=execute(fixture.get(),
+        "SELECT status::text,(SELECT count(*) FROM openproof.oauth_resource_scopes WHERE resource_id=$1)::text "
+        "FROM openproof.oauth_resources WHERE id=$1",{resourceId});
+    ASSERT_EQ(PQntuples(resourceState.get()),1);
+    EXPECT_STREQ(PQgetvalue(resourceState.get(),0,0),"2");
+    EXPECT_STREQ(PQgetvalue(resourceState.get(),0,1),"2");
     ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
         {seed.org,seed.owner}));
     EXPECT_FALSE(read(Read::Clients,app));
     EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
     EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
     EXPECT_FALSE(runMutation(keyTask(client,"denied",pem)));
+    EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Revoke),{}, {},kNow+8s)));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)
