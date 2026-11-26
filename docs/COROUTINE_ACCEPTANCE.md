@@ -4875,3 +4875,17 @@ retains its shared monotonic deadline and smart-account verification
 fallback semantics. Source gate checks actual native probes and mandatory
 runtime wiring. Exact-head compiled, live RPC and E2E acceptance remain
 required before production approval.
+
+### Native contact verification issuance runtime
+
+Account-enabled authenticated deployments now route POST /account/email/change
+and POST /account/phone through native account authorization, native
+generation-bound reservation/challenge storage, and coroutine webhook
+delivery. The authenticated identity alone selects the owner; payload
+fields remain email or phone_number, success remains HTTP 202 accepted.
+Delegated account-scoped credentials use the same native authorization
+port as Web3. Delivery failure compensates only the exact issued generation.
+The remaining signup/resend/password-reset flows still use the legacy
+delivery boundary. The proxy bridge cannot yet be retired; protected
+gateway coverage and those remaining callers require separate migration.
+No new schema migration. Compiled and live delivery acceptance pending.
