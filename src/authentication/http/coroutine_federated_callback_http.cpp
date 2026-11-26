@@ -227,6 +227,56 @@ private:
         });
 }
 
+[[nodiscard]] std::string encodeQueryComponent(std::string_view value)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(value.size());
+    for (const char symbol : value) {
+        const auto byte = static_cast<unsigned char>(symbol);
+        const bool unreserved = (byte >= 'A' && byte <= 'Z')
+            || (byte >= 'a' && byte <= 'z')
+            || (byte >= '0' && byte <= '9')
+            || byte == '-' || byte == '_' || byte == '.' || byte == '~';
+        if (unreserved) {
+            output.push_back(static_cast<char>(byte));
+        } else {
+            output.push_back('%');
+            output.push_back(hex[(byte >> 4U) & 0x0fU]);
+            output.push_back(hex[byte & 0x0fU]);
+        }
+    }
+    return output;
+}
+
+[[nodiscard]] std::string appendQueryParameter(
+    std::string target, std::string_view name, std::string_view value)
+{
+    const auto fragment = target.find('#');
+    std::string suffix;
+    if (fragment != std::string::npos) {
+        suffix = target.substr(fragment);
+        target.resize(fragment);
+    }
+    target.push_back(target.contains('?') ? '&' : '?');
+    target.append(name);
+    target.push_back('=');
+    target.append(encodeQueryComponent(value));
+    target.append(suffix);
+    return target;
+}
+
+[[nodiscard]] gateway::HttpResponse connectionDenied(
+    foundation::ErrorCode code, const gateway::HttpRequest& request, std::string target)
+{
+    auto location=appendQueryParameter(std::move(target),"op_error",foundation::errorCodeName(code));
+    location=appendQueryParameter(std::move(location),"op_request",request.correlation().value());
+    gateway::HttpResponse response{302,gateway::Headers{{"location",std::move(location)}},{}};
+    secure(response);
+    clearState(response);
+    return response;
+}
+
 [[nodiscard]] idp::ClientContext context(const gateway::HttpRequest& request)
 {
     idp::ClientContext result;
@@ -286,7 +336,7 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     SensitiveFederatedCallbackRequestGuard wipeRequestOnExit{request};
 
     // The native opt-in initially supports only OAuth2 GET redirects.
-    // SAML/POST, OAuth1 and account connection ceremonies remain disabled.
+    // SAML/POST and OAuth1 remain disabled; OAuth2 link proof is purpose-bound.
     if (request.method() != gateway::HttpMethod::Get) {
         request.wipeTargetQuery();
         request.wipeBody();
@@ -325,7 +375,7 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     auto returning = readCookie(request, kReturn, 16U * 1024U, invalidCookie);
     auto mode = readCookie(request, kMode, 16U, invalidCookie);
     auto previous = readCookie(request, kSession, 128U, invalidCookie);
-    if (invalidCookie || mode || !continuation || !bindingToken
+    if (invalidCookie || (mode && *mode!="link") || !continuation || !bindingToken
         || !transaction || !challenge || !returning) {
         request.wipeTargetQuery();
         request.wipeCookieHeader();
@@ -363,6 +413,23 @@ CoroutineFederatedCallbackAdapter::handleAsync(gateway::HttpRequest request)
     request.wipeBody();
     request.wipeAuthorizationHeader();
     request.wipeCookieHeader();
+
+    if (mode) {
+        // A link callback is never a login, even if the caller tampers with
+        // the mode cookie: the coordinator consumes and checks server purpose.
+        try {
+            auto linked=co_await m_authentication->completeConnectionAsync(
+                idp::TransactionId{*transactionText},std::move(continuationSecret),
+                binding.value(),std::move(proof));
+            if (!linked) co_return connectionDenied(linked.error().code(),request,*returnTo);
+        } catch (...) {
+            co_return connectionDenied(foundation::ErrorCode::Unavailable,request,*returnTo);
+        }
+        gateway::HttpResponse response{302,gateway::Headers{{"location",*returnTo}},{}};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
 
     foundation::Result<VerifiedAuthentication> verified =
         foundation::fail(foundation::ErrorCode::Unavailable);

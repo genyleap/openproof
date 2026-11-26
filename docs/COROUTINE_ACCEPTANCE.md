@@ -4680,3 +4680,16 @@ linked avatar eligibility and only writes presentation columns. It does
 not rewrite verified contact fields, ownership, creation time, credentials
 or sessions. No new schema or feature flag. Missing or foreign profiles,
 invalid avatar selection and untrusted adapter owner echoes fail closed.
+
+### Native OAuth2 connection handoff
+
+The paired federation experiment now includes cookie-authenticated direct
+connection start and ticket issuance/redemption. Native transaction storage
+consumes the short-lived handoff atomically, checks its purpose, and verifies
+the active tenant-bound canonical target before starting a native connection
+proof. A link callback completes the server-bound connection transaction
+without issuing or replacing a login session. The mode cookie does not
+authorize a link; the consumed server transaction must match its purpose.
+Delegated Bearer issuance/start remain on compatibility. SAML/POST and
+OAuth1 are not migrated by this change; provider bridges are intentionally
+not removed until all relevant runtime routes are covered.

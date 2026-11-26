@@ -1486,6 +1486,104 @@ AuthenticationService::consumeBrowserConnectionHandoff(
         provider::ProviderId{providerId->second}, returnTarget->second};
 }
 
+boost::asio::awaitable<foundation::Result<BrowserConnectionHandoff>>
+AuthenticationService::issueBrowserConnectionHandoffAsync(
+    identity::core::IdentityId identity,
+    provider::ProviderId providerId,
+    std::string returnTarget,
+    foundation::CorrelationId correlation)
+{
+    if (identity.empty() || providerId.empty() || returnTarget.empty()
+        || returnTarget.size() > 2048U || correlation.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The browser connection handoff is invalid.");
+    }
+    auto* nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical || !m_asyncCanonical->nativeConnectionsEnabled()
+        || !nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto* implementation=m_providers.find(providerId);
+    if (!implementation || implementation->interactionModel()!=provider::InteractionModel::Redirect)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(identity);
+    if (!active) co_return foundation::fail(active.error());
+    auto generatedId = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto generatedSecret = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    if (!generatedId) co_return foundation::fail(generatedId.error());
+    if (!generatedSecret) co_return foundation::fail(generatedSecret.error());
+
+    provider::TransactionId transactionId{generatedId.value()};
+    foundation::SecretString secret{std::move(generatedSecret).value()};
+    const foundation::Instant now = m_clock.now();
+    const foundation::Duration lifetime =
+        std::min(kBrowserHandoffLifetime, m_maximumTransactionLifetime);
+    auto transaction = provider::AuthenticationTransaction::create(
+        transactionId, provider::ProviderId{std::string{kHandoffProvider}},
+        provider::InteractionModel::Redirect, secret.clone(), provider::BindingDigest{},
+        std::move(correlation), now, lifetime);
+    if (!transaction) co_return foundation::fail(transaction.error());
+    transaction->setMetadata(std::string{kHandoffIdentityMetadata},
+                             std::string{identity.value()});
+    transaction->setMetadata(std::string{kHandoffProviderMetadata},
+                             std::string{providerId.value()});
+    transaction->setMetadata(std::string{kHandoffReturnMetadata},
+                             std::move(returnTarget));
+    auto recorded = co_await nativeTransactions->beginAsync(std::move(transaction).value());
+    if (!recorded) co_return foundation::fail(recorded.error());
+
+    co_return BrowserConnectionHandoff{
+        foundation::SecretString{std::string{transactionId.value()} + "."
+                                 + secret.expose()},
+        now + lifetime};
+}
+
+boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
+AuthenticationService::consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket)
+{
+    const std::string_view presented = ticket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: malformed ticket."));
+    }
+    auto* nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical || !m_asyncCanonical->nativeConnectionsEnabled())
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: ticket is unknown, expired, invalid, or already consumed."));
+    }
+    if (consumed->provider().value() != kHandoffProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: transaction purpose mismatch."));
+    }
+    const auto identity = consumed->metadata().find(kHandoffIdentityMetadata);
+    const auto providerId = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto returnTarget = consumed->metadata().find(kHandoffReturnMetadata);
+    if (identity == consumed->metadata().end() || identity->second.empty()
+        || providerId == consumed->metadata().end() || providerId->second.empty()
+        || returnTarget == consumed->metadata().end() || returnTarget->second.empty()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: server-bound state is incomplete."));
+    }
+    if (!nativeProviderAuthenticationEnabled(provider::ProviderId{providerId->second}))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(
+        identity::core::IdentityId{identity->second});
+    if (!active) co_return foundation::fail(active.error());
+    co_return BrowserConnectionTarget{
+        identity::core::IdentityId{identity->second},
+        provider::ProviderId{providerId->second}, returnTarget->second};
+}
+
 foundation::Result<BrowserAuthenticationHandoff>
 AuthenticationService::issueBrowserAuthenticationHandoff(
     const provider::ProviderId& providerId,

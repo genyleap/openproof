@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <boost/json.hpp>
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
@@ -961,7 +962,7 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncF
     EXPECT_EQ(response.headers().at("location"), "https://example.test/authorize");
     EXPECT_EQ(response.headers().at("cache-control"), "no-store");
     ASSERT_TRUE(response.headers().contains("set-cookie"));
-    EXPECT_EQ(response.repeatedHeaders().size(), 4U);
+    EXPECT_EQ(response.repeatedHeaders().size(), 5U);
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
@@ -1095,7 +1096,7 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartRealHttpLoopbackPreserves
     for (const auto& field : response) {
         if (field.name() == wire::field::set_cookie) ++cookieCount;
     }
-    EXPECT_EQ(cookieCount, 5);
+    EXPECT_EQ(cookieCount, 6);
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
@@ -1141,6 +1142,7 @@ public:
 {
     std::string result;
     const auto append = [&result](std::string_view field) {
+        if (field.find("Max-Age=0")!=std::string_view::npos) return;
         const auto semi = field.find(';');
         if (!result.empty()) result.append("; ");
         result.append(field.substr(0U, semi));
@@ -1234,6 +1236,63 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackConsumesProofAndIssues
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
 }
 
+TEST(TrustedAuthenticationCoroutineTest, FederatedConnectionHandoffIsSingleUseAndNeverIssuesLogin)
+{
+    namespace gw=openproof::gateway;
+    namespace sess=openproof::session;
+    Fixture fixture;
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{
+        service,fixture.providers,limiter.value(),fallback,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="fixture-session")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return sess::Session::create(sess::SessionId{"link-session"},
+                ids::IdentityId{"canonical-identity"},idp::ProviderId{"local"},
+                idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+                kNow,sess::TokenDigest{binding("fixture-session")},kNow,
+                std::chrono::hours{8},std::chrono::minutes{30});
+        }};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,fallback};
+    auto issue=[&](std::string token){
+        return invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
+            "/account/connections/handoff",
+            {{"cookie","__Host-openproof-session="+std::move(token)},{"content-type","application/json"}},
+            R"({"provider":"async-test","return_to":"/account"})",
+            "127.0.0.1",fnd::CorrelationId{"handoff-test"}).value());
+    };
+    EXPECT_EQ(issue("wrong").status(),401);
+    const auto ticket=issue("fixture-session");
+    ASSERT_EQ(ticket.status(),201);
+    const auto handoff=boost::json::parse(ticket.body()).as_object().at("handoff_url").as_string();
+    const std::string target{handoff.data(),handoff.size()};
+    ASSERT_TRUE(target.starts_with("/account/connections/handoff?ticket="));
+    const auto linked=invokeFederated(start,makeFederatedStart(target));
+    ASSERT_EQ(linked.status(),302);
+    const auto cookies=federatedCookies(linked);
+    ASSERT_NE(cookies.find("__Host-openproof-federation-mode=link"),std::string::npos);
+    EXPECT_GE(invokeFederated(start,makeFederatedStart(target)).status(),400);
+    const auto completed=invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",cookies));
+    EXPECT_EQ(completed.status(),302);
+    EXPECT_EQ(completed.headers().at("location"),"/account");
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(federatedCookies(completed).find("__Host-openproof-session="),std::string::npos);
+    const auto replay=invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",cookies));
+    EXPECT_EQ(replay.status(),302);
+    EXPECT_NE(replay.headers().at("location").find("op_error="),std::string::npos);
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls,0);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
 TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMissingState)
 {
     Fixture fixture;
@@ -1319,10 +1378,11 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRealHttpLoopbackIssues
         ++count;
         const std::string value{
             field.value().data(), field.value().size()};
+        if (value.find("Max-Age=0")!=std::string::npos) continue;
         if (!cookies.empty()) cookies.append("; ");
         cookies.append(value.substr(0U, value.find(';')));
     }
-    EXPECT_EQ(count, 5U);
+    EXPECT_EQ(count, 6U);
     ASSERT_FALSE(cookies.empty());
 
     auto finished = exchange(
