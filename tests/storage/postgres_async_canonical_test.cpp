@@ -5,6 +5,7 @@
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -24,8 +25,11 @@
 #include "async_pool.hpp"
 #include "coroutine_canonical_finalizer.hpp"
 #include "coroutine_session_authenticator.hpp"
+#include "coroutine_authorization_audit.hpp"
 
 import openproof.authentication;
+import openproof.audit;
+import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
@@ -777,6 +781,132 @@ asio::awaitable<bool> concurrentConnectionRead(
     auto linked = co_await canonical.readConnectionsAsync(owner);
     co_return linked && linked->first == owner
         && linked->second.empty() == emptyExpected;
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAndRollsBack)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    namespace pol = openproof::policy;
+    namespace ses = openproof::session;
+    namespace aud = openproof::audit;
+    using namespace std::chrono_literals;
+    fnd::ManualClockSource clock{kNow};
+    auto authenticated = ses::AuthenticatedSession::fromDelegatedAccess(
+        ids::IdentityId{seed.owner}, idp::ProviderId{"native-canonical-provider"},
+        idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
+        kNow, kNow, kNow + 1h);
+    ASSERT_TRUE(authenticated);
+    const auto makeKey = [] {
+        return aud::AuditKey::create(fnd::SecretString{std::string(32U, 'A')}).value();
+    };
+    auto config = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
+    ASSERT_TRUE(config);
+    auto legacyPool = pg::ConnectionPool::create(std::move(config).value());
+    ASSERT_TRUE(legacyPool);
+    pg::PostgresAuthorizationDecisionSink legacy{*legacyPool.value(), makeKey(), clock};
+    asio::io_context io;
+    pg::CoroutineAuthorizationDecisionSink native{
+        io.get_executor(), fnd::SecretString{*dsn}, makeKey(), clock,
+        2U, 500ms, 1000ms, 2000ms};
+    const ids::OrganizationId tenant{seed.org};
+    const pol::Action action{"protected.read"};
+    const pol::Resource resource{"protected-resource"};
+    const auto denial = pol::AuthorizationDecision::deny("fixture policy denied");
+    const auto record = [&](const std::string& correlation) {
+        io.restart();
+        auto completion = asio::co_spawn(io, native.recordAsync(
+            authenticated.value(), tenant, action, resource, denial,
+            fnd::CorrelationId{correlation}), asio::use_future);
+        io.run();
+        return completion.get();
+    };
+    const std::string first = "legacy-audit-" + seed.suffix;
+    const std::string second = "native-audit-" + seed.suffix;
+    const std::string third = "legacy-tail-" + seed.suffix;
+    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
+        denial, fnd::CorrelationId{first}));
+    ASSERT_TRUE(record(second));
+    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
+        denial, fnd::CorrelationId{third}));
+    auto chain = execute(fixture.get(),
+        "SELECT a.sequence,a.event_id,a.correlation_id,encode(a.previous_hash,'hex'),"
+        "encode(a.event_hash,'hex'),o.payload->>'type',o.payload->>'identity_id',"
+        "o.payload->>'severity',o.payload->>'actor_identity_id',"
+        "a.detail->>'reason',a.detail->>'action',a.detail->>'resource',a.detail->>'provider',"
+        "a.detail->>'assurance' FROM openproof.audit_events a "
+        "JOIN openproof.security_event_outbox o USING(event_id) "
+        "WHERE a.identity_id=$1 ORDER BY a.sequence", {seed.owner});
+    ASSERT_EQ(PQntuples(chain.get()), 3);
+    EXPECT_EQ(std::string{PQgetvalue(chain.get(), 0, 2)}, first);
+    EXPECT_EQ(std::string{PQgetvalue(chain.get(), 1, 2)}, second);
+    EXPECT_EQ(std::string{PQgetvalue(chain.get(), 2, 2)}, third);
+    EXPECT_STREQ(PQgetvalue(chain.get(), 0, 4), PQgetvalue(chain.get(), 1, 3));
+    EXPECT_STREQ(PQgetvalue(chain.get(), 1, 4), PQgetvalue(chain.get(), 2, 3));
+    for (int row = 0; row < 3; ++row) {
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 5), "authorization.protected-route.denied");
+        EXPECT_EQ(std::string{PQgetvalue(chain.get(), row, 6)}, seed.owner);
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 7), "warning");
+        EXPECT_EQ(std::string{PQgetvalue(chain.get(), row, 8)}, seed.owner);
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 9), "fixture policy denied");
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 10), "protected.read");
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 11), "protected-resource");
+        EXPECT_STREQ(PQgetvalue(chain.get(), row, 12), "native-canonical-provider");
+        EXPECT_EQ(std::string{PQgetvalue(chain.get(), row, 13)},
+                  idp::assuranceLevelName(idp::AssuranceLevel::Ial2));
+        std::optional<openproof::security::Sha256Digest> previous;
+        if (!PQgetisnull(chain.get(), row, 3)) {
+            auto bytes = fnd::fromHex(PQgetvalue(chain.get(), row, 3));
+            ASSERT_TRUE(bytes && bytes->size() == openproof::security::Sha256Digest{}.size());
+            openproof::security::Sha256Digest digest{};
+            std::copy(bytes->begin(), bytes->end(), digest.begin());
+            previous = digest;
+        }
+        auto event = aud::AuditEvent::create(
+            aud::AuditEventId{PQgetvalue(chain.get(), row, 1)}, kNow,
+            fnd::CorrelationId{PQgetvalue(chain.get(), row, 2)}, tenant,
+            ids::IdentityId{seed.owner}, "authorization", "protected-route.evaluate", "deny",
+            aud::AuditFields{{"action", "protected.read"},
+                {"assurance", std::string{idp::assuranceLevelName(idp::AssuranceLevel::Ial2)}},
+                {"provider", "native-canonical-provider"}, {"reason", "fixture policy denied"},
+                {"resource", "protected-resource"}});
+        ASSERT_TRUE(event);
+        auto hash = aud::computeAuditRecordHash(event.value(),
+            std::stoull(PQgetvalue(chain.get(), row, 0)), previous, makeKey());
+        ASSERT_TRUE(hash);
+        EXPECT_EQ(fnd::toHex(hash.value()), PQgetvalue(chain.get(), row, 4));
+    }
+
+    // The constraint exists only in this explicitly disposable fixture.
+    // Force failure AFTER the audit insert and HMAC update. No partial
+    // audit record may survive, and subsequent writes must recover.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.security_event_outbox ADD CONSTRAINT fixture_reject_warning "
+        "CHECK ((payload->>'severity') <> 'warning') NOT VALID", {})));
+    const std::string failed = "failed-audit-" + seed.suffix;
+    auto rejected = record(failed);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "ALTER TABLE openproof.security_event_outbox DROP CONSTRAINT fixture_reject_warning", {})));
+    EXPECT_TRUE(!rejected && rejected.error().code() == fnd::ErrorCode::Unavailable);
+    auto partial = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.audit_events WHERE correlation_id=$1", {failed});
+    EXPECT_STREQ(PQgetvalue(partial.get(), 0, 0), "0");
+    const std::string recovered = "recovered-audit-" + seed.suffix;
+    ASSERT_TRUE(record(recovered));
+    auto tail = execute(fixture.get(),
+        "SELECT encode(previous_hash,'hex') FROM openproof.audit_events WHERE correlation_id=$1",
+        {recovered});
+    ASSERT_EQ(PQntuples(tail.get()), 1);
+    EXPECT_STREQ(PQgetvalue(tail.get(), 0, 0), PQgetvalue(chain.get(), 2, 4));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenantBoundAndFresh)
