@@ -53,7 +53,8 @@ test("all account paths fail closed and browser renderers cannot access storage"
   assert.match(security,/co_return renderSecurityPage\(/);
   assert.equal((pages.match(/security::randomTokenBase64Url\(24U\)/g)??[]).length,2);
   assert.equal((pages.match(/frame-ancestors 'none'/g)??[]).length,2);
-  assert.doesNotMatch(cppExecutableText(pages),/co_await|m_accounts->|m_sessions->|m_authentication->|PQexec/);
+  assert.doesNotMatch(cppExecutableText(pages),/co_await|m_accounts->|m_sessions->|m_authentication->|PQexec|authenticated->/);
+  assert.match(security,/identity::provider::assuranceLevelName\(actor->assurance\(\)\)/);
   assert.match(read("tests/account/session_coroutine_http_test.cpp"),/NativeSecurityAndRecoveryPagesPreserveCspAndOwnerBoundary/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/assert.match\(security.body,\/Account Security\//);
 });

@@ -936,10 +936,10 @@ service; caller-provided scope headers are removed at the gateway boundary.
 
 See `examples/openproof.toml` for a complete deployment sample.
 
-### Native OAuth UserInfo and introspection
+### Native OAuth UserInfo, introspection and revocation
 
 OIDC-enabled runtimes use strict native overlays for `/oauth/userinfo` (GET,
-POST and OPTIONS) and `/oauth/introspect` (POST). No synchronous token
+POST and OPTIONS), `/oauth/introspect` (POST) and `/oauth/revoke` (POST). No synchronous token
 repository is called on these paths. UserInfo requires the openid scope
 and discloses presentation claims only with profile scope, email only
 with email scope. Sender-constrained tokens use the native DPoP/mTLS
@@ -952,7 +952,16 @@ from a bounded SQL snapshot. Unknown/inactive tokens return active=false;
 storage failures are reported as unavailable, not inactive. Raw form
 credentials are erased before database suspension. The existing same-tenant
 confidential-client introspection policy is preserved; public clients are
-denied. Authorization, token issuance/rotation, revocation, PAR and device
+denied.
+
+Revocation authenticates public or confidential clients and locks the
+token family within one tenant-scoped transaction. Unknown and other
+clients' tokens return the same empty success response. Access token
+revocation affects only that token; refresh token revocation invalidates
+the entire family, including existing successors. Legacy rotation and
+revocation acquire the family lock before token rows and refuse rotation
+of a revoked family. This preserves the concurrency invariant during
+migration. Authorization, native token issuance/rotation, PAR and device
 flows still require separate migration and executable acceptance.
 
 ### Native account TOTP status (coroutine branch only)

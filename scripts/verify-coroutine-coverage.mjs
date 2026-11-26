@@ -1121,17 +1121,22 @@ const checked = segments.map(([name, relative]) => {
     const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");
     for(const method of ["loginPage","loginSubmit","authorize","consentSubmit",
-      "pushedAuthorization","deviceAuthorization","deviceVerification","tokenEndpoint","revoke"]){
+      "pushedAuthorization","deviceAuthorization","deviceVerification","tokenEndpoint"]){
       const start=legacy.indexOf("OAuthHttpApi::"+method+"(");
       const end=legacy.indexOf("\ngateway::HttpResponse OAuthHttpApi::",start+1);
       const body=legacy.slice(start,end<0?undefined:end);
       if (/m_(?:authorization|tokens|clients|authentication|sessions|consents|resources|serviceIdentities|devices|pushedAuthorization|jar)->/.test(body))
         issues.push({line:0,kind:"synchronous OAuth lifecycle remains",expression:method});
     }
-    for(const route of ["/oauth/userinfo","/oauth/introspect"]){
+    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke"]){
       if(!app.includes('nativePaths.emplace_back("'+route+'")'))
-        issues.push({line:0,kind:"native OAuth read missing strict dispatch",expression:route});
+        issues.push({line:0,kind:"native OAuth token operation missing strict dispatch",expression:route});
     }
+    const native=fs.readFileSync(path.join(root,"src/oauth/http/coroutine_token_read_http.cpp"),"utf8");
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/userinfo"/.test(legacy)
+       || !/co_await m_revoke\(/.test(native)
+       || !/reader->revokeOAuthTokenAsync/.test(app))
+      issues.push({line:0,kind:"OAuth token revocation has incomplete native retirement",expression:"strict revocation and runtime storage binding"});
   }
   if(relative==="src/account/http/http.cpp"){
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");

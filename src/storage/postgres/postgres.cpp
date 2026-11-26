@@ -6626,7 +6626,18 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
         PGconn* connection=lease->get();
         auto begun=beginTransaction(connection);
         if(!begun)return begun;
-        ResultPointer current=execParams(connection,"SELECT family_id,sequence,state,expires_at_ms FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{foundation::toHex(presented.bytes())});
+        // Serialize with native and legacy family revocation before
+        // locking a refresh token. A revoked family can never mint a successor.
+        const std::string presentedHex=foundation::toHex(presented.bytes());
+        ResultPointer familyLock=execParams(connection,
+            "SELECT f.id,f.revoked_at_ms FROM openproof.oauth_token_families f "
+            "JOIN openproof.oauth_refresh_tokens r ON r.family_id=f.id "
+            "WHERE r.token_digest=decode($1,'hex') FOR UPDATE OF f",{presentedHex});
+        if(!tuplesOk(familyLock.get())){auto error=databaseError(familyLock.get(),"lock refresh family");
+            rollback(connection); return foundation::fail(error);}
+        if(PQntuples(familyLock.get())!=1 || !PQgetisnull(familyLock.get(),0,1)){
+            rollback(connection); return foundation::fail(authenticationFailure("Inactive refresh family."));}
+        ResultPointer current=execParams(connection,"SELECT family_id,sequence,state,expires_at_ms FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{presentedHex});
         if(!tuplesOk(current.get())){auto error=databaseError(current.get(),"lock refresh token");
             rollback(connection);
             return foundation::fail(error);
@@ -6649,7 +6660,7 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
             if(!committed)return committed;
             return foundation::fail(authenticationFailure("Refresh token reuse or expiry detected; family revoked."));
         }
-        if(replacementAccess.family()!=family||replacementRefresh.family()!=family||replacementRefresh.sequence()!=sequence.value()+1U){rollback(connection);
+        if(family.value()!=field(familyLock.get(),0,0)||replacementAccess.family()!=family||replacementRefresh.family()!=family||replacementRefresh.sequence()!=sequence.value()+1U){rollback(connection);
             return foundation::fail(foundation::ErrorCode::InvalidArgument,"The refresh rotation replacement is inconsistent.");
         }
         auto used=runCommand(connection,"UPDATE openproof.oauth_refresh_tokens SET state=1,changed_at_ms=$2 WHERE token_digest=decode($1,'hex') AND state=0",{foundation::toHex(presented.bytes()),instant(now)},"consume refresh token");
@@ -6686,7 +6697,9 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
         auto begun=beginTransaction(connection);
         if(!begun)return begun;
         const std::string digest=foundation::toHex(digestValue.bytes());
-        ResultPointer access=execParams(connection,"SELECT family_id FROM openproof.oauth_access_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{digest});
+        ResultPointer access=execParams(connection,"SELECT f.id FROM openproof.oauth_token_families f "
+            "JOIN openproof.oauth_access_tokens t ON t.family_id=f.id "
+            "WHERE t.token_digest=decode($1,'hex') FOR UPDATE OF f",{digest});
         if(!tuplesOk(access.get())){auto error=databaseError(access.get(),"find token to revoke");
             rollback(connection);
             return foundation::fail(error);
@@ -6697,7 +6710,9 @@ PostgresIdentityProviderStore::PostgresIdentityProviderStore(ConnectionPool& poo
             }
             return commit(connection);
         }
-        ResultPointer refresh=execParams(connection,"SELECT family_id FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex') FOR UPDATE",{digest});
+        ResultPointer refresh=execParams(connection,"SELECT f.id FROM openproof.oauth_token_families f "
+            "JOIN openproof.oauth_refresh_tokens t ON t.family_id=f.id "
+            "WHERE t.token_digest=decode($1,'hex') FOR UPDATE OF f",{digest});
         if(!tuplesOk(refresh.get())){auto error=databaseError(refresh.get(),"find refresh token to revoke");
             rollback(connection);
             return foundation::fail(error);

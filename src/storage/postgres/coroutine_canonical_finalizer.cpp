@@ -1231,4 +1231,102 @@ CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::revokeOAuthTokenAsync(std::string clientId,
+    std::optional<std::string> clientDigest,std::string tokenDigest,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || !validDigest(tokenDigest)
+        || (clientDigest && !validDigest(*clientDigest)))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        // Locate without locking token rows; acquire the family lock FIRST.
+        // All rotation and family-revocation writers use the same order.
+        // Authorization is bound to the authenticated client and tenant.
+        Params familyParams{tokenDigest,clientId,tenant};
+        const auto found=co_await execute(
+            "WITH candidates AS ("
+            "SELECT family_id,true AS access FROM openproof.oauth_access_tokens WHERE token_digest=decode($1,'hex') "
+            "UNION ALL SELECT family_id,false AS access FROM openproof.oauth_refresh_tokens WHERE token_digest=decode($1,'hex')) "
+            "SELECT f.id,t.access FROM candidates t JOIN openproof.oauth_token_families f ON f.id=t.family_id "
+            "JOIN openproof.identities i ON i.id=f.identity_id "
+            "WHERE f.client_id=$2 AND i.organization_id=$3 "
+            "ORDER BY f.id LIMIT 2 FOR UPDATE OF f",std::move(familyParams));
+        if (found.rows.empty()) {
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return foundation::ok();
+        }
+        if (found.rows.size()!=1U || found.rows.front().size()!=2U)
+            throw std::runtime_error{"Ambiguous OAuth token family"};
+        const auto family=required(found.rows.front()[0]);
+        const auto access=boolean(found.rows.front()[1]);
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        if (access) {
+            Params args{tokenDigest,family,timestamp};
+            const auto revoked=co_await execute(
+                "UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=COALESCE(revoked_at_ms,$3) "
+                "WHERE token_digest=decode($1,'hex') AND family_id=$2 RETURNING family_id",std::move(args));
+            if (revoked.rows.size()!=1U || required(revoked.rows.front().front())!=family)
+                throw std::runtime_error{"OAuth access revocation mismatch"};
+        } else {
+            // A refresh credential revokes the entire family, including all
+            // successors minted before acquiring the family lock.
+            Params args{family,timestamp};
+            const auto revoked=co_await execute(
+                "UPDATE openproof.oauth_token_families SET revoked_at_ms=COALESCE(revoked_at_ms,$2) "
+                "WHERE id=$1 RETURNING id",std::move(args));
+            if (revoked.rows.size()!=1U || required(revoked.rows.front().front())!=family)
+                throw std::runtime_error{"OAuth family revocation mismatch"};
+            Params accessArgs{family,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=COALESCE(revoked_at_ms,$2) "
+                "WHERE family_id=$1 AND state=0",std::move(accessArgs)));
+            Params refreshArgs{family,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_refresh_tokens SET state=2,changed_at_ms=COALESCE(changed_at_ms,$2) "
+                "WHERE family_id=$1 AND state<>2",std::move(refreshArgs)));
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native OAuth token revocation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

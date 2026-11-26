@@ -650,13 +650,15 @@ OAuthHttpApi::OAuthHttpApi(
     resource::ServiceIdentityService& serviceIdentities,
     DeviceAuthorizationService& devices, PushedAuthorizationService& pushedAuthorization,
     JarService& jar, SenderProofVerifier& senderProof,
-    gateway::TokenBucketRateLimiter& limiter, gateway::HttpHandler& fallback)
+    gateway::TokenBucketRateLimiter& limiter, gateway::HttpHandler& fallback,
+    bool nativeTokenReadsRequired)
     : m_authorization(&authorization), m_tokens(&tokens), m_oidc(&oidc),
       m_clients(&clients), m_authentication(&authentication), m_sessions(&sessions),
       m_localProvider(std::move(localProvider)), m_consents(&consents),
       m_resources(&resources), m_serviceIdentities(&serviceIdentities),
       m_devices(&devices), m_pushedAuthorization(&pushedAuthorization),
-      m_jar(&jar), m_senderProof(&senderProof), m_limiter(&limiter), m_fallback(&fallback) {}
+      m_jar(&jar), m_senderProof(&senderProof), m_limiter(&limiter), m_fallback(&fallback),
+      m_nativeTokenReadsRequired(nativeTokenReadsRequired) {}
 
 gateway::HttpResponse OAuthHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request) const
@@ -672,6 +674,12 @@ gateway::HttpResponse OAuthHttpApi::error(
 gateway::HttpResponse OAuthHttpApi::handle(gateway::HttpRequest request)
 {
     const auto path = request.path();
+    if (m_nativeTokenReadsRequired && (path=="/oauth/userinfo"
+        || path=="/oauth/introspect" || path=="/oauth/revoke")) {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
     if (request.method() == gateway::HttpMethod::Options
         && (path == "/oauth/token" || path == "/oauth/par"
             || path == "/oauth/device_authorization"

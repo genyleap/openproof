@@ -48,6 +48,8 @@ import openproof.organization;
 import openproof.policy;
 import openproof.session;
 import openproof.security;
+import openproof.token;
+import openproof.client;
 
 namespace {
 namespace asio = boost::asio;
@@ -1425,7 +1427,65 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=1 WHERE id=$1",{application}));
     EXPECT_FALSE(read(native));
     ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=0 WHERE id=$1",{application}));
-    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET revoked_at_ms=1770000000000 WHERE id=$1",{family}));
+    const auto otherClient=client+"-other";
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,"
+        "created_at_ms,updated_at_ms) VALUES($1,$2,'Other fixture',1,0,1770000000000,1770000000000)",{otherClient,application}));
+    const auto refreshDigest=openproof::security::sha256(family+"-refresh").value();
+    const auto refreshHex=fnd::toHex(refreshDigest);
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+        "VALUES(decode($1,'hex'),$2,0,0,1770000000000,1770000060000)",{refreshHex,family}));
+    auto revoke=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string caller,
+        std::optional<std::string> proof,std::string fingerprint){
+        io.restart();
+        auto pending=asio::co_spawn(io,store.revokeOAuthTokenAsync(std::move(caller),
+            std::move(proof),std::move(fingerprint),kNow+1s),asio::use_future);
+        io.run(); return pending.get();
+    };
+    EXPECT_FALSE(revoke(foreign,client,std::nullopt,refreshHex));
+    EXPECT_FALSE(revoke(native,client,clientProof,refreshHex)); // public clients must not present a secret
+    EXPECT_TRUE(revoke(native,otherClient,std::nullopt,refreshHex)); // foreign token, indistinguishable no-op
+    EXPECT_TRUE(revoke(native,client,std::nullopt,std::string(64U,'0')));
+    EXPECT_TRUE(read(native));
+    EXPECT_TRUE(revoke(native,client,std::nullopt,digest)); // access only
+    EXPECT_FALSE(read(native));
+    auto liveFamily=execute(fixture.get(),
+        "SELECT (revoked_at_ms IS NULL)::text FROM openproof.oauth_token_families WHERE id=$1",{family});
+    ASSERT_EQ(PQntuples(liveFamily.get()),1);
+    EXPECT_STREQ(PQgetvalue(liveFamily.get(),0,0),"true");
+    // Race native family revocation against the still-legacy rotation.
+    // Both possible orders must leave no live successor after revocation.
+    namespace tok=openproof::token;
+    namespace cli=openproof::client;
+    auto config=pg::PoolConfig::create(fnd::SecretString{*dsn},1U,500ms);
+    ASSERT_TRUE(config);
+    auto pool=pg::ConnectionPool::create(std::move(config).value());
+    ASSERT_TRUE(pool);
+    pg::PostgresIdentityProviderStore legacy{*pool.value()};
+    const tok::TokenContext tokenContext{cli::ClientId{client},ids::IdentityId{seed.owner},
+        idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},{"account"},kNow};
+    const tok::TokenFamilyId familyId{family};
+    const auto nextAccess=tok::TokenDigest{openproof::security::sha256(family+"-next-access").value()};
+    const auto nextRefresh=tok::TokenDigest{openproof::security::sha256(family+"-next-refresh").value()};
+    auto rotate=std::async(std::launch::async,[&] {
+        return legacy.rotateRefresh(tok::TokenDigest{refreshDigest},kNow+1s,
+            tok::AccessTokenRecord{nextAccess,familyId,tokenContext,kNow+1s,kNow+30s},
+            tok::RefreshTokenRecord{nextRefresh,familyId,1U,tokenContext,kNow+1s,kNow+60s});
+    });
+    const auto revoked=revoke(native,client,std::nullopt,refreshHex);
+    const auto rotated=rotate.get();
+    ASSERT_TRUE(revoked);
+    if (!rotated) EXPECT_EQ(rotated.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    const auto states=execute(fixture.get(),
+        "SELECT (f.revoked_at_ms IS NOT NULL)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t WHERE t.family_id=f.id AND t.state=0)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.state<>2)::text "
+        "FROM openproof.oauth_token_families f WHERE f.id=$1",{family});
+    ASSERT_EQ(PQntuples(states.get()),1);
+    EXPECT_STREQ(PQgetvalue(states.get(),0,0),"true");
+    EXPECT_STREQ(PQgetvalue(states.get(),0,1),"0");
+    EXPECT_STREQ(PQgetvalue(states.get(),0,2),"0");
+    EXPECT_TRUE(revoke(native,client,std::nullopt,refreshHex)); // idempotent
     EXPECT_FALSE(read(native));
 }
 

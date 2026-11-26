@@ -109,6 +109,12 @@ public:
     authenticateConfidentialClientAsync(std::string clientId,
         std::string digestHex);
 
+    // RFC 7009: authenticate public or confidential client inside the same
+    // transaction as its token revocation. Unknown/foreign tokens are no-ops.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    revokeOAuthTokenAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string tokenDigest,foundation::Instant now);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeSenderReplayAsync(session::DelegatedSenderConstraintKind kind,
         std::string thumbprint,std::string identifier,foundation::Instant expiresAt,

@@ -3154,10 +3154,16 @@ addProtectedRoutes(gateway::Router& router,
                             return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
                                 std::move(identifier),expires,observed);
                         });
+                },
+                [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
+                    std::string tokenDigest) {
+                    return reader->revokeOAuthTokenAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(tokenDigest),clock.now());
                 });
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");
+            nativePaths.emplace_back("/oauth/revoke");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
@@ -3755,7 +3761,7 @@ addProtectedRoutes(gateway::Router& router,
         authorizationService, tokenService, openIdProvider, clientManager,
         authentication, sessions, providerId, consentService, resourceRegistry,
         serviceIdentityService, deviceAuthorizationService, pushedAuthorizationService,
-        jarService, senderProof, limiter.value(), federatedApi};
+        jarService, senderProof, limiter.value(), federatedApi,true};
     applicationHttp::ApplicationManagementHttpApi applicationApi{
         applicationRegistry, identityProviderStore, clientManager,
         identityProviderStore, resourceRegistry, serviceIdentityService, jarService,

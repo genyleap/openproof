@@ -410,7 +410,8 @@ CoroutineAccountSessionAdapter::securityPage(gateway::HttpRequest request)
     if (!status) co_return fail(status.error(),request);
     if (status->first!=actor->identity()) co_return fail(foundation::Error{E::Unavailable},request);
     co_return renderSecurityPage(status->second,identity::provider::meetsAssurance(
-        actor->assurance(),identity::provider::AssuranceLevel::Ial2));
+        actor->assurance(),identity::provider::AssuranceLevel::Ial2),
+        identity::provider::assuranceLevelName(actor->assurance()));
 }
 
 asio::awaitable<gateway::HttpResponse>

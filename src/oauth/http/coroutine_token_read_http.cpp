@@ -22,6 +22,9 @@ bool userInfoRoute(const gateway::HttpRequest& r) {
 bool introspectRoute(const gateway::HttpRequest& r) {
     return r.path()=="/oauth/introspect" && r.method()==Method::Post;
 }
+bool revokeRoute(const gateway::HttpRequest& r) {
+    return r.path()=="/oauth/revoke" && r.method()==Method::Post;
+}
 void scrub(gateway::HttpRequest& r) noexcept {
     r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeBody(); r.wipeTargetQuery();
 }
@@ -95,7 +98,7 @@ struct IntrospectionForm final {
     std::string clientId;
     foundation::SecretString secret,token;
 };
-foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r) {
+foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r,bool requireSecret=true) {
     const auto type=r.header("content-type");
     if (!type || (*type!="application/x-www-form-urlencoded" &&
             !type->starts_with("application/x-www-form-urlencoded;"))
@@ -120,9 +123,10 @@ foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r) {
         if (!value) return foundation::fail(value.error());
         dest->emplace(std::move(value).value());
     }
-    if (!id || id->empty() || !secret || secret->empty() || !token || token->empty())
+    if (!id || id->empty() || (requireSecret && (!secret || secret->empty())) || !token || token->empty())
         return foundation::fail(E::InvalidArgument);
-    IntrospectionForm result{std::string{id->expose()},std::move(*secret),std::move(*token)};
+    IntrospectionForm result{std::string{id->expose()},
+        secret ? std::move(*secret) : foundation::SecretString{},std::move(*token)};
     r.wipeBody();
     return result;
 }
@@ -130,20 +134,21 @@ foundation::Result<IntrospectionForm> form(gateway::HttpRequest& r) {
 CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
     gateway::TokenBucketRateLimiter& limiter,foundation::SecretString tokenKey,
     foundation::SecretString clientKey,ReadAccess access,AuthenticateClient client,
-    ReadProfile profile,VerifySender sender)
+    ReadProfile profile,VerifySender sender,Revoke revoke)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
-      m_profile(std::move(profile)),m_sender(std::move(sender)) {}
+      m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
+    if (revokeRoute(r)) return static_cast<bool>(m_revoke);
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -158,6 +163,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
         scrub(r); co_return fail(E::RateLimited,r);
     }
     if (userInfoRoute(r)) co_return co_await userInfo(std::move(r));
+    if (revokeRoute(r)) co_return co_await revoke(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -238,5 +244,29 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::introspect(gat
         .add("scope",joined(access->scopes())).add("aud",joined(access->audiences()))
         .add("iat",seconds(issued)).add("exp",seconds(session.absoluteExpiresAt()));
     co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::revoke(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    auto input=form(r,false);
+    if (!input) co_return fail(input.error().code(),r);
+    r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeTargetQuery();
+    std::optional<std::string> clientDigest;
+    if (!input->secret.empty()) {
+        auto digest=security::hmacSha256(m_clientKey,input->secret.expose());
+        if (!digest) co_return fail(E::Unavailable,r);
+        clientDigest.emplace(foundation::toHex(digest.value()));
+    }
+    auto tokenDigest=security::hmacSha256(m_tokenKey,input->token.expose());
+    input->secret=foundation::SecretString{};
+    input->token=foundation::SecretString{};
+    if (!tokenDigest) co_return fail(E::Unavailable,r);
+    // Storage authenticates the caller and revokes only its own token in
+    // one transaction. Unknown/foreign tokens have identical success output.
+    auto result=co_await m_revoke(std::move(input->clientId),std::move(clientDigest),
+        foundation::toHex(tokenDigest.value()));
+    if (!result) co_return fail(result.error().code(),r);
+    gateway::HttpResponse response{200,{},{}};
+    secure(response);
+    co_return response;
 }
 }

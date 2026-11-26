@@ -920,7 +920,7 @@ target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_verification openproof_storage_postgres openproof_account
     openproof_postgres_async_local_credentials openproof_postgres_async_recovery_repository
     openproof_authentication openproof_identity_core
-    openproof_identity_provider openproof_identity_profile
+    openproof_identity_provider openproof_identity_profile openproof_token openproof_client
     openproof_security openproof_foundation Boost::headers OpenProof::libpq
     GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

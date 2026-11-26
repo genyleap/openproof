@@ -1742,6 +1742,29 @@ async function main() {
       }).toString(),
     });
     expectStatus(familyResponse, 400);
+    if (nativeAccountRuntime) {
+      const revoke = (form) => edgeRequest("/oauth/revoke", {
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams(form).toString(),
+      });
+      const userInfo = (token) => edgeRequest("/oauth/userinfo",{
+        headers:{authorization:`Bearer ${token}`},
+      });
+      expectStatus(await revoke({client_id:clientId,client_secret:clientSecret,
+        token:nativeTokens.refresh_token}),200); // another client's token: no-op
+      expectStatus(await userInfo(nativeTokens.access_token),200);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.access_token}),200);
+      expectStatus(await userInfo(nativeTokens.access_token),401);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.refresh_token}),200);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.refresh_token}),200);
+      const revokedRefresh=await edgeRequest("/oauth/token",{
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams({grant_type:"refresh_token",client_id:nativeClientId,
+          refresh_token:nativeTokens.refresh_token}).toString(),
+      });
+      expectStatus(revokedRefresh,400);
+      expectStatus(await userInfo(profileOnlyTokens.access_token),200);
+    }
 
     await stopOpp();
     await startOpp();

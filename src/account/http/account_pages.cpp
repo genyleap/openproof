@@ -120,7 +120,7 @@ resetForm.addEventListener('submit',async event=>{
     return response;
 }
 
-gateway::HttpResponse renderSecurityPage(std::optional<bool> enabled, bool ial2)
+gateway::HttpResponse renderSecurityPage(std::optional<bool> enabled, bool ial2,std::string_view assuranceName)
 {
     auto nonce = security::randomTokenBase64Url(24U);
     if (!nonce) return jsonResponse(503,json::object{{"error","Unable to render security page."}});
@@ -160,8 +160,7 @@ button,.button{appearance:none;border:0;border-radius:12px;background:linear-gra
     body += R"HTML("></span><div><strong>)HTML";
     body += totpEnabled ? "Authenticator enabled" : "Authenticator not set up";
     body += R"HTML(</strong><br><span>Current session: )HTML";
-    body += std::string{identity::provider::assuranceLevelName(
-        authenticated->session().assurance())};
+    body += assuranceName;
     body += R"HTML(</span></div></div><div id="notice" class="notice" role="status" aria-live="polite" tabindex="-1"></div>)HTML";
 
     if (!available) {

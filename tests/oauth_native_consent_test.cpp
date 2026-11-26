@@ -130,7 +130,7 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
     const auto valid=fingerprint("fixture-access"),restricted=fingerprint("fixture-restricted"),
         bound=fingerprint("fixture-bound"),unavailable=fingerprint("fixture-unavailable");
     const auto clientDigest=fnd::toHex(sec::hmacSha256(clientKey,"fixture-client-proof").value());
-    int accessCalls=0,clientCalls=0,profileCalls=0,senderCalls=0;
+    int accessCalls=0,clientCalls=0,profileCalls=0,senderCalls=0,revokeCalls=0;
     bool foreign=false;
     http::CoroutineTokenReadAdapter api{fallback,limiter,tokenKey.clone(),clientKey.clone(),
         [&](std::string digest,fnd::Instant* issued)->asio::awaitable<fnd::Result<sess::DelegatedAccess>> {
@@ -168,6 +168,16 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
             ++senderCalls;
             if (!dpop || constraint.value()!="fixture-thumbprint" || token.expose()!="fixture-bound")
                 co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return fnd::ok();
+        },
+        [&](std::string id,std::optional<std::string> proof,std::string digest)->asio::awaitable<fnd::Status> {
+            ++revokeCalls;
+            if ((id=="fixture-client" && proof!=clientDigest)
+                || (id=="fixture-public" && proof)
+                || (id!="fixture-client" && id!="fixture-public"))
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            if (digest==unavailable) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            EXPECT_EQ(digest.size(),64U);
             co_return fnd::ok();
         }};
     auto run=[&](gw::HttpRequest input) {
@@ -212,6 +222,20 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
     EXPECT_EQ(run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
         "client_id=fixture-client&client_secret=fixture-client-proof&token=a&token=b")).status(),400);
     EXPECT_EQ(clientCalls,4);
+    auto revoke=[&](std::string form){
+        return run(request(gw::HttpMethod::Post,"/oauth/revoke",{},std::move(form)));
+    };
+    auto publicRevocation=revoke("client_id=fixture-public&token=fixture-access");
+    ASSERT_EQ(publicRevocation.status(),200);
+    EXPECT_TRUE(publicRevocation.body().empty());
+    EXPECT_EQ(publicRevocation.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(revoke("client_id=fixture-client&client_secret=fixture-client-proof&token=unknown").status(),200);
+    EXPECT_EQ(revoke("client_id=fixture-client&client_secret=wrong&token=fixture-access").status(),401);
+    EXPECT_EQ(revoke("client_id=fixture-public&client_secret=wrong&token=fixture-access").status(),401);
+    EXPECT_EQ(revoke("client_id=fixture-public&token=fixture-unavailable").status(),503);
+    EXPECT_EQ(revoke("client_id=fixture-public&token=a&token=b").status(),400);
+    EXPECT_EQ(revokeCalls,5);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/oauth/revoke",{},"client_id=fixture-public&token=fixture-access")).status(),503);
     EXPECT_EQ(api.handle(request(gw::HttpMethod::Get,"/oauth/userinfo")).status(),503);
     EXPECT_EQ(fallback.syncCalls,0);
     EXPECT_EQ(fallback.asyncCalls,0);
