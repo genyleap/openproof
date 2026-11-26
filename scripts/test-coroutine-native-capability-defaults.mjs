@@ -140,7 +140,7 @@ test("loopback-native test implementations explicitly opt in", () => {
   }
 });
 
-test("native protected proxy is opt-in, first-party only and confined to its namespace", () => {
+test("native protected proxy defaults on for first-party runtime and is confined to its namespace", () => {
   const app = read("apps/opp/main.cpp");
   const domain = read("src/gateway/gateway.cpp");
   const implementation = read("src/gateway/http_coroutine.cpp");
@@ -161,7 +161,7 @@ test("native protected proxy is opt-in, first-party only and confined to its nam
   assert.ok(native.indexOf("co_await m_authorize") < native.indexOf("co_await m_transport->sendAsync"));
   assert.doesNotMatch(native, /m_gateway->handle\(|m_fallback->handle\(|m_transport->send\(/);
   assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY"\)/);
-  assert.match(app, /nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "1"/);
+  assert.match(app, /nativeProtectedGatewayEnabled = nativeProtectedGatewayFlag\s*\? \*nativeProtectedGatewayFlag == "1"\s*: platform\.auth\(\)\.enabled\(\) && !platform\.oidc\(\)\.enabled\(\)/);
   assert.match(app, /nativeProtectedGatewayEnabled\s*&& \(!platform\.auth\(\)\.enabled\(\) \|\| platform\.oidc\(\)\.enabled\(\)\)/);
   assert.match(app, /co_await reader->readAuthorizationContextAsync/);
   assert.match(app, /co_await sink->recordAsync/);
