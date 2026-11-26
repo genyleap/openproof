@@ -25,7 +25,7 @@ CoroutineRecoveryCodeService::create(
 
 asio::awaitable<foundation::Result<std::vector<foundation::SecretString>>>
 CoroutineRecoveryCodeService::issue(
-    identity::core::IdentityId identity, std::size_t count)
+    identity::core::IdentityId identity, std::size_t count,std::optional<RecoveryIssuanceFence> fence)
 {
     if (identity.empty() || count == 0U || count > 32U) {
         co_return foundation::fail(
@@ -47,11 +47,24 @@ CoroutineRecoveryCodeService::issue(
     }
 
     // On any persistence failure none of the plaintext codes escape to HTTP.
-    auto saved = co_await m_repository->replaceAsync(
+    foundation::Status saved=foundation::ok();
+    if (fence) saved=co_await m_repository->replaceFencedAsync(
+        std::move(identity),std::move(digests),std::move(*fence));
+    else saved = co_await m_repository->replaceAsync(
         std::move(identity), std::move(digests));
     if (!saved) co_return foundation::fail(saved.error());
     co_return foundation::Result<std::vector<foundation::SecretString>>{
         std::move(codes)};
+}
+
+asio::awaitable<foundation::Result<std::vector<foundation::SecretString>>>
+CoroutineRecoveryCodeService::issueFenced(identity::core::IdentityId identity,std::size_t count)
+{
+    if (identity.empty() || count==0U || count>32U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto fence=co_await m_repository->captureIssuanceAsync(identity);
+    if (!fence) co_return foundation::fail(fence.error());
+    co_return co_await issue(std::move(identity),count,std::move(fence).value());
 }
 
 asio::awaitable<foundation::Status>

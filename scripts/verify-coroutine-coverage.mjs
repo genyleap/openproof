@@ -872,10 +872,11 @@ const checked = segments.map(([name, relative]) => {
       executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
     const issue=executable.slice(
       executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
-    const firstCheck=issue.indexOf("co_await m_eligible(");
-    const issuance=issue.indexOf("co_await m_recoveryCodes->issue(");
-    const secondCheck=issue.lastIndexOf("co_await m_eligible(");
-    const revocation=issue.indexOf("co_await m_recoveryCodes->revoke(");
+    const issuance=issue.indexOf("co_await m_recoveryCodes->issueFenced(");
+    const denied=issue.indexOf("if (!issued)");
+    const domain=fs.readFileSync(path.join(root,"src/credentials/coroutine_recovery_codes.cpp"),"utf8");
+    const fenced=domain.slice(domain.indexOf("CoroutineRecoveryCodeService::issueFenced("),
+      domain.indexOf("CoroutineRecoveryCodeService::consume("));
     const response=issue.indexOf("co_return jsonResponse(201");
     if(!/CoroutineRecoveryCodeHttpAdapter final/.test(header)
        || !/nativeEnabled\(\) const noexcept override \{ return false; \}/.test(header)
@@ -888,13 +889,16 @@ const checked = segments.map(([name, relative]) => {
        || !/gateway::takeSessionCredential\(request\)/.test(issue)
        || !/co_await m_authenticate\(/.test(issue)
        || !/idp::AssuranceLevel::Ial2/.test(issue)
-       || firstCheck<0 || issuance<firstCheck || secondCheck<issuance
-       || revocation<secondCheck || response<revocation
+       || issuance<0 || denied<issuance || response<denied
+       || /m_recoveryCodes->revoke\(/.test(issue)
+       || !/co_await m_repository->captureIssuanceAsync\(/.test(fenced)
+       || !/co_await issue\(std::move\(identity\),count,std::move\(fence\).value\(\)\)/.test(fenced)
+       || !/co_await m_repository->replaceFencedAsync\(/.test(domain)
        || !/co_return fail\(/.test(issue)
        || !/cache-control/.test(source)
        || !/no-store/.test(source))
       issues.push({line:0,kind:"native recovery HTTP permits synchronous fallback or unverified plaintext issuance",
-        expression:"native bearer + IAL2 + dual eligibility + atomic recovery issue/revoke before JSON"});
+        expression:"native bearer + IAL2 + generation-fenced atomic issue before JSON"});
     const guard=source.slice(source.indexOf("class SensitiveSessionHeadersGuard final"),
       source.indexOf("[[nodiscard]] bool isRecoveryRoute("));
     if(!guard.includes("m_request.wipeAuthorizationHeader()")
@@ -927,7 +931,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"CSPRNG + keyed digest + await atomic persistence before returning secrets"});
   }
   if(relative==="src/storage/postgres/coroutine_recovery_code_repository.cpp"){
-    const entryPoints=["replaceAsync","consumeAsync","remainingAsync","eligibleAsync"];
+    const entryPoints=["replaceAsync","consumeAsync","remainingAsync","eligibleAsync","captureIssuanceAsync","replaceFencedAsync"];
     const bounded = entryPoints.every(name=>{
       const start = source.indexOf(
         "CoroutinePostgresRecoveryCodeRepository::"+name+"(");
@@ -935,7 +939,7 @@ const checked = segments.map(([name, relative]) => {
         start+name.length+3);
       const part=source.slice(start,end < 0 ? undefined:end);
       return start>=0
-        && /const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/.test(part)
+        && /const Deadline deadline\s*=\s*Clock::now\(\)\s*\+\s*m_impl->queryTimeout/.test(part)
         && /co_await m_impl->pool\.acquire\(deadline\)/.test(part)
         && /remaining\(deadline\)/.test(part)
         && !/m_impl->pool\.acquire\(\)/.test(part);
@@ -975,12 +979,17 @@ const checked = segments.map(([name, relative]) => {
        || !/canonicalDigest\(std::move\(digest\)\)/.test(replace)
        || !/std::adjacent_find/.test(replace)
        || !/const Deadline deadline = Clock::now\(\) \+ timeout/.test(replace)
-       || !/co_await conn\.query\(\s*"BEGIN", \{\}, remainingBudget\(deadline\)\)/.test(replace)
+       || !/co_await conn\.query\(\s*"BEGIN ISOLATION LEVEL READ COMMITTED", \{\}, remainingBudget\(deadline\)\)/.test(replace)
        || !/pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/.test(replace)
        || replace.indexOf("pg_advisory_xact_lock") > replace.indexOf('"DELETE FROM "')
        || !/co_await conn\.query\(\s*"COMMIT", \{\}, remainingBudget\(deadline\)\)/.test(replace)
        || !/std::move\(sql\), std::move\(parameters\), remainingBudget\(deadline\)/.test(replace)
-       || (replace.match(/\bco_await\b/g) || []).length !== 5
+       || !/FOR UPDATE OF i FOR SHARE OF o/.test(replace)
+       || !/p.changed_at_ms=\$4::bigint AND t.enrolled_at_ms=\$5::bigint/.test(replace)
+       || !/FOR SHARE OF p,e,t/.test(replace)
+       || replace.indexOf("FOR SHARE OF p,e,t") > replace.indexOf('"DELETE FROM "')
+       || !/if \(!exact\(factor\)\)[\s\S]*?co_return false/.test(replace)
+       || (replace.match(/\bco_await\b/g) || []).length !== 11
        || !/WHERE identity_id=\$1 AND code_digest=decode\(\$2,'hex'\)/.test(consume)
        || !/RETURNING identity_id/.test(consume)
        || !/co_return !rows\.rows\.empty\(\)/.test(consume))

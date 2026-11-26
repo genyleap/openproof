@@ -4,6 +4,8 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <chrono>
+#include <charconv>
+#include <cstdint>
 #include <cstddef>
 #include <exception>
 #include <memory>
@@ -41,26 +43,30 @@ public:
          std::size_t maximumConnections,
          foundation::Duration acquireTimeout,
          foundation::Duration connectTimeout,
-         foundation::Duration timeout)
+         foundation::Duration timeout,identity::core::OrganizationId tenantValue,
+         identity::provider::ProviderId providerValue)
         : pool(std::move(executor), std::move(dsn), maximumConnections,
-               acquireTimeout, connectTimeout), queryTimeout(timeout) {}
+               acquireTimeout, connectTimeout), queryTimeout(timeout),tenant(std::move(tenantValue)),provider(std::move(providerValue)) {}
 
     async_detail::AsyncConnectionPool pool;
     async_detail::AsyncRecoveryCodeSql sql;
     foundation::Duration queryTimeout;
+    identity::core::OrganizationId tenant;
+    identity::provider::ProviderId provider;
 };
 
 CoroutinePostgresRecoveryCodeRepository::CoroutinePostgresRecoveryCodeRepository(
     asio::any_io_executor executor, foundation::SecretString dsn,
     std::size_t maxConnections, foundation::Duration acquireTimeout,
-    foundation::Duration connectTimeout, foundation::Duration queryTimeout)
+    foundation::Duration connectTimeout, foundation::Duration queryTimeout,
+    identity::core::OrganizationId tenant,identity::provider::ProviderId localProvider)
 {
-    if (queryTimeout <= foundation::Duration::zero()) {
+    if (queryTimeout <= foundation::Duration::zero() || tenant.empty() || localProvider.empty()) {
         throw std::invalid_argument{"Invalid recovery-code SQL timeout"};
     }
     m_impl = std::make_unique<Impl>(
         std::move(executor), std::string{dsn.expose()},
-        maxConnections, acquireTimeout, connectTimeout, queryTimeout);
+        maxConnections, acquireTimeout, connectTimeout, queryTimeout,std::move(tenant),std::move(localProvider));
 }
 
 CoroutinePostgresRecoveryCodeRepository::~CoroutinePostgresRecoveryCodeRepository()
@@ -71,8 +77,7 @@ CoroutinePostgresRecoveryCodeRepository::replaceAsync(
     identity::core::IdentityId identity,
     std::vector<credentials::RecoveryCodeDigest> digests)
 {
-    if (identity.empty()
-        || digests.size() > async_detail::AsyncRecoveryCodeSql::kMaximumRecoveryCodes) {
+    if (identity.empty() || !digests.empty()) {
         co_return foundation::fail(
             foundation::ErrorCode::InvalidArgument,
             "Invalid recovery-code set.");
@@ -97,6 +102,67 @@ CoroutinePostgresRecoveryCodeRepository::replaceAsync(
         co_return foundation::fail(
             foundation::ErrorCode::Unavailable,
             "Recovery-code persistence is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<credentials::RecoveryIssuanceFence>>
+CoroutinePostgresRecoveryCodeRepository::captureIssuanceAsync(identity::core::IdentityId identity)
+{
+    if (identity.empty() || identity.value().size()>200U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        std::vector<std::optional<std::string>> params{std::string{identity.value()},
+            std::string{m_impl->tenant.value()},std::string{m_impl->provider.value()}};
+        const auto rows=co_await lease.connection().query(
+            "SELECT e.external_subject,p.changed_at_ms::text,t.enrolled_at_ms::text "
+            "FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.external_identities e ON e.identity_id=i.id "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+            "JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND e.provider=$3 "
+            "AND i.kind=0 AND i.status=0 AND o.state=0 LIMIT 2",std::move(params),remaining(deadline));
+        if (rows.rows.empty()) co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+        if (rows.rows.size()!=1U || rows.rows.front().size()!=3U)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        const auto& row=rows.rows.front();
+        const auto validGeneration=[](const std::optional<std::string>& value) {
+            if (!value) return false;
+            std::int64_t number{};
+            const auto result=std::from_chars(value->data(),value->data()+value->size(),number);
+            return result.ec==std::errc{} && result.ptr==value->data()+value->size() && number>=0;
+        };
+        if (!row[0] || row[0]->empty() || row[0]->size()>1000U
+            || !validGeneration(row[1]) || !validGeneration(row[2]))
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return credentials::RecoveryIssuanceFence{*row[0],*row[1],*row[2]};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,"Recovery eligibility unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Status>
+CoroutinePostgresRecoveryCodeRepository::replaceFencedAsync(identity::core::IdentityId identity,
+    std::vector<credentials::RecoveryCodeDigest> digests,credentials::RecoveryIssuanceFence fence)
+{
+    if (identity.empty() || digests.empty() || digests.size()>async_detail::AsyncRecoveryCodeSql::kMaximumRecoveryCodes)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    std::vector<std::string> hex;
+    hex.reserve(digests.size());
+    for (const auto& digest:digests) hex.emplace_back(foundation::toHex(digest));
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        async_detail::AsyncRecoveryCodeSql::IssuanceScope scope{std::string{m_impl->tenant.value()},
+            std::string{m_impl->provider.value()},std::move(fence.subject),
+            std::move(fence.credentialGeneration),std::move(fence.factorGeneration)};
+        if (!(co_await m_impl->sql.replaceFenced(lease.connection(),std::string{identity.value()},
+            std::move(hex),std::move(scope),remaining(deadline))))
+            co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,"Recovery-code persistence unavailable.");
     }
 }
 
