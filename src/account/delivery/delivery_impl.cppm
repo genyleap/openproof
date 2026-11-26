@@ -9,7 +9,9 @@ module;
 #include <utility>
 #include <vector>
 
-module openproof.account.delivery;
+module openproof.account.delivery:implementation;
+
+import :coroutine;
 
 import openproof.account;
 import openproof.foundation;
