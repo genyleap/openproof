@@ -135,6 +135,24 @@ test("native migration and session regression suites exercise production SQL wit
     const end=migration.indexOf("\nTEST",start);
     assert.match(migration.slice(start,end<0?undefined:end),/pg::migrateSchemaBeforeListener/);
   }
+  const nativeCases=[
+    ["PasskeyConcurrentRemovalPreservesFinalCredential",["mutatePasskeyAccountAsync","readPasskeyAccountAsync","ASSERT_NE(a.has_value(),b.has_value())"]],
+    ["SessionUseRotationAndRevocationAreImmediate",["peer.use","repository.rotate","peer.revoke"]],
+    ["TransactionCanBeConsumedExactlyOnceAcrossThreads",["consumeAsync","redeem(peer)","authentication_transaction_metadata"]],
+    ["FailedNonceBurnsTransactionAtomically",["consumeAsync","wrong-nonce","right-nonce","state::text"]],
+    ["RecoveryCodeIsConsumedExactlyOnceAcrossNodes",["captureIssuanceAsync","replaceFencedAsync","consumeAsync","remainingAsync"]],
+    ["RecoveryRotationWaitsForNativeTransactionLock",["replaceFencedAsync","pg_locks","consumeAsync"]],
+    ["RejectedAuthorizationIsChainedAndPublished",["CoroutineAuthorizationDecisionSink","recordAsync","security_event_outbox"]],
+    ["MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState",["beginAsync","CoroutinePostgresSessionRepository","rotateMasterKeyOffline"]]
+  ];
+  for(const [name,required] of nativeCases){
+    const start=migration.indexOf("TEST_F(PostgresIntegrationTest, "+name+")");
+    assert.ok(start>=0,name);
+    const end=migration.indexOf("\nTEST",start+1);
+    const section=migration.slice(start,end<0?undefined:end);
+    assert.doesNotMatch(section,/pg::Postgres\w+\b/);
+    for(const token of required) assert.ok(section.includes(token),name+": "+token);
+  }
   const session=read("tests/storage/postgres_coroutine_repository_integration_test.cpp");
   assert.doesNotMatch(session,/import openproof.storage.postgres;|pg::(?:PoolConfig|ConnectionPool|Migrator|PostgresSessionRepository)\b/);
   assert.match(session,/pg::CoroutinePostgresSessionRepository peer\{/);

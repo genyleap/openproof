@@ -10,13 +10,22 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 #include <libpq-fe.h>
+#include "../../src/storage/postgres/coroutine_session_repository.hpp"
+#include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
+#include "../../src/storage/postgres/coroutine_recovery_code_repository.hpp"
 #include "../../src/storage/postgres/coroutine_startup.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
+#include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
 
 import openproof.foundation;
 import openproof.administration;
@@ -39,6 +48,8 @@ import openproof.storage.postgres;
 
 namespace {
 
+namespace asio = boost::asio;
+using namespace std::chrono_literals;
 namespace app = openproof::application;
 namespace cli = openproof::client;
 namespace core = openproof::identity::core;
@@ -111,6 +122,40 @@ protected:
             << PQresultErrorMessage(result.get());
     }
 
+    template<typename T>
+    T run(asio::awaitable<T> operation)
+    {
+        io.restart();
+        std::optional<T> value;
+        const auto capture=[](asio::awaitable<T> task,std::optional<T>& out)->asio::awaitable<void>{
+            out.emplace(co_await std::move(task));
+        };
+        auto done=asio::co_spawn(io,capture(std::move(operation),value),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(value).value();
+    }
+
+    std::string scalar(const char* sql)
+    {
+        std::unique_ptr<PGresult,ResultDeleter> result{PQexec(direct.get(),sql)};
+        if (!result || PQresultStatus(result.get())!=PGRES_TUPLES_OK ||
+            PQntuples(result.get())!=1 || PQnfields(result.get())!=1 || PQgetisnull(result.get(),0,0))
+            throw std::runtime_error{"Invalid PostgreSQL test scalar"};
+        return PQgetvalue(result.get(),0,0);
+    }
+
+    void seedRecoveryEligibility()
+    {
+        execute("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+            "VALUES('local','fixture-owner','identity-1',1770000000000)");
+        execute("INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES('identity-1','fixture-hash',1770000000000)");
+        execute("INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES('identity-1',decode('00','hex'),1,NULL,1770000000000)");
+    }
+
+    asio::io_context io;
     std::string connectionString;
     std::unique_ptr<pg::ConnectionPool> pool;
     std::unique_ptr<PGconn, ConnectionDeleter> direct;
@@ -358,65 +403,54 @@ TEST_F(PostgresIntegrationTest, ExistingSchemaNeverRestoresSnapshot)
 
 TEST_F(PostgresIntegrationTest, PasskeyConcurrentRemovalPreservesFinalCredential)
 {
-    pg::PostgresPasskeyRepository repository{*pool};
     const core::IdentityId identity{"identity-1"};
-    const auto value = [&](std::string id) {
-        return passkey::PasskeyCredential{
-            std::move(id), identity, "x", "y", 0U, kNow, kNow};
-    };
-    ASSERT_TRUE(repository.addCredential(value("passkey-a")));
-    ASSERT_TRUE(repository.addCredential(value("passkey-b")));
-
-    std::atomic<int> removed{0};
-    std::thread first([&] {
-        if (repository.removeCredentialIfAnotherExists(identity, "passkey-a")) {
-            removed.fetch_add(1, std::memory_order_relaxed);
-        }
-    });
-    std::thread second([&] {
-        if (repository.removeCredentialIfAnotherExists(identity, "passkey-b")) {
-            removed.fetch_add(1, std::memory_order_relaxed);
-        }
-    });
-    first.join();
-    second.join();
-
-    EXPECT_EQ(removed.load(std::memory_order_relaxed), 1);
-    auto remaining = repository.listCredentials(identity);
+    pg::CoroutinePostgresSessionRepository sessions{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
+    ASSERT_TRUE(run(sessions.add(sessionValue("passkey-test-token"))));
+    execute("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+        "VALUES('passkey','identity-1','identity-1',1770000000000)");
+    execute("INSERT INTO openproof.passkey_credentials(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+        "VALUES('passkey-a','identity-1','x','y',0,1770000000000,1770000000000),"
+        "('passkey-b','identity-1','x','y',0,1770000000000,1770000000000)");
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},1U,2s,2s,4s};
+    pg::CoroutinePostgresCanonicalFinalizer peer{io.get_executor(),fnd::SecretString{connectionString},
+        core::OrganizationId{"org"},1U,2s,2s,4s};
+    const sess::SessionId sessionId{"session-1"};
+    io.restart();
+    auto first=asio::co_spawn(io,native.mutatePasskeyAccountAsync(identity,sessionId,kNow+1s,
+        "passkey-a",std::nullopt,std::nullopt),asio::use_future);
+    auto second=asio::co_spawn(io,peer.mutatePasskeyAccountAsync(identity,sessionId,kNow+1s,
+        "passkey-b",std::nullopt,std::nullopt),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto remaining=run(native.readPasskeyAccountAsync(identity,sessionId,kNow+2s));
     ASSERT_TRUE(remaining);
-    ASSERT_EQ(remaining->size(), 1U);
+    ASSERT_EQ(remaining->size(),1U);
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.external_identities WHERE provider='passkey' AND identity_id='identity-1'"),"1");
 }
 
 TEST_F(PostgresIntegrationTest, SessionUseRotationAndRevocationAreImmediate)
 {
-    pg::PostgresSessionRepository repository{*pool};
-    ASSERT_TRUE(repository.add(sessionValue("old-token")));
-    auto used = repository.use(sess::TokenDigest{sec::sha256("old-token").value()},
-                               kNow + std::chrono::minutes{1});
+    pg::CoroutinePostgresSessionRepository repository{io.get_executor(),fnd::SecretString{connectionString},2U,2s,2s,4s};
+    pg::CoroutinePostgresSessionRepository peer{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
+    ASSERT_TRUE(run(repository.add(sessionValue("old-token"))));
+    const sess::TokenDigest oldToken{sec::sha256("old-token").value()},newToken{sec::sha256("new-token").value()};
+    auto used=run(peer.use(oldToken,kNow+1min));
     ASSERT_TRUE(used);
-    EXPECT_EQ(used->identity(), core::IdentityId{"identity-1"});
-
-    ASSERT_TRUE(repository.rotate(
-        sess::SessionId{"session-1"},
-        sess::TokenDigest{sec::sha256("old-token").value()},
-        sess::TokenDigest{sec::sha256("new-token").value()},
-        kNow + std::chrono::minutes{2}));
-    EXPECT_FALSE(repository.use(
-        sess::TokenDigest{sec::sha256("old-token").value()},
-        kNow + std::chrono::minutes{2}));
-    EXPECT_TRUE(repository.use(
-        sess::TokenDigest{sec::sha256("new-token").value()},
-        kNow + std::chrono::minutes{2}));
-    ASSERT_TRUE(repository.revoke(sess::SessionId{"session-1"},
-                                  kNow + std::chrono::minutes{3}));
-    EXPECT_FALSE(repository.use(
-        sess::TokenDigest{sec::sha256("new-token").value()},
-        kNow + std::chrono::minutes{3}));
+    EXPECT_EQ(used->identity(),core::IdentityId{"identity-1"});
+    ASSERT_TRUE(run(repository.rotate(sess::SessionId{"session-1"},oldToken,newToken,kNow+2min)));
+    EXPECT_FALSE(run(peer.use(oldToken,kNow+2min)));
+    EXPECT_TRUE(run(peer.use(newToken,kNow+2min)));
+    ASSERT_TRUE(run(peer.revoke(sess::SessionId{"session-1"},kNow+3min)));
+    EXPECT_FALSE(run(repository.use(newToken,kNow+3min)));
 }
 
 TEST_F(PostgresIntegrationTest, TransactionCanBeConsumedExactlyOnceAcrossThreads)
 {
-    pg::PostgresAuthenticationTransactionStore store{*pool};
+    pg::CoroutinePostgresAuthenticationTransactionStore store{io.get_executor(),fnd::SecretString{connectionString},2U,2s,2s,4s};
+    pg::CoroutinePostgresAuthenticationTransactionStore peer{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
     const fnd::SecretString nonce{"single-use-nonce"};
     const idp::BindingDigest binding = sec::sha256("binding").value();
     auto transaction = idp::AuthenticationTransaction::create(
@@ -424,73 +458,57 @@ TEST_F(PostgresIntegrationTest, TransactionCanBeConsumedExactlyOnceAcrossThreads
         idp::InteractionModel::ChallengeResponse, nonce.clone(), binding,
         fnd::CorrelationId{"correlation"}, kNow, std::chrono::minutes{5}).value();
     transaction.setMetadata("challenge_id", "challenge");
-    ASSERT_TRUE(store.begin(std::move(transaction)));
-
-    std::atomic<unsigned int> winners{0U};
-    auto redeem = [&] {
-        auto result = store.consume(idp::TransactionId{"transaction-1"}, nonce,
-                                    binding, kNow + std::chrono::seconds{1});
-        if (result.has_value()) winners.fetch_add(1U);
+    ASSERT_TRUE(run(store.beginAsync(std::move(transaction))));
+    const auto redeem=[&](pg::CoroutinePostgresAuthenticationTransactionStore& target)->asio::awaitable<bool>{
+        auto result=co_await target.consumeAsync(idp::TransactionId{"transaction-1"},nonce.clone(),binding,kNow+1s);
+        co_return result && result->metadata().at("challenge_id")=="challenge";
     };
-    std::thread first{redeem};
-    std::thread second{redeem};
-    first.join();
-    second.join();
-    EXPECT_EQ(winners.load(), 1U);
-    auto stored = store.find(idp::TransactionId{"transaction-1"});
-    ASSERT_TRUE(stored);
-    ASSERT_TRUE(stored->has_value());
-    EXPECT_EQ(stored->value().state(), idp::TransactionState::Consumed);
-    EXPECT_EQ(stored->value().metadata().at("challenge_id"), "challenge");
+    io.restart();
+    auto first=asio::co_spawn(io,redeem(store),asio::use_future);
+    auto second=asio::co_spawn(io,redeem(peer),asio::use_future);
+    io.run();
+    EXPECT_NE(first.get(),second.get());
+    EXPECT_EQ(scalar("SELECT state::text FROM openproof.authentication_transactions WHERE id='transaction-1'"),"1");
+    EXPECT_EQ(scalar("SELECT value FROM openproof.authentication_transaction_metadata WHERE transaction_id='transaction-1' AND key='challenge_id'"),"challenge");
 }
 
 TEST_F(PostgresIntegrationTest, FailedNonceBurnsTransactionAtomically)
 {
-    pg::PostgresAuthenticationTransactionStore store{*pool};
+    pg::CoroutinePostgresAuthenticationTransactionStore store{io.get_executor(),fnd::SecretString{connectionString},2U,2s,2s,4s};
     const idp::BindingDigest binding = sec::sha256("binding").value();
     auto transaction = idp::AuthenticationTransaction::create(
         idp::TransactionId{"transaction-1"}, idp::ProviderId{"provider"},
         idp::InteractionModel::ChallengeResponse, fnd::SecretString{"right-nonce"},
         binding, fnd::CorrelationId{"correlation"}, kNow,
         std::chrono::minutes{5}).value();
-    ASSERT_TRUE(store.begin(std::move(transaction)));
-    EXPECT_FALSE(store.consume(idp::TransactionId{"transaction-1"},
-                               fnd::SecretString{"wrong-nonce"}, binding,
-                               kNow + std::chrono::seconds{1}));
-    EXPECT_FALSE(store.consume(idp::TransactionId{"transaction-1"},
-                               fnd::SecretString{"right-nonce"}, binding,
-                               kNow + std::chrono::seconds{2}));
-    auto stored = store.find(idp::TransactionId{"transaction-1"});
-    ASSERT_TRUE(stored);
-    ASSERT_TRUE(stored->has_value());
-    EXPECT_EQ(stored->value().state(), idp::TransactionState::Failed);
+    ASSERT_TRUE(run(store.beginAsync(std::move(transaction))));
+    EXPECT_FALSE(run(store.consumeAsync(idp::TransactionId{"transaction-1"},fnd::SecretString{"wrong-nonce"},binding,kNow+1s)));
+    EXPECT_FALSE(run(store.consumeAsync(idp::TransactionId{"transaction-1"},fnd::SecretString{"right-nonce"},binding,kNow+2s)));
+    EXPECT_EQ(scalar("SELECT state::text FROM openproof.authentication_transactions WHERE id='transaction-1'"),"2");
 }
 
 TEST_F(PostgresIntegrationTest, RecoveryCodeIsConsumedExactlyOnceAcrossNodes)
 {
-    pg::PostgresRecoveryCodeRepository firstRepository{*pool};
-    pg::PostgresRecoveryCodeRepository secondRepository{*pool};
-    auto service = cred::RecoveryCodeService::create(
-        firstRepository, fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto batch = service.issue(core::IdentityId{"identity-1"}, 4U);
-    ASSERT_TRUE(batch.has_value());
-    ASSERT_EQ(firstRepository.remaining(core::IdentityId{"identity-1"}).value(), 4U);
-
-    auto secondService = cred::RecoveryCodeService::create(
-        secondRepository, fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    const fnd::SecretString presented = batch->codes().front().clone();
-    std::atomic<unsigned int> winners{0U};
-    auto consume = [&] {
-        if (secondService.consume(core::IdentityId{"identity-1"}, presented).has_value()) {
-            winners.fetch_add(1U);
-        }
-    };
-    std::thread first{consume};
-    std::thread second{consume};
-    first.join();
-    second.join();
-    EXPECT_EQ(winners.load(), 1U);
-    EXPECT_EQ(firstRepository.remaining(core::IdentityId{"identity-1"}).value(), 3U);
+    seedRecoveryEligibility();
+    pg::CoroutinePostgresRecoveryCodeRepository firstRepository{io.get_executor(),fnd::SecretString{connectionString},
+        2U,2s,2s,4s,core::OrganizationId{"org"},idp::ProviderId{"local"}};
+    pg::CoroutinePostgresRecoveryCodeRepository secondRepository{io.get_executor(),fnd::SecretString{connectionString},
+        1U,2s,2s,4s,core::OrganizationId{"org"},idp::ProviderId{"local"}};
+    const core::IdentityId identity{"identity-1"};
+    std::vector<cred::RecoveryCodeDigest> batch(4U);
+    for (std::size_t index=0;index<batch.size();++index)
+        batch[index].fill(static_cast<std::byte>(index+1U));
+    const auto presented=batch.front();
+    auto fence=run(firstRepository.captureIssuanceAsync(identity));
+    ASSERT_TRUE(fence);
+    ASSERT_TRUE(run(firstRepository.replaceFencedAsync(identity,std::move(batch),fence.value())));
+    ASSERT_EQ(run(firstRepository.remainingAsync(identity)).value(),4U);
+    io.restart();
+    auto first=asio::co_spawn(io,firstRepository.consumeAsync(identity,presented),asio::use_future);
+    auto second=asio::co_spawn(io,secondRepository.consumeAsync(identity,presented),asio::use_future);
+    io.run();
+    EXPECT_NE(first.get().has_value(),second.get().has_value());
+    EXPECT_EQ(run(secondRepository.remainingAsync(identity)).value(),3U);
 }
 
 TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
@@ -498,13 +516,17 @@ TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
     // The fixture already applies the real schema in the exclusive
     // integration database. Hold the exact advisory transaction lock
     // used by AsyncRecoveryCodeSql::replace on a separate connection.
-    pg::PostgresRecoveryCodeRepository repository{*pool};
+    seedRecoveryEligibility();
+    pg::CoroutinePostgresRecoveryCodeRepository repository{io.get_executor(),fnd::SecretString{connectionString},
+        2U,2s,2s,6s,core::OrganizationId{"org"},idp::ProviderId{"local"}};
     const core::IdentityId identity{"identity-1"};
+    auto fence=run(repository.captureIssuanceAsync(identity));
+    ASSERT_TRUE(fence);
     cred::RecoveryCodeDigest prior{};
     prior.fill(std::byte{0x11});
     cred::RecoveryCodeDigest next{};
     next.fill(std::byte{0x22});
-    ASSERT_TRUE(repository.replace(identity, {prior}));
+    ASSERT_TRUE(run(repository.replaceFencedAsync(identity,{prior},fence.value())));
     execute("BEGIN");
     std::unique_ptr<PGresult, ResultDeleter> locked{PQexec(direct.get(),
         "SELECT pg_advisory_xact_lock(hashtextextended('identity-1',0))")};
@@ -517,7 +539,7 @@ TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
 
     bool replaced = false;
     std::jthread rotate{[&] {
-        replaced = repository.replace(identity, {next}).has_value();
+        replaced = run(repository.replaceFencedAsync(identity,{next},fence.value())).has_value();
     }};
     // Observe a real ungranted advisory lock on our lock key rather
     // than guessing from a thread's sleep or scheduling delay.
@@ -550,15 +572,15 @@ TEST_F(PostgresIntegrationTest, RecoveryRotationWaitsForNativeTransactionLock)
     ASSERT_FALSE(observerFailed);
     EXPECT_TRUE(waited);
     ASSERT_TRUE(replaced);
-    auto count = repository.remaining(identity);
+    auto count=run(repository.remainingAsync(identity));
     ASSERT_TRUE(count);
-    EXPECT_EQ(count.value(), 1U);
+    EXPECT_EQ(count.value(),1U);
     cred::RecoveryCodeDigest intervening{};
     intervening.fill(std::byte{0x33});
-    EXPECT_FALSE(repository.consume(identity, prior));
-    EXPECT_FALSE(repository.consume(identity, intervening));
-    EXPECT_TRUE(repository.consume(identity, next));
-    EXPECT_FALSE(repository.consume(identity, next));
+    EXPECT_FALSE(run(repository.consumeAsync(identity,prior)));
+    EXPECT_FALSE(run(repository.consumeAsync(identity,intervening)));
+    EXPECT_TRUE(run(repository.consumeAsync(identity,next)));
+    EXPECT_FALSE(run(repository.consumeAsync(identity,next)));
 }
 
 TEST_F(PostgresIntegrationTest, IdentityOrganizationMembershipAndExternalLinksRoundTrip)
@@ -629,16 +651,16 @@ TEST_F(PostgresIntegrationTest, RejectedAuthorizationIsChainedAndPublished)
         fnd::SecretString{"denied-token"});
     ASSERT_TRUE(authenticated);
 
-    pg::PostgresAuthorizationDecisionSink sink{
-        *pool,
+    pg::CoroutineAuthorizationDecisionSink sink{
+        io.get_executor(),fnd::SecretString{connectionString},
         audit::AuditKey::create(fnd::SecretString{
             "abcdef0123456789abcdef0123456789"}).value(),
-        clock};
-    ASSERT_TRUE(sink.record(
-        authenticated.value(), core::OrganizationId{"org"},
-        pol::Action{"proxy.GET:/api"}, pol::Resource{"upstream:/api"},
+        clock,1U,2s,2s,4s};
+    ASSERT_TRUE(run(sink.recordAsync(
+        authenticated.value(),core::OrganizationId{"org"},
+        pol::Action{"proxy.GET:/api"},pol::Resource{"upstream:/api"},
         pol::AuthorizationDecision::deny("required role is absent"),
-        fnd::CorrelationId{"authorization-request"}));
+        fnd::CorrelationId{"authorization-request"})));
 
     std::unique_ptr<PGresult, ResultDeleter> evidence{PQexec(
         direct.get(),
@@ -916,18 +938,18 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
 
 TEST_F(PostgresIntegrationTest, MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState)
 {
-    pg::PostgresAuthenticationTransactionStore transactions{*pool};
+    pg::CoroutinePostgresAuthenticationTransactionStore transactions{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
     auto transaction = idp::AuthenticationTransaction::create(
         idp::TransactionId{"master-rotation-transaction"},
         idp::ProviderId{"local"}, idp::InteractionModel::ChallengeResponse,
         fnd::SecretString{"master-rotation-nonce"}, sec::sha256("binding").value(),
         fnd::CorrelationId{"master-rotation"}, kNow,
         std::chrono::minutes{5}).value();
-    ASSERT_TRUE(transactions.begin(std::move(transaction)));
+    ASSERT_TRUE(run(transactions.beginAsync(std::move(transaction))));
 
-    pg::PostgresSessionRepository sessions{*pool};
-    ASSERT_TRUE(sessions.add(sessionValue(
-        "master-rotation-session", "master-rotation-session")));
+    pg::CoroutinePostgresSessionRepository sessions{io.get_executor(),fnd::SecretString{connectionString},1U,2s,2s,4s};
+    ASSERT_TRUE(run(sessions.add(sessionValue(
+        "master-rotation-session", "master-rotation-session"))));
 
     execute("INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
             "VALUES('identity-1','scrypt$v1$1024$8$1$2097152$c2FsdHNhbHRzYWx0c2FsdA$"
