@@ -5,6 +5,7 @@
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -23,7 +24,10 @@
 
 #include "async_pool.hpp"
 #include "coroutine_canonical_finalizer.hpp"
+#include "coroutine_verification_challenge_store.hpp"
 
+import openproof.account;
+import openproof.storage.postgres;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
@@ -772,6 +776,101 @@ asio::awaitable<bool> concurrentConnectionRead(
     auto linked = co_await canonical.readConnectionsAsync(owner);
     co_return linked && linked->first == owner
         && linked->second.empty() == emptyExpected;
+}
+
+TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPreserveLatestOwnerChallenge)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace acc = openproof::account;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),
+        fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U, 500ms, 1000ms, 3000ms};
+    pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),
+        fnd::SecretString{*dsn}, ids::OrganizationId{seed.foreignOrg}, 1U, 500ms, 1000ms, 3000ms};
+    auto poolConfig = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
+    ASSERT_TRUE(poolConfig);
+    auto pool = pg::ConnectionPool::create(std::move(poolConfig).value());
+    ASSERT_TRUE(pool);
+    pg::PostgresAccountRepository legacy{*pool.value()};
+    const auto purpose = acc::VerificationPurpose::ChangeEmail;
+    std::array<std::byte, 32> digest{};
+    digest[0] = std::byte{42};
+    auto challenge = [&](const std::string& id, const std::string& owner,
+                         acc::VerificationPurpose p = acc::VerificationPurpose::ChangeEmail) {
+        return acc::VerificationChallenge::create(acc::VerificationId{id},
+            ids::IdentityId{owner}, p, acc::VerificationChannel::Email,
+            "contact@example.test", acc::VerificationDigest{digest}, kNow, 10min).value();
+    };
+    auto run = [&](asio::awaitable<fnd::Status> pending) {
+        io.restart();
+        auto complete = asio::co_spawn(io, std::move(pending), asio::use_future);
+        io.run();
+        return complete.get();
+    };
+    const auto first = "verification-first-" + seed.suffix;
+    const auto second = "verification-second-" + seed.suffix;
+    const auto third = "verification-third-" + seed.suffix;
+    const auto last = "verification-last-" + seed.suffix;
+    // Native and synchronous issuers operate on the same owner/purpose.
+    // A concurrent first issuance cannot leave two redeemable challenges.
+    auto legacyWrite = std::async(std::launch::async, [&] {
+        return legacy.replace(challenge(first, seed.owner));
+    });
+    io.restart();
+    auto a = asio::co_spawn(io, store.replaceAsync(challenge(second, seed.owner)), asio::use_future);
+    auto b = asio::co_spawn(io, store.replaceAsync(challenge(third, seed.owner)), asio::use_future);
+    io.run();
+    ASSERT_TRUE(legacyWrite.get());
+    ASSERT_TRUE(a.get());
+    ASSERT_TRUE(b.get());
+    auto count = execute(fixture.get(),
+        "SELECT count(*) FROM openproof.account_verification_challenges WHERE identity_id=$1 AND purpose=1",
+        {seed.owner});
+    EXPECT_STREQ(PQgetvalue(count.get(), 0, 0), "1");
+
+    ASSERT_TRUE(run(store.replaceAsync(challenge(last, seed.owner))));
+    for (const auto& previous : {first, second, third})
+        EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{previous},
+            ids::IdentityId{seed.owner}, purpose)));
+    EXPECT_TRUE(run(foreign.discardAsync(acc::VerificationId{last},
+        ids::IdentityId{seed.owner}, purpose)));
+    EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{last},
+        ids::IdentityId{seed.secondOwner}, purpose)));
+    EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{last},
+        ids::IdentityId{seed.owner}, acc::VerificationPurpose::VerifyPhone)));
+    auto denied = run(store.replaceAsync(challenge("foreign-" + seed.suffix, seed.foreignOwner)));
+    EXPECT_TRUE(!denied && denied.error().code() == fnd::ErrorCode::PermissionDenied);
+    auto locked = run(store.replaceAsync(challenge("locked-" + seed.suffix, seed.lockedOwner)));
+    EXPECT_TRUE(!locked && locked.error().code() == fnd::ErrorCode::PermissionDenied);
+    auto signup = run(store.replaceAsync(challenge("signup-" + seed.suffix,
+        seed.owner, acc::VerificationPurpose::SignupEmail)));
+    EXPECT_TRUE(!signup && signup.error().code() == fnd::ErrorCode::InvalidArgument);
+    // Legacy consumption must still understand the native-issued digest.
+    auto consumed = legacy.consume(acc::VerificationId{last},
+        acc::VerificationDigest{digest}, kNow, 8U);
+    ASSERT_TRUE(consumed);
+    EXPECT_EQ(consumed->identity().value(), seed.owner);
+    EXPECT_EQ(consumed->purpose(), purpose);
+    EXPECT_FALSE(legacy.consume(acc::VerificationId{last},
+        acc::VerificationDigest{digest}, kNow, 8U));
+    const auto failed = "verification-failed-" + seed.suffix;
+    ASSERT_TRUE(run(store.replaceAsync(challenge(failed, seed.owner))));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
+        ids::IdentityId{seed.owner}, purpose)));
+    EXPECT_FALSE(legacy.consume(acc::VerificationId{failed},
+        acc::VerificationDigest{digest}, kNow, 8U));
+    EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
+        ids::IdentityId{seed.owner}, purpose)));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
