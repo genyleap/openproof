@@ -38,7 +38,7 @@ struct Fallback final : gw::http::CoroutineHttpHandler {
         return r.path() == "/auth/logout";
     }
     gw::HttpResponse handle(gw::HttpRequest) override {
-        ++sync; return {500, {}, {}};
+        ++sync; return gw::HttpResponse{500, {}, {}};
     }
     asio::awaitable<gw::HttpResponse> handleAsync(gw::HttpRequest) override {
         ++async; co_return gw::HttpResponse{204, {}, {}};
