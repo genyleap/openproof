@@ -5063,3 +5063,20 @@ ordinary login rather than replay of the consumed proof. The flag remains
 opt-in until executable acceptance, expired pending cleanup and cross-path
 concurrency are verified. Both isolated native E2E workloads enable it.
 No schema or production change.
+
+### Bounded abandoned fresh native signup collection
+
+New fresh native signup IDs use the reserved opaque opi_signup_ namespace.
+After bounded KDF admission, the opt-in signup route collects at most eight
+untouched, deactivated, unverified fresh accounts in its own tenant after
+48 hours and only when every reservation and signup challenge is expired.
+It locks canonical identity/profile/password, then reservations and proofs,
+and repeats eligibility on a fresh statement snapshot. Active or historical
+IDs, modified profiles or credentials, other verification purposes, external
+links, memberships, sessions, OAuth records, passkeys, SCIM, evidence, and
+audit-associated owners are excluded. Unknown cascading identity FK tables
+fail closed. No historical identity is automatically deleted. Cleanup is
+opportunistic on signup traffic, not a timer; existing verified owners with
+expired pending local enrollment still need a separate retry policy.
+The isolated canonical runner includes the referenced existing schema
+tables. No new migration. Exact-head executable acceptance pending.

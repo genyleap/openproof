@@ -3410,6 +3410,10 @@ addProtectedRoutes(gateway::Router& router,
                 if (!normalized) co_return fnd::fail(normalized.error());
                 auto hashed=co_await nativeLocalPasswords->hashAsync(std::move(password));
                 if (!hashed) co_return fnd::fail(hashed.error());
+                // Bounded opportunistic collection, after KDF admission.
+                // Failure is not permission to delete more broadly.
+                auto reaped=co_await contactStore.reapExpiredSignupsAsync(clock.now());
+                if (!reaped) co_return fnd::fail(reaped.error());
                 auto pending=co_await contactStore.provisionSignupAsync(providerId,std::move(normalized).value(),
                     std::move(hashed).value(),std::move(displayName),signupKey.value(),clock.now(),
                     accountPolicy->emailVerificationLifetime());

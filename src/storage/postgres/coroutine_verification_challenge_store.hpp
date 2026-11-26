@@ -51,6 +51,11 @@ public:
     replacePublicEmailAsync(account::VerificationChallenge challenge,
         identity::provider::ProviderId provider);
 
+    // Reap only untouched identities created by native signup, never an
+    // existing canonical identity or an identity with other associations.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::size_t>>
+    reapExpiredSignupsAsync(foundation::Instant now);
+
     struct PendingSignup final {
         account::VerificationDispatch dispatch;
         bool createdIdentity;

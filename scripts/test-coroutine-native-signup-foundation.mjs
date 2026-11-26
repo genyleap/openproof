@@ -112,3 +112,23 @@ test("native signup pair shares bounded KDF and owner-bound verification before 
     "if (!safe(issued->id.value())","response.addHeader(\"set-cookie\""]);
   assert.doesNotMatch(body,/m_fallback->handle\(|m_accounts->/);
 });
+
+test("abandoned signup collection is bounded, tenant-scoped and refuses unrelated identity state",()=>{
+  const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  const gate=source.slice(source.indexOf("constexpr std::string_view abandonedSignupEligibility="),source.indexOf("bool exactRow("));
+  for(const marker of ["i.organization_id=$1 AND i.kind=0 AND i.status=3",
+    "starts_with(i.id,'opi_signup_')","p.updated_at_ms=i.created_at_ms",
+    "c.changed_at_ms=i.created_at_ms","NOT p.email_verified","r.expires_at_ms>$3",
+    "v.expires_at_ms>$3","external_identities","sessions","memberships","oauth_token_families",
+    "passkey_credentials","scim_users","evidence","audit_events"])
+    assert.ok(gate.includes(marker),marker);
+  const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::reapExpiredSignupsAsync("),
+    source.indexOf("CoroutineVerificationChallengeStore::provisionSignupAsync("));
+  assert.match(body,/std::chrono::hours\{48\}/);
+  assert.match(body,/LIMIT 8 FOR UPDATE OF i,p,c SKIP LOCKED/);
+  assert.match(body,/pg_catalog.pg_constraint/);
+  assert.equal([...body.matchAll(/std::string\{abandonedSignupEligibility\}/g)].length,2);
+  assert.match(body,/WHERE identity_id=\$1 FOR UPDATE/);
+  assert.match(body,/DELETE FROM openproof.identities target WHERE target.id=\$4/);
+  assert.match(read("apps/opp/main.cpp"),/co_await contactStore.reapExpiredSignupsAsync\(clock.now\(\)\)/);
+});
