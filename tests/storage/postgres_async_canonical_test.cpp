@@ -857,6 +857,13 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
     auto linked = co_await canonical.readConnectionsAsync(ids::IdentityId{seed.owner});
     checks.activeConnections = linked
         && linked->first.value() == seed.owner && !linked->second.empty();
+    if (checks.activeConnections) {
+        const auto external=linked->second.front();
+        EXPECT_TRUE(co_await canonical.authorizeHandoffOwnerAsync(ids::IdentityId{seed.owner},external));
+        EXPECT_FALSE(co_await wrongTenant.authorizeHandoffOwnerAsync(ids::IdentityId{seed.owner},external));
+        EXPECT_FALSE(co_await canonical.authorizeHandoffOwnerAsync(ids::IdentityId{seed.secondOwner},external));
+        EXPECT_FALSE(co_await canonical.authorizeHandoffOwnerAsync(ids::IdentityId{seed.lockedOwner},external));
+    }
     auto emptyLinks = co_await canonical.readConnectionsAsync(
         ids::IdentityId{seed.emptyConnectionsOwner});
     checks.emptyConnections = emptyLinks

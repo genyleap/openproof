@@ -49,7 +49,8 @@ public:
     [[nodiscard]] idp::ProviderId id() const override { return idp::ProviderId{providerName}; }
     std::string providerName{"async-test"};
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
-    { return idp::InteractionModel::Redirect; }
+    { return model; }
+    idp::InteractionModel model{idp::InteractionModel::Redirect};
     [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
     { return idp::AssuranceLevel::Ial2; }
     [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
@@ -154,6 +155,17 @@ public:
 
     [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
         return true;
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    authorizeHandoffOwnerAsync(ids::IdentityId owner,ids::ExternalIdentityRef external) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        auto current=m_directory->ownerOf(external);
+        if (!current) co_return fnd::fail(current.error());
+        if (!current->has_value() || current->value()!=owner)
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return fnd::ok();
     }
 
     [[nodiscard]] asio::awaitable<fnd::Status>
@@ -306,6 +318,61 @@ TEST(TrustedAuthenticationCoroutineTest, RejectsFinalizerSubstitutionOfCredentia
     io.run();
     future.get();
     EXPECT_TRUE(denied);
+}
+
+asio::awaitable<void> checkNativeWalletHandoff(auth::AuthenticationService& service,
+    Fixture& fixture,bool detachBeforeRedeem,bool& passed)
+{
+    auto ticket=co_await service.issueBrowserAuthenticationHandoffAsync(
+        idp::ProviderId{"async-test"},fnd::CorrelationId{"native-mobile-handoff"});
+    if (!ticket) co_return;
+    EXPECT_NE(ticket->publisherTicket().expose(),ticket->redeemTicket().expose());
+    EXPECT_EQ(ticket->expiresAt(),kNow+std::chrono::minutes{2});
+    auto pending=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    EXPECT_FALSE(pending);
+    const auto bound=binding("native-wallet-browser");
+    auto started=co_await service.beginAsync(fixture.request(),bound,
+        fnd::CorrelationId{"wallet-proof"});
+    if (!started) co_return;
+    auto verified=co_await service.completeAsync(started->transactionId(),
+        started->continuationToken().clone(),bound,
+        proof(std::string{started->challenge().id().value()}));
+    if (!verified) co_return;
+    auto published=co_await service.publishBrowserAuthenticationHandoffAsync(
+        ticket->publisherTicket().clone(),std::move(verified).value());
+    if (!published) co_return;
+    if (detachBeforeRedeem) {
+        const auto detached=fixture.identities.detach(ids::ExternalIdentityRef{
+            idp::ProviderId{"async-test"},idp::ExternalSubject{"verified-subject"}},
+            ids::IdentityId{"canonical-identity"});
+        if (!detached) co_return;
+    }
+    auto redeemed=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    auto replay=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    if (detachBeforeRedeem) {
+        passed=!redeemed && redeemed.error().code()==fnd::ErrorCode::AuthenticationFailed && !replay;
+    } else {
+        passed=redeemed && redeemed->identity().value()=="canonical-identity"
+            && redeemed->outcome().requiredCanonicalOwner()==std::optional<std::string>{"canonical-identity"}
+            && !replay;
+    }
+    passed=passed && fixture.coroutineProvider->syncCalls==0;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeWalletHandoffRedeemsOnceAndRechecksOwner)
+{
+    for (bool detached:{false,true}) {
+        Fixture fixture;
+        fixture.coroutineProvider->model=idp::InteractionModel::ChallengeResponse;
+        auto service=fixture.service();
+        bool passed=false;
+        asio::io_context io;
+        auto done=asio::co_spawn(io,checkNativeWalletHandoff(service,fixture,detached,passed),
+            asio::use_future);
+        io.run();
+        ASSERT_NO_THROW(done.get());
+        EXPECT_TRUE(passed) << "owner detached before redemption: " << detached;
+    }
 }
 
 TEST(TrustedAuthenticationCoroutineTest, VerifiesNativeProofAndConsumesTransactionOnce)

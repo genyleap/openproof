@@ -4801,3 +4801,16 @@ The native redemption and callback paths preserve provider/owner binding.
 Source gates require the actual native outbound exchanges and runtime
 handoff wiring. Exact-head runtime and external-provider acceptance remain
 mandatory; source results are not release approval.
+
+### Native mobile wallet handoff domain foundation
+
+Adds coroutine issue, publication and redemption of the existing split
+publisher/redeemer tickets using the same transaction schema and lifetime.
+Publication and redemption independently revalidate the active tenant-bound
+external-account owner using a read-only SQL query; no profile refresh or
+provisioning is performed. Redemption preserves the canonical-owner
+constraint. Tests cover pending, successful redemption, replay and link
+removal before redemption, plus wrong-tenant/owner SQL denial. HTTP wiring,
+presentation metadata, connection flows and exact-head executable tests
+remain pending. The old Web3 RPC facade is intentionally retained until
+these runtime paths preserve all existing behavior.

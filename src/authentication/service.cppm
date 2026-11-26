@@ -214,6 +214,14 @@ public:
     [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) = 0;
 
+    // Read-only revalidation for handoff redemption. An implementation that
+    // has not migrated authoritative ownership must refuse rather than write
+    // a profile or fall back to a synchronous repository.
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    authorizeHandoffOwnerAsync(identity::core::IdentityId,
+                              identity::core::ExternalIdentityRef)
+    { co_return foundation::fail(foundation::ErrorCode::Unavailable); }
+
     /** Atomically attach or confirm a verified link; never reassign owners. */
     [[nodiscard]] virtual boost::asio::awaitable<
         foundation::Result<identity::core::ExternalIdentityRef>>
@@ -427,6 +435,17 @@ public:
     [[nodiscard]] foundation::Result<VerifiedAuthentication>
     redeemBrowserAuthenticationHandoff(
         const foundation::SecretString& redeemTicket);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserAuthenticationHandoff>>
+    issueBrowserAuthenticationHandoffAsync(provider::ProviderId providerId,
+        foundation::CorrelationId correlation);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    publishBrowserAuthenticationHandoffAsync(foundation::SecretString publisherTicket,
+        VerifiedAuthentication authentication);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+    redeemBrowserAuthenticationHandoffAsync(foundation::SecretString redeemTicket);
 
 private:
     struct CompletedExchange final {
