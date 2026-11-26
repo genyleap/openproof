@@ -232,7 +232,14 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
 bool CoroutineAccountSessionAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
-    if (!accountNamespace(request)) {
+    // These exact connection ceremonies are owned by downstream native
+    // Web3/federation handlers, not the account session/profile adapter.
+    if (!accountNamespace(request)
+        || request.path()=="/account/connections/web3/start"
+        || request.path()=="/account/connections/web3/complete"
+        || request.path()=="/account/connections/web3/handoff"
+        || request.path()=="/account/connections/start"
+        || request.path()=="/account/connections/handoff") {
         return m_asyncFallback->nativeEnabledFor(request);
     }
     if (profileReadRoute(request)) {
@@ -337,8 +344,8 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     if (passwordUpgradeConfirmRoute(request)) {
         co_return co_await passwordUpgradeConfirm(std::move(request));
     }
-    // Only non-account requests can reach the fallback's native entry.
-    // No synchronous AccountHttpApi method executes on the reactor.
+    // Only requests explicitly admitted by the downstream native handler
+    // reach this branch; never invoke synchronous AccountHttpApi here.
     co_return co_await m_asyncFallback->handleAsync(std::move(request));
 }
 

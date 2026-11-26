@@ -174,3 +174,13 @@ test("native delegated context is snapshot-consistent, bounded and preserves sen
   assert.match(account,/if \(access->senderConstraint\(\)\)/);
   assert.match(account,/if \(!access->permits\("account"\)\)/);
 });
+
+test("native account adapter preserves explicitly downstream Web3 ceremony capabilities",()=>{
+  const source=read("src/account/http/coroutine_session_http.cpp");
+  const body=source.slice(source.indexOf("CoroutineAccountSessionAdapter::nativeEnabledFor("),
+    source.indexOf("CoroutineAccountSessionAdapter::handle("));
+  for (const route of ["/account/connections/web3/start","/account/connections/web3/complete",
+    "/account/connections/web3/handoff","/account/connections/start","/account/connections/handoff"])
+    assert.ok(body.includes('request.path()=="'+route+'"'));
+  assert.match(body,/return m_asyncFallback->nativeEnabledFor\(request\)/);
+});

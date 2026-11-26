@@ -4970,3 +4970,14 @@ or expired assertions fail closed. Timestamp overflow, control characters
 in replay keys and the exact mTLS expiry boundary are rejected by both
 native and legacy validation. The OIDC protected gateway still uses
 compatibility dispatch until the native verifier is wired end-to-end.
+
+### Native account middleware composition correction
+
+PR 100 built opp and passed 20 canonical PostgreSQL tests; its identity
+E2E failed at Farcaster connection start with 503. Account session
+middleware denied all unowned account paths before the downstream
+Web3 adapter could report its native capability. Exact Web3 and federated
+connection paths now defer to that downstream capability. Method and
+dependency guards remain authoritative there; unrelated account paths
+are not enabled. Added HTTP dispatch regression. The repaired full E2E
+still needs execution.
