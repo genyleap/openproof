@@ -1375,6 +1375,16 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     return m_profileRepository->save(profile.value());
 }
 
+boost::asio::awaitable<foundation::Status>
+AuthenticationService::updateConnectionPresentationAsync(identity::core::IdentityId owner,
+    identity::core::ExternalIdentityRef external)
+{
+    if (!m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    co_return co_await m_asyncCanonical->updatePresentationAsync(
+        std::move(owner),std::move(external),m_clock.now());
+}
+
 foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
 AuthenticationService::connections(const identity::core::IdentityId& identity) const
 {

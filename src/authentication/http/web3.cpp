@@ -900,14 +900,11 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
                      request, true);
     }
-    // Profile presentation persistence is still synchronous. Reject these
-    // fields before burning the one-time proof on the native route.
-    if (body->contains("display_name")
-        || body->contains("preferred_username")
-        || body->contains("picture_url")) {
-        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
-                        request, true);
-    }
+    // These values are unverified presentation only, just as in legacy
+    // Web3. Never place them in the provider proof or trust decision.
+    auto displayName=detail::presentationText(stringField(body.value(),"display_name",256U),256U);
+    auto preferredUsername=detail::presentationText(stringField(body.value(),"preferred_username",128U),128U);
+    auto pictureUrl=detail::presentationPictureUrl(stringField(body.value(),"picture_url",2048U));
     auto message = stringField(body.value(), "message", 8192U);
     SensitiveWeb3CopyGuard wipeMessageOnExit{message};
     auto signature = stringField(body.value(), "signature", 8192U);
@@ -969,6 +966,14 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
         std::move(transactionId), std::move(continuationSecret),
         binding.value(), std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
+    if (displayName || preferredUsername || pictureUrl) {
+        // Preserve the legacy best-effort presentation behavior, but
+        // never update a link that changed owners during verification.
+        static_cast<void>(co_await m_authentication->updateConnectionPresentationAsync(
+            verified->identity(),identity::core::ExternalIdentityRef{
+                verified->outcome().provider(),verified->outcome().subject(),
+                std::move(displayName),std::move(preferredUsername),std::move(pictureUrl)}));
+    }
     if (publisherTicket) {
         const std::string provider{verified->outcome().provider().value()};
         auto published=co_await m_authentication->publishBrowserAuthenticationHandoffAsync(

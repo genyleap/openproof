@@ -222,6 +222,12 @@ public:
                               identity::core::ExternalIdentityRef)
     { co_return foundation::fail(foundation::ErrorCode::Unavailable); }
 
+    // Unverified presentation metadata, never authentication claims.
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    updatePresentationAsync(identity::core::IdentityId,
+        identity::core::ExternalIdentityRef, foundation::Instant)
+    { co_return foundation::fail(foundation::ErrorCode::Unavailable); }
+
     /** Atomically attach or confirm a verified link; never reassign owners. */
     [[nodiscard]] virtual boost::asio::awaitable<
         foundation::Result<identity::core::ExternalIdentityRef>>
@@ -380,6 +386,10 @@ public:
         std::optional<std::string> displayName,
         std::optional<std::string> preferredUsername,
         std::optional<std::string> pictureUrl);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    updateConnectionPresentationAsync(identity::core::IdentityId owner,
+        identity::core::ExternalIdentityRef external);
 
     /** @brief Lists the authentication-capable external accounts attached to an identity. */
     [[nodiscard]] foundation::Result<std::vector<identity::core::ExternalIdentityRef>>

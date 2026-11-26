@@ -223,6 +223,15 @@ public:
         co_return fnd::ok();
     }
 
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    updatePresentationAsync(identity::IdentityId owner,identity::ExternalIdentityRef external,
+        fnd::Instant) override
+    {
+        auto allowed=co_await authorizeHandoffOwnerAsync(owner,external);
+        if (!allowed) co_return fnd::fail(allowed.error());
+        co_return m_directory->updatePresentation(external);
+    }
+
     [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
         return true;
     }
@@ -757,7 +766,7 @@ asio::awaitable<void> mobileHandoffFlow(Fixture& fixture,bool& passed)
     auto complete=[&](std::string cookieHeader) {
         return gateway::HttpRequest::create(gateway::HttpMethod::Post,"/auth/web3/complete",
             {{"content-type","application/json"},{"cookie",std::move(cookieHeader)}},
-            R"({"message":"SIWE test challenge","signature":"test-signed-proof"})",
+            R"({"message":"SIWE test challenge","signature":"test-signed-proof","display_name":"Mobile wallet","picture_url":"https://example.test/avatar.png"})",
             "127.0.0.1",fnd::CorrelationId{"native-mobile-proof"}).value();
     };
     auto ambiguous=co_await fixture.api.handleAsync(complete(cookies+"; __Host-openproof-web3-auth-handoff=duplicate"));
@@ -794,12 +803,12 @@ TEST(Web3HttpCoroutineTest, MobileHandoffPublishesWithoutSessionAndRedeemsOnce)
     EXPECT_EQ(fixture.fallback.calls,0);
 }
 
-TEST(Web3HttpCoroutineTest, NativeProfileWriteFailsBeforeReadingCredentials)
+TEST(Web3HttpCoroutineTest, NativePresentationCannotBypassProof)
 {
     Fixture fixture;
     EXPECT_EQ(execute(fixture, request(
         "/auth/web3/complete",
-        R"({"message":"test","signature":"sig","display_name":"Example"})")), 503);
+        R"({"message":"test","signature":"sig","display_name":"Example"})")), 401);
     EXPECT_EQ(fixture.nativeSessions.nativeCalls, 0);
     EXPECT_EQ(fixture.transactions.size(), 0U);
 }

@@ -881,6 +881,25 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
         ids::IdentityId{seed.suspendedOwner});
     checks.suspendedConnectionsDenied = !suspendedLinks
         && suspendedLinks.error().code() == fnd::ErrorCode::NotFound;
+    if (linked && !linked->second.empty()) {
+        const auto& link=linked->second.front();
+        const ids::ExternalIdentityRef presentation{link.providerId(),link.subject(),
+            std::string{"Wallet presentation"},std::nullopt,std::nullopt};
+        EXPECT_FALSE(co_await wrongTenant.updatePresentationAsync(ids::IdentityId{seed.owner},presentation,kNow));
+        EXPECT_FALSE(co_await canonical.updatePresentationAsync(ids::IdentityId{seed.secondOwner},presentation,kNow));
+        EXPECT_TRUE(co_await canonical.updatePresentationAsync(ids::IdentityId{seed.owner},presentation,kNow));
+        auto after=co_await canonical.readConnectionsAsync(ids::IdentityId{seed.owner});
+        EXPECT_TRUE(after);
+        if (after) {
+            const auto found=std::ranges::find_if(after->second,[&](const auto& candidate){
+                return candidate.providerId()==link.providerId() && candidate.subject()==link.subject();
+            });
+            EXPECT_NE(found,after->second.end());
+            if (found!=after->second.end()) {
+                EXPECT_EQ(found->displayName(),std::optional<std::string>{"Wallet presentation"});
+            }
+        }
+    }
     const auto updatedAt=kNow+std::chrono::milliseconds{1000};
     auto changed=co_await canonical.updateProfileAsync(ids::IdentityId{seed.owner},
         std::string{"Native self-service"},std::nullopt,std::string{"fa-IR"},
