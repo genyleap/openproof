@@ -8,7 +8,6 @@ module;
 #include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,7 +25,6 @@ module;
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
-#include <boost/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/ssl.h>
@@ -39,7 +37,6 @@ namespace openproof::provider::x {
 namespace {
 
 namespace asio = boost::asio;
-namespace json = boost::json;
 namespace idp = identity::provider;
 
 constexpr std::string_view kApiHost{"api.x.com"};
@@ -358,55 +355,6 @@ struct HttpResponse final {
             "The X HTTPS request failed.");
     }
     co_return HttpResponse{result.response.status, std::move(result.response.body)};
-}
-
-void logUpstreamFailure(std::string_view stage,
-                        const foundation::Result<HttpResponse>& response)
-{
-    if (!response) {
-        std::cerr << "openproof_x_oauth1_failure stage=" << stage
-                  << " transport=failed\n";
-        return;
-    }
-
-    std::string oauthProblem{"-"};
-    std::string jsonCode{"-"};
-    std::string jsonMessage{"-"};
-
-    auto form = parseForm(response->body);
-    if (form) {
-        if (const auto found = form->find("oauth_problem");
-            found != form->end() && safeText(found->second, 256U)) {
-            oauthProblem = found->second;
-        }
-    }
-
-    boost::system::error_code parseError;
-    auto parsed = json::parse(response->body, parseError);
-    if (!parseError && parsed.is_object()) {
-        const auto& object = parsed.as_object();
-        if (const auto* errors = object.if_contains("errors");
-            errors != nullptr && errors->is_array()
-            && !errors->as_array().empty()
-            && errors->as_array().front().is_object()) {
-            const auto& first = errors->as_array().front().as_object();
-            if (const auto* code = first.if_contains("code"); code != nullptr) {
-                if (code->is_int64()) jsonCode = std::to_string(code->as_int64());
-                else if (code->is_uint64()) jsonCode = std::to_string(code->as_uint64());
-            }
-            if (const auto* message = first.if_contains("message");
-                message != nullptr && message->is_string()) {
-                std::string value{message->as_string()};
-                if (safeText(value, 512U)) jsonMessage = std::move(value);
-            }
-        }
-    }
-
-    std::cerr << "openproof_x_oauth1_failure stage=" << stage
-              << " status=" << response->status
-              << " oauth_problem=" << oauthProblem
-              << " error_code=" << jsonCode
-              << " error_message=" << jsonMessage << '\n';
 }
 
 [[nodiscard]] std::string unixTimestamp(const foundation::ClockSource& clock)
