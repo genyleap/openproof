@@ -69,6 +69,17 @@ jobs:
       - name: End-to-end coroutine coverage gate
         run: node scripts/verify-coroutine-coverage.mjs
 
+  schema-baseline:
+    name: Disposable schema baseline round-trip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 16 tools
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+      - name: Verify disposable baseline reconstruction
+        run: python3 scripts/verify-schema-baseline.py
+
   ldap-fixture:
     name: Real LDAPS fixture preflight
     runs-on: ubuntu-24.04
