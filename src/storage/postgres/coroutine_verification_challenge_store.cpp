@@ -115,6 +115,18 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
             co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
         }
         if (!exactRow(locked, owner)) throw std::runtime_error{"Invalid challenge owner"};
+        // Challenge IDs are generation tokens and must never be reused.
+        // The PK also arbitrates cross-owner races on a not-yet-existing ID.
+        Params generationParams{id};
+        const auto existing = co_await connection.query(
+            "SELECT id FROM openproof.account_verification_challenges WHERE id=$1 "
+            "UNION ALL SELECT verification_id FROM openproof.pending_external_identity_reservations "
+            "WHERE verification_id=$1 LIMIT 1",
+            std::move(generationParams), remaining(deadline));
+        if (!existing.rows.empty()) {
+            static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::Conflict);
+        }
         if (provider) {
             if (challenge.purpose() == account::VerificationPurpose::ChangeEmail) {
                 Params profileParams{owner};
