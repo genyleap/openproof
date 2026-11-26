@@ -5046,3 +5046,20 @@ pending-enrollment cleanup and cross-path legacy concurrency remain
 open. Added compiled regressions for wrong tenant, wrong proof, locked
 owner, rollback, concurrent redemption, and stale compensation.
 No migration changes.
+
+### Native signup HTTP composition
+
+OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP=1 selects both POST /account/signup
+and POST /account/email/verify as strict native routes. Bounded KDF
+completes before persistence, webhook delivery follows committed
+provisioning, and failed delivery discards only that proof. Verification
+consumes the proof and commits activation before rechecking the exact
+committed owner/link and minting IAL1 possession authentication and a
+native session. No raw password/proof copies survive the first await in
+the parser; cookie fields are validated before interpolation. The existing
+201/200 response shapes and secure cookie contract remain. Session
+issuance is a separate transaction: a failure after activation requires
+ordinary login rather than replay of the consumed proof. The flag remains
+opt-in until executable acceptance, expired pending cleanup and cross-path
+concurrency are verified. Both isolated native E2E workloads enable it.
+No schema or production change.

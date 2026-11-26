@@ -1670,7 +1670,7 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
         "WHERE id=$1 AND identity_id=$2 AND purpose=0 AND secret_digest=decode($3,'hex')",
         {std::string{winner->dispatch.id().value()},owner,fnd::toHex(digest->bytes())}),"1");
     EXPECT_EQ(count("SELECT count(*) FROM openproof.external_identities WHERE identity_id=$1",{owner}),"0");
-    using Activated=fnd::Result<ids::ExternalIdentityRef>;
+    using Activated=fnd::Result<pg::CoroutineVerificationChallengeStore::ActivatedSignup>;
     pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),fnd::SecretString{*dsn},
         ids::OrganizationId{seed.foreignOrg},1U,500ms,1000ms,3000ms};
     const auto activate=[&](pg::CoroutineVerificationChallengeStore& adapter,acc::VerificationId id,

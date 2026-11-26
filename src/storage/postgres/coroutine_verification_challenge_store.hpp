@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 import openproof.account;
 import openproof.credentials;
@@ -63,7 +64,8 @@ public:
 
     // Consume only a signup proof; promote the pending identity and local
     // link in the same transaction. Does not issue an authentication grant.
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::core::ExternalIdentityRef>>
+    using ActivatedSignup=std::pair<identity::core::ExternalIdentityRef,identity::core::IdentityId>;
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<ActivatedSignup>>
     activateSignupAsync(identity::provider::ProviderId provider,account::VerificationId id,
         account::VerificationDigest presented,foundation::Instant now,std::uint32_t maximumAttempts);
 

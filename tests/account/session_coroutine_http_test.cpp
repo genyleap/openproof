@@ -839,4 +839,74 @@ TEST(NativeContactVerificationHttpTest, AuthorizedOwnerAndPurposeArePassedWithou
     EXPECT_EQ(fallback.invoked,0);
 }
 
+TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOnFailure)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int signups=0,verifications=0;
+    bool deliveryFailure=false,invalidGrant=false;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,{},{},{},
+        [&](std::string email,fnd::SecretString password,std::optional<std::string> name)
+            ->asio::awaitable<fnd::Result<core::IdentityId>> {
+            ++signups;
+            EXPECT_EQ(email,"new@example.test");
+            EXPECT_EQ(password.expose(),"fixture-password");
+            if (name) EXPECT_EQ(*name,"Fixture");
+            if (deliveryFailure) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            co_return core::IdentityId{"new-owner"};
+        },
+        [&](account::VerificationId id,fnd::SecretString proof,idp::ClientContext)
+            ->asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>> {
+            ++verifications;
+            EXPECT_EQ(id.value(),"fixture-proof");
+            if (proof.expose()!="valid-secret")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return sess::CoroutineIssuedSession{sess::SessionId{"verified-session"},
+                fnd::SecretString{invalidGrant?"bad;cookie":"session-bearer"}};
+        }};
+    auto run=[&](gw::HttpRequest input){
+        asio::io_context io;
+        auto result=asio::co_spawn(io,dispatch(api,std::move(input)),asio::use_future);
+        io.run();
+        return std::move(result.get()).value();
+    };
+    const auto post=[&](std::string path,std::string body){
+        return run(request(gw::HttpMethod::Post,std::move(path),"",std::move(body)));
+    };
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/signup")));
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/email/verify")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/signup")));
+    EXPECT_EQ(post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(signups,0);
+    auto created=post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","display_name":"Fixture"})");
+    ASSERT_EQ(created.status(),201);
+    EXPECT_TRUE(json::parse(created.body()).as_object().at("verification_required").as_bool());
+    EXPECT_EQ(json::parse(created.body()).as_object().at("identity_id").as_string(),"new-owner");
+    EXPECT_EQ(created.body().find("fixture-password"),std::string::npos);
+    EXPECT_EQ(created.headers().at("cache-control"),"no-store");
+    deliveryFailure=true;
+    EXPECT_EQ(post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","display_name":null})").status(),503);
+    EXPECT_EQ(signups,2);
+    const auto rejected=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"wrong-secret"})");
+    EXPECT_EQ(rejected.status(),401);
+    EXPECT_FALSE(rejected.headers().contains("set-cookie"));
+    invalidGrant=true;
+    const auto malformed=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"valid-secret"})");
+    EXPECT_EQ(malformed.status(),500);
+    EXPECT_FALSE(malformed.headers().contains("set-cookie"));
+    invalidGrant=false;
+    const auto verified=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"valid-secret"})");
+    ASSERT_EQ(verified.status(),200);
+    EXPECT_TRUE(json::parse(verified.body()).as_object().at("verified").as_bool());
+    EXPECT_EQ(json::parse(verified.body()).as_object().at("session_id").as_string(),"verified-session");
+    EXPECT_EQ(verified.body().find("session-bearer"),std::string::npos);
+    EXPECT_EQ(verified.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(verifications,3);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/signup")).status(),503);
+    EXPECT_EQ(fallback.invoked,0);
+}
+
 } // namespace

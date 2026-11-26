@@ -1387,6 +1387,19 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    const auto nativeSignupFlag=environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP");
+    if (nativeSignupFlag && *nativeSignupFlag!="0" && *nativeSignupFlag!="1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeSignupEnabled=nativeSignupFlag && *nativeSignupFlag=="1";
+    if (nativeSignupEnabled && (!platform.auth().enabled() || !platform.account().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native signup requires authentication and account API."});
+        return ExitCode::ConfigurationError;
+    }
+
     // Validate the experimental flag before opening any database connection
     // or applying migrations. An invalid opt-in must be side-effect-free.
     const auto nativeProtectedGatewayFlag =
@@ -2813,6 +2826,8 @@ addProtectedRoutes(gateway::Router& router,
     };
 
     accountDelivery::CoroutineContactVerificationIssuer* nativeContactIssuer=nullptr;
+    accountHttp::CoroutineContactVerificationAdapter::Signup nativeSignup;
+    accountHttp::CoroutineContactVerificationAdapter::VerifySignup nativeVerifySignup;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -3005,7 +3020,7 @@ addProtectedRoutes(gateway::Router& router,
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
                 },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
                     return issuer->issuePublicEmailAsync(purpose,std::move(destination));
-                });
+                },nativeSignup,nativeVerifySignup);
             nativeHandler=asyncContact.get();
         }
         if (nativeConsentEnabled) {
@@ -3111,6 +3126,10 @@ addProtectedRoutes(gateway::Router& router,
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
+            if (nativeSignupEnabled) {
+                nativeMethods.emplace_back("/account/signup",gateway::HttpMethod::Post);
+                nativeMethods.emplace_back("/account/email/verify",gateway::HttpMethod::Post);
+            }
         }
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/account/connections/web3/start");
@@ -3308,6 +3327,7 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::InternalError;
         }
         auto nativeVerificationKey=account::VerificationKey::create(verificationMaterial->clone());
+        auto signupKey=account::VerificationKey::create(verificationMaterial->clone());
         auto verificationKey = account::VerificationKey::create(
             std::move(verificationMaterial).value());
         auto accountPolicy = account::AccountPolicy::create(
@@ -3316,7 +3336,7 @@ addProtectedRoutes(gateway::Router& router,
         auto deliveryProxyConfig = gatewayHttp::ProxyConfig::create(
             32U * 1024U, 256U * 1024U,
             std::string{platform.account().deliveryCaFile()});
-        if (!verificationKey || !nativeVerificationKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
+        if (!verificationKey || !nativeVerificationKey || !signupKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
             reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
             return ExitCode::ConfigurationError;
         }
@@ -3378,8 +3398,52 @@ addProtectedRoutes(gateway::Router& router,
             std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
         accountHttp::AccountHttpApi accountApi{
             accountService, authentication, sessions, limiter.value(), fallback, delegated};
+        if (nativeSignupEnabled) {
+            if (!nativeLocalPasswords || !nativeLocalAuthentication) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native signup dependencies are unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            nativeSignup=[&](std::string email,fnd::SecretString password,std::optional<std::string> displayName)
+                ->boost::asio::awaitable<fnd::Result<identity::IdentityId>> {
+                auto normalized=account::VerificationPreparation::normalizePublicEmail(std::move(email));
+                if (!normalized) co_return fnd::fail(normalized.error());
+                auto hashed=co_await nativeLocalPasswords->hashAsync(std::move(password));
+                if (!hashed) co_return fnd::fail(hashed.error());
+                auto pending=co_await contactStore.provisionSignupAsync(providerId,std::move(normalized).value(),
+                    std::move(hashed).value(),std::move(displayName),signupKey.value(),clock.now(),
+                    accountPolicy->emailVerificationLifetime());
+                if (!pending) co_return fnd::fail(pending.error());
+                const auto owner=pending->dispatch.identity();
+                const auto generation=pending->dispatch.id();
+                auto delivered=co_await nativeDelivery.value()->deliverAsync(pending->dispatch);
+                // Only this failed proof is removed. Pending enrollment can
+                // be recovered by resend; a concurrent replacement survives.
+                if (!delivered) {
+                    auto discarded=co_await contactStore.discardAsync(generation,owner,account::VerificationPurpose::SignupEmail);
+                    if (!discarded) co_return fnd::fail(discarded.error());
+                    co_return fnd::fail(delivered.error());
+                }
+                co_return owner;
+            };
+            nativeVerifySignup=[&](account::VerificationId id,fnd::SecretString secret,idp::ClientContext client)
+                ->boost::asio::awaitable<fnd::Result<session::CoroutineIssuedSession>> {
+                auto digest=account::VerificationPreparation::digest(signupKey.value(),id,secret);
+                secret=fnd::SecretString{};
+                if (!digest) co_return fnd::fail(digest.error());
+                auto activated=co_await contactStore.activateSignupAsync(providerId,std::move(id),digest.value(),
+                    clock.now(),accountPolicy->maximumAttempts());
+                if (!activated) co_return fnd::fail(activated.error());
+                auto verified=co_await nativeLocalAuthentication->acceptVerifiedEmailAsync(
+                    std::move(activated->first),std::move(activated->second));
+                if (!verified) co_return fnd::fail(verified.error());
+                co_return co_await nativeSessions->issueAsync(verified.value(),std::move(client));
+            };
+        }
         nativeContactIssuer=&contactIssuer;
         const auto result=runWithPasskey(accountApi,delegated);
+        nativeSignup={};
+        nativeVerifySignup={};
         nativeContactIssuer=nullptr;
         return result;
     };

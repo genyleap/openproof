@@ -19,6 +19,7 @@ import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.profile;
+import openproof.identity.provider;
 import openproof.session;
 
 namespace openproof::account::http {
@@ -121,9 +122,13 @@ public:
         identity::core::IdentityId, VerificationPurpose, std::string)>;
 
     using PublicIssue=std::function<boost::asio::awaitable<foundation::Status>(VerificationPurpose,std::string)>;
+    using Signup=std::function<boost::asio::awaitable<foundation::Result<identity::core::IdentityId>>(
+        std::string,foundation::SecretString,std::optional<std::string>)>;
+    using VerifySignup=std::function<boost::asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>(
+        VerificationId,foundation::SecretString,identity::provider::ClientContext)>;
     CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue,
-        PublicIssue publicIssue = {});
+        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
@@ -136,6 +141,9 @@ private:
     Authenticate m_authenticate;
     Issue m_issue;
     PublicIssue m_publicIssue;
+    Signup m_signup;
+    VerifySignup m_verifySignup;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> signupOrVerify(gateway::HttpRequest request);
 };
 
 } // namespace openproof::account::http

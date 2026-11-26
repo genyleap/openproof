@@ -348,6 +348,12 @@ public:
     [[nodiscard]] foundation::Result<VerifiedAuthentication>
     acceptVerifiedEmail(const identity::core::ExternalIdentityRef& external);
 
+    // Called only by the trusted signup activation boundary, after its
+    // atomic proof consumption. Never resolve a different current owner.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+    acceptVerifiedEmailAsync(identity::core::ExternalIdentityRef external,
+        identity::core::IdentityId expectedOwner);
+
     /**
      * @brief Completes a server-bound connection ceremony without creating a session.
      *

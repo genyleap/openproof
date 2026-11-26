@@ -1217,6 +1217,27 @@ AuthenticationService::acceptVerifiedEmail(
         std::move(outcome).value(), std::move(owner).value().value()};
 }
 
+boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+AuthenticationService::acceptVerifiedEmailAsync(identity::core::ExternalIdentityRef external,
+    identity::core::IdentityId expectedOwner)
+{
+    if (!m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto active=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(expectedOwner,external);
+    if (!active) co_return foundation::fail(active.error());
+    provider::VerifiedClaims claims;
+    claims.set(provider::ClaimName::Email,std::string{external.subject().value()});
+    claims.set(provider::ClaimName::EmailVerified,"true");
+    provider::ProviderEvidence evidence;
+    evidence.add("method","email_verification_link");
+    auto outcome=provider::AuthenticationOutcome::create(external.providerId(),external.subject(),
+        std::move(claims),provider::AssuranceLevel::Ial1,
+        provider::AuthenticationStrength{provider::AuthenticationFactor::Possession,false},
+        std::move(evidence),m_clock.now());
+    if (!outcome) co_return foundation::fail(outcome.error());
+    co_return VerifiedAuthentication{std::move(outcome).value(),std::move(expectedOwner)};
+}
+
 foundation::Result<identity::core::ExternalIdentityRef>
 AuthenticationService::completeConnection(
     const provider::TransactionId& transactionId,
