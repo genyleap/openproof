@@ -48,6 +48,7 @@
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/operations/http/coroutine_health_http.hpp"
+#include "../../src/authentication/http/coroutine_passkey_http.hpp"
 #include "../../src/application/http/coroutine_management_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
@@ -3499,6 +3500,21 @@ addProtectedRoutes(gateway::Router& router,
                 "/admin/resources/activate","/admin/resources/revoke","/admin/service-identities",
                 "/admin/service-identities/activate","/admin/service-identities/deactivate"})
                 nativePaths.emplace_back(route);
+        }
+        std::unique_ptr<authHttp::CoroutinePasskeyAccountAdapter> nativePasskeyAccount;
+        if (passkeyConfig) {
+            nativePasskeyAccount=std::make_unique<authHttp::CoroutinePasskeyAccountAdapter>(
+                *nativeHandler,limiter.value(),clock,*passkeyConfig,
+                [service=nativeSessions.get()](fnd::SecretString credential) {
+                    return service->authenticate(std::move(credential));
+                },
+                [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                    fnd::Instant now,std::optional<passkey::RegistrationCeremony> ceremony) {
+                    return reader->readPasskeyAccountAsync(std::move(actor),std::move(sessionId),now,std::move(ceremony));
+                });
+            nativeHandler=nativePasskeyAccount.get();
+            nativeMethods.emplace_back("/account/passkeys",gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/passkeys/options");
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};

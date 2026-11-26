@@ -3602,4 +3602,100 @@ CoroutinePostgresCanonicalFinalizer::mutateServiceIdentityAsync(
     }
 }
 
+asio::awaitable<foundation::Result<std::vector<provider::passkey::CredentialSummary>>>
+CoroutinePostgresCanonicalFinalizer::readPasskeyAccountAsync(core::IdentityId actor,
+    session::SessionId sessionId,foundation::Instant now,
+    std::optional<provider::passkey::RegistrationCeremony> ceremony)
+{
+    using E=foundation::ErrorCode;
+    using Summary=provider::passkey::CredentialSummary;
+    if (actor.empty() || actor.value().size()>200U || sessionId.empty() || sessionId.value().size()>200U
+        || now.time_since_epoch().count()<0 || (ceremony &&
+        (ceremony->identity!=actor || ceremony->id.empty() || ceremony->id.value().size()>256U
+            || ceremony->expiresAt<=now || ceremony->expiresAt-now>std::chrono::minutes{10})))
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args) {
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string identityId{actor.value()},tenant{m_impl->organization.value()};
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        if (ceremony) {
+            Params args{identityId};
+            static_cast<void>(co_await execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",std::move(args)));
+        }
+        Params sessionArgs{identityId,tenant,std::string{sessionId.value()},timestamp};
+        const auto permitted=co_await execute(
+            "SELECT s.id FROM openproof.sessions s JOIN openproof.identities i ON i.id=s.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND i.kind=0 AND o.state=0 "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "FOR SHARE OF i,o,s",std::move(sessionArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        Params credentialArgs{identityId};
+        const auto rows=co_await execute(
+            "SELECT credential_id,sign_count,created_at_ms,last_used_at_ms "
+            "FROM openproof.passkey_credentials WHERE identity_id=$1 "
+            "ORDER BY created_at_ms,credential_id LIMIT 257",std::move(credentialArgs));
+        if (rows.rows.size()>256U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::Unavailable);
+        }
+        std::vector<Summary> result;
+        result.reserve(rows.rows.size());
+        for (const auto& row:rows.rows) {
+            if (row.size()!=4U) throw std::runtime_error{"Malformed passkey metadata"};
+            auto credentialId=required(row[0]);
+            const auto count=milliseconds(row[1]);
+            if (credentialId.empty() || credentialId.size()>4096U || count>4294967295LL)
+                throw std::runtime_error{"Invalid passkey metadata"};
+            result.push_back(Summary{std::move(credentialId),static_cast<std::uint32_t>(count),
+                foundation::Instant{foundation::Duration{milliseconds(row[2])}},
+                foundation::Instant{foundation::Duration{milliseconds(row[3])}}});
+        }
+        if (ceremony) {
+            // Reclaim a bounded batch of expired records for this identity.
+            // Do not invalidate other concurrently active ceremonies.
+            Params purgeArgs{identityId,timestamp};
+            static_cast<void>(co_await execute(
+                "WITH expired AS (SELECT id FROM openproof.passkey_registration_ceremonies "
+                "WHERE identity_id=$1 AND expires_at_ms<=$2 ORDER BY expires_at_ms LIMIT 128 FOR UPDATE SKIP LOCKED) "
+                "DELETE FROM openproof.passkey_registration_ceremonies c USING expired e WHERE c.id=e.id",
+                std::move(purgeArgs)));
+            Params countArgs{identityId,timestamp};
+            const auto active=co_await execute(
+                "SELECT id FROM openproof.passkey_registration_ceremonies "
+                "WHERE identity_id=$1 AND expires_at_ms>$2 AND consumed_at_ms IS NULL LIMIT 33",
+                std::move(countArgs));
+            if (active.rows.size()>=32U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::RateLimited);
+            }
+            Params args{std::string{ceremony->id.value()},identityId,
+                std::to_string(ceremony->expiresAt.time_since_epoch().count())};
+            const auto inserted=co_await execute(
+                "INSERT INTO openproof.passkey_registration_ceremonies(id,identity_id,expires_at_ms) "
+                "VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING id",std::move(args));
+            if (inserted.rows.size()!=1U || inserted.rows.front().size()!=1U
+                || required(inserted.rows.front()[0])!=ceremony->id.value()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::Conflict);
+            }
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return result;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native passkey account operation is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

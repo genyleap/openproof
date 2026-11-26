@@ -742,6 +742,85 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     ASSERT_NO_THROW(done.get());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChallengeAreSessionBound)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace pk=openproof::provider::passkey;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto sessionName="passkey-session-"+seed.suffix;
+    const auto credentialId="passkey-credential-"+seed.suffix;
+    const auto otherCredential="passkey-other-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(sessionName).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.passkey_credentials(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+        "VALUES($1,$2,'fixture-x','fixture-y',7,1770000000000,1770000000000),"
+        "($3,$4,'fixture-x','fixture-y',0,1770000000000,1770000000000)",
+        {credentialId,seed.owner,otherCredential,seed.secondOwner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](std::optional<pk::RegistrationCeremony> ceremony=std::nullopt,
+        std::string identity={},fnd::Instant now=kNow+1s) {
+        io.restart();
+        auto task=native.readPasskeyAccountAsync(ids::IdentityId{identity.empty()?seed.owner:identity},
+            openproof::session::SessionId{sessionName},now,std::move(ceremony));
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    const auto listed=read();
+    ASSERT_TRUE(listed);
+    ASSERT_EQ(listed->size(),1U);
+    EXPECT_EQ(listed->front().credentialId,credentialId);
+    EXPECT_EQ(listed->front().signCount,7U);
+    EXPECT_FALSE(read(std::nullopt,seed.secondOwner));
+    EXPECT_FALSE(read(std::nullopt,seed.owner,kNow+601s));
+    auto ceremony=[&](std::string suffix,fnd::Instant expiry) {
+        return pk::RegistrationCeremony{openproof::identity::provider::ChallengeId{"pkr_"+seed.suffix+suffix},
+            ids::IdentityId{seed.owner},expiry};
+    };
+    const auto first=ceremony("-first",kNow+300s);
+    const auto expired=ceremony("-expired",kNow);
+    EXPECT_FALSE(read(expired));
+    auto mismatch=first;
+    mismatch.identity=ids::IdentityId{seed.secondOwner};
+    EXPECT_FALSE(read(mismatch));
+    ASSERT_TRUE(read(first));
+    EXPECT_FALSE(read(first));
+    const auto stored=execute(fixture.get(),
+        "SELECT identity_id,expires_at_ms::text,consumed_at_ms IS NULL FROM openproof.passkey_registration_ceremonies WHERE id=$1",
+        {std::string{first.id.value()}});
+    ASSERT_EQ(PQntuples(stored.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(stored.get(),0,0)},seed.owner);
+    EXPECT_STREQ(PQgetvalue(stored.get(),0,1),"1770000300000");
+    EXPECT_STREQ(PQgetvalue(stored.get(),0,2),"t");
+    // The existing ceremony counts toward the bound; no unbounded creation.
+    for (int n=1;n<32;++n) {
+        const auto next=ceremony("-"+std::to_string(n),kNow+300s);
+        ASSERT_TRUE(read(next));
+    }
+    auto capped=read(ceremony("-capped",kNow+300s));
+    ASSERT_FALSE(capped);
+    EXPECT_EQ(capped.error().code(),fnd::ErrorCode::RateLimited);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
+    EXPECT_FALSE(read());
+    EXPECT_FALSE(read(ceremony("-revoked",kNow+300s)));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSessionAndNeverProjectSecrets)
 {
     const auto dsn=disposableDsn();

@@ -1152,9 +1152,20 @@ application registry, resource registry, service identity service or JAR
 management service. The legacy client manager is still needed by the
 compatibility token service; it is not used for native management.
 
+Passkey credential listing and registration-options creation use native
+first-party session authentication and the configured tenant. The
+transaction verifies the exact active human identity/session, returns
+only bounded credential metadata, and creates a short-lived registration
+ceremony under the shared per-identity advisory lock. Expired ceremonies
+are pruned in bounded batches and at most 32 unconsumed, unexpired
+ceremonies are allowed per identity. WebAuthn challenge derivation,
+RP configuration and required user verification are shared with the
+existing provider implementation. Registration completion, removal and
+assertion authentication still use the compatibility path.
+
 The remaining PostgreSQL compatibility surfaces include passkey
-operations, evidence/trust and enabled SCIM operations, as well as
-startup and offline administration.
+registration completion, removal and assertion operations, evidence/trust
+and enabled SCIM operations, as well as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

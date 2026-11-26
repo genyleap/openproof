@@ -691,26 +691,35 @@ foundation::Result<RegistrationStart> PasskeyService::beginRegistration(
 {
     auto random = security::randomTokenBase64Url(24U); if (!random) return foundation::fail(random.error());
     idp::ChallengeId id{"pkr_" + std::move(random).value()};
-    auto challenge = challengeFor(*m_config, "register", id); if (!challenge) return foundation::fail(challenge.error());
     auto stored = m_repository->addCeremony(RegistrationCeremony{id, identity, m_clock->now() + m_config->ceremonyLifetime()});
     if (!stored) return foundation::fail(stored.error());
+    auto existing = m_repository->listCredentials(identity);
+    if (!existing) return foundation::fail(existing.error());
+    std::vector<std::string> excluded;
+    for (const auto& credential:existing.value()) excluded.push_back(credential.credentialId);
+    return registrationOptions(*m_config,identity,id,excluded);
+}
+
+foundation::Result<RegistrationStart> registrationOptions(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const idp::ChallengeId& id,const std::vector<std::string>& excludedCredentialIds)
+{
+    auto challenge = challengeFor(config, "register", id); if (!challenge) return foundation::fail(challenge.error());
     auto userDigest = security::sha256(identity.value()); if (!userDigest) return foundation::fail(userDigest.error());
     json::object options;
     options["challenge"] = challenge.value();
-    options["rp"] = json::object{{"id", m_config->relyingPartyId()}, {"name", m_config->relyingPartyName()}};
+    options["rp"] = json::object{{"id", config.relyingPartyId()}, {"name", config.relyingPartyName()}};
     options["user"] = json::object{{"id", foundation::toBase64Url(userDigest.value())},
                                     {"name", identity.value()}, {"displayName", identity.value()}};
     options["pubKeyCredParams"] = json::array{json::object{{"type", "public-key"}, {"alg", -7}}};
-    options["timeout"] = std::chrono::duration_cast<std::chrono::milliseconds>(m_config->ceremonyLifetime()).count();
+    options["timeout"] = std::chrono::duration_cast<std::chrono::milliseconds>(config.ceremonyLifetime()).count();
     options["attestation"] = "none";
     options["authenticatorSelection"] = json::object{{"residentKey", "required"},
         {"requireResidentKey", true}, {"userVerification", "required"}};
-    auto existing = m_repository->listCredentials(identity);
-    if (existing) {
-        json::array excluded;
-        for (const auto& credential : existing.value()) excluded.emplace_back(json::object{{"type", "public-key"}, {"id", credential.credentialId}});
-        options["excludeCredentials"] = std::move(excluded);
-    }
+    json::array excluded;
+    for (const auto& credentialId:excludedCredentialIds)
+        excluded.emplace_back(json::object{{"type", "public-key"}, {"id", credentialId}});
+    options["excludeCredentials"] = std::move(excluded);
     return RegistrationStart{id, json::serialize(options)};
 }
 

@@ -82,6 +82,7 @@ jobs:
           node scripts/test-coroutine-native-oauth-token-read.mjs
           node scripts/test-coroutine-native-health-runtime.mjs
           node scripts/test-coroutine-native-application-read.mjs
+          node scripts/test-coroutine-native-passkey-account.mjs
       - name: Mandatory native public discovery and provider catalog contract
         run: |
           node scripts/test-coroutine-native-oidc-discovery-runtime.mjs

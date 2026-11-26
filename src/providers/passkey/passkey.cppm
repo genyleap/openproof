@@ -157,6 +157,19 @@ struct RegistrationStart final {
     std::string publicKeyOptionsJson;
 };
 
+// Public metadata only; the administrative account listing never reads key coordinates.
+struct CredentialSummary final {
+    std::string credentialId;
+    std::uint32_t signCount{};
+    foundation::Instant createdAt{};
+    foundation::Instant lastUsedAt{};
+};
+
+[[nodiscard]] foundation::Result<RegistrationStart> registrationOptions(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const identity::provider::ChallengeId& ceremony,
+    const std::vector<std::string>& excludedCredentialIds);
+
 /** @brief Authenticated self-service WebAuthn registration/removal service. */
 class PasskeyService final {
 public:

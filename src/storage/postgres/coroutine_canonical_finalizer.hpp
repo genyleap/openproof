@@ -24,6 +24,7 @@ import openproof.policy;
 import openproof.session;
 import openproof.oauth;
 import openproof.resource;
+import openproof.provider.passkey;
 
 namespace openproof::storage::postgres {
 
@@ -81,6 +82,10 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<resource::ServiceIdentity>>
     mutateServiceIdentityAsync(resource::ServiceMutationCommand command,
         identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::vector<provider::passkey::CredentialSummary>>>
+    readPasskeyAccountAsync(identity::core::IdentityId actor,session::SessionId sessionId,foundation::Instant now,
+        std::optional<provider::passkey::RegistrationCeremony> ceremony=std::nullopt);
 
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
