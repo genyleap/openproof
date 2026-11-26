@@ -16,7 +16,7 @@ test("TOTP status is separately gated, read-only and preserves compatibility", (
 });
 test("status SQL is one tenant-scoped coroutine read and does not select secrets", () => {
   const start = sql.indexOf("CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(");
-  const end = sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(", start);
+  const end = sql.indexOf("CoroutinePostgresCanonicalFinalizer::readMembersAsync(", start);
   assert.ok(start >= 0 && end > start);
   const body = sql.slice(start, end);
   for (const term of ["co_await m_impl->pool.acquire(deadline)", "co_await lease.connection().query(", "i.organization_id=$2", "i.status=0 AND o.state=0", "e.provider=$3", "e.identity_id=i.id", "remaining(deadline)"])
