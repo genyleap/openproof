@@ -441,6 +441,9 @@ public:
     [[nodiscard]] foundation::Duration upstreamTimeout() const noexcept;
 
 private:
+    friend class GatewayNativePreparationSource;
+    [[nodiscard]] std::variant<HttpResponse, GatewayForwardPlan>
+    completeForward(HttpRequest request, const Route& route);
     [[nodiscard]] HttpResponse errorResponse(const foundation::Error& error,
                                              const HttpRequest& request) const;
     const Router* m_router;
@@ -455,6 +458,33 @@ private:
     ProxyTransport* m_proxy;
     TrustedContextSigner* m_contextSigner;
     foundation::Duration m_upstreamTimeout;
+};
+
+/** Trusted adapter seam for the native first-party protected-route stage.
+ * The native path is deliberately unavailable with delegated OAuth configured.
+ * Only the dedicated /proxy namespace is eligible; other HTTP middleware
+ * remains authoritative for its own paths. This seam does not accept an
+ * identity or policy decision from a request header.
+ */
+class GatewayNativePreparationSource {
+protected:
+    struct Pending final {
+        HttpRequest request;
+        Route route;
+        foundation::SecretString credential;
+    };
+    [[nodiscard]] static bool eligible(const Gateway& gateway,
+                                       const HttpRequest& request) noexcept;
+    [[nodiscard]] static std::variant<HttpResponse, Pending>
+    begin(Gateway& gateway, HttpRequest request);
+    [[nodiscard]] static bool admitIdentity(Gateway& gateway,
+        const session::AuthenticatedSession& authenticated);
+    [[nodiscard]] static HttpResponse reject(const Gateway& gateway,
+        const foundation::Error& error, HttpRequest request);
+    [[nodiscard]] static std::variant<HttpResponse, GatewayForwardPlan>
+    finish(Gateway& gateway, Pending pending,
+           const session::AuthenticatedSession& authenticated,
+           const policy::AuthorizationDecision& decision);
 };
 
 }

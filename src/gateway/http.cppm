@@ -15,6 +15,8 @@ export module openproof.gateway.http;
 
 import openproof.foundation;
 import openproof.gateway;
+import openproof.policy;
+import openproof.session;
 
 export namespace openproof::gateway::http {
 
@@ -234,6 +236,30 @@ public:
 private:
     Gateway* m_gateway;
     BeastProxyTransport* m_transport;
+};
+
+/** Narrow opt-in native protected proxy. Unsupported routes and OAuth
+ * credentials remain with the original compatibility composition.
+ */
+class CoroutineProtectedGatewayAdapter final : public CoroutineHttpHandler,
+    private GatewayNativePreparationSource {
+public:
+    using Verify = std::function<boost::asio::awaitable<
+        foundation::Result<session::AuthenticatedSession>>(foundation::SecretString)>;
+    using Authorize = std::function<boost::asio::awaitable<policy::AuthorizationDecision>(
+        session::AuthenticatedSession, Route, foundation::CorrelationId)>;
+
+    CoroutineProtectedGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport,
+        CoroutineHttpHandler& fallback, Verify verify, Authorize authorize);
+    [[nodiscard]] bool nativeEnabledFor(const HttpRequest& request) const noexcept override;
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<HttpResponse> handleAsync(HttpRequest request) override;
+private:
+    Gateway* m_gateway;
+    BeastProxyTransport* m_transport;
+    CoroutineHttpHandler* m_fallback;
+    Verify m_verify;
+    Authorize m_authorize;
 };
 
 }
