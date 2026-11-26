@@ -645,8 +645,7 @@ bool Web3AuthenticationHttpApi::nativeEnabledFor(
         || path=="/account/connections/web3/complete") {
         return request.method()==gateway::HttpMethod::Post
             && m_authentication->nativeConnectionCompletionEnabled()
-            && static_cast<bool>(m_authenticate)
-            && (path=="/account/connections/web3/complete" || !request.header("authorization").has_value());
+            && static_cast<bool>(m_authenticate);
     }
     if (path.starts_with("/auth/web3/")
         || path.starts_with("/account/connections/web3/")) return false;

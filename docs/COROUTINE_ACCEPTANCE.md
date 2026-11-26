@@ -4848,3 +4848,16 @@ refresh uses that same owner and stays best effort. Cookie-only initiation
 and completion use native storage; delegated Bearer start/issuance retain
 compatibility authorization. Compiled HTTP and live provider acceptance
 remain required. No schema change.
+
+### Native delegated Web3 account authorization
+
+The native Web3 connection start and handoff issuance now accept both
+first-party and delegated credentials through a native authorization port.
+The delegated token is HMAC-digested using the same derived OAuth token key
+as TokenService. A single bounded SQL snapshot checks active access token,
+family, client, application, identity and tenant, the account scope and
+absence of sender constraints. The synthetic authorization context is not
+persisted as a session. Existing status/response shapes are preserved for
+authorized clients; inactive identities and revoked families fail closed.
+Strict route overlays prevent blocking fallback. Web3 remains opt-in until
+compiled PostgreSQL/HTTP and external-provider tests confirm parity.
