@@ -257,7 +257,6 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     return {
       subject, unlinkedSubject, linkedPassword, unlinkedPassword, close,
       environment: {
-        OPENPROOF_EXPERIMENTAL_NATIVE_LDAP: "1",
         OPENPROOF_LDAP_URI: uri,
         OPENPROOF_LDAP_BASE_DN: peopleDn,
         OPENPROOF_LDAP_USERNAME_ATTRIBUTE: "uid",

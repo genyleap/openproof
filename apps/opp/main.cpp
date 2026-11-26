@@ -1411,8 +1411,14 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_LDAP must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeLdapEnabled =
-        nativeLdapFlag && *nativeLdapFlag == "1";
+    // The synchronous LDAP verifier is retired and denies all requests.
+    // A configured directory therefore selects the native implementation
+    // by default. Preserve an explicit operational disable switch; it must
+    // never route credentials to a blocking or provisioning fallback.
+    const auto ldapUri = environment.get("OPENPROOF_LDAP_URI");
+    const bool nativeLdapEnabled = nativeLdapFlag
+        ? *nativeLdapFlag == "1"
+        : ldapUri && !ldapUri->empty();
     // Account session management must not depend on whether enterprise LDAP
     // is configured. Keep its native SQL path independently opt-in until
     // compiled listener and disposable-PostgreSQL acceptance is complete.
@@ -1667,7 +1673,6 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
     if (nativeLdapEnabled) {
-        const auto ldapUri = environment.get("OPENPROOF_LDAP_URI");
         if (!platform.auth().enabled() || !ldapUri || ldapUri->empty()) {
             reportStartupFailure(fnd::Error{
                 fnd::ErrorCode::FailedPrecondition,
@@ -2361,7 +2366,7 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
-    if (const auto ldapUri = environment.get("OPENPROOF_LDAP_URI"); ldapUri && !ldapUri->empty()) {
+    if (ldapUri && !ldapUri->empty()) {
         const auto baseDn = environment.get("OPENPROOF_LDAP_BASE_DN");
         if (!baseDn || baseDn->empty()) {
             reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -2693,8 +2698,8 @@ addProtectedRoutes(gateway::Router& router,
 #endif
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
-        // A Web3-only opt-in must never activate LDAP inadvertently just
-        // because both login types share the native canonical SQL stack.
+        // A Web3-only opt-in must never activate an unconfigured LDAP
+        // directory just because both share native canonical SQL storage.
         if (nativeLdapEnabled) {
             nativePaths.emplace_back("/auth/ldap/start");
             nativePaths.emplace_back("/auth/ldap/complete");

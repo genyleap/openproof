@@ -810,6 +810,8 @@ async function main() {
     if (nativeLdapFixtureEnabled) {
       ldapFixture = await startNativeLdapFixture(tempRoot, reservePort);
       Object.assign(childEnvironment, ldapFixture.environment);
+      // Exercise the configured native default, never an inherited opt-in.
+      delete childEnvironment.OPENPROOF_EXPERIMENTAL_NATIVE_LDAP;
     }
     if (holdOpen) {
       demoPortal = await startLocalDemoPortal({

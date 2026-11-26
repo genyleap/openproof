@@ -835,6 +835,14 @@ see [WALLETCONNECT.md](WALLETCONNECT.md).
 
 ### LDAP and SAML federation
 
+On the coroutine development branch, a nonempty OPENPROOF_LDAP_URI
+selects native asynchronous LDAP authentication by default; no experimental
+opt-in is needed. OPENPROOF_EXPERIMENTAL_NATIVE_LDAP=0 disables native LDAP
+and preserves the fail-closed legacy endpoint; =1 requires configured LDAP
+and enabled authentication. Invalid values fail startup before schema changes.
+Without a configured directory, LDAP is not activated by other native flags.
+This is development integration, not approval to deploy the branch.
+
 LDAP is enabled by `OPENPROOF_LDAP_URI` and requires
 `OPENPROOF_LDAP_BASE_DN`. The URI must be one structurally valid `ldaps://host[:port]`
 endpoint (URI lists, plaintext fallbacks, paths and malformed authorities are rejected),

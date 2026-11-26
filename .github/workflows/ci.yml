@@ -64,6 +64,7 @@ jobs:
       - name: Native LDAP disposable fixture and transport contract
         run: |
           node scripts/test-native-enterprise-ldaps.mjs
+          node scripts/test-coroutine-enterprise-ldap.mjs
           node scripts/test-native-ldap-real-e2e-contract.mjs
       - name: Whitespace
         run: git diff --check

@@ -24,6 +24,9 @@ test("HTTP LDAP E2E checks negative proofs against persistent row counts", () =>
   assert.match(e2e, /url\.hostname !== "127\.0\.0\.1"/);
   assert.match(e2e, /url\.pathname !== "\/openproof_native_ldap_e2e_ci"/);
   assert.match(e2e, /await startNativeLdapFixture\(tempRoot, reservePort\)/);
+  assert.match(e2e, /delete childEnvironment\.OPENPROOF_EXPERIMENTAL_NATIVE_LDAP;/);
+  assert.doesNotMatch(read("scripts/ci/native-ldap-fixture.mjs"),
+    /OPENPROOF_EXPERIMENTAL_NATIVE_LDAP:\s*"1"/);
   assert.match(e2e, /"intentionally-invalid-fixture-password", wrongJar\), 401/);
   assert.match(e2e, /completeLdap\(unlinked, ldapFixture\.unlinkedPassword, unlinkedJar\), 401/);
   assert.match(e2e, /assert\.equal\(counts\(\), initialCounts/);

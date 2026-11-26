@@ -181,10 +181,8 @@ const checked = segments.map(([name, relative]) => {
     // LDAP is a ChallengeResponse provider: /auth/ldap/start and
     // /auth/ldap/complete live in enterprise.cpp, not in the federated
     // redirect callback. Never count unrelated OAuth work as LDAP coverage.
-    // The dev HTTP and composition now contain an opt-in native stack.
-    // Do not confuse source-level dependency wiring with build/E2E acceptance
-    // or automatic production enablement. A default-disabled experimental
-    // feature is still a migration blocker until explicitly certified.
+    // The configured directory must use the native stack. Source-level
+    // wiring is not a replacement for build/E2E or production acceptance.
     const enterpriseHttp = cppExecutableText(fs.readFileSync(
       path.join(root,"src/authentication/http/enterprise.cpp"),"utf8"));
     const ldapNative = enterpriseHttp.slice(
@@ -207,18 +205,24 @@ const checked = segments.map(([name, relative]) => {
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
       && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
-      // Exact paths must be added ONLY when LDAP is explicitly enabled.
-      // An independent Web3 opt-in may share native transaction/canonical
-      // storage but must not automatically expose LDAP authentication.
+      // Exact paths must be added ONLY for enabled LDAP configuration.
+      // An independent Web3 opt-in must not expose an unconfigured directory.
       && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)
       && /nativeHandler\s*=\s*&nativeEnterprise/.test(app)
       && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*healthApi\s*,\s*\*nativeHandler\s*,\s*std::move\(nativePaths\)/.test(app);
     if (!nativeWiring)
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
         expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
-    else if (/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/.test(appSource))
-      issues.push({line:0,kind:"LDAP native runtime remains experimental and disabled by default",
-        expression:"complete GCC16 build, real LDAP/PostgreSQL HTTP E2E and security acceptance before production enablement"});
+    // Configured LDAP must select the native-only path by default.
+    // Require the positive configuration predicate, explicit override,
+    // validation and fail-closed dependency check, not just absence of the
+    // previous experimental expression. Full live E2E remains mandatory.
+    else if (!/const\s+auto\s+ldapUri\s*=\s*environment\.get\("OPENPROOF_LDAP_URI"\)/.test(appSource)
+      || !/const\s+bool\s+nativeLdapEnabled\s*=\s*nativeLdapFlag\s*\?\s*\*nativeLdapFlag\s*==\s*"1"\s*:\s*ldapUri\s*&&\s*!ldapUri->empty\(\)\s*;/.test(appSource)
+      || !/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*!=\s*"0"\s*&&\s*\*nativeLdapFlag\s*!=\s*"1"/.test(appSource)
+      || !/if\s*\(nativeLdapEnabled\)\s*\{\s*if\s*\(!platform\.auth\(\)\.enabled\(\)\s*\|\|\s*!ldapUri\s*\|\|\s*ldapUri->empty\(\)\)/.test(appSource))
+      issues.push({line:0,kind:"LDAP configured native default or fail-closed override is missing",
+        expression:"configured LDAP -> native by default; explicit 0 disables; invalid configuration fails closed"});
 
     const iface = fs.readFileSync(
       path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");
