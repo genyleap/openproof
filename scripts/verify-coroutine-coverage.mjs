@@ -126,16 +126,50 @@ const checked = segments.map(([name, relative]) => {
     "src/providers/x/x.cpp",
     "src/providers/web3/web3.cpp"
   ].includes(relative)){
-    const target = relative.endsWith("/web3.cpp") ? "rpcAsync" : "httpsRequestAsync";
-    const legacyBridge = /asio::co_spawn\s*\(\s*io\s*,\s*(?:httpsRequestAsync|rpcAsync)\s*\(/;
-    if(relative==="src/providers/web3/web3.cpp" && !legacyBridge.test(source))
-      issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
-        expression:"co_spawn(io, "+target+"(...))"});
+    // All network provider bridges must be retired, not moved to a helper.
     // Even with native transport, this legacy facade waits synchronously
     // for the future; do not mark its caller nonblocking until retired.
     if(/\bio\.run\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
+  }
+  if (relative==="src/providers/web3/web3.cpp") {
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const native=fs.readFileSync(path.join(root,"src/authentication/http/web3.cpp"),"utf8");
+    const syncWallet=executable.slice(executable.indexOf("WalletAuthenticationProvider::completeAuthentication("),
+      executable.indexOf("WalletAuthenticationProvider::beginAuthenticationAsync("));
+    const syncFarcaster=executable.slice(executable.indexOf("FarcasterAuthenticationProvider::beginAuthentication("),
+      executable.indexOf("FarcasterAuthenticationProvider::beginAuthenticationAsync("));
+    if (!/return foundation::fail\(foundation::ErrorCode::Unavailable,/.test(syncWallet)
+        || (syncFarcaster.match(/return foundation::fail\(foundation::ErrorCode::Unavailable,/g)||[]).length!==2
+        || /\b(?:rpc|rpcString|rpcChainMatches|contractWalletValid|universalSignatureValid|farcasterIdOf|farcasterAuthAddressValid|io_context|use_future)\s*\(/.test(executable)
+        || !/co_await client.exchange\(/.test(executable)
+        || (executable.match(/co_await rpcStringAsync\(/g)||[]).length!==6
+        || !executable.includes("co_await universalSignatureValidAsync(")
+        || !executable.includes("co_await contractWalletValidAsync(")
+        || !executable.includes("co_await native->authorizeSignerAsync(")
+        || !executable.includes("co_await native->verifySignatureAsync("))
+      issues.push({line:0,kind:"Web3 synchronous network path remains or native verification is incomplete",
+        expression:"native EOA/ERC1271/ERC6492 and Farcaster signer probes"});
+    const startup=app.slice(app.indexOf("const auto nativeWeb3Flag"),app.indexOf("const auto nativeAuthSessionFlag"));
+    if (!startup.includes('platform.auth().enabled() && nativeWeb3Flag && *nativeWeb3Flag == "0"')
+        || !startup.includes("const bool nativeWeb3Enabled = platform.auth().enabled()")
+        || !startup.includes("return ExitCode::ConfigurationError;")
+        || !app.includes("nativeCanonical->authorizeDelegatedAccountAsync("))
+      issues.push({line:0,kind:"native Web3 runtime may be disabled or lacks delegated access",
+        expression:"mandatory native Web3 startup"});
+    for (const route of ["/auth/web3/start","/auth/web3/complete","/auth/web3/handoff",
+        "/auth/web3/handoff/redeem","/account/connections/web3/start",
+        "/account/connections/web3/handoff","/account/connections/web3/complete"]) {
+      if (!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"missing strict Web3 route overlay",expression:route});
+    }
+    for (const method of ["beginAsync","completeAsync","beginConnectionAsync","completeConnectionAsync",
+      "issueBrowserAuthenticationHandoffAsync","redeemBrowserAuthenticationHandoffAsync",
+      "publishBrowserAuthenticationHandoffAsync","issueBrowserConnectionHandoffAsync","consumeBrowserConnectionHandoffAsync"]) {
+      if (!native.includes("co_await m_authentication->"+method+"("))
+        issues.push({line:0,kind:"missing native Web3 lifecycle operation",expression:method});
+    }
   }
   if (["src/providers/oidc/oidc.cpp","src/providers/x/x.cpp"].includes(relative)) {
     const oidc=relative.includes("/oidc/");

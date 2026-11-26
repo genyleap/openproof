@@ -1015,3 +1015,15 @@ authentication is enabled rejects startup before database migration;
 there is no synchronous HTTP fallback. Public-only installations do
 not allocate these dependencies. This is a candidate cutover, not
 approval for deployment before the global coroutine release gate.
+
+### Native Web3 runtime
+
+Authenticated deployments require the native Web3 login, mobile handoff
+and connection lifecycle. The historical
+OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN setting may be unset or 1;
+0 in authenticated mode is rejected before migrations. Wallet local
+challenge construction remains synchronous because it has no I/O.
+Synchronous Wallet completion and Farcaster initiation/completion
+return Unavailable rather than performing network I/O. Native callers
+use the coroutine SPI for EOA, ERC-1271, ERC-6492 and FIP-11 verification.
+This candidate still requires exact-head compiled and runtime acceptance.

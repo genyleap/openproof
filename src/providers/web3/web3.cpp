@@ -22,20 +22,10 @@ module;
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/use_future.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl/context.hpp>
-#include <boost/asio/ssl/host_name_verification.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/ssl.hpp>
 #include <boost/json.hpp>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
-#include <openssl/ssl.h>
 
 module openproof.provider.web3;
 
@@ -45,11 +35,8 @@ namespace openproof::provider::web3 {
 namespace {
 
 namespace asio = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
 namespace json = boost::json;
 namespace idp = identity::provider;
-using Tcp = asio::ip::tcp;
 
 constexpr std::size_t kMaximumRpcResponse = 2U * 1024U * 1024U;
 constexpr std::string_view kWalletStatement{"Sign in to OpenProof with your Ethereum account."};
@@ -497,49 +484,10 @@ using PointPtr = std::unique_ptr<EC_POINT, PointDeleter>;
 
 struct RpcResponse final { json::value result; };
 
-// Legacy wallet verification remains synchronous at its public boundary,
-// but both its RPC network transport and the native verifier use the same
-// bounded, private-address-rejecting coroutine HTTPS client.
+// Remote verification uses only the bounded coroutine HTTPS client.
 using NativeRpcClient = openproof::provider::http::async_detail::AsyncHttpsClient;
 using NativeRpcRequest = openproof::provider::http::async_detail::HttpsRequest;
 using RpcDeadline = std::chrono::steady_clock::time_point;
-
-[[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
-    NativeRpcClient& client, std::string_view endpoint,
-    std::string_view method, json::array parameters,
-    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false);
-
-[[nodiscard]] foundation::Result<RpcResponse> rpc(
-    std::string_view endpoint, std::string_view method, json::array parameters,
-    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    try {
-        asio::io_context io;
-        NativeRpcClient client{std::string{caFile}, kMaximumRpcResponse};
-        auto completion = asio::co_spawn(io,
-            rpcAsync(client, endpoint, method, std::move(parameters),
-                authorization, std::chrono::steady_clock::now()
-                    + std::chrono::seconds{10}, allowLoopback),
-            asio::use_future);
-        io.run();
-        return completion.get();
-    } catch (...) {
-        return foundation::fail(foundation::ErrorCode::Unavailable,
-                                "The Web3 RPC HTTPS request failed.");
-    }
-}
-
-[[nodiscard]] foundation::Result<std::string> rpcString(
-    std::string_view endpoint, std::string_view method, json::array parameters,
-    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    auto response = rpc(endpoint, method, std::move(parameters), caFile, authorization, allowLoopback);
-    if (!response || !response->result.is_string()) {
-        return foundation::fail(foundation::ErrorCode::Unavailable,
-                                "The Web3 RPC result is not a string.");
-    }
-    return std::string{response->result.as_string()};
-}
 
 // Native Web3 RPC transport. The configured HTTPS authority is immutable
 // provider state, and all redirects/private DNS answers are rejected by the
@@ -548,7 +496,7 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
 [[nodiscard]] asio::awaitable<foundation::Result<RpcResponse>> rpcAsync(
     NativeRpcClient& client, std::string_view endpoint,
     std::string_view method, json::array parameters,
-    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback)
+    const foundation::SecretString& authorization, RpcDeadline deadline, bool allowLoopback = false)
 {
     const auto parsed = parseHttpsUrl(endpoint);
     if (!parsed) co_return foundation::fail(parsed.error());
@@ -635,109 +583,6 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     auto digest = keccak256(signature);
     if (!digest) return foundation::fail(digest.error());
     return encodeHex(std::span{digest->data(), 4U}, false);
-}
-
-[[nodiscard]] foundation::Result<bool> rpcChainMatches(
-    std::string_view endpoint, std::uint64_t expected, std::string_view caFile,
-    const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    auto chain = rpcString(endpoint, "eth_chainId", {}, caFile, authorization, allowLoopback);
-    if (!chain || !chain->starts_with("0x") || chain->size() > 34U) {
-        return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::Unavailable}
-                                      : chain.error());
-    }
-    std::uint64_t parsed{};
-    const auto text = std::string_view{*chain}.substr(2U);
-    const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed, 16);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
-        return foundation::fail(foundation::ErrorCode::Unavailable);
-    }
-    return parsed == expected;
-}
-
-
-[[nodiscard]] foundation::Result<bool> universalSignatureValid(
-    std::string_view endpoint, std::string_view address,
-    std::span<const std::byte, 32> digest, std::string_view signature,
-    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    auto signatureBytes = decodeHex(signature);
-    if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 8192U) {
-        return foundation::fail(authenticationFailure(
-            "The universal signature encoding is invalid."));
-    }
-    std::string data{kUniversalSignatureValidatorByteCode};
-    data.append(24U, '0');
-    data.append(address.substr(2U));
-    data.append(encodeHex(digest, false));
-    data.append(uint256Hex(96U));
-    data.append(uint256Hex(signatureBytes->size()));
-    data.append(encodeHex(*signatureBytes, false));
-    const std::size_t remainder = signatureBytes->size() % 32U;
-    if (remainder != 0U) data.append((32U - remainder) * 2U, '0');
-
-    json::object call;
-    call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call",
-        json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
-    if (!result) return foundation::fail(result.error());
-    if (!result->starts_with("0x") || result->size() > 66U) {
-        return foundation::fail(foundation::ErrorCode::Unavailable,
-                                "The universal signature verifier returned malformed data.");
-    }
-    std::string_view value{*result};
-    value.remove_prefix(2U);
-    while (value.size() > 1U && value.front() == '0') value.remove_prefix(1U);
-    return value == "1";
-}
-
-[[nodiscard]] foundation::Result<bool> contractWalletValid(
-    std::string_view endpoint, std::string_view address,
-    std::span<const std::byte, 32> digest, std::string_view signature,
-    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    // Match the verifier used by Farcaster AuthKit/viem. The deployless
-    // ERC-6492 validator handles EOAs, deployed ERC-1271 wallets, and
-    // counterfactual smart accounts without persisting any deployment.
-    auto universal = universalSignatureValid(
-        endpoint, address, digest, signature, caFile, authorization, allowLoopback);
-    if (universal) return universal.value();
-
-    // Preserve the previous direct paths as a compatibility fallback for RPC
-    // providers that do not permit contract-creation eth_call simulations.
-    auto code = rpcString(endpoint, "eth_getCode", json::array{address, "latest"}, caFile, authorization, allowLoopback);
-    if (!code) return foundation::fail(code.error());
-    const bool contract = *code != "0x" && *code != "0x0" && *code != "0x00";
-    if (!contract) {
-        auto recovered = recoverAddress(digest, signature);
-        if (!recovered) return foundation::fail(recovered.error());
-        return security::constantTimeEquals(*recovered, address);
-    }
-
-    auto signatureBytes = decodeHex(signature);
-    if (!signatureBytes || signatureBytes->empty() || signatureBytes->size() > 4096U) {
-        return foundation::fail(authenticationFailure("The ERC-1271 signature encoding is invalid."));
-    }
-    auto selector = functionSelector("isValidSignature(bytes32,bytes)");
-    if (!selector) return foundation::fail(selector.error());
-    std::string data{"0x"};
-    data.append(*selector);
-    data.append(encodeHex(digest, false));
-    data.append(uint256Hex(64U));
-    data.append(uint256Hex(signatureBytes->size()));
-    data.append(encodeHex(*signatureBytes, false));
-    const std::size_t remainder = signatureBytes->size() % 32U;
-    if (remainder != 0U) data.append((32U - remainder) * 2U, '0');
-    json::object call;
-    call["to"] = address;
-    call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
-    if (!result) return foundation::fail(result.error());
-    std::string lowered = *result;
-    std::ranges::transform(lowered, lowered.begin(), [](unsigned char symbol) {
-        return static_cast<char>(std::tolower(symbol));
-    });
-    return lowered.starts_with(kErc1271Magic);
 }
 
 [[nodiscard]] asio::awaitable<foundation::Result<bool>> rpcChainMatchesAsync(
@@ -841,40 +686,6 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
     co_return lowered.starts_with(kErc1271Magic);
 }
 
-[[nodiscard]] foundation::Result<std::uint64_t> farcasterIdOf(
-    std::string_view endpoint, std::string_view registry, std::string_view address,
-    std::string_view caFile, const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    auto selector = functionSelector("idOf(address)");
-    if (!selector) return foundation::fail(selector.error());
-    std::string data{"0x"};
-    data.append(*selector);
-    data.append(24U, '0');
-    data.append(address.substr(2U));
-    json::object call;
-    call["to"] = registry;
-    call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"}, caFile, authorization, allowLoopback);
-    if (!result || !result->starts_with("0x") || result->size() > 66U) {
-        return foundation::fail(result ? foundation::Error{foundation::ErrorCode::Unavailable}
-                                       : result.error());
-    }
-    std::uint64_t value{};
-    std::string_view text{*result};
-    text.remove_prefix(2U);
-    while (text.size() > 16U && text.front() == '0') text.remove_prefix(1U);
-    if (text.size() > 16U) {
-        return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "The Farcaster FID exceeds the supported 64-bit range.");
-    }
-    if (text.empty()) return std::uint64_t{0};
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
-        return foundation::fail(foundation::ErrorCode::Unavailable);
-    }
-    return value;
-}
-
 [[nodiscard]] foundation::Result<std::uint64_t> abiUint64(
     std::string_view result, std::size_t word)
 {
@@ -892,32 +703,6 @@ using RpcDeadline = std::chrono::steady_clock::time_point;
         return foundation::fail(foundation::ErrorCode::Unavailable);
     }
     return value;
-}
-
-[[nodiscard]] foundation::Result<bool> farcasterAuthAddressValid(
-    std::string_view endpoint, std::string_view registry, std::uint64_t fid,
-    std::string_view address, std::string_view caFile,
-    const foundation::SecretString& authorization, bool allowLoopback = false)
-{
-    auto selector = functionSelector("keyDataOf(uint256,bytes)");
-    if (!selector) return foundation::fail(selector.error());
-    std::string data{"0x"};
-    data.append(*selector);
-    data.append(uint256Hex(fid));
-    data.append(uint256Hex(64U));
-    data.append(uint256Hex(32U));
-    data.append(24U, '0');
-    data.append(address.substr(2U));
-    json::object call;
-    call["to"] = registry;
-    call["data"] = std::move(data);
-    auto result = rpcString(endpoint, "eth_call", json::array{std::move(call), "latest"},
-                            caFile, authorization, allowLoopback);
-    if (!result) return foundation::fail(result.error());
-    auto state = abiUint64(*result, 0U);
-    auto keyType = abiUint64(*result, 1U);
-    if (!state || !keyType) return foundation::fail(state ? keyType.error() : state.error());
-    return state.value() == 1U && keyType.value() == kFarcasterAuthAddressKeyType;
 }
 
 [[nodiscard]] asio::awaitable<foundation::Result<std::uint64_t>> farcasterIdOfAsync(
@@ -1358,39 +1143,13 @@ public:
           m_rpcClient(std::string{config.caFile()}, kMaximumRpcResponse) {}
 
     [[nodiscard]] foundation::Result<bool> chainMatches() override
-    {
-        return rpcChainMatches(m_config->rpcEndpoint(), m_config->chainId(),
-                               m_config->caFile(), m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
-    }
-
+    { return foundation::fail(foundation::ErrorCode::Unavailable); }
     [[nodiscard]] foundation::Result<bool> verifySignature(
-        std::string_view address, std::string_view message,
-        std::string_view signature) override
-    {
-        auto digest = ethereumMessageHash(message);
-        if (!digest) return foundation::fail(digest.error());
-        return contractWalletValid(m_config->rpcEndpoint(), address, digest.value(), signature,
-                                   m_config->caFile(), m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
-    }
-
+        std::string_view, std::string_view, std::string_view) override
+    { return foundation::fail(foundation::ErrorCode::Unavailable); }
     [[nodiscard]] foundation::Result<std::optional<FarcasterSignerKind>>
-    authorizeSigner(std::uint64_t fid, std::string_view address) override
-    {
-        auto custodyFid = farcasterIdOf(m_config->rpcEndpoint(),
-            m_config->idRegistryAddress(), address, m_config->caFile(),
-            m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
-        if (!custodyFid) return foundation::fail(custodyFid.error());
-        if (custodyFid.value() == fid) return FarcasterSignerKind::Custody;
-        if (m_config->keyRegistryAddress().empty()) {
-            return std::optional<FarcasterSignerKind>{};
-        }
-        auto valid = farcasterAuthAddressValid(m_config->rpcEndpoint(),
-            m_config->keyRegistryAddress(), fid, address, m_config->caFile(),
-            m_config->authorizationHeader(), m_config->trustedLoopbackRpc());
-        if (!valid) return foundation::fail(valid.error());
-        if (valid.value()) return FarcasterSignerKind::AuthAddress;
-        return std::optional<FarcasterSignerKind>{};
-    }
+    authorizeSigner(std::uint64_t,std::string_view) override
+    { return foundation::fail(foundation::ErrorCode::Unavailable); }
 
     // Both production RPC and injected native-verifier implementations must
     // use the SAME monotonic deadline during all chain/identity probes.
@@ -1561,57 +1320,10 @@ WalletAuthenticationProvider::beginAuthentication(const idp::AuthenticationReque
 }
 
 foundation::Result<idp::AuthenticationOutcome>
-WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
+WalletAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse&)
 {
-    const auto message = credential(response.parameters(), "message");
-    const auto signature = credential(response.parameters(), "signature");
-    if (!message || !signature || signature->size() > 8192U) {
-        return foundation::fail(authenticationFailure("The SIWE completion is incomplete."));
-    }
-    auto parsed = validateSiweMessage(*message, response.challengeId(), "siwe_",
-        m_implementation->config.domain(), m_implementation->config.uri(),
-        kWalletStatement, m_implementation->config.derivationKey(),
-        m_implementation->config.challengeLifetime(), m_implementation->clock->now());
-    if (!parsed) return foundation::fail(parsed.error());
-    auto digest = ethereumMessageHash(*message);
-    if (!digest) return foundation::fail(digest.error());
-
-    bool verified = false;
-    auto recovered = recoverAddress(digest.value(), *signature);
-    if (recovered && security::constantTimeEquals(*recovered, parsed->address)) {
-        verified = true;
-    } else if (const auto endpoint = m_implementation->config.rpcEndpoint(parsed->chainId)) {
-        auto matchingChain = rpcChainMatches(
-            *endpoint, parsed->chainId, m_implementation->config.caFile(),
-            m_implementation->config.authorizationHeader());
-        if (!matchingChain) return foundation::fail(matchingChain.error());
-        if (!matchingChain.value()) {
-            return foundation::fail(foundation::ErrorCode::FailedPrecondition,
-                                    "The configured smart-wallet RPC reports the wrong chain.");
-        }
-        auto valid = contractWalletValid(
-            *endpoint, parsed->address, digest.value(), *signature,
-            m_implementation->config.caFile(),
-            m_implementation->config.authorizationHeader());
-        if (!valid) return foundation::fail(valid.error());
-        verified = valid.value();
-    }
-    if (!verified) {
-        return foundation::fail(authenticationFailure(
-            "The SIWE signature is invalid, or this smart-account chain has no configured RPC."));
-    }
-
-    idp::VerifiedClaims claims;
-    claims.setExtension("wallet_address", parsed->address);
-    claims.setExtension("chain_id", std::to_string(parsed->chainId));
-    idp::ProviderEvidence evidence;
-    evidence.add("protocol", "erc4361_siwe");
-    evidence.add("chain_id", std::to_string(parsed->chainId));
-    evidence.add("wallet_address", parsed->address);
-    return idp::AuthenticationOutcome::create(
-        id(), idp::ExternalSubject{parsed->address}, std::move(claims), idp::AssuranceLevel::Ial1,
-        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-        std::move(evidence), m_implementation->clock->now());
+    return foundation::fail(foundation::ErrorCode::Unavailable,
+        "Wallet completion requires the native coroutine entry.");
 }
 
 asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
@@ -1756,105 +1468,16 @@ idp::AssuranceLevel FarcasterAuthenticationProvider::maximumClaimableAssurance()
 foundation::Result<idp::AuthenticationChallenge>
 FarcasterAuthenticationProvider::beginAuthentication(const idp::AuthenticationRequest& request)
 {
-    if (request.provider() != id()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
-    const auto addressValue = publicParameter(request.parameters(), "address");
-    const auto fidValue = publicParameter(request.parameters(), "fid");
-    if (addressValue.has_value() != fidValue.has_value()) {
-        return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                "A direct SIWF request must provide both address and FID.");
-    }
-    auto chain = m_implementation->verifier->chainMatches();
-    if (!chain || !chain.value()) return foundation::fail(chain ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
-                                                            : chain.error());
-    std::optional<std::string> address;
-    std::optional<std::uint64_t> fid;
-    std::optional<FarcasterSignerKind> signerKind;
-    if (addressValue && fidValue) {
-        address = normalizeAddress(*addressValue);
-        auto parsedFid = parseDecimal(*fidValue);
-        if (!address || !parsedFid || parsedFid.value() == 0U) {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "The direct SIWF address or FID is invalid.");
-        }
-        fid = parsedFid.value();
-        auto authorized = m_implementation->verifier->authorizeSigner(*fid, *address);
-        if (!authorized || !authorized.value()) {
-            return foundation::fail(authorized
-                ? authenticationFailure("The address is not an active custody or auth address for that FID.")
-                : authorized.error());
-        }
-        signerKind = *authorized.value();
-    }
-    const auto now = m_implementation->clock->now();
-    auto challengeId = makeChallengeId("fcsiwf_", now);
-    if (!challengeId) return foundation::fail(challengeId.error());
-    auto nonce = challengeNonce(m_implementation->config.derivationKey(), challengeId.value());
-    if (!nonce) return foundation::fail(nonce.error());
-    idp::AuthenticationChallenge challenge{challengeId.value(), now + m_implementation->config.challengeLifetime()};
-    challenge.setParameter("nonce", nonce.value());
-    challenge.setParameter("domain", std::string{m_implementation->config.domain()});
-    challenge.setParameter("uri", std::string{m_implementation->config.uri()});
-    challenge.setParameter("statement", std::string{kFarcasterStatement});
-    challenge.setParameter("resource_prefix", "farcaster://fid/");
-    challenge.setParameter("chain_id", std::to_string(m_implementation->config.chainId()));
-    if (address && fid && signerKind) {
-        challenge.setParameter("message", buildFarcasterMessage(
-            m_implementation->config.domain(), *address, m_implementation->config.uri(),
-            nonce.value(), now, now + m_implementation->config.challengeLifetime(), *fid));
-        challenge.setParameter("address", *address);
-        challenge.setParameter("fid", std::to_string(*fid));
-        challenge.setParameter("signer_kind",
-            *signerKind == FarcasterSignerKind::Custody ? "custody" : "auth_address");
-    }
-    return challenge;
+    if (request.provider()!=id()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    return foundation::fail(foundation::ErrorCode::Unavailable,
+        "Farcaster start requires the native coroutine entry.");
 }
 
 foundation::Result<idp::AuthenticationOutcome>
-FarcasterAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse& response)
+FarcasterAuthenticationProvider::completeAuthentication(const idp::AuthenticationResponse&)
 {
-    const auto message = credential(response.parameters(), "message");
-    const auto signature = credential(response.parameters(), "signature");
-    if (!message || !signature || signature->size() > 8192U) {
-        return foundation::fail(authenticationFailure("The Farcaster SIWF completion is incomplete."));
-    }
-    auto parsed = validateFarcasterMessage(*message, response.challengeId(),
-        m_implementation->config.domain(), m_implementation->config.uri(),
-        m_implementation->config.derivationKey(), m_implementation->config.challengeLifetime(),
-        m_implementation->clock->now());
-    if (!parsed) return foundation::fail(parsed.error());
-    auto signatureValid = m_implementation->verifier->verifySignature(
-        parsed->address, *message, *signature);
-    if (!signatureValid || !signatureValid.value()) {
-        return foundation::fail(signatureValid ? authenticationFailure("The Farcaster SIWF signature is invalid.")
-                                               : signatureValid.error());
-    }
-    auto authorized = m_implementation->verifier->authorizeSigner(parsed->fid, parsed->address);
-    if (!authorized || !authorized.value()) {
-        return foundation::fail(authorized
-            ? authenticationFailure("The Farcaster signer was revoked or changed before verification completed.")
-            : authorized.error());
-    }
-    const bool custody = *authorized.value() == FarcasterSignerKind::Custody;
-    idp::VerifiedClaims claims;
-    claims.setExtension("fid", std::to_string(parsed->fid));
-    claims.setExtension("signer_address", parsed->address);
-    claims.setExtension("signer_kind", custody ? "custody" : "auth_address");
-    if (custody) claims.setExtension("custody_address", parsed->address);
-    claims.setExtension("chain_id", std::to_string(m_implementation->config.chainId()));
-    idp::ProviderEvidence evidence;
-    evidence.add("protocol", "farcaster_fip11_siwf");
-    evidence.add("fid", std::to_string(parsed->fid));
-    evidence.add("signer_address", parsed->address);
-    evidence.add("signer_kind", custody ? "custody" : "auth_address");
-    evidence.add("id_registry", std::string{m_implementation->config.idRegistryAddress()});
-    if (!m_implementation->config.keyRegistryAddress().empty()) {
-        evidence.add("key_registry", std::string{m_implementation->config.keyRegistryAddress()});
-    }
-    return idp::AuthenticationOutcome::create(
-        id(), idp::ExternalSubject{std::to_string(parsed->fid)}, std::move(claims),
-        idp::AssuranceLevel::Ial1,
-        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-        std::move(evidence), m_implementation->clock->now());
+    return foundation::fail(foundation::ErrorCode::Unavailable,
+        "Farcaster completion requires the native coroutine entry.");
 }
 
 asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>

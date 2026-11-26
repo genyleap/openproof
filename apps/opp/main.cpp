@@ -1513,9 +1513,7 @@ addProtectedRoutes(gateway::Router& router,
             "Native TOTP status requires enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
-    // Wallet/Farcaster already expose native verification coroutines, but
-    // their synchronous browser-handoff APIs are not yet migrated. Select
-    // only the direct native start/complete pair with a separate opt-in.
+    // Native Web3 owns login, mobile handoff and account connection.
     const auto nativeWeb3Flag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN");
     if (nativeWeb3Flag && *nativeWeb3Flag != "0"
@@ -1525,7 +1523,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeWeb3Enabled = nativeWeb3Flag && *nativeWeb3Flag == "1";
+    if (platform.auth().enabled() && nativeWeb3Flag && *nativeWeb3Flag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native Web3 cannot be disabled in an authenticated runtime."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeWeb3Enabled = platform.auth().enabled()
+        || (nativeWeb3Flag && *nativeWeb3Flag == "1");
     // First-party rotation and revocation use the native SQL listener.
     const auto nativeAuthSessionFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");

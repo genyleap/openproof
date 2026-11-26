@@ -863,7 +863,7 @@ TEST(AuthenticationHttpApiTest, SharedSessionCredentialParserRejectsAmbiguity)
 
     auto rejected=gw::takeSessionCredential(ambiguous.value());
     EXPECT_FALSE(rejected);
-    EXPECT_EQ(rejected.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(rejected.error().code(),fnd::ErrorCode::AuthenticationRequired);
 }
 
 TEST(Web3PresentationMetadataTest, DiscardsUnsafeTextWithoutBlockingAuthentication)
