@@ -91,11 +91,11 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(web3.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 
-# This opt-in remains OFF while the full GCC native gateway/module build
-# and end-to-end route tests are pending. Do not place experimental HTTP
-# objects in the default production graph or silently change live routing.
+# Compile the native adapter and its regressions in the normal development
+# build. Runtime routing remains independently disabled by default.
+# Explicit OFF remains supported for compatibility-only builds.
 option(OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP
-    "Build the experimental native recovery-code HTTP route" OFF)
+    "Build the experimental native recovery-code HTTP route" ON)
 if(OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP)
 # Native recovery-code issuance route. This separate, provider-neutral
 # coroutine adapter does not import synchronous local-account/storage SPIs

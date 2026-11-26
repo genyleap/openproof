@@ -65,6 +65,15 @@ test("native PostgreSQL rotate/logout deny paths erase request credential header
     mutation.indexOf("limiter.allow("));
   assert.ok(mutation.indexOf("SensitiveSessionHeadersGuard wipeHeadersOnExit{request}") <
     mutation.indexOf("gateway::takeSessionCredential(request)"));
+  // These routes do not consume body or query data. Wipe before rate
+  // limiting, credential extraction, and the first database suspension.
+  for (const scrub of ["wipeBody", "wipeTargetQuery"]) {
+    const index = mutation.indexOf("request." + scrub + "()");
+    assert.ok(index >= 0, "native mutation must erase " + scrub);
+    assert.ok(index < mutation.indexOf("limiter.allow("));
+    assert.ok(index < mutation.indexOf("gateway::takeSessionCredential(request)"));
+    assert.ok(index < mutation.indexOf("co_await"));
+  }
 });
 
 test("native PostgreSQL listener scrubs failed direct and fallback credentials", () => {

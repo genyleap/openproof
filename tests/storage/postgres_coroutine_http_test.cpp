@@ -44,10 +44,11 @@ struct TestFixture {
 
     [[nodiscard]] gw::HttpResponse run(
         gw::HttpMethod method, std::string path,
-        std::vector<std::pair<std::string, std::string>> headers = {})
+        std::vector<std::pair<std::string, std::string>> headers = {},
+        std::string body = {})
     {
         auto request = gw::HttpRequest::create(
-            method, std::move(path), std::move(headers), {}, "127.0.0.1",
+            method, std::move(path), std::move(headers), std::move(body), "127.0.0.1",
             fnd::CorrelationId{"isolated-coroutine-http-test"});
         if (!request) throw std::runtime_error{"Could not create test request"};
         std::optional<gw::HttpResponse> output;
@@ -88,6 +89,24 @@ TEST(PostgresCoroutineHttpTest, AnonymousLogoutClearsOnlySessionCookie)
     EXPECT_NE(cookie.find("HttpOnly"), std::string::npos);
     EXPECT_NE(cookie.find("Secure"), std::string::npos);
     EXPECT_NE(cookie.find("SameSite=Strict"), std::string::npos);
+}
+
+TEST(PostgresCoroutineHttpTest, IgnoredBodyAndQueryCannotSupplySessionCredentials)
+{
+    TestFixture fixture;
+    const auto rotate = fixture.run(
+        gw::HttpMethod::Post, "/auth/session/rotate?token=not-a-real-token",
+        {}, R"({"token":"not-a-real-token"})");
+    EXPECT_EQ(rotate.status(), 401);
+    EXPECT_FALSE(rotate.headers().contains("set-cookie"));
+    EXPECT_EQ(rotate.body().find("not-a-real-token"), std::string::npos);
+
+    const auto logout = fixture.run(
+        gw::HttpMethod::Post, "/auth/logout-all?token=not-a-real-token",
+        {}, R"({"token":"not-a-real-token"})");
+    EXPECT_EQ(logout.status(), 204);
+    EXPECT_NE(logout.headers().at("set-cookie").find("Max-Age=0"), std::string::npos);
+    EXPECT_EQ(fixture.fallbackCalls, 0);
 }
 
 TEST(PostgresCoroutineHttpTest, DatabaseOutageCannotRotateOrLogout)

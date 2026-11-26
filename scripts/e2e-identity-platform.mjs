@@ -13,6 +13,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 import { startLocalDemoPortal } from "./local-demo-portal.mjs";
 import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
+import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-diagnostics.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -394,10 +395,12 @@ async function main() {
     response.end(JSON.stringify({ upstream: true, path: request.url }));
   });
   const upstreamPort = await listen(upstreamServer);
-  const oppPort = await reservePort();
+  let oppPort = await reservePort();
 
   let oppProcess;
   let oppLog = "";
+  let oppClosed;
+  let startupFailureCategory;
   let loadResult;
   let loadResourceMetrics = {};
   let nativeClientId = "";
@@ -547,6 +550,28 @@ async function main() {
   };
 
   async function startOpp() {
+    // A released ephemeral port is not reserved until the subprocess binds.
+    // Retry only a positively identified listener collision, never a failed
+    // migration, crypto operation, readiness check or unknown startup error.
+    for (let attempt = 0; attempt < 3; ++attempt) {
+      startupFailureCategory = undefined;
+      try {
+        await launchOpp();
+        return;
+      } catch (error) {
+        if (startupFailureCategory !== "listener-address-in-use" || attempt === 2)
+          throw error;
+        const nextPort = await reservePort();
+        fs.writeFileSync(configurationPath,
+          replaceFixturePort(fs.readFileSync(configurationPath, "utf8"), oppPort, nextPort),
+          { mode: 0o600 });
+        oppPort = nextPort;
+        console.warn("identity E2E: fixture listener collision; retrying with a fresh port");
+      }
+    }
+  }
+
+  async function launchOpp() {
     oppLog = "";
     const checked = command(binary, ["check-config", "--config", configurationPath], {
       env: childEnvironment,
@@ -561,7 +586,9 @@ async function main() {
       oppLog += chunk.toString("utf8");
       if (oppLog.length > 32_000) oppLog = oppLog.slice(-32_000);
     };
-    oppProcess.stdout.on("data", append);
+    oppClosed = new Promise(resolve => oppProcess.once("close", resolve));
+    // Drain stdout without retaining potentially sensitive structured logs.
+    oppProcess.stdout.resume();
     oppProcess.stderr.on("data", append);
     await waitUntilReady();
   }
@@ -655,8 +682,11 @@ async function main() {
   async function waitUntilReady() {
     let lastError;
     for (let attempt = 0; attempt < 100; ++attempt) {
-      if (oppProcess.exitCode !== null) {
-        fail(`opp exited during startup (status ${oppProcess.exitCode}); raw service logs withheld`);
+      if (oppProcess.exitCode !== null || oppProcess.signalCode !== null) {
+        await oppClosed; // stderr has drained before classifying the exit.
+        startupFailureCategory = classifyStartupFailure(oppLog);
+        oppLog = "";
+        fail(`opp exited during startup (status ${oppProcess.exitCode ?? "signal"}, category ${startupFailureCategory}); raw service logs withheld`);
       }
       try {
         const response = await edgeRequest("/health/ready");
@@ -1158,6 +1188,52 @@ async function main() {
       expectStatus(status, 200);
       assert.deepEqual(jsonBody(status), { available: true, enabled: true, assurance: "ial2" });
       assert.equal(status.headers["cache-control"], "no-store");
+    }
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES === "1") {
+      const countCodes = () => Number(command("psql", [
+        databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "select count(*) from openproof.recovery_codes where identity_id='e2e-owner'",
+      ]).trim());
+      expectStatus(await jsonRequest("/auth/recovery-codes", "POST", undefined), 401);
+      expectStatus(await jsonRequest("/auth/recovery-codes", "POST", undefined,
+        consumerJarAfterReset), 403);
+      assert.equal(countCodes(), 0);
+      async function issueCodes() {
+        const result = await jsonRequest("/auth/recovery-codes", "POST", undefined, ownerJar);
+        expectStatus(result, 201);
+        assert.equal(result.headers["cache-control"], "no-store");
+        const codes = jsonBody(result).codes;
+        assert.ok(Array.isArray(codes) && codes.length === 10 && new Set(codes).size === 10,
+          "issuance must return exactly ten distinct codes");
+        assert.ok(codes.every(code => typeof code === "string" && /^[A-Za-z0-9_-]{27}$/.test(code)));
+        assert.equal(countCodes(), 10);
+        return codes;
+      }
+      const old = await issueCodes();
+      const fresh = await issueCodes();
+      assert.ok(old.every(code => !fresh.includes(code)), "rotation must replace the prior batch");
+      async function recover(code, expected) {
+        const jar = new CookieJar();
+        const started = await jsonRequest("/auth/login", "POST", { subject: "owner@e2e.invalid" }, jar);
+        expectStatus(started, 202);
+        const challenge = jsonBody(started);
+        const completed = await jsonRequest("/auth/mfa/verify", "POST", {
+          transaction_id: challenge.transaction_id, challenge_id: challenge.challenge_id,
+          password: ownerPassword, recovery_code: code,
+        }, jar);
+        expectStatus(completed, expected);
+        if (expected === 200) {
+          assert.equal(jsonBody(completed).assurance, "ial2");
+          expectStatus(await jsonRequest("/auth/logout", "POST", undefined, jar), 204);
+        }
+      }
+      await recover(old[0], 401);
+      assert.equal(countCodes(), 10);
+      await recover(fresh[0], 200);
+      assert.equal(countCodes(), 9);
+      await recover(fresh[0], 401);
+      assert.equal(countCodes(), 9);
+      console.log("- native recovery issuance and legacy one-time redemption: IAL2, rotation, persistence and replay passed");
     }
     const adminConsole = await edgeRequest("/admin/console", { jar: ownerJar });
     expectStatus(adminConsole, 200);

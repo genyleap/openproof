@@ -495,6 +495,72 @@ CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(
     }
 }
 
+asio::awaitable<foundation::Result<organization::Membership>>
+CoroutinePostgresCanonicalFinalizer::readAuthorizationMembershipAsync(
+    core::IdentityId subject, core::OrganizationId tenant)
+{
+    constexpr std::size_t maxRoles = 256U;
+    if (subject.empty() || subject.value().size() > 200U || tenant.empty())
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    if (tenant != m_impl->organization)
+        co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{subject.value()}, std::string{tenant.value()}};
+        // Keep identity, organization, membership lifecycle and assigned
+        // roles in the SAME statement snapshot. Do not infer membership
+        // from the identity's existence or reuse previously cached roles.
+        const auto rows = co_await lease.connection().query(
+            "SELECT m.identity_id,m.organization_id,m.invited_at_ms,r.role "
+            "FROM openproof.memberships m "
+            "JOIN openproof.identities i ON i.id=m.identity_id "
+            "AND i.organization_id=m.organization_id "
+            "JOIN openproof.organizations o ON o.id=m.organization_id "
+            "LEFT JOIN openproof.membership_roles r ON r.organization_id=m.organization_id "
+            "AND r.identity_id=m.identity_id "
+            "WHERE m.identity_id=$1 AND m.organization_id=$2 "
+            "AND m.state=1 AND i.status=0 AND o.state=0 "
+            "ORDER BY r.role COLLATE \"C\" NULLS FIRST LIMIT 257",
+            std::move(params), remaining(deadline));
+        if (rows.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        if (rows.rows.size() > maxRoles || rows.rows.front().size() != 4U)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        const auto invitedAt = milliseconds(rows.rows.front()[2]);
+        auto membership = organization::Membership::invite(
+            tenant, subject, foundation::Instant{foundation::Duration{invitedAt}});
+        if (!membership || !membership->accept())
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        for (const auto& row : rows.rows) {
+            if (row.size() != 4U || required(row[0]) != subject.value()
+                || required(row[1]) != tenant.value()
+                || milliseconds(row[2]) != invitedAt)
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            if (!row[3]) {
+                // A legitimate active membership may hold zero roles.
+                if (rows.rows.size() != 1U)
+                    co_return foundation::fail(foundation::ErrorCode::Unavailable);
+                continue;
+            }
+            const auto& role = *row[3];
+            if (role.empty() || role.size() > 200U
+                || std::any_of(role.begin(), role.end(), [](char c) {
+                    const auto byte = static_cast<unsigned char>(c);
+                    return byte < 0x20U || byte == 0x7fU;
+                })
+                || membership->hasRole(organization::Role{role}))
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            if (!membership->grantRole(organization::Role{role}))
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        }
+        co_return std::move(membership).value();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native authorization membership lookup is unavailable.");
+    }
+}
+
 asio::awaitable<foundation::Result<administration::MemberListing>>
 CoroutinePostgresCanonicalFinalizer::readMembersAsync(core::IdentityId actor)
 {

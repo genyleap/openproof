@@ -7,7 +7,7 @@ const read = p => fs.readFileSync(path.join(root,p), "utf8");
 test("owner and active tenant authorization are in the same bounded native SQL snapshot", () => {
   const source = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const body = source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::readMembersAsync("),
-    source.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync("));
+    source.indexOf("\n}\n", source.indexOf("CoroutinePostgresCanonicalFinalizer::readMembersAsync(")));
   for (const term of ["a.identity_id=$1 AND a.organization_id=$2", "a.state=1 AND ai.status=0 AND o.state=0",
     "ar.organization_id=a.organization_id AND ar.identity_id=a.identity_id",
     "AND ar.role='owner'", "m.organization_id=$2", "i.organization_id=m.organization_id",
