@@ -970,16 +970,16 @@ Gateway::completeForward(HttpRequest request, const Route& route)
 }
 
 bool GatewayNativePreparationSource::eligible(const Gateway& gateway,
-    const HttpRequest& request) noexcept
+    const HttpRequest& request,bool delegated) noexcept
 {
     try {
-        if (gateway.m_delegatedAccess != nullptr
-            || gateway.m_senderConstraintVerifier != nullptr
+        if ((!delegated && (gateway.m_delegatedAccess != nullptr
+            || gateway.m_senderConstraintVerifier != nullptr))
             || (request.path() != "/proxy" && !request.path().starts_with("/proxy/")))
             return false;
         const auto route = gateway.m_router->match(request.method(), request.path());
-        return route && route->isProtected() && route->requiredScope().empty()
-            && route->requiredAudience().empty();
+        return route && route->isProtected()
+            && (delegated || (route->requiredScope().empty() && route->requiredAudience().empty()));
     } catch (...) {
         return false;
     }
@@ -1026,14 +1026,14 @@ HttpResponse GatewayNativePreparationSource::reject(const Gateway& gateway,
 }
 
 std::variant<HttpResponse, GatewayNativePreparationSource::Pending>
-GatewayNativePreparationSource::begin(Gateway& gateway, HttpRequest request)
+GatewayNativePreparationSource::begin(Gateway& gateway, HttpRequest request,bool delegated)
 {
-    if (!eligible(gateway, request))
+    if (!eligible(gateway, request,delegated))
         return reject(gateway, foundation::Error{foundation::ErrorCode::Unavailable},
                       std::move(request));
     auto route = gateway.m_router->match(request.method(), request.path());
-    if (!route || !route->isProtected() || !route->requiredScope().empty()
-        || !route->requiredAudience().empty())
+    if (!route || !route->isProtected() || (!delegated
+        && (!route->requiredScope().empty() || !route->requiredAudience().empty())))
         return reject(gateway, foundation::Error{foundation::ErrorCode::PermissionDenied},
                       std::move(request));
     if (!gateway.m_rateLimiter->allow(request.remoteAddress()))
@@ -1048,11 +1048,11 @@ GatewayNativePreparationSource::begin(Gateway& gateway, HttpRequest request)
         return reject(gateway, credential
             ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
             : credential.error(), std::move(request));
-    if (dpop)
+    if (dpop && !delegated)
         return reject(gateway, foundation::Error{foundation::ErrorCode::AuthenticationFailed},
                       std::move(request));
     return Pending{std::move(request), std::move(route).value(),
-                   std::move(credential->value())};
+                   std::move(credential->value()),dpop};
 }
 
 bool GatewayNativePreparationSource::admitIdentity(Gateway& gateway,
@@ -1065,12 +1065,26 @@ bool GatewayNativePreparationSource::admitIdentity(Gateway& gateway,
 std::variant<HttpResponse, GatewayForwardPlan>
 GatewayNativePreparationSource::finish(Gateway& gateway, Pending pending,
     const session::AuthenticatedSession& authenticated,
-    const policy::AuthorizationDecision& decision)
+    const policy::AuthorizationDecision& decision,const session::DelegatedAccess* delegated)
 {
     if (!decision.isPermitted())
         return reject(gateway, foundation::Error{foundation::ErrorCode::PermissionDenied},
                       std::move(pending.request));
     attachAuthenticatedHeaders(pending.request, authenticated, pending.route);
+    if (delegated) {
+        pending.request.setHeader("x-openproof-client-id",std::string{delegated->clientId()});
+        std::string scopes;
+        for (const auto& scope:delegated->scopes()) {
+            if (!scopes.empty()) scopes.push_back(' ');
+            scopes.append(scope);
+        }
+        pending.request.setHeader("x-openproof-scopes",std::move(scopes));
+    }
+    // Proof material is ingress-only even on unconstrained credentials.
+    for (const auto name:{"dpop","x-forwarded-client-cert-sha256",
+            "x-forwarded-client-cert-timestamp","x-forwarded-client-cert-nonce",
+            "x-forwarded-client-cert-signature"})
+        pending.request.eraseHeader(name);
     return gateway.completeForward(std::move(pending.request), pending.route);
 }
 

@@ -29,3 +29,28 @@ test("native sender verification shares cryptography and never invokes legacy re
   assert.match(native,/co_return co_await consume\(/);
   assert.doesNotMatch(native,/m_dpop->consume\(|m_mtlsReplays->|verifyDpop\(/);
 });
+
+test("native delegated proxy verifies sender and route grants before policy and forwarding",()=>{
+  const app=read("apps/opp/main.cpp");
+  const source=read("src/gateway/http_coroutine.cpp");
+  const domain=read("src/gateway/gateway.cpp");
+  const body=source.slice(source.indexOf("auto started = begin(*m_gateway"));
+  const ordered=["co_await m_verify(","co_await m_verifyDelegated(","co_await m_verifySender(",
+    "pending.credential=foundation::SecretString{}","delegated->permits(","delegated->permitsAudience(",
+    "admitIdentity(","co_await m_authorize(","co_await m_transport->sendAsync("];
+  let last=-1;
+  for (const marker of ordered) {
+    const index=body.indexOf(marker);
+    assert.ok(index>last,marker);
+    last=index;
+  }
+  assert.match(body,/authenticated.error\(\).code\(\)!=foundation::ErrorCode::AuthenticationFailed/);
+  assert.match(body,/if \(!m_verifySender\)/);
+  assert.match(app,/nativeCanonical->readDelegatedAccessAsync\(/);
+  assert.match(app,/nativeGatewaySender->verifyAsync\(/);
+  assert.match(app,/reader->consumeSenderReplayAsync\(/);
+  const finish=domain.slice(domain.indexOf("GatewayNativePreparationSource::finish("),domain.indexOf("Gateway::nextForwardEndpoint("));
+  assert.match(finish,/x-openproof-client-id/);
+  assert.match(finish,/x-openproof-scopes/);
+  assert.match(finish,/pending.request.eraseHeader\(name\)/);
+});

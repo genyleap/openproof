@@ -472,15 +472,16 @@ protected:
         HttpRequest request;
         Route route;
         foundation::SecretString credential;
+        bool dpopScheme{};
     };
     [[nodiscard]] static bool eligible(const Gateway& gateway,
-                                       const HttpRequest& request) noexcept;
+                                       const HttpRequest& request,bool delegated=false) noexcept;
     [[nodiscard]] static bool eligiblePublic(const Gateway& gateway,
         const HttpRequest& request) noexcept;
     [[nodiscard]] static std::variant<HttpResponse,GatewayForwardPlan>
     preparePublic(Gateway& gateway,HttpRequest request);
     [[nodiscard]] static std::variant<HttpResponse, Pending>
-    begin(Gateway& gateway, HttpRequest request);
+    begin(Gateway& gateway, HttpRequest request,bool delegated=false);
     [[nodiscard]] static bool admitIdentity(Gateway& gateway,
         const session::AuthenticatedSession& authenticated);
     [[nodiscard]] static HttpResponse reject(const Gateway& gateway,
@@ -488,7 +489,8 @@ protected:
     [[nodiscard]] static std::variant<HttpResponse, GatewayForwardPlan>
     finish(Gateway& gateway, Pending pending,
            const session::AuthenticatedSession& authenticated,
-           const policy::AuthorizationDecision& decision);
+           const policy::AuthorizationDecision& decision,
+           const session::DelegatedAccess* delegated=nullptr);
 };
 
 }
