@@ -32,6 +32,7 @@ import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
+import openproof.identity.provider;
 import openproof.policy;
 import openproof.session;
 
@@ -1325,6 +1326,104 @@ TEST(BeastHttpIntegrationTest, ListenerAndReverseProxyRoundTrip)
         "first=one; Secure; HttpOnly", "second=two; Secure; HttpOnly"}));
 
     edgeServer.stop();
+    upstreamServer.stop();
+}
+
+class VerifiedProxyUpstream final : public gw::HttpHandler {
+public:
+    explicit VerifiedProxyUpstream(const gw::TrustedContextSigner& signer) : m_signer(&signer) {}
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest request) override
+    {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        const bool valid = m_signer->verify(request).has_value()
+            && request.header("x-openproof-identity") == std::optional<std::string_view>{"native-owner"}
+            && request.header("x-openproof-organization") == std::optional<std::string_view>{"tenant-a"}
+            && !request.header("authorization") && !request.header("cookie");
+        return gw::HttpResponse{valid ? 200 : 500, {}, valid ? "verified" : "invalid-context"};
+    }
+    std::atomic<int> calls{0};
+private:
+    const gw::TrustedContextSigner* m_signer;
+};
+
+TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermittedRequests)
+{
+    namespace idp = openproof::identity::provider;
+    namespace ids = openproof::identity::core;
+    CoreFixture core;
+    VerifiedProxyUpstream upstream{core.signer};
+    httpAdapter::BeastHttpServer upstreamServer{upstream, serverConfig()};
+    ASSERT_TRUE(upstreamServer.start());
+    gw::Router router;
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"native-proxy"}, gw::HttpMethod::Get,
+        "/proxy", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"}, pol::Resource{"upstream:/proxy"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"scoped-proxy"}, gw::HttpMethod::Get,
+        "/proxy/scoped", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.scoped"}, pol::Resource{"upstream:/proxy"}, "delegated.read").value()));
+    ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"}, {
+        gw::Endpoint::create(gw::EndpointId{"upstream"}, "127.0.0.1",
+            upstreamServer.boundPort(), false, 1U).value()}));
+    auto proxy = httpAdapter::BeastProxyTransport::create(
+        httpAdapter::ProxyConfig::create(8192U, 4096U).value());
+    ASSERT_TRUE(proxy);
+    gw::Gateway gateway{router, core.sessions, core.access, core.limiter,
+        core.discovery, core.balancer, core.circuits, *proxy.value(), core.signer,
+        std::chrono::seconds{2}};
+    SelectiveCoroutineHandler fallback;
+    std::atomic<int> verifications{0};
+    std::atomic<int> authorizations{0};
+    httpAdapter::CoroutineProtectedGatewayAdapter native{gateway, *proxy.value(), fallback,
+        [&](fnd::SecretString bearer) -> asio::awaitable<fnd::Result<sess::AuthenticatedSession>> {
+            verifications.fetch_add(1, std::memory_order_relaxed);
+            if (bearer.expose() != "fixture-valid" && bearer.expose() != "fixture-denied")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            const bool denied = bearer.expose() == "fixture-denied";
+            co_return sess::AuthenticatedSession::fromDelegatedAccess(
+                ids::IdentityId{denied ? "native-denied" : "native-owner"},
+                idp::ProviderId{"fixture"}, idp::AssuranceLevel::Ial2,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
+                kNow, kNow, kNow + std::chrono::hours{1});
+        },
+        [&](sess::AuthenticatedSession authenticated, gw::Route matched,
+            fnd::CorrelationId) -> asio::awaitable<pol::AuthorizationDecision> {
+            authorizations.fetch_add(1, std::memory_order_relaxed);
+            EXPECT_EQ(matched.organization().value(), "tenant-a");
+            EXPECT_EQ(matched.action().value(), "proxy.read");
+            if (authenticated.session().identity().value() == "native-owner")
+                co_return pol::AuthorizationDecision::allow("fixture permit");
+            co_return pol::AuthorizationDecision::deny("fixture denial");
+        }};
+    httpAdapter::BeastHttpServer server{native, serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto send = [&](std::string path, std::string bearer = {}) {
+        return sendRequest(server.boundPort(), beastHttp::verb::get,
+            std::move(path), {}, {}, {}, std::move(bearer));
+    };
+    EXPECT_EQ(send("/proxy/item").result_int(), 401U);
+    EXPECT_EQ(send("/proxy/item", "Bearer invalid").result_int(), 401U);
+    EXPECT_EQ(send("/proxy/item", "DPoP fixture-valid").result_int(), 401U);
+    EXPECT_EQ(send("/proxy/item", "Bearer fixture-denied").result_int(), 403U);
+    EXPECT_EQ(upstream.calls.load(), 0);
+    auto accepted = send("/proxy/item?key=value", "Bearer fixture-valid");
+    EXPECT_EQ(accepted.result_int(), 200U);
+    EXPECT_EQ(accepted.body(), "verified");
+    EXPECT_EQ(accepted.at("cache-control"), "no-store");
+    EXPECT_EQ(upstream.calls.load(), 1);
+    EXPECT_EQ(send("/proxy/scoped", "Bearer fixture-valid").body(), "legacy");
+    EXPECT_EQ(send("/proxy-other", "Bearer fixture-valid").body(), "legacy");
+    EXPECT_EQ(send("/native").body(), "native");
+    EXPECT_EQ(verifications.load(), 3);
+    EXPECT_EQ(authorizations.load(), 2);
+    EXPECT_EQ(fallback.synchronousCalls.load(), 2);
+    EXPECT_EQ(fallback.asynchronousCalls.load(), 1);
+    auto direct = gw::HttpRequest::create(gw::HttpMethod::Get, "/proxy/item",
+        {{"authorization", "Bearer fixture-valid"}}, {}, "127.0.0.1",
+        fnd::CorrelationId{"direct-sync"});
+    ASSERT_TRUE(direct);
+    EXPECT_EQ(native.handle(std::move(direct).value()).status(), 503);
+    EXPECT_EQ(upstream.calls.load(), 1);
+    server.stop();
     upstreamServer.stop();
 }
 

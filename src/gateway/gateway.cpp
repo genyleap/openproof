@@ -115,6 +115,19 @@ void stripTrustedIdentityHeaders(HttpRequest& request)
     for (const auto& name : names) request.eraseHeader(name);
 }
 
+void attachAuthenticatedHeaders(HttpRequest& request,
+    const session::AuthenticatedSession& accepted, const Route& route)
+{
+    request.setHeader("x-openproof-identity",
+                      std::string{accepted.session().identity().value()});
+    request.setHeader("x-openproof-provider",
+                      std::string{accepted.session().provider().value()});
+    request.setHeader("x-openproof-assurance",
+                      std::string{identity::provider::assuranceLevelName(
+                          accepted.session().assurance())});
+    request.setHeader("x-openproof-organization", std::string{route.organization().value()});
+}
+
 void secureResponse(HttpResponse& response)
 {
     for (std::string_view name : {"connection", "proxy-connection", "keep-alive",
@@ -925,15 +938,7 @@ Gateway::prepareForward(HttpRequest request)
         if (!decision.isPermitted()) {
             return errorResponse(foundation::Error{foundation::ErrorCode::PermissionDenied}, request);
         }
-        request.setHeader("x-openproof-identity",
-                          std::string{accepted.session().identity().value()});
-        request.setHeader("x-openproof-provider",
-                          std::string{accepted.session().provider().value()});
-        request.setHeader("x-openproof-assurance",
-                          std::string{identity::provider::assuranceLevelName(
-                              accepted.session().assurance())});
-        request.setHeader("x-openproof-organization",
-                          std::string{route->organization().value()});
+        attachAuthenticatedHeaders(request, accepted, route.value());
         if (delegated.has_value()) {
             request.setHeader("x-openproof-client-id", std::string{delegated->clientId()});
             std::string scopes;
@@ -944,18 +949,99 @@ Gateway::prepareForward(HttpRequest request)
             request.setHeader("x-openproof-scopes", std::move(scopes));
         }
     }
+    return completeForward(std::move(request), route.value());
+}
+
+std::variant<HttpResponse, GatewayForwardPlan>
+Gateway::completeForward(HttpRequest request, const Route& route)
+{
     request.setHeader("x-openproof-request-id",
                       std::string{request.correlation().value()});
     const foundation::Status sealed = m_contextSigner->seal(request);
     if (!sealed.has_value()) return errorResponse(sealed.error(), request);
 
-    auto endpoints = m_discovery->resolve(route->service());
+    auto endpoints = m_discovery->resolve(route.service());
     if (!endpoints.has_value()) return errorResponse(endpoints.error(), request);
     const std::size_t attempts = retryable(request.method())
         ? std::min<std::size_t>(2U, endpoints->size()) : 1U;
     return GatewayForwardPlan{
-        std::move(request), route->service(), std::move(endpoints).value(),
+        std::move(request), route.service(), std::move(endpoints).value(),
         attempts, m_upstreamTimeout};
+}
+
+bool GatewayNativePreparationSource::eligible(const Gateway& gateway,
+    const HttpRequest& request) noexcept
+{
+    try {
+        if (gateway.m_delegatedAccess != nullptr
+            || gateway.m_senderConstraintVerifier != nullptr
+            || (request.path() != "/proxy" && !request.path().starts_with("/proxy/")))
+            return false;
+        const auto route = gateway.m_router->match(request.method(), request.path());
+        return route && route->isProtected() && route->requiredScope().empty()
+            && route->requiredAudience().empty();
+    } catch (...) {
+        return false;
+    }
+}
+
+HttpResponse GatewayNativePreparationSource::reject(const Gateway& gateway,
+    const foundation::Error& error, HttpRequest request)
+{
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    request.wipeBody();
+    request.wipeTargetQuery();
+    return gateway.errorResponse(error, request);
+}
+
+std::variant<HttpResponse, GatewayNativePreparationSource::Pending>
+GatewayNativePreparationSource::begin(Gateway& gateway, HttpRequest request)
+{
+    if (!eligible(gateway, request))
+        return reject(gateway, foundation::Error{foundation::ErrorCode::Unavailable},
+                      std::move(request));
+    auto route = gateway.m_router->match(request.method(), request.path());
+    if (!route || !route->isProtected() || !route->requiredScope().empty()
+        || !route->requiredAudience().empty())
+        return reject(gateway, foundation::Error{foundation::ErrorCode::PermissionDenied},
+                      std::move(request));
+    if (!gateway.m_rateLimiter->allow(request.remoteAddress()))
+        return reject(gateway, foundation::Error{foundation::ErrorCode::RateLimited},
+                      std::move(request));
+    stripTrustedIdentityHeaders(request);
+    stripHopByHop(request);
+    const auto auth = request.header("authorization");
+    const bool dpop = auth && auth->starts_with("DPoP ");
+    auto credential = takeSessionCredential(request);
+    if (!credential || !credential->has_value())
+        return reject(gateway, credential
+            ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
+            : credential.error(), std::move(request));
+    if (dpop)
+        return reject(gateway, foundation::Error{foundation::ErrorCode::AuthenticationFailed},
+                      std::move(request));
+    return Pending{std::move(request), std::move(route).value(),
+                   std::move(credential->value())};
+}
+
+bool GatewayNativePreparationSource::admitIdentity(Gateway& gateway,
+    const session::AuthenticatedSession& authenticated)
+{
+    return gateway.m_rateLimiter->allow(
+        std::string{"identity:"} + authenticated.session().identity().value());
+}
+
+std::variant<HttpResponse, GatewayForwardPlan>
+GatewayNativePreparationSource::finish(Gateway& gateway, Pending pending,
+    const session::AuthenticatedSession& authenticated,
+    const policy::AuthorizationDecision& decision)
+{
+    if (!decision.isPermitted())
+        return reject(gateway, foundation::Error{foundation::ErrorCode::PermissionDenied},
+                      std::move(pending.request));
+    attachAuthenticatedHeaders(pending.request, authenticated, pending.route);
+    return gateway.completeForward(std::move(pending.request), pending.route);
 }
 
 std::optional<Endpoint> Gateway::nextForwardEndpoint(GatewayForwardPlan& plan)

@@ -110,7 +110,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   const sessionRepo = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer = app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
   const canonicalGate = app.indexOf(
-    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled) {", sessionIssuer);
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {", sessionIssuer);
   const canonical = app.indexOf("nativeCanonical = std::make_unique<", canonicalGate);
   const authGate = app.indexOf(
     "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {", canonical);
@@ -123,7 +123,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   assert.ok(canonical < authGate && authGate < transactions
     && transactions < nativeAuthentication);
   assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\s*\|\| nativeProtectedGatewayEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
@@ -138,4 +138,33 @@ test("loopback-native test implementations explicitly opt in", () => {
     const tail = gatewayTests.slice(start, gatewayTests.indexOf("\n};", start));
     assert.match(tail, /nativeEnabled\(\) const noexcept override \{ return true; \}/);
   }
+});
+
+test("native protected proxy is opt-in, first-party only and confined to its namespace", () => {
+  const app = read("apps/opp/main.cpp");
+  const domain = read("src/gateway/gateway.cpp");
+  const implementation = read("src/gateway/http_coroutine.cpp");
+  const start = domain.indexOf("bool GatewayNativePreparationSource::eligible(");
+  const end = domain.indexOf("HttpResponse GatewayNativePreparationSource::reject(", start);
+  assert.ok(start >= 0 && end > start);
+  const gate = domain.slice(start, end);
+  assert.match(gate, /m_delegatedAccess != nullptr/);
+  assert.match(gate, /m_senderConstraintVerifier != nullptr/);
+  assert.match(gate, /request\.path\(\) != "\/proxy" && !request\.path\(\)\.starts_with\("\/proxy\/"\)/);
+  assert.match(gate, /route->isProtected\(\) && route->requiredScope\(\)\.empty\(\)/);
+  assert.match(gate, /route->requiredAudience\(\)\.empty\(\)/);
+  const native = implementation.slice(implementation.indexOf("CoroutineProtectedGatewayAdapter::handleAsync("));
+  assert.ok(native.includes("co_await m_verify"));
+  assert.ok(native.includes("co_await m_authorize"));
+  assert.ok(native.includes("co_await m_transport->sendAsync"));
+  assert.ok(native.indexOf("co_await m_verify") < native.indexOf("co_await m_authorize"));
+  assert.ok(native.indexOf("co_await m_authorize") < native.indexOf("co_await m_transport->sendAsync"));
+  assert.doesNotMatch(native, /m_gateway->handle\(|m_fallback->handle\(|m_transport->send\(/);
+  assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY"\)/);
+  assert.match(app, /nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "1"/);
+  assert.match(app, /nativeProtectedGatewayEnabled\s*&& \(!platform\.auth\(\)\.enabled\(\) \|\| platform\.oidc\(\)\.enabled\(\)\)/);
+  assert.match(app, /co_await reader->readAuthorizationContextAsync/);
+  assert.match(app, /co_await sink->recordAsync/);
+  assert.match(app, /runListener\(platform, nativeGateway, logger\)/);
+  assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermittedRequests\)/);
 });

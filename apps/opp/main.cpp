@@ -46,6 +46,8 @@
 #include <boost/json.hpp>
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
+#include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
 #include "../../src/storage/postgres/coroutine_session_service.hpp"
 #include "../../src/storage/postgres/coroutine_session_listener.hpp"
@@ -1382,6 +1384,22 @@ addProtectedRoutes(gateway::Router& router,
 
     // Validate the experimental flag before opening any database connection
     // or applying migrations. An invalid opt-in must be side-effect-free.
+    const auto nativeProtectedGatewayFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY");
+    if (nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag != "0"
+        && *nativeProtectedGatewayFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeProtectedGatewayEnabled =
+        nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "1";
+    if (nativeProtectedGatewayEnabled
+        && (!platform.auth().enabled() || platform.oidc().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native protected gateway requires authentication without delegated OIDC."});
+        return ExitCode::ConfigurationError;
+    }
     const auto nativeLdapFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP");
     if (nativeLdapFlag && *nativeLdapFlag != "0" && *nativeLdapFlag != "1") {
@@ -1639,7 +1657,8 @@ addProtectedRoutes(gateway::Router& router,
     // another copy of that key for a disabled feature.
     std::optional<fnd::SecretString> nativeSessionSecret;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled || nativeFederatedStartEnabled)
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled
+        || nativeProtectedGatewayEnabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
@@ -2438,12 +2457,15 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
+    std::unique_ptr<postgres::CoroutineSessionAuthenticator> nativeGatewayVerifier;
+    std::unique_ptr<postgres::CoroutineAuthorizationDecisionSink> nativeGatewayAudit;
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
     std::unique_ptr<postgres::CoroutinePostgresRecoveryCodeRepository> nativeRecoveryRepository;
     std::optional<credentials::CoroutineRecoveryCodeService> nativeRecoveryCodes;
 #endif
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
-        || nativeAuthSessionEnabled || nativeFederatedStartEnabled) {
+        || nativeAuthSessionEnabled || nativeFederatedStartEnabled
+        || nativeProtectedGatewayEnabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2458,13 +2480,26 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionRepository>(
                 executor, platform.database().connectionString().clone(),
                 nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+        if (nativeProtectedGatewayEnabled) {
+            nativeGatewayVerifier = std::make_unique<postgres::CoroutineSessionAuthenticator>(
+                *nativeSessionRepository, clock, nativeSessionSecret->clone());
+            auto key = audit::AuditKey::create(authorizationAuditKey->secret().clone());
+            if (!key) {
+                reportStartupFailure(key.error());
+                return ExitCode::ConfigurationError;
+            }
+            nativeGatewayAudit = std::make_unique<postgres::CoroutineAuthorizationDecisionSink>(
+                executor, platform.database().connectionString().clone(),
+                std::move(key).value(), clock, nativeConnections,
+                acquireDeadline, connectDeadline, queryDeadline);
+        }
         nativeSessions = std::make_unique<
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
-            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled) {
+            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2592,6 +2627,7 @@ addProtectedRoutes(gateway::Router& router,
 
     operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
+    gateway::Gateway* nativeGatewayCore = nullptr;
 
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
@@ -2830,6 +2866,40 @@ addProtectedRoutes(gateway::Router& router,
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),
             std::move(nativeMethods)};
+        if (nativeProtectedGatewayEnabled) {
+            if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native protected gateway dependencies are unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            gatewayHttp::CoroutineProtectedGatewayAdapter nativeGateway{
+                *nativeGatewayCore, *proxy.value(), nativeRoutes,
+                [verifier = nativeGatewayVerifier.get()](fnd::SecretString bearer) {
+                    return verifier->verifyAsync(std::move(bearer));
+                },
+                [reader = nativeCanonical.get(), sink = nativeGatewayAudit.get(),
+                 engine = memberPolicy->get()](session::AuthenticatedSession authenticated,
+                    gateway::Route route, fnd::CorrelationId correlation)
+                    -> boost::asio::awaitable<policy::AuthorizationDecision> {
+                    auto context = co_await reader->readAuthorizationContextAsync(
+                        authenticated, route.organization(), route.action(), route.resource());
+                    auto decision = context
+                        ? policy::evaluateProtected(engine, context.value())
+                        : policy::AuthorizationDecision::indeterminate(
+                            "Trusted authorization context failed: "
+                            + std::string{context.error().internalDetail()});
+                    if (!decision.isPermitted()) {
+                        const auto recorded = co_await sink->recordAsync(
+                            std::move(authenticated), route.organization(), route.action(),
+                            route.resource(), decision, std::move(correlation));
+                        if (!recorded)
+                            co_return policy::AuthorizationDecision::indeterminate(
+                                "Authorization was denied and its security audit could not be persisted.");
+                    }
+                    co_return decision;
+                }};
+            return runListener(platform, nativeGateway, logger);
+        }
         return runListener(platform, nativeRoutes, logger);
     };
 
@@ -2929,6 +2999,7 @@ addProtectedRoutes(gateway::Router& router,
         gateway::Gateway gatewayCore{
             router, sessions, access, limiter.value(), discovery, loadBalancer,
             circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+        if (nativeProtectedGatewayEnabled) nativeGatewayCore = &gatewayCore;
         adminHttp::AdministrationHttpApi administrationApi{
             sessions, *administrationRepository.value(), identities, memberships,
             limiter.value(),
