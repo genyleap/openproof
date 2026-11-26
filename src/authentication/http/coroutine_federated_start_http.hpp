@@ -1,8 +1,8 @@
 #pragma once
 
 // Native OAuth2 login and connection start, including single-use browser
-// handoff. Delegated authentication and other provider families retain their
-// compatibility paths pending full coroutine acceptance.
+// handoff. Explicit account-scoped Bearer uses a separate verifier and
+// never starts a browser-bound provider ceremony without a one-time ticket.
 #include <functional>
 #include <optional>
 #include <string>
@@ -27,7 +27,8 @@ public:
         AuthenticationService& authentication,
         identity::provider::ProviderRegistry& providers,
         gateway::TokenBucketRateLimiter& limiter,
-        gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate = {});
+        gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate = {},
+        Authenticate authenticateBearer = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -46,6 +47,7 @@ private:
     gateway::TokenBucketRateLimiter* m_limiter;
     gateway::http::CoroutineHttpHandler* m_fallback;
     Authenticate m_authenticate;
+    Authenticate m_authenticateBearer;
 };
 
 } // namespace openproof::authentication::http

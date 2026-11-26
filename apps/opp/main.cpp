@@ -574,16 +574,6 @@ extern "C" void requestShutdown(int) noexcept
     g_shutdownRequested = 1;
 }
 
-// The old AccountService still supports non-delivery compatibility reads.
-// Never permit a legacy service to send a verification webhook.
-class RetiredVerificationDelivery final : public account::VerificationDelivery {
-public:
-    [[nodiscard]] fnd::Status deliver(const account::VerificationDispatch&) override
-    {
-        return fnd::fail(fnd::ErrorCode::Unavailable);
-    }
-};
-
 // Preserve local administration namespace ownership without constructing
 // any legacy SQL-backed HTTP administrator. Application-management routes
 // are handled by the outer application middleware before this boundary.
@@ -2871,7 +2861,6 @@ addProtectedRoutes(gateway::Router& router,
     }
     trustModel::TrustEngine evidenceTrust{identityProviderStore, clock, std::move(evidenceTrustPolicy)};
 
-    postgres::PostgresAccountRepository accountRepository{*pool.value()};
     postgres::PostgresScimDirectoryRepository scimDirectory{*pool.value()};
     scim::Service scimService{
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
@@ -3100,9 +3089,9 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
-            // Profile reads accept scoped native Bearer authentication.
-            // Profile writes remain method-scoped; Bearer writes retain
-            // their compatibility authorization until separately migrated.
+            nativePaths.emplace_back("/account/recover");
+            nativePaths.emplace_back("/account/security");
+            // All self-service account paths are strict native overlays.
         }
         if (nativeContactIssuer) {
             asyncContact=std::make_unique<accountHttp::CoroutineContactVerificationAdapter>(
@@ -3194,7 +3183,7 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeAuthentication, providers, limiter.value(), *nativeHandler,
                 [service=nativeSessions.get()](fnd::SecretString token) {
                     return service->authenticate(std::move(token));
-                });
+                },authenticateNativeWeb3);
             nativeHandler = asyncFederated.get();
             nativePaths.emplace_back("/auth/federated/start");
 
@@ -3235,25 +3224,22 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/account/connections/web3/complete");
         }
         if (nativeFederatedStartEnabled) {
-            nativeMethods.emplace_back("/account/connections/start",gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/connections/start");
+            nativePaths.emplace_back("/account/connections/handoff");
+            nativePaths.emplace_back("/account/connections/complete");
         }
         if (nativeAccountProfileEnabled) {
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Patch);
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Put);
+            nativePaths.emplace_back("/account/profile");
         }
         if (nativeAccountConnectionsEnabled) {
-            nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/connections");
             nativePaths.emplace_back("/account/connections/disconnect");
         }
         if (nativeAccountTotpStatusEnabled) {
-            nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/totp");
         }
         if (nativeLocalEnabled && nativeAccountEnabled && platform.account().enabled()) {
-            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/password/upgrade");
         }
         if (nativeAdminReadEnabled) {
             if (!nativeSessions || !nativeCanonical || !nativeAdminStore) {
@@ -3436,15 +3422,13 @@ addProtectedRoutes(gateway::Router& router,
         }
         auto nativeVerificationKey=account::VerificationKey::create(verificationMaterial->clone());
         auto signupKey=account::VerificationKey::create(verificationMaterial->clone());
-        auto verificationKey = account::VerificationKey::create(
-            std::move(verificationMaterial).value());
         auto accountPolicy = account::AccountPolicy::create(
             std::chrono::hours{24}, std::chrono::minutes{10},
             std::chrono::minutes{30}, 8U);
         auto deliveryProxyConfig = gatewayHttp::ProxyConfig::create(
             32U * 1024U, 256U * 1024U,
             std::string{platform.account().deliveryCaFile()});
-        if (!verificationKey || !nativeVerificationKey || !signupKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
+        if (!nativeVerificationKey || !signupKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
             reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
             return ExitCode::ConfigurationError;
         }
@@ -3454,7 +3438,6 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(deliveryTransport.error());
             return ExitCode::ConfigurationError;
         }
-        RetiredVerificationDelivery delivery;
         auto nativeDelivery=accountDelivery::createCoroutineWebhookVerificationDelivery(
             *deliveryTransport.value(),std::string{platform.account().deliveryHost()},
             platform.account().deliveryPort(),platform.account().deliveryTls(),
@@ -3487,15 +3470,9 @@ addProtectedRoutes(gateway::Router& router,
             [&contactStore](account::VerificationChallenge challenge,idp::ProviderId verificationProvider) {
                 return contactStore.replacePublicEmailAsync(std::move(challenge),std::move(verificationProvider));
             });
-        account::AccountService accountService{
-            identity::OrganizationId{std::string{platform.auth().organizationId()}},
-            providerId,
-            idp::ProviderId{std::string{platform.account().phoneProviderId()}},
-            identities, externalIdentities, identityProviderStore,
-            *accounts.value(), recoveryCodes.value(), accountRepository, sessions, clock,
-            std::move(verificationKey).value(), accountPolicy.value(), delivery};
-        accountHttp::AccountHttpApi accountApi{
-            accountService, authentication, sessions, limiter.value(), fallback, delegated};
+        // Namespace-only fallback: all account operations are native; no
+        // synchronous AccountService or verification repository is composed.
+        accountHttp::AccountHttpApi accountApi{limiter.value(),fallback};
         if (nativeSignupEnabled) {
             if (!nativeLocalPasswords || !nativeLocalAuthentication) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,

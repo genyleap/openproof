@@ -57,7 +57,10 @@ const checked = segments.map(([name, relative]) => {
     : relative === "src/authentication/http/admin.cpp"
       ? [relative, "src/authentication/http/coroutine_admin_read_http.cpp",
          "src/storage/postgres/coroutine_admin_store.cpp"]
-      : [relative];
+      : relative === "src/account/http/http.cpp"
+        ? [relative,"src/account/http/coroutine_session_http.cpp","src/account/http/account_pages.cpp",
+           "src/authentication/http/coroutine_federated_start_http.cpp"]
+        : [relative];
   const source = sourcePaths.map(file =>
     fs.readFileSync(path.join(root,file),"utf8")).join("\n");
   const executable = cppExecutableText(source);
@@ -203,9 +206,12 @@ const checked = segments.map(([name, relative]) => {
         expression:type+" native start and completion"});
     if (!app.includes("authApi, nullptr, true}")
         || !app.includes("authApi, &tokenService, true}")
-        || !app.includes('nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get)')
-        || !legacy.includes("if (m_nativeRedirectsRequired)")
-        || !legacy.includes("m_authentication->issueBrowserConnectionHandoff(*connectionTarget,")
+        || !app.includes('nativePaths.emplace_back("/account/connections/handoff")')
+        || !app.includes('nativePaths.emplace_back("/account/connections/start")')
+        || !legacy.includes('|| request.path()=="/account/connections/handoff"')
+        || !legacy.includes('|| request.path()=="/account/connections/start"')
+        || !nativeStart.includes("co_await m_authentication->issueBrowserConnectionHandoffAsync(")
+        || !nativeStart.includes("m_authenticateBearer")
         || !nativeStart.includes("co_await m_authentication->consumeBrowserConnectionHandoffAsync(")
         || !nativeStart.includes("co_await m_authentication->beginConnectionAsync(")
         || !nativeCallback.includes("co_await m_authentication->completeConnectionAsync("))
@@ -1104,6 +1110,50 @@ const checked = segments.map(([name, relative]) => {
        || /revokeOwnedSession\s*\(/.test(service))
       issues.push({line:0,kind:"native owned revocation still checks then revokes across await",
         expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
+  }
+  if(relative==="src/account/http/http.cpp"){
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    const http=fs.readFileSync(path.join(root,"src/account/http/coroutine_session_http.cpp"),"utf8");
+    const pages=fs.readFileSync(path.join(root,"src/account/http/account_pages.cpp"),"utf8");
+    const federation=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_start_http.cpp"),"utf8");
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const paths=["/account/sessions","/account/sessions/revoke","/account/recover","/account/security",
+      "/account/profile","/account/connections","/account/connections/disconnect","/account/totp",
+      "/account/password/upgrade","/account/signup","/account/email/verify","/account/email/change",
+      "/account/email/change/verify","/account/email/resend","/account/phone","/account/phone/verify",
+      "/account/password/forgot","/account/password/reset","/account/totp/start","/account/totp/complete",
+      "/account/totp/disable","/account/connections/start","/account/connections/complete",
+      "/account/connections/handoff","/account/connections/web3/start","/account/connections/web3/handoff",
+      "/account/connections/web3/complete"];
+    const strict=app.slice(app.indexOf('nativePaths.emplace_back("/account/sessions")'),
+      app.indexOf("if (nativeAdminReadEnabled) {",app.indexOf('nativePaths.emplace_back("/account/sessions")')));
+    const boundary=http.slice(http.indexOf("CoroutineAccountSessionAdapter::handleAsync("),
+      http.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+    const security=http.slice(http.indexOf("CoroutineAccountSessionAdapter::securityPage("),
+      http.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+    const confirm=http.slice(http.indexOf("CoroutineAccountSessionAdapter::passwordUpgradeConfirm("),
+      http.indexOf("CoroutineAccountSessionAdapter::profileUpdate("));
+    if(!/E::Unavailable/.test(legacy) || /m_accounts->|m_sessions->|m_authentication->|m_delegated->/.test(legacy)
+       || /account::AccountService accountService|PostgresAccountRepository accountRepository/.test(app)
+       || !/AccountHttpApi accountApi\{limiter.value\(\),fallback\}/.test(app)
+       || !paths.every(route=>strict.includes('"'+route+'"'))
+       || /nativeMethods\.emplace_back\("\/account\//.test(app)
+       || !/co_return renderRecoveryPage\(\)/.test(boundary)
+       || !/co_await securityPage\(/.test(boundary)
+       || !/co_await m_authenticate\(/.test(security)
+       || !/co_await m_readTotpStatus\(actor->identity\(\)\)/.test(security)
+       || !/status->first!=actor->identity\(\)/.test(security)
+       || !/co_return renderSecurityPage\(/.test(security)
+       || !/co_await m_authenticate\(/.test(confirm) || /m_authenticateReadBearer/.test(confirm)
+       || !/trustedPasswordUpgradeOrigin/.test(confirm)
+       || !/co_await m_disconnect\(/.test(http) || !/co_await m_updateProfile\(/.test(http)
+       || !/co_await m_authentication->issueBrowserConnectionHandoffAsync\(/.test(federation)
+       || !/co_await m_authentication->consumeBrowserConnectionHandoffAsync\(/.test(federation)
+       || !/m_authenticateBearer/.test(federation)
+       || /m_authentication->(?:issueBrowserConnectionHandoff|consumeBrowserConnectionHandoff|beginConnection)\(/.test(federation)
+       || /m_sessions->|m_accounts->|m_authentication->|co_await/.test(pages))
+      issues.push({line:0,kind:"account native lifecycle, strict dispatch or legacy retirement incomplete",
+        expression:"strict account paths -> native auth/storage and pure page renderers; no synchronous account service"});
   }
   if(relative==="src/authentication/http/admin.cpp"){
     // Scan both the retired ABI and the real HTTP + SQL implementations.

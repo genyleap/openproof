@@ -124,9 +124,15 @@ test("native federated redirect rejects before SQL without exposing a Location h
   const handler = block(nativeStart,
     "CoroutineFederatedStartAdapter::handleAsync(", null);
   assert.match(handler, /if \(!started\) co_return denied\(started.error\(\), request\)/);
-  assert.ok(handler.indexOf("if (!started)") <
-    handler.indexOf('gateway::HttpResponse response{'),
-    "No Location or cookies may be built after a rejected start");
+  const providerStart=handler.slice(handler.indexOf("CoroutineFederatedStartAdapter::startPrepared("));
+  assert.ok(providerStart.indexOf("if (!started)") <
+    providerStart.indexOf('gateway::HttpResponse response{'),
+    "No provider Location or cookies may be built before successful start");
+  const handoff=handler.slice(handler.indexOf("if (explicitBearer)"),
+    handler.indexOf("target.emplace(actor->identity())"));
+  assert.ok(handoff.indexOf("if (!issued)")>0 &&
+    handoff.indexOf("if (!issued)")<handoff.indexOf("gateway::HttpResponse response{"),
+    "No browser handoff Location may be built before durable issuance");
 });
 
 test("both native federation HTTP legs erase raw request secrets on early denial", () => {

@@ -146,7 +146,7 @@ test("native account lifecycle is mandatory and independent of LDAP", () => {
   assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
   assert.match(app, /nativeAccountConnectionsEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods\.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
+  assert.match(app, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths\.emplace_back\("\/account\/profile"\)/);
 });
 
 test("loopback-native test implementations explicitly opt in", () => {

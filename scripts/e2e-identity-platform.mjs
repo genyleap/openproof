@@ -1324,6 +1324,21 @@ async function main() {
       console.log("- native profile mutation: rollback, protected contacts and tenant ownership passed");
     }
 
+    if (nativeAccountRuntime) {
+      const recovery = await edgeRequest("/account/recover");
+      expectStatus(recovery,200);
+      assert.match(recovery.headers["content-security-policy"],/script-src 'nonce-/);
+      assert.match(recovery.body,/Reset your OpenProof password/);
+      const security = await edgeRequest("/account/security",{jar:consumerJar});
+      expectStatus(security,200);
+      assert.equal(security.headers["cache-control"],"no-store");
+      assert.match(security.headers["content-security-policy"],/frame-ancestors 'none'/);
+      assert.match(security.body,/Account Security/);
+      const unauthenticated = await edgeRequest("/account/security");
+      expectStatus(unauthenticated,303);
+      assert.equal(unauthenticated.headers.location,"/login?return_to=%2Faccount%2Fsecurity");
+    }
+
     const forgot = await jsonRequest("/account/password/forgot", "POST", {
       email: "consumer@e2e.invalid",
     });
@@ -1597,7 +1612,11 @@ async function main() {
     });
     expectStatus(connectionsWithoutScope, 403);
     if (nativeAccountRuntime) {
-      for (const route of ["/account/profile", "/account/connections"]) {
+      for (const route of ["/account/profile", "/account/connections", "/account/totp", "/account/password/upgrade"]) {
+        const allowed = await edgeRequest(route,{headers:{authorization:`Bearer ${nativeTokens.access_token}`}});
+        expectStatus(allowed,200);
+        const unscoped = await edgeRequest(route,{headers:{authorization:`Bearer ${profileOnlyTokens.access_token}`}});
+        expectStatus(unscoped,403);
         const proofWithoutVerifier = await edgeRequest(route, {
           headers: { authorization: `DPoP ${nativeTokens.access_token}` },
         });

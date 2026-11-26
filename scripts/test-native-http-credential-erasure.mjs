@@ -97,8 +97,9 @@ test("native and legacy account JSON handlers reject MIME prefix confusion", () 
   // The executable-only scanner erases string literal contents, so read
   // the raw method bodies for exact MIME-token validation.
   const native = method(accountRaw, "revokeTarget(", "CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(");
-  const legacy = method(legacyAccountRaw, "objectBody(", "trustedPasswordUpgradeOrigin(");
-  for (const source of [native, legacy]) {
+  assert.match(legacyAccountRaw,/E::Unavailable/);
+  assert.doesNotMatch(legacyAccountRaw,/m_accounts->|m_sessions->|json::parse/);
+  for (const source of [native]) {
     assert.match(source, /\*contentType != "application\/json"/);
     assert.match(source, /contentType->starts_with\("application\/json;"\)/);
     assert.doesNotMatch(source, /!contentType->starts_with\("application\/json"\)/);

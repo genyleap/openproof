@@ -10,9 +10,9 @@ const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 test("TOTP status is mandatory for enabled account API and read-only", () => {
   assert.match(app, /nativeAccountTotpStatusFlag && \*nativeAccountTotpStatusFlag == "1"/);
   assert.match(app, /nativeAccountTotpStatusEnabled\s*&& \(!nativeAccountEnabled \|\| !platform\.account\(\)\.enabled\(\)\)/);
-  assert.match(app, /nativeMethods\.emplace_back\("\/account\/totp", gateway::HttpMethod::Get\)/);
+  assert.match(app, /nativePaths\.emplace_back\("\/account\/totp"\)/);
   assert.match(app, /reader->readTotpStatusAsync\(std::move\(owner\), providerId\)/);
-  assert.match(http, /if \(totpStatusReadRoute\(request\)\) \{\s*return !request\.header\("authorization"\)\.has_value\(\)/);
+  assert.match(http, /if \(totpStatusReadRoute\(request\)\) \{\s*return \(!request\.header\("authorization"\)\.has_value\(\) \|\| m_authenticateReadBearer\)/);
 });
 test("status SQL is one tenant-scoped coroutine read and does not select secrets", () => {
   const start = sql.indexOf("CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(");
@@ -27,7 +27,7 @@ test("status SQL is one tenant-scoped coroutine read and does not select secrets
 });
 test("native status authorizes before lookup, validates owner and runs actual regressions", () => {
   const body = http.slice(http.indexOf("CoroutineAccountSessionAdapter::totpStatusRead("));
-  const authenticate = body.indexOf("co_await m_authenticate(");
+  const authenticate = body.indexOf("co_await authenticate(");
   const lookup = body.indexOf("co_await m_readTotpStatus(authenticated->identity())");
   const owner = body.indexOf("status->first != authenticated->identity()");
   const response = body.indexOf("co_return jsonResponse");

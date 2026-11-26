@@ -84,6 +84,8 @@ public:
         gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> securityPage(
+        gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionList(
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionRevoke(
@@ -116,8 +118,8 @@ private:
     ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
     ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
     UpdateProfile m_updateProfile;
-    // Profile/connection reads and explicit disconnect may use the account-
-    // scoped bearer verifier; session and credential mutations may not.
+    // Profile presentation, connection management and status reads may use
+    // scoped Bearer; password confirmation/session management do not.
     Authenticate m_authenticateReadBearer;
     Disconnect m_disconnect;
 };

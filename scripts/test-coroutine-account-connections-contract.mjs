@@ -14,13 +14,13 @@ const native = cppExecutableText(http);
 const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 
-test("connection reads are mandatory for enabled account API and method-scoped", () => {
+test("connection reads are mandatory for enabled account API and strict-path scoped", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadConnections readConnections = \{\}/);
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
   assert.match(main, /nativeAccountConnectionsFlag && \*nativeAccountConnectionsFlag == "1"/);
   assert.match(main, /nativeAccountConnectionsEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/connections", gateway::HttpMethod::Get\)/);
+  assert.match(main, /nativePaths.emplace_back\("\/account\/connections"\)/);
   assert.match(http, /request.method\(\) == gateway::HttpMethod::Get\s*&& request.path\(\) == "\/account\/connections"/);
   assert.match(http, /if \(connectionsReadRoute\(request\)\)[\s\S]*?\!request.header\("authorization"\).has_value\(\)/);
 });

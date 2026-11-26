@@ -727,9 +727,12 @@ reject startup. Explicit 1 is invalid if account management is disabled.
 Signup, contact challenge issuance and verification, password reset and TOTP
 mutation paths are exact native overlays. Unsupported methods or missing
 native capability fail closed instead of dispatching legacy credential SQL.
-Password hashing remains on the bounded KDF executor. Account profile
-mutations and other methods not yet fully migrated retain method-specific
-compatibility where documented.
+Password hashing remains on the bounded KDF executor. The account HTTP
+boundary has no synchronous AccountService or verification repository in
+the server composition root. All registered account paths use strict
+native overlays, including profile, session management, TOTP status,
+password upgrade, recovery and security pages, and connection ceremonies.
+Unsupported methods or unavailable capabilities fail closed.
 
 The native implementation verifies the session before a tenant-scoped,
 read-only asynchronous PostgreSQL query; it checks active identity and
@@ -739,13 +742,22 @@ The response retains the established JSON `connections` array, including
 numeric Farcaster `fid` and `profile_url` fields. No identity, provider
 connection, or authentication transaction is created by the read.
 
-When native account profile or connections reads are enabled, explicit
-Bearer credentials use the native account-scoped verifier. It checks the
-first-party session first, only tries delegated OAuth after an authentication
-failure, and requires an active, tenant-bound grant with the account scope.
-Sender-constrained tokens are rejected because these routes have no proof
-verification boundary. Cookie-only reads retain first-party verification;
-session and credential mutations do not use the new read verifier.
+Explicit Bearer credentials for profile reads/writes, connection reads,
+TOTP status and password-upgrade status use the native account-scoped
+verifier. It checks the first-party session first, only tries delegated
+OAuth after an authentication failure, and requires an active, tenant-bound
+grant with the account scope. Sender-constrained tokens are rejected
+because these routes have no proof verification boundary. Cookie reads
+retain first-party verification. Session management, password-upgrade
+confirmation, the authenticated security page and TOTP enrollment/disable
+require first-party sessions; password confirmation also requires the
+existing same-origin check and identity-wide rate limit.
+
+The public recovery page is rendered without storage access. The security
+page obtains owner-bound TOTP status asynchronously before rendering;
+unauthenticated requests redirect to sign-in and storage failures remain
+errors rather than being mistaken for unauthenticated users. Both retain
+the original HTML, per-response CSP nonce and no-store headers.
 POST `/account/connections/disconnect` also uses the account-scoped verifier
 for explicit Bearer credentials and the first-party verifier for cookies.
 The exact native overlay cannot dispatch to the synchronous detach service.
@@ -766,11 +778,13 @@ OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK accept unset or 1;
 setting either to 0 rejects startup. Native browser redirects support
 OAuth2 GET/form POST, OAuth1 GET and SAML POST, using the same durable
 transaction schema. GitHub, OIDC and X synchronous network SPIs are retired.
-Delegated Bearer connection start and handoff issuance retain their
-compatibility authorization path. Direct delegated connection start now
-redirects to a short-lived one-time local handoff URL; navigate to that URL
-in the browser without the Authorization header. Native redemption starts
-the external provider exchange and callback completion stays native. This
+Delegated Bearer connection start and handoff issuance use the native
+account-scoped verifier and asynchronous owner-bound transaction storage.
+Direct Bearer connection start redirects to a short-lived one-time local
+handoff URL; navigate to that URL in the browser without the Authorization
+header. Native redemption starts the external provider exchange and
+callback completion stays native. Native-required legacy federation
+dispatch denies account start, handoff and completion. This
 candidate is not approved for production until compiled, signed-assertion
 and full federation runtime acceptance are complete.
 
@@ -925,8 +939,8 @@ See `examples/openproof.toml` for a complete deployment sample.
 ### Native account TOTP status (coroutine branch only)
 
 `GET /account/totp` defaults to the native first-party cookie verifier in
-account-enabled runtimes. Requests carrying an Authorization header still
-retain compatibility dispatch. TOTP enrollment, replacement and disable use
+account-enabled runtimes. Explicit Bearer credentials are checked by the
+native account-scoped verifier. TOTP enrollment, replacement and disable use
 the strict native credential lifecycle described above.
 A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,

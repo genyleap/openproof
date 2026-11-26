@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Source-level guards complement, not replace, the GCC16 C++ socket tests.
-// The legacy AccountHttpApi remains a migration blocker until all routes
-// and persistence services are truly nonblocking.
+// The legacy AccountHttpApi now denies all account operations; independent
+// compiled C++ and PostgreSQL acceptance remain mandatory.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -29,6 +29,33 @@ test("Account HTTP opts in only native authenticated list and revoke", () => {
   assert.doesNotMatch(native, /m_legacyAccount->handle\s*\(/);
   assert.doesNotMatch(native, /m_sessions->(?:authenticate|list|revokeOwned)\s*\(/);
   assert.match(native, /co_await\s+m_asyncFallback->handleAsync\(/);
+});
+
+test("all account paths fail closed and browser renderers cannot access storage", () => {
+  const legacy=read("src/account/http/http.cpp");
+  const pages=read("src/account/http/account_pages.cpp");
+  const app=read("apps/opp/main.cpp");
+  assert.match(legacy,/E::Unavailable/);
+  assert.doesNotMatch(legacy,/m_accounts->|m_sessions->|m_authentication->|m_delegated->/);
+  assert.doesNotMatch(app,/account::AccountService accountService|PostgresAccountRepository accountRepository|nativeMethods\.emplace_back\("\/account\//);
+  assert.match(app,/AccountHttpApi accountApi\{limiter.value\(\),fallback\}/);
+  for(const route of ["/account/recover","/account/security","/account/profile",
+    "/account/totp","/account/password/upgrade","/account/connections/complete",
+    "/account/connections/handoff","/account/connections/start"])
+    assert.ok(app.includes('nativePaths.emplace_back("'+route+'")'),route);
+  assert.match(implementation,/co_return renderRecoveryPage\(\)/);
+  const security=implementation.slice(implementation.indexOf("CoroutineAccountSessionAdapter::securityPage("),
+    implementation.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+  assert.match(security,/co_await m_authenticate\(/);
+  assert.doesNotMatch(security,/m_authenticateReadBearer/);
+  assert.match(security,/co_await m_readTotpStatus\(actor->identity\(\)\)/);
+  assert.match(security,/status->first!=actor->identity\(\)/);
+  assert.match(security,/co_return renderSecurityPage\(/);
+  assert.equal((pages.match(/security::randomTokenBase64Url\(24U\)/g)??[]).length,2);
+  assert.equal((pages.match(/frame-ancestors 'none'/g)??[]).length,2);
+  assert.doesNotMatch(cppExecutableText(pages),/co_await|m_accounts->|m_sessions->|m_authentication->|PQexec/);
+  assert.match(read("tests/account/session_coroutine_http_test.cpp"),/NativeSecurityAndRecoveryPagesPreserveCspAndOwnerBoundary/);
+  assert.match(read("scripts/e2e-identity-platform.mjs"),/assert.match\(security.body,\/Account Security\//);
 });
 
 test("native session routes preserve bearer and operation authorization", () => {

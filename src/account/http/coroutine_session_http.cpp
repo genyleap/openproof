@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "coroutine_session_http.hpp"
+#include "account_pages.hpp"
 
 import openproof.identity.provider;
 
@@ -250,9 +251,14 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
         || request.path()=="/account/connections/web3/complete"
         || request.path()=="/account/connections/web3/handoff"
         || request.path()=="/account/connections/start"
+        || request.path()=="/account/connections/complete"
         || request.path()=="/account/connections/handoff") {
         return m_asyncFallback->nativeEnabledFor(request);
     }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/recover")
+        return true;
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/security")
+        return m_authenticate && m_readTotpStatus;
     if (profileReadRoute(request)) {
         // A separately injected account-scoped verifier admits Bearer reads.
         // Without it, preserve the standalone adapter's cookie-only contract.
@@ -261,7 +267,7 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
             && static_cast<bool>(m_readProfile);
     }
     if (profileUpdateRoute(request)) {
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate) && static_cast<bool>(m_updateProfile);
     }
     if (connectionsReadRoute(request)) {
@@ -274,17 +280,17 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
             && (!request.header("authorization").has_value() || m_authenticateReadBearer);
     }
     if (totpStatusReadRoute(request)) {
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readTotpStatus);
     }
     if (passwordUpgradeStatusReadRoute(request)) {
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readPasswordUpgradeStatus);
     }
     if (passwordUpgradeConfirmRoute(request)) {
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_confirmPasswordUpgrade);
     }
@@ -297,8 +303,9 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
 gateway::HttpResponse CoroutineAccountSessionAdapter::handle(
     gateway::HttpRequest request)
 {
-    // The existing synchronous AccountHttpApi remains the default ABI for
-    // every route until the listener explicitly selects this native adapter.
+    // Production supplies the namespace-only account denial boundary.
+    // Standalone callers can inject their own compatibility handler; native
+    // dispatch never invokes it.
     return m_legacyAccount->handle(std::move(request));
 }
 
@@ -331,6 +338,15 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
         if (passwordUpgradeConfirmRoute(request)) request.wipeBody();
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/recover") {
+        request.wipeBody();
+        request.wipeTargetQuery();
+        if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+            co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+        co_return renderRecoveryPage();
+    }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/security")
+        co_return co_await securityPage(std::move(request));
     if (sessionListRoute(request)) {
         co_return co_await sessionList(std::move(request));
     }
@@ -361,6 +377,40 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     // Only requests explicitly admitted by the downstream native handler
     // reach this branch; never invoke synchronous AccountHttpApi here.
     co_return co_await m_asyncFallback->handleAsync(std::move(request));
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::securityPage(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    request.wipeTargetQuery();
+    using E=foundation::ErrorCode;
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{E::RateLimited},request);
+    const auto redirect=[] {
+        return gateway::HttpResponse{303,gateway::Headers{
+            {"location","/login?return_to=%2Faccount%2Fsecurity"},
+            {"cache-control","no-store"},{"pragma","no-cache"},
+            {"x-content-type-options","nosniff"},{"referrer-policy","no-referrer"}},{}};
+    };
+    // Browser security pages accept only a first-party session; the
+    // delegated-account verifier is deliberately not consulted.
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return redirect();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential || !credential->has_value()) co_return redirect();
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) {
+        if (actor.error().code()==E::AuthenticationFailed || actor.error().code()==E::AuthenticationRequired)
+            co_return redirect();
+        co_return fail(actor.error(),request);
+    }
+    auto status=co_await m_readTotpStatus(actor->identity());
+    if (!status) co_return fail(status.error(),request);
+    if (status->first!=actor->identity()) co_return fail(foundation::Error{E::Unavailable},request);
+    co_return renderSecurityPage(status->second,identity::provider::meetsAssurance(
+        actor->assurance(),identity::provider::AssuranceLevel::Ial2));
 }
 
 asio::awaitable<gateway::HttpResponse>
@@ -602,11 +652,15 @@ CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value())
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto status = co_await m_readTotpStatus(authenticated->identity());
     if (!status) co_return fail(status.error(), request);
@@ -626,11 +680,15 @@ CoroutineAccountSessionAdapter::passwordUpgradeStatusRead(gateway::HttpRequest r
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value())
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto status = co_await m_readPasswordUpgradeStatus(authenticated->identity());
     if (!status) co_return fail(status.error(), request);
@@ -653,6 +711,8 @@ CoroutineAccountSessionAdapter::passwordUpgradeConfirm(gateway::HttpRequest requ
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
     if (!trustedPasswordUpgradeOrigin(request))
         co_return fail(foundation::Error{foundation::ErrorCode::PermissionDenied},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(),request);
     if (!credential->has_value())
@@ -681,11 +741,15 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
         +":"+std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential=gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(),request);
     if (!credential->has_value())
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
-    auto authenticated=co_await m_authenticate(std::move(credential->value()));
+    auto authenticated=co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(),request);
     const auto type=request.header("content-type");
     if (request.body().empty() || request.body().size()>32U*1024U || !type

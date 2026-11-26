@@ -15,7 +15,7 @@ const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 const main = read("apps/opp/main.cpp");
 
-test("native profile routes are method scoped and mandatory for enabled account API", () => {
+test("native profile routes are strict-path scoped and mandatory for enabled account API", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadProfile readProfile = \{\}/);
   assert.match(header, /nativeEnabled\(\) const noexcept override \{ return false; \}/);
@@ -24,7 +24,7 @@ test("native profile routes are method scoped and mandatory for enabled account 
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(main, /nativeAccountProfileFlag && \*nativeAccountProfileFlag == "1"/);
   assert.match(main, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
+  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths.emplace_back\("\/account\/profile"\)/);
   const overlay = read("src/gateway/http_coroutine.cpp");
   assert.match(overlay, /m_methodScopedNativePaths/);
   assert.match(overlay, /method == request\.method\(\)/);
@@ -139,7 +139,7 @@ test("profile mutation locks the owner and profile and only writes presentation 
     body.indexOf("RETURNING identity_id"));
   for (const forbidden of ["email", "phone_number", "created_at", "password_hash"])
     assert.ok(!mutation.includes(forbidden), forbidden);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Patch\)/);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Put\)/);
+  assert.match(main, /nativePaths.emplace_back\("\/account\/profile"\)/);
+  assert.match(account,/request.method\(\)==gateway::HttpMethod::Patch \|\| request.method\(\)==gateway::HttpMethod::Put/);
   assert.match(account, /co_await m_updateProfile\(authenticated->identity\(\)/);
 });

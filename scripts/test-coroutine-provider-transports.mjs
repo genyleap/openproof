@@ -72,13 +72,17 @@ for (const item of cases) {
   });
 }
 
-test("runtime delegated federation initiation issues a handoff instead of blocking provider I/O",()=>{
+test("runtime delegated federation initiation issues a native handoff instead of blocking provider I/O",()=>{
   const source=fs.readFileSync(path.join(root,"src/authentication/http/federated.cpp"),"utf8");
-  const runtime=source.slice(source.indexOf("if (m_nativeRedirectsRequired) {"),
-    source.indexOf("return startPrepared(std::move(request), idp::ProviderId{providerIt->second}"));
-  assert.match(runtime,/issueBrowserConnectionHandoff\(\*connectionTarget,/);
-  assert.match(runtime,/\/account\/connections\/handoff\?ticket=/);
-  assert.doesNotMatch(runtime,/beginConnection\(|beginAuthentication\(|completeAuthentication\(/);
+  const entry=source.slice(source.indexOf("FederatedAuthenticationHttpApi::handle("),source.indexOf("FederatedAuthenticationHttpApi::connectionComplete("));
+  assert.match(entry,/m_nativeRedirectsRequired/);
+  assert.match(entry,/request.path\(\)=="\/account\/connections\/handoff"/);
+  assert.match(entry,/request.path\(\)=="\/account\/connections\/start"/);
+  assert.match(entry,/ErrorCode::Unavailable/);
+  const native=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_start_http.cpp"),"utf8");
+  assert.match(native,/co_await m_authentication->issueBrowserConnectionHandoffAsync\(/);
+  assert.match(native,/\/account\/connections\/handoff\?ticket=/);
+  assert.doesNotMatch(native,/m_authentication->(?:beginConnection|beginAuthentication|issueBrowserConnectionHandoff)\(/);
   const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
   assert.match(app,/authApi, nullptr, true\}/);
   assert.match(app,/authApi, &tokenService, true\}/);

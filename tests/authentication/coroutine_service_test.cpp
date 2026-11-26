@@ -1337,9 +1337,37 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedConnectionHandoffIsSingleUseAn
                 idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
                 kNow,sess::TokenDigest{binding("fixture-session")},kNow,
                 std::chrono::hours{8},std::chrono::minutes{30});
+        },
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="scoped-fixture")
+                co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+            co_return sess::Session::create(sess::SessionId{"delegated-link-session"},
+                ids::IdentityId{"canonical-identity"},idp::ProviderId{"local"},
+                idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+                kNow,sess::TokenDigest{binding("scoped-fixture")},kNow,
+                std::chrono::hours{8},std::chrono::minutes{30});
         }};
     FederatedNativeSessionIssuer issuer;
     auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,fallback};
+    const auto bearerStart=[&](std::string authHeader) {
+        return invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Get,
+            "/account/connections/start?provider=async-test&return_to=%2Faccount",
+            {{"authorization",std::move(authHeader)}},{},"127.0.0.1",
+            fnd::CorrelationId{"scoped-handoff"}).value());
+    };
+    EXPECT_EQ(bearerStart("Bearer no-scope-fixture").status(),403);
+    EXPECT_EQ(bearerStart("DPoP scoped-fixture").status(),401);
+    const auto bearerTicket=bearerStart("Bearer scoped-fixture");
+    ASSERT_EQ(bearerTicket.status(),302);
+    EXPECT_TRUE(bearerTicket.headers().at("location").starts_with("/account/connections/handoff?ticket="));
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
+    const auto bearerPost=invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
+        "/account/connections/handoff",{{"authorization","Bearer scoped-fixture"},{"content-type","application/json"}},
+        R"({"provider":"async-test","return_to":"/account"})","127.0.0.1",fnd::CorrelationId{"scoped-handoff-post"}).value());
+    EXPECT_EQ(bearerPost.status(),201);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
+    EXPECT_EQ(invokeFederated(start,makeFederatedStart("/account/connections/complete")).status(),204);
     auto issue=[&](std::string token){
         return invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
             "/account/connections/handoff",

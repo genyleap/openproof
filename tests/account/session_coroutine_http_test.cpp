@@ -663,12 +663,47 @@ TEST(AccountCoroutineSessionHttpTest, ScopedBearerReadsNeverDelegateSessionOrCre
     EXPECT_EQ(f.run(profileCookieRequest()).status(), 200);
     EXPECT_EQ(f.authenticationCalls, 1);
     EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/sessions", "delegated-fixture")).status(), 401);
-    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Patch, "/account/profile", "delegated-fixture")));
-    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get, "/account/totp", "delegated-fixture")));
-    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post, "/account/password/upgrade", "delegated-fixture")));
-    EXPECT_EQ(f.scopedBearerCalls, 8);
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Patch, "/account/profile", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get, "/account/totp", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post, "/account/password/upgrade", "delegated-fixture")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/totp","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/password/upgrade","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","no-scope-fixture",R"({"display_name":"denied"})")).status(),403);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","delegated-fixture",R"({"display_name":"Allowed"})")).status(),200);
+    auto delegatedUpgrade=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/password/upgrade",
+        {{"authorization","Bearer delegated-fixture"},{"host","example.invalid"},{"origin","https://example.invalid"},
+            {"sec-fetch-site","same-origin"},{"content-type","application/json"}},
+        R"({"password":"fixture-password"})","127.0.0.1",fnd::CorrelationId{"delegated-upgrade"}).value();
+    EXPECT_EQ(f.run(std::move(delegatedUpgrade)).status(),401);
+    EXPECT_EQ(f.passwordConfirmCalls,0);
+    EXPECT_EQ(f.scopedBearerCalls, 12);
     EXPECT_EQ(f.listCalls, 0);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeSecurityAndRecoveryPagesPreserveCspAndOwnerBoundary)
+{
+    Fixture f{false,false,true,false,false,false,true};
+    auto recovery=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    ASSERT_EQ(recovery.status(),200);
+    EXPECT_EQ(recovery.headers().at("cache-control"),"no-store");
+    EXPECT_NE(recovery.headers().at("content-security-policy").find("frame-ancestors 'none'"),std::string::npos);
+    EXPECT_NE(recovery.body().find("/account/password/reset"),std::string::npos);
+    auto recoveryAgain=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    EXPECT_NE(recovery.headers().at("content-security-policy"),recoveryAgain.headers().at("content-security-policy"));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security")).status(),303);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","delegated-fixture")).status(),303);
+    EXPECT_EQ(f.totpStatusCalls,0);
+    auto security=f.run(request(gw::HttpMethod::Get,"/account/security","valid-token"));
+    ASSERT_EQ(security.status(),200);
+    EXPECT_NE(security.body().find("Account Security"),std::string::npos);
+    EXPECT_NE(security.headers().at("content-security-policy").find("script-src 'nonce-"),std::string::npos);
+    EXPECT_EQ(security.body().find("valid-token"),std::string::npos);
+    EXPECT_EQ(f.totpStatusCalls,1);
+    f.totpForeign=true;
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","valid-token")).status(),503);
+    EXPECT_EQ(f.scopedBearerCalls,0);
+    EXPECT_EQ(f.legacy.invoked,0);
 }
 
 TEST(AccountCoroutineSessionHttpTest, NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack)
