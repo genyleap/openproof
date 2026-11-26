@@ -43,6 +43,7 @@ started=1
 # Never mutate a preexisting cluster or use credentials from the environment.
 for migration in \
     0001_identity_auth_gateway.sql \
+    0002_memberships.sql \
     0003_identity_provider.sql \
     0005_account_lifecycle.sql \
     0018_profile_avatar_sources.sql; do
