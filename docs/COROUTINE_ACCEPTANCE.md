@@ -4595,3 +4595,21 @@ overlays retain their own flags. The disposable LDAP HTTP workload also
 enables local login and recovery redemption; ordinary baseline remains
 unchanged. Full executable build and real HTTP acceptance are required
 before changing the default. Production remains NOT_APPROVED.
+
+
+### Local disposable Docker HTTP acceptance
+
+The existing identity-platform E2E now additionally tests native local
+unknown and locked subjects, wrong password, cross-browser binding,
+one-time challenge replay, no implicit provisioning, atomic same-browser
+session replacement, and missing/replayed TOTP. These checks run only
+with the native local pilot enabled.
+
+On a restricted development server with Docker and a locally installed
+postgres:16 image, use scripts/run-local-native-login-e2e.py --opp
+PATH_TO_BUILT_OPP. The wrapper creates a unique, memory/CPU-limited
+loopback-only database, checks that it is empty, passes only test
+configuration to the existing E2E, then removes the container and its
+anonymous volume. Use --probe-only to validate creation and cleanup
+without a built executable. This probe is not HTTP acceptance. The
+local workload is for correctness, not comparative throughput.

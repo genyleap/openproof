@@ -1073,6 +1073,74 @@ async function main() {
 
     const consumerJar = new CookieJar();
     const consumerGrant = await login("consumer@e2e.invalid", consumerPassword, consumerJar);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1") {
+      assert.equal(consumerGrant.assurance, "ial1");
+      const sql = statement => command("psql", [
+        databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c", statement,
+      ]).trim();
+      const counts = () => sql("SELECT (SELECT count(*) FROM openproof.identities), " +
+        "(SELECT count(*) FROM openproof.external_identities), " +
+        "(SELECT count(*) FROM openproof.sessions)");
+      const active = () => Number(sql("SELECT count(*) FROM openproof.sessions s " +
+        "JOIN openproof.external_identities e ON e.identity_id=s.identity_id " +
+        "WHERE e.provider='local' AND e.external_subject='consumer@e2e.invalid' AND s.state=0"));
+      async function startLocal(subject, jar) {
+        const result = await jsonRequest("/auth/login", "POST", { subject }, jar);
+        expectStatus(result, 202);
+        assert.equal(result.headers["cache-control"], "no-store");
+        return jsonBody(result);
+      }
+      function completeLocal(challenge, password, jar, extraHeaders = {}) {
+        return jsonRequest("/auth/mfa/verify", "POST", {
+          transaction_id: challenge.transaction_id, challenge_id: challenge.challenge_id, password,
+        }, jar, extraHeaders);
+      }
+      const before = counts();
+      const beforeActive = active();
+      const unknownJar = new CookieJar();
+      const unknown = await startLocal("native-local-unlinked@e2e.invalid", unknownJar);
+      expectStatus(await completeLocal(unknown, consumerPassword, unknownJar), 401);
+
+      const failed = await startLocal("consumer@e2e.invalid", consumerJar);
+      const failedCookie = consumerJar.header();
+      expectStatus(await completeLocal(failed, "intentionally-invalid-fixture-password", consumerJar), 401);
+      expectStatus(await completeLocal(failed, consumerPassword, undefined, { cookie: failedCookie }), 401);
+      expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 200);
+
+      const browserA = new CookieJar();
+      const browserB = new CookieJar();
+      const boundA = await startLocal("consumer@e2e.invalid", browserA);
+      await startLocal("consumer@e2e.invalid", browserB);
+      expectStatus(await completeLocal(boundA, consumerPassword, browserB), 401);
+
+      const lockedJar = new CookieJar();
+      const locked = await startLocal("consumer@e2e.invalid", lockedJar);
+      sql("UPDATE openproof.identities SET status=2 WHERE id=(SELECT identity_id " +
+        "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid')");
+      try {
+        expectStatus(await completeLocal(locked, consumerPassword, lockedJar), 401);
+      } finally {
+        sql("UPDATE openproof.identities SET status=0 WHERE id=(SELECT identity_id " +
+          "FROM openproof.external_identities WHERE provider='local' AND external_subject='consumer@e2e.invalid')");
+      }
+      assert.equal(counts(), before, "rejected local proof created identity/link/session rows");
+      assert.equal(active(), beforeActive);
+
+      const oldCookie = consumerJar.header();
+      const replacement = await startLocal("consumer@e2e.invalid", consumerJar);
+      const replayCookie = consumerJar.header();
+      const completed = await completeLocal(replacement, consumerPassword, consumerJar);
+      expectStatus(completed, 200);
+      assert.equal(jsonBody(completed).assurance, "ial1");
+      assert.notEqual(jsonBody(completed).session_id, consumerGrant.session_id);
+      const replacedCounts = counts();
+      expectStatus(await completeLocal(replacement, consumerPassword, undefined, { cookie: replayCookie }), 401);
+      assert.equal(counts(), replacedCounts);
+      expectStatus(await edgeRequest("/account/profile", { headers: { cookie: oldCookie } }), 401);
+      expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 200);
+      assert.equal(active(), beforeActive, "same-browser local login must atomically replace the session");
+      console.log("- native local HTTP: unknown/locked subject, invalid password, binding, replay, no provisioning and session replacement passed");
+    }
     if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
       expectStatus(await edgeRequest("/account/totp"), 401);
       const status = await edgeRequest("/account/totp", { jar: consumerJar });
@@ -1185,6 +1253,27 @@ async function main() {
     const ownerGrant = await login(
       "owner@e2e.invalid", ownerPassword, ownerJar, initialOwnerTotp);
     assert.equal(ownerGrant.assurance, "ial2");
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1") {
+      const countOwnerSessions = () => command("psql", [
+        databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT count(*) FROM openproof.sessions WHERE identity_id='e2e-owner'",
+      ]).trim();
+      const before = countOwnerSessions();
+      for (const factor of [{}, { totp: initialOwnerTotp }]) {
+        const jar = new CookieJar();
+        const started = await jsonRequest("/auth/login", "POST", { subject: "owner@e2e.invalid" }, jar);
+        expectStatus(started, 202);
+        const challenge = jsonBody(started);
+        const denied = await jsonRequest("/auth/mfa/verify", "POST", {
+          transaction_id: challenge.transaction_id, challenge_id: challenge.challenge_id,
+          password: ownerPassword, ...factor,
+        }, jar);
+        expectStatus(denied, 401);
+        expectStatus(await edgeRequest("/account/profile", { jar }), 401);
+      }
+      assert.equal(countOwnerSessions(), before);
+      console.log("- native local MFA: missing second factor and previously consumed TOTP denied");
+    }
     if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
       const status = await edgeRequest("/account/totp", { jar: ownerJar });
       expectStatus(status, 200);

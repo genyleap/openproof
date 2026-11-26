@@ -26,8 +26,14 @@ test("runtime injects genuine native session and tenant-scoped eligibility, neve
   assert.doesNotMatch(http, /m_nativeFallback->handle\(/);
   assert.match(read("tests/authentication/coroutine_recovery_code_http_test.cpp"), /OtherNativeAuthCapabilityIsPreserved/);
 });
-test("CI exercises two real database E2Es and legacy one-time redemption", () => {
-  assert.equal((read(".github/workflows/ci.yml").match(/OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/g) ?? []).length, 2);
+test("CI exercises two legacy redemption workloads and the separate native local pilot", () => {
+  const ci = read(".github/workflows/ci.yml");
+  assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/g) ?? []).length, 3);
+  const pilot = ci.slice(ci.indexOf("- name: Native LDAP TLS and PostgreSQL HTTP E2E"),
+    ci.indexOf("- name: Isolated OpenProof PostgreSQL E2E"));
+  assert.match(pilot, /OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"/);
+  assert.match(pilot, /OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/);
+  assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"/g) ?? []).length, 1);
   const e2e = read("scripts/e2e-identity-platform.mjs");
   assert.match(e2e, /await recover\(old\[0\], 401\)/);
   assert.match(e2e, /await recover\(fresh\[0\], 200\)/);

@@ -76,7 +76,7 @@ test("profile route is isolated from OAuth transaction provisioning", () => {
     main.indexOf("std::optional<passkey::PasskeyService>"));
   assert.ok(native.indexOf("nativeCanonical = std::make_unique<") <
     native.indexOf("nativeTransactions = std::make_unique<"));
-  assert.match(native, /if \(nativeLdapEnabled \|\| nativeWeb3Enabled \|\| nativeFederatedStartEnabled\) \{\s*nativeTransactions/);
+  assert.match(native, /if \(nativeLdapEnabled \|\| nativeWeb3Enabled \|\| nativeFederatedStartEnabled \|\| nativeLocalEnabled\) \{\s*nativeTransactions/);
   assert.match(main, /reader->readProfileAsync\(std::move\(owner\)\)/);
 });
 
