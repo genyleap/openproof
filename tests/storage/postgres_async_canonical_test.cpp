@@ -890,10 +890,14 @@ asio::awaitable<ProfileReadChecks> verifyTenantScopedProfileRead(
         std::string{"Must roll back"},std::nullopt,std::nullopt,std::nullopt,
         std::string{"missing-avatar-provider"},updatedAt);
     EXPECT_FALSE(denied);
-    if (!denied) EXPECT_EQ(denied.error().code(),fnd::ErrorCode::InvalidArgument);
+    if (!denied) {
+        EXPECT_EQ(denied.error().code(),fnd::ErrorCode::InvalidArgument);
+    }
     auto persisted=co_await canonical.readProfileAsync(ids::IdentityId{seed.owner});
     EXPECT_TRUE(persisted);
-    if (persisted) EXPECT_EQ(persisted->displayName(),std::optional<std::string>{"Native self-service"});
+    if (persisted) {
+        EXPECT_EQ(persisted->displayName(),std::optional<std::string>{"Native self-service"});
+    }
     auto deniedWrite=co_await wrongTenant.updateProfileAsync(ids::IdentityId{seed.owner},
         std::string{"foreign"},std::nullopt,std::nullopt,std::nullopt,std::nullopt,updatedAt);
     EXPECT_FALSE(deniedWrite);
