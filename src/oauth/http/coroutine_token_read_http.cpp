@@ -9,6 +9,7 @@
 #include "coroutine_token_read_http.hpp"
 
 import openproof.security;
+import openproof.client;
 
 namespace openproof::oauth::http {
 namespace asio=boost::asio;
@@ -122,6 +123,68 @@ bool refreshRoute(const gateway::HttpRequest& r) noexcept {
 bool codeRoute(const gateway::HttpRequest& r) noexcept {
     return grantRoute(r,"authorization_code");
 }
+constexpr std::string_view kExchangeGrant="urn:ietf:params:oauth:grant-type:token-exchange";
+constexpr std::string_view kAccessType="urn:ietf:params:oauth:token-type:access_token";
+bool machineRoute(const gateway::HttpRequest& r) noexcept {
+    return grantRoute(r,"client_credentials") || grantRoute(r,kExchangeGrant);
+}
+struct MachineForm final {
+    std::string clientId,audience;
+    foundation::SecretString secret;
+    std::optional<foundation::SecretString> subject;
+    std::vector<std::string> scopes;
+};
+foundation::Result<MachineForm> machineForm(gateway::HttpRequest& r) {
+    const auto type=r.header("content-type");
+    if (!type || (*type!="application/x-www-form-urlencoded" &&
+        !type->starts_with("application/x-www-form-urlencoded;"))
+        || r.body().empty() || r.body().size()>16U*1024U)
+        return foundation::fail(E::InvalidArgument);
+    auto input=std::string_view{r.body()};
+    std::optional<foundation::SecretString> id,secret,subject,subjectType,resource,scope,grant;
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto part=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (part.empty()) continue;
+        const auto eq=part.find('=');
+        if (eq==std::string_view::npos) return foundation::fail(E::InvalidArgument);
+        auto key=decode(part.substr(0,eq),128U);
+        if (!key) return foundation::fail(key.error());
+        const auto name=key->expose();
+        auto* dest=name=="client_id"?&id:name=="client_secret"?&secret:
+            name=="subject_token"?&subject:name=="subject_token_type"?&subjectType:
+            name=="resource"?&resource:name=="scope"?&scope:name=="grant_type"?&grant:nullptr;
+        if (!dest || dest->has_value()) return foundation::fail(E::InvalidArgument);
+        auto value=decode(part.substr(eq+1U),name=="scope"?8192U:name=="resource"?2048U:
+            name=="client_secret"||name=="subject_token"?512U:256U);
+        if (!value) return foundation::fail(value.error());
+        dest->emplace(std::move(value).value());
+    }
+    if (!id || id->empty() || !grant) return foundation::fail(E::InvalidArgument);
+    const bool exchange=grant->expose()==kExchangeGrant;
+    if ((!exchange && grant->expose()!="client_credentials")
+        || (exchange && (!subject || subject->empty() || !subjectType || subjectType->expose()!=kAccessType))
+        || (!exchange && (subject || subjectType))) return foundation::fail(E::InvalidArgument);
+    if (!resource || resource->empty()) return foundation::fail(E::NotFound);
+    std::vector<std::string> scopes;
+    if (scope) {
+        std::string_view remaining{scope->expose()};
+        while (!remaining.empty()) {
+            const auto space=remaining.find(' ');
+            const auto value=remaining.substr(0,space);
+            if (space==std::string_view::npos) remaining={}; else remaining.remove_prefix(space+1U);
+            if (value.empty()) continue;
+            if (scopes.size()>=256U || !client::Scope::create(std::string{value}))
+                return foundation::fail(E::PermissionDenied);
+            scopes.emplace_back(value);
+        }
+    }
+    MachineForm result{std::string{id->expose()},std::string{resource->expose()},
+        secret?std::move(*secret):foundation::SecretString{},std::move(subject),std::move(scopes)};
+    r.wipeBody();
+    return result;
+}
 struct CodeForm final {
     std::string clientId,redirectUri;
     foundation::SecretString secret,code,verifier;
@@ -206,25 +269,26 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     foundation::SecretString clientKey,ReadAccess access,AuthenticateClient client,
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
-    std::optional<CodeExchangeContext> codeExchange)
+    std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
-      m_codeExchange(std::move(codeExchange)) {}
+      m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
     if (revokeRoute(r)) return static_cast<bool>(m_revoke);
     if (refreshRoute(r)) return m_rotate && m_prepareSender;
     if (codeRoute(r)) return m_codeExchange && m_codeExchange->exchange && m_prepareSender;
+    if (machineRoute(r)) return m_issueMachine && m_prepareSender;
     return m_fallback->nativeEnabledFor(r);
 }
 gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) {
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -242,6 +306,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (revokeRoute(r)) co_return co_await revoke(std::move(r));
     if (refreshRoute(r)) co_return co_await refresh(std::move(r));
     if (codeRoute(r)) co_return co_await exchangeCode(std::move(r));
+    if (machineRoute(r)) co_return co_await issueMachine(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -469,6 +534,74 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::exchangeCode(g
         .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(m_accessLifetime).count()))
         .add("scope",joined(exchanged->scopes));
     if (exchanged->idToken) body.add("id_token",exchanged->idToken->expose());
+    co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    const auto oauthError=[](int status,std::string_view code) {
+        foundation::JsonObjectWriter body;
+        body.add("error",code);
+        return json(status,std::move(body));
+    };
+    auto input=machineForm(r);
+    if (!input) {
+        if (input.error().code()==E::NotFound) co_return oauthError(400,"invalid_target");
+        if (input.error().code()==E::PermissionDenied) co_return oauthError(400,"invalid_scope");
+        co_return oauthError(400,"invalid_request");
+    }
+    const bool exchange=input->subject.has_value();
+    r.wipeAuthorizationHeader(); r.wipeCookieHeader();
+    std::optional<std::string> clientDigest,subjectDigest;
+    if (!input->secret.empty()) {
+        auto digest=security::hmacSha256(m_clientKey,input->secret.expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        clientDigest.emplace(foundation::toHex(digest.value()));
+    }
+    if (input->subject) {
+        auto digest=security::hmacSha256(m_tokenKey,input->subject->expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        subjectDigest.emplace(foundation::toHex(digest.value()));
+    }
+    input->secret=foundation::SecretString{};
+    input->subject.reset();
+    auto proof=m_prepareSender(r);
+    r.wipeTargetQuery();
+    auto sender=co_await std::move(proof);
+    if (!sender) co_return sender.error().code()==E::Unavailable
+        ?oauthError(503,"temporarily_unavailable"):oauthError(400,"invalid_dpop_proof");
+    std::optional<session::DelegatedSenderConstraint> binding;
+    if (sender->has_value())
+        binding.emplace(sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls,
+            std::string{sender->value().value()});
+    auto family=security::randomTokenBase64Url(24U);
+    auto accessRaw=security::randomTokenBase64Url(32U);
+    if (!accessRaw) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString access{std::string{"opa_"}+accessRaw.value()};
+    foundation::secureWipe(accessRaw->data(),accessRaw->size());
+    const auto accessDigest=security::hmacSha256(m_tokenKey,access.expose());
+    if (!family || !accessDigest) co_return oauthError(503,"temporarily_unavailable");
+    auto issued=co_await m_issueMachine(std::move(input->clientId),std::move(clientDigest),
+        std::move(subjectDigest),std::move(input->audience),std::move(input->scopes),
+        std::move(family).value(),foundation::toHex(accessDigest.value()),std::move(binding));
+    if (!issued) {
+        switch (issued.error().code()) {
+        case E::AuthenticationRequired: co_return oauthError(401,"invalid_client");
+        case E::AuthenticationFailed: co_return oauthError(400,"invalid_grant");
+        case E::FailedPrecondition: co_return oauthError(400,"unauthorized_client");
+        case E::PermissionDenied: co_return oauthError(400,"invalid_scope");
+        case E::NotFound: co_return oauthError(400,"invalid_target");
+        case E::InvalidArgument: co_return oauthError(400,"invalid_request");
+        default: co_return oauthError(503,"temporarily_unavailable");
+        }
+    }
+    foundation::JsonObjectWriter body;
+    body.add("access_token",access.expose())
+        .add("token_type",sender->has_value() && sender->value().kind()==token::SenderConstraintKind::Dpop
+            ?"DPoP":"Bearer")
+        .add("expires_in",static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(issued->expiresIn).count()))
+        .add("scope",joined(issued->scopes));
+    if (exchange) body.add("issued_token_type",kAccessType);
     co_return json(200,std::move(body));
 }
 }

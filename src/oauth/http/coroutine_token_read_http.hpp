@@ -37,6 +37,9 @@ public:
     using ExchangeCode=std::function<boost::asio::awaitable<foundation::Result<NativeCodeExchangeResult>>(
         std::string,std::optional<std::string>,std::string,std::string,std::string,
         std::string,std::string,std::string,std::optional<session::DelegatedSenderConstraint>)>;
+    using IssueMachine=std::function<boost::asio::awaitable<foundation::Result<NativeMachineGrantResult>>(
+        std::string,std::optional<std::string>,std::optional<std::string>,std::string,
+        std::vector<std::string>,std::string,std::string,std::optional<session::DelegatedSenderConstraint>)>;
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
         ExchangeCode exchange;
@@ -47,7 +50,7 @@ public:
         ReadProfile profile,VerifySender sender,Revoke revoke={},
         Rotate rotate={},PrepareSender prepareSender={},
         foundation::Duration accessLifetime=foundation::Duration{900000},
-        std::optional<CodeExchangeContext> codeExchange=std::nullopt);
+        std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -68,6 +71,8 @@ private:
     PrepareSender m_prepareSender;
     foundation::Duration m_accessLifetime;
     std::optional<CodeExchangeContext> m_codeExchange;
+    IssueMachine m_issueMachine;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> issueMachine(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> exchangeCode(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> refresh(gateway::HttpRequest);
 };

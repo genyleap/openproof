@@ -3194,7 +3194,14 @@ addProtectedRoutes(gateway::Router& router,
                             [oidc](const oauth::AuthorizationCode& code) {
                                 return oidc->issueIdTokenForNativeExchange(code);
                             });
-                    }});
+                    }},
+                [reader,&clock,nativeOAuthAccessLifetime](std::string clientId,std::optional<std::string> clientDigest,
+                    std::optional<std::string> subjectDigest,std::string audience,std::vector<std::string> scopes,
+                    std::string family,std::string accessDigest,std::optional<session::DelegatedSenderConstraint> sender) {
+                    return reader->issueOAuthMachineGrantAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(subjectDigest),std::move(audience),std::move(scopes),std::move(family),
+                        std::move(accessDigest),std::move(sender),clock.now(),nativeOAuthAccessLifetime);
+                });
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");

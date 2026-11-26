@@ -983,9 +983,20 @@ signs the ID token for openid using the existing OIDC signer, persists the
 initial access and refresh token family, and consumes the code atomically.
 The signed ID token and raw credentials are released only after commit.
 A signing or persistence failure must not consume the code. Replaying
-the same code after success returns invalid_grant. Other issuance grants,
-authorization/login, PAR and device flows still require separate migration
-and executable acceptance.
+the same code after success returns invalid_grant.
+
+Client credentials and RFC 8693 access-token exchange also use native
+grant-scoped dispatch. Machine grants authenticate the client and lock
+the active resource and service identity or source token family in one
+transaction. The target audience and every requested (or default) scope
+must be permitted by both the source grant and the current resource.
+Exchange requires the same client, tenant and sender binding as the
+source, and cannot extend the source access token's expiry. Both grants
+issue only access tokens, never refresh tokens. As before, an exchanged
+token is a separate family; revocation of the source after a successful
+exchange does not cascade to previously issued families. Native-required
+legacy dispatch rejects these grants. Device-code polling, authorization/login
+and PAR still require separate migration and executable acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 

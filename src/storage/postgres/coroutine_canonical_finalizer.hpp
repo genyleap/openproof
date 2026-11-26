@@ -126,6 +126,15 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    // No refresh token for machine grants. A subject digest selects RFC 8693;
+    // otherwise the grant is restricted to the client's service identity.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeMachineGrantResult>>
+    issueOAuthMachineGrantAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::optional<std::string> subjectDigest,std::string audience,
+        std::vector<std::string> requestedScopes,std::string family,std::string accessDigest,
+        std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+        foundation::Duration accessLifetime);
+
     using SignCodeIdToken=std::function<foundation::Result<std::string>(const oauth::AuthorizationCode&)>;
     [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeCodeExchangeResult>>
     exchangeOAuthCodeAsync(std::string clientId,std::optional<std::string> clientDigest,

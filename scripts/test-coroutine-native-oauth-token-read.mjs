@@ -171,3 +171,32 @@ test("native code exchange validates PKCE and atomically issues the initial fami
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeCodeExchangeConsumesExactlyOnceAndRollsBackFailedSigning/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/invalid.set\("code_verifier", "a".repeat\(43\)\)/);
 });
+test("machine grants authenticate and enforce resource, scope and subject lifetime atomically",()=>{
+  const issue=http.slice(http.indexOf("CoroutineTokenReadAdapter::issueMachine("));
+  assert.match(http,/grantRoute\(r,"client_credentials"\) \|\| grantRoute\(r,kExchangeGrant\)/);
+  assert.match(http,/subjectType->expose\(\)!=kAccessType/);
+  assert.match(issue,/input->secret=foundation::SecretString\{\};\s*input->subject.reset\(\);\s*auto proof=m_prepareSender\(r\)/);
+  assert.ok(issue.indexOf("co_await m_issueMachine(")<issue.indexOf('body.add("access_token",access.expose())'));
+  assert.doesNotMatch(issue,/body.add\("refresh_token"/);
+  assert.match(app,/reader->issueOAuthMachineGrantAsync/);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::issueOAuthMachineGrantAsync("));
+  for(const term of ["FOR SHARE OF c,a,o","security::constantTimeEquals","!subjectDigest && kind!=3",
+    "WHERE audience=$1 AND status=0 FOR SHARE","f.client_id=$2 AND i.organization_id=$3",
+    "FOR SHARE OF f,i","senderMatches","family_id=$2 AND state=0 AND revoked_at_ms IS NULL",
+    "expires=std::min(expires,milliseconds(live.rows.front()[0]))",
+    "family_id=$1 AND audience=$2 FOR SHARE","s.active AND i.kind=1 AND i.status=0",
+    "FOR SHARE OF s,i","client_id=$1 AND audience=$2 FOR SHARE",
+    "const bool defaultScopes=requestedScopes.empty()",
+    "std::ranges::find(allowedResource,scope)!=allowedResource.end()",
+    "defaultScopes || std::ranges::find(sourceScopes,scope)!=sourceScopes.end()"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("FOR SHARE OF f,i")<store.indexOf("family_id=$2 AND state=0"));
+  assert.ok(store.indexOf("defaultScopes || std::ranges::find(sourceScopes")<store.indexOf("INSERT INTO openproof.oauth_token_families"));
+  assert.ok(store.indexOf('execute("COMMIT",{})')<store.indexOf("co_return oauth::NativeMachineGrantResult"));
+  assert.doesNotMatch(store,/INSERT INTO openproof.oauth_refresh_tokens/);
+  const legacy=read("src/oauth/http/http.cpp");
+  const token=legacy.slice(legacy.indexOf("OAuthHttpApi::tokenEndpoint("));
+  const guard=token.indexOf('m_nativeTokenReadsRequired && (grantType.value()=="client_credentials"');
+  assert.ok(guard>=0 && guard<token.indexOf("m_clients->authenticate("));
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeMachineGrantsCannotWidenScopeAudienceOrLifetime/);
+});

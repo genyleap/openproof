@@ -162,6 +162,11 @@ private:
 
 // Committed native authorization-code exchange result. Raw access and
 // refresh credentials stay with the HTTP caller; persistence sees digests.
+struct NativeMachineGrantResult final {
+    std::vector<std::string> scopes;
+    foundation::Duration expiresIn;
+};
+
 struct NativeCodeExchangeResult final {
     std::vector<std::string> scopes;
     std::optional<foundation::SecretString> idToken;

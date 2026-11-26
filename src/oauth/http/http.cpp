@@ -1467,6 +1467,12 @@ gateway::HttpResponse OAuthHttpApi::tokenEndpoint(gateway::HttpRequest request)
         request.wipeTargetQuery();
         return oauthErrorResponse(503,"temporarily_unavailable","Native code exchange is unavailable.");
     }
+    if (m_nativeTokenReadsRequired && (grantType.value()=="client_credentials"
+        || grantType.value()=="urn:ietf:params:oauth:grant-type:token-exchange")) {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native machine grant is unavailable.");
+    }
     client::ClientId clientId{clientIdText.value()};
     std::optional<foundation::SecretString> clientSecret;
     if (const auto rawSecret = optional(form.value(), "client_secret")) {

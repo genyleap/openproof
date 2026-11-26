@@ -1637,4 +1637,219 @@ CoroutinePostgresCanonicalFinalizer::exchangeOAuthCodeAsync(
     }
 }
 
+asio::awaitable<foundation::Result<oauth::NativeMachineGrantResult>>
+CoroutinePostgresCanonicalFinalizer::issueOAuthMachineGrantAsync(
+    std::string clientId,std::optional<std::string> clientDigest,
+    std::optional<std::string> subjectDigest,std::string audience,
+    std::vector<std::string> requestedScopes,std::string family,std::string accessDigest,
+    std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+    foundation::Duration accessLifetime)
+{
+    using E=foundation::ErrorCode;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || audience.empty() || audience.size()>2048U
+        || family.empty() || family.size()>200U || !validDigest(accessDigest)
+        || (clientDigest && !validDigest(*clientDigest))
+        || (subjectDigest && (!validDigest(*subjectDigest) || *subjectDigest==accessDigest))
+        || requestedScopes.size()>256U
+        || accessLifetime<=foundation::Duration::zero() || accessLifetime>std::chrono::hours{1}
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-accessLifetime.count()
+        || (sender && (sender->value().empty() || sender->value().size()>256U)))
+        co_return foundation::fail(E::InvalidArgument);
+    for (const auto& scope:requestedScopes)
+        if (!client::Scope::create(scope)) co_return foundation::fail(E::InvalidArgument);
+    std::ranges::sort(requestedScopes);
+    requestedScopes.erase(std::unique(requestedScopes.begin(),requestedScopes.end()),requestedScopes.end());
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        const auto observed=now.time_since_epoch().count();
+        const auto timestamp=std::to_string(observed);
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        std::int64_t kind=-1;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        if (!subjectDigest && kind!=3) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::FailedPrecondition);
+        }
+        // Parent row locks serialize resource and service scope replacement.
+        Params resourceArgs{audience};
+        const auto resource=co_await execute(
+            "SELECT id FROM openproof.oauth_resources WHERE audience=$1 AND status=0 FOR SHARE",
+            std::move(resourceArgs));
+        if (resource.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (resource.rows.size()!=1U || resource.rows.front().size()!=1U)
+            throw std::runtime_error{"Malformed resource"};
+        Params resourceScopeArgs{required(resource.rows.front()[0])};
+        const auto resourceScopes=co_await execute(
+            "SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=$1 ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",
+            std::move(resourceScopeArgs));
+        const auto scopesFrom=[](const auto& rows) {
+            if (rows.size()>256U) throw std::runtime_error{"Oversized machine grant scopes"};
+            std::vector<std::string> values;
+            for (const auto& row:rows) {
+                if (row.size()!=1U || !client::Scope::create(required(row[0])))
+                    throw std::runtime_error{"Invalid machine grant scope"};
+                values.push_back(required(row[0]));
+            }
+            return values;
+        };
+        const auto allowedResource=scopesFrom(resourceScopes.rows);
+        std::vector<std::string> sourceScopes;
+        std::string identityId,provider="client_credentials",assurance="1",factors="1",phishing="false",authenticatedAt=timestamp;
+        auto expires=observed+accessLifetime.count();
+        if (subjectDigest) {
+            // The source family lock precedes the token lock, matching native
+            // revocation and rotation. Read the source only after admission.
+            Params args{*subjectDigest,clientId,tenant};
+            const auto source=co_await execute(
+                "SELECT f.id,f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
+                "f.authenticated_at_ms,f.sender_constraint_kind,f.sender_constraint_value "
+                "FROM openproof.oauth_access_tokens t JOIN openproof.oauth_token_families f ON f.id=t.family_id "
+                "JOIN openproof.identities i ON i.id=f.identity_id "
+                "WHERE t.token_digest=decode($1,'hex') AND f.client_id=$2 AND i.organization_id=$3 "
+                "AND i.status=0 AND f.revoked_at_ms IS NULL FOR SHARE OF f,i",std::move(args));
+            if (source.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AuthenticationFailed);
+            }
+            if (source.rows.size()!=1U || source.rows.front().size()!=9U)
+                throw std::runtime_error{"Malformed exchange subject"};
+            const auto& row=source.rows.front();
+            const auto sourceFamily=required(row[0]);
+            const bool senderMatches=(!sender && !row[7] && !row[8])
+                || (sender && row[7] && row[8] && milliseconds(row[7])==static_cast<int>(sender->kind())
+                    && *row[8]==sender->value());
+            if (!senderMatches || milliseconds(row[6])>observed) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AuthenticationFailed);
+            }
+            Params liveArgs{*subjectDigest,sourceFamily,timestamp};
+            const auto live=co_await execute(
+                "SELECT expires_at_ms FROM openproof.oauth_access_tokens WHERE token_digest=decode($1,'hex') "
+                "AND family_id=$2 AND state=0 AND revoked_at_ms IS NULL AND issued_at_ms<=$3 AND expires_at_ms>$3 FOR SHARE",
+                std::move(liveArgs));
+            if (live.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AuthenticationFailed);
+            }
+            if (live.rows.size()!=1U || live.rows.front().size()!=1U)
+                throw std::runtime_error{"Malformed source expiry"};
+            expires=std::min(expires,milliseconds(live.rows.front()[0]));
+            Params audienceArgs{sourceFamily,audience};
+            const auto permitted=co_await execute(
+                "SELECT audience FROM openproof.oauth_token_family_audiences WHERE family_id=$1 AND audience=$2 FOR SHARE",
+                std::move(audienceArgs));
+            if (permitted.rows.size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::AuthenticationFailed);
+            }
+            Params scopeArgs{sourceFamily};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.oauth_token_family_scopes WHERE family_id=$1 ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",
+                std::move(scopeArgs));
+            sourceScopes=scopesFrom(grants.rows);
+            identityId=required(row[1]); provider=required(row[2]);
+            assurance=required(row[3]); factors=required(row[4]);
+            phishing=boolean(row[5])?"true":"false"; authenticatedAt=required(row[6]);
+        } else {
+            Params args{clientId,tenant};
+            const auto service=co_await execute(
+                "SELECT s.identity_id FROM openproof.service_identities s "
+                "JOIN openproof.identities i ON i.id=s.identity_id "
+                "WHERE s.client_id=$1 AND i.organization_id=$2 AND s.active AND i.kind=1 AND i.status=0 "
+                "FOR SHARE OF s,i",std::move(args));
+            if (service.rows.empty()) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::PermissionDenied);
+            }
+            if (service.rows.size()!=1U || service.rows.front().size()!=1U)
+                throw std::runtime_error{"Malformed service identity"};
+            identityId=required(service.rows.front()[0]);
+            Params audienceArgs{clientId,audience};
+            const auto permitted=co_await execute(
+                "SELECT audience FROM openproof.service_identity_audiences WHERE client_id=$1 AND audience=$2 FOR SHARE",
+                std::move(audienceArgs));
+            if (permitted.rows.size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::PermissionDenied);
+            }
+            Params scopeArgs{clientId};
+            const auto grants=co_await execute(
+                "SELECT scope FROM openproof.service_identity_scopes WHERE client_id=$1 ORDER BY scope COLLATE \"C\" LIMIT 257 FOR SHARE",
+                std::move(scopeArgs));
+            sourceScopes=scopesFrom(grants.rows);
+        }
+        const bool defaultScopes=requestedScopes.empty();
+        auto scopes=defaultScopes?std::move(sourceScopes):std::move(requestedScopes);
+        // Default scopes are checked against the resource as well: no
+        // implicit scope expansion when the registry has narrowed a grant.
+        if (scopes.empty() || !std::ranges::all_of(scopes,[&](const auto& scope){
+            return std::ranges::find(allowedResource,scope)!=allowedResource.end()
+                && (defaultScopes || std::ranges::find(sourceScopes,scope)!=sourceScopes.end());
+        })) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        Params familyArgs{family,clientId,identityId,provider,assurance,factors,phishing,authenticatedAt,
+            sender?std::optional<std::string>{std::to_string(static_cast<int>(sender->kind()))}:std::nullopt,
+            sender?std::optional<std::string>{std::string{sender->value()}}:std::nullopt};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_token_families "
+            "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms,sender_constraint_kind,sender_constraint_value) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",std::move(familyArgs)));
+        for (const auto& scope:scopes) {
+            Params args{family,scope};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,$2)",std::move(args)));
+        }
+        Params audienceArgs{family,audience};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_token_family_audiences(family_id,audience) VALUES($1,$2)",std::move(audienceArgs)));
+        Params accessArgs{accessDigest,family,timestamp,std::to_string(expires)};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",std::move(accessArgs)));
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return oauth::NativeMachineGrantResult{std::move(scopes),foundation::Duration{expires-observed}};
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native OAuth machine grant is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres
