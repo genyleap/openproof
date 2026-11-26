@@ -30,6 +30,40 @@ bool supported(account::VerificationPurpose purpose)
         || purpose == account::VerificationPurpose::VerifyPhone;
 }
 
+bool publicPurpose(account::VerificationPurpose purpose)
+{
+    return purpose==account::VerificationPurpose::SignupEmail
+        || purpose==account::VerificationPurpose::PasswordReset;
+}
+
+std::string publicOwnerSql(account::VerificationPurpose purpose,bool locked)
+{
+    // Only an existing pending signup reservation or active local link is
+    // eligible. A contact-change reservation must never become signup proof.
+    std::string sql=purpose==account::VerificationPurpose::SignupEmail
+        ? "SELECT i.id FROM openproof.pending_external_identity_reservations r "
+          "JOIN openproof.identities i ON i.id=r.identity_id "
+          "JOIN openproof.organizations o ON o.id=i.organization_id "
+          "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+          "WHERE r.provider=$1 AND r.external_subject=$2 AND r.expires_at_ms>$3 "
+          "AND r.verification_id IS NULL AND i.status IN (0,3) "
+          "AND NOT EXISTS (SELECT 1 FROM openproof.external_identities e "
+          "WHERE e.provider=$1 AND (e.external_subject=$2 OR e.identity_id=i.id)) "
+        : "SELECT i.id FROM openproof.external_identities e "
+          "JOIN openproof.identities i ON i.id=e.identity_id "
+          "JOIN openproof.organizations o ON o.id=i.organization_id "
+          "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+          "WHERE e.provider=$1 AND e.external_subject=$2 AND $3::bigint>=0 "
+          "AND i.status=0 ";
+    sql+="AND i.organization_id=$4 AND o.state=0";
+    if (locked) {
+        sql+=" AND i.id=$5";
+        sql+=purpose==account::VerificationPurpose::SignupEmail
+            ? " FOR SHARE OF r,p,o" : " FOR SHARE OF e,p,o";
+    }
+    return sql;
+}
+
 bool exactRow(const async_detail::QueryRows& rows, std::string_view expected)
 {
     return rows.rows.size() == 1U && rows.rows.front().size() == 1U
@@ -79,12 +113,44 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::reserve
     return replaceImpl(std::move(challenge), std::move(provider));
 }
 
+asio::awaitable<foundation::Result<std::optional<core::IdentityId>>>
+CoroutineVerificationChallengeStore::findPublicEmailOwnerAsync(
+    identity::provider::ProviderId provider,account::VerificationPurpose purpose,
+    std::string destination,foundation::Instant now)
+{
+    if (!publicPurpose(purpose) || provider.empty() || provider.value().size()>200U
+        || destination.empty() || destination.size()>320U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{provider.value()},std::move(destination),
+            std::to_string(now.time_since_epoch().count()),std::string{m_impl->tenant.value()}};
+        const auto rows=co_await lease.connection().query(publicOwnerSql(purpose,false),
+            std::move(params),remaining(deadline));
+        if (rows.rows.empty()) co_return std::optional<core::IdentityId>{};
+        if (rows.rows.size()!=1U || rows.rows.front().size()!=1U || !rows.rows.front().front())
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return std::optional<core::IdentityId>{core::IdentityId{*rows.rows.front().front()}};
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replacePublicEmailAsync(
+    account::VerificationChallenge challenge,identity::provider::ProviderId provider)
+{
+    return replaceImpl(std::move(challenge),std::move(provider),true);
+}
+
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replaceImpl(
     account::VerificationChallenge challenge,
-    std::optional<identity::provider::ProviderId> provider)
+    std::optional<identity::provider::ProviderId> provider,bool publicEmail)
 {
     if ((provider && (provider->empty() || provider->value().size() > 200U))
-        || !supported(challenge.purpose()) || challenge.attempts() != 0U
+        || (publicEmail ? (!provider || !publicPurpose(challenge.purpose())
+                || challenge.channel()!=account::VerificationChannel::Email)
+            : !supported(challenge.purpose())) || challenge.attempts() != 0U
         || challenge.id().value().size() > 200U || challenge.identity().value().size() > 200U
         || (challenge.purpose() == account::VerificationPurpose::ChangeEmail
             && challenge.channel() != account::VerificationChannel::Email)
@@ -106,10 +172,12 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
         // waiting for a concurrent replacement, including when none existed.
         Params lockParams{owner, tenant};
         const auto locked = co_await connection.query(
-            "SELECT i.id FROM openproof.identities i "
-            "JOIN openproof.organizations o ON o.id=i.organization_id "
-            "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 "
-            "FOR UPDATE OF i FOR SHARE OF o", std::move(lockParams), remaining(deadline));
+            publicEmail && challenge.purpose()==account::VerificationPurpose::SignupEmail
+            ? "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+              "WHERE i.id=$1 AND i.organization_id=$2 AND i.status IN (0,3) AND o.state=0 FOR UPDATE OF i FOR SHARE OF o"
+            : "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+              "WHERE i.id=$1 AND i.organization_id=$2 AND i.status=0 AND o.state=0 FOR UPDATE OF i FOR SHARE OF o",
+            std::move(lockParams), remaining(deadline));
         if (locked.rows.empty()) {
             static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
             co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
@@ -127,7 +195,16 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
             static_cast<void>(co_await connection.query("ROLLBACK", {}, remaining(deadline)));
             co_return foundation::fail(foundation::ErrorCode::Conflict);
         }
-        if (provider) {
+        if (publicEmail) {
+            Params publicParams{std::string{provider->value()},std::string{challenge.destination()},
+                std::to_string(challenge.createdAt().time_since_epoch().count()),tenant,owner};
+            const auto eligible=co_await connection.query(publicOwnerSql(challenge.purpose(),true),
+                std::move(publicParams),remaining(deadline));
+            if (!exactRow(eligible,owner)) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::NotFound);
+            }
+        } else if (provider) {
             if (challenge.purpose() == account::VerificationPurpose::ChangeEmail) {
                 Params profileParams{owner};
                 const auto profile = co_await connection.query(
@@ -201,7 +278,7 @@ asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::replace
 asio::awaitable<foundation::Status> CoroutineVerificationChallengeStore::discardAsync(
     account::VerificationId id, core::IdentityId owner, account::VerificationPurpose purpose)
 {
-    if (id.empty() || owner.empty() || !supported(purpose))
+    if (id.empty() || owner.empty() || (!supported(purpose) && !publicPurpose(purpose)))
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
     try {
         const auto deadline = Clock::now() + m_impl->queryTimeout;

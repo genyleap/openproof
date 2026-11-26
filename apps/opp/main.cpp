@@ -3001,6 +3001,8 @@ addProtectedRoutes(gateway::Router& router,
                 [issuer=nativeContactIssuer](identity::IdentityId owner,account::VerificationPurpose purpose,
                     std::string destination) {
                     return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
+                },[issuer=nativeContactIssuer](account::VerificationPurpose purpose,std::string destination) {
+                    return issuer->issuePublicEmailAsync(purpose,std::move(destination));
                 });
             nativeHandler=asyncContact.get();
         }
@@ -3105,6 +3107,8 @@ addProtectedRoutes(gateway::Router& router,
         if (nativeContactIssuer) {
             nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
             nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
+            nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
+            nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
         }
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/account/connections/web3/start");
@@ -3320,6 +3324,15 @@ addProtectedRoutes(gateway::Router& router,
             [&contactStore](account::VerificationId id,identity::IdentityId owner,account::VerificationPurpose purpose) {
                 return contactStore.discardAsync(std::move(id),std::move(owner),purpose);
             }};
+        contactIssuer.configurePublicEmail(
+            [&contactStore](idp::ProviderId provider,account::VerificationPurpose purpose,
+                std::string destination,fnd::Instant now) {
+                return contactStore.findPublicEmailOwnerAsync(std::move(provider),purpose,
+                    std::move(destination),now);
+            },
+            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId provider) {
+                return contactStore.replacePublicEmailAsync(std::move(challenge),std::move(provider));
+            });
         account::AccountService accountService{
             identity::OrganizationId{std::string{platform.auth().organizationId()}},
             providerId,

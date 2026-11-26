@@ -40,6 +40,16 @@ public:
     reserveAndReplaceAsync(account::VerificationChallenge challenge,
                            identity::provider::ProviderId provider);
 
+    // Public email requests never provision a subject. Lookup and write
+    // independently revalidate eligibility; the latter runs under the owner lock.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<identity::core::IdentityId>>>
+    findPublicEmailOwnerAsync(identity::provider::ProviderId provider,
+        account::VerificationPurpose purpose,std::string destination,foundation::Instant now);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    replacePublicEmailAsync(account::VerificationChallenge challenge,
+        identity::provider::ProviderId provider);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.
@@ -50,7 +60,7 @@ public:
 private:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     replaceImpl(account::VerificationChallenge challenge,
-                std::optional<identity::provider::ProviderId> provider);
+                std::optional<identity::provider::ProviderId> provider,bool publicEmail=false);
     class Impl;
     std::unique_ptr<Impl> m_impl;
 };

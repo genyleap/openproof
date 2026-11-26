@@ -4889,3 +4889,19 @@ The remaining signup/resend/password-reset flows still use the legacy
 delivery boundary. The proxy bridge cannot yet be retired; protected
 gateway coverage and those remaining callers require separate migration.
 No new schema migration. Compiled and live delivery acceptance pending.
+
+### Native public email issuance
+
+Resend signup verification and forgotten-password requests now use native
+email lookup, purpose-bound challenge replacement and coroutine delivery.
+A pending signup requires its existing untagged reservation and password
+credential in the same tenant; password reset requires an active local
+link and password credential. Eligibility is rechecked under the owner
+lock before insertion. Resend does not extend or delete the original
+signup reservation. Public responses do not distinguish unknown owners,
+storage or delivery failures (202 for structurally valid requests; invalid
+resend email syntax retains its existing error). This intentionally
+changes legacy delivery-failure status to prevent direct enumeration;
+latency equivalence is not established. No provisioning, schema change,
+or synchronous delivery fallback. Signup itself and protected gateway
+remain blocking proxy callers; compiled/runtime acceptance is pending.

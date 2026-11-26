@@ -292,4 +292,72 @@ TEST(NativeVerificationDeliveryTest, IssuerPersistsBeforeDeliveryAndCompensatesE
     EXPECT_EQ(probe.calls, 4);
 }
 
+TEST(NativeVerificationDeliveryTest, PublicEmailNeverProvisionsAndMasksDeliveryFailure)
+{
+    IssuanceProbe probe;
+    fnd::ManualClockSource clock{kNow};
+    int lookups=0,writes=0,discards=0;
+    bool known=false;
+    auto key=account::VerificationKey::create(fnd::SecretString{std::string(32U,'v')});
+    ASSERT_TRUE(key);
+    delivery::CoroutineContactVerificationIssuer issuer{
+        std::move(key).value(),account::AccountPolicy::create(24h,10min,30min,8U).value(),
+        idp::ProviderId{"local"},idp::ProviderId{"phone"},clock,probe,
+        [](account::VerificationChallenge,idp::ProviderId)->asio::awaitable<fnd::Status>{
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        },
+        [&](account::VerificationId id,core::IdentityId owner,account::VerificationPurpose purpose)
+            ->asio::awaitable<fnd::Status>{
+            ++discards;
+            if (probe.stored) {
+                EXPECT_EQ(id,probe.stored->id());
+                EXPECT_EQ(owner,probe.stored->identity());
+                EXPECT_EQ(purpose,probe.stored->purpose());
+            }
+            probe.stored.reset();
+            co_return fnd::ok();
+        }};
+    issuer.configurePublicEmail(
+        [&](idp::ProviderId provider,account::VerificationPurpose,std::string destination,fnd::Instant)
+            ->asio::awaitable<fnd::Result<std::optional<core::IdentityId>>> {
+            ++lookups;
+            EXPECT_EQ(provider.value(),"local");
+            EXPECT_EQ(destination,"owner@example.test");
+            if (known) co_return std::optional<core::IdentityId>{core::IdentityId{"owner"}};
+            co_return std::optional<core::IdentityId>{};
+        },
+        [&](account::VerificationChallenge challenge,idp::ProviderId provider)
+            ->asio::awaitable<fnd::Status>{
+            ++writes;
+            EXPECT_EQ(provider.value(),"local");
+            EXPECT_EQ(challenge.identity().value(),"owner");
+            probe.stored.emplace(std::move(challenge));
+            co_return fnd::ok();
+        });
+    auto issue=[&](account::VerificationPurpose purpose,std::string email){
+        asio::io_context io;
+        auto task=asio::co_spawn(io,issuer.issuePublicEmailAsync(purpose,std::move(email)),asio::use_future);
+        io.run();
+        return task.get();
+    };
+    const auto signup=account::VerificationPurpose::SignupEmail;
+    const auto reset=account::VerificationPurpose::PasswordReset;
+    EXPECT_TRUE(issue(reset,"invalid"));
+    EXPECT_FALSE(issue(signup,"invalid"));
+    EXPECT_EQ(lookups,0);
+    EXPECT_TRUE(issue(reset,"OWNER@EXAMPLE.TEST"));
+    EXPECT_EQ(writes,0);
+    EXPECT_EQ(probe.calls,0);
+    known=true;
+    ASSERT_TRUE(issue(signup,"OWNER@EXAMPLE.TEST"));
+    ASSERT_TRUE(probe.stored);
+    EXPECT_EQ(probe.stored->purpose(),signup);
+    EXPECT_EQ(probe.stored->expiresAt(),kNow+24h);
+    probe.reject=true;
+    EXPECT_TRUE(issue(reset,"OWNER@EXAMPLE.TEST"));
+    EXPECT_EQ(writes,2);
+    EXPECT_EQ(discards,1);
+    EXPECT_FALSE(probe.stored);
+}
+
 } // namespace

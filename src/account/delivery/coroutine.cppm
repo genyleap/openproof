@@ -4,6 +4,7 @@ module;
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 export module openproof.account.delivery:coroutine;
@@ -62,6 +63,12 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     issueAsync(identity::core::IdentityId owner, VerificationPurpose purpose,
                std::string destination);
+    using FindPublicOwner=std::function<boost::asio::awaitable<
+        foundation::Result<std::optional<identity::core::IdentityId>>>(
+        identity::provider::ProviderId,VerificationPurpose,std::string,foundation::Instant)>;
+    void configurePublicEmail(FindPublicOwner find,Reserve replace);
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    issuePublicEmailAsync(VerificationPurpose purpose,std::string destination);
 private:
     VerificationKey m_key;
     AccountPolicy m_policy;
@@ -71,6 +78,11 @@ private:
     CoroutineVerificationDelivery* m_delivery;
     Reserve m_reserve;
     Discard m_discard;
+    FindPublicOwner m_findPublicOwner;
+    Reserve m_replacePublic;
+    [[nodiscard]] boost::asio::awaitable<foundation::Status> deliverPrepared(
+        VerificationPreparation::Prepared prepared,identity::core::IdentityId owner,
+        VerificationPurpose purpose,Reserve& persist,identity::provider::ProviderId provider);
 };
 
 

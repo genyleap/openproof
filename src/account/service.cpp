@@ -209,6 +209,11 @@ foundation::Result<VerificationPreparation::Prepared> VerificationPreparation::p
                              std::move(secret), expiresAt}};
 }
 
+foundation::Result<std::string> VerificationPreparation::normalizePublicEmail(std::string value)
+{
+    return normalizeEmail(std::move(value));
+}
+
 foundation::Result<VerificationPreparation::Prepared> VerificationPreparation::prepareContact(
     const VerificationKey& key, const AccountPolicy& policy,
     const identity::core::IdentityId& identity, VerificationPurpose purpose,

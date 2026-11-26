@@ -279,12 +279,49 @@ boost::asio::awaitable<foundation::Status> CoroutineContactVerificationIssuer::i
     auto prepared = VerificationPreparation::prepareContact(
         m_key, m_policy, owner, purpose, std::move(destination), m_clock->now());
     if (!prepared) co_return foundation::fail(prepared.error());
-    auto id = prepared->first.id();
-    std::optional<VerificationDispatch> dispatch{std::move(prepared->second)};
+    co_return co_await deliverPrepared(std::move(prepared).value(),std::move(owner),purpose,
+        m_reserve,purpose==VerificationPurpose::ChangeEmail?m_localProvider:m_phoneProvider);
+}
+
+void CoroutineContactVerificationIssuer::configurePublicEmail(FindPublicOwner find,Reserve replace)
+{
+    m_findPublicOwner=std::move(find);
+    m_replacePublic=std::move(replace);
+}
+
+boost::asio::awaitable<foundation::Status> CoroutineContactVerificationIssuer::issuePublicEmailAsync(
+    VerificationPurpose purpose,std::string destination)
+{
+    if (!m_findPublicOwner || !m_replacePublic || !m_discard || m_localProvider.empty()
+        || (purpose!=VerificationPurpose::SignupEmail && purpose!=VerificationPurpose::PasswordReset))
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    auto normalized=VerificationPreparation::normalizePublicEmail(std::move(destination));
+    if (!normalized) {
+        if (purpose==VerificationPurpose::PasswordReset) co_return foundation::ok();
+        co_return foundation::fail(normalized.error());
+    }
+    auto owner=co_await m_findPublicOwner(m_localProvider,purpose,normalized.value(),m_clock->now());
+    // Do not distinguish unknown identities, races or delivery outages on
+    // public email endpoints. Operational failures remain internal.
+    if (!owner || !owner->has_value()) co_return foundation::ok();
+    auto prepared=VerificationPreparation::prepare(m_key,owner->value(),purpose,
+        VerificationChannel::Email,std::move(normalized).value(),m_clock->now(),
+        purpose==VerificationPurpose::SignupEmail?m_policy.emailVerificationLifetime():m_policy.passwordResetLifetime());
+    if (!prepared) co_return foundation::ok();
+    static_cast<void>(co_await deliverPrepared(std::move(prepared).value(),
+        std::move(owner->value()),purpose,m_replacePublic,m_localProvider));
+    co_return foundation::ok();
+}
+
+boost::asio::awaitable<foundation::Status> CoroutineContactVerificationIssuer::deliverPrepared(
+    VerificationPreparation::Prepared prepared,identity::core::IdentityId owner,
+    VerificationPurpose purpose,Reserve& persist,identity::provider::ProviderId provider)
+{
+    auto id = prepared.first.id();
+    std::optional<VerificationDispatch> dispatch{std::move(prepared.second)};
     foundation::Status stored = foundation::fail(foundation::ErrorCode::Unavailable);
     try {
-        stored = co_await m_reserve(std::move(prepared->first),
-            purpose == VerificationPurpose::ChangeEmail ? m_localProvider : m_phoneProvider);
+        stored = co_await persist(std::move(prepared.first),std::move(provider));
     } catch (...) {
         // The commit may have been ambiguous. Never send a secret in this case.
     }

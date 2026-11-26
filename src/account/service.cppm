@@ -81,6 +81,8 @@ public:
         VerificationPurpose purpose, VerificationChannel channel,
         std::string destination, foundation::Instant now, foundation::Duration lifetime);
 
+    [[nodiscard]] static foundation::Result<std::string> normalizePublicEmail(std::string value);
+
     [[nodiscard]] static foundation::Result<Prepared> prepareContact(
         const VerificationKey& key, const AccountPolicy& policy,
         const identity::core::IdentityId& identity, VerificationPurpose purpose,

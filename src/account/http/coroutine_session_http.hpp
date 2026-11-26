@@ -120,8 +120,10 @@ public:
     using Issue=std::function<boost::asio::awaitable<foundation::Status>(
         identity::core::IdentityId, VerificationPurpose, std::string)>;
 
+    using PublicIssue=std::function<boost::asio::awaitable<foundation::Status>(VerificationPurpose,std::string)>;
     CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
-        gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue);
+        gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue,
+        PublicIssue publicIssue = {});
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
@@ -133,6 +135,7 @@ private:
     gateway::TokenBucketRateLimiter* m_limiter;
     Authenticate m_authenticate;
     Issue m_issue;
+    PublicIssue m_publicIssue;
 };
 
 } // namespace openproof::account::http

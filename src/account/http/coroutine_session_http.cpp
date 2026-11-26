@@ -670,19 +670,25 @@ namespace {
 [[nodiscard]] bool contactIssueRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method()==gateway::HttpMethod::Post
-        && (request.path()=="/account/email/change" || request.path()=="/account/phone");
+        && (request.path()=="/account/email/change" || request.path()=="/account/phone"
+            || request.path()=="/account/email/resend" || request.path()=="/account/password/forgot");
+}
+[[nodiscard]] bool publicEmailIssue(const gateway::HttpRequest& request) noexcept
+{
+    return request.path()=="/account/email/resend" || request.path()=="/account/password/forgot";
 }
 }
 
 CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    Authenticate authenticate,Issue issue)
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue)
     : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
-      m_issue(std::move(issue)) {}
+      m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)) {}
 
 bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
 {
-    if (contactIssueRoute(request)) return static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
+    if (contactIssueRoute(request)) return publicEmailIssue(request) ? static_cast<bool>(m_publicIssue)
+        : static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
     return m_fallback->nativeEnabledFor(request);
 }
 
@@ -718,17 +724,25 @@ CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
     }
     SensitiveSessionHeadersGuard wipeHeaders{request};
     PasswordRequestGuard wipeBody{request};
-    if (!m_authenticate || !m_issue)
+    const bool publicRequest=publicEmailIssue(request);
+    if (publicRequest ? !m_publicIssue : (!m_authenticate || !m_issue))
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
     if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
-    auto credential=gateway::takeSessionCredential(request);
-    if (!credential) co_return fail(credential.error(),request);
-    if (!credential->has_value())
-        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
-    auto actor=co_await m_authenticate(std::move(credential->value()));
-    if (!actor) co_return fail(actor.error(),request);
-    const bool email=request.path()=="/account/email/change";
+    std::optional<session::Session> actor;
+    if (!publicRequest) {
+        auto credential=gateway::takeSessionCredential(request);
+        if (!credential) co_return fail(credential.error(),request);
+        if (!credential->has_value())
+            co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+        auto authenticated=co_await m_authenticate(std::move(credential->value()));
+        if (!authenticated) co_return fail(authenticated.error(),request);
+        actor.emplace(std::move(authenticated).value());
+    } else {
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+    }
+    const bool email=request.path()!="/account/phone";
     const auto type=request.header("content-type");
     if (request.body().empty() || request.body().size()>32U*1024U || !type
         || (*type!="application/json" && !type->starts_with("application/json;")))
@@ -751,6 +765,12 @@ CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
         destination.assign(value);
     }
     request.wipeBody();
+    if (publicRequest) {
+        auto status=co_await m_publicIssue(request.path()=="/account/email/resend"
+            ? VerificationPurpose::SignupEmail:VerificationPurpose::PasswordReset,std::move(destination));
+        if (!status) co_return fail(status.error(),request);
+        co_return jsonResponse(202,json::object{{"accepted",true}});
+    }
     auto status=co_await m_issue(actor->identity(),
         email?VerificationPurpose::ChangeEmail:VerificationPurpose::VerifyPhone,
         std::move(destination));
