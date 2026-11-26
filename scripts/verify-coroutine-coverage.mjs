@@ -1108,15 +1108,28 @@ const checked = segments.map(([name, relative]) => {
         issues.push({line:0,kind:"blocking native HTTP fallback",expression:"m_fallback->handle("});
       for(const expression of [
         /\bm_sessions->(?:issue|authenticate|issueReplacing)\s*\(/,
-        /\bm_authentication->(?:publishBrowserAuthenticationHandoff|consumeBrowserConnectionHandoff|updateConnectionPresentation)\s*\(/
+        /\bm_authentication->(?:issueBrowserAuthenticationHandoff|redeemBrowserAuthenticationHandoff|publishBrowserAuthenticationHandoff|issueBrowserConnectionHandoff|consumeBrowserConnectionHandoff|updateConnectionPresentation|beginConnection|completeConnection)\s*\(/
       ]){
         if(expression.test(nativeSection))
           issues.push({line:0,kind:"legacy blocking call in native Web3 handler",expression:expression.source});
       }
       if(!/\bco_await\s+m_asyncSessions->issueAsync\s*\(/.test(nativeSection))
         issues.push({line:0,kind:"missing native session persistence",expression:"m_asyncSessions->issueAsync("});
-      if(!/if\s*\(connection\s*\|\|\s*m_asyncSessions\s*==\s*nullptr\s*\|\|\s*!m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(nativeSection))
-        issues.push({line:0,kind:"missing fail-closed session/connection gate",expression:"connection || m_asyncSessions == nullptr || !nativeCanonicalCompletionEnabled()"});
+      const capability=source.slice(source.indexOf("Web3AuthenticationHttpApi::nativeEnabledFor("),nativeIndex);
+      const start=nativeSection.slice(nativeSection.indexOf("Web3AuthenticationHttpApi::startAsync("),
+        nativeSection.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+      const complete=nativeSection.slice(nativeSection.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+      const link=complete.slice(complete.indexOf("if (connection) {"),complete.indexOf("co_await m_authentication->completeAsync("));
+      if(!/m_asyncSessions\s*!=\s*nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\(\)/.test(capability)
+          || !/m_authentication->nativeConnectionCompletionEnabled\(\)\s*&&\s*static_cast<bool>\(m_authenticate\)/.test(capability)
+          || !/if\s*\(!nativeEnabledFor\(request\)\)/.test(start)
+          || !/if\s*\(!nativeEnabledFor\(request\)\)/.test(complete)
+          || !/co_await m_authentication->beginConnectionAsync\(/.test(start)
+          || !/co_await m_authentication->consumeBrowserConnectionHandoffAsync\(/.test(start)
+          || !/co_await m_authentication->completeConnectionAsync\(/.test(link)
+          || !/co_return response;/.test(link)
+          || /m_asyncSessions->issueAsync\(/.test(link))
+        issues.push({line:0,kind:"missing fail-closed native session/connection gate",expression:"request capability, native handoff and link completion without session issuance"});
     }
   }
   return {name,file:relative,coAwaitCount:awaitCount,issues};

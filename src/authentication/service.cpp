@@ -1235,7 +1235,8 @@ AuthenticationService::completeConnectionAsync(
     provider::TransactionId transactionId,
     foundation::SecretString continuationToken,
     provider::BindingDigest binding,
-    provider::AuthenticationResponse response)
+    provider::AuthenticationResponse response,
+    ConnectionPresentation presentation)
 {
     // Reject a non-native directory before consuming single-use link proofs.
     auto* const finalizer = m_asyncCanonical;
@@ -1268,6 +1269,19 @@ AuthenticationService::completeConnectionAsync(
         || linked->subject() != exchange->outcome.subject()) {
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "Canonical connection result does not match verified provider proof.");
+    }
+    // Best-effort display metadata is bound to the consumed transaction's
+    // original owner, not a fresh owner lookup or client-supplied identity.
+    if (presentation.displayName || presentation.preferredUsername || presentation.pictureUrl) {
+        try {
+            static_cast<void>(co_await finalizer->updatePresentationAsync(
+                *exchange->connectionTarget,identity::core::ExternalIdentityRef{
+                    linked->providerId(),linked->subject(),std::move(presentation.displayName),
+                    std::move(presentation.preferredUsername),std::move(presentation.pictureUrl)},
+                exchange->completedAt));
+        } catch (...) {
+            // The verified connection is already committed.
+        }
     }
     co_return std::move(linked).value();
 }
@@ -1520,7 +1534,8 @@ AuthenticationService::issueBrowserConnectionHandoffAsync(
     identity::core::IdentityId identity,
     provider::ProviderId providerId,
     std::string returnTarget,
-    foundation::CorrelationId correlation)
+    foundation::CorrelationId correlation,
+    provider::InteractionModel expected)
 {
     if (identity.empty() || providerId.empty() || returnTarget.empty()
         || returnTarget.size() > 2048U || correlation.empty()) {
@@ -1533,7 +1548,7 @@ AuthenticationService::issueBrowserConnectionHandoffAsync(
         || !nativeProviderAuthenticationEnabled(providerId))
         co_return foundation::fail(foundation::ErrorCode::Unavailable);
     auto* implementation=m_providers.find(providerId);
-    if (!implementation || implementation->interactionModel()!=provider::InteractionModel::Redirect)
+    if (!implementation || implementation->interactionModel()!=expected)
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
     auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(identity);
     if (!active) co_return foundation::fail(active.error());
@@ -1568,7 +1583,8 @@ AuthenticationService::issueBrowserConnectionHandoffAsync(
 }
 
 boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
-AuthenticationService::consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket)
+AuthenticationService::consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket,
+    provider::InteractionModel expected)
 {
     const std::string_view presented = ticket.expose();
     const auto separator = presented.find('.');
@@ -1605,6 +1621,9 @@ AuthenticationService::consumeBrowserConnectionHandoffAsync(foundation::SecretSt
     }
     if (!nativeProviderAuthenticationEnabled(provider::ProviderId{providerId->second}))
         co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto* implementation=m_providers.find(provider::ProviderId{providerId->second});
+    if (!implementation || implementation->interactionModel()!=expected)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(
         identity::core::IdentityId{identity->second});
     if (!active) co_return foundation::fail(active.error());

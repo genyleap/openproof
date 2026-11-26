@@ -3,6 +3,7 @@ module;
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/awaitable.hpp>
+#include <functional>
 
 export module openproof.authentication.web3.http;
 
@@ -19,13 +20,17 @@ export namespace openproof::authentication::http {
 /** @brief Same-origin SIWE challenge/response surface for Ethereum and Farcaster login. */
 class Web3AuthenticationHttpApi final : public gateway::http::CoroutineHttpHandler {
 public:
+    using Authenticate=std::function<boost::asio::awaitable<
+        foundation::Result<session::Session>>(foundation::SecretString)>;
+
     Web3AuthenticationHttpApi(AuthenticationService& authentication,
                               identity::provider::ProviderRegistry& providers,
                               session::SessionService& sessions,
                               gateway::TokenBucketRateLimiter& rateLimiter,
                               gateway::HttpHandler& fallback,
                               session::DelegatedAccessAuthenticator* delegated = nullptr,
-                              session::CoroutineSessionIssuer* asyncSessions = nullptr);
+                              session::CoroutineSessionIssuer* asyncSessions = nullptr,
+                              Authenticate authenticate = {});
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
@@ -50,6 +55,8 @@ private:
     redeemAuthenticationHandoffAsync(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse issueAuthenticationHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse redeemAuthenticationHandoff(gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    issueConnectionHandoffAsync(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse issueConnectionHandoff(gateway::HttpRequest request);
     [[nodiscard]] gateway::HttpResponse start(gateway::HttpRequest request, bool connection);
     [[nodiscard]] gateway::HttpResponse complete(gateway::HttpRequest request, bool connection);
@@ -62,6 +69,7 @@ private:
     session::SessionService* m_sessions;
     session::DelegatedAccessAuthenticator* m_delegated;
     session::CoroutineSessionIssuer* m_asyncSessions;
+    Authenticate m_authenticate;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;
 };

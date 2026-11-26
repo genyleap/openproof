@@ -4836,3 +4836,15 @@ conditionally updates only the originally verified owner/provider/subject
 link and refreshes presentation without contact claims. Failure remains
 best effort as in the legacy HTTP contract. Native connection presentation
 and complete Web3 cutover remain pending. No schema change.
+
+### Native wallet connection HTTP lifecycle
+
+Extends the existing native Web3 opt-in to first-party connection handoff
+issuance, direct session-authenticated start, one-time handoff start and
+connection completion. The provider interaction model is checked on ticket
+issue and redemption. Link completion uses the server transaction's
+canonical owner and never issues a login session. Optional presentation
+refresh uses that same owner and stays best effort. Cookie-only initiation
+and completion use native storage; delegated Bearer start/issuance retain
+compatibility authorization. Compiled HTTP and live provider acceptance
+remain required. No schema change.

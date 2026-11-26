@@ -803,6 +803,70 @@ TEST(Web3HttpCoroutineTest, MobileHandoffPublishesWithoutSessionAndRedeemsOnce)
     EXPECT_EQ(fixture.fallback.calls,0);
 }
 
+asio::awaitable<void> nativeLinkHandoffFlow(Fixture& fixture,bool& passed)
+{
+    namespace json=boost::json;
+    http::Web3AuthenticationHttpApi api{fixture.authentication,fixture.providers,
+        fixture.sessions,fixture.limiter,fixture.fallback,nullptr,&fixture.nativeSessions,
+        [](fnd::SecretString)->asio::awaitable<fnd::Result<sess::Session>> {
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        }};
+    auto ticket=co_await fixture.authentication.issueBrowserConnectionHandoffAsync(
+        identity::IdentityId{"link-owner"},idp::ProviderId{"ethereum-wallet"},
+        "/account",fnd::CorrelationId{"native-link-test"},idp::InteractionModel::ChallengeResponse);
+    if (!ticket) co_return;
+    json::object fields{{"provider","ethereum-wallet"},
+        {"address","0x1111111111111111111111111111111111111111"},{"chain_id","1"},
+        {"handoff_ticket",ticket->ticket().expose()}};
+    const auto body=json::serialize(fields);
+    auto started=co_await api.handleAsync(request("/account/connections/web3/start",body));
+    if (started.status()!=200) co_return;
+    auto replay=co_await api.handleAsync(request("/account/connections/web3/start",body));
+    EXPECT_EQ(replay.status(),401);
+    std::string cookies;
+    auto collect=[&](std::string_view name,std::string_view value) {
+        if (name!="set-cookie" || value.find("Max-Age=0")!=std::string_view::npos) return;
+        if (!cookies.empty()) cookies.append("; ");
+        cookies.append(value.substr(0,value.find(';')));
+    };
+    for (const auto& [name,value]:started.headers()) collect(name,value);
+    for (const auto& [name,value]:started.repeatedHeaders()) collect(name,value);
+    const auto proof=[&](std::string path) {
+        return gateway::HttpRequest::create(gateway::HttpMethod::Post,std::move(path),
+            {{"content-type","application/json"},{"cookie",cookies}},
+            R"({"message":"SIWE test challenge","signature":"test-signed-proof","display_name":"Linked wallet"})",
+            "127.0.0.1",fnd::CorrelationId{"native-link-proof"}).value();
+    };
+    auto wrong=co_await api.handleAsync(proof("/auth/web3/complete"));
+    EXPECT_EQ(wrong.status(),401);
+    auto linked=co_await api.handleAsync(proof("/account/connections/web3/complete"));
+    if (linked.status()!=200) co_return;
+    EXPECT_TRUE(json::parse(linked.body()).as_object().at("connected").as_bool());
+    auto owner=fixture.identities.ownerOf(identity::ExternalIdentityRef{
+        idp::ProviderId{"ethereum-wallet"},idp::ExternalSubject{"wallet-user"}});
+    auto completedReplay=co_await api.handleAsync(proof("/account/connections/web3/complete"));
+    EXPECT_EQ(completedReplay.status(),401);
+    passed=owner && owner->has_value() && owner->value().value()=="link-owner"
+        && fixture.nativeSessions.nativeCalls==0 && fixture.sessionsRepository.size()==0U;
+}
+
+TEST(Web3HttpCoroutineTest, NativeLinkHandoffNeverIssuesLoginSession)
+{
+    Fixture fixture;
+    auto provider=std::make_unique<NativeWalletProvider>();
+    auto* observed=provider.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(provider)));
+    bool passed=false;
+    asio::io_context io;
+    auto done=asio::co_spawn(io,nativeLinkHandoffFlow(fixture,passed),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    EXPECT_TRUE(passed);
+    EXPECT_EQ(observed->nativeCalls,2);
+    EXPECT_EQ(observed->blockingCalls,0);
+    EXPECT_EQ(fixture.fallback.calls,0);
+}
+
 TEST(Web3HttpCoroutineTest, NativePresentationCannotBypassProof)
 {
     Fixture fixture;

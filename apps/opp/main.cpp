@@ -3059,6 +3059,11 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
+        if (nativeWeb3Enabled) {
+            nativeMethods.emplace_back("/account/connections/web3/start",gateway::HttpMethod::Post);
+            nativeMethods.emplace_back("/account/connections/web3/handoff",gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/connections/web3/complete");
+        }
         if (nativeFederatedStartEnabled) {
             nativeMethods.emplace_back("/account/connections/start",gateway::HttpMethod::Get);
             nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get);
@@ -3170,7 +3175,10 @@ addProtectedRoutes(gateway::Router& router,
             if (nativeWeb3Enabled) {
                 authHttp::Web3AuthenticationHttpApi localWeb3Api{
                     *nativeAuthentication, providers, sessions, limiter.value(),
-                    localEnterpriseApi, nullptr, nativeSessions.get()};
+                    localEnterpriseApi, nullptr, nativeSessions.get(),
+                    [service=nativeSessions.get()](fnd::SecretString token) {
+                        return service->authenticate(std::move(token));
+                    }};
                 return runWithScim(enterpriseApi, localWeb3Api);
             }
             return runWithScim(enterpriseApi, localEnterpriseApi);
@@ -3182,7 +3190,10 @@ addProtectedRoutes(gateway::Router& router,
             // actually receive native requests.
             authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
                 *nativeAuthentication, providers, sessions, limiter.value(),
-                enterpriseApi, nullptr, nativeSessions.get()};
+                enterpriseApi, nullptr, nativeSessions.get(),
+                [service=nativeSessions.get()](fnd::SecretString token) {
+                    return service->authenticate(std::move(token));
+                }};
             return runWithScim(enterpriseApi, nativeWeb3Api);
         }
         return runWithScim(enterpriseApi, enterpriseApi);
