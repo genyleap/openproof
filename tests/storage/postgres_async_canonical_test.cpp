@@ -29,6 +29,7 @@ import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.identity.provider;
+import openproof.organization;
 
 namespace {
 namespace asio = boost::asio;
@@ -685,6 +686,103 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     auto done = asio::co_spawn(io, run(), asio::use_future);
     io.run();
     ASSERT_NO_THROW(done.get());
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    Conn connection{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(connection && PQstatus(connection.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(connection.get()));
+    for (const auto& [tenant, identity, state, role] : {
+         std::tuple{seed.org, seed.owner, "1", "owner"},
+         std::tuple{seed.org, seed.secondOwner, "1", "member"},
+         std::tuple{seed.org, seed.freshLoginOwner, "2", "owner"},
+         std::tuple{seed.org, seed.lockedOwner, "1", "owner"},
+         std::tuple{seed.org, seed.emptyConnectionsOwner, "3", ""},
+         std::tuple{seed.foreignOrg, seed.foreignOwner, "1", "owner"},
+         std::tuple{seed.suspendedOrg, seed.suspendedOwner, "1", "owner"}}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(connection.get(),
+            "INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+            "VALUES($1,$2,$3,1770000000000)", {tenant, identity, state})));
+        if (std::string_view{role}.size() != 0U) {
+            ASSERT_NO_THROW(static_cast<void>(execute(connection.get(),
+                "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,$3)",
+                {tenant, identity, role})));
+        }
+    }
+    ASSERT_NO_THROW(static_cast<void>(execute(connection.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'auditor')",
+        {seed.org, seed.owner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer canonical{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    pg::CoroutinePostgresCanonicalFinalizer suspended{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.suspendedOrg}, 1U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    auto check = [&]() -> asio::awaitable<void> {
+        const auto result = co_await canonical.readMembersAsync(ids::IdentityId{seed.owner});
+        if (!result) {
+            ADD_FAILURE() << "Owner membership projection failed";
+            co_return;
+        }
+        EXPECT_EQ(result->actor.value(), seed.owner);
+        EXPECT_EQ(result->members.size(), 5U);
+        bool ownerSeen = false;
+        bool removedSeen = false;
+        bool suspendedSeen = false;
+        for (const auto& member : result->members) {
+            EXPECT_NE(member.identity.value(), seed.foreignOwner);
+            EXPECT_NE(member.identity.value(), seed.suspendedOwner);
+            if (member.identity.value() == seed.owner) {
+                ownerSeen = true;
+                EXPECT_EQ(member.roles.size(), 2U);
+                if (member.roles.size() == 2U) {
+                    EXPECT_EQ(member.roles[0].value(), "auditor");
+                    EXPECT_EQ(member.roles[1].value(), "owner");
+                }
+            }
+            if (member.identity.value() == seed.emptyConnectionsOwner) {
+                removedSeen = true;
+                EXPECT_EQ(member.membershipState, openproof::organization::MembershipState::Removed);
+                EXPECT_TRUE(member.roles.empty());
+            }
+            if (member.identity.value() == seed.freshLoginOwner) {
+                suspendedSeen = true;
+                EXPECT_EQ(member.membershipState, openproof::organization::MembershipState::Suspended);
+            }
+        }
+        EXPECT_TRUE(ownerSeen && removedSeen && suspendedSeen);
+        for (const auto& actor : {seed.secondOwner, seed.freshLoginOwner, seed.lockedOwner,
+                                  seed.foreignOwner, seed.simultaneousOwner}) {
+            auto denied = co_await canonical.readMembersAsync(ids::IdentityId{actor});
+            EXPECT_TRUE(!denied && denied.error().code() == fnd::ErrorCode::PermissionDenied);
+        }
+        auto inactive = co_await suspended.readMembersAsync(ids::IdentityId{seed.suspendedOwner});
+        EXPECT_TRUE(!inactive && inactive.error().code() == fnd::ErrorCode::PermissionDenied);
+    };
+    auto done = asio::co_spawn(io, check(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+    // The first member is valid but the removed membership is deliberately
+    // corrupted; no partial member list may be returned.
+    ASSERT_NO_THROW(static_cast<void>(execute(connection.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",
+        {seed.org, seed.emptyConnectionsOwner})));
+    io.restart();
+    auto malformed = asio::co_spawn(io, canonical.readMembersAsync(ids::IdentityId{seed.owner}), asio::use_future);
+    io.run();
+    auto denied = malformed.get();
+    EXPECT_TRUE(!denied && denied.error().code() == fnd::ErrorCode::Unavailable);
 }
 
 struct ProfileReadChecks final {

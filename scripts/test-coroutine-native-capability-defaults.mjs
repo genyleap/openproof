@@ -110,7 +110,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   const sessionRepo = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer = app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
   const canonicalGate = app.indexOf(
-    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled) {", sessionIssuer);
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled) {", sessionIssuer);
   const canonical = app.indexOf("nativeCanonical = std::make_unique<", canonicalGate);
   const authGate = app.indexOf(
     "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {", canonical);

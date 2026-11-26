@@ -53,6 +53,7 @@ jobs:
           node scripts/test-coroutine-account-profile-contract.mjs
           node scripts/test-coroutine-account-connections-contract.mjs
           node scripts/test-coroutine-account-totp-status-contract.mjs
+          node scripts/test-native-admin-members-contract.mjs
       - name: Whitespace
         run: git diff --check
       - name: End-to-end coroutine coverage gate
@@ -110,6 +111,8 @@ jobs:
         run: |
           cmake --build --preset gcc-release --target openproof_account_coroutine_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
+          cmake --build --preset gcc-release --target openproof_admin_coroutine_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_admin_coroutine_http_tests
 
       # A dedicated Unix-socket PostgreSQL instance, created and destroyed
       # by the checked-in guard script, validates the new connection SQL
@@ -136,6 +139,8 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_profile_e2e_ci
           node scripts/e2e-identity-platform.mjs
@@ -152,6 +157,8 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
           node scripts/e2e-identity-platform.mjs

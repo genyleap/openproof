@@ -1030,6 +1030,19 @@ async function main() {
     assert.equal(localMember.identity_id, "e2e-dispatcher");
     assert.ok(localMember.initial_password.length >= 32);
     assert.match(localMember.totp_secret_base32, /^[A-Z2-7]+$/);
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+      expectStatus(await edgeRequest("/admin/local-members"), 401);
+      expectStatus(await edgeRequest("/admin/local-members", { jar: consumerJarAfterReset }), 403);
+      const listing = await edgeRequest("/admin/local-members", { jar: ownerJar });
+      expectStatus(listing, 200);
+      assert.equal(listing.headers["cache-control"], "no-store");
+      const members = jsonBody(listing).members;
+      assert.ok(members.some(m => m.identity_id === "e2e-owner" && m.roles.includes("owner")
+        && m.identity_status === "active" && m.membership_state === "active"));
+      assert.ok(members.some(m => m.identity_id === "e2e-dispatcher" && m.roles.includes("dispatcher")));
+      assert.ok(members.every(m => Object.keys(m).sort().join(",")
+        === "identity_id,identity_status,membership_state,roles"));
+    }
 
     const applicationResponse = await jsonRequest("/admin/applications", "POST", {
       identifier: "e2e-product",
@@ -1242,6 +1255,10 @@ async function main() {
       initialDispatcherTotp,
     );
     assert.equal(dispatcherGrant.assurance, "ial2");
+    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+      expectStatus(await edgeRequest("/admin/local-members", { jar: dispatcherJar }), 403);
+      console.log("- native owner-only administration listing: IAL2 non-owner denied");
+    }
 
     await stopOpp();
     const masterRotationDryRun = command(binary, [

@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+import openproof.administration;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
@@ -76,6 +77,12 @@ public:
         std::pair<identity::core::IdentityId, std::optional<bool>>>>
     readTotpStatusAsync(identity::core::IdentityId owner,
                         identity::provider::ProviderId localProvider);
+
+    /** Owner-only administration projection. Authorization and listing share
+     * one SQL snapshot, bound to the configured tenant. No credential reads.
+     */
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<administration::MemberListing>>
+    readMembersAsync(identity::core::IdentityId actor);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;

@@ -54,6 +54,7 @@
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
+#include "../../src/authentication/http/coroutine_admin_read_http.hpp"
 
 import openproof.account;
 import openproof.account.delivery;
@@ -1489,6 +1490,19 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeAuthSessionEnabled =
         nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    const auto nativeAdminReadFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS");
+    if (nativeAdminReadFlag && *nativeAdminReadFlag != "0" && *nativeAdminReadFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAdminReadEnabled = nativeAdminReadFlag && *nativeAdminReadFlag == "1";
+    if (nativeAdminReadEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native administration reads require native authentication sessions and authentication API."});
+        return ExitCode::ConfigurationError;
+    }
     // Public OIDC discovery/JWKS are memory-only and can be served without
     // the synchronous OAuth handler. Keep all state-changing OAuth routes
     // on the existing compatibility chain until their SQL SPI is migrated.
@@ -2422,7 +2436,7 @@ addProtectedRoutes(gateway::Router& router,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
-            || nativeAccountTotpStatusEnabled) {
+            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2555,6 +2569,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
+        std::unique_ptr<adminHttp::CoroutineAdministrationReadAdapter> asyncAdminRead;
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
         // A Web3-only opt-in must never activate LDAP inadvertently just
@@ -2719,6 +2734,25 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountTotpStatusEnabled) {
             nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+        }
+        if (nativeAdminReadEnabled) {
+            if (!nativeSessions || !nativeCanonical) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native administration reader is unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* service = nativeSessions.get();
+            auto* canonical = nativeCanonical.get();
+            asyncAdminRead = std::make_unique<adminHttp::CoroutineAdministrationReadAdapter>(
+                *nativeHandler, limiter.value(),
+                [service](fnd::SecretString bearer) {
+                    return service->authenticate(std::move(bearer));
+                },
+                [canonical](identity::IdentityId actor) {
+                    return canonical->readMembersAsync(std::move(actor));
+                });
+            nativeHandler = asyncAdminRead.get();
+            nativeMethods.emplace_back("/admin/local-members", gateway::HttpMethod::Get);
         }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             healthApi, *nativeHandler, std::move(nativePaths),

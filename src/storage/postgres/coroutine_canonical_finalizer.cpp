@@ -3,6 +3,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/any_io_executor.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -24,6 +25,7 @@ import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.identity.provider;
+import openproof.organization;
 
 namespace openproof::storage::postgres {
 namespace asio = boost::asio;
@@ -490,6 +492,105 @@ CoroutinePostgresCanonicalFinalizer::readTotpStatusAsync(
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
             "Native TOTP status lookup is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<administration::MemberListing>>
+CoroutinePostgresCanonicalFinalizer::readMembersAsync(core::IdentityId actor)
+{
+    constexpr std::size_t maxMembers = 256U;
+    constexpr std::size_t maxRoles = 16U;
+    constexpr std::size_t maxRows = maxMembers * maxRoles;
+    if (actor.empty() || actor.value().size() > 200U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline = Clock::now() + m_impl->queryTimeout;
+        auto lease = co_await m_impl->pool.acquire(deadline);
+        // Owner authorization is part of the same statement/snapshot as
+        // enumeration. No data is returned if actor, membership or tenant
+        // is inactive or the owner role was absent in this snapshot.
+        const auto rows = co_await lease.connection().query(
+            "WITH permitted AS (SELECT a.identity_id FROM openproof.memberships a "
+            "JOIN openproof.identities ai ON ai.id=a.identity_id "
+            "AND ai.organization_id=a.organization_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE a.identity_id=$1 AND a.organization_id=$2 "
+            "AND a.state=1 AND ai.status=0 AND o.state=0 "
+            "AND EXISTS(SELECT 1 FROM openproof.membership_roles ar "
+            "WHERE ar.organization_id=a.organization_id AND ar.identity_id=a.identity_id "
+            "AND ar.role='owner')) "
+            "SELECT p.identity_id,i.id,i.status,m.state,r.role "
+            "FROM permitted p JOIN openproof.memberships m ON m.organization_id=$2 "
+            "JOIN openproof.identities i ON i.id=m.identity_id AND i.organization_id=m.organization_id "
+            "LEFT JOIN openproof.membership_roles r ON r.organization_id=m.organization_id "
+            "AND r.identity_id=m.identity_id "
+            "ORDER BY i.id COLLATE \"C\",r.role COLLATE \"C\" NULLS FIRST LIMIT 4097",
+            {std::string{actor.value()}, std::string{m_impl->organization.value()}},
+            remaining(deadline));
+        if (rows.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        if (rows.rows.size() > maxRows)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable,
+                "Native membership listing exceeds its bounded result.");
+        const auto statusValue = [](const std::optional<std::string>& field,
+                                    unsigned int maximum) {
+            const auto value = required(field);
+            unsigned int parsed{};
+            const auto [end, error] = std::from_chars(
+                value.data(), value.data() + value.size(), parsed);
+            if (error != std::errc{} || end != value.data() + value.size()
+                || parsed > maximum)
+                throw std::runtime_error{"Malformed membership status"};
+            return parsed;
+        };
+        const auto validText = [](std::string_view value) {
+            return !value.empty() && value.size() <= 200U
+                && std::all_of(value.begin(), value.end(), [](char c) {
+                    const auto byte = static_cast<unsigned char>(c);
+                    return byte >= 0x20U && byte != 0x7fU;
+                });
+        };
+        administration::MemberListing result{actor, {}};
+        bool ownerSeen = false;
+        for (const auto& row : rows.rows) {
+            if (row.size() != 5U || required(row[0]) != actor.value())
+                throw std::runtime_error{"Invalid owner-bound member row"};
+            const auto identity = required(row[1]);
+            if (!validText(identity)) throw std::runtime_error{"Invalid member identity"};
+            const auto identityStatus = static_cast<core::IdentityStatus>(statusValue(row[2], 5U));
+            const auto membershipState = static_cast<organization::MembershipState>(statusValue(row[3], 3U));
+            if (result.members.empty() || result.members.back().identity.value() != identity) {
+                if (result.members.size() >= maxMembers)
+                    throw std::runtime_error{"Native member count exceeds bound"};
+                if (!result.members.empty() && result.members.back().identity.value() >= identity)
+                    throw std::runtime_error{"Member rows are not strictly ordered"};
+                result.members.push_back(administration::MemberSummary{
+                    core::IdentityId{identity}, identityStatus, membershipState, {}});
+            }
+            auto& member = result.members.back();
+            if (member.identityStatus != identityStatus || member.membershipState != membershipState)
+                throw std::runtime_error{"Inconsistent member projection"};
+            if (row[4]) {
+                const auto& role = *row[4];
+                if (!validText(role) || member.roles.size() >= maxRoles
+                    || member.membershipState == organization::MembershipState::Removed
+                    || (!member.roles.empty() && member.roles.back().value() >= role))
+                    throw std::runtime_error{"Invalid member role projection"};
+                member.roles.emplace_back(role);
+                if (member.identity == actor && role == "owner"
+                    && identityStatus == core::IdentityStatus::Active
+                    && membershipState == organization::MembershipState::Active)
+                    ownerSeen = true;
+            } else if (!member.roles.empty()) {
+                throw std::runtime_error{"Unexpected missing membership role"};
+            }
+        }
+        if (!ownerSeen)
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return std::move(result);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native tenant membership listing is unavailable.");
     }
 }
 
