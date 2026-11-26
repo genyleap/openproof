@@ -921,3 +921,18 @@ compatibility dispatch. A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
+
+### Experimental native recovery-code issuance
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` enables only
+`POST /auth/recovery-codes` with a valid first-party session at IAL2 or
+higher. Default is disabled; native authentication sessions and the
+active authentication API are mandatory. Builds explicitly configured with
+`OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=OFF` reject the runtime opt-in.
+Native eligibility reads use the configured organization and local provider;
+issuance and the legacy repository share the same identity-scoped transaction
+lock and key material. Before returning plaintext, the native HTTP adapter
+rechecks eligibility and revokes codes on a failed recheck. The existing login
+and MFA verification paths redeem the same digests once. This capability is
+experimental, not approval of the remaining migration or concurrent TOTP
+lifecycle acceptance.
