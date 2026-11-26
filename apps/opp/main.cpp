@@ -47,6 +47,7 @@
 #include <boost/json.hpp>
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/operations/http/coroutine_health_http.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
 #include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
@@ -2877,7 +2878,6 @@ addProtectedRoutes(gateway::Router& router,
         scimBearerToken.emplace(std::move(*configuredScimToken));
     }
 
-    operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
     gateway::Gateway* nativeGatewayCore = nullptr;
     oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
@@ -2929,7 +2929,9 @@ addProtectedRoutes(gateway::Router& router,
         evidenceHttp::Api evidenceApi{
             evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
             sessions, evidenceProviders, limiter.value(), fallback};
-        operationsHttp::HealthHttpApi healthApi{readiness, evidenceApi};
+        // Health probes share the native SQL admission/deadline boundary.
+        // The compatibility chain must never construct a synchronous readiness check.
+
         // Legacy health, evidence and SCIM middleware remain the authoritative
         // compatibility chain. Exact native routes bypass it only when their
         // independently verified coroutine dependencies are available.
@@ -3449,8 +3451,12 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/oauth/consents");
             nativePaths.emplace_back("/oauth/consents/revoke");
         }
+        operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
+            [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
+        nativePaths.emplace_back("/health/live");
+        nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
-            healthApi, *nativeHandler, std::move(nativePaths),
+            evidenceApi, nativeHealth, std::move(nativePaths),
             std::move(nativeMethods)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {

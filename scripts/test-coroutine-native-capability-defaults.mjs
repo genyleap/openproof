@@ -81,7 +81,8 @@ test("partially migrated runtime overlays LDAP and opted-in account sessions wit
   }
   assert.match(overlay, /return unavailable\(request\)/);
   assert.doesNotMatch(overlay.slice(overlay.indexOf("CoroutineRouteOverlay::handleAsync(")), /m_compatibility->handle\(/);
-  assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?healthApi, \*nativeHandler, std::move\(nativePaths\)/);
+  assert.match(app, /CoroutineRouteOverlay nativeRoutes\{[\s\S]*?evidenceApi, nativeHealth, std::move\(nativePaths\)/);
+  assert.match(app, /CoroutineHealthAdapter nativeHealth\{\*nativeHandler,/);
   assert.match(app, /nativeHandler = &nativeEnterprise/);
   assert.match(app, /if \(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/);
   assert.match(app, /if \(nativeWeb3Enabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/web3\/start"\);\s*nativePaths\.emplace_back\("\/auth\/web3\/complete"\)/);

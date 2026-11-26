@@ -1079,6 +1079,22 @@ Proof headers are ingress-only and stripped before forwarding. The
 existing retry deadline and circuit-breaker decisions are preserved.
 This is not full migration acceptance.
 
+### Native health probes
+
+For authenticated runtimes, /health/live is independent of PostgreSQL and
+/health/ready awaits SELECT 1 on the bounded native canonical pool, using
+one monotonic deadline for admission, connect/reset and query. Storage
+failure or pool exhaustion produces a sanitized 503; non-GET methods
+return 405. Both paths have strict native ownership, with no synchronous
+readiness fallback. This also checks the actual request-processing pool
+rather than a separate legacy connection pool.
+
+The remaining PostgreSQL compatibility surfaces include application/client/
+resource/service-identity administration, passkey operations, evidence/trust
+and enabled SCIM operations, as well as startup and offline administration.
+Their synchronous dependencies must be separately audited and migrated
+before claiming complete native runtime acceptance.
+
 ### Native owner-only local member administration
 
 Authenticated runtimes require the native local-member administration API.

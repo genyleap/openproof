@@ -80,6 +80,7 @@ target_link_libraries(opp
         openproof_postgres_async_repository
         openproof_postgres_async_listener
         openproof_operations_http
+        openproof_operations_async_http
         openproof_organization
         openproof_session
         openproof_oauth

@@ -980,6 +980,20 @@ gtest_discover_tests(openproof_admin_lifecycle_http_tests
     TEST_PREFIX "NativeAdminLifecycle." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
 
+add_executable(openproof_native_health_tests operations/coroutine_health_test.cpp)
+target_compile_features(openproof_native_health_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_native_health_tests PROPERTIES CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_native_health_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_native_health_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_native_health_tests PRIVATE
+    openproof_operations_async_http GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_native_health_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_native_health_tests TEST_PREFIX "NativeHealth."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120 PROPERTIES LABELS "health;async;http" TIMEOUT 20)
+
 # Isolated native delivery regression: keep the Gateway Asio definitions
 # separate from the umbrella provider executable.
 add_executable(openproof_account_delivery_coroutine_tests

@@ -2698,4 +2698,20 @@ CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::healthCheckAsync()
+{
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto rows=co_await lease.connection().query("SELECT 1",{},remaining(deadline));
+        if (rows.rows.size()!=1U || rows.rows.front().size()!=1U
+            || rows.rows.front().front()!=std::optional<std::string>{"1"})
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
 } // namespace openproof::storage::postgres

@@ -581,6 +581,29 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTimeoutDropsPoisonedConnection)
     EXPECT_TRUE(recovered);
 }
 
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseNativeReadinessChecksActualPool)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{"readiness-fixture"},1U,500ms,1000ms,3000ms};
+    auto first=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    auto second=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    io.run();
+    EXPECT_TRUE(first.get());
+    EXPECT_TRUE(second.get());
+    io.restart();
+    auto third=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    io.run();
+    EXPECT_TRUE(third.get()); // the previous probes returned the only lease
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
 {
     const auto dsn = disposableDsn();

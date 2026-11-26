@@ -78,7 +78,9 @@ jobs:
           node scripts/test-native-http-credential-erasure.mjs
           node scripts/test-coroutine-provider-transports.mjs
       - name: Native OAuth token read contract
-        run: node scripts/test-coroutine-native-oauth-token-read.mjs
+        run: |
+          node scripts/test-coroutine-native-oauth-token-read.mjs
+          node scripts/test-coroutine-native-health-runtime.mjs
       - name: Mandatory native public discovery and provider catalog contract
         run: |
           node scripts/test-coroutine-native-oidc-discovery-runtime.mjs
@@ -188,6 +190,8 @@ jobs:
           ./cmake-build-gcc-release/tests/openproof_admin_coroutine_http_tests
           cmake --build --preset gcc-release --target openproof_admin_lifecycle_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_admin_lifecycle_http_tests
+          cmake --build --preset gcc-release --target openproof_native_health_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_native_health_tests
 
       # A dedicated Unix-socket PostgreSQL instance, created and destroyed
       # by the checked-in guard script, validates the new connection SQL

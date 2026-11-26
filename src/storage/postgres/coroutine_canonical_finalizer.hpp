@@ -51,6 +51,9 @@ public:
         const CoroutinePostgresCanonicalFinalizer&) = delete;
     ~CoroutinePostgresCanonicalFinalizer() override;
 
+    // Probe the real native pool, including queue admission and reconnect.
+    [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
+
     [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
         return true;
     }
