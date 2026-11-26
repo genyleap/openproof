@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install lint tools
         run: sudo apt-get update -qq && sudo apt-get install -y shellcheck python3
       - name: Shellcheck
@@ -32,6 +34,8 @@ jobs:
             scripts/backup-postgres.sh scripts/restore-postgres.sh
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
+      - name: Pinned release schema checksum inventory
+        run: python3 scripts/inventory-release-schema.py --check
       - name: CSPRNG temporary entropy and zeroization regression
         run: node scripts/test-security-random-wipe.mjs
       - name: OpenAPI coverage
@@ -65,6 +69,21 @@ jobs:
         run: git diff --check
       - name: End-to-end coroutine coverage gate
         run: node scripts/verify-coroutine-coverage.mjs
+
+  schema-baseline:
+    name: Disposable schema baseline round-trip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 16 tools
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+      - name: Verify release artifact inventory matching
+        run: python3 scripts/test-verify-migration-artifacts.py
+      - name: Verify baseline migration admission
+        run: python3 scripts/test-verify-schema-baseline.py
+      - name: Verify disposable baseline reconstruction
+        run: python3 scripts/verify-schema-baseline.py
 
   ldap-fixture:
     name: Real LDAPS fixture preflight
@@ -236,6 +255,19 @@ jobs:
       - name: Test
         run: ctest --preset gcc-release --output-on-failure
 
+      - name: Consolidated fresh schema and legacy-ledger integration
+        env:
+          OPENPROOF_TEST_BASELINE_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_baseline_ci
+          OPENPROOF_TEST_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture
+          OPENPROOF_TEST_BASELINE_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_baseline_ci
+          cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
+            --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
+          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
+
+
       # Paired comparison is deliberately gated on the *full* test suite.
       # The candidate and pinned mainline baseline run on the same runner,
       # with distinct disposable databases and the same E2E workload.
@@ -303,3 +335,15 @@ jobs:
           ./packaging/build-bundle.sh cmake-build-gcc-release dist amd64
           dpkg-deb --info dist/openproof_*_amd64.deb
           tar -tzf dist/openproof_*_linux_amd64.tar.gz | grep -q './opt/openproof/bin/opp.real'
+
+      - name: Build and verify opt-in schema baseline packages
+        env:
+          OPENPROOF_SCHEMA_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture/baseline
+        run: |
+          mkdir -p dist-baseline
+          ./packaging/build-deb.sh cmake-build-gcc-release dist-baseline amd64
+          ./packaging/build-bundle.sh cmake-build-gcc-release dist-baseline amd64
+          python3 scripts/verify-migration-artifacts.py --source migrations \
+            --baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY" \
+            --deb dist-baseline/openproof_*_amd64.deb \
+            --bundle dist-baseline/openproof_*_linux_amd64.tar.gz
