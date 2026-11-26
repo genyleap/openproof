@@ -70,6 +70,8 @@ public:
                                const foundation::ClockSource& clock);
     ~LdapAuthenticationProvider() override;
 
+    /** Startup readiness of the prepared certificate trust store. */
+    [[nodiscard]] bool nativeTrustReady() const noexcept;
     [[nodiscard]] identity::provider::ProviderId id() const override;
     [[nodiscard]] identity::provider::InteractionModel interactionModel() const noexcept override;
     [[nodiscard]] identity::provider::AssuranceLevel maximumClaimableAssurance() const noexcept override;

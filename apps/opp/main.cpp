@@ -2307,8 +2307,14 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(ldapConfig.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = providers.registerProvider(std::make_unique<enterprise::LdapAuthenticationProvider>(
-            std::move(ldapConfig).value(), clock));
+        auto ldapProvider = std::make_unique<enterprise::LdapAuthenticationProvider>(
+            std::move(ldapConfig).value(), clock);
+        if (!ldapProvider->nativeTrustReady()) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                "LDAP certificate trust could not be prepared."});
+            return ExitCode::ConfigurationError;
+        }
+        auto status = providers.registerProvider(std::move(ldapProvider));
         if (status) status = trust.trust(idp::ProviderId{"ldap"}, idp::AssuranceLevel::Ial1, true);
         if (!status) {
             reportStartupFailure(status.error());
