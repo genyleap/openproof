@@ -4087,8 +4087,10 @@ namespace openproof::storage::postgres {
 
         auto removed = runCommand(
             connection,
-            "DELETE FROM openproof.account_verification_challenges "
-            "WHERE identity_id=$1 AND purpose=$2",
+            "WITH obsolete AS (DELETE FROM openproof.account_verification_challenges "
+            "WHERE identity_id=$1 AND purpose=$2 RETURNING id,identity_id) "
+            "DELETE FROM openproof.pending_external_identity_reservations r USING obsolete c "
+            "WHERE r.verification_id=c.id AND r.identity_id=c.identity_id",
             {std::string{challenge.identity().value()},
              integer(static_cast<unsigned int>(challenge.purpose()))},
             "replace account verification challenge");
