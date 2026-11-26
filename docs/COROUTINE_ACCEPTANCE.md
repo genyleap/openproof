@@ -5159,3 +5159,20 @@ separate owner-checked native read after commit. No session or identity
 is created. Added compiled regression and source checks. Legacy untagged
 contact reservations are not accepted by native completion. No schema
 change; exact-head executable acceptance pending.
+
+### Atomic native email change completion
+
+The opt-in account workload now selects POST /account/email/change/verify
+with native authentication and exact owner/generation-bound email proof.
+Optional enrollment password uses the bounded KDF before the SQL lease.
+Profile-only verification creates no credential or local link. Initial
+local enrollment is insert-only; existing local accounts retain their
+password hash, and a subject rebind removes only the exact previous
+owner link and advances the credential generation to fence alias ABA.
+Ambiguous local links fail closed. Subject, profile, proof and reservation
+commit together. Contact issuance cannot overwrite a live untagged
+signup reservation even for the same owner. Profile response is a
+separate native read after commit; no session issued. Native completion
+requires tagged reservations, as phone verification does. Legacy
+compatibility writers and exact-head executable acceptance remain open.
+No schema change.

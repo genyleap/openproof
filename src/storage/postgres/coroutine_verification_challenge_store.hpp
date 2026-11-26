@@ -88,6 +88,12 @@ public:
         account::VerificationId id,account::VerificationDigest presented,
         foundation::Instant now,std::uint32_t maximumAttempts);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    changeEmailAsync(identity::provider::ProviderId provider,identity::core::IdentityId owner,
+        account::VerificationId id,account::VerificationDigest presented,
+        std::optional<credentials::PasswordHash> enrollment,
+        foundation::Instant now,std::uint32_t maximumAttempts);
+
     /** Compensation only for the exact issued ID, owner and purpose.
      * Idempotent if consumed or superseded; never deletes a newer challenge.
      * Allowed even after the identity becomes inactive in the same tenant.

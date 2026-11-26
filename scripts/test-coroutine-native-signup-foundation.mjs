@@ -224,7 +224,7 @@ test("local password proof generation remains fenced through both session persis
 test("phone completion is owner-bound, generation-bound and atomic",()=>{
   const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
   const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::verifyPhoneAsync("),
-    source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+    source.indexOf("CoroutineVerificationChallengeStore::changeEmailAsync("));
   const markers=["BEGIN ISOLATION LEVEL READ COMMITTED","i.organization_id=$2 AND i.status=0 AND o.state=0",
     "FOR UPDATE OF i FOR SHARE OF o","identity_id=$2 AND purpose=2 AND channel=1 FOR UPDATE",
     "security::constantTimeEquals","r.verification_id=$4 AND r.expires_at_ms>$5",
@@ -243,4 +243,22 @@ test("phone completion is owner-bound, generation-bound and atomic",()=>{
   assert.match(route,/co_await m_verifyPhone\(actor->identity\(\)/);
   assert.match(route,/value->identity\(\)!=actor->identity\(\)/);
   assert.match(read("apps/opp/main.cpp"),/if \(nativeVerifyPhone\) nativeMethods.emplace_back\("\/account\/phone\/verify"/);
+});
+
+test("native email change keeps existing password, fences alias ABA and never creates a second owner",()=>{
+  const source=read("src/storage/postgres/coroutine_verification_challenge_store.cpp");
+  const body=source.slice(source.indexOf("CoroutineVerificationChallengeStore::changeEmailAsync("),source.indexOf("CoroutineVerificationChallengeStore::replaceImpl("));
+  const ordered=["FOR UPDATE OF i FOR SHARE OF o","purpose=1 AND channel=0 FOR UPDATE","security::constantTimeEquals",
+    "r.verification_id=$4 AND r.expires_at_ms>$5","ORDER BY external_subject LIMIT 2 FOR UPDATE",
+    "if (previous || enrollment)","ON CONFLICT(identity_id) DO NOTHING","ON CONFLICT(provider,external_subject) DO NOTHING",
+    "DELETE FROM openproof.external_identities","SET changed_at_ms=GREATEST(changed_at_ms+1,$2::bigint)",
+    "SET email=$2,email_verified=true","const auto consumed=","const auto released="];
+  let last=-1; for (const marker of ordered){const i=body.indexOf(marker);assert.ok(i>last,marker);last=i;}
+  assert.match(body,/local.rows.size\(\)>1U/);
+  assert.doesNotMatch(body,/UPDATE openproof.password_credentials SET password_hash|INSERT INTO openproof.identities/);
+  assert.match(source,/r.identity_id=EXCLUDED.identity_id AND r.verification_id IS NOT NULL/);
+  const app=read("apps/opp/main.cpp");
+  assert.match(app,/contactStore.changeEmailAsync\(providerId,owner/);
+  assert.match(app,/nativeMethods.emplace_back\("\/account\/email\/change\/verify"/);
+  assert.match(read("src/account/http/coroutine_session_http.cpp"),/co_await m_verifyEmailChange\(actor->identity\(\)/);
 });
