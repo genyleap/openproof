@@ -66,6 +66,16 @@ for soname in libstdc++.so.6 libgcc_s.so.1; do
 done
 
 cp -a "$ROOT/migrations/." "$PKG/opt/openproof/migrations/"
+migration_verify_args=(--source "$ROOT/migrations")
+# Opt-in only: CI uses the already round-tripped runtime candidate. Never
+# generate a new schema from a potentially live database during packaging.
+if [[ -n "${OPENPROOF_SCHEMA_BASELINE_DIRECTORY:-}" ]]; then
+  migration_verify_args+=(--baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY")
+  python3 "$ROOT/scripts/verify-migration-artifacts.py" "${migration_verify_args[@]}" --check-source
+  install -d "$PKG/opt/openproof/migrations/baseline"
+  install -m 0644 "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY/schema.sql" "$PKG/opt/openproof/migrations/baseline/schema.sql"
+  install -m 0644 "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY/checksums.txt" "$PKG/opt/openproof/migrations/baseline/checksums.txt"
+fi
 find "$PKG/opt/openproof/migrations" -type d -exec chmod 0755 {} +
 find "$PKG/opt/openproof/migrations" -type f -exec chmod 0644 {} +
 install -m 0644 "$ROOT/docs/OPERATIONS.md" "$PKG/opt/openproof/docs/OPERATIONS.md"
@@ -127,6 +137,6 @@ mkdir -p "$OUT_DIR"
 ASSET="$OUT_DIR/openproof_"$RAW_VERSION"_"$ARCH".deb"
 dpkg-deb --build --root-owner-group "$PKG" "$ASSET" >/dev/null
 python3 "$ROOT/scripts/verify-migration-artifacts.py" \
-  --source "$ROOT/migrations" --deb "$ASSET"
+  "${migration_verify_args[@]}" --deb "$ASSET"
 sha256sum "$ASSET"
 printf 'Built %s\n' "$ASSET"
