@@ -2,6 +2,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 #include <boost/asio/awaitable.hpp>
 
 import openproof.foundation;
@@ -10,6 +11,7 @@ import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.session;
+import openproof.token;
 
 namespace openproof::oauth::http {
 // Native OAuth token reads and revocation. All persistence callbacks must use
@@ -26,10 +28,17 @@ public:
 
     using Revoke=std::function<boost::asio::awaitable<foundation::Status>(
         std::string,std::optional<std::string>,std::string)>;
+    using Rotate=std::function<boost::asio::awaitable<foundation::Result<std::vector<std::string>>>(
+        std::string,std::optional<std::string>,std::string,std::string,std::string,
+        std::optional<session::DelegatedSenderConstraint>)>;
+    using PrepareSender=std::function<boost::asio::awaitable<foundation::Result<
+        std::optional<token::SenderConstraint>>>(gateway::HttpRequest&)>;
     CoroutineTokenReadAdapter(gateway::http::CoroutineHttpHandler& fallback,
         gateway::TokenBucketRateLimiter& limiter,foundation::SecretString tokenKey,
         foundation::SecretString clientKey,ReadAccess access,AuthenticateClient client,
-        ReadProfile profile,VerifySender sender,Revoke revoke={});
+        ReadProfile profile,VerifySender sender,Revoke revoke={},
+        Rotate rotate={},PrepareSender prepareSender={},
+        foundation::Duration accessLifetime=foundation::Duration{900000});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -46,5 +55,9 @@ private:
     ReadProfile m_profile;
     VerifySender m_sender;
     Revoke m_revoke;
+    Rotate m_rotate;
+    PrepareSender m_prepareSender;
+    foundation::Duration m_accessLifetime;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> refresh(gateway::HttpRequest);
 };
 }

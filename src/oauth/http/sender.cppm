@@ -57,6 +57,9 @@ public:
         const foundation::SecretString& accessToken,bool dpopAuthorizationScheme,
         ConsumeReplay consume);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+    tokenEndpointConstraintAsync(gateway::HttpRequest& request,ConsumeReplay consume);
+
 private:
     struct ReplayProof final {
         token::SenderConstraint binding;
@@ -69,6 +72,8 @@ private:
         gateway::HttpRequest& request);
     [[nodiscard]] static boost::asio::awaitable<foundation::Status>
     consumePreparedAsync(foundation::Result<ReplayProof> proof,ConsumeReplay consume);
+    [[nodiscard]] static boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+    consumeTokenProofAsync(foundation::Result<std::optional<ReplayProof>> proof,ConsumeReplay consume);
     [[nodiscard]] foundation::Result<token::SenderConstraint> verifyDpop(
         gateway::HttpRequest& request,
         const foundation::SecretString* accessToken = nullptr);

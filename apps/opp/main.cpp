@@ -2882,6 +2882,7 @@ addProtectedRoutes(gateway::Router& router,
     gateway::Gateway* nativeGatewayCore = nullptr;
     oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
     std::optional<fnd::SecretString> nativeOAuthClientKey;
+    fnd::Duration nativeOAuthAccessLifetime{};
 
     std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
     if (nativeWeb3Enabled && platform.oidc().enabled()) {
@@ -3129,7 +3130,8 @@ addProtectedRoutes(gateway::Router& router,
             nativeHandler = asyncConsent.get();
         }
         if (platform.oidc().enabled()) {
-            if (!nativeCanonical || !nativeWeb3DelegatedKey || !nativeOAuthClientKey || !nativeGatewaySender) {
+            if (!nativeCanonical || !nativeWeb3DelegatedKey || !nativeOAuthClientKey || !nativeGatewaySender
+                || nativeOAuthAccessLifetime<=fnd::Duration::zero()) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
                     "Native OAuth token reads require native storage and sender verification."});
                 return ExitCode::ConfigurationError;
@@ -3159,7 +3161,22 @@ addProtectedRoutes(gateway::Router& router,
                     std::string tokenDigest) {
                     return reader->revokeOAuthTokenAsync(std::move(clientId),std::move(clientDigest),
                         std::move(tokenDigest),clock.now());
-                });
+                },
+                [reader,&clock,nativeOAuthAccessLifetime](std::string clientId,
+                    std::optional<std::string> clientDigest,std::string presented,std::string accessDigest,
+                    std::string refreshDigest,std::optional<session::DelegatedSenderConstraint> sender) {
+                    return reader->rotateOAuthRefreshAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(presented),std::move(accessDigest),std::move(refreshDigest),
+                        std::move(sender),clock.now(),nativeOAuthAccessLifetime);
+                },
+                [reader,sender=nativeGatewaySender](gateway::HttpRequest& request) {
+                    return sender->tokenEndpointConstraintAsync(request,
+                        [reader](session::DelegatedSenderConstraintKind kind,std::string thumbprint,
+                            std::string identifier,fnd::Instant expires,fnd::Instant observed) {
+                            return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
+                                std::move(identifier),expires,observed);
+                        });
+                },nativeOAuthAccessLifetime);
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
             nativePaths.emplace_back("/oauth/introspect");
@@ -3242,6 +3259,10 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
+        // The token endpoint shares its URL across grants. Only refresh is
+        // native here; the legacy handler independently rejects that grant.
+        if (platform.oidc().enabled())
+            nativeMethods.emplace_back("/oauth/token",gateway::HttpMethod::Post);
         if (nativeSignupEnabled) {
             if (!nativeContactIssuer || !nativeSignup || !nativeVerifySignup
                 || !nativeResetPassword || !nativeVerifyPhone || !nativeVerifyEmailChange || !nativeTotp) {
@@ -3698,6 +3719,7 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
+    nativeOAuthAccessLifetime=tokenPolicy->accessLifetime();
     postgres::PostgresResourceRepository resourceRepository{*pool.value()};
     postgres::PostgresConsentRepository consentRepository{*pool.value()};
     resource::ResourceRegistry resourceRegistry{resourceRepository, clock};

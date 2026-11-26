@@ -1487,6 +1487,52 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_STREQ(PQgetvalue(states.get(),0,2),"0");
     EXPECT_TRUE(revoke(native,client,std::nullopt,refreshHex)); // idempotent
     EXPECT_FALSE(read(native));
+
+    // Fresh family for native/native rotation: exactly one transaction
+    // consumes the original token; the second detects reuse and commits
+    // revocation of that transaction's newly issued successor.
+    const auto rotatingFamily=family+"-native-rotation";
+    const auto fingerprint=[&](std::string_view label) {
+        return fnd::toHex(openproof::security::sha256(rotatingFamily+std::string{label}).value());
+    };
+    const auto original=fingerprint("-original");
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families(id,client_id,identity_id,provider,"
+        "assurance,factors,phishing_resistant,authenticated_at_ms) VALUES($1,$2,$3,'local',1,1,false,1770000000000)",
+        {rotatingFamily,client,seed.owner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'account')",{rotatingFamily}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+        "VALUES(decode($1,'hex'),$2,0,0,1770000000000,1770000060000)",{original,rotatingFamily}));
+    using Sender=openproof::session::DelegatedSenderConstraint;
+    auto attempt=[&](std::string caller,std::string suffix,std::optional<Sender> binding=std::nullopt){
+        return native.rotateOAuthRefreshAsync(std::move(caller),std::nullopt,original,
+            fingerprint("-access-"+suffix),fingerprint("-refresh-"+suffix),std::move(binding),kNow+2s,15min);
+    };
+    io.restart();
+    auto denied=asio::co_spawn(io,attempt(otherClient,"foreign"),asio::use_future);
+    auto wrongSender=asio::co_spawn(io,attempt(client,"sender",Sender{
+        openproof::session::DelegatedSenderConstraintKind::Dpop,"fixture"}),asio::use_future);
+    io.run();
+    EXPECT_FALSE(denied.get());
+    EXPECT_FALSE(wrongSender.get());
+    io.restart();
+    auto first=asio::co_spawn(io,attempt(client,"first"),asio::use_future);
+    auto second=asio::co_spawn(io,attempt(client,"second"),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ((a?a:b).value(),std::vector<std::string>{"account"});
+    const auto finalState=execute(fixture.get(),
+        "SELECT (f.revoked_at_ms IS NOT NULL)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t WHERE t.family_id=f.id AND t.state=0)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.state<>2)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.sequence=1 AND r.expires_at_ms=1770000060000)::text "
+        "FROM openproof.oauth_token_families f WHERE f.id=$1",{rotatingFamily});
+    ASSERT_EQ(PQntuples(finalState.get()),1);
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,0),"true");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,1),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,2),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,3),"1");
 }
 
 TEST(PostgresCanonicalCoroutineTest, SenderReplayConsumptionIsAtomicAcrossTenantsAndLegacy)

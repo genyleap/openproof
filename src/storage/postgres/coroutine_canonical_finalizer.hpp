@@ -115,6 +115,14 @@ public:
     revokeOAuthTokenAsync(std::string clientId,std::optional<std::string> clientDigest,
         std::string tokenDigest,foundation::Instant now);
 
+    // Rotate one refresh credential under the family lock. Return its
+    // immutable scopes only after commit. Reuse/expiry revokes the family.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::vector<std::string>>>
+    rotateOAuthRefreshAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string presentedDigest,std::string accessDigest,std::string refreshDigest,
+        std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+        foundation::Duration accessLifetime);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeSenderReplayAsync(session::DelegatedSenderConstraintKind kind,
         std::string thumbprint,std::string identifier,foundation::Instant expiresAt,

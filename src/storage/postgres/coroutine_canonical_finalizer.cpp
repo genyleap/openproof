@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -1326,6 +1327,152 @@ CoroutinePostgresCanonicalFinalizer::revokeOAuthTokenAsync(std::string clientId,
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable,"Native OAuth token revocation is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<std::vector<std::string>>>
+CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync(
+    std::string clientId,std::optional<std::string> clientDigest,std::string presentedDigest,
+    std::string accessDigest,std::string refreshDigest,
+    std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
+    foundation::Duration accessLifetime)
+{
+    using E=foundation::ErrorCode;
+    const auto validDigest=[](std::string_view digest) {
+        return digest.size()==64U && std::ranges::all_of(digest,[](char ch) {
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        });
+    };
+    if (clientId.empty() || clientId.size()>256U || !validDigest(presentedDigest)
+        || !validDigest(accessDigest) || !validDigest(refreshDigest)
+        || presentedDigest==accessDigest || presentedDigest==refreshDigest || accessDigest==refreshDigest
+        || (clientDigest && !validDigest(*clientDigest))
+        || accessLifetime<=foundation::Duration::zero() || accessLifetime>std::chrono::hours{1}
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-accessLifetime.count())
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        // Client -> identity -> family -> token lock order. Share the family
+        // lock with revocation and legacy rotation; take a fresh token snapshot
+        // after admission so a concurrent successor cannot escape revocation.
+        Params familyParams{presentedDigest,clientId,tenant};
+        const auto locked=co_await execute(
+            "SELECT f.id,f.revoked_at_ms,f.sender_constraint_kind,f.sender_constraint_value "
+            "FROM openproof.oauth_refresh_tokens r JOIN openproof.oauth_token_families f ON f.id=r.family_id "
+            "JOIN openproof.identities i ON i.id=f.identity_id "
+            "WHERE r.token_digest=decode($1,'hex') AND f.client_id=$2 AND i.organization_id=$3 "
+            "AND i.status=0 FOR UPDATE OF f FOR SHARE OF i",std::move(familyParams));
+        if (locked.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (locked.rows.size()!=1U || locked.rows.front().size()!=4U)
+            throw std::runtime_error{"Malformed refresh family"};
+        const auto& binding=locked.rows.front();
+        const auto family=required(binding[0]);
+        const bool senderMatches=(!sender && !binding[2] && !binding[3])
+            || (sender && binding[2] && binding[3]
+                && milliseconds(binding[2])==static_cast<int>(sender->kind())
+                && *binding[3]==sender->value());
+        if (binding[1] || !senderMatches) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        Params tokenParams{presentedDigest,family};
+        const auto current=co_await execute(
+            "SELECT sequence,state,issued_at_ms,expires_at_ms FROM openproof.oauth_refresh_tokens "
+            "WHERE token_digest=decode($1,'hex') AND family_id=$2 FOR UPDATE",std::move(tokenParams));
+        if (current.rows.size()!=1U || current.rows.front().size()!=4U)
+            throw std::runtime_error{"Malformed refresh token"};
+        const auto& row=current.rows.front();
+        const auto sequence=milliseconds(row[0]),state=milliseconds(row[1]);
+        const auto issued=milliseconds(row[2]),expires=milliseconds(row[3]);
+        const auto observed=now.time_since_epoch().count();
+        const auto timestamp=std::to_string(observed);
+        if (state!=0 || expires<=observed) {
+            Params familyArgs{family,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_token_families SET revoked_at_ms=COALESCE(revoked_at_ms,$2) WHERE id=$1",
+                std::move(familyArgs)));
+            Params accessArgs{family,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=COALESCE(revoked_at_ms,$2) "
+                "WHERE family_id=$1 AND state=0",std::move(accessArgs)));
+            Params refreshArgs{family,timestamp};
+            static_cast<void>(co_await execute(
+                "UPDATE openproof.oauth_refresh_tokens SET state=2,changed_at_ms=COALESCE(changed_at_ms,$2) "
+                "WHERE family_id=$1 AND state<>2",std::move(refreshArgs)));
+            // Reuse detection must commit the revocation, not roll it back.
+            static_cast<void>(co_await execute("COMMIT",{}));
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        if (issued>observed || sequence==std::numeric_limits<std::int64_t>::max())
+            throw std::runtime_error{"Invalid refresh token chronology"};
+        Params scopeParams{family};
+        const auto grants=co_await execute(
+            "SELECT scope FROM openproof.oauth_token_family_scopes WHERE family_id=$1 "
+            "ORDER BY scope COLLATE \"C\" LIMIT 257",std::move(scopeParams));
+        if (grants.rows.size()>256U) throw std::runtime_error{"Oversized refresh scope set"};
+        std::vector<std::string> scopes;
+        for (const auto& grant:grants.rows) {
+            if (grant.size()!=1U) throw std::runtime_error{"Invalid refresh scope"};
+            const auto scope=required(grant[0]);
+            if (scope.empty() || scope.size()>128U || !std::ranges::all_of(scope,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte==0x21U || (byte>=0x23U && byte<=0x5BU) || (byte>=0x5DU && byte<=0x7EU);
+            })) throw std::runtime_error{"Invalid refresh scope"};
+            scopes.push_back(scope);
+        }
+        Params consumeArgs{presentedDigest,family,timestamp};
+        const auto used=co_await execute(
+            "UPDATE openproof.oauth_refresh_tokens SET state=1,changed_at_ms=$3 "
+            "WHERE token_digest=decode($1,'hex') AND family_id=$2 AND state=0 RETURNING family_id",
+            std::move(consumeArgs));
+        if (used.rows.size()!=1U || used.rows.front().size()!=1U || required(used.rows.front()[0])!=family)
+            throw std::runtime_error{"Refresh consumption mismatch"};
+        Params accessArgs{accessDigest,family,timestamp,std::to_string(observed+accessLifetime.count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,0,$3,$4)",std::move(accessArgs)));
+        Params refreshArgs{refreshDigest,family,std::to_string(sequence+1),timestamp,std::to_string(expires)};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,$3,0,$4,$5)",std::move(refreshArgs)));
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return scopes;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native OAuth refresh rotation is unavailable.");
     }
 }
 

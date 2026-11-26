@@ -961,8 +961,18 @@ revocation affects only that token; refresh token revocation invalidates
 the entire family, including existing successors. Legacy rotation and
 revocation acquire the family lock before token rows and refuse rotation
 of a revoked family. This preserves the concurrency invariant during
-migration. Authorization, native token issuance/rotation, PAR and device
-flows still require separate migration and executable acceptance.
+migration. Refresh rotation is native on the shared `/oauth/token` POST
+endpoint when the decoded grant type is refresh_token. Other grant types
+retain the compatibility path; a native-required synchronous handler
+explicitly denies refresh. Client/tenant and sender bindings are checked
+under the family lock; replay or expiry commits family revocation.
+Successful rotation consumes the old credential and inserts both new
+token digests in a single transaction while preserving the original
+refresh expiry and scopes. DPoP/mTLS proofs use the shared native replay
+store. The refresh request accepts the existing client and refresh
+credential fields (extra fields are rejected). Authorization, other
+token issuance grants, PAR and device flows still require separate
+migration and executable acceptance.
 
 ### Native account TOTP status (coroutine branch only)
 

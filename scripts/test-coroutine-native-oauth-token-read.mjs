@@ -89,3 +89,41 @@ test("native revocation binds caller and tenant, serializes family mutation and 
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Race native family revocation against the still-legacy rotation/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/another client's token: no-op/);
 });
+test("native refresh uses grant-scoped routing, durable proof and atomic family rotation",()=>{
+  const refresh=http.slice(http.indexOf("CoroutineTokenReadAdapter::refresh("));
+  const ordered=["form(r,false,true)","security::hmacSha256(m_tokenKey,input->token.expose())",
+    "input->secret=foundation::SecretString{}","input->token=foundation::SecretString{}",
+    "m_prepareSender(r)","co_await std::move(proof)","co_await m_rotate(",
+    "if (!scopes)",'body.add("access_token",access.expose())'];
+  let previous=-1;
+  for(const term of ordered){
+    const index=refresh.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(http,/value->expose\(\)=="refresh_token"/);
+  assert.match(app,/nativeMethods.emplace_back\("\/oauth\/token",gateway::HttpMethod::Post\)/);
+  assert.match(app,/reader->rotateOAuthRefreshAsync/);
+  assert.match(app,/sender->tokenEndpointConstraintAsync/);
+  assert.match(app,/nativeOAuthAccessLifetime=tokenPolicy->accessLifetime\(\)/);
+  const legacy=read("src/oauth/http/http.cpp");
+  const token=legacy.slice(legacy.indexOf("OAuthHttpApi::tokenEndpoint("));
+  assert.ok(token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="refresh_token"')>=0);
+  assert.ok(token.indexOf('m_nativeTokenReadsRequired && grantType.value()=="refresh_token"')<token.indexOf("m_clients->authenticate("));
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::rotateOAuthRefreshAsync("));
+  for(const term of ["FOR SHARE OF c,a,o","security::constantTimeEquals",
+    "f.client_id=$2 AND i.organization_id=$3","FOR UPDATE OF f","senderMatches",
+    "WHERE token_digest=decode($1,'hex') AND family_id=$2 FOR UPDATE",
+    "state!=0 || expires<=observed","UPDATE openproof.oauth_token_families SET revoked_at_ms",
+    "sequence==std::numeric_limits","std::to_string(sequence+1),timestamp,std::to_string(expires)"])
+    assert.ok(store.includes(term),term);
+  assert.ok(store.indexOf("FOR UPDATE OF f")<store.indexOf("family_id=$2 FOR UPDATE"));
+  assert.ok(store.indexOf("UPDATE openproof.oauth_token_families SET revoked_at_ms")<store.indexOf('execute("COMMIT",{})'));
+  assert.ok(store.lastIndexOf('execute("COMMIT",{})')<store.indexOf("co_return scopes"));
+  const sender=read("src/oauth/http/sender.cpp");
+  const proof=sender.slice(sender.indexOf("SenderProofVerifier::tokenEndpointConstraintAsync("),sender.indexOf("SenderProofVerifier::tokenEndpointConstraint("));
+  assert.match(proof,/prepareDpop\(request,nullptr\):prepareMtlsForwarding\(request\)/);
+  assert.match(proof,/co_await consume\(/);
+  assert.doesNotMatch(proof,/m_dpop->consume|m_mtlsReplays->|verifyDpop\(/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Fresh family for native\/native rotation/);
+  assert.match(read("tests/oauth_native_consent_test.cpp"),/grant_type=refresh%5Ftoken/);
+});

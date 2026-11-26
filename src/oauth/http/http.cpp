@@ -1457,6 +1457,11 @@ gateway::HttpResponse OAuthHttpApi::tokenEndpoint(gateway::HttpRequest request)
                                   "grant_type and client_id are required.");
     }
 
+    if (m_nativeTokenReadsRequired && grantType.value()=="refresh_token") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native refresh rotation is unavailable.");
+    }
     client::ClientId clientId{clientIdText.value()};
     std::optional<foundation::SecretString> clientSecret;
     if (const auto rawSecret = optional(form.value(), "client_secret")) {
