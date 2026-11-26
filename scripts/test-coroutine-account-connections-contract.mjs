@@ -233,10 +233,10 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
 });
 
 test("native account connections retain legacy registered-provider projection", () => {
-  const start = app.indexOf("connectionsReader = [reader, registered = providers.ids()]");
-  const end = app.indexOf("ReadTotpStatus totpStatusReader", start);
+  const start = main.indexOf("connectionsReader = [reader, registered = providers.ids()]");
+  const end = main.indexOf("ReadTotpStatus totpStatusReader", start);
   assert.ok(start >= 0 && end > start);
-  const adapter = app.slice(start, end);
+  const adapter = main.slice(start, end);
   assert.match(adapter, /co_await reader->readConnectionsAsync\(std::move\(owner\)\)/);
   assert.match(adapter, /std::erase_if\(result->second/);
   assert.match(adapter, /std::ranges::find\(registered, external\.providerId\(\)\) == registered\.end\(\)/);
