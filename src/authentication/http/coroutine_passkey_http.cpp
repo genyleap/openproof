@@ -12,6 +12,7 @@ import openproof.identity.provider;
 namespace openproof::authentication::http {
 namespace {
 namespace pk=provider::passkey;
+namespace idp=identity::provider;
 using E=foundation::ErrorCode;
 using Method=gateway::HttpMethod;
 bool listing(const gateway::HttpRequest& r) noexcept {
@@ -23,14 +24,15 @@ bool options(const gateway::HttpRequest& r) noexcept {
 constexpr std::string_view prefix="/account/passkeys/";
 constexpr std::string_view registrationCookie="__Host-openproof-passkey-registration";
 bool owned(const gateway::HttpRequest& r) noexcept {
-    return r.path()=="/account/passkeys" || r.path().starts_with(prefix);
+    return r.path()=="/account/passkeys" || r.path().starts_with(prefix)
+        || r.path()=="/auth/passkey/options" || r.path()=="/auth/passkey/verify";
 }
 bool encoded(std::string_view value,std::size_t limit) {
     return !value.empty() && value.size()<=limit && std::ranges::all_of(value,[](char c){
         return (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9') || c=='-' || c=='_';
     });
 }
-std::optional<std::string> ceremonyCookie(const gateway::HttpRequest& r) {
+std::optional<std::string> ceremonyCookie(const gateway::HttpRequest& r,std::string_view wanted=registrationCookie) {
     auto header=r.header("cookie");
     if (!header) return std::nullopt;
     auto rest=*header;
@@ -41,7 +43,7 @@ std::optional<std::string> ceremonyCookie(const gateway::HttpRequest& r) {
         if (end==std::string_view::npos) rest={}; else rest.remove_prefix(end+1U);
         while (!item.empty() && (item.front()==' ' || item.front()=='\t')) item.remove_prefix(1U);
         const auto eq=item.find('=');
-        if (eq!=std::string_view::npos && item.substr(0,eq)==registrationCookie) {
+        if (eq!=std::string_view::npos && item.substr(0,eq)==wanted) {
             auto value=item.substr(eq+1U);
             if (found || !encoded(value,256U)) return std::nullopt;
             found=std::string{value};
@@ -90,11 +92,60 @@ gateway::HttpResponse fail(E code,const gateway::HttpRequest& r) {
     return out;
 }
 }
+CoroutinePasskeyProvider::CoroutinePasskeyProvider(const pk::PasskeyConfig& config,
+    const foundation::ClockSource& clock,Verify verify):m_config(&config),m_clock(&clock),m_verify(std::move(verify)) {}
+idp::ProviderId CoroutinePasskeyProvider::id() const {return idp::ProviderId{"passkey"};}
+idp::InteractionModel CoroutinePasskeyProvider::interactionModel() const noexcept {return idp::InteractionModel::ChallengeResponse;}
+idp::AssuranceLevel CoroutinePasskeyProvider::maximumClaimableAssurance() const noexcept {return idp::AssuranceLevel::Ial2;}
+foundation::Result<idp::AuthenticationChallenge> CoroutinePasskeyProvider::beginAuthentication(const idp::AuthenticationRequest&) {
+    return foundation::fail(E::Unavailable);
+}
+foundation::Result<idp::AuthenticationOutcome> CoroutinePasskeyProvider::completeAuthentication(const idp::AuthenticationResponse&) {
+    return foundation::fail(E::Unavailable);
+}
+boost::asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+CoroutinePasskeyProvider::beginAuthenticationAsync(idp::AuthenticationRequest request) {
+    if (request.provider()!=id()) co_return foundation::fail(E::InvalidArgument);
+    co_return pk::assertionOptions(*m_config,m_clock->now());
+}
+boost::asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+CoroutinePasskeyProvider::completeAuthenticationAsync(idp::AuthenticationResponse response) {
+    const auto& fields=response.parameters();
+    const auto get=[&](std::string_view name,std::size_t maximum)->std::optional<std::string>{
+        const auto it=fields.find(name);
+        if (it==fields.end() || !encoded(it->second.expose(),maximum)) return std::nullopt;
+        return std::string{it->second.expose()};
+    };
+    auto credential=get("credential_id",4096U),client=get("client_data_json",32U*1024U),
+        data=get("authenticator_data",128U*1024U),signature=get("signature",4096U);
+    auto handle=get("user_handle",4096U);
+    if (!m_verify || !credential || !client || !data || !signature
+        || (fields.contains("user_handle") && !handle) || fields.size()!=(handle?5U:4U))
+        co_return foundation::fail(E::AuthenticationFailed);
+    auto credentialId=*credential;
+    const auto now=m_clock->now();
+    pk::AssertionResponse assertion{std::move(*credential),std::move(*client),std::move(*data),
+        std::move(*signature),std::move(handle)};
+    auto owner=co_await m_verify(response.challengeId(),std::move(assertion),now);
+    if (!owner || owner->empty()) co_return foundation::fail(E::AuthenticationFailed);
+    idp::ProviderEvidence evidence;
+    evidence.add("protocol","webauthn_level3");
+    evidence.add("credential_id",credentialId);
+    evidence.add("algorithm","ES256");
+    evidence.add("user_verification","required");
+    co_return idp::AuthenticationOutcome::create(id(),idp::ExternalSubject{std::string{owner->value()}},
+        idp::VerifiedClaims{},idp::AssuranceLevel::Ial2,
+        idp::AuthenticationStrength{idp::AuthenticationFactor::Possession,true},std::move(evidence),now,
+        std::string{owner->value()});
+}
+
 CoroutinePasskeyAccountAdapter::CoroutinePasskeyAccountAdapter(
     gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
-    const foundation::ClockSource& clock,const pk::PasskeyConfig& config,Authenticate authenticate,Read read,Mutate mutate)
+    const foundation::ClockSource& clock,const pk::PasskeyConfig& config,Authenticate authenticate,Read read,Mutate mutate,
+    AuthenticationService* authentication,session::CoroutineReplacingSessionIssuer* issuer)
     :m_fallback(&fallback),m_limiter(&limiter),m_clock(&clock),m_config(&config),
-    m_authenticate(std::move(authenticate)),m_read(std::move(read)),m_mutate(std::move(mutate)) {}
+    m_authenticate(std::move(authenticate)),m_read(std::move(read)),m_mutate(std::move(mutate)),
+    m_authentication(authentication),m_issuer(issuer) {}
 
 bool CoroutinePasskeyAccountAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     return owned(r) || m_fallback->nativeEnabledFor(r);
@@ -111,6 +162,8 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::ha
         if (m_fallback->nativeEnabledFor(r)) co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
     }
+    if (r.path()=="/auth/passkey/options" || r.path()=="/auth/passkey/verify")
+        co_return co_await assertion(std::move(r));
     Scrub wipe{r};
     if (!begin && !listing(r) && !registration && !removal)
         co_return response(405,R"({"error":"method_not_allowed"})");
@@ -203,5 +256,99 @@ boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::ha
     boost::json::object body;
     body["passkeys"]=std::move(items);
     co_return response(200,boost::json::serialize(body));
+}
+
+boost::asio::awaitable<gateway::HttpResponse> CoroutinePasskeyAccountAdapter::assertion(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    constexpr std::string_view continuation="__Host-openproof-passkey-continuation";
+    constexpr std::string_view bindingCookie="__Host-openproof-passkey-binding";
+    constexpr std::string_view transaction="__Host-openproof-passkey-transaction";
+    constexpr std::string_view challenge="__Host-openproof-passkey-challenge";
+    const auto cookie=[](std::string_view name,std::string_view value,int age) {
+        return std::string{name}+"="+std::string{value}+"; Path=/; Max-Age="+std::to_string(age)+"; Secure; HttpOnly; SameSite=Strict";
+    };
+    const auto clear=[&](gateway::HttpResponse& out){
+        for (const auto name:{continuation,bindingCookie,transaction,challenge}) out.addHeader("set-cookie",cookie(name,"",0));
+    };
+    if (r.method()!=Method::Post) co_return response(405,R"({"error":"method_not_allowed"})");
+    if (!m_authentication || !m_issuer) co_return fail(E::Unavailable,r);
+    if (!m_limiter->allow("passkey:"+std::string{r.remoteAddress()}+":"+std::string{r.path()}))
+        co_return fail(E::RateLimited,r);
+    if (r.header("authorization")) co_return fail(E::AuthenticationFailed,r);
+    if (auto origin=r.header("origin");origin && *origin!=m_config->origin()) co_return fail(E::PermissionDenied,r);
+    idp::ClientContext client;
+    client.setRemoteAddress(std::string{r.remoteAddress()});
+    if (const auto agent=r.header("user-agent")) client.setUserAgent(std::string{agent->substr(0,1024U)});
+    if (r.path()=="/auth/passkey/options") {
+        auto random=security::randomTokenBase64Url(32U);
+        if (!random) co_return fail(E::Unavailable,r);
+        foundation::SecretString token{std::move(random).value()};
+        auto digest=security::sha256(token.expose());
+        if (!digest) co_return fail(E::Unavailable,r);
+        idp::AuthenticationRequest request{idp::ProviderId{"passkey"},client};
+        request.setRequestedAssurance(idp::AssuranceLevel::Ial2);
+        scrub(r);
+        auto started=co_await m_authentication->beginAsync(std::move(request),digest.value(),r.correlation());
+        if (!started) co_return fail(started.error().code(),r);
+        const auto found=started->challenge().parameters().find("public_key_options");
+        if (found==started->challenge().parameters().end()) co_return fail(E::Internal,r);
+        boost::system::error_code error;
+        auto options=boost::json::parse(found->second,error);
+        if (error || !options.is_object()) co_return fail(E::Internal,r);
+        boost::json::object body; body["publicKey"]=std::move(options);
+        auto out=response(200,boost::json::serialize(body));
+        out.addHeader("set-cookie",cookie(continuation,started->continuationToken().expose(),300));
+        out.addHeader("set-cookie",cookie(bindingCookie,token.expose(),300));
+        out.addHeader("set-cookie",cookie(transaction,started->transactionId().value(),300));
+        out.addHeader("set-cookie",cookie(challenge,started->challenge().id().value(),300));
+        co_return out;
+    }
+    auto rawContinuation=ceremonyCookie(r,continuation),rawBinding=ceremonyCookie(r,bindingCookie);
+    auto transactionId=ceremonyCookie(r,transaction),challengeId=ceremonyCookie(r,challenge);
+    std::optional<foundation::SecretString> continuationToken,bindingToken,previous;
+    if (rawContinuation) continuationToken.emplace(std::move(*rawContinuation));
+    if (rawBinding) bindingToken.emplace(std::move(*rawBinding));
+    if (auto rawPrevious=ceremonyCookie(r,"__Host-openproof-session")) previous.emplace(std::move(*rawPrevious));
+    const auto media=r.header("content-type");
+    if (!continuationToken || !bindingToken || !transactionId || !challengeId || !media
+        || (*media!="application/json" && !media->starts_with("application/json;")) || r.body().size()>128U*1024U) {
+        auto out=fail(E::AuthenticationFailed,r); clear(out); co_return out;
+    }
+    boost::system::error_code error;
+    auto parsed=boost::json::parse(r.body(),error);
+    r.wipeBody();
+    if (error || !parsed.is_object()) {auto out=fail(E::AuthenticationFailed,r); clear(out); co_return out;}
+    idp::AuthenticationResponse input{idp::ChallengeId{*challengeId},client};
+    const auto add=[&](std::string_view key,std::size_t limit,bool optional){
+        const auto* item=parsed.as_object().if_contains(key);
+        if (!item || item->is_null()) return optional;
+        if (!item->is_string() || !encoded(std::string_view{item->as_string().data(),item->as_string().size()},limit)) return false;
+        input.setParameter(std::string{key},idp::CredentialValue{std::string{item->as_string().data(),item->as_string().size()}});
+        return true;
+    };
+    if (!add("credential_id",4096U,false) || !add("client_data_json",32U*1024U,false)
+        || !add("authenticator_data",128U*1024U,false) || !add("signature",4096U,false)
+        || !add("user_handle",4096U,true) || parsed.as_object().size()>5U) {
+        auto out=fail(E::AuthenticationFailed,r); clear(out); co_return out;
+    }
+    parsed=nullptr;
+    auto digest=security::sha256(bindingToken->expose());
+    bindingToken.reset();
+    if (!digest) co_return fail(E::Unavailable,r);
+    scrub(r);
+    auto verified=co_await m_authentication->completeAsync(idp::TransactionId{*transactionId},
+        std::move(*continuationToken),digest.value(),std::move(input));
+    if (!verified || verified->outcome().provider()!=idp::ProviderId{"passkey"}
+        || !idp::meetsAssurance(verified->outcome().assurance(),idp::AssuranceLevel::Ial2)) {
+        auto out=fail(verified?E::AuthenticationFailed:verified.error().code(),r);
+        clear(out);co_return out;
+    }
+    auto issued=co_await m_issuer->issueReplacingAsync(verified.value(),std::move(client),std::move(previous));
+    if (!issued) {auto out=fail(issued.error().code(),r);clear(out);co_return out;}
+    boost::json::object body{{"session_id",issued->id.value()},{"assurance","ial2"}};
+    auto out=response(200,boost::json::serialize(body));
+    clear(out);
+    out.addHeader("set-cookie",cookie("__Host-openproof-session",issued->token.expose(),8*60*60));
+    co_return out;
 }
 }

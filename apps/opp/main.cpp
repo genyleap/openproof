@@ -1934,7 +1934,6 @@ addProtectedRoutes(gateway::Router& router,
     postgres::PostgresSessionRepository sessionRepository{*pool.value()};
     postgres::PostgresAuthenticationTransactionStore transactions{*pool.value()};
     postgres::PostgresRecoveryCodeRepository recoveryRepository{*pool.value()};
-    postgres::PostgresPasskeyRepository passkeyRepository{*pool.value()};
 
     auto configuredOrganization = organizations.findById(
         identity::OrganizationId{std::string{platform.auth().organizationId()}});
@@ -2047,12 +2046,7 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
         passkeyConfig.emplace(std::move(configured).value());
-        auto implementation = std::make_unique<passkey::PasskeyAuthenticationProvider>(
-            passkeyRepository, clock, *passkeyConfig);
-        auto status = providers.registerProvider(std::move(implementation));
-        if (status) {
-            status = trust.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2);
-        }
+        auto status = trust.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;
@@ -2739,6 +2733,21 @@ addProtectedRoutes(gateway::Router& router,
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
                     nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+            if (passkeyConfig) {
+                if (!nativeCanonical) {
+                    reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition});
+                    return ExitCode::ConfigurationError;
+                }
+                auto status=providers.registerProvider(std::make_unique<authHttp::CoroutinePasskeyProvider>(
+                    *passkeyConfig,clock,[reader=nativeCanonical.get(),&config=*passkeyConfig](
+                        idp::ChallengeId challenge,passkey::AssertionResponse assertion,fnd::Instant now) {
+                        return reader->verifyPasskeyAssertionAsync(config,std::move(challenge),std::move(assertion),now);
+                    }));
+                if (!status) {
+                    reportStartupFailure(status.error());
+                    return ExitCode::ConfigurationError;
+                }
+            }
             nativeAuthentication = std::make_unique<auth::AuthenticationService>(
                 providers, *nativeTransactions, externalIdentities, clock,
                 std::move(nativeTrust), std::chrono::minutes{5},
@@ -2793,9 +2802,11 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 #endif
-    std::optional<passkey::PasskeyService> passkeyService;
-    if (passkeyConfig) {
-        passkeyService.emplace(passkeyRepository, externalIdentities, clock, *passkeyConfig);
+    if (passkeyConfig && (!nativeAuthentication ||
+        !nativeAuthentication->nativeProviderAuthenticationEnabled(idp::ProviderId{"passkey"}))) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native passkey authentication runtime is incomplete."});
+        return ExitCode::ConfigurationError;
     }
     auto memberPolicy = policy::RolePolicyEngine::create(
         std::move(authorizationRules));
@@ -3517,9 +3528,11 @@ addProtectedRoutes(gateway::Router& router,
                     std::optional<passkey::PasskeyCredential> verified) {
                     return reader->mutatePasskeyAccountAsync(std::move(actor),std::move(sessionId),now,
                         std::move(credentialId),std::move(ceremony),std::move(verified));
-                });
+                },nativeAuthentication.get(),nativeSessions.get());
             nativeHandler=nativePasskeyAccount.get();
             nativePaths.emplace_back("/account/passkeys");
+            nativePaths.emplace_back("/auth/passkey/options");
+            nativePaths.emplace_back("/auth/passkey/verify");
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
@@ -3651,17 +3664,9 @@ addProtectedRoutes(gateway::Router& router,
         return runWithEnterprise(web3Api);
     };
 
-    const auto runWithPasskey = [&](gateway::HttpHandler& fallback,
-                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        if (!passkeyService) return runWithWeb3(fallback, delegated);
-        authHttp::PasskeyAuthenticationHttpApi passkeyApi{
-            *passkeyService, authentication, sessions, limiter.value(), fallback};
-        return runWithWeb3(passkeyApi, delegated);
-    };
-
     const auto runWithAccount = [&](gateway::HttpHandler& fallback,
                                     session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        if (!platform.account().enabled()) return runWithPasskey(fallback, delegated);
+        if (!platform.account().enabled()) return runWithWeb3(fallback, delegated);
 
         auto verificationMaterial = deriveSecret(
             platform.security().tokenSigningKey(), "openproof/account-verification-key/v1");
@@ -3847,7 +3852,7 @@ addProtectedRoutes(gateway::Router& router,
             };
         }
         nativeContactIssuer=&contactIssuer;
-        const auto result=runWithPasskey(accountApi,delegated);
+        const auto result=runWithWeb3(accountApi,delegated);
         nativeSignup={};
         nativeVerifySignup={};
         nativeResetPassword={};

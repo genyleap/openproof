@@ -170,6 +170,14 @@ struct CredentialSummary final {
     const identity::provider::ChallengeId& ceremony,
     const std::vector<std::string>& excludedCredentialIds);
 
+// Shared, storage-independent WebAuthn assertion verifier. The caller must
+// compare-and-update the counter against the exact verified credential.
+[[nodiscard]] foundation::Result<std::uint32_t> verifyAssertionProof(
+    const PasskeyConfig& config,const identity::provider::ChallengeId& ceremony,
+    const AssertionResponse& response,const PasskeyCredential& credential);
+[[nodiscard]] foundation::Result<identity::provider::AuthenticationChallenge>
+assertionOptions(const PasskeyConfig& config,foundation::Instant now);
+
 // Pure verification shared by the native and compatibility registration paths.
 [[nodiscard]] foundation::Result<PasskeyCredential> verifyRegistration(
     const PasskeyConfig& config,const identity::core::IdentityId& identity,

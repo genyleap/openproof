@@ -2463,10 +2463,10 @@ CoroutinePostgresCanonicalFinalizer::pushOAuthAuthorizationAsync(std::string cli
             "(request_digest,client_id,redirect_uri,code_challenge,state,nonce,maximum_authentication_age_ms,resource,response_mode,issued_at_ms,expires_at_ms) "
             "VALUES(decode($1,'hex'),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",std::move(args)));
         for (const auto& scope:request.scopes()) {
-            Params scopeArgs{requestDigest,std::string{scope.value()}};
+            Params pushedScopeArgs{requestDigest,std::string{scope.value()}};
             static_cast<void>(co_await execute(
                 "INSERT INTO openproof.oauth_pushed_authorization_request_scopes(request_digest,scope) "
-                "VALUES(decode($1,'hex'),$2)",std::move(scopeArgs)));
+                "VALUES(decode($1,'hex'),$2)",std::move(pushedScopeArgs)));
         }
         static_cast<void>(co_await execute("COMMIT",{}));
         co_return foundation::ok();
@@ -2636,9 +2636,9 @@ CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync(
                 std::move(args));
             bool covered=false;
             if (existing.rows.size()==1U && existing.rows.front().size()==1U) {
-                Params args{required(existing.rows.front()[0])};
+                Params consentScopeArgs{required(existing.rows.front()[0])};
                 const auto scopes=co_await execute(
-                    "SELECT scope FROM openproof.oauth_consent_scopes WHERE consent_id=$1 LIMIT 257 FOR SHARE",std::move(args));
+                    "SELECT scope FROM openproof.oauth_consent_scopes WHERE consent_id=$1 LIMIT 257 FOR SHARE",std::move(consentScopeArgs));
                 if (scopes.rows.size()>256U) throw std::runtime_error{"Oversized consent"};
                 covered=std::ranges::all_of(request.scopes(),[&](const auto& scope){return hasScope(scopes.rows,scope.value());});
             }
@@ -2663,9 +2663,9 @@ CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync(
             static_cast<void>(co_await execute(
                 "INSERT INTO openproof.oauth_consents(id,identity_id,client_id,audience,granted_at_ms) VALUES($1,$2,$3,$4,$5)",std::move(insert)));
             for (const auto& scope:request.scopes()) {
-                Params args{consentId,std::string{scope.value()}};
+                Params consentScopeArgs{consentId,std::string{scope.value()}};
                 static_cast<void>(co_await execute(
-                    "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) VALUES($1,$2)",std::move(args)));
+                    "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) VALUES($1,$2)",std::move(consentScopeArgs)));
             }
         }
         if (decision!=Decision::Deny) {
@@ -2678,9 +2678,9 @@ CoroutinePostgresCanonicalFinalizer::completeOAuthAuthorizationAsync(
                 "(code_digest,client_id,identity_id,redirect_uri,code_challenge,nonce,provider,assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms,resource) "
                 "VALUES(decode($1,'hex'),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",std::move(args)));
             for (const auto& scope:request.scopes()) {
-                Params args{codeDigest,std::string{scope.value()}};
+                Params codeScopeArgs{codeDigest,std::string{scope.value()}};
                 static_cast<void>(co_await execute(
-                    "INSERT INTO openproof.oauth_authorization_code_scopes(code_digest,scope) VALUES(decode($1,'hex'),$2)",std::move(args)));
+                    "INSERT INTO openproof.oauth_authorization_code_scopes(code_digest,scope) VALUES(decode($1,'hex'),$2)",std::move(codeScopeArgs)));
             }
         }
         if (parDigest) {
@@ -3065,14 +3065,14 @@ CoroutinePostgresCanonicalFinalizer::mutateOAuthClientAsync(
                 || required(inserted.rows.front()[0])!=value->id().value())
                 throw std::runtime_error{"Client insert mismatch"};
             for (const auto& uri:value->redirectUris()) {
-                Params args{std::string{value->id().value()},std::string{uri.value()}};
+                Params uriArgs{std::string{value->id().value()},std::string{uri.value()}};
                 static_cast<void>(co_await execute(
-                    "INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) VALUES($1,$2)",std::move(args)));
+                    "INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) VALUES($1,$2)",std::move(uriArgs)));
             }
             for (const auto& scope:value->scopes()) {
-                Params args{std::string{value->id().value()},std::string{scope.value()}};
+                Params clientScopeArgs{std::string{value->id().value()},std::string{scope.value()}};
                 static_cast<void>(co_await execute(
-                    "INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,$2)",std::move(args)));
+                    "INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,$2)",std::move(clientScopeArgs)));
             }
         } else {
             // Lock parent and client in the same statement as grant admission.
@@ -3336,9 +3336,9 @@ CoroutinePostgresCanonicalFinalizer::mutateOAuthResourceAsync(
                 || required(inserted.rows.front()[0])!=value->id().value())
                 throw std::runtime_error{"Resource insert mismatch"};
             for (const auto& scope:value->scopes()) {
-                Params args{std::string{value->id().value()},scope};
+                Params resourceScopeArgs{std::string{value->id().value()},scope};
                 static_cast<void>(co_await execute(
-                    "INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,$2)",std::move(args)));
+                    "INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,$2)",std::move(resourceScopeArgs)));
             }
         } else {
             Params args{command.audience};
@@ -3817,6 +3817,80 @@ CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync(core::IdentityId 
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable,"Native passkey mutation is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<core::IdentityId>>
+CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync(const provider::passkey::PasskeyConfig& config,
+    idp::ChallengeId challenge,provider::passkey::AssertionResponse assertion,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (challenge.empty() || challenge.value().size()>256U || assertion.credentialId.empty()
+        || assertion.credentialId.size()>4096U || now.time_since_epoch().count()<0)
+        co_return foundation::fail(E::AuthenticationFailed);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params args){
+            return connection.query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params lookupArgs{assertion.credentialId,tenant};
+        const auto owner=co_await execute(
+            "SELECT p.identity_id FROM openproof.passkey_credentials p "
+            "JOIN openproof.identities i ON i.id=p.identity_id WHERE p.credential_id=$1 AND i.organization_id=$2",
+            std::move(lookupArgs));
+        if (owner.rows.size()!=1U || owner.rows.front().size()!=1U)
+            co_return foundation::fail(E::AuthenticationFailed);
+        const auto identityId=required(owner.rows.front()[0]);
+        Params lockArgs{identityId};
+        static_cast<void>(co_await execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",std::move(lockArgs)));
+        Params actorArgs{identityId,tenant};
+        const auto actor=co_await execute(
+            "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND o.id=$2 AND i.status=0 AND i.kind=0 AND o.state=0 FOR SHARE OF i,o",
+            std::move(actorArgs));
+        if (actor.rows.size()!=1U) co_return foundation::fail(E::AuthenticationFailed);
+        Params linkArgs{identityId};
+        const auto link=co_await execute(
+            "SELECT identity_id FROM openproof.external_identities WHERE provider='passkey' "
+            "AND external_subject=$1 AND identity_id=$1 FOR SHARE",std::move(linkArgs));
+        if (link.rows.size()!=1U) co_return foundation::fail(E::AuthenticationFailed);
+        Params credentialArgs{assertion.credentialId,identityId};
+        const auto locked=co_await execute(
+            "SELECT public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms "
+            "FROM openproof.passkey_credentials WHERE credential_id=$1 AND identity_id=$2 FOR UPDATE",
+            std::move(credentialArgs));
+        if (locked.rows.size()!=1U || locked.rows.front().size()!=5U)
+            co_return foundation::fail(E::AuthenticationFailed);
+        const auto& row=locked.rows.front();
+        const auto counter=milliseconds(row[2]);
+        if (counter>4294967295LL) co_return foundation::fail(E::AuthenticationFailed);
+        provider::passkey::PasskeyCredential credential{assertion.credentialId,core::IdentityId{identityId},
+            required(row[0]),required(row[1]),static_cast<std::uint32_t>(counter),
+            foundation::Instant{foundation::Duration{milliseconds(row[3])}},
+            foundation::Instant{foundation::Duration{milliseconds(row[4])}}};
+        auto verified=provider::passkey::verifyAssertionProof(config,challenge,assertion,credential);
+        if (!verified) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationFailed);
+        }
+        Params updateArgs{credential.credentialId,identityId,std::to_string(credential.signCount),
+            std::to_string(verified.value()),std::to_string(now.time_since_epoch().count())};
+        const auto advanced=co_await execute(
+            "UPDATE openproof.passkey_credentials SET sign_count=$4,last_used_at_ms=GREATEST(last_used_at_ms,$5) "
+            "WHERE credential_id=$1 AND identity_id=$2 AND sign_count=$3 RETURNING credential_id",
+            std::move(updateArgs));
+        if (advanced.rows.size()!=1U || advanced.rows.front().size()!=1U
+            || required(advanced.rows.front()[0])!=credential.credentialId)
+            co_return foundation::fail(E::AuthenticationFailed);
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return core::IdentityId{identityId};
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native passkey verification is unavailable.");
     }
 }
 

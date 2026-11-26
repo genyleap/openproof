@@ -1166,11 +1166,17 @@ inserts the credential and attaches the canonical passkey link. Removal
 uses the same per-identity advisory lock as disconnection and registration;
 the final credential is protected while its authentication link remains.
 Exact and slash-delimited prefix route ownership prevents synchronous
-fallback for account passkey operations. Assertion authentication still
-uses the compatibility path.
+fallback for account passkey operations. Assertion authentication uses
+the native broker's one-time transaction and binding digest, a shared
+WebAuthn signature verifier, and a tenant-bound SQL transaction locking
+the credential and its current canonical ownership before updating the
+signature counter. Successful proof is owner-bound; session issuance
+atomically replaces a previous first-party session. The proof counter
+transaction commits before session issuance; a failed issuance requires
+a new assertion ceremony. The server no longer constructs synchronous
+passkey repositories, services or HTTP handlers.
 
-The remaining PostgreSQL compatibility surfaces include passkey
-assertion operations, evidence/trust
+The remaining PostgreSQL compatibility surfaces include evidence/trust
 and enabled SCIM operations, as well as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.

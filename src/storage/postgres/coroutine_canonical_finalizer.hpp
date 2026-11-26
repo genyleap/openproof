@@ -93,6 +93,11 @@ public:
         std::string credentialId,std::optional<identity::provider::ChallengeId> ceremony,
         std::optional<provider::passkey::PasskeyCredential> verified);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::core::IdentityId>>
+    verifyPasskeyAssertionAsync(const provider::passkey::PasskeyConfig& config,
+        identity::provider::ChallengeId challenge,provider::passkey::AssertionResponse assertion,
+        foundation::Instant now);
+
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();
 

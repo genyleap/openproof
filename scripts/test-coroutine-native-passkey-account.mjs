@@ -50,7 +50,8 @@ test("native passkey metadata and challenge transaction enforce tenant session, 
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativePasskeyListingAndRegistrationChallengeAreSessionBound/);
 });
 test("registration completion and removal serialize against disconnect and commit credential, ceremony and ownership atomically",()=>{
-  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync("));
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::mutatePasskeyAccountAsync("),
+    source.indexOf("CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync("));
   const order=["pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
     "FOR UPDATE OF i FOR SHARE OF o,s","WHERE provider='passkey' AND external_subject=$1 FOR UPDATE",
     "count(*) FILTER (WHERE credential_id=$2)","UPDATE openproof.passkey_registration_ceremonies",
@@ -71,4 +72,43 @@ test("registration completion and removal serialize against disconnect and commi
   assert.match(app,/reader->mutatePasskeyAccountAsync/);
   assert.match(read("src/gateway/http_coroutine.cpp"),/prefix.back\(\)=='\/' && path.starts_with\(prefix\)/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Passkey mutation rollback and last credential protection/);
+});
+test("native passkey assertion uses one-time broker, owner-bound proof and locked counter advancement before session issuance",()=>{
+  const store=source.slice(source.indexOf("CoroutinePostgresCanonicalFinalizer::verifyPasskeyAssertionAsync("));
+  const handler=http.slice(http.indexOf("CoroutinePasskeyAccountAdapter::assertion("));
+  const provider=http.slice(http.indexOf("CoroutinePasskeyProvider::completeAuthenticationAsync("),
+    http.indexOf("CoroutinePasskeyAccountAdapter::CoroutinePasskeyAccountAdapter("));
+  for (const route of ["/auth/passkey/options","/auth/passkey/verify"])
+    assert.ok(app.includes('nativePaths.emplace_back("'+route+'")'),route);
+  assert.match(app,/reader->verifyPasskeyAssertionAsync/);
+  assert.match(app,/nativeProviderAuthenticationEnabled\(idp::ProviderId\{"passkey"\}\)/);
+  assert.doesNotMatch(app,/\b(?:PostgresPasskeyRepository|PasskeyAuthenticationHttpApi|PasskeyService)\s+\w+\s*[\{;]/);
+  assert.match(handler,/co_await m_authentication->beginAsync/);
+  assert.match(handler,/request.setRequestedAssurance\(idp::AssuranceLevel::Ial2\)/);
+  const order=["security::sha256(bindingToken->expose())","bindingToken.reset()","scrub(r);",
+    "co_await m_authentication->completeAsync","verified->outcome().provider()!=idp::ProviderId",
+    "co_await m_issuer->issueReplacingAsync","issued->token.expose()"];
+  let previous=-1;
+  for (const term of order){
+    const index=handler.indexOf(term,previous+1);
+    assert.ok(index>previous,term);previous=index;
+  }
+  assert.match(provider,/co_await m_verify/);
+  assert.match(provider,/AuthenticationStrength\{idp::AuthenticationFactor::Possession,true\}/);
+  assert.match(provider,/std::string\{owner->value\(\)\}\);/);
+  const storageOrder=["i.organization_id=$2","pg_advisory_xact_lock(hashtextextended($1::text, 684271993))",
+    "i.status=0 AND i.kind=0 AND o.state=0 FOR SHARE OF i,o",
+    "provider='passkey'","AND external_subject=$1 AND identity_id=$1 FOR SHARE",
+    "credential_id=$1 AND identity_id=$2 FOR UPDATE","verifyAssertionProof(config,challenge,assertion,credential)",
+    "UPDATE openproof.passkey_credentials SET sign_count=$4","AND sign_count=$3 RETURNING credential_id",
+    'execute("COMMIT",{})'];
+  previous=-1;
+  for (const term of storageOrder){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term);previous=index;
+  }
+  const crypto=read("src/providers/passkey/passkey.cpp");
+  assert.match(crypto,/verifyEs256\(stored.publicKeyX, stored.publicKeyY/);
+  assert.match(crypto,/\(previous != 0U \|\| next != 0U\) && next <= previous/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/EXPECT_FALSE\(assertProof\(remaining->front\(\).credentialId\)\)/);
 });

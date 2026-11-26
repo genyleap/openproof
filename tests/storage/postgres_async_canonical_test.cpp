@@ -863,8 +863,29 @@ TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChalleng
         {seed.owner});
     ASSERT_EQ(PQntuples(link.get()),1);
     EXPECT_EQ(std::string{PQgetvalue(link.get(),0,0)},seed.owner);
+    auto config=pk::PasskeyConfig::create("identity.example.test","Fixture","https://identity.example.test",
+        fnd::SecretString{std::string(32U,'k')},5min);
+    ASSERT_TRUE(config);
+    auto options=pk::assertionOptions(config.value(),kNow+2s);
+    ASSERT_TRUE(options);
+    const auto assertProof=[&](std::string credential){
+        io.restart();
+        std::optional<fnd::Result<ids::IdentityId>> result;
+        auto collect=[&]()->asio::awaitable<void>{
+            result.emplace(co_await native.verifyPasskeyAssertionAsync(config.value(),options->id(),
+                pk::AssertionResponse{std::move(credential),"invalid","invalid","invalid",std::nullopt},kNow+2s));
+        };
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(result).value();
+    };
+    EXPECT_FALSE(assertProof(remaining->front().credentialId));
+    EXPECT_FALSE(assertProof(otherCredential));
+    const auto unchanged=read();
+    ASSERT_TRUE(unchanged && unchanged->size()==1U);
+    EXPECT_EQ(unchanged->front().signCount,remaining->front().signCount);
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
         "DELETE FROM openproof.external_identities WHERE provider='passkey' AND external_subject=$1",{seed.owner})));
+    EXPECT_FALSE(assertProof(remaining->front().credentialId));
     ASSERT_TRUE(runMutation(mutate(remaining->front().credentialId)));
     ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
         "UPDATE openproof.sessions SET state=1 WHERE id=$1",{sessionName})));
