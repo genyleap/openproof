@@ -12,6 +12,7 @@
 #include <vector>
 
 import openproof.administration;
+import openproof.application;
 import openproof.authentication;
 import openproof.foundation;
 import openproof.identity.core;
@@ -50,6 +51,13 @@ public:
     CoroutinePostgresCanonicalFinalizer& operator=(
         const CoroutinePostgresCanonicalFinalizer&) = delete;
     ~CoroutinePostgresCanonicalFinalizer() override;
+
+    // Owner and exact first-party IAL2 session are rechecked in the same
+    // read-only snapshot as the bounded public management projection.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::string>>
+    readApplicationManagementAsync(application::ManagementRead operation,
+        identity::core::IdentityId actor,session::SessionId sessionId,
+        std::optional<std::string> filter,foundation::Instant now);
 
     // Probe the real native pool, including queue admission and reconnect.
     [[nodiscard]] boost::asio::awaitable<foundation::Status> healthCheckAsync();

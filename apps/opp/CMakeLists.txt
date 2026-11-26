@@ -56,6 +56,7 @@ target_link_libraries(opp
         openproof_resource
         openproof_client
         openproof_application_http
+        openproof_application_async_http
         openproof_authentication
         openproof_authentication_http
         openproof_administration_async_http

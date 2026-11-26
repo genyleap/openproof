@@ -2714,4 +2714,155 @@ CoroutinePostgresCanonicalFinalizer::healthCheckAsync()
     }
 }
 
+asio::awaitable<foundation::Result<std::string>>
+CoroutinePostgresCanonicalFinalizer::readApplicationManagementAsync(
+    application::ManagementRead operation,core::IdentityId actor,session::SessionId sessionId,
+    std::optional<std::string> filter,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    using Read=application::ManagementRead;
+    const bool filtered=operation==Read::Clients || operation==Read::JarKey || operation==Read::ServiceIdentity;
+    if (actor.empty() || sessionId.empty() || actor.value().size()>200U || sessionId.value().size()>200U
+        || filtered!=filter.has_value() || (filter && (filter->empty() || filter->size()>256U))
+        || now.time_since_epoch().count()<0)
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params actorArgs{std::string{actor.value()},tenant,std::string{sessionId.value()},
+            std::to_string(now.time_since_epoch().count())};
+        const auto permitted=co_await execute(
+            "SELECT s.assurance FROM openproof.sessions s "
+            "JOIN openproof.identities i ON i.id=s.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "JOIN openproof.memberships m ON m.identity_id=i.id AND m.organization_id=o.id "
+            "WHERE i.id=$1 AND o.id=$2 AND s.id=$3 AND s.state=0 "
+            "AND i.status=0 AND o.state=0 AND m.state=1 "
+            "AND s.issued_at_ms<=$4 AND s.absolute_expires_at_ms>$4 AND s.last_seen_at_ms+s.idle_timeout_ms>$4 "
+            "AND EXISTS(SELECT 1 FROM openproof.membership_roles r WHERE r.identity_id=i.id "
+            "AND r.organization_id=o.id AND r.role='owner')",std::move(actorArgs));
+        if (permitted.rows.size()!=1U || permitted.rows.front().size()!=1U) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto assurance=milliseconds(permitted.rows.front()[0]);
+        if (assurance<2 || assurance>4) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AssuranceInsufficient);
+        }
+        std::string query,label;
+        Params args;
+        switch(operation) {
+        case Read::Applications:
+            label="applications"; args={tenant};
+            query=
+                "SELECT jsonb_build_object('id',id,'identifier',identifier,'name',display_name,"
+                "'environment',(ARRAY['development','staging','production'])[environment+1],"
+                "'status',(ARRAY['active','suspended','revoked'])[status+1])::text "
+                "FROM openproof.applications WHERE organization_id=$1 ORDER BY id COLLATE \"C\" LIMIT 257";
+            break;
+        case Read::Clients: {
+            label="clients";
+            Params appArgs{*filter,tenant};
+            const auto app=co_await execute(
+                "SELECT id FROM openproof.applications WHERE id=$1 AND organization_id=$2",std::move(appArgs));
+            if (app.rows.size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::NotFound);
+            }
+            args={*filter,tenant};
+            // Deliberately never project secret_digest, not even for the owner.
+            query=
+                "SELECT CASE WHEN cardinality(redirects)<=256 AND cardinality(scopes)<=256 THEN "
+                "jsonb_build_object('id',c.id,'application_id',c.application_id,'name',c.display_name,"
+                "'kind',(ARRAY['web','native','browser','service'])[c.kind+1],"
+                "'status',(ARRAY['active','suspended','revoked'])[c.status+1],"
+                "'redirect_uris',redirects,'scopes',scopes)::text END "
+                "FROM openproof.oauth_clients c JOIN openproof.applications a ON a.id=c.application_id "
+                "CROSS JOIN LATERAL (SELECT ARRAY(SELECT redirect_uri FROM openproof.oauth_client_redirect_uris "
+                "WHERE client_id=c.id ORDER BY redirect_uri COLLATE \"C\" LIMIT 257) AS redirects,"
+                "ARRAY(SELECT scope FROM openproof.oauth_client_scopes WHERE client_id=c.id "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257) AS scopes) children "
+                "WHERE c.application_id=$1 AND a.organization_id=$2 ORDER BY c.id COLLATE \"C\" LIMIT 257";
+            break;
+        }
+        case Read::JarKey:
+            args={*filter,tenant};
+            query=
+                "SELECT CASE WHEN octet_length(k.public_key_pem)<=32768 THEN "
+                "jsonb_build_object('client_id',c.id,'key_id',k.key_id,'public_key_pem',k.public_key_pem)::text END "
+                "FROM openproof.oauth_client_request_signing_keys k JOIN openproof.oauth_clients c ON c.id=k.client_id "
+                "JOIN openproof.applications a ON a.id=c.application_id "
+                "WHERE c.id=$1 AND a.organization_id=$2";
+            break;
+        case Read::Resources:
+            // The existing resource registry has no organization column.
+            // Preserve its platform-wide visibility for authorized owners.
+            label="resources";
+            query=
+                "SELECT CASE WHEN cardinality(scopes)<=256 THEN "
+                "jsonb_build_object('id',r.id,'audience',r.audience,'name',r.display_name,"
+                "'status',(ARRAY['active','suspended','revoked'])[r.status+1],'scopes',scopes)::text END "
+                "FROM openproof.oauth_resources r CROSS JOIN LATERAL "
+                "(SELECT ARRAY(SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=r.id "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257) AS scopes) children "
+                "ORDER BY r.id COLLATE \"C\" LIMIT 257";
+            break;
+        case Read::ServiceIdentity:
+            args={*filter,tenant};
+            query=
+                "SELECT CASE WHEN cardinality(audiences)<=256 AND cardinality(scopes)<=256 THEN "
+                "jsonb_build_object('identity_id',s.identity_id,'client_id',s.client_id,'active',s.active,"
+                "'audiences',audiences,'scopes',scopes)::text END "
+                "FROM openproof.service_identities s JOIN openproof.oauth_clients c ON c.id=s.client_id "
+                "JOIN openproof.applications a ON a.id=c.application_id "
+                "JOIN openproof.identities i ON i.id=s.identity_id AND i.organization_id=a.organization_id "
+                "CROSS JOIN LATERAL (SELECT ARRAY(SELECT audience FROM openproof.service_identity_audiences "
+                "WHERE client_id=s.client_id ORDER BY audience COLLATE \"C\" LIMIT 257) AS audiences,"
+                "ARRAY(SELECT scope FROM openproof.service_identity_scopes WHERE client_id=s.client_id "
+                "ORDER BY scope COLLATE \"C\" LIMIT 257) AS scopes) children "
+                "WHERE s.client_id=$1 AND a.organization_id=$2 AND i.kind=1";
+            break;
+        default:
+            co_return foundation::fail(E::InvalidArgument);
+        }
+        // Enforce the aggregate byte budget inside PostgreSQL, before
+        // libpq allocates the result. A NULL sentinel distinguishes an
+        // oversized projection from an authorized empty collection.
+        query="WITH projected AS MATERIALIZED (SELECT row_number() OVER () AS ordinal,value FROM ("+
+            query+") AS q(value)), bounds AS (SELECT count(*)<=256 AND "
+            "count(value)=count(*) AND COALESCE(sum(octet_length(value)),0)<=2096000 "
+            "AND COALESCE(max(octet_length(value)),0)<=1048576 AS ok FROM projected) "
+            "SELECT value FROM (SELECT ordinal,value FROM projected,bounds WHERE ok "
+            "UNION ALL SELECT 0::bigint,NULL::text FROM bounds WHERE NOT ok) bounded ORDER BY ordinal";
+        auto rows=co_await execute(std::move(query),std::move(args));
+        if (label.empty() && rows.rows.empty()) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::NotFound);
+        }
+        if (rows.rows.size()>256U || (label.empty() && rows.rows.size()!=1U))
+            co_return foundation::fail(E::Unavailable);
+        std::string output=label.empty()?std::string{}:"{\""+label+"\":[";
+        for (std::size_t index=0;index<rows.rows.size();++index) {
+            const auto& row=rows.rows[index];
+            if (row.size()!=1U || !row[0] || row[0]->size()>1024U*1024U
+                || output.size()+row[0]->size()>2U*1024U*1024U)
+                co_return foundation::fail(E::Unavailable);
+            if (index!=0U) output.push_back(',');
+            output.append(*row[0]);
+        }
+        if (!label.empty()) output.append("]}");
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return output;
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native application management read is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

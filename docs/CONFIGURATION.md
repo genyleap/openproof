@@ -1089,9 +1089,19 @@ return 405. Both paths have strict native ownership, with no synchronous
 readiness fallback. This also checks the actual request-processing pool
 rather than a separate legacy connection pool.
 
+Application management GET endpoints for applications, clients, JAR keys,
+resources and service identities now use a bounded native read-only
+repeatable-read snapshot. The exact first-party session, IAL2 assurance,
+active identity, organization, membership and owner role are checked
+inside the snapshot. Client secrets are never selected. Resource registry
+visibility remains platform-wide as in the existing schema; applications,
+clients, JAR keys and service identities are tenant-bound. Oversized
+results fail closed rather than returning a misleading truncated list.
+
 The remaining PostgreSQL compatibility surfaces include application/client/
-resource/service-identity administration, passkey operations, evidence/trust
-and enabled SCIM operations, as well as startup and offline administration.
+resource/service-identity mutations and the administration console,
+passkey operations, evidence/trust and enabled SCIM operations, as well
+as startup and offline administration.
 Their synchronous dependencies must be separately audited and migrated
 before claiming complete native runtime acceptance.
 

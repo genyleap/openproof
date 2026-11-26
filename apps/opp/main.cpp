@@ -48,6 +48,7 @@
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
 #include "../../src/operations/http/coroutine_health_http.hpp"
+#include "../../src/application/http/coroutine_management_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
 #include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
@@ -3450,6 +3451,23 @@ addProtectedRoutes(gateway::Router& router,
         if (nativeConsentEnabled) {
             nativePaths.emplace_back("/oauth/consents");
             nativePaths.emplace_back("/oauth/consents/revoke");
+        }
+        std::unique_ptr<applicationHttp::CoroutineManagementReadAdapter> nativeManagement;
+        if (platform.oidc().enabled()) {
+            nativeManagement=std::make_unique<applicationHttp::CoroutineManagementReadAdapter>(
+                *nativeHandler,limiter.value(),
+                [service=nativeSessions.get()](fnd::SecretString credential) {
+                    return service->authenticate(std::move(credential));
+                },
+                [reader=nativeCanonical.get(),&clock](application::ManagementRead operation,
+                    identity::IdentityId actor,session::SessionId sessionId,std::optional<std::string> filter) {
+                    return reader->readApplicationManagementAsync(operation,std::move(actor),
+                        std::move(sessionId),std::move(filter),clock.now());
+                });
+            nativeHandler=nativeManagement.get();
+            for (const auto* route : {"/admin/applications","/admin/clients","/admin/clients/jar-key",
+                "/admin/resources","/admin/service-identities"})
+                nativeMethods.emplace_back(route,gateway::HttpMethod::Get);
         }
         operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};

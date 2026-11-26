@@ -742,6 +742,84 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     ASSERT_NO_THROW(done.get());
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSessionAndNeverProjectSecrets)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    using Read=openproof::application::ManagementRead;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="read-app-"+seed.suffix, foreignApp="foreign-"+app, client="read-client-"+seed.suffix;
+    const auto sessionName="read-session-"+seed.suffix, weakSession=sessionName+"-weak";
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    const auto digest=[&](std::string_view label) {
+        return fnd::toHex(openproof::security::sha256(seed.suffix+std::string{label}).value());
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+        "VALUES($1,$2,1,1770000000000),($1,$3,1,1770000000000)",{seed.org,seed.owner,seed.secondOwner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.membership_roles(organization_id,identity_id,role) "
+        "VALUES($1,$2,'owner'),($1,$3,'member')",{seed.org,seed.owner,seed.secondOwner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000),"
+        "($4,$2,'local',1,1,false,0,decode($5,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest("-session"),weakSession,digest("-weak")}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'read-fixture','Fixture',0,0,1770000000000,1770000000000),"
+        "($3,$4,'foreign-fixture','Foreign',0,0,1770000000000,1770000000000)",{app,seed.org,foreignApp,seed.foreignOrg}));
+    const auto secret=digest("-client-secret");
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',0,0,decode($3,'hex'),1770000000000,1770000000000)",{client,app,secret}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) "
+        "VALUES($1,'https://fixture.example.invalid/callback')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'openid')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_request_signing_keys(client_id,key_id,public_key_pem,updated_at_ms) "
+        "VALUES($1,'fixture-key','fixture-public-material',1770000000000)",{client}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](Read op,std::optional<std::string> filter=std::nullopt,
+        std::string actor={},std::string session={}) {
+        io.restart();
+        auto task=native.readApplicationManagementAsync(op,ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},std::move(filter),kNow+1s);
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    auto apps=read(Read::Applications);
+    ASSERT_TRUE(apps);
+    EXPECT_NE(apps->find(app),std::string::npos);
+    EXPECT_EQ(apps->find(foreignApp),std::string::npos);
+    EXPECT_FALSE(read(Read::Applications,std::nullopt,seed.secondOwner));
+    auto weak=read(Read::Applications,std::nullopt,seed.owner,weakSession);
+    ASSERT_FALSE(weak);
+    EXPECT_EQ(weak.error().code(),fnd::ErrorCode::AssuranceInsufficient);
+    EXPECT_FALSE(read(Read::Clients,foreignApp));
+    auto clients=read(Read::Clients,app);
+    ASSERT_TRUE(clients);
+    EXPECT_NE(clients->find(client),std::string::npos);
+    EXPECT_NE(clients->find("https://fixture.example.invalid/callback"),std::string::npos);
+    EXPECT_EQ(clients->find(secret),std::string::npos);
+    EXPECT_EQ(clients->find("secret_digest"),std::string::npos);
+    auto jar=read(Read::JarKey,client);
+    ASSERT_TRUE(jar);
+    EXPECT_NE(jar->find("fixture-public-material"),std::string::npos);
+    EXPECT_TRUE(read(Read::Resources));
+    EXPECT_FALSE(read(Read::ServiceIdentity,client));
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
+        {seed.org,seed.owner}));
+    EXPECT_FALSE(read(Read::Clients,app));
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)
 {
     const auto dsn = disposableDsn();
