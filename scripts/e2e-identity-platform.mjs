@@ -13,6 +13,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 import { startLocalDemoPortal } from "./local-demo-portal.mjs";
 import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
+import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-diagnostics.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -394,10 +395,12 @@ async function main() {
     response.end(JSON.stringify({ upstream: true, path: request.url }));
   });
   const upstreamPort = await listen(upstreamServer);
-  const oppPort = await reservePort();
+  let oppPort = await reservePort();
 
   let oppProcess;
   let oppLog = "";
+  let oppClosed;
+  let startupFailureCategory;
   let loadResult;
   let loadResourceMetrics = {};
   let nativeClientId = "";
@@ -547,6 +550,28 @@ async function main() {
   };
 
   async function startOpp() {
+    // A released ephemeral port is not reserved until the subprocess binds.
+    // Retry only a positively identified listener collision, never a failed
+    // migration, crypto operation, readiness check or unknown startup error.
+    for (let attempt = 0; attempt < 3; ++attempt) {
+      startupFailureCategory = undefined;
+      try {
+        await launchOpp();
+        return;
+      } catch (error) {
+        if (startupFailureCategory !== "listener-address-in-use" || attempt === 2)
+          throw error;
+        const nextPort = await reservePort();
+        fs.writeFileSync(configurationPath,
+          replaceFixturePort(fs.readFileSync(configurationPath, "utf8"), oppPort, nextPort),
+          { mode: 0o600 });
+        oppPort = nextPort;
+        console.warn("identity E2E: fixture listener collision; retrying with a fresh port");
+      }
+    }
+  }
+
+  async function launchOpp() {
     oppLog = "";
     const checked = command(binary, ["check-config", "--config", configurationPath], {
       env: childEnvironment,
@@ -561,7 +586,9 @@ async function main() {
       oppLog += chunk.toString("utf8");
       if (oppLog.length > 32_000) oppLog = oppLog.slice(-32_000);
     };
-    oppProcess.stdout.on("data", append);
+    oppClosed = new Promise(resolve => oppProcess.once("close", resolve));
+    // Drain stdout without retaining potentially sensitive structured logs.
+    oppProcess.stdout.resume();
     oppProcess.stderr.on("data", append);
     await waitUntilReady();
   }
@@ -655,8 +682,11 @@ async function main() {
   async function waitUntilReady() {
     let lastError;
     for (let attempt = 0; attempt < 100; ++attempt) {
-      if (oppProcess.exitCode !== null) {
-        fail(`opp exited during startup (status ${oppProcess.exitCode}); raw service logs withheld`);
+      if (oppProcess.exitCode !== null || oppProcess.signalCode !== null) {
+        await oppClosed; // stderr has drained before classifying the exit.
+        startupFailureCategory = classifyStartupFailure(oppLog);
+        oppLog = "";
+        fail(`opp exited during startup (status ${oppProcess.exitCode ?? "signal"}, category ${startupFailureCategory}); raw service logs withheld`);
       }
       try {
         const response = await edgeRequest("/health/ready");
