@@ -885,6 +885,7 @@ target_compile_definitions(openproof_postgres_async_canonical_tests PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_canonical openproof_postgres_async_io
+    openproof_postgres_async_consent openproof_consent
     openproof_postgres_async_repository openproof_policy openproof_session
     openproof_authentication openproof_identity_core
     openproof_identity_provider openproof_identity_profile
