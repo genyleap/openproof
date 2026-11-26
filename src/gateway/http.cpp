@@ -362,19 +362,19 @@ public:
             // an arbitrary HTTP reactor worker: Beast's stream timer and
             // socket operations are not thread-safe across executors.
             asio::post(m_stream.get_executor(),
-                [self = shared_from_this(), result = std::move(wire)]() mutable {
+                [self = shared_from_this(), result = std::move(wire), headRequest]() mutable {
                     if (self->m_owner->m_running.load(std::memory_order_acquire)) {
-                        self->write(std::move(result));
+                        self->write(std::move(result), headRequest);
                     }
                 });
             m_owner->m_pendingHandlers.fetch_sub(
                 1U, std::memory_order_acq_rel);
         }
 
-        void write(beastHttp::response<beastHttp::string_body> response)
+        void write(beastHttp::response<beastHttp::string_body> response, bool headRequest = false)
         {
             m_response.emplace(std::move(response));
-            asio::co_spawn(m_stream.get_executor(), writeResponse(),
+            asio::co_spawn(m_stream.get_executor(), writeResponse(headRequest),
                 [self = shared_from_this()](std::exception_ptr error) {
                     if (error) {
                         try { std::rethrow_exception(error); }
@@ -383,13 +383,20 @@ public:
                 });
         }
 
-        asio::awaitable<void> writeResponse()
+        asio::awaitable<void> writeResponse(bool headRequest)
         {
             m_stream.expires_after(m_owner->m_config.writeTimeout());
             boost::system::error_code error;
-            static_cast<void>(co_await beastHttp::async_write(
-                m_stream, *m_response,
-                asio::redirect_error(asio::use_awaitable, error)));
+            if (headRequest) {
+                beastHttp::response_serializer<beastHttp::string_body> serializer{*m_response};
+                static_cast<void>(co_await beastHttp::async_write_header(
+                    m_stream, serializer,
+                    asio::redirect_error(asio::use_awaitable, error)));
+            } else {
+                static_cast<void>(co_await beastHttp::async_write(
+                    m_stream, *m_response,
+                    asio::redirect_error(asio::use_awaitable, error)));
+            }
             boost::system::error_code ignored;
             m_stream.socket().shutdown(Tcp::socket::shutdown_send, ignored);
         }
