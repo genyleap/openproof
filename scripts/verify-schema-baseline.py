@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import pwd
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +24,12 @@ PORT = "55428"
 
 def migration_files() -> list[Path]:
     directory = ROOT / "migrations"
-    legacy_names = {p.name for p in (directory / "legacy").glob("*.sql")}
+    archive = directory / "legacy"
+    if not archive.is_dir() or archive.is_symlink():
+        raise ValueError("Missing immutable legacy archive")
+    legacy_names = {p.name for p in archive.glob("*.sql")}
+    if not legacy_names:
+        raise ValueError("Empty immutable legacy archive")
     files = sorted(directory.glob("*.sql"))
     if not files or len({p.name[:4] for p in files}) != len(files):
         raise ValueError("Missing or ambiguous schema migration sequence")
