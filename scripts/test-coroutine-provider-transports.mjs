@@ -10,8 +10,8 @@ import path from "node:path";
 const root = path.resolve(import.meta.dirname, "..");
 const cases = [
   {name:"GitHub OAuth",file:"src/providers/github/github.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
-  {name:"OIDC federation",file:"src/providers/oidc/oidc.cpp",legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
-  {name:"X OAuth 1.0a",file:"src/providers/x/x.cpp",legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
+  {name:"OIDC federation",file:"src/providers/oidc/oidc.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
+  {name:"X OAuth 1.0a",file:"src/providers/x/x.cpp",retired:true,legacy:"httpsRequest",native:"httpsRequestAsync",client:"AsyncHttpsClient",limit:"kMaximumResponseBytes"},
   {name:"Web3 RPC",file:"src/providers/web3/web3.cpp",legacy:"rpc",native:"rpcAsync",client:"NativeRpcClient",limit:"kMaximumRpcResponse"}
 ];
 const forbidden = [
@@ -23,12 +23,16 @@ for (const item of cases) {
   test(item.name+(item.retired?" has only native remote exchanges":" legacy I/O is delegated to native coroutine HTTPS"),()=>{
     const source = fs.readFileSync(path.join(root,item.file),"utf8");
     if (item.retired) {
-      const sync=source.slice(source.indexOf("GitHubAuthenticationProvider::completeAuthentication("),
-        source.indexOf("GitHubAuthenticationProvider::beginAuthenticationAsync("));
-      assert.match(sync,/return foundation::fail\(foundation::ErrorCode::Unavailable,/);
+      const type=item.name==="GitHub OAuth"?"GitHubAuthenticationProvider":
+        item.name==="OIDC federation"?"OidcAuthenticationProvider":"XAuthenticationProvider";
+      const github=type.startsWith("GitHub");
+      const sync=source.slice(source.indexOf(type+(github?"::completeAuthentication(":"::beginAuthentication(")),
+        source.indexOf(type+"::beginAuthenticationAsync("));
+      assert.equal([...sync.matchAll(/return foundation::fail\(foundation::ErrorCode::Unavailable,/g)].length,
+        github?1:2);
       assert.doesNotMatch(source,/\b(?:io\.run|httpsRequest|completion\.get)\s*\(/);
-      const native=source.slice(source.indexOf("GitHubAuthenticationProvider::completeAuthenticationAsync("));
-      assert.equal([...native.matchAll(/co_await httpsRequestAsync\(/g)].length,3);
+      assert.equal([...source.matchAll(/co_await httpsRequestAsync\(/g)].length,
+        github?3:type.startsWith("Oidc")?4:2);
       assert.match(source,/co_await\s+client\.exchange\s*\(/);
       for (const pattern of forbidden) assert.doesNotMatch(source,pattern);
       return;
@@ -57,3 +61,15 @@ for (const item of cases) {
       "native transport must use the bounded shared HTTPS implementation");
   });
 }
+
+test("runtime delegated federation initiation issues a handoff instead of blocking provider I/O",()=>{
+  const source=fs.readFileSync(path.join(root,"src/authentication/http/federated.cpp"),"utf8");
+  const runtime=source.slice(source.indexOf("if (m_nativeRedirectsRequired) {"),
+    source.indexOf("return startPrepared(std::move(request), idp::ProviderId{providerIt->second}"));
+  assert.match(runtime,/issueBrowserConnectionHandoff\(\*connectionTarget,/);
+  assert.match(runtime,/\/account\/connections\/handoff\?ticket=/);
+  assert.doesNotMatch(runtime,/beginConnection\(|beginAuthentication\(|completeAuthentication\(/);
+  const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+  assert.match(app,/authApi, nullptr, true\}/);
+  assert.match(app,/authApi, &tokenService, true\}/);
+});

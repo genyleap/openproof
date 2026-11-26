@@ -50,6 +50,37 @@ public:
     }
 };
 
+class HandoffOnlyRedirectProvider final : public idp::AuthenticationProvider,
+    public idp::CoroutineAuthenticationProvider {
+public:
+    idp::ProviderId id() const override {return idp::ProviderId{"handoff-test"};}
+    idp::InteractionModel interactionModel() const noexcept override {return idp::InteractionModel::Redirect;}
+    idp::AssuranceLevel maximumClaimableAssurance() const noexcept override {return idp::AssuranceLevel::Ial1;}
+    fnd::Result<idp::AuthenticationChallenge> beginAuthentication(const idp::AuthenticationRequest&) override
+    {++syncCalls;return fnd::fail(fnd::ErrorCode::Unavailable);}
+    fnd::Result<idp::AuthenticationOutcome> completeAuthentication(const idp::AuthenticationResponse&) override
+    {++syncCalls;return fnd::fail(fnd::ErrorCode::Unavailable);}
+    boost::asio::awaitable<fnd::Result<idp::AuthenticationChallenge>>
+    beginAuthenticationAsync(idp::AuthenticationRequest) override
+    {co_return fnd::fail(fnd::ErrorCode::Unavailable);}
+    boost::asio::awaitable<fnd::Result<idp::AuthenticationOutcome>>
+    completeAuthenticationAsync(idp::AuthenticationResponse) override
+    {co_return fnd::fail(fnd::ErrorCode::Unavailable);}
+    int syncCalls{};
+};
+class HandoffDelegatedAccess final : public sess::DelegatedAccessAuthenticator {
+public:
+    fnd::Result<sess::DelegatedAccess> authenticateDelegated(const fnd::SecretString& token) override {
+        if (token.expose()!="fixture-delegated") return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        auto actor=sess::AuthenticatedSession::fromDelegatedAccess(core::IdentityId{"identity-current"},
+            idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+            kNow,kNow,kNow+std::chrono::hours{1});
+        if (!actor) return fnd::fail(actor.error());
+        return sess::DelegatedAccess{std::move(actor).value(),"fixture-client",{"account"}};
+    }
+};
+
 class RedirectProvider final : public idp::AuthenticationProvider {
 public:
     explicit RedirectProvider(std::string providerId = "redirect")
@@ -915,6 +946,54 @@ TEST(Web3AuthenticationHttpApiTest, MobileWalletHandoffSeparatesBrowserRedeemCre
     ASSERT_EQ(pending.status(), 202) << pending.body();
     EXPECT_TRUE(json::parse(pending.body()).as_object().at("pending").as_bool());
     EXPECT_TRUE(cookieValue(pending, "__Host-openproof-session").empty());
+}
+
+TEST(FederatedAuthenticationHttpApiTest, RuntimeDelegatedStartUsesOneTimeHandoffWithoutProviderIo)
+{
+    fnd::ManualClockSource clock{kNow};
+    idp::ProviderRegistry registry;
+    auto implementation=std::make_unique<HandoffOnlyRedirectProvider>();
+    auto* observed=implementation.get();
+    ASSERT_TRUE(registry.registerProvider(std::move(implementation)));
+    idp::InMemoryAuthenticationTransactionStore transactions;
+    core::InMemoryExternalIdentityDirectory identities;
+    auth::ProviderTrustPolicy trust;
+    ASSERT_TRUE(trust.trust(idp::ProviderId{"handoff-test"},idp::AssuranceLevel::Ial1));
+    auth::AuthenticationService authentication{registry,transactions,identities,clock,
+        std::move(trust),std::chrono::minutes{5}};
+    sess::InMemorySessionRepository repository;
+    sess::SessionService sessions{repository,clock,
+        sess::SessionKey::create(fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value(),
+        sess::SessionPolicy::create(std::chrono::hours{8},std::chrono::minutes{30}).value()};
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    Fallback fallback;
+    HandoffDelegatedAccess delegated;
+    authHttp::FederatedAuthenticationHttpApi api{
+        authentication,registry,sessions,limiter,fallback,&delegated,true};
+    const auto request=[](std::string target,std::string bearer){
+        return gw::HttpRequest::create(gw::HttpMethod::Get,std::move(target),
+            {{"authorization","Bearer "+std::move(bearer)}},"","127.0.0.1",
+            fnd::CorrelationId{"handoff-test"}).value();
+    };
+    const std::string route="/account/connections/start?provider=handoff-test&return_to=%2Faccount";
+    EXPECT_EQ(api.handle(request(route,"wrong-token")).status(),401);
+    const auto response=api.handle(request(route,"fixture-delegated"));
+    ASSERT_EQ(response.status(),302) << response.body();
+    const auto location=response.headers().at("location");
+    const std::string prefix="/account/connections/handoff?ticket=";
+    ASSERT_TRUE(location.starts_with(prefix));
+    EXPECT_EQ(response.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(api.handle(request(location,"fixture-delegated")).status(),503);
+    auto consumed=authentication.consumeBrowserConnectionHandoff(
+        fnd::SecretString{location.substr(prefix.size())});
+    ASSERT_TRUE(consumed);
+    EXPECT_EQ(consumed->identity.value(),"identity-current");
+    EXPECT_EQ(consumed->providerId.value(),"handoff-test");
+    EXPECT_EQ(consumed->returnTarget,"/account");
+    EXPECT_FALSE(authentication.consumeBrowserConnectionHandoff(
+        fnd::SecretString{location.substr(prefix.size())}));
+    EXPECT_EQ(observed->syncCalls,0);
+    EXPECT_EQ(api.handle(getRequest("/auth/federated/callback?code=never")).status(),503);
 }
 
 TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndChallengeProviders)

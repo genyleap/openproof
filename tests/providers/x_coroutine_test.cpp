@@ -95,4 +95,19 @@ TEST(XCoroutineProviderTest, ForgedChallengeEnvelopeRejectedBeforeOutboundReques
 {
     rejectCallback(true);
 }
+TEST(XCoroutineProviderTest, SynchronousStartAndCompletionFailClosed)
+{
+    auto configured=config();
+    ASSERT_TRUE(configured);
+    fnd::ManualClockSource clock{fnd::Instant{std::chrono::milliseconds{1770000000000}}};
+    xProvider::XAuthenticationProvider provider{std::move(configured).value(),clock};
+    auto start=provider.beginAuthentication(idp::AuthenticationRequest{
+        idp::ProviderId{"x"},idp::ClientContext{}});
+    ASSERT_FALSE(start);
+    EXPECT_EQ(start.error().code(),fnd::ErrorCode::Unavailable);
+    auto completion=provider.completeAuthentication(idp::AuthenticationResponse{
+        idp::ChallengeId{"fixture"},idp::ClientContext{}});
+    ASSERT_FALSE(completion);
+    EXPECT_EQ(completion.error().code(),fnd::ErrorCode::Unavailable);
+}
 } // namespace
