@@ -17,6 +17,8 @@ import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.security;
+import openproof.oauth;
+import openproof.oauth.http.sender;
 import openproof.session;
 
 namespace {
@@ -207,4 +209,76 @@ TEST(NativeConsentHttpTest, RateLimitAndStorageFailureNeverReportSuccess)
     EXPECT_EQ(f.revokeCalls, 1);
     EXPECT_EQ(f.listCalls, 1);
 }
+class LegacyReplayProbe final : public openproof::oauth::DpopReplayStore,
+    public openproof::oauth::MtlsForwardingReplayStore {
+public:
+    fnd::Status consumeDpopReplay(std::string_view,std::string_view,fnd::Instant,fnd::Instant) override {
+        ++calls; return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    fnd::Status consumeMtlsForwardingReplay(std::string_view,std::string_view,fnd::Instant,fnd::Instant) override {
+        ++calls; return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    int calls{};
+};
+
+TEST(NativeSenderProofTest, MtlsProofBindsRequestAndUsesOnlyNativeReplay)
+{
+    LegacyReplayProbe legacy;
+    fnd::ManualClockSource clock{kNow};
+    openproof::oauth::DpopService dpop{legacy,clock,5min};
+    const std::string key(32U,'k'),thumbprint(43U,'A');
+    http::SenderProofVerifier verifier{dpop,legacy,clock,"https://issuer.example.test",
+        fnd::SecretString{key}};
+    const sess::DelegatedSenderConstraint binding{sess::DelegatedSenderConstraintKind::Mtls,thumbprint};
+    const fnd::SecretString token{"fixture-access-token"};
+    int writes=0;
+    bool rejectReplay=false;
+    http::SenderProofVerifier::ConsumeReplay consume=[&](sess::DelegatedSenderConstraintKind kind,
+        std::string thumb,std::string nonce,fnd::Instant expires,fnd::Instant now)->asio::awaitable<fnd::Status>{
+        ++writes;
+        EXPECT_EQ(kind,sess::DelegatedSenderConstraintKind::Mtls);
+        EXPECT_EQ(thumb,thumbprint);
+        EXPECT_EQ(nonce,"fixture-nonce");
+        EXPECT_EQ(expires,kNow+60s);
+        EXPECT_EQ(now,kNow);
+        if (rejectReplay) co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return fnd::ok();
+    };
+    auto make=[&](std::string path,std::int64_t timestamp){
+        const std::string stamp=std::to_string(timestamp);
+        const std::string payload="GET\n/proxy?item=1\n"+thumbprint+"\n"+stamp+"\nfixture-nonce";
+        const auto mac=openproof::security::hmacSha256(fnd::SecretString{key},payload).value();
+        return gw::HttpRequest::create(gw::HttpMethod::Get,std::move(path),
+            {{"x-forwarded-client-cert-sha256",thumbprint},{"x-forwarded-client-cert-timestamp",stamp},
+             {"x-forwarded-client-cert-nonce","fixture-nonce"},
+             {"x-forwarded-client-cert-signature",fnd::toBase64Url(mac)}},
+             {},"127.0.0.1",fnd::CorrelationId{"native-mtls"}).value();
+    };
+    auto run=[&](gw::HttpRequest& input,const sess::DelegatedSenderConstraint& constraint,bool scheme=false){
+        asio::io_context io;
+        auto pending=verifier.verifyAsync(input,constraint,token,scheme,consume);
+        auto done=asio::co_spawn(io,std::move(pending),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    auto valid=make("/proxy?item=1",kNow.time_since_epoch().count());
+    EXPECT_TRUE(run(valid,binding));
+    EXPECT_FALSE(valid.header("x-forwarded-client-cert-signature"));
+    EXPECT_EQ(writes,1);
+    auto wrong=make("/proxy?item=2",kNow.time_since_epoch().count());
+    EXPECT_FALSE(run(wrong,binding));
+    auto wrongBinding=make("/proxy?item=1",kNow.time_since_epoch().count());
+    EXPECT_FALSE(run(wrongBinding,sess::DelegatedSenderConstraint{sess::DelegatedSenderConstraintKind::Mtls,std::string(43U,'B')}));
+    auto expired=make("/proxy?item=1",(kNow-60s).time_since_epoch().count());
+    EXPECT_FALSE(run(expired,binding));
+    auto wrongScheme=make("/proxy?item=1",kNow.time_since_epoch().count());
+    EXPECT_FALSE(run(wrongScheme,binding,true));
+    EXPECT_EQ(writes,1);
+    rejectReplay=true;
+    auto repeated=make("/proxy?item=1",kNow.time_since_epoch().count());
+    EXPECT_FALSE(run(repeated,binding));
+    EXPECT_EQ(writes,2);
+    EXPECT_EQ(legacy.calls,0);
+}
+
 } // namespace

@@ -897,6 +897,66 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
 }
 
 asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::consumeSenderReplayAsync(
+    session::DelegatedSenderConstraintKind kind,std::string thumbprint,
+    std::string identifier,foundation::Instant expiresAt,foundation::Instant now)
+{
+    const auto valid=[](const std::string& value,std::size_t maximum) {
+        return !value.empty() && value.size()<=maximum
+            && std::ranges::none_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7fU;
+            });
+    };
+    if ((kind!=session::DelegatedSenderConstraintKind::Dpop
+            && kind!=session::DelegatedSenderConstraintKind::Mtls)
+        || !valid(thumbprint,128U) || !valid(identifier,256U)
+        || now.time_since_epoch().count()<0 || expiresAt<=now
+        || expiresAt-now>std::chrono::minutes{12})
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        // Replay keys are GLOBAL, matching the legacy tables. A token proof
+        // must not become redeemable again merely by changing tenants.
+        // Bounded cleanup excludes the inserted key and skips locked rows.
+        // Conflict handling is atomic even across native/legacy connections.
+        constexpr auto dpopSql=
+            "WITH expired AS (SELECT jwk_thumbprint,jwt_id FROM openproof.oauth_dpop_replays "
+            "WHERE expires_at_ms<=$4 AND (jwk_thumbprint,jwt_id)<>($1,$2) "
+            "ORDER BY expires_at_ms LIMIT 64 FOR UPDATE SKIP LOCKED),"
+            "purged AS (DELETE FROM openproof.oauth_dpop_replays r USING expired e "
+            "WHERE r.jwk_thumbprint=e.jwk_thumbprint AND r.jwt_id=e.jwt_id) "
+            "INSERT INTO openproof.oauth_dpop_replays AS r(jwk_thumbprint,jwt_id,expires_at_ms) "
+            "VALUES($1,$2,$3) ON CONFLICT(jwk_thumbprint,jwt_id) DO UPDATE "
+            "SET expires_at_ms=EXCLUDED.expires_at_ms WHERE r.expires_at_ms<=$4 RETURNING 1";
+        constexpr auto mtlsSql=
+            "WITH expired AS (SELECT certificate_thumbprint,nonce FROM openproof.oauth_mtls_forwarding_replays "
+            "WHERE expires_at_ms<=$4 AND (certificate_thumbprint,nonce)<>($1,$2) "
+            "ORDER BY expires_at_ms LIMIT 64 FOR UPDATE SKIP LOCKED),"
+            "purged AS (DELETE FROM openproof.oauth_mtls_forwarding_replays r USING expired e "
+            "WHERE r.certificate_thumbprint=e.certificate_thumbprint AND r.nonce=e.nonce) "
+            "INSERT INTO openproof.oauth_mtls_forwarding_replays AS r(certificate_thumbprint,nonce,expires_at_ms) "
+            "VALUES($1,$2,$3) ON CONFLICT(certificate_thumbprint,nonce) DO UPDATE "
+            "SET expires_at_ms=EXCLUDED.expires_at_ms WHERE r.expires_at_ms<=$4 RETURNING 1";
+        Params params{std::move(thumbprint),std::move(identifier),
+            std::to_string(expiresAt.time_since_epoch().count()),
+            std::to_string(now.time_since_epoch().count())};
+        const auto result=co_await lease.connection().query(
+            kind==session::DelegatedSenderConstraintKind::Dpop?dpopSql:mtlsSql,
+            std::move(params),remaining(deadline));
+        if (result.rows.empty())
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        if (result.rows.size()!=1U || result.rows.front().size()!=1U
+            || required(result.rows.front().front())!="1")
+            co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Status>
 CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync(
     core::IdentityId owner,core::ExternalIdentityRef external)
 {

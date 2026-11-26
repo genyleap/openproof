@@ -1,6 +1,7 @@
 module;
 
 #include <string_view>
+#include <utility>
 
 export module openproof.oauth:dpop;
 
@@ -54,6 +55,12 @@ public:
     [[nodiscard]] foundation::Status consume(
         std::string_view jwkThumbprint, std::string_view jwtId,
         foundation::Instant issuedAt);
+
+    // Validate the already verified proof without performing storage I/O.
+    // Returns (expiry, observation time) for a single atomic replay write.
+    [[nodiscard]] foundation::Result<std::pair<foundation::Instant,foundation::Instant>>
+    replayWindow(std::string_view jwkThumbprint,std::string_view jwtId,
+        foundation::Instant issuedAt) const;
 
 private:
     DpopReplayStore* m_replays;

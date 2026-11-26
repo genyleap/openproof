@@ -145,7 +145,7 @@ test("native wallet connection uses native ownership and never issues a login gr
 test("delegated account authorization uses one native SQL snapshot and preserves scope constraints",()=>{
   const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const body=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeDelegatedAccountAsync("),
-    sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync("));
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::consumeSenderReplayAsync("));
   for (const required of ["t.state=0","t.expires_at_ms>$2","f.revoked_at_ms IS NULL",
     "f.sender_constraint_kind,f.sender_constraint_value",
     "c.status=0","a.status=0","i.status=0","o.state=0","i.organization_id=$3",
@@ -161,7 +161,7 @@ test("delegated account authorization uses one native SQL snapshot and preserves
 test("native delegated context is snapshot-consistent, bounded and preserves sender proof requirement",()=>{
   const source=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const start=source.indexOf("CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(");
-  const body=source.slice(start,source.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync(",start));
+  const body=source.slice(start,source.indexOf("CoroutinePostgresCanonicalFinalizer::consumeSenderReplayAsync(",start));
   assert.equal([...body.matchAll(/co_await lease.connection\(\).query\(/g)].length,1);
   assert.match(body,/LEFT JOIN LATERAL/);
   assert.match(body,/UNION ALL/);

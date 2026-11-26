@@ -4957,3 +4957,16 @@ sender constraint. The new context reader does not verify DPoP/mTLS proof:
 a caller must verify it before using a sender-constrained context.
 Protected OAuth gateway dispatch is deliberately unchanged until that
 verification boundary is native. No schema change.
+
+### Native sender proof replay boundary
+
+Shared DPoP and authenticated mTLS preparation retains signature, method,
+target, token binding, issuer origin and time checks before replay I/O.
+The new native verifier awaits only a callback owning the validated proof
+tuple, not request/credential references. The PostgreSQL consumer uses
+the existing global replay tables, atomic conflict handling, bounded
+64-row expired cleanup and an expiry bound; no schema change. Replayed
+or expired assertions fail closed. Timestamp overflow, control characters
+in replay keys and the exact mTLS expiry boundary are rejected by both
+native and legacy validation. The OIDC protected gateway still uses
+compatibility dispatch until the native verifier is wired end-to-end.

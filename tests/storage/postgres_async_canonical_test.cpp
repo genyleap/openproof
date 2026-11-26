@@ -1414,6 +1414,55 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_FALSE(read(native));
 }
 
+TEST(PostgresCanonicalCoroutineTest, SenderReplayConsumptionIsAtomicAcrossTenantsAndLegacy)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    using Kind=openproof::session::DelegatedSenderConstraintKind;
+    Seed seed;
+    const std::string thumbprint="replay-"+seed.suffix;
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    auto run=[&](asio::awaitable<fnd::Status> task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    for (const auto kind:{Kind::Dpop,Kind::Mtls}) {
+        io.restart();
+        auto first=asio::co_spawn(io,native.consumeSenderReplayAsync(kind,thumbprint,"concurrent",kNow+60s,kNow),asio::use_future);
+        auto second=asio::co_spawn(io,foreign.consumeSenderReplayAsync(kind,thumbprint,"concurrent",kNow+60s,kNow),asio::use_future);
+        io.run();
+        const auto a=first.get(),b=second.get();
+        ASSERT_NE(a.has_value(),b.has_value());
+        const auto& rejected=a?b:a;
+        EXPECT_EQ(rejected.error().code(),fnd::ErrorCode::AuthenticationFailed);
+        EXPECT_FALSE(run(native.consumeSenderReplayAsync(kind,thumbprint,"concurrent",kNow+60s,kNow)));
+        EXPECT_TRUE(run(native.consumeSenderReplayAsync(kind,thumbprint,"concurrent",kNow+120s,kNow+60s)));
+        EXPECT_FALSE(run(native.consumeSenderReplayAsync(kind,thumbprint,"expired",kNow,kNow)));
+        EXPECT_FALSE(run(native.consumeSenderReplayAsync(kind,thumbprint,std::string{"a\0b",3U},kNow+60s,kNow)));
+        EXPECT_FALSE(run(native.consumeSenderReplayAsync(kind,thumbprint,"long",kNow+13min,kNow)));
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.oauth_dpop_replays(jwk_thumbprint,jwt_id,expires_at_ms) VALUES($1,'legacy',1770000060000)",{thumbprint})));
+    EXPECT_FALSE(run(native.consumeSenderReplayAsync(Kind::Dpop,thumbprint,"legacy",kNow+60s,kNow)));
+    EXPECT_TRUE(run(native.consumeSenderReplayAsync(Kind::Dpop,thumbprint,"legacy",kNow+120s,kNow+60s)));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.oauth_mtls_forwarding_replays(certificate_thumbprint,nonce,expires_at_ms) VALUES($1,'legacy',1770000060000)",{thumbprint})));
+    EXPECT_FALSE(run(native.consumeSenderReplayAsync(Kind::Mtls,thumbprint,"legacy",kNow+60s,kNow)));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeConsentListAndRevokeAreTenantScopedAndBounded)
 {
     const auto dsn = disposableDsn();
