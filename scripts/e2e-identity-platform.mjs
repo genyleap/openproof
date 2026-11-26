@@ -1235,7 +1235,9 @@ async function main() {
       assert.equal(countCodes(), 9);
       await recover(fresh[0], 401);
       assert.equal(countCodes(), 9);
-      console.log("- native recovery issuance and legacy one-time redemption: IAL2, rotation, persistence and replay passed");
+      console.log("- native recovery issuance and " +
+        (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1" ? "native" : "legacy") +
+        " one-time redemption: IAL2, rotation, persistence and replay passed");
     }
     const adminConsole = await edgeRequest("/admin/console", { jar: ownerJar });
     expectStatus(adminConsole, 200);

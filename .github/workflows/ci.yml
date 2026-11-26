@@ -222,6 +222,9 @@ jobs:
           OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_ldap_e2e_ci
           OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
           OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_ldap_e2e_ci
           node scripts/e2e-identity-platform.mjs

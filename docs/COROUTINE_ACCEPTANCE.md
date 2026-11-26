@@ -4581,3 +4581,17 @@ are login-only and denied on the legacy synchronous and connection paths.
 Existing unbound provider outcomes retain their prior semantics. The
 disposable regression rebinds the alias between proof and finalization.
 Runtime activation remains pending; no public HTTP route changes.
+
+
+### Native local HTTP runtime pilot
+
+The opt-in local login route overlay connects the existing native HTTP
+login/verify adapter to the owner-bound local provider, bounded password
+worker, native authentication transactions, canonical finalization and
+atomic session replacement. A separate provider registry preserves legacy
+OAuth behavior without exposing synchronous local completion on the
+selected native routes. Shared LDAP/Web3 and independent session/account
+overlays retain their own flags. The disposable LDAP HTTP workload also
+enables local login and recovery redemption; ordinary baseline remains
+unchanged. Full executable build and real HTTP acceptance are required
+before changing the default. Production remains NOT_APPROVED.

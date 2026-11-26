@@ -1017,3 +1017,15 @@ restart; changing the file alone does not alter an already prepared trust
 store. With no private CA, OpenSSL's normal system trust defaults remain in
 use (system certificate-directory lookup is governed by OpenSSL). LDAP native
 routing remains explicitly experimental and default-off.
+
+
+### Native local login development pilot
+
+OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN=1 enables the native
+/auth/login and /auth/mfa/verify paths only. It requires enabled
+authentication and uses the configured password algorithm, credential
+encryption key/version, recovery pepper and tenant. One dedicated
+bounded KDF worker is allocated; the ordinary provider registry remains
+available for unmigrated OAuth operations. No other route is enabled by
+this switch. Unset or 0 retains the compatibility path. This is a
+development acceptance switch, not an approved production default.

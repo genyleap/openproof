@@ -55,6 +55,7 @@
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
 #include "../../src/oauth/http/coroutine_consent_http.hpp"
 #include "../../src/storage/postgres/coroutine_consent_store.hpp"
+#include "../../src/storage/postgres/coroutine_local_proof_verifier.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
@@ -1403,6 +1404,19 @@ addProtectedRoutes(gateway::Router& router,
             "Native protected gateway requires authentication without delegated OIDC."});
         return ExitCode::ConfigurationError;
     }
+    // Keep the local login pilot independent of LDAP and legacy OAuth.
+    const auto nativeLocalFlag = environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN");
+    if (nativeLocalFlag && *nativeLocalFlag != "0" && *nativeLocalFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeLocalEnabled = nativeLocalFlag && *nativeLocalFlag == "1";
+    if (nativeLocalEnabled && !platform.auth().enabled()) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native local login requires enabled authentication."});
+        return ExitCode::ConfigurationError;
+    }
     const auto nativeLdapFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP");
     if (nativeLdapFlag && *nativeLdapFlag != "0" && *nativeLdapFlag != "1") {
@@ -1694,7 +1708,7 @@ addProtectedRoutes(gateway::Router& router,
     std::optional<fnd::SecretString> nativeSessionSecret;
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
         || nativeAuthSessionEnabled || nativeFederatedStartEnabled
-        || nativeProtectedGatewayEnabled)
+        || nativeProtectedGatewayEnabled || nativeLocalEnabled)
         nativeSessionSecret.emplace(sessionSecret->clone());
     auto sessionKey = session::SessionKey::create(
         std::move(sessionSecret).value());
@@ -1823,6 +1837,29 @@ addProtectedRoutes(gateway::Router& router,
     if (!passwordSecret || !totpSecret || !recoverySecret || !auditSecret) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
+    }
+    std::unique_ptr<credentials::BoundedPasswordExecutor> nativeLocalPasswords;
+    std::optional<security::AeadKey> nativeLocalTotpKey;
+    std::optional<fnd::SecretString> nativeLocalRecoveryPepper;
+    if (nativeLocalEnabled) {
+        auto hasher = credentials::PasswordHasher::create(
+            passwordSecret->clone(), credentials::PasswordPolicy::recommended(),
+            std::string{platform.security().passwordHashAlgorithm()});
+        auto key = security::AeadKey::create(totpSecret->clone());
+        if (!hasher || !key) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
+            return ExitCode::ConfigurationError;
+        }
+        // One KDF worker in the initial runtime pilot; do not reserve
+        // memory for passwords on installations that leave it disabled.
+        auto worker = credentials::BoundedPasswordExecutor::create(std::move(hasher).value(), 1U);
+        if (!worker) {
+            reportStartupFailure(worker.error());
+            return ExitCode::ConfigurationError;
+        }
+        nativeLocalPasswords = std::move(worker).value();
+        nativeLocalTotpKey.emplace(std::move(key).value());
+        nativeLocalRecoveryPepper.emplace(recoverySecret->clone());
     }
     auto administrationPasswordHasher = credentials::PasswordHasher::create(
         passwordSecret->clone(), credentials::PasswordPolicy::recommended(),
@@ -2469,6 +2506,7 @@ addProtectedRoutes(gateway::Router& router,
     // OAuth, account, SAML and other compatibility handlers. LDAP's native
     // coordinator receives its own identical operator trust policy.
     auto nativeTrust = trust;
+    auto nativeLocalTrust = trust;
     auth::AuthenticationService authentication{
         providers, transactions, externalIdentities, clock, std::move(trust),
         std::chrono::minutes{5}, &identities,
@@ -2493,6 +2531,12 @@ addProtectedRoutes(gateway::Router& router,
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
+    // Destroy coordinator and registry before their verifier/store. The
+    // ordinary registry retains the synchronous provider for legacy OAuth.
+    std::unique_ptr<postgres::CoroutineLocalCredentialStore> nativeLocalStore;
+    std::unique_ptr<postgres::CoroutinePostgresLocalProofVerifier> nativeLocalVerifier;
+    std::unique_ptr<idp::ProviderRegistry> nativeLocalProviders;
+    std::unique_ptr<auth::AuthenticationService> nativeLocalAuthentication;
     std::unique_ptr<postgres::CoroutineSessionAuthenticator> nativeGatewayVerifier;
     std::unique_ptr<postgres::CoroutineAuthorizationDecisionSink> nativeGatewayAudit;
     std::unique_ptr<postgres::CoroutineConsentStore> nativeConsentStore;
@@ -2502,7 +2546,7 @@ addProtectedRoutes(gateway::Router& router,
 #endif
     if (nativeLdapEnabled || nativeAccountEnabled || nativeWeb3Enabled
         || nativeAuthSessionEnabled || nativeFederatedStartEnabled
-        || nativeProtectedGatewayEnabled) {
+        || nativeProtectedGatewayEnabled || nativeLocalEnabled) {
         nativeIo = std::make_unique<boost::asio::thread_pool>(2U);
         const auto executor = nativeIo->get_executor();
         const std::size_t nativeConnections =
@@ -2542,7 +2586,7 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
-            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
+            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled || nativeLocalEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2565,7 +2609,7 @@ addProtectedRoutes(gateway::Router& router,
             nativeRecoveryCodes.emplace(std::move(created).value());
         }
 #endif
-        if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {
+        if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled || nativeLocalEnabled) {
             nativeTransactions = std::make_unique<
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
@@ -2577,6 +2621,34 @@ addProtectedRoutes(gateway::Router& router,
                 identity::OrganizationId{
                     std::string{platform.auth().organizationId()}},
                 &identityProviderStore, nativeCanonical.get());
+        }
+        if (nativeLocalEnabled) {
+            nativeLocalStore = std::make_unique<postgres::CoroutineLocalCredentialStore>(
+                executor, platform.database().connectionString().clone(),
+                identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                providerId, nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+            nativeLocalVerifier = std::make_unique<postgres::CoroutinePostgresLocalProofVerifier>(
+                *nativeLocalStore, *nativeLocalPasswords, credentials::TotpPolicy::recommended(),
+                std::move(*nativeLocalTotpKey), platform.security().credentialEncryptionKeyVersion(),
+                std::move(*nativeLocalRecoveryPepper));
+            nativeLocalProviders = std::make_unique<idp::ProviderRegistry>();
+            auto status = nativeLocalProviders->registerProvider(
+                std::make_unique<local::CoroutineLocalAuthenticationProvider>(
+                    providerId, *nativeLocalVerifier, clock, std::chrono::minutes{5}));
+            if (!status) {
+                reportStartupFailure(status.error());
+                return ExitCode::ConfigurationError;
+            }
+            nativeLocalAuthentication = std::make_unique<auth::AuthenticationService>(
+                *nativeLocalProviders, *nativeTransactions, externalIdentities, clock,
+                std::move(nativeLocalTrust), std::chrono::minutes{5}, &identities,
+                identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                &identityProviderStore, nativeCanonical.get());
+            if (!nativeLocalAuthentication->nativeProviderAuthenticationEnabled(providerId)) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native local login capability is unavailable."});
+                return ExitCode::ConfigurationError;
+            }
         }
     }
 
@@ -2698,6 +2770,10 @@ addProtectedRoutes(gateway::Router& router,
 #endif
         gatewayHttp::CoroutineHttpHandler* nativeHandler = &nativeEnterprise;
         std::vector<std::string> nativePaths;
+        if (nativeLocalEnabled) {
+            nativePaths.emplace_back("/auth/login");
+            nativePaths.emplace_back("/auth/mfa/verify");
+        }
         // A Web3-only opt-in must never activate an unconfigured LDAP
         // directory just because both share native canonical SQL storage.
         if (nativeLdapEnabled) {
@@ -3005,6 +3081,23 @@ addProtectedRoutes(gateway::Router& router,
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             nativeAuthentication ? *nativeAuthentication : authentication,
             sessions, limiter.value(), fallback, nativeSessions.get()};
+        // The native local handler is a leaf of the native-only chain.
+        // Keep the synchronous compatibility chain unchanged for other routes.
+        if (nativeLocalEnabled) {
+            authHttp::AuthenticationHttpApi nativeLocalApi{
+                *nativeLocalAuthentication, sessions, recoveryCodes.value(), *accounts.value(),
+                limiter.value(), providerId, fallback, nativeSessions.get()};
+            authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
+                nativeAuthentication ? *nativeAuthentication : authentication,
+                sessions, limiter.value(), nativeLocalApi, nativeSessions.get()};
+            if (nativeWeb3Enabled) {
+                authHttp::Web3AuthenticationHttpApi localWeb3Api{
+                    *nativeAuthentication, providers, sessions, limiter.value(),
+                    localEnterpriseApi, nullptr, nativeSessions.get()};
+                return runWithScim(enterpriseApi, localWeb3Api);
+            }
+            return runWithScim(enterpriseApi, localEnterpriseApi);
+        }
         if (nativeWeb3Enabled) {
             // Compose native Web3 ABOVE the native LDAP adapter. Its guarded
             // coroutine fallback delegates LDAP without touching the legacy

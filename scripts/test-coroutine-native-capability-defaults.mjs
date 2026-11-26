@@ -110,10 +110,10 @@ test("native account-session runtime remains independent of LDAP and profile rea
   const sessionRepo = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const sessionIssuer = app.indexOf("nativeSessions = std::make_unique<", sessionRepo);
   const canonicalGate = app.indexOf(
-    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {", sessionIssuer);
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled\n            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled || nativeLocalEnabled) {", sessionIssuer);
   const canonical = app.indexOf("nativeCanonical = std::make_unique<", canonicalGate);
   const authGate = app.indexOf(
-    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled) {", canonical);
+    "if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled || nativeLocalEnabled) {", canonical);
   const transactions = app.indexOf("nativeTransactions = std::make_unique<", authGate);
   const nativeAuthentication = app.indexOf(
     "nativeAuthentication = std::make_unique<auth::AuthenticationService>", transactions);
@@ -123,7 +123,7 @@ test("native account-session runtime remains independent of LDAP and profile rea
   assert.ok(canonical < authGate && authGate < transactions
     && transactions < nativeAuthentication);
   assert.match(app, /if \(platform\.account\(\)\.enabled\(\) && nativeAccountEnabled && nativeSessions\)/);
-  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\s*\|\| nativeProtectedGatewayEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app, /if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled[\s\S]*?\|\| nativeAuthSessionEnabled \|\| nativeFederatedStartEnabled\s*\|\| nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)[\s\S]*?nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(app, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
   assert.match(app, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
@@ -167,4 +167,24 @@ test("native protected proxy is opt-in, first-party only and confined to its nam
   assert.match(app, /co_await sink->recordAsync/);
   assert.match(app, /runListener\(platform, nativeGateway, logger\)/);
   assert.match(gatewayTests, /TEST\(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermittedRequests\)/);
+});
+
+test("native local login is a separate opt-in with strict routes and owner-bound proof verification", () => {
+  const app = read("apps/opp/main.cpp");
+  const cmake = read("apps/opp/CMakeLists.txt");
+  assert.match(app, /environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN"\)/);
+  assert.match(app, /nativeLocalFlag && \*nativeLocalFlag != "0" && \*nativeLocalFlag != "1"/);
+  assert.match(app, /const bool nativeLocalEnabled = nativeLocalFlag && \*nativeLocalFlag == "1"/);
+  assert.match(app, /nativeLocalEnabled && !platform\.auth\(\)\.enabled\(\)/);
+  const flag = app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN");
+  assert.ok(flag < app.indexOf("postgres::Migrator migrator{*pool.value()}", flag));
+  assert.match(app, /BoundedPasswordExecutor::create\(std::move\(hasher\)\.value\(\), 1U\)/);
+  assert.match(app, /nativeLocalProviders->registerProvider\(\s*std::make_unique<local::CoroutineLocalAuthenticationProvider>/);
+  assert.match(app, /\*nativeLocalProviders, \*nativeTransactions, externalIdentities, clock/);
+  assert.match(app, /nativeLocalAuthentication->nativeProviderAuthenticationEnabled\(providerId\)/);
+  assert.match(app, /if \(nativeLocalEnabled\) \{\s*nativePaths\.emplace_back\("\/auth\/login"\);\s*nativePaths\.emplace_back\("\/auth\/mfa\/verify"\);\s*\}/);
+  assert.match(app, /authHttp::AuthenticationHttpApi nativeLocalApi\{\s*\*nativeLocalAuthentication, sessions, recoveryCodes\.value\(\), \*accounts\.value\(\),\s*limiter\.value\(\), providerId, fallback, nativeSessions\.get\(\)\}/);
+  assert.match(app, /runWithScim\(enterpriseApi, localEnterpriseApi\)/);
+  assert.match(app, /runWithScim\(enterpriseApi, localWeb3Api\)/);
+  assert.match(cmake, /openproof_postgres_async_local_credentials/);
 });

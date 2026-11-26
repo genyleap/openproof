@@ -25,12 +25,12 @@ test("auth session cutover is independently opt-in and rejected before DB migrat
 });
 
 test("session-only runtime builds async SQL session service without identity canonical/LDAP",()=>{
-  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace/);
-  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*\{/);
+  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*nativeSessionSecret\.emplace/);
+  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*\{/);
   const start=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
   const repo=app.indexOf("nativeSessionRepository = std::make_unique<",start);
   const sessions=app.indexOf("nativeSessions = std::make_unique<",repo);
-  const canonicalGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled)",sessions);
+  const canonicalGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled",sessions);
   const canonical=app.indexOf("nativeCanonical = std::make_unique<",canonicalGate);
   assert.ok(start>=0 && repo>start && sessions>repo && canonicalGate>sessions && canonical>canonicalGate);
   assert.match(cmake,/openproof_postgres_async_listener/);

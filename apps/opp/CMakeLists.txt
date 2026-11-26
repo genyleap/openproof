@@ -75,6 +75,7 @@ target_link_libraries(opp
         openproof_postgres_async_auth_repository
         openproof_postgres_async_canonical
         openproof_postgres_async_consent
+        openproof_postgres_async_local_credentials
         openproof_postgres_async_repository
         openproof_postgres_async_listener
         openproof_operations_http
