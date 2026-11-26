@@ -1397,8 +1397,9 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeProtectedGatewayEnabled =
-        nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "1";
+    const bool nativeProtectedGatewayEnabled = nativeProtectedGatewayFlag
+        ? *nativeProtectedGatewayFlag == "1"
+        : platform.auth().enabled() && !platform.oidc().enabled();
     if (nativeProtectedGatewayEnabled
         && (!platform.auth().enabled() || platform.oidc().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,

@@ -5,6 +5,11 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pgbin="${OPENPROOF_TEST_PGBIN:-/usr/lib/postgresql/16/bin}"
+build_dir="${1:-$repo/cmake-build-gcc-release}"
+if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
+    echo "Expected existing CMake build directory: $build_dir" >&2
+    exit 1
+fi
 # Fail before allocating any test directory if a restricted root runner
 # cannot switch to postgres. Never attempt to run postgres as root.
 if [[ "$(id -u)" == 0 ]] &&
@@ -47,6 +52,7 @@ for migration in \
     0003_identity_provider.sql \
     0005_account_lifecycle.sql \
     0006_resource_consent.sql \
+    0010_oauth_sender_constraints.sql \
     0017_session_client_metadata.sql \
     0018_profile_avatar_sources.sql \
     0021_verification_reservation_generation.sql; do
@@ -57,7 +63,7 @@ done
 
 export OPENPROOF_TEST_POSTGRES_DOMAIN="host=$work port=$port user=postgres dbname=openproof_coroutine_ci"
 export OPENPROOF_TEST_POSTGRES_DOMAIN_ACK=YES_EXCLUSIVE_DISPOSABLE_DATABASE
-ctest --test-dir "$repo/cmake-build-gcc-release" \
+ctest --test-dir "$build_dir" \
     -R '^NativePgCanonical\.' --output-on-failure -V -j 1 \
     --output-junit "$work/test-results.xml"
 # A skipped SQL test must never be mistaken for acceptance of the real DB

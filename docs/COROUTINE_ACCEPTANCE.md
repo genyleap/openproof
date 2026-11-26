@@ -4920,3 +4920,20 @@ dispatch refusal. Delegated account SQL was checked directly against an
 isolated PostgreSQL 16 with the complete migration set; C++ integration
 still fails on a previous head and needs diagnosis before OAuth
 protected cutover. No schema changes.
+
+### First-party protected gateway default and SQL fixture repair
+
+The canonical PostgreSQL runner omitted the existing 0010 sender
+constraint migration, although delegated account authorization queries its
+columns. The fixture now applies 0010 and can target an explicit existing
+CMake build directory; no historical migration file changed. An actual
+PostgreSQL 16 fixture with the runner's migration list must return the
+expected delegated authorization row and deny revoked/expired/constrained,
+missing-scope and foreign-tenant credentials.
+
+The existing native first-party protected proxy defaults on for
+authenticated non-OIDC configurations. Explicit disable remains available
+during executable acceptance. Namespace, configured protection, scope,
+audience, policy and denied-decision audit checks remain unchanged.
+Delegated OAuth and proof-of-possession proxy paths are not cut over.
+The source gate remains incomplete; real compiled acceptance is required.
