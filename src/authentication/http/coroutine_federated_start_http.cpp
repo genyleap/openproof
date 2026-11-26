@@ -226,6 +226,8 @@ bool CoroutineFederatedStartAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
     if (isStart(request)) return true;
+    if (isHandoff(request) && request.method()==gateway::HttpMethod::Get)
+        return static_cast<bool>(m_authenticate);
     if (isConnectionStart(request) || isHandoff(request)) {
         return static_cast<bool>(m_authenticate)
             && (request.method()==gateway::HttpMethod::Get
@@ -266,6 +268,8 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
             co_return denied(foundation::Error{foundation::ErrorCode::RateLimited},request);
         if (request.method()==gateway::HttpMethod::Post)
             co_return co_await issueHandoff(std::move(request));
+        if (request.header("authorization").has_value())
+            co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
         auto params=query(request);
         if (!params)
             co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);

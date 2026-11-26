@@ -1626,8 +1626,8 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeCatalogEnabled =
         nativeCatalogFlag && *nativeCatalogFlag == "1";
-    // Experimental native first leg of federated login; no legacy provider
-    // fallback is permitted on the async route.
+    // Authenticated runtimes require native federation; the historical
+    // opt-in flags are accepted only when they do not restore blocking I/O.
     const auto nativeFederatedStartFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START");
     if (nativeFederatedStartFlag && *nativeFederatedStartFlag != "0"
@@ -1637,10 +1637,14 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeFederatedStartEnabled =
-        nativeFederatedStartFlag && *nativeFederatedStartFlag == "1";
-    // The callback has a separate experimental gate: enabling only the
-    // first leg must not change compatibility callbacks or SAML/OAuth1.
+    if (platform.auth().enabled() && nativeFederatedStartFlag && *nativeFederatedStartFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native federated start cannot be disabled in an authenticated runtime."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeFederatedStartEnabled = platform.auth().enabled()
+        || (nativeFederatedStartFlag && *nativeFederatedStartFlag == "1");
+    // Callback and start must be available as a pair.
     const auto nativeFederatedCallbackFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK");
     if (nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag != "0"
@@ -1650,13 +1654,16 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeFederatedCallbackEnabled =
-        nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag == "1";
-    // Both HTTP legs must use the SAME native transaction repository.
-    // A native start followed by a legacy callback cannot redeem the
-    // persisted challenge, while a native callback cannot consume a
-    // transaction created by the legacy synchronous store. Refuse a
-    // split-brain deployment before the listener and any migrations start.
+    if (platform.auth().enabled() && nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native federated callback cannot be disabled in an authenticated runtime."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeFederatedCallbackEnabled = platform.auth().enabled()
+        || (nativeFederatedCallbackFlag && *nativeFederatedCallbackFlag == "1");
+    // Keep both native legs paired. The legacy handoff issuer and native
+    // redeemer share the durable transaction schema; delegated Bearer
+    // authorization is not part of this transport cutover.
     if (nativeFederatedStartEnabled != nativeFederatedCallbackEnabled) {
         reportStartupFailure(fnd::Error{
             fnd::ErrorCode::FailedPrecondition,

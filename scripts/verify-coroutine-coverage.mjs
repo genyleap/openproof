@@ -128,7 +128,7 @@ const checked = segments.map(([name, relative]) => {
   ].includes(relative)){
     const target = relative.endsWith("/web3.cpp") ? "rpcAsync" : "httpsRequestAsync";
     const legacyBridge = /asio::co_spawn\s*\(\s*io\s*,\s*(?:httpsRequestAsync|rpcAsync)\s*\(/;
-    if(!legacyBridge.test(source))
+    if(relative!=="src/providers/github/github.cpp" && !legacyBridge.test(source))
       issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
         expression:"co_spawn(io, "+target+"(...))"});
     // Even with native transport, this legacy facade waits synchronously
@@ -150,6 +150,39 @@ const checked = segments.map(([name, relative]) => {
         expression:"RAII volatile secret scrub on normal and exceptional exits"});
   }
   if(relative==="src/providers/github/github.cpp"){
+    // The retired synchronous GitHub SPI must reject unconditionally.
+    // Require the actual native exchanges AND mandatory runtime routing,
+    // not merely absence of the io.run spelling.
+    const sync = executable.slice(
+      executable.indexOf("GitHubAuthenticationProvider::completeAuthentication("),
+      executable.indexOf("GitHubAuthenticationProvider::beginAuthenticationAsync("));
+    const complete = executable.slice(executable.indexOf("GitHubAuthenticationProvider::completeAuthenticationAsync("));
+    const completeWithLiterals = source.slice(source.indexOf("GitHubAuthenticationProvider::completeAuthenticationAsync("));
+    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const callback = fs.readFileSync(path.join(root,
+      "src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+    const startup = app.slice(app.indexOf("const auto nativeFederatedStartFlag"),
+      app.indexOf("if (nativeCatalogEnabled && !platform.auth().enabled())"));
+    if (!/return\s+foundation::fail\(foundation::ErrorCode::Unavailable,/.test(sync)
+        || /\bhttpsRequest\s*\(/.test(executable)
+        || /\b(?:io_context|use_future|completion\.get)\b/.test(executable)
+        || (complete.match(/co_await\s+httpsRequestAsync\s*\(/g)||[]).length!==3
+        || !completeWithLiterals.includes('"/login/oauth/access_token"')
+        || !completeWithLiterals.includes('"/user"')
+        || !completeWithLiterals.includes('"/user/emails?per_page=100"'))
+      issues.push({line:0,kind:"GitHub completion still has a synchronous path or missing native exchange",
+        expression:"reject sync SPI; await token, user and email exchanges"});
+    for (const leg of ["Start","Callback"]) {
+      if (!startup.includes("const bool nativeFederated"+leg+"Enabled = platform.auth().enabled()")
+          || !startup.includes("platform.auth().enabled() && nativeFederated"+leg+'Flag && *nativeFederated'+leg+'Flag == "0"')
+          || !app.includes('nativePaths.emplace_back("/auth/federated/'+leg.toLowerCase()+'")'))
+        issues.push({line:0,kind:"GitHub native federation runtime is optional or lacks strict route",
+          expression:leg});
+    }
+    if (!callback.includes("co_await m_authentication->completeAsync(")
+        || !callback.includes("co_await m_authentication->completeConnectionAsync("))
+      issues.push({line:0,kind:"native federated callback cannot complete both login and connection",
+        expression:"completeAsync and completeConnectionAsync"});
     // All four native OAuth providers share one awaitable HTTPS transport.
     // Completing a verified and framed HTTP response must not wait for the
     // peer's optional TLS close_notify before returning the result.

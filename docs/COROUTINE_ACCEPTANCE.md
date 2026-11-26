@@ -4772,3 +4772,17 @@ GET and mixed OAuth/SAML proofs are rejected. Tests cover wire dispatch,
 provider mismatch, replay and bounded worker architecture. Full signed
 SAML interoperability, worker cancellation/saturation and exact-head
 compiled acceptance remain required before mandatory federation cutover.
+
+### GitHub blocking exchange retirement
+
+GitHub's duplicated synchronous remote exchange and private io_context
+bridge are removed. The common synchronous completion SPI rejects with
+Unavailable before any remote work. All three remote exchanges now exist
+only in completeAuthenticationAsync. Authenticated runtime mandates both
+native federation legs and strictly overlays the callback route; the
+native callback handles login and connection proof completion. Legacy
+delegated Bearer authorization may still issue a handoff or construct a
+local GitHub redirect challenge, but cannot complete remote proof on a
+blocking worker. The updated source gate checks actual native exchanges
+and runtime wiring as well as absence of the retired bridge. This is
+source-level progress; compiled/runtime verification remains outstanding.
