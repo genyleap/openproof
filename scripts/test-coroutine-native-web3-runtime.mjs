@@ -77,3 +77,22 @@ test("native Web3 entry awaits verification and session issuance but cannot rede
   assert.match(complete,/if \(authenticationHandoff\)/);
   assert.doesNotMatch(complete,/m_sessions->issue\(/);
 });
+
+test("native wallet handoff owns the two one-time tickets and revalidates ownership without mutation",()=>{
+  const service=read("src/authentication/service.cpp");
+  const begin=service.indexOf("AuthenticationService::issueBrowserAuthenticationHandoffAsync(");
+  assert.ok(begin>=0);
+  const native=service.slice(begin);
+  assert.match(native,/publisherSecretValue/);
+  assert.match(native,/redeemSecretValue/);
+  assert.equal([...native.matchAll(/co_await nativeTransactions->beginAsync\(/g)].length,2);
+  assert.equal([...native.matchAll(/co_await nativeTransactions->consumeAsync\(/g)].length,2);
+  assert.equal([...native.matchAll(/co_await m_asyncCanonical->authorizeHandoffOwnerAsync\(/g)].length,2);
+  assert.doesNotMatch(native,/m_transactions\.(?:begin|consume)\(|m_identities\.ownerOf\(|requireActiveIdentity\(/);
+  const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
+  const owner=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::finishConnectionAsync("));
+  assert.match(owner,/i.id=\$1 AND e.provider=\$2 AND e.external_subject=\$3/);
+  assert.match(owner,/i.organization_id=\$4 AND i.status=0 AND o.state=0/);
+  assert.doesNotMatch(owner,/\b(?:UPDATE|INSERT|DELETE)\b/);
+});

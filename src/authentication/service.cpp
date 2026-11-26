@@ -1851,4 +1851,266 @@ AuthenticationService::redeemBrowserAuthenticationHandoff(
     return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
 }
 
+boost::asio::awaitable<foundation::Result<BrowserAuthenticationHandoff>>
+AuthenticationService::issueBrowserAuthenticationHandoffAsync(
+    provider::ProviderId providerId,
+    foundation::CorrelationId correlation)
+{
+    if (providerId.empty() || correlation.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The browser authentication handoff is invalid.");
+    }
+    auto* implementation = m_providers.find(providerId);
+    if (implementation == nullptr
+        || implementation->interactionModel() != provider::InteractionModel::ChallengeResponse) {
+        co_return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That authentication provider is not available.");
+    }
+
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    if (!nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto publisherIdValue = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto publisherSecretValue = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    auto resultIdValue = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto redeemSecretValue = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    if (!publisherIdValue || !publisherSecretValue || !resultIdValue || !redeemSecretValue) {
+        if (!publisherIdValue) co_return foundation::fail(publisherIdValue.error());
+        if (!publisherSecretValue) co_return foundation::fail(publisherSecretValue.error());
+        if (!resultIdValue) co_return foundation::fail(resultIdValue.error());
+        co_return foundation::fail(redeemSecretValue.error());
+    }
+
+    provider::TransactionId publisherId{publisherIdValue.value()};
+    provider::TransactionId resultId{resultIdValue.value()};
+    foundation::SecretString publisherSecret{std::move(publisherSecretValue).value()};
+    foundation::SecretString redeemSecret{std::move(redeemSecretValue).value()};
+    auto redeemDigest = security::sha256(redeemSecret.expose());
+    if (!redeemDigest) co_return foundation::fail(redeemDigest.error());
+
+    const foundation::Instant now = m_clock.now();
+    const foundation::Duration lifetime =
+        std::min(kBrowserHandoffLifetime, m_maximumTransactionLifetime);
+    auto transaction = provider::AuthenticationTransaction::create(
+        publisherId, provider::ProviderId{std::string{kAuthenticationHandoffProvider}},
+        provider::InteractionModel::Redirect, publisherSecret.clone(),
+        provider::BindingDigest{}, std::move(correlation), now, lifetime);
+    if (!transaction) co_return foundation::fail(transaction.error());
+    transaction->setMetadata(std::string{kHandoffProviderMetadata},
+                             std::string{providerId.value()});
+    transaction->setMetadata(std::string{kAuthenticationHandoffResultIdMetadata},
+                             std::string{resultId.value()});
+    transaction->setMetadata(std::string{kAuthenticationHandoffRedeemDigestMetadata},
+                             digestHex(redeemDigest.value()));
+    auto recorded = co_await nativeTransactions->beginAsync(std::move(transaction).value());
+    if (!recorded) co_return foundation::fail(recorded.error());
+
+    co_return BrowserAuthenticationHandoff{
+        foundation::SecretString{std::string{publisherId.value()} + "."
+                                 + publisherSecret.expose()},
+        foundation::SecretString{std::string{resultId.value()} + "."
+                                 + redeemSecret.expose()},
+        now + lifetime};
+}
+
+boost::asio::awaitable<foundation::Status> AuthenticationService::publishBrowserAuthenticationHandoffAsync(
+    foundation::SecretString publisherTicket,
+    VerifiedAuthentication authentication)
+{
+    const std::string_view presented = publisherTicket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: malformed ticket."));
+    }
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) co_return foundation::fail(consumed.error());
+    if (consumed->provider().value() != kAuthenticationHandoffProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: purpose mismatch."));
+    }
+
+    const auto providerMetadata = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto resultIdMetadata =
+        consumed->metadata().find(kAuthenticationHandoffResultIdMetadata);
+    const auto digestMetadata =
+        consumed->metadata().find(kAuthenticationHandoffRedeemDigestMetadata);
+    if (providerMetadata == consumed->metadata().end()
+        || resultIdMetadata == consumed->metadata().end()
+        || digestMetadata == consumed->metadata().end()
+        || providerMetadata->second.empty() || resultIdMetadata->second.empty()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: state is incomplete."));
+    }
+    if (authentication.outcome().provider().value() != providerMetadata->second) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: provider mismatch."));
+    }
+    auto redeemDigest = parseDigestHex(digestMetadata->second);
+    if (!redeemDigest) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: invalid redeem digest."));
+    }
+
+    if (authentication.outcome().requiredCanonicalOwner()
+        && *authentication.outcome().requiredCanonicalOwner()!=authentication.identity().value())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    auto owner=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(
+        authentication.identity(),identity::core::ExternalIdentityRef{
+            authentication.outcome().provider(),authentication.outcome().subject()});
+    if (!owner) co_return foundation::fail(owner.error());
+    const foundation::Instant now = m_clock.now();
+    if (consumed->expiresAt() <= now) {
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "This authentication request has expired.");
+    }
+    provider::AttributeMap metadata;
+    metadata.emplace(std::string{kAuthenticationHandoffIdentityMetadata},
+                     std::string{authentication.identity().value()});
+    metadata.emplace(std::string{kHandoffProviderMetadata},
+                     std::string{authentication.outcome().provider().value()});
+    metadata.emplace(std::string{kAuthenticationHandoffSubjectMetadata},
+                     std::string{authentication.outcome().subject().value()});
+    metadata.emplace(std::string{kAuthenticationHandoffAssuranceMetadata},
+                     std::string{provider::assuranceLevelName(
+                         authentication.outcome().claimedAssurance())});
+    metadata.emplace(std::string{kAuthenticationHandoffFactorsMetadata},
+                     std::to_string(static_cast<unsigned int>(
+                         static_cast<std::uint8_t>(
+                             authentication.outcome().strength().factors()))));
+    metadata.emplace(std::string{kAuthenticationHandoffPhishingMetadata},
+                     authentication.outcome().strength().isPhishingResistant()
+                         ? "1" : "0");
+    metadata.emplace(std::string{kAuthenticationHandoffVerifiedAtMetadata},
+                     std::to_string(authentication.outcome().verifiedAt()
+                                        .time_since_epoch().count()));
+
+    auto result = provider::AuthenticationTransaction::restore(
+        provider::TransactionId{resultIdMetadata->second},
+        provider::ProviderId{std::string{kAuthenticationHandoffResultProvider}},
+        provider::InteractionModel::Redirect, *redeemDigest,
+        provider::BindingDigest{}, consumed->correlation(),
+        provider::TransactionState::Pending, now, consumed->expiresAt(),
+        std::move(metadata));
+    if (!result) co_return foundation::fail(result.error());
+    co_return co_await nativeTransactions->beginAsync(std::move(result).value());
+}
+
+boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+AuthenticationService::redeemBrowserAuthenticationHandoffAsync(
+    foundation::SecretString redeemTicket)
+{
+    const std::string_view presented = redeemTicket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: malformed ticket."));
+    }
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) co_return foundation::fail(consumed.error());
+    if (consumed->provider().value() != kAuthenticationHandoffResultProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: purpose mismatch."));
+    }
+
+    const auto identityMetadata =
+        consumed->metadata().find(kAuthenticationHandoffIdentityMetadata);
+    const auto providerMetadata = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto subjectMetadata =
+        consumed->metadata().find(kAuthenticationHandoffSubjectMetadata);
+    const auto assuranceMetadata =
+        consumed->metadata().find(kAuthenticationHandoffAssuranceMetadata);
+    const auto factorsMetadata =
+        consumed->metadata().find(kAuthenticationHandoffFactorsMetadata);
+    const auto phishingMetadata =
+        consumed->metadata().find(kAuthenticationHandoffPhishingMetadata);
+    const auto verifiedAtMetadata =
+        consumed->metadata().find(kAuthenticationHandoffVerifiedAtMetadata);
+    if (identityMetadata == consumed->metadata().end()
+        || providerMetadata == consumed->metadata().end()
+        || subjectMetadata == consumed->metadata().end()
+        || assuranceMetadata == consumed->metadata().end()
+        || factorsMetadata == consumed->metadata().end()
+        || phishingMetadata == consumed->metadata().end()
+        || verifiedAtMetadata == consumed->metadata().end()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: state is incomplete."));
+    }
+
+    const auto assurance = parseAssurance(assuranceMetadata->second);
+    unsigned int factorsValue{};
+    const auto factorsParsed = std::from_chars(
+        factorsMetadata->second.data(),
+        factorsMetadata->second.data() + factorsMetadata->second.size(),
+        factorsValue, 10);
+    std::int64_t verifiedAtValue{};
+    const auto verifiedAtParsed = std::from_chars(
+        verifiedAtMetadata->second.data(),
+        verifiedAtMetadata->second.data() + verifiedAtMetadata->second.size(),
+        verifiedAtValue, 10);
+    if (!assurance
+        || factorsParsed.ec != std::errc{}
+        || factorsParsed.ptr
+            != factorsMetadata->second.data() + factorsMetadata->second.size()
+        || factorsValue > 7U
+        || (phishingMetadata->second != "0" && phishingMetadata->second != "1")
+        || verifiedAtParsed.ec != std::errc{}
+        || verifiedAtParsed.ptr
+            != verifiedAtMetadata->second.data() + verifiedAtMetadata->second.size()
+        || verifiedAtValue < 0) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: result is invalid."));
+    }
+
+    provider::ProviderId providerId{providerMetadata->second};
+    auto* implementation = m_providers.find(providerId);
+    const auto maximum = implementation == nullptr
+        ? std::optional<provider::AssuranceLevel>{}
+        : effectiveMaximum(*implementation, providerId);
+    if (!maximum || !provider::meetsAssurance(*maximum, *assurance)) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: provider trust changed."));
+    }
+
+    identity::core::IdentityId identity{identityMetadata->second};
+    if (!nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto owner=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(identity,
+        identity::core::ExternalIdentityRef{providerId,provider::ExternalSubject{subjectMetadata->second}});
+    if (!owner) co_return foundation::fail(owner.error());
+
+    provider::VerifiedClaims claims;
+    provider::ProviderEvidence evidence;
+    auto outcome = provider::AuthenticationOutcome::create(
+        std::move(providerId),
+        provider::ExternalSubject{subjectMetadata->second},
+        std::move(claims), *assurance,
+        provider::AuthenticationStrength{
+            static_cast<provider::AuthenticationFactor>(
+                static_cast<std::uint8_t>(factorsValue)),
+            phishingMetadata->second == "1"},
+        std::move(evidence),
+        foundation::Instant{foundation::Duration{verifiedAtValue}},std::string{identity.value()});
+    if (!outcome) co_return foundation::fail(outcome.error());
+    co_return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
+}
+
 }

@@ -118,6 +118,10 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    authorizeHandoffOwnerAsync(identity::core::IdentityId owner,
+        identity::core::ExternalIdentityRef external) override;
+
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::core::ExternalIdentityRef>>
     finishConnectionAsync(

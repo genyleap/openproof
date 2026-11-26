@@ -786,6 +786,35 @@ CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync(
+    core::IdentityId owner,core::ExternalIdentityRef external)
+{
+    if (owner.empty() || owner.value().size()>200U
+        || external.providerId().empty() || external.providerId().value().size()>128U
+        || external.subject().empty() || external.subject().value().size()>1000U)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        Params params{std::string{owner.value()},std::string{external.providerId().value()},
+            std::string{external.subject().value()},std::string{m_impl->organization.value()}};
+        const auto rows=co_await lease.connection().query(
+            "SELECT i.id FROM openproof.external_identities e "
+            "JOIN openproof.identities i ON i.id=e.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND e.provider=$2 AND e.external_subject=$3 "
+            "AND i.organization_id=$4 AND i.status=0 AND o.state=0",
+            std::move(params),remaining(deadline));
+        if (rows.rows.size()!=1U || rows.rows.front().size()!=1U
+            || required(rows.rows.front().front())!=owner.value())
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
 asio::awaitable<foundation::Result<core::ExternalIdentityRef>>
 CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
     const idp::AuthenticationOutcome& outcome,
