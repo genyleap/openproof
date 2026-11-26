@@ -56,6 +56,7 @@
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
+#include "../../src/authentication/http/coroutine_admin_read_http.hpp"
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
 #include "../../src/authentication/http/coroutine_recovery_code_http.hpp"
 #include "../../src/storage/postgres/coroutine_recovery_code_repository.hpp"
@@ -1511,6 +1512,19 @@ addProtectedRoutes(gateway::Router& router,
     }
     const bool nativeAuthSessionEnabled =
         nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    const auto nativeAdminReadFlag =
+        environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS");
+    if (nativeAdminReadFlag && *nativeAdminReadFlag != "0" && *nativeAdminReadFlag != "1") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+            "OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS must be 0 or 1."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAdminReadEnabled = nativeAdminReadFlag && *nativeAdminReadFlag == "1";
+    if (nativeAdminReadEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native administration reads require native authentication sessions and authentication API."});
+        return ExitCode::ConfigurationError;
+    }
     // Recovery-code issuance is separately opted in and uses only native
     // session authentication and tenant-scoped canonical eligibility reads.
     const auto nativeRecoveryFlag =
@@ -2499,7 +2513,7 @@ addProtectedRoutes(gateway::Router& router,
                 std::move(*nativeSessionSecret), sessionPolicy);
         if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled
             || nativeAccountProfileEnabled || nativeAccountConnectionsEnabled
-            || nativeAccountTotpStatusEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
+            || nativeAccountTotpStatusEnabled || nativeAdminReadEnabled || nativeRecoveryEnabled || nativeProtectedGatewayEnabled) {
             nativeCanonical = std::make_unique<
                 postgres::CoroutinePostgresCanonicalFinalizer>(
                     executor, platform.database().connectionString().clone(),
@@ -2648,6 +2662,7 @@ addProtectedRoutes(gateway::Router& router,
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
+        std::unique_ptr<adminHttp::CoroutineAdministrationReadAdapter> asyncAdminRead;
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
         std::unique_ptr<authHttp::CoroutineRecoveryCodeHttpAdapter> asyncRecovery;
 #endif
@@ -2859,6 +2874,25 @@ addProtectedRoutes(gateway::Router& router,
         }
         if (nativeAccountTotpStatusEnabled) {
             nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+        }
+        if (nativeAdminReadEnabled) {
+            if (!nativeSessions || !nativeCanonical) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native administration reader is unavailable."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* service = nativeSessions.get();
+            auto* canonical = nativeCanonical.get();
+            asyncAdminRead = std::make_unique<adminHttp::CoroutineAdministrationReadAdapter>(
+                *nativeHandler, limiter.value(),
+                [service](fnd::SecretString bearer) {
+                    return service->authenticate(std::move(bearer));
+                },
+                [canonical](identity::IdentityId actor) {
+                    return canonical->readMembersAsync(std::move(actor));
+                });
+            nativeHandler = asyncAdminRead.get();
+            nativeMethods.emplace_back("/admin/local-members", gateway::HttpMethod::Get);
         }
         if (nativeRecoveryEnabled) {
             nativeMethods.emplace_back("/auth/recovery-codes", gateway::HttpMethod::Post);

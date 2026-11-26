@@ -222,7 +222,7 @@ target_link_libraries(openproof_postgres_async_canonical PUBLIC
     openproof_postgres_async_io openproof_authentication
     openproof_identity_core openproof_identity_provider
     openproof_identity_profile openproof_organization openproof_policy openproof_session
-    openproof_audit openproof_security
+    openproof_administration openproof_audit openproof_security
     openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

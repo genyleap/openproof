@@ -945,6 +945,19 @@ slice. The flag is experimental and does not imply full migration acceptance;
 OAuth delegated access, other paths, and legacy synchronous transport
 consumers remain subject to the global release gate.
 
+### Experimental native owner-only member listing
+
+`OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS=1` enables only
+`GET /admin/local-members`; default is disabled. Requires the authentication
+API and native authentication sessions. A single asynchronous tenant-scoped
+SQL snapshot verifies active owner membership before enumerating members.
+The read preserves identity status, membership state and sorted roles; it
+never selects credential material. Maximum 256 members and 16 roles per
+member; oversized or malformed results fail closed with 503 rather than
+silently truncating. All administrative mutations remain on compatibility
+routes. This bounded experimental projection requires full acceptance before
+default activation.
+
 ### Experimental native recovery-code issuance
 
 `OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` enables only

@@ -14,6 +14,20 @@ import openproof.organization;
 
 export namespace openproof::administration {
 
+/** Read-only tenant membership projection. No credential material. */
+struct MemberSummary final {
+    identity::core::IdentityId identity;
+    identity::core::IdentityStatus identityStatus;
+    organization::MembershipState membershipState;
+    std::vector<organization::Role> roles;
+};
+
+/** The repository attests the owner whose authorization was checked. */
+struct MemberListing final {
+    identity::core::IdentityId actor;
+    std::vector<MemberSummary> members;
+};
+
 /**
  * Validated, one-time ceremony for creating the first tenant owner.
  *
