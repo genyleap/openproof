@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 #include <boost/asio/detail/call_stack.hpp>
@@ -179,4 +180,111 @@ TEST(NativeVerificationDeliveryTest, DispatchLifetimeAndWebhookStatusOverRealTcp
     EXPECT_EQ(receiver.calls.load(), 2);
     server.stop();
 }
+class IssuanceProbe final : public delivery::CoroutineVerificationDelivery {
+public:
+    asio::awaitable<fnd::Status> deliverAsync(const account::VerificationDispatch& dispatch) override
+    {
+        ++calls;
+        EXPECT_TRUE(stored.has_value());
+        if (stored) {
+            EXPECT_EQ(stored->id(), dispatch.id());
+            EXPECT_EQ(stored->identity(), dispatch.identity());
+            EXPECT_EQ(stored->destination(), dispatch.destination());
+            auto key = account::VerificationKey::create(fnd::SecretString{std::string(32U, 'v')});
+            EXPECT_TRUE(key);
+            if (key) {
+                auto digest = account::VerificationPreparation::digest(
+                    key.value(), dispatch.id(), dispatch.secret());
+                EXPECT_TRUE(digest && digest.value() == stored->digest());
+            }
+        }
+        if (dispatch.channel() == account::VerificationChannel::Sms) {
+            EXPECT_EQ(dispatch.secret().size(), 8U);
+            for (char c : dispatch.secret().expose()) EXPECT_TRUE(c >= '0' && c <= '9');
+        }
+        if (throwOnDelivery) throw std::runtime_error{"fixture delivery failure"};
+        return complete();
+    }
+    asio::awaitable<fnd::Status> complete()
+    {
+        if (reject) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        co_return fnd::ok();
+    }
+    std::optional<account::VerificationChallenge> stored;
+    int calls{};
+    bool reject{};
+    bool throwOnDelivery{};
+};
+
+TEST(NativeVerificationDeliveryTest, IssuerPersistsBeforeDeliveryAndCompensatesExactId)
+{
+    IssuanceProbe probe;
+    fnd::ManualClockSource clock{kNow};
+    int writes = 0, discards = 0;
+    bool rejectStore = false, rejectDiscard = false;
+    auto key = account::VerificationKey::create(fnd::SecretString{std::string(32U, 'v')});
+    ASSERT_TRUE(key);
+    delivery::CoroutineContactVerificationIssuer issuer{
+        std::move(key).value(), account::AccountPolicy::create(24h, 10min, 30min, 8U).value(),
+        idp::ProviderId{"local"}, idp::ProviderId{"phone"}, clock, probe,
+        [&](account::VerificationChallenge challenge, idp::ProviderId provider)
+            -> asio::awaitable<fnd::Status> {
+            ++writes;
+            EXPECT_EQ(provider.value(), challenge.purpose() == account::VerificationPurpose::ChangeEmail
+                ? "local" : "phone");
+            if (rejectStore) co_return fnd::fail(fnd::ErrorCode::AlreadyExists);
+            probe.stored.emplace(std::move(challenge));
+            co_return fnd::ok();
+        },
+        [&](account::VerificationId id, core::IdentityId owner, account::VerificationPurpose purpose)
+            -> asio::awaitable<fnd::Status> {
+            ++discards;
+            EXPECT_TRUE(probe.stored);
+            if (probe.stored) {
+                EXPECT_EQ(id, probe.stored->id());
+                EXPECT_EQ(owner, probe.stored->identity());
+                EXPECT_EQ(purpose, probe.stored->purpose());
+            }
+            if (rejectDiscard) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            probe.stored.reset();
+            co_return fnd::ok();
+        }};
+    const auto issue = [&](account::VerificationPurpose purpose, std::string destination) {
+        asio::io_context io;
+        auto completed = asio::co_spawn(io,
+            issuer.issueAsync(core::IdentityId{"owner"}, purpose, std::move(destination)),
+            asio::use_future);
+        io.run();
+        return completed.get();
+    };
+    const auto email = account::VerificationPurpose::ChangeEmail;
+    const auto phone = account::VerificationPurpose::VerifyPhone;
+    EXPECT_FALSE(issue(email, "bad-email"));
+    EXPECT_FALSE(issue(account::VerificationPurpose::SignupEmail, "owner@example.test"));
+    EXPECT_EQ(writes, 0);
+    rejectStore = true;
+    auto rejected = issue(email, "OWNER@EXAMPLE.TEST");
+    EXPECT_TRUE(!rejected && rejected.error().code() == fnd::ErrorCode::AlreadyExists);
+    EXPECT_EQ(probe.calls, 0);
+    rejectStore = false;
+    ASSERT_TRUE(issue(email, "OWNER@EXAMPLE.TEST"));
+    ASSERT_TRUE(probe.stored);
+    EXPECT_EQ(probe.stored->destination(), "owner@example.test");
+    EXPECT_EQ(probe.stored->expiresAt(), kNow + 24h);
+    EXPECT_EQ(discards, 0);
+    probe.reject = true;
+    EXPECT_FALSE(issue(phone, "+15551234567"));
+    EXPECT_FALSE(probe.stored);
+    EXPECT_EQ(discards, 1);
+    probe.throwOnDelivery = true;
+    EXPECT_FALSE(issue(email, "another@example.test"));
+    EXPECT_FALSE(probe.stored);
+    EXPECT_EQ(discards, 2);
+    rejectDiscard = true;
+    auto failed = issue(email, "another@example.test");
+    EXPECT_TRUE(!failed && failed.error().code() == fnd::ErrorCode::Unavailable);
+    EXPECT_EQ(discards, 3);
+    EXPECT_EQ(probe.calls, 4);
+}
+
 } // namespace
