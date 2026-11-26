@@ -121,7 +121,8 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
 
 struct Fixture final {
     explicit Fixture(bool profileEnabled = false,
-                     bool connectionsEnabled = false)
+                     bool connectionsEnabled = false,
+                     bool totpStatusEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -207,7 +208,18 @@ struct Fixture final {
                           co_return http::CoroutineAccountSessionAdapter::ConnectionList{
                               resultOwner, std::move(values)};
                       }}
-                  : http::CoroutineAccountSessionAdapter::ReadConnections{})
+                  : http::CoroutineAccountSessionAdapter::ReadConnections{},
+              totpStatusEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadTotpStatus{
+                      [this](core::IdentityId owner) -> asio::awaitable<
+                          fnd::Result<http::CoroutineAccountSessionAdapter::TotpStatus>> {
+                          ++totpStatusCalls;
+                          if (totpMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return http::CoroutineAccountSessionAdapter::TotpStatus{
+                              totpForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              totpEnabled};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{})
     {
     }
 
@@ -231,6 +243,10 @@ struct Fixture final {
     int revokeCalls{};
     int profileReadCalls{};
     int connectionsReadCalls{};
+    int totpStatusCalls{};
+    bool totpForeign{};
+    bool totpMissing{};
+    std::optional<bool> totpEnabled{false};
     bool connectionsForeign{};
     bool connectionsMissing{};
     bool connectionsEmpty{};
@@ -553,6 +569,47 @@ TEST(AccountCoroutineSessionHttpTest, ConnectionsReadRejectsForeignAndMissingWit
         .as_array().empty());
     f.connectionsMissing = true;
     EXPECT_EQ(f.run(connectionsCookieRequest()).status(), 404);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+[[nodiscard]] gw::HttpRequest totpCookieRequest(std::string token = "valid-token")
+{
+    return gw::HttpRequest::create(gw::HttpMethod::Get, "/account/totp",
+        {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+        "127.0.0.1", fnd::CorrelationId{"native-totp-status-test"}).value();
+}
+
+TEST(AccountCoroutineSessionHttpTest, TotpStatusIsOptInCookieOnlyAndOwnerBound)
+{
+    Fixture off;
+    EXPECT_FALSE(off.api.nativeEnabledFor(totpCookieRequest()));
+    Fixture f{false, false, true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy, f.api, {},
+        {{"/account/totp", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(totpCookieRequest()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get,
+        "/account/totp", "delegated-oauth")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post, "/account/totp/start")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/totp")).status(), 401);
+    EXPECT_EQ(f.run(totpCookieRequest("invalid-token")).status(), 401);
+    EXPECT_EQ(f.totpStatusCalls, 0);
+    for (const auto enrolled : {std::optional<bool>{}, std::optional<bool>{false},
+                                std::optional<bool>{true}}) {
+        f.totpEnabled = enrolled;
+        const auto result = f.run(totpCookieRequest());
+        ASSERT_EQ(result.status(), 200);
+        const auto body = json::parse(result.body()).as_object();
+        EXPECT_EQ(body.size(), 3U);
+        EXPECT_EQ(body.at("available").as_bool(), enrolled.has_value());
+        EXPECT_EQ(body.at("enabled").as_bool(), enrolled.value_or(false));
+        EXPECT_EQ(body.at("assurance").as_string(), "ial1");
+        EXPECT_EQ(result.headers().at("cache-control"), "no-store");
+    }
+    f.totpForeign = true;
+    EXPECT_EQ(f.run(totpCookieRequest()).status(), 503);
+    f.totpForeign = false;
+    f.totpMissing = true;
+    EXPECT_EQ(f.run(totpCookieRequest()).status(), 404);
     EXPECT_EQ(f.legacy.invoked, 0);
 }
 
