@@ -61,6 +61,22 @@ jobs:
       - name: End-to-end coroutine coverage gate
         run: node scripts/verify-coroutine-coverage.mjs
 
+  ldap-fixture:
+    name: Real LDAPS fixture preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fixture dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends slapd ldap-utils openssl
+      - name: Verify real LDAPS fixture without building opp
+        env:
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
+        run: node scripts/ci/test-native-ldap-fixture.mjs
+
   build:
     name: Build and test
     runs-on: ubuntu-24.04

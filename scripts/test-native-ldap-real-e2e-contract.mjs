@@ -44,3 +44,18 @@ test("LDIF identity mapping requires two independently unique subjects", () => {
   assert.equal(parseFixtureSubjects(first + "\n\n" + second.replace(unlinked, "malformed")), null);
   assert.equal(parseFixtureSubjects(first + "\nentryUUID: " + unlinked + "\n\n" + second), null);
 });
+
+test("fixture verifies a real certificate chain and tests bind before full build", () => {
+  const fixture = read("scripts/ci/native-ldap-fixture.mjs");
+  assert.match(fixture, /basicConstraints=critical,CA:FALSE/);
+  assert.match(fixture, /extendedKeyUsage=serverAuth/);
+  assert.match(fixture, /rejectUnauthorized: true/);
+  assert.match(fixture, /TLSCertificateFile " \+ cert/);
+  assert.match(fixture, /TLS_REQCERT demand/);
+  assert.match(fixture, /const uri = "ldaps:\/\/127\.0\.0\.1:"/);
+  const smoke = read("scripts/ci/test-native-ldap-fixture.mjs");
+  assert.match(smoke, /spawnSync\("ldapwhoami"/);
+  assert.match(smoke, /assert\.equal\(bind\(\)\.status, 0/);
+  assert.match(smoke, /assert\.notEqual\(denied\.status, 0/);
+  assert.match(read(".github/workflows/ci.yml"), /name: Real LDAPS fixture preflight/);
+});

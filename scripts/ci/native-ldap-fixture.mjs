@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import tls from "node:tls";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -55,8 +56,13 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
   fs.mkdirSync(directory, { mode: 0o700 });
   const db = path.join(directory, "mdb");
   fs.mkdirSync(db, { mode: 0o700 });
-  const ca = path.join(directory, "ldap.crt");
+  const ca = path.join(directory, "ca.crt");
+  const caKey = path.join(directory, "ca.key");
+  const cert = path.join(directory, "ldap.crt");
   const key = path.join(directory, "ldap.key");
+  const csr = path.join(directory, "ldap.csr");
+  const extensions = path.join(directory, "ldap.ext");
+  const ldapConf = path.join(directory, "ldap.conf");
   const config = path.join(directory, "slapd.conf");
   const ldif = path.join(directory, "seed.ldif");
   const readerPasswordFile = path.join(directory, "reader.password");
@@ -64,11 +70,27 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
   const linkedPassword = randomPassword();
   const unlinkedPassword = randomPassword();
   const rootPassword = randomPassword();
+  // Use a distinct CA and server leaf so OpenSSL and GnuTLS independently
+  // verify a normal certificate chain rather than a self-signed CA-as-leaf.
   run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
-    "-days", "1", "-subj", "/CN=localhost",
-    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
-    "-keyout", key, "-out", ca]);
+    "-days", "1", "-subj", "/CN=OpenProof disposable LDAP CA",
+    "-addext", "basicConstraints=critical,CA:TRUE",
+    "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+    "-keyout", caKey, "-out", ca]);
+  run("openssl", ["req", "-new", "-newkey", "rsa:2048", "-nodes",
+    "-subj", "/CN=localhost", "-keyout", key, "-out", csr]);
+  fs.writeFileSync(extensions, [
+    "basicConstraints=critical,CA:FALSE",
+    "keyUsage=critical,digitalSignature,keyEncipherment",
+    "extendedKeyUsage=serverAuth",
+    "subjectAltName=DNS:localhost,IP:127.0.0.1",
+  ].join("\n") + "\n", { mode: 0o600 });
+  run("openssl", ["x509", "-req", "-in", csr, "-CA", ca, "-CAkey", caKey,
+    "-CAcreateserial", "-days", "1", "-sha256", "-extfile", extensions, "-out", cert]);
+  fs.chmodSync(caKey, 0o600);
   fs.chmodSync(key, 0o600);
+  run("openssl", ["verify", "-CAfile", ca, "-verify_ip", "127.0.0.1", cert]);
+  fs.writeFileSync(ldapConf, "TLS_CACERT " + ca + "\nTLS_REQCERT demand\n", { mode: 0o600 });
   fs.writeFileSync(readerPasswordFile, readerPassword, { mode: 0o600 });
   const settings = [
     "include /etc/ldap/schema/core.schema",
@@ -78,7 +100,7 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     "argsfile " + path.join(directory, "slapd.args"),
     "modulepath /usr/lib/ldap",
     "moduleload back_mdb",
-    "TLSCertificateFile " + ca,
+    "TLSCertificateFile " + cert,
     "TLSCertificateKeyFile " + key,
     "TLSCACertificateFile " + ca,
     "TLSVerifyClient never",
@@ -112,12 +134,24 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
   fs.writeFileSync(ldif, records.join("\n\n") + "\n\n", { mode: 0o600 });
   run("/usr/sbin/slapadd", ["-f", config, "-l", ldif]);
   const port = await reservePort();
-  const uri = "ldaps://localhost:" + port;
+  // Exact loopback address matches the bound interface and the IP SAN.
+  // Do not depend on localhost DNS ordering or reverse name resolution.
+  const uri = "ldaps://127.0.0.1:" + port;
   const child = spawn("/usr/sbin/slapd",
-    ["-f", config, "-h", "ldaps://127.0.0.1:" + port + "/", "-d", "0"],
-    { stdio: ["ignore", "ignore", "ignore"] });
+    ["-f", config, "-h", "ldaps://127.0.0.1:" + port + "/", "-d", "1"],
+    { stdio: ["ignore", "ignore", "pipe"] });
   let failed = false;
+  let daemonOutcome = "no-startup-error-observed";
   child.once("error", () => { failed = true; });
+  // Classify, never forward raw diagnostics. Even a fixture log may include
+  // bind DNs or credential material. Drain continuously to avoid pipe stalls.
+  child.stderr.on("data", chunk => {
+    const message = chunk.toString("utf8");
+    if (/permission denied|operation not permitted/i.test(message)) daemonOutcome = "permission";
+    else if (/address already in use|bind\(\) failed/i.test(message)) daemonOutcome = "listen";
+    else if (/TLS.*(?:error|failed)|certificate.*(?:error|failed)/i.test(message)) daemonOutcome = "tls";
+    else if (/mdb.*(?:error|failed)/i.test(message)) daemonOutcome = "mdb";
+  });
   async function close() {
     if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
     const exited = new Promise(resolve => child.once("exit", resolve));
@@ -129,16 +163,34 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
   }
   const lookup = () => spawnSync("ldapsearch", [
     "-LLL", "-x", "-H", uri, "-D", readerDn, "-y", readerPasswordFile,
-    "-o", "nettimeout=1", "-o", "ldif-wrap=no", "-l", "2", "-b", peopleDn,
+    "-o", "nettimeout=1", "-l", "2", "-b", peopleDn,
     "(|(uid=linked)(uid=unlinked))", "uid", "entryUUID",
   ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 3000,
-    env: { ...process.env, LDAPTLS_CACERT: ca, LDAPTLS_REQCERT: "demand" } });
+    env: { ...process.env, HOME: directory, LDAPCONF: ldapConf,
+      LDAPRC: "ldap.conf", LDAPTLS_CACERT: ca, LDAPTLS_REQCERT: "demand" } });
+  // Independently prove the endpoint serves the pinned certificate and
+  // hostname. No anonymous/simple bind is attempted by this probe.
+  function verifyTls() {
+    return new Promise(resolve => {
+      const socket = tls.connect({ host: "127.0.0.1", port,
+        servername: "localhost", ca: fs.readFileSync(ca), rejectUnauthorized: true });
+      const done = outcome => { socket.destroy(); resolve(outcome); };
+      socket.once("secureConnect", () => done(socket.authorized ? "verified" : "unverified"));
+      socket.once("error", error => done(
+        ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"].includes(error.code)
+          ? error.code : "certificate-or-tls"));
+      socket.setTimeout(1000, () => done("timeout"));
+    });
+  }
   try {
     const deadline = Date.now() + 15_000;
     let subject;
     let lastOutcome = "not-ready";
+    let tlsOutcome = "not-ready";
     while (Date.now() < deadline && !failed && child.exitCode === null
            && child.signalCode === null) {
+      if (tlsOutcome !== "verified") tlsOutcome = await verifyTls();
+      if (tlsOutcome !== "verified") { await delay(100); continue; }
       const result = lookup();
       if (result.status === 0) {
         // One directory snapshot must contain exactly the two requested
@@ -151,8 +203,12 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
         }
         lastOutcome = "invalid-entry-set";
       } else {
-        lastOutcome = result.error?.code === "ETIMEDOUT"
-          ? "search-timeout"
+        const diagnostic = result.stderr ?? "";
+        lastOutcome = result.error?.code === "ETIMEDOUT" ? "search-timeout"
+          : /invalid credentials/i.test(diagnostic) ? "bind-rejected"
+          : /certificate|TLS/i.test(diagnostic) ? "ldap-tls"
+          : /can't contact LDAP server|cannot contact LDAP server/i.test(diagnostic) ? "ldap-transport"
+          : /unrecognized option|invalid option|usage:/i.test(diagnostic) ? "ldap-client-option"
           : "search-exit-" + (Number.isInteger(result.status) ? result.status : "unknown");
       }
       await delay(100);
@@ -160,7 +216,10 @@ export async function startNativeLdapFixture(tempRoot, reservePort) {
     if (!subject) {
       // The outcome contains only a fixed category or numeric exit status.
       // Do not print LDAP stdout/stderr, DNs, UUIDs or fixture credentials.
-      throw new Error("disposable LDAPS lookup did not return unique fixture UUIDs (" + lastOutcome + ")");
+      const processState = failed ? "spawn-failed" : child.signalCode ? "signaled"
+        : child.exitCode === null ? "running" : "exit-" + child.exitCode;
+      throw new Error("disposable LDAPS fixture failed: tls=" + tlsOutcome
+        + "; search=" + lastOutcome + "; daemon=" + processState + "/" + daemonOutcome);
     }
     return {
       subject, linkedPassword, unlinkedPassword, close,
