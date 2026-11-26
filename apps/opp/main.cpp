@@ -46,6 +46,7 @@
 #include <boost/json.hpp>
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
 #include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
 #include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
 #include "../../src/storage/postgres/coroutine_session_repository.hpp"
@@ -2783,6 +2784,34 @@ addProtectedRoutes(gateway::Router& router,
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
     gateway::Gateway* nativeGatewayCore = nullptr;
 
+    std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
+    if (nativeWeb3Enabled && platform.oidc().enabled()) {
+        auto key=deriveSecret(platform.security().tokenSigningKey(),"openproof/oauth-token-key/v1");
+        if (!key) {
+            reportStartupFailure(key.error());
+            return ExitCode::ConfigurationError;
+        }
+        nativeWeb3DelegatedKey.emplace(std::move(key).value());
+    }
+    const auto authenticateNativeWeb3=[&](fnd::SecretString credential)
+        -> boost::asio::awaitable<fnd::Result<session::Session>> {
+        if (!nativeSessions || !nativeCanonical)
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        auto authenticated=co_await nativeSessions->authenticate(credential.clone());
+        if (authenticated || !nativeWeb3DelegatedKey)
+            co_return std::move(authenticated);
+        if (credential.empty() || credential.expose().size()>256U)
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
+        credential=fnd::SecretString{};
+        if (!fingerprint) co_return fnd::fail(fingerprint.error());
+        // The native SQL adapter receives only the keyed digest.
+        co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
+            fnd::toHex(fingerprint.value()),clock.now());
+    };
+
+    accountDelivery::CoroutineContactVerificationIssuer* nativeContactIssuer=nullptr;
+
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
         gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
@@ -2798,6 +2827,7 @@ addProtectedRoutes(gateway::Router& router,
         // All other account routes remain on the compatibility worker.
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
+        std::unique_ptr<accountHttp::CoroutineContactVerificationAdapter> asyncContact;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         std::unique_ptr<oauthHttp::CoroutineConsentAdapter> asyncConsent;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
@@ -2965,6 +2995,15 @@ addProtectedRoutes(gateway::Router& router,
             // Profile reads and writes are method scoped below; delegated
             // OAuth credentials remain on the compatibility worker.
         }
+        if (nativeContactIssuer) {
+            asyncContact=std::make_unique<accountHttp::CoroutineContactVerificationAdapter>(
+                *nativeHandler,limiter.value(),authenticateNativeWeb3,
+                [issuer=nativeContactIssuer](identity::IdentityId owner,account::VerificationPurpose purpose,
+                    std::string destination) {
+                    return issuer->issueAsync(std::move(owner),purpose,std::move(destination));
+                });
+            nativeHandler=asyncContact.get();
+        }
         if (nativeConsentEnabled) {
             if (!nativeSessions || !nativeConsentStore) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3063,6 +3102,10 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
+        if (nativeContactIssuer) {
+            nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
+            nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
+        }
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/account/connections/web3/start");
             nativePaths.emplace_back("/account/connections/web3/handoff");
@@ -3163,32 +3206,6 @@ addProtectedRoutes(gateway::Router& router,
         return runWithEvidence(scimApi, nativeEnterprise);
     };
 
-    std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
-    if (nativeWeb3Enabled && platform.oidc().enabled()) {
-        auto key=deriveSecret(platform.security().tokenSigningKey(),"openproof/oauth-token-key/v1");
-        if (!key) {
-            reportStartupFailure(key.error());
-            return ExitCode::ConfigurationError;
-        }
-        nativeWeb3DelegatedKey.emplace(std::move(key).value());
-    }
-    const auto authenticateNativeWeb3=[&](fnd::SecretString credential)
-        -> boost::asio::awaitable<fnd::Result<session::Session>> {
-        if (!nativeSessions || !nativeCanonical)
-            co_return fnd::fail(fnd::ErrorCode::Unavailable);
-        auto authenticated=co_await nativeSessions->authenticate(credential.clone());
-        if (authenticated || !nativeWeb3DelegatedKey)
-            co_return std::move(authenticated);
-        if (credential.empty() || credential.expose().size()>256U)
-            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
-        auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
-        credential=fnd::SecretString{};
-        if (!fingerprint) co_return fnd::fail(fingerprint.error());
-        // The native SQL adapter receives only the keyed digest.
-        co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
-            fnd::toHex(fingerprint.value()),clock.now());
-    };
-
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             nativeAuthentication ? *nativeAuthentication : authentication,
@@ -3250,6 +3267,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(verificationMaterial.error());
             return ExitCode::InternalError;
         }
+        auto nativeVerificationKey=account::VerificationKey::create(verificationMaterial->clone());
         auto verificationKey = account::VerificationKey::create(
             std::move(verificationMaterial).value());
         auto accountPolicy = account::AccountPolicy::create(
@@ -3258,7 +3276,7 @@ addProtectedRoutes(gateway::Router& router,
         auto deliveryProxyConfig = gatewayHttp::ProxyConfig::create(
             32U * 1024U, 256U * 1024U,
             std::string{platform.account().deliveryCaFile()});
-        if (!verificationKey || !accountPolicy || !deliveryProxyConfig) {
+        if (!verificationKey || !nativeVerificationKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
             reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
             return ExitCode::ConfigurationError;
         }
@@ -3279,6 +3297,29 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(delivery.error());
             return ExitCode::ConfigurationError;
         }
+        auto nativeDelivery=accountDelivery::createCoroutineWebhookVerificationDelivery(
+            *deliveryTransport.value(),std::string{platform.account().deliveryHost()},
+            platform.account().deliveryPort(),platform.account().deliveryTls(),
+            std::string{platform.account().deliveryPath()},
+            platform.account().deliveryAuthorization().clone(),std::chrono::seconds{10});
+        if (!nativeDelivery) {
+            reportStartupFailure(nativeDelivery.error());
+            return ExitCode::ConfigurationError;
+        }
+        postgres::CoroutineVerificationChallengeStore contactStore{
+            nativeIo->get_executor(),platform.database().connectionString().clone(),
+            identity::OrganizationId{std::string{platform.auth().organizationId()}},
+            std::min<std::size_t>(2U,platform.database().poolSize()),
+            std::chrono::seconds{2},std::chrono::seconds{3},std::chrono::seconds{5}};
+        accountDelivery::CoroutineContactVerificationIssuer contactIssuer{
+            std::move(nativeVerificationKey).value(),accountPolicy.value(),providerId,
+            idp::ProviderId{std::string{platform.account().phoneProviderId()}},clock,*nativeDelivery.value(),
+            [&contactStore](account::VerificationChallenge challenge,idp::ProviderId provider) {
+                return contactStore.reserveAndReplaceAsync(std::move(challenge),std::move(provider));
+            },
+            [&contactStore](account::VerificationId id,identity::IdentityId owner,account::VerificationPurpose purpose) {
+                return contactStore.discardAsync(std::move(id),std::move(owner),purpose);
+            }};
         account::AccountService accountService{
             identity::OrganizationId{std::string{platform.auth().organizationId()}},
             providerId,
@@ -3288,7 +3329,10 @@ addProtectedRoutes(gateway::Router& router,
             std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
         accountHttp::AccountHttpApi accountApi{
             accountService, authentication, sessions, limiter.value(), fallback, delegated};
-        return runWithPasskey(accountApi, delegated);
+        nativeContactIssuer=&contactIssuer;
+        const auto result=runWithPasskey(accountApi,delegated);
+        nativeContactIssuer=nullptr;
+        return result;
     };
 
     if (!platform.oidc().enabled()) {

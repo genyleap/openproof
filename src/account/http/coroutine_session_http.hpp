@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
@@ -108,6 +109,30 @@ private:
     ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
     ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
     UpdateProfile m_updateProfile;
+};
+
+/** Native contact challenge issuance, independent of session-list opt-ins.
+ * The issuer owns durable reservation and delivery compensation.
+ */
+class CoroutineContactVerificationAdapter final : public gateway::http::CoroutineHttpHandler {
+public:
+    using Authenticate=CoroutineAccountSessionAdapter::Authenticate;
+    using Issue=std::function<boost::asio::awaitable<foundation::Status>(
+        identity::core::IdentityId, VerificationPurpose, std::string)>;
+
+    CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
+        gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue);
+    [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest request) override;
+private:
+    [[nodiscard]] static gateway::HttpResponse fail(const foundation::Error& failure,
+        const gateway::HttpRequest& request);
+    gateway::http::CoroutineHttpHandler* m_fallback;
+    gateway::TokenBucketRateLimiter* m_limiter;
+    Authenticate m_authenticate;
+    Issue m_issue;
 };
 
 } // namespace openproof::account::http

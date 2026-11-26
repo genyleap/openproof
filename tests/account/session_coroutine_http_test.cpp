@@ -773,4 +773,62 @@ TEST(AccountCoroutineSessionHttpTest, NativeProfileMutationRequiresOwnerAndPrese
     EXPECT_EQ(f.legacy.invoked,0);
 }
 
+TEST(NativeContactVerificationHttpTest, AuthorizedOwnerAndPurposeArePassedWithoutLegacyFallback)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int issued=0;
+    bool failDelivery=false;
+    std::string owner,destination;
+    std::optional<account::VerificationPurpose> purpose;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="valid-token") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return validSession("current");
+        },
+        [&](core::IdentityId identity,account::VerificationPurpose kind,std::string target)
+            ->asio::awaitable<fnd::Status> {
+            ++issued;
+            owner=identity.value();
+            purpose=kind;
+            destination=std::move(target);
+            if (failDelivery) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            co_return fnd::ok();
+        }};
+    auto run=[&](gw::HttpRequest input){
+        asio::io_context io;
+        auto result=asio::co_spawn(io,dispatch(api,std::move(input)),asio::use_future);
+        io.run();
+        return std::move(result.get()).value();
+    };
+    const std::string email=R"({"email":"new@example.test"})";
+    const std::string phone=R"({"phone_number":"+12025550123"})";
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","",email)).status(),401);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","wrong-token",email)).status(),401);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","valid-token",
+        R"({"email":"new@example.test","identity_id":"another-owner"})")).status(),400);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone,
+        "application/json-invalid")).status(),400);
+    EXPECT_EQ(issued,0);
+    const auto accepted=run(request(gw::HttpMethod::Post,"/account/email/change","valid-token",email));
+    EXPECT_EQ(accepted.status(),202);
+    EXPECT_EQ(accepted.headers().at("cache-control"),"no-store");
+    EXPECT_TRUE(json::parse(accepted.body()).as_object().at("accepted").as_bool());
+    EXPECT_EQ(owner,"identity-current");
+    EXPECT_EQ(destination,"new@example.test");
+    EXPECT_EQ(purpose,account::VerificationPurpose::ChangeEmail);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),202);
+    EXPECT_EQ(destination,"+12025550123");
+    EXPECT_EQ(purpose,account::VerificationPurpose::VerifyPhone);
+    failDelivery=true;
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),503);
+    EXPECT_EQ(issued,3);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),503);
+    EXPECT_EQ(issued,3);
+    EXPECT_EQ(fallback.invoked,0);
+}
+
 } // namespace

@@ -666,4 +666,96 @@ CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
     co_return jsonResponse(200, std::move(body));
 }
 
+namespace {
+[[nodiscard]] bool contactIssueRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && (request.path()=="/account/email/change" || request.path()=="/account/phone");
+}
+}
+
+CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
+    gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
+    Authenticate authenticate,Issue issue)
+    : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
+      m_issue(std::move(issue)) {}
+
+bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
+{
+    if (contactIssueRoute(request)) return static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
+    return m_fallback->nativeEnabledFor(request);
+}
+
+gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
+    const foundation::Error& failure,const gateway::HttpRequest& request)
+{
+    gateway::HttpResponse response{foundation::errorHttpStatus(failure.code()),
+        gateway::Headers{{"content-type","application/json"}},
+        foundation::toClientJson(failure,request.correlation().value())};
+    response.setHeader("cache-control","no-store");
+    response.setHeader("pragma","no-cache");
+    response.setHeader("x-content-type-options","nosniff");
+    response.setHeader("referrer-policy","no-referrer");
+    if (response.status()==401) response.setHeader("www-authenticate","Bearer");
+    return response;
+}
+
+gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
+{
+    if (!contactIssueRoute(request)) return m_fallback->handle(std::move(request));
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
+{
+    if (!contactIssueRoute(request)) {
+        if (m_fallback->nativeEnabledFor(request))
+            co_return co_await m_fallback->handleAsync(std::move(request));
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    if (!m_authenticate || !m_issue)
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    const bool email=request.path()=="/account/email/change";
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    std::string destination;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        if (ec || !parsed.is_object() || parsed.as_object().size()!=1U)
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto* field=parsed.as_object().if_contains(email?"email":"phone_number");
+        if (!field || !field->is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view value{field->as_string().data(),field->as_string().size()};
+        if (value.empty() || value.size()>(email?320U:32U)
+            || std::ranges::any_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7FU;
+            })) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        destination.assign(value);
+    }
+    request.wipeBody();
+    auto status=co_await m_issue(actor->identity(),
+        email?VerificationPurpose::ChangeEmail:VerificationPurpose::VerifyPhone,
+        std::move(destination));
+    if (!status) co_return fail(status.error(),request);
+    co_return jsonResponse(202,json::object{{"accepted",true}});
+}
+
 } // namespace openproof::account::http
