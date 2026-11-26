@@ -362,6 +362,10 @@ public:
                        const provider::BindingDigest& binding,
                        const provider::AuthenticationResponse& response);
 
+    struct ConnectionPresentation final {
+        std::optional<std::string> displayName, preferredUsername, pictureUrl;
+    };
+
     /** Completes a native coroutine connection with the exact same purpose,
      * single-use transaction and canonical ownership constraints as the
      * synchronous compatibility API.
@@ -371,7 +375,8 @@ public:
     completeConnectionAsync(provider::TransactionId transactionId,
                             foundation::SecretString continuationToken,
                             provider::BindingDigest binding,
-                            provider::AuthenticationResponse response);
+                            provider::AuthenticationResponse response,
+                            ConnectionPresentation presentation = {});
 
     /**
      * @brief Refreshes display-only metadata for an already verified connection.
@@ -420,10 +425,12 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionHandoff>>
     issueBrowserConnectionHandoffAsync(identity::core::IdentityId identity,
         provider::ProviderId providerId, std::string returnTarget,
-        foundation::CorrelationId correlation);
+        foundation::CorrelationId correlation,
+        provider::InteractionModel expected = provider::InteractionModel::Redirect);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
-    consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket);
+    consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket,
+        provider::InteractionModel expected = provider::InteractionModel::Redirect);
 
     /**
      * @brief Issues separated publisher/redeemer credentials for mobile wallet login.

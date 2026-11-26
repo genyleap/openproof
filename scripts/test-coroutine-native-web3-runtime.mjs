@@ -33,7 +33,7 @@ test("Web3 login gets async transaction, canonical and session services without 
   assert.match(runtime, /CoroutinePostgresAuthenticationTransactionStore/);
   assert.match(runtime, /CoroutinePostgresCanonicalFinalizer/);
   assert.match(runtime, /nativeCanonical\.get\(\)/);
-  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\)\}/);
+  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\),\s*\[service=nativeSessions\.get\(\)\]/);
   assert.match(app, /runWithScim\(enterpriseApi, nativeWeb3Api\)/);
   assert.match(app, /runWithScim\(enterpriseApi, enterpriseApi\)/);
 });
@@ -117,4 +117,25 @@ test("native Web3 presentation is owner-bound and cannot alter proof or contact 
   assert.match(body,/WHERE identity_id=\$1 AND provider=\$2 AND external_subject=\$3 RETURNING identity_id/);
   assert.match(body,/ProfilePurpose::Connection/);
   assert.doesNotMatch(body,/ClaimName::(?:Email|PhoneNumber)|INSERT INTO openproof.external_identities/);
+});
+
+test("native wallet connection uses native ownership and never issues a login grant",()=>{
+  const begin=web3.slice(web3.indexOf("Web3AuthenticationHttpApi::startAsync("),
+    web3.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+  const complete=web3.slice(web3.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+  assert.match(begin,/co_await m_authentication->consumeBrowserConnectionHandoffAsync\(/);
+  assert.match(begin,/co_await m_authentication->beginConnectionAsync\(/);
+  assert.match(begin,/co_await m_authenticate\(std::move\(\*actorToken\)\)/);
+  const link=complete.slice(complete.indexOf("if (connection) {"),
+    complete.indexOf("co_await m_authentication->completeAsync("));
+  assert.match(link,/co_await m_authentication->completeConnectionAsync\(/);
+  assert.match(link,/co_return response;/);
+  assert.doesNotMatch(link,/issueAsync\(/);
+  assert.match(app,/nativeMethods.emplace_back\("\/account\/connections\/web3\/start",gateway::HttpMethod::Post\)/);
+  assert.match(app,/nativeMethods.emplace_back\("\/account\/connections\/web3\/handoff",gateway::HttpMethod::Post\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/account\/connections\/web3\/complete"\)/);
+  const service=read("src/authentication/service.cpp");
+  const owner=service.slice(service.indexOf("AuthenticationService::completeConnectionAsync("),
+    service.indexOf("AuthenticationService::finishConnection("));
+  assert.match(owner,/finalizer->updatePresentationAsync\(\s*\*exchange->connectionTarget,/);
 });
