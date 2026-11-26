@@ -255,6 +255,157 @@ CoroutineLocalCredentialStore::confirmPasswordUpgradeAsync(core::IdentityId owne
     }
 }
 
+asio::awaitable<foundation::Result<CoroutineLocalCredentialStore::OwnerCredential>>
+CoroutineLocalCredentialStore::confirmMfaPasswordAsync(core::IdentityId owner,
+    foundation::SecretString password,credentials::BoundedPasswordExecutor& policy)
+{
+    if (!bounded(owner.value(),200U))
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
+        std::optional<OwnerCredential> captured;
+        {
+            const auto deadline=Clock::now()+m_impl->queryTimeout;
+            auto lease=co_await m_impl->pool.acquire(deadline);
+            Params params{std::string{owner.value()},std::string{m_impl->tenant.value()},
+                std::string{m_impl->provider.value()}};
+            const auto rows=co_await lease.connection().query(
+                "SELECT e.external_subject,p.password_hash,CASE WHEN octet_length(t.encrypted_seed)>2048 "
+                "THEN '!' ELSE encode(t.encrypted_seed,'hex') END,t.key_version::text,"
+                "t.last_accepted_step::text,p.changed_at_ms::text,t.enrolled_at_ms::text "
+                "FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+                "JOIN openproof.external_identities e ON e.identity_id=i.id "
+                "JOIN openproof.password_credentials p ON p.identity_id=i.id "
+                "LEFT JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+                "WHERE i.id=$1 AND i.organization_id=$2 AND e.provider=$3 "
+                "AND i.kind=0 AND i.status=0 AND o.state=0 LIMIT 2",
+                std::move(params),remaining(deadline));
+            if (rows.rows.empty()) co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+            if (rows.rows.size()!=1U || rows.rows.front().size()!=7U)
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            const auto& row=rows.rows.front();
+            if (!row[0] || !bounded(*row[0],1000U) || !row[1] || !row[5])
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            LocalCredentialSnapshot snapshot{owner,*row[1],row[2],row[3],row[4],*row[5],row[6]};
+            if (!valid(snapshot)) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            captured.emplace(idp::ExternalSubject{*row[0]},std::move(snapshot));
+        }
+        auto hash=credentials::PasswordHash::parse(captured->second.passwordHash);
+        if (!hash) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        auto verified=co_await policy.verifyAsync(std::move(password),std::move(hash).value());
+        if (!verified) co_return foundation::fail(verified.error());
+        if (!verified.value()) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        co_return std::move(*captured);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,std::string{kUnavailable});
+    }
+}
+
+asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::changeTotpAsync(
+    OwnerCredential captured,std::optional<EncryptedTotpEnrollment> enrollment,foundation::Instant now)
+{
+    const auto& subject=captured.first;
+    const auto& snapshot=captured.second;
+    if (!bounded(subject.value(),1000U) || !valid(snapshot) || now.time_since_epoch().count()<0
+        || (!enrollment && !snapshot.encryptedTotpHex))
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition);
+    if (enrollment) {
+        if (!bounded(enrollment->ciphertextHex,4096U) || enrollment->ciphertextHex.size()%2U!=0U
+            || enrollment->keyVersion==0U
+            || enrollment->keyVersion>static_cast<unsigned int>(std::numeric_limits<int>::max())
+            || enrollment->acceptedStep>static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+            co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+        for (const auto ch:enrollment->ciphertextHex)
+            if (!((ch>='0' && ch<='9') || (ch>='a' && ch<='f')))
+                co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    }
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const std::string owner{snapshot.owner.value()};
+        const std::string observed=std::to_string(now.time_since_epoch().count());
+        static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+        // Serialize with recovery rotation/redemption before taking row locks.
+        Params recoveryLock{owner};
+        static_cast<void>(co_await connection.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            std::move(recoveryLock),remaining(deadline)));
+        Params ownerParams{owner,std::string{m_impl->tenant.value()}};
+        const auto locked=co_await connection.query(
+            "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE i.id=$1 AND i.organization_id=$2 AND i.kind=0 AND i.status=0 AND o.state=0 "
+            "FOR UPDATE OF i FOR SHARE OF o",std::move(ownerParams),remaining(deadline));
+        auto ownerStatus=confirmed(locked,owner);
+        if (!ownerStatus) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return ownerStatus;
+        }
+        Params passwordParams{owner,std::string{m_impl->provider.value()},std::string{subject.value()},
+            snapshot.passwordHash,snapshot.passwordChangedAt};
+        const auto passwordRow=co_await connection.query(
+            "SELECT p.identity_id FROM openproof.password_credentials p "
+            "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+            "WHERE p.identity_id=$1 AND e.provider=$2 AND e.external_subject=$3 "
+            "AND p.password_hash=$4 AND p.changed_at_ms=$5::bigint FOR UPDATE OF p FOR SHARE OF e",
+            std::move(passwordParams),remaining(deadline));
+        auto passwordStatus=confirmed(passwordRow,owner);
+        if (!passwordStatus) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return passwordStatus;
+        }
+        Params factorParams{owner};
+        const auto factor=co_await connection.query(
+            "SELECT encode(encrypted_seed,'hex'),key_version::text,enrolled_at_ms::text "
+            "FROM openproof.totp_credentials WHERE identity_id=$1 FOR UPDATE",
+            std::move(factorParams),remaining(deadline));
+        const bool sameFactor=snapshot.encryptedTotpHex
+            ? (factor.rows.size()==1U && factor.rows.front().size()==3U
+                && factor.rows.front()[0]==snapshot.encryptedTotpHex
+                && factor.rows.front()[1]==snapshot.keyVersion
+                && factor.rows.front()[2]==snapshot.totpEnrolledAt)
+            : factor.rows.empty();
+        if (!sameFactor) {
+            static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        }
+        if (enrollment) {
+            Params installParams{owner,std::move(enrollment->ciphertextHex),std::to_string(enrollment->keyVersion),
+                std::to_string(enrollment->acceptedStep),observed};
+            const auto installed=co_await connection.query(
+                "INSERT INTO openproof.totp_credentials AS t "
+                "(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+                "VALUES($1,decode($2,'hex'),$3,$4,$5) ON CONFLICT(identity_id) DO UPDATE SET "
+                "encrypted_seed=EXCLUDED.encrypted_seed,key_version=EXCLUDED.key_version,"
+                "last_accepted_step=EXCLUDED.last_accepted_step,"
+                "enrolled_at_ms=GREATEST(t.enrolled_at_ms+1,EXCLUDED.enrolled_at_ms) RETURNING identity_id",
+                std::move(installParams),remaining(deadline));
+            if (!confirmed(installed,owner)) throw std::runtime_error{"TOTP enrollment failed"};
+        } else {
+            Params removeParams{owner};
+            const auto removed=co_await connection.query(
+                "DELETE FROM openproof.totp_credentials WHERE identity_id=$1 RETURNING identity_id",
+                std::move(removeParams),remaining(deadline));
+            if (!confirmed(removed,owner)) throw std::runtime_error{"TOTP removal failed"};
+        }
+        // Any factor-generation change invalidates the old recovery batch,
+        // and all in-flight password-authenticated session proofs. Existing
+        // session revocation policy is intentionally unchanged.
+        Params revokeParams{owner};
+        static_cast<void>(co_await connection.query(
+            "DELETE FROM openproof.recovery_codes WHERE identity_id=$1",std::move(revokeParams),remaining(deadline)));
+        Params advanceParams{owner,observed,snapshot.passwordChangedAt};
+        const auto advanced=co_await connection.query(
+            "UPDATE openproof.password_credentials SET changed_at_ms=GREATEST(changed_at_ms+1,$2::bigint) "
+            "WHERE identity_id=$1 AND changed_at_ms=$3::bigint RETURNING identity_id",
+            std::move(advanceParams),remaining(deadline));
+        if (!confirmed(advanced,owner)) throw std::runtime_error{"MFA generation changed"};
+        static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,std::string{kUnavailable});
+    }
+}
+
 asio::awaitable<foundation::Status> CoroutineLocalCredentialStore::confirmPasswordOnlyAsync(
     idp::ExternalSubject subject, LocalCredentialSnapshot snapshot)
 {

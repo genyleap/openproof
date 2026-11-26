@@ -5176,3 +5176,25 @@ separate native read after commit; no session issued. Native completion
 requires tagged reservations, as phone verification does. Legacy
 compatibility writers and exact-head executable acceptance remain open.
 No schema change.
+
+### Native MFA management storage foundation
+
+Owner-bound MFA password confirmation reads a unique active local link
+and current password/factor snapshot, releases its SQL lease, then uses
+the shared bounded KDF. Native factor installation, replacement and
+removal revalidate the exact owner/link, password and factor generation
+under recovery advisory and canonical row locks. TOTP ciphertext,
+accepted step, recovery batch deletion and a monotonic credential
+generation advance commit atomically; no plaintext seed reaches SQL.
+Same-millisecond changes invalidate stale password-authenticated session
+proofs, including enrollment/removal ABA. Old recovery batches are
+invalidated on any factor change. Existing sessions are not revoked
+by this operation, matching the prior MFA session lifecycle policy.
+This is an internal storage boundary: the runtime still needs a bounded
+pending enrollment store, code verification/encryption, IAL2 guards and
+native HTTP dispatch. Recovery issuance currently has a separate
+eligibility/read and rotation boundary; full concurrent issuance
+fencing remains open. Legacy MFA writers do not yet share these locks.
+No schema change. The LDAP implementation applies the existing scoped
+GCC16 no-inlining workaround after PR111's compiler diagnostic; no
+warning is disabled. Exact-head executable acceptance remains pending.

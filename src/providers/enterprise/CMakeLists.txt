@@ -90,6 +90,12 @@ openproof_add_module(openproof_provider_enterprise
         ${OPENPROOF_ENTERPRISE_NATIVE_LIBRARIES}
 )
 
+# Same GCC16/Asio aligned frame allocator inlining issue as Web3.
+# Keep every diagnostic enabled, including -Werror.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(enterprise.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
 if(APPLE)
     target_compile_definitions(openproof_provider_enterprise PRIVATE
         OPENPROOF_PLATFORM_APPLE=1
