@@ -40,6 +40,23 @@ preserve old ledger checksums and isolate the upgrade path. New published
 tags must be explicitly added to the inventory. Do not silently regenerate
 the recorded history to accommodate moved tags.
 
+### Development baseline round-trip
+
+Run `python3 scripts/verify-schema-baseline.py` on a PostgreSQL 16-capable
+test runner. The script creates a private temporary cluster with no TCP
+listener and no external connection string, applies only root-level neutral
+schema migrations, generates a single SQL candidate, and reconstructs a
+second empty database. It compares full schema dumps (including grants,
+constraints and indexes, excluding database-owner differences) and fresh
+data/sequence dumps. Historical customer SQL is excluded. The dedicated CI
+job runs this round-trip independently of the C++ build.
+
+Use `--emit` to obtain the candidate SQL after a successful comparison.
+The candidate is not yet the production installation baseline: the final
+schema must be frozen, upgrade history and existing-data transformations
+must be tested, and the migrator, installation packaging and release gate
+must be updated together.
+
 ## 2. Tag
 
 For a release candidate:
