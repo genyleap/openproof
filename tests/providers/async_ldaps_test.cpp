@@ -299,7 +299,7 @@ struct LocalLdaps final {
         ldap::SensitiveString{"service-secret"},
         "testuser",
         ldap::SensitiveString{"user-secret"},
-        pinned ? server.caFile : std::string{}
+        ldap::LdapsTrust::load(pinned ? server.caFile : std::string{})
     };
 }
 
@@ -412,5 +412,27 @@ TEST(AsyncLdapsTest, UntrustedUriAndDeadlineFailWithoutNetworking)
     auto timeout = request(server);
     timeout.timeout = 0ms;
     EXPECT_EQ(execute(std::move(timeout)).failure,
+              ldap::LdapsFailure::InvalidConfiguration);
+}
+
+TEST(AsyncLdapsTest, PreparedPrivateCaIsNotReopenedDuringAuthentication)
+{
+    LocalLdaps server;
+    auto proof = request(server);
+    ASSERT_TRUE(proof.trust);
+    ASSERT_TRUE(std::filesystem::remove(server.caFile));
+    EXPECT_FALSE(ldap::LdapsTrust::load(server.caFile));
+    server.start();
+    const auto result = execute(std::move(proof));
+    EXPECT_TRUE(result.success());
+    EXPECT_EQ(result.subject, "directory-user-27");
+}
+
+TEST(AsyncLdapsTest, MissingPreparedTrustFailsBeforeNetworking)
+{
+    LocalLdaps server;
+    auto proof = request(server);
+    proof.trust.reset();
+    EXPECT_EQ(execute(std::move(proof)).failure,
               ldap::LdapsFailure::InvalidConfiguration);
 }

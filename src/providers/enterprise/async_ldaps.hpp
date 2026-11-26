@@ -31,6 +31,24 @@ private:
     std::unique_ptr<std::string> m_value;
 };
 
+// A startup-prepared TLS context. The object exposes no mutation after
+// construction; each request gets its own SSL stream and hostname check.
+// Explicit CA files are loaded once, never opened from authenticate().
+class LdapsTrust final {
+public:
+    [[nodiscard]] static std::shared_ptr<const LdapsTrust>
+    load(std::string_view caFile) noexcept;
+    ~LdapsTrust();
+    LdapsTrust(const LdapsTrust&) = delete;
+    LdapsTrust& operator=(const LdapsTrust&) = delete;
+
+private:
+    friend class AsyncLdapsClient;
+    class Impl;
+    explicit LdapsTrust(std::unique_ptr<Impl> implementation) noexcept;
+    std::unique_ptr<Impl> m_implementation;
+};
+
 struct LdapsRequest final {
     // A previously validated ldaps:// endpoint, not supplied by HTTP users.
     std::string uri;
@@ -43,7 +61,7 @@ struct LdapsRequest final {
     SensitiveString servicePassword;
     std::string username;
     SensitiveString userPassword;
-    std::string caFile;
+    std::shared_ptr<const LdapsTrust> trust;
     // Trusted internal budget; production uses 10s and tests may tighten it.
     std::chrono::milliseconds timeout{10000};
 
