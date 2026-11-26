@@ -330,6 +330,16 @@ AuthenticationHttpApi::AuthenticationHttpApi(
 {
 }
 
+AuthenticationHttpApi::AuthenticationHttpApi(
+    AuthenticationService& authentication, session::CoroutineReplacingSessionIssuer& sessions,
+    gateway::TokenBucketRateLimiter& rateLimiter, idp::ProviderId provider,
+    gateway::HttpHandler& fallback)
+    : m_authentication(&authentication), m_sessions(nullptr),
+      m_asyncSessions(&sessions), m_recoveryCodes(nullptr), m_localAccounts(nullptr),
+      m_rateLimiter(&rateLimiter), m_provider(std::move(provider)), m_fallback(&fallback)
+{
+}
+
 gateway::HttpResponse AuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request,
     bool clearPreauthentication) const
@@ -353,6 +363,12 @@ gateway::HttpResponse AuthenticationHttpApi::handle(gateway::HttpRequest request
 {
     if (request.path() != "/auth" && !request.path().starts_with("/auth/")) {
         return m_fallback->handle(std::move(request));
+    }
+    // Runtime construction has no legacy service dependencies. Fail closed
+    // even if a listener or middleware accidentally invokes sync dispatch.
+    if (m_sessions == nullptr) {
+        SensitiveAuthRequestGuard wipeRequestOnExit{request};
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
     }
     if (!m_rateLimiter->allow(std::string{"auth-ip:"} + std::string{request.remoteAddress()})) {
         return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);

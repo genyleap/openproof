@@ -1404,14 +1404,20 @@ addProtectedRoutes(gateway::Router& router,
             "Native protected gateway requires authentication without delegated OIDC."});
         return ExitCode::ConfigurationError;
     }
-    // Keep the local login pilot independent of LDAP and legacy OAuth.
+    // Authentication-enabled runtimes always use native local credentials.
     const auto nativeLocalFlag = environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN");
     if (nativeLocalFlag && *nativeLocalFlag != "0" && *nativeLocalFlag != "1") {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
             "OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeLocalEnabled = nativeLocalFlag && *nativeLocalFlag == "1";
+    if (platform.auth().enabled() && nativeLocalFlag && *nativeLocalFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Synchronous local HTTP login is retired; the native route cannot be disabled."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeLocalEnabled = platform.auth().enabled()
+        || (nativeLocalFlag && *nativeLocalFlag == "1");
     if (nativeLocalEnabled && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native local login requires enabled authentication."});
@@ -1520,9 +1526,7 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
     const bool nativeWeb3Enabled = nativeWeb3Flag && *nativeWeb3Flag == "1";
-    // Session rotation/revocation has its own native SQL service and HTTP
-    // listener. Enable only these three methods; do not infer readiness of
-    // password login, OAuth or recovery-code issuance.
+    // First-party rotation and revocation use the native SQL listener.
     const auto nativeAuthSessionFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
     if (nativeAuthSessionFlag && *nativeAuthSessionFlag != "0"
@@ -1532,8 +1536,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAuthSessionEnabled =
-        nativeAuthSessionFlag && *nativeAuthSessionFlag == "1";
+    if (platform.auth().enabled() && nativeAuthSessionFlag && *nativeAuthSessionFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Synchronous HTTP session mutation is retired; native sessions cannot be disabled."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAuthSessionEnabled = platform.auth().enabled()
+        || (nativeAuthSessionFlag && *nativeAuthSessionFlag == "1");
     const auto nativeAdminReadFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS");
     if (nativeAdminReadFlag && *nativeAdminReadFlag != "0" && *nativeAdminReadFlag != "1") {
@@ -1547,8 +1556,7 @@ addProtectedRoutes(gateway::Router& router,
             "Native administration reads require native authentication sessions and authentication API."});
         return ExitCode::ConfigurationError;
     }
-    // Recovery-code issuance is separately opted in and uses only native
-    // session authentication and tenant-scoped canonical eligibility reads.
+    // Recovery issuance requires native session and canonical eligibility.
     const auto nativeRecoveryFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES");
     if (nativeRecoveryFlag && *nativeRecoveryFlag != "0"
@@ -1557,8 +1565,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeRecoveryEnabled =
-        nativeRecoveryFlag && *nativeRecoveryFlag == "1";
+    if (platform.auth().enabled() && nativeRecoveryFlag && *nativeRecoveryFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Synchronous HTTP recovery issuance is retired; native recovery cannot be disabled."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeRecoveryEnabled = platform.auth().enabled()
+        || (nativeRecoveryFlag && *nativeRecoveryFlag == "1");
     if (nativeRecoveryEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native recovery-code issuance requires native authentication sessions and authentication API."});
@@ -1850,8 +1863,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
             return ExitCode::ConfigurationError;
         }
-        // One KDF worker in the initial runtime pilot; do not reserve
-        // memory for passwords on installations that leave it disabled.
+        // One bounded KDF worker; public-only installations need no worker.
         auto worker = credentials::BoundedPasswordExecutor::create(std::move(hasher).value(), 1U);
         if (!worker) {
             reportStartupFailure(worker.error());
@@ -2652,6 +2664,22 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
+    // The authenticated runtime has no compatibility fallback for these
+    // six endpoints. Validate the complete dependency set before composing
+    // any HTTP middleware or starting the listener.
+    if (!nativeLocalEnabled || !nativeAuthSessionEnabled || !nativeRecoveryEnabled
+        || !nativeLocalAuthentication || !nativeSessions || !nativeCanonical) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native first-party authentication runtime is incomplete."});
+        return ExitCode::ConfigurationError;
+    }
+#ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
+    if (!nativeRecoveryCodes) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native recovery runtime is incomplete."});
+        return ExitCode::ConfigurationError;
+    }
+#endif
     std::optional<passkey::PasskeyService> passkeyService;
     if (passkeyConfig) {
         passkeyService.emplace(passkeyRepository, externalIdentities, clock, *passkeyConfig);
@@ -3062,7 +3090,7 @@ addProtectedRoutes(gateway::Router& router,
             nativeMethods.emplace_back("/admin/local-members", gateway::HttpMethod::Get);
         }
         if (nativeRecoveryEnabled) {
-            nativeMethods.emplace_back("/auth/recovery-codes", gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/auth/recovery-codes");
         }
         if (nativeConsentEnabled) {
             nativeMethods.emplace_back("/oauth/consents", gateway::HttpMethod::Get);
@@ -3125,8 +3153,8 @@ addProtectedRoutes(gateway::Router& router,
         // Keep the synchronous compatibility chain unchanged for other routes.
         if (nativeLocalEnabled) {
             authHttp::AuthenticationHttpApi nativeLocalApi{
-                *nativeLocalAuthentication, sessions, recoveryCodes.value(), *accounts.value(),
-                limiter.value(), providerId, fallback, nativeSessions.get()};
+                *nativeLocalAuthentication, *nativeSessions,
+                limiter.value(), providerId, fallback};
             authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
                 nativeAuthentication ? *nativeAuthentication : authentication,
                 sessions, limiter.value(), nativeLocalApi, nativeSessions.get()};
@@ -3228,7 +3256,7 @@ addProtectedRoutes(gateway::Router& router,
             identity::OrganizationId{std::string{platform.auth().organizationId()}},
             providerId, clock, gatewayCore};
         authHttp::AuthenticationHttpApi authApi{
-            authentication, sessions, recoveryCodes.value(), *accounts.value(),
+            *nativeLocalAuthentication, *nativeSessions,
             limiter.value(), providerId, administrationApi};
         authHttp::FederatedAuthenticationHttpApi federatedApi{
             authentication, providers, sessions, limiter.value(), authApi};
@@ -3326,7 +3354,7 @@ addProtectedRoutes(gateway::Router& router,
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
         providerId, clock, gatewayCore};
     authHttp::AuthenticationHttpApi authApi{
-        authentication, sessions, recoveryCodes.value(), *accounts.value(),
+        *nativeLocalAuthentication, *nativeSessions,
         limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
         authentication, providers, sessions, limiter.value(), authApi, &tokenService};

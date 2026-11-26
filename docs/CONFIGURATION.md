@@ -991,19 +991,18 @@ and other OAuth methods retain the existing compatibility path. Do not
 enable this experimental option before exact-head compiled and real
 PostgreSQL/HTTP acceptance has passed.
 
-### Experimental native recovery-code issuance
+### Native recovery-code issuance
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` enables only
-`POST /auth/recovery-codes` with a valid first-party session at IAL2 or
-higher. Default is disabled; native authentication sessions and the
-active authentication API are mandatory. Builds explicitly configured with
-`OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=OFF` reject the runtime opt-in.
+`POST /auth/recovery-codes` always uses the native path when authentication
+is enabled. Native sessions and active authentication are mandatory.
+The historical `OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES=1` remains
+accepted; `0` is rejected for authenticated installations. Builds with
+`OPENPROOF_EXPERIMENTAL_ASYNC_RECOVERY_HTTP=OFF` cannot start an authenticated runtime.
 Native eligibility reads use the configured organization and local provider;
 issuance and the legacy repository share the same identity-scoped transaction
 lock and key material. Before returning plaintext, the native HTTP adapter
 rechecks eligibility and revokes codes on a failed recheck. The existing login
-and MFA verification paths redeem the same digests once. This capability is
-experimental, not approval of the remaining migration or concurrent TOTP
+and MFA verification paths redeem the same digests once. This cutover does not approve the remaining migration or concurrent TOTP
 lifecycle acceptance.
 
 #### LDAP certificate trust lifecycle
@@ -1019,13 +1018,20 @@ use (system certificate-directory lookup is governed by OpenSSL). LDAP native
 routing remains explicitly experimental and default-off.
 
 
-### Native local login development pilot
+### Native first-party HTTP authentication
 
-OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN=1 enables the native
-/auth/login and /auth/mfa/verify paths only. It requires enabled
-authentication and uses the configured password algorithm, credential
-encryption key/version, recovery pepper and tenant. One dedicated
-bounded KDF worker is allocated; the ordinary provider registry remains
-available for unmigrated OAuth operations. No other route is enabled by
-this switch. Unset or 0 retains the compatibility path. This is a
-development acceptance switch, not an approved production default.
+Authenticated runtimes use native password login, MFA verification,
+session rotation, logout, logout-all and recovery-code issuance without
+an opt-in. The configured password algorithm, credential-encryption
+key/version, recovery pepper and tenant remain authoritative. One
+dedicated bounded KDF worker is allocated. The ordinary provider
+registry remains available for unmigrated OAuth operations.
+
+The historical switches OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN,
+OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS and
+OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES accept 1 for compatibility
+with existing deployment configuration. Setting any to 0 while
+authentication is enabled rejects startup before database migration;
+there is no synchronous HTTP fallback. Public-only installations do
+not allocate these dependencies. This is a candidate cutover, not
+approval for deployment before the global coroutine release gate.

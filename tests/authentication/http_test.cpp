@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <boost/json.hpp>
+#include <boost/asio/awaitable.hpp>
 
 #include "../../src/authentication/http/web3_presentation.hpp"
 
@@ -460,6 +461,39 @@ struct Fixture {
     std::unique_ptr<authHttp::AuthenticationHttpApi> api;
     std::string totpCode;
 };
+
+class NeverIssueNativeSession final : public sess::CoroutineReplacingSessionIssuer {
+public:
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueAsync(const auth::VerifiedAuthentication&,idp::ClientContext) override {
+        ++calls;
+        co_return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    boost::asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>>
+    issueReplacingAsync(const auth::VerifiedAuthentication&,idp::ClientContext,
+                        std::optional<fnd::SecretString>) override {
+        ++calls;
+        co_return fnd::fail(fnd::ErrorCode::Unavailable);
+    }
+    int calls{};
+};
+
+TEST(AuthenticationHttpApiTest, NativeRuntimeConstructorCannotDispatchLegacyAuthentication)
+{
+    Fixture fixture;
+    NeverIssueNativeSession issuer;
+    authHttp::AuthenticationHttpApi api{
+        *fixture.authentication,issuer,fixture.limiter,idp::ProviderId{"local"},fixture.fallback};
+    for (const auto route:{"/auth/login","/auth/mfa/verify","/auth/session/rotate",
+                           "/auth/logout","/auth/logout-all","/auth/recovery-codes"}) {
+        EXPECT_EQ(api.handle(request(route,R"({"subject":"alice"})")).status(),503)
+            << route;
+    }
+    EXPECT_EQ(fixture.transactions.size(),0U);
+    EXPECT_EQ(fixture.sessionRepository.size(),0U);
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(api.handle(request("/non-auth",{})).status(),418);
+}
 
 TEST(AuthenticationHttpApiTest, LoginMfaRecoveryRotationAndLogoutAreEndToEnd)
 {

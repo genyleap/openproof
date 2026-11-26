@@ -30,6 +30,14 @@ public:
                           gateway::HttpHandler& fallback,
                           session::CoroutineReplacingSessionIssuer* asyncSessions = nullptr);
 
+    // Runtime constructor: no synchronous credential, recovery or session
+    // service is accepted. Other auth routes are mounted by native adapters.
+    AuthenticationHttpApi(AuthenticationService& authentication,
+                          session::CoroutineReplacingSessionIssuer& sessions,
+                          gateway::TokenBucketRateLimiter& rateLimiter,
+                          identity::provider::ProviderId provider,
+                          gateway::HttpHandler& fallback);
+
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override {
         // Native capability is per handler, not per endpoint. Until rotation,

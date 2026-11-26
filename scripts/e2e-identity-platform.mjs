@@ -1076,7 +1076,7 @@ async function main() {
 
     const consumerJar = new CookieJar();
     const consumerGrant = await login("consumer@e2e.invalid", consumerPassword, consumerJar);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1") {
+    if (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1") {
       assert.equal(consumerGrant.assurance, "ial1");
       const sql = statement => command("psql", [
         databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c", statement,
@@ -1303,7 +1303,7 @@ async function main() {
     const ownerGrant = await login(
       "owner@e2e.invalid", ownerPassword, ownerJar, initialOwnerTotp);
     assert.equal(ownerGrant.assurance, "ial2");
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1") {
+    if (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1") {
       const countOwnerSessions = () => command("psql", [
         databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
         "SELECT count(*) FROM openproof.sessions WHERE identity_id='e2e-owner'",
@@ -1330,7 +1330,7 @@ async function main() {
       assert.deepEqual(jsonBody(status), { available: true, enabled: true, assurance: "ial2" });
       assert.equal(status.headers["cache-control"], "no-store");
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES === "1") {
+    if (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1") {
       const countCodes = () => Number(command("psql", [
         databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
         "select count(*) from openproof.recovery_codes where identity_id='e2e-owner'",
@@ -1375,7 +1375,7 @@ async function main() {
       await recover(fresh[0], 401);
       assert.equal(countCodes(), 9);
       console.log("- native recovery issuance and " +
-        (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN === "1" ? "native" : "legacy") +
+        (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1" ? "native" : "legacy") +
         " one-time redemption: IAL2, rotation, persistence and replay passed");
     }
     const adminConsole = await edgeRequest("/admin/console", { jar: ownerJar });

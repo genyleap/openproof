@@ -4716,3 +4716,18 @@ denial and binding-failure burn. This test establishes the compatibility
 precondition for retiring legacy federation transport without abandoning
 in-flight browser transactions. It does not by itself authorize default
 activation of native callbacks or removal of compatibility handlers.
+
+### Mandatory native first-party authentication runtime
+
+The authenticated executable now requires native local login, native
+session mutations and native recovery issuance. Their historical flags
+may be unset or 1; explicitly disabling any rejects startup before
+migration. All three AuthenticationHttpApi constructions in opp use
+the native-only constructor, which has no synchronous session,
+credential or recovery dependencies. Six exact paths fail closed rather
+than fall back. Existing library compatibility constructor/methods
+remain for the old in-memory regressions; this increment does not remove
+them from the library or claim a passing global HTTP authentication gate.
+Default candidate E2E exercises native proof and recovery behavior;
+only the pinned historical benchmark sets OPENPROOF_E2E_EXPECT_LEGACY_AUTH.
+Full compiled and disposable HTTP acceptance is required before release.
