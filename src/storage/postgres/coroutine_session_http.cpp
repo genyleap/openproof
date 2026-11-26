@@ -76,6 +76,10 @@ asio::awaitable<gateway::HttpResponse> sessionMutation(
     gateway::HttpRequest request)
 {
     SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    // These endpoints consume only the session credential and path. Erase
+    // unused body/query bytes before any database suspension or denial.
+    request.wipeBody();
+    request.wipeTargetQuery();
     if (!limiter.allow(
             std::string{"auth-ip:"} + std::string{request.remoteAddress()})) {
         co_return clientError(
