@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install lint tools
         run: sudo apt-get update -qq && sudo apt-get install -y shellcheck python3
       - name: Shellcheck
@@ -32,6 +34,8 @@ jobs:
             scripts/backup-postgres.sh scripts/restore-postgres.sh
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
+      - name: Pinned release schema checksum inventory
+        run: python3 scripts/inventory-release-schema.py --check
       - name: CSPRNG temporary entropy and zeroization regression
         run: node scripts/test-security-random-wipe.mjs
       - name: OpenAPI coverage
