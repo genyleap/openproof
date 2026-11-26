@@ -1,6 +1,7 @@
 module;
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -24,6 +25,9 @@ module;
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #if OPENPROOF_PLATFORM_APPLE
 #include <LDAP/ldap.h>
@@ -814,14 +818,19 @@ public:
     Implementation(SamlProviderConfig providerConfig,
                    const foundation::ClockSource& clockSource)
         : config(std::move(providerConfig)), clock(&clockSource) {}
+    foundation::Result<idp::AuthenticationOutcome> verify(const idp::AuthenticationResponse& response) const;
     SamlProviderConfig config;
     const foundation::ClockSource* clock;
+    // XML parsing and RSA signature verification must not occupy the I/O
+    // reactor. Exactly one admitted operation; no unbounded work queue.
+    std::atomic<bool> busy{false};
+    boost::asio::thread_pool worker{1U};
 };
 
 SamlAuthenticationProvider::SamlAuthenticationProvider(SamlProviderConfig config,
                                                        const foundation::ClockSource& clock)
     : m_implementation(std::make_unique<Implementation>(std::move(config), clock)) {}
-SamlAuthenticationProvider::~SamlAuthenticationProvider() = default;
+SamlAuthenticationProvider::~SamlAuthenticationProvider() { m_implementation->worker.join(); }
 idp::ProviderId SamlAuthenticationProvider::id() const { return idp::ProviderId{"saml"}; }
 idp::InteractionModel SamlAuthenticationProvider::interactionModel() const noexcept { return idp::InteractionModel::Redirect; }
 idp::AssuranceLevel SamlAuthenticationProvider::maximumClaimableAssurance() const noexcept { return idp::AssuranceLevel::Ial1; }
@@ -860,8 +869,8 @@ foundation::Result<idp::AuthenticationChallenge> SamlAuthenticationProvider::beg
     return challenge;
 }
 
-foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::completeAuthentication(
-    const idp::AuthenticationResponse& response)
+foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::Implementation::verify(
+    const idp::AuthenticationResponse& response) const
 {
     const auto assertionIt = response.parameters().find("SAMLResponse");
     const auto relayIt = response.parameters().find("RelayState");
@@ -869,7 +878,6 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
         || assertionIt->second.empty() || relayIt->second.empty()) {
         return foundation::fail(authenticationFailure("The SAML callback is incomplete."));
     }
-    const auto& config = m_implementation->config;
     const std::string expectedRelay = hmacToken(config.m_derivationKey, "saml-relay", response.challengeId().value());
     if (expectedRelay.empty() || !security::constantTimeEquals(expectedRelay, relayIt->second.expose())) {
         return foundation::fail(authenticationFailure("The SAML RelayState is invalid."));
@@ -902,7 +910,7 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     auto assertions = children(root, "Assertion", kSamlAssertion);
     if (assertions.size() != 1U) return foundation::fail(authenticationFailure("The SAML response must contain exactly one assertion."));
     xmlNodePtr assertion = assertions.front();
-    const auto now = m_implementation->clock->now();
+    const auto now = clock->now();
     const bool responseSigned = uniqueChild(root, "Signature", kXmlDsig) != nullptr;
     const bool assertionSigned = uniqueChild(assertion, "Signature", kXmlDsig) != nullptr;
 
@@ -989,10 +997,69 @@ foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::compl
     evidence.add("protocol", "saml2");
     evidence.add("idp_entity_id", config.m_idpEntityId);
     evidence.add("signature", responseSigned && assertionSigned ? "response+assertion" : (responseSigned ? "response" : "assertion"));
-    return idp::AuthenticationOutcome::create(id(), idp::ExternalSubject{externalSubject}, std::move(claims),
+    return idp::AuthenticationOutcome::create(idp::ProviderId{"saml"}, idp::ExternalSubject{externalSubject}, std::move(claims),
         idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{},
         std::move(evidence), now);
+}
+
+foundation::Result<idp::AuthenticationOutcome> SamlAuthenticationProvider::completeAuthentication(
+    const idp::AuthenticationResponse& response)
+{
+    return m_implementation->verify(response);
+}
+
+namespace {
+struct SamlPermit final {
+    explicit SamlPermit(std::atomic<bool>& active) noexcept : busy(&active) {}
+    SamlPermit(SamlPermit&& other) noexcept : busy(std::exchange(other.busy,nullptr)) {}
+    SamlPermit(const SamlPermit&)=delete;
+    SamlPermit& operator=(const SamlPermit&)=delete;
+    ~SamlPermit() { if (busy) busy->store(false,std::memory_order_release); }
+    std::atomic<bool>* busy;
+};
+
+template<class Verifier>
+boost::asio::awaitable<std::optional<foundation::Result<idp::AuthenticationOutcome>>>
+verifySamlWorker(SamlPermit permit,const Verifier& provider,
+                 idp::AuthenticationResponse response)
+{
+    // The frame owns admission even if its waiting HTTP coroutine cancels.
+    static_cast<void>(permit);
+    co_return std::optional<foundation::Result<idp::AuthenticationOutcome>>{provider.verify(response)};
+}
+}
+
+boost::asio::awaitable<foundation::Result<idp::AuthenticationChallenge>>
+SamlAuthenticationProvider::beginAuthenticationAsync(idp::AuthenticationRequest request)
+{
+    // Local, bounded request construction; no network or untrusted XML.
+    co_return beginAuthentication(request);
+}
+
+boost::asio::awaitable<foundation::Result<idp::AuthenticationOutcome>>
+SamlAuthenticationProvider::completeAuthenticationAsync(idp::AuthenticationResponse response)
+{
+    const auto& fields=response.parameters();
+    const auto assertion=fields.find("SAMLResponse");
+    const auto relay=fields.find("RelayState");
+    if (fields.size()!=2U || assertion==fields.end() || relay==fields.end()
+        || assertion->second.empty() || assertion->second.expose().size()>900U*1024U
+        || relay->second.empty() || relay->second.expose().size()>512U)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    bool expected=false;
+    if (!m_implementation->busy.compare_exchange_strong(expected,true,std::memory_order_acq_rel))
+        co_return foundation::fail(foundation::ErrorCode::RateLimited);
+    SamlPermit permit{m_implementation->busy};
+    try {
+        auto result=co_await boost::asio::co_spawn(m_implementation->worker,
+            verifySamlWorker(std::move(permit),*m_implementation,std::move(response)),
+            boost::asio::use_awaitable);
+        if (!result) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+        co_return std::move(*result);
+    } catch (...) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
 }
 
 } // namespace openproof::provider::enterprise

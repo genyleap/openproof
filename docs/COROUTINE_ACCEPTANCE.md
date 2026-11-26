@@ -4759,3 +4759,16 @@ exits. New provider-neutral callback regressions cover successful form POST,
 provider-selection independence, malformed proof rejection and replay.
 SAML assertion verification and full provider transport retirement remain
 separate work; no default cutover for federation is made by this increment.
+
+### Native SAML assertion completion
+
+The existing SAML signature and assertion verifier is reused on a dedicated
+single-worker executor, with one admission permit held in the work frame
+until verification finishes (including waiter cancellation). The provider
+declares the SAML proof family, checked against the consumed transaction
+before dispatch. HTTP POST accepts only an isolated SAMLResponse/RelayState
+pair within the previous 1 MiB encoded body and 900 KiB assertion limits.
+GET and mixed OAuth/SAML proofs are rejected. Tests cover wire dispatch,
+provider mismatch, replay and bounded worker architecture. Full signed
+SAML interoperability, worker cancellation/saturation and exact-head
+compiled acceptance remain required before mandatory federation cutover.

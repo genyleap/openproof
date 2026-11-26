@@ -128,7 +128,8 @@ private:
 };
 
 /** @brief SAML 2.0 Redirect/AuthnRequest + POST/XMLDSIG authentication provider. */
-class SamlAuthenticationProvider final : public identity::provider::AuthenticationProvider {
+class SamlAuthenticationProvider final : public identity::provider::AuthenticationProvider,
+    public identity::provider::CoroutineAuthenticationProvider {
 public:
     SamlAuthenticationProvider(SamlProviderConfig config,
                                const foundation::ClockSource& clock);
@@ -141,6 +142,13 @@ public:
     beginAuthentication(const identity::provider::AuthenticationRequest& request) override;
     [[nodiscard]] foundation::Result<identity::provider::AuthenticationOutcome>
     completeAuthentication(const identity::provider::AuthenticationResponse& response) override;
+
+    [[nodiscard]] identity::provider::RedirectProofKind redirectProofKind() const noexcept override
+    { return identity::provider::RedirectProofKind::SamlAssertion; }
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::provider::AuthenticationChallenge>>
+    beginAuthenticationAsync(identity::provider::AuthenticationRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::provider::AuthenticationOutcome>>
+    completeAuthenticationAsync(identity::provider::AuthenticationResponse response) override;
 
 private:
     class Implementation;

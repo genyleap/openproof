@@ -252,7 +252,7 @@ protected:
     AuthenticationProvider() = default;
 };
 
-enum class RedirectProofKind { AuthorizationCode, OAuth1 };
+enum class RedirectProofKind { AuthorizationCode, OAuth1, SamlAssertion };
 
 /**
  * @brief Provider-neutral optional capability for asynchronous verification.

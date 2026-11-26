@@ -760,8 +760,9 @@ suspension. Both flags accept only `0` or `1`.
 are supported with disjoint proof shapes and provider-bound transactions.
 Cookie-authenticated account connection start and one-time browser handoff
 issuance/redemption also use the native path. Link callbacks cannot mint a
-login session. SAML and non-native providers remain unsupported by
-the experimental callback. Delegated Bearer connection initiation and
+login session. SAML assertion POST also has a native transaction-bound path with a bounded
+XML verification worker. Non-native providers remain unsupported by the
+experimental callback. Delegated Bearer connection initiation and
 handoff issuance still use compatibility. Do not enable the paired flags
 for mixed deployments until all required ceremonies have been validated.
 
