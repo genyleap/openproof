@@ -23,9 +23,11 @@
 
 #include "async_pool.hpp"
 #include "coroutine_canonical_finalizer.hpp"
+#include "coroutine_consent_store.hpp"
 #include "coroutine_session_authenticator.hpp"
 
 import openproof.authentication;
+import openproof.consent;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
@@ -949,6 +951,133 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
     ASSERT_TRUE(refreshedResult);
     auto& bounded = *refreshedResult;
     EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeConsentListAndRevokeAreTenantScopedAndBounded)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace consent = openproof::consent;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app = "consent-app-" + seed.suffix;
+    const auto client = "consent-client-" + seed.suffix;
+    const auto foreignApp = "foreign-app-" + seed.suffix;
+    const auto foreignClient = "foreign-client-" + seed.suffix;
+    for (const auto& [application, tenant, clientId] :
+         {std::tuple{app, seed.org, client}, std::tuple{foreignApp, seed.foreignOrg, foreignClient}}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.applications(id,organization_id,identifier,display_name,"
+            "environment,status,created_at_ms,updated_at_ms) VALUES($1,$2,'consent-fixture','Fixture',0,0,$3,$3)",
+            {application, tenant, "1770000000000"})));
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,"
+            "created_at_ms,updated_at_ms) VALUES($1,$2,'Fixture client',1,0,$3,$3)",
+            {clientId, application, "1770000000000"})));
+    }
+    const auto active = "consent-active-" + seed.suffix;
+    const auto expired = "consent-expired-" + seed.suffix;
+    const auto revoked = "consent-revoked-" + seed.suffix;
+    const auto other = "consent-other-" + seed.suffix;
+    auto insert = [&](const std::string& id, const std::string& owner,
+                      const std::string& clientId, const std::string& grantedAt) {
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.oauth_consents(id,identity_id,client_id,audience,granted_at_ms)"
+            " VALUES($1,$2,$3,'urn:fixture:resource',$4)", {id, owner, clientId, grantedAt}));
+        static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) VALUES($1,'write'),($1,'read')",
+            {id}));
+    };
+    ASSERT_NO_THROW(insert(active, seed.owner, client, "1769999999999"));
+    ASSERT_NO_THROW(insert(expired, seed.owner, client, "1769999999998"));
+    ASSERT_NO_THROW(insert(revoked, seed.owner, client, "1769999999997"));
+    ASSERT_NO_THROW(insert(other, seed.secondOwner, client, "1769999999999"));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.oauth_consents SET expires_at_ms=1770000000000 WHERE id=$1", {expired})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.oauth_consents SET revoked_at_ms=1769999999999 WHERE id=$1", {revoked})));
+
+    asio::io_context io;
+    pg::CoroutineConsentStore store{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, 2U, 500ms, 1000ms, 3000ms};
+    const ids::IdentityId owner{seed.owner};
+    auto list = [&](const ids::IdentityId& identity) {
+        io.restart();
+        auto pending = asio::co_spawn(io, store.listAsync(identity), asio::use_future);
+        io.run();
+        return pending.get();
+    };
+    auto revoke = [&](const std::string& grant, const ids::IdentityId& identity,
+                      fnd::Instant now = kNow) {
+        io.restart();
+        auto pending = asio::co_spawn(io, store.revokeAsync(consent::ConsentId{grant}, identity, now),
+            asio::use_future);
+        io.run();
+        return pending.get();
+    };
+    auto result = list(owner);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 3U);
+    EXPECT_EQ(result->at(0).id().value(), active);
+    EXPECT_EQ(result->at(0).identity(), owner);
+    EXPECT_EQ(result->at(0).scopes(), (std::vector<std::string>{"read", "write"}));
+    EXPECT_TRUE(result->at(0).activeAt(kNow));
+    EXPECT_EQ(result->at(1).id().value(), expired);
+    EXPECT_FALSE(result->at(1).activeAt(kNow));
+    EXPECT_EQ(result->at(2).id().value(), revoked);
+    EXPECT_FALSE(result->at(2).activeAt(kNow));
+    auto empty = list(ids::IdentityId{seed.emptyConnectionsOwner});
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->empty());
+    for (const auto& deniedOwner : {seed.lockedOwner, seed.foreignOwner, seed.suspendedOwner}) {
+        auto denied = list(ids::IdentityId{deniedOwner});
+        EXPECT_TRUE(!denied && denied.error().code() == fnd::ErrorCode::PermissionDenied);
+        auto deniedRevoke = revoke(active, ids::IdentityId{deniedOwner});
+        EXPECT_TRUE(!deniedRevoke && deniedRevoke.error().code() == fnd::ErrorCode::PermissionDenied);
+    }
+    auto wrongOwner = revoke(other, owner);
+    EXPECT_TRUE(!wrongOwner && wrongOwner.error().code() == fnd::ErrorCode::NotFound);
+    ASSERT_TRUE(revoke(active, owner));
+    ASSERT_TRUE(revoke(active, owner, kNow + 1h));
+    result = list(owner);
+    ASSERT_TRUE(result && result->size() == 3U);
+    EXPECT_EQ(result->at(0).revokedAt(), std::optional<fnd::Instant>{kNow});
+    auto otherResult = list(ids::IdentityId{seed.secondOwner});
+    ASSERT_TRUE(otherResult && otherResult->size() == 1U);
+    EXPECT_TRUE(otherResult->at(0).activeAt(kNow));
+
+    // An inconsistent cross-tenant grant must never be serialized or mutated.
+    const auto malformed = "consent-cross-tenant-" + seed.suffix;
+    ASSERT_NO_THROW(insert(malformed, seed.owner, foreignClient, "1769999999999"));
+    auto crossTenant = list(owner);
+    EXPECT_TRUE(!crossTenant && crossTenant.error().code() == fnd::ErrorCode::Unavailable);
+    auto crossRevoke = revoke(malformed, owner);
+    EXPECT_TRUE(!crossRevoke && crossRevoke.error().code() == fnd::ErrorCode::NotFound);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.oauth_consents WHERE id=$1", {malformed})));
+
+    // Oversized or scope-less grants fail closed instead of truncating.
+    const auto overflow = "consent-overflow-" + seed.suffix;
+    ASSERT_NO_THROW(insert(overflow, seed.owner, client, "1769999999999"));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.oauth_consent_scopes(consent_id,scope) "
+        "SELECT $1,'scope-' || n FROM generate_series(1,257) AS n", {overflow})));
+    auto bounded = list(owner);
+    EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.oauth_consent_scopes WHERE consent_id=$1", {overflow})));
+    auto malformedScope = list(owner);
+    EXPECT_TRUE(!malformedScope && malformedScope.error().code() == fnd::ErrorCode::Unavailable);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.oauth_consents WHERE id=$1", {overflow})));
+    ASSERT_TRUE(list(owner));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
