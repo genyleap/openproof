@@ -258,7 +258,8 @@ jobs:
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_baseline_ci
           cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
-          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
+            --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
           ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
 
 

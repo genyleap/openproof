@@ -329,6 +329,39 @@ TEST(PostgresMigrationBaselineTest, FreshSnapshotRecordsHistoricalChecksumsAndIs
     EXPECT_TRUE(pool.value()->healthCheck());
 }
 
+TEST(PostgresMigrationBaselineTest, HistoricalReleaseUpgrade)
+{
+    const char* dsn = std::getenv("OPENPROOF_TEST_HISTORICAL_POSTGRES");
+    const char* directory = std::getenv("OPENPROOF_TEST_HISTORICAL_DIRECTORY");
+    const char* pending = std::getenv("OPENPROOF_TEST_HISTORICAL_PENDING");
+    const char* ack = std::getenv("OPENPROOF_TEST_HISTORICAL_ACK");
+    if (!dsn && !directory && !pending && !ack)
+        GTEST_SKIP() << "Requires a private historical upgrade fixture.";
+    ASSERT_NE(dsn, nullptr);
+    ASSERT_NE(directory, nullptr);
+    ASSERT_NE(pending, nullptr);
+    ASSERT_NE(ack, nullptr);
+    ASSERT_STREQ(ack, "YES_EXCLUSIVE_DISPOSABLE_DATABASE");
+    ASSERT_TRUE(std::string_view{dsn}.starts_with("host=/tmp/openproof-baseline-pg."));
+    auto config = pg::PoolConfig::create(
+        fnd::SecretString{dsn}, 1U, std::chrono::seconds{2});
+    ASSERT_TRUE(config);
+    auto pool = pg::ConnectionPool::create(std::move(config).value());
+    ASSERT_TRUE(pool);
+    pg::Migrator migrator{*pool.value()};
+    auto result = migrator.applyDirectory(std::filesystem::path{directory});
+    ASSERT_TRUE(result) << (result ? "" : std::string{result.error().internalDetail()});
+    EXPECT_FALSE(result->usedBaseline);
+    EXPECT_EQ(result->applied, std::stoull(pending));
+    EXPECT_GT(result->alreadyApplied, 0U);
+    auto again = migrator.applyDirectory(std::filesystem::path{directory});
+    ASSERT_TRUE(again);
+    EXPECT_FALSE(again->usedBaseline);
+    EXPECT_EQ(again->applied, 0U);
+    EXPECT_EQ(again->alreadyApplied, result->alreadyApplied + result->applied);
+    EXPECT_TRUE(pool.value()->healthCheck());
+}
+
 TEST_F(PostgresIntegrationTest, ExistingSchemaNeverRestoresSnapshot)
 {
     const char* path = std::getenv("OPENPROOF_TEST_BASELINE_DIRECTORY");
