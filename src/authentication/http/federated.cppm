@@ -22,7 +22,8 @@ public:
                                    session::SessionService& sessions,
                                    gateway::TokenBucketRateLimiter& rateLimiter,
                                    gateway::HttpHandler& fallback,
-                                   session::DelegatedAccessAuthenticator* delegated = nullptr);
+                                   session::DelegatedAccessAuthenticator* delegated = nullptr,
+                                   bool nativeRedirectsRequired = false);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
@@ -48,6 +49,7 @@ private:
     session::DelegatedAccessAuthenticator* m_delegated;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;
+    bool m_nativeRedirectsRequired;
 };
 
 } // namespace openproof::authentication::http

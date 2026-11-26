@@ -742,9 +742,12 @@ callback. Historical OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_START and
 OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK accept unset or 1;
 setting either to 0 rejects startup. Native browser redirects support
 OAuth2 GET/form POST, OAuth1 GET and SAML POST, using the same durable
-transaction schema. GitHub's synchronous completion SPI is retired.
+transaction schema. GitHub, OIDC and X synchronous network SPIs are retired.
 Delegated Bearer connection start and handoff issuance retain their
-compatibility authorization path; callback completion is native. This
+compatibility authorization path. Direct delegated connection start now
+redirects to a short-lived one-time local handoff URL; navigate to that URL
+in the browser without the Authorization header. Native redemption starts
+the external provider exchange and callback completion stays native. This
 candidate is not approved for production until compiled, signed-assertion
 and full federation runtime acceptance are complete.
 

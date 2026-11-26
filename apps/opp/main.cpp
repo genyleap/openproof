@@ -3266,7 +3266,7 @@ addProtectedRoutes(gateway::Router& router,
             *nativeLocalAuthentication, *nativeSessions,
             limiter.value(), providerId, administrationApi};
         authHttp::FederatedAuthenticationHttpApi federatedApi{
-            authentication, providers, sessions, limiter.value(), authApi};
+            authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
         return runWithAccount(federatedApi, nullptr);
     }
 
@@ -3364,7 +3364,7 @@ addProtectedRoutes(gateway::Router& router,
         *nativeLocalAuthentication, *nativeSessions,
         limiter.value(), providerId, administrationApi};
     authHttp::FederatedAuthenticationHttpApi federatedApi{
-        authentication, providers, sessions, limiter.value(), authApi, &tokenService};
+        authentication, providers, sessions, limiter.value(), authApi, &tokenService, true};
     oauthHttp::OAuthHttpApi oauthApi{
         authorizationService, tokenService, openIdProvider, clientManager,
         authentication, sessions, providerId, consentService, resourceRegistry,

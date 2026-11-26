@@ -4786,3 +4786,18 @@ local GitHub redirect challenge, but cannot complete remote proof on a
 blocking worker. The updated source gate checks actual native exchanges
 and runtime wiring as well as absence of the retired bridge. This is
 source-level progress; compiled/runtime verification remains outstanding.
+
+### OIDC and X blocking exchange retirement
+
+Removed duplicated synchronous discovery, token, JWKS, UserInfo and
+OAuth1 request/access token exchanges. Both synchronous remote-provider
+entry points now deny rather than performing network I/O. The authenticated
+runtime compatibility federation handler requires native redirects and
+rejects synchronous callback/redemption; an authorized delegated direct
+connection start instead issues the existing one-time owner-bound handoff.
+The browser follows that local URL without forwarding the Bearer token.
+This is an intentional additional redirect for direct delegated clients.
+The native redemption and callback paths preserve provider/owner binding.
+Source gates require the actual native outbound exchanges and runtime
+handoff wiring. Exact-head runtime and external-provider acceptance remain
+mandatory; source results are not release approval.

@@ -128,7 +128,7 @@ const checked = segments.map(([name, relative]) => {
   ].includes(relative)){
     const target = relative.endsWith("/web3.cpp") ? "rpcAsync" : "httpsRequestAsync";
     const legacyBridge = /asio::co_spawn\s*\(\s*io\s*,\s*(?:httpsRequestAsync|rpcAsync)\s*\(/;
-    if(relative!=="src/providers/github/github.cpp" && !legacyBridge.test(source))
+    if(relative==="src/providers/web3/web3.cpp" && !legacyBridge.test(source))
       issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
         expression:"co_spawn(io, "+target+"(...))"});
     // Even with native transport, this legacy facade waits synchronously
@@ -136,6 +136,33 @@ const checked = segments.map(([name, relative]) => {
     if(/\bio\.run\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
+  }
+  if (["src/providers/oidc/oidc.cpp","src/providers/x/x.cpp"].includes(relative)) {
+    const oidc=relative.includes("/oidc/");
+    const type=oidc?"OidcAuthenticationProvider":"XAuthenticationProvider";
+    const sync=executable.slice(executable.indexOf(type+"::beginAuthentication("),
+      executable.indexOf(type+"::beginAuthenticationAsync("));
+    const native=executable.slice(executable.indexOf(type+"::beginAuthenticationAsync("));
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const legacy=fs.readFileSync(path.join(root,"src/authentication/http/federated.cpp"),"utf8");
+    const nativeStart=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_start_http.cpp"),"utf8");
+    const nativeCallback=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+    if ((sync.match(/return foundation::fail\(foundation::ErrorCode::Unavailable,/g)||[]).length!==2
+        || /\b(?:httpsRequest|io_context|use_future|completion\.get|discovery)\s*\(/.test(executable)
+        || (executable.match(/co_await httpsRequestAsync\(/g)||[]).length!==(oidc?4:2)
+        || (oidc && (native.match(/co_await m_implementation->discoveryAsync\(/g)||[]).length!==2))
+      issues.push({line:0,kind:"redirect provider retains a blocking path or misses native exchanges",
+        expression:type+" native start and completion"});
+    if (!app.includes("authApi, nullptr, true}")
+        || !app.includes("authApi, &tokenService, true}")
+        || !app.includes('nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get)')
+        || !legacy.includes("if (m_nativeRedirectsRequired)")
+        || !legacy.includes("m_authentication->issueBrowserConnectionHandoff(*connectionTarget,")
+        || !nativeStart.includes("co_await m_authentication->consumeBrowserConnectionHandoffAsync(")
+        || !nativeStart.includes("co_await m_authentication->beginConnectionAsync(")
+        || !nativeCallback.includes("co_await m_authentication->completeConnectionAsync("))
+      issues.push({line:0,kind:"delegated connection initiation can bypass native federation",
+        expression:"runtime-required native browser handoff and callback"});
   }
   if(relative==="src/providers/x/x.cpp"){
     const signing=source.slice(source.indexOf("oauthAuthorization("),
