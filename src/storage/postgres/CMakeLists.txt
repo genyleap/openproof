@@ -38,6 +38,9 @@ openproof_add_module(openproof_migration_package
     SOURCES migration_package.cpp
     LINK_PUBLIC openproof_foundation openproof_security)
 
+# Compatibility repository regression fixtures only. Production targets
+# must link the independently built native storage components below.
+if(OPENPROOF_BUILD_TESTS)
 openproof_add_module(openproof_storage_postgres
     MODULES
         postgres.cppm
@@ -72,6 +75,7 @@ openproof_add_module(openproof_storage_postgres
         openproof_postgres_async_io
         openproof_migration_package
 )
+endif()
 
 add_library(openproof_postgres_async_startup STATIC coroutine_startup.cpp)
 target_compile_features(openproof_postgres_async_startup PUBLIC cxx_std_26)

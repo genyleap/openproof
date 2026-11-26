@@ -7,6 +7,7 @@
 #include <variant>
 
 import openproof.administration;
+import openproof.credentials;
 import openproof.audit;
 import openproof.foundation;
 import openproof.identity.core;
@@ -16,6 +17,17 @@ import openproof.security;
 namespace openproof::credentials { class BoundedPasswordExecutor; }
 
 namespace openproof::storage::postgres {
+// Offline ceremonies never run on an HTTP reactor. The caller must stop the
+// server before invoking them; SQL uses a finite socket-driven event loop.
+[[nodiscard]] foundation::Status initializeAdministratorOffline(
+    foundation::SecretString dsn,const administration::InitialAdministrator& administrator,
+    const credentials::PasswordHasher& hasher,const security::AeadKey& totpKey,
+    std::uint32_t keyVersion,const identity::provider::ProviderId& provider,const audit::AuditKey& auditKey);
+[[nodiscard]] foundation::Status repairInitialOwnerOffline(
+    foundation::SecretString dsn,const identity::core::OrganizationId& organization,
+    const identity::core::IdentityId& identity,const identity::provider::ProviderId& provider,
+    foundation::Instant now,const audit::AuditKey& auditKey);
+
 // Owns the same tenant, credential encryption policy and audit key as the
 // existing administration SPI. Commands are owned by the awaiting caller.
 class CoroutineAdminStore final {

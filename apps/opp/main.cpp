@@ -119,7 +119,6 @@ import openproof.provider.web3;
 import openproof.provider.enterprise;
 import openproof.security;
 import openproof.session;
-import openproof.storage.postgres;
 import openproof.telemetry;
 import openproof.token;
 
@@ -1024,25 +1023,13 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
     const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresCredentialRekeyer rekeyer{*pool.value()};
-    auto report = rekeyer.rotateTotp(
+    auto report = postgres::rekeyTotpOffline(
+        platform.database().connectionString().clone(),
         currentKey.value(), platform.security().credentialEncryptionKeyVersion(),
         replacementKey.value(), commandLine.newKeyVersion(), commandLine.dryRun());
     if (!report) {
@@ -1177,18 +1164,6 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
     const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
@@ -1224,17 +1199,10 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(administrator.error());
         return ExitCode::ConfigurationError;
     }
-    auto repository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        idp::ProviderId{std::string{platform.auth().providerId()}},
-        std::move(auditKey).value());
-    if (!repository) {
-        reportStartupFailure(repository.error());
-        return ExitCode::InternalError;
-    }
-    const fnd::Status initialized = repository.value()->initialize(administrator.value());
+    const fnd::Status initialized = postgres::initializeAdministratorOffline(
+        platform.database().connectionString().clone(),administrator.value(),
+        passwordHasher.value(),totpKey.value(),platform.security().credentialEncryptionKeyVersion(),
+        idp::ProviderId{std::string{platform.auth().providerId()}},auditKey.value());
     if (!initialized) {
         reportStartupFailure(initialized.error());
         return initialized.error().code() == fnd::ErrorCode::AlreadyExists
@@ -1267,18 +1235,6 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
     const fnd::Status activeMaster =
         verifyActiveMasterKey(platform);
     if (!activeMaster) {
@@ -1303,20 +1259,11 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::InternalError;
     }
 
-    auto repository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        idp::ProviderId{std::string{platform.auth().providerId()}},
-        std::move(auditKey).value());
-    if (!repository) {
-        reportStartupFailure(repository.error());
-        return ExitCode::InternalError;
-    }
-
-    const fnd::Status repaired = repository.value()->repairInitialOwnerMembership(
+    const fnd::Status repaired = postgres::repairInitialOwnerOffline(
+        platform.database().connectionString().clone(),
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        identity::IdentityId{commandLine.identityId()}, clock.now());
+        identity::IdentityId{commandLine.identityId()},
+        idp::ProviderId{std::string{platform.auth().providerId()}},clock.now(),auditKey.value());
     if (!repaired) {
         reportStartupFailure(repaired.error());
         return repaired.error().code() == fnd::ErrorCode::FailedPrecondition

@@ -89,6 +89,41 @@ test("offline master key rotation and all CLI schema checks use native libpq",()
   assert.match(integration,/MasterKeyRotationAtomicallyInvalidatesOnlyDerivedState/);
   assert.match(integration,/pg::rotateMasterKeyOffline\(fnd::SecretString\{dsn\}/);
 });
+test("all offline CLI mutations and production linking are independent of blocking storage",()=>{
+  const cli=app.slice(app.indexOf("ExitCode runTotpRekey("),app.indexOf("ExitCode runListener("));
+  for(const call of ["rekeyTotpOffline","rotateMasterKeyOffline","initializeAdministratorOffline","repairInitialOwnerOffline"])
+    assert.ok(cli.includes("postgres::"+call+"("),call);
+  assert.doesNotMatch(cppExecutableText(app),/\bpostgres::(?:ConnectionPool|PoolConfig|Migrator|Postgres\w+Repository|Postgres\w+Store|PostgresCredentialRekeyer|PostgresMasterKeyRotator)\b/);
+  assert.doesNotMatch(app,/import openproof.storage.postgres;/);
+  for(const file of ["apps/opp/CMakeLists.txt","src/operations/http/CMakeLists.txt"])
+    assert.doesNotMatch(read(file),/\bopenproof_storage_postgres\b/);
+  assert.doesNotMatch(read("src/operations/http/http.cppm"),/import openproof.storage.postgres;/);
+  assert.match(read("src/storage/postgres/CMakeLists.txt"),/if\(OPENPROOF_BUILD_TESTS\)\s*openproof_add_module\(openproof_storage_postgres/);
+  const startup=read("src/storage/postgres/coroutine_startup.cpp");
+  const rekey=startup.slice(startup.indexOf("rekeyTotpAsync("),startup.indexOf("foundation::Result<NativeCredentialRekeyReport> rekeyTotpOffline("));
+  for(const term of ["BEGIN ISOLATION LEVEL SERIALIZABLE","pg_advisory_xact_lock(7299730475761673316)",
+    "LOCK TABLE openproof.totp_credentials IN ACCESS EXCLUSIVE MODE","LIMIT 128 FOR UPDATE",
+    "openAes256Gcm(replacementKey","openAes256Gcm(currentKey","sealAes256Gcm(replacementKey",
+    "AND encrypted_seed=decode($5,'hex') RETURNING identity_id",'execute("ROLLBACK",{})',
+    "INSERT INTO openproof.credential_key_rotations",'execute("COMMIT",{})'])
+    assert.ok(rekey.includes(term),term);
+  const admin=read("src/storage/postgres/coroutine_admin_store.cpp");
+  const bootstrap=admin.slice(admin.indexOf("initializeAdministratorAsync("),admin.indexOf("repairInitialOwnerAsync("));
+  const repair=admin.slice(admin.indexOf("repairInitialOwnerAsync("),admin.indexOf("foundation::Status initializeAdministratorOffline("));
+  for(const section of [bootstrap,repair]){
+    assert.match(section,/BEGIN ISOLATION LEVEL SERIALIZABLE/);
+    assert.match(section,/pg_advisory_xact_lock\(7299730475761673313\)/);
+    assert.match(section,/co_await appendRecords/);
+    assert.ok(section.indexOf("co_await appendRecords")<section.indexOf('execute("COMMIT",{})'));
+    assert.doesNotMatch(cppExecutableText(section),/PQexec|PQconnectdb/);
+  }
+  for(const term of ["SELECT count(*) FROM openproof.memberships","SELECT count(*) FROM openproof.membership_roles WHERE role='owner'",
+    "bootstrap.initial-owner.repair","AND i.kind=0 AND i.status=0","assurance>=2","issued_at_ms<=$2::bigint",
+    "E::AssuranceInsufficient"]) assert.ok(repair.includes(term),term);
+  const integration=read("tests/storage/postgres_integration_test.cpp");
+  for(const call of ["rekeyTotpOffline","initializeAdministratorOffline","repairInitialOwnerOffline"])
+    assert.ok(integration.includes("pg::"+call+"("),call);
+});
 test("liveness has no SQL dependency and readiness is bounded and fail-closed",()=>{
   const body=http.slice(http.indexOf("CoroutineHealthAdapter::handleAsync("));
   const ordered=["scrub(request);","method!=gateway::HttpMethod::Get","if (live) co_return response(200,true)",

@@ -7,7 +7,6 @@ openproof_add_module(openproof_operations_http
         openproof_foundation
         openproof_gateway
         openproof_security
-        openproof_storage_postgres
         openproof_telemetry
 )
 

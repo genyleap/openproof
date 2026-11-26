@@ -210,6 +210,14 @@ jobs:
       - name: Build opp executable
         run: cmake --build --preset gcc-release --target opp --parallel 2
 
+      - name: Verify executable has no blocking PostgreSQL symbols
+        run: |
+          nm -C ./cmake-build-gcc-release/apps/opp/opp > "${RUNNER_TEMP}/opp-symbols.txt"
+          if grep -E '(^|[[:space:]])(PQexec(Params)?|PQconnectdb(Params)?|PQreset)(@[^[:space:]]+)?$|openproof::storage::postgres::(ConnectionPool|PostgresAdministrationRepository|PostgresCredentialRekeyer|PostgresMasterKeyRotator)::' "${RUNNER_TEMP}/opp-symbols.txt"; then
+            echo "Blocking PostgreSQL implementation linked into opp"
+            exit 1
+          fi
+
       # Run the ordinary identity-platform HTTP scenarios over real native
       # PostgreSQL profile reads, with a separate disposable database. Keep
       # the paired baseline workload unchanged by not enabling these flags

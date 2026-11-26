@@ -100,6 +100,7 @@ target_link_libraries(openproof_tests
         Boost::headers
         openproof_storage_postgres
         openproof_postgres_async_startup
+        openproof_postgres_async_canonical
         openproof_operations_http
         openproof_credentials
         OpenProof::libpq

@@ -16,6 +16,7 @@
 
 #include <libpq-fe.h>
 #include "../../src/storage/postgres/coroutine_startup.hpp"
+#include "../../src/storage/postgres/coroutine_admin_store.hpp"
 
 import openproof.foundation;
 import openproof.administration;
@@ -853,12 +854,11 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
     const std::string oldCiphertext = PQgetvalue(before.get(), 0, 0);
     const std::string acceptedStep = PQgetvalue(before.get(), 0, 2);
 
-    pg::PostgresCredentialRekeyer rekeyer{*pool};
     auto unchangedOldKey = sec::AeadKey::create(
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
     auto unchangedNewKey = sec::AeadKey::create(
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
-    auto unchanged = rekeyer.rotateTotp(
+    auto unchanged = pg::rekeyTotpOffline(fnd::SecretString{connectionString},
         unchangedOldKey, 1U, unchangedNewKey, 2U, true);
     ASSERT_FALSE(unchanged);
     EXPECT_EQ(unchanged.error().code(), fnd::ErrorCode::InvalidArgument);
@@ -867,7 +867,7 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
     auto newDryKey = sec::AeadKey::create(
         fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
-    auto dryRun = rekeyer.rotateTotp(oldDryKey, 1U, newDryKey, 2U, true);
+    auto dryRun = pg::rekeyTotpOffline(fnd::SecretString{connectionString},oldDryKey, 1U, newDryKey, 2U, true);
     ASSERT_TRUE(dryRun);
     EXPECT_EQ(dryRun->rekeyed, 1U);
     EXPECT_EQ(dryRun->alreadyCurrent, 0U);
@@ -888,7 +888,7 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
         fnd::SecretString{std::string(32U, 'x')}).value();
     auto newAttemptKey = sec::AeadKey::create(
         fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
-    auto refused = rekeyer.rotateTotp(
+    auto refused = pg::rekeyTotpOffline(fnd::SecretString{connectionString},
         wrongOldKey, 1U, newAttemptKey, 2U, false);
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code(), fnd::ErrorCode::AuthenticationFailed);
@@ -897,7 +897,7 @@ TEST_F(PostgresIntegrationTest, TotpCredentialRekeyIsAtomicVersionedAndDryRunnab
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
     auto newKey = sec::AeadKey::create(
         fnd::SecretString{"fedcba9876543210fedcba9876543210"}).value();
-    auto rotated = rekeyer.rotateTotp(oldKey, 1U, newKey, 2U, false);
+    auto rotated = pg::rekeyTotpOffline(fnd::SecretString{connectionString},oldKey, 1U, newKey, 2U, false);
     ASSERT_TRUE(rotated) << rotated.error().internalDetail();
     EXPECT_EQ(rotated->rekeyed, 1U);
     EXPECT_FALSE(rotated->dryRun);
@@ -1097,13 +1097,11 @@ TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndO
         fnd::SecretString{"0123456789abcdef0123456789abcdef"}).value();
     auto auditKey = audit::AuditKey::create(
         fnd::SecretString{"abcdef0123456789abcdef0123456789"}).value();
-    auto bootstrap = pg::PostgresAdministrationRepository::create(
-        *pool, std::move(hasher), std::move(encryptionKey), 1U,
-        idp::ProviderId{"local"}, std::move(auditKey));
-    ASSERT_TRUE(bootstrap);
-    ASSERT_TRUE(bootstrap.value()->initialize(command.value()));
+    ASSERT_TRUE(pg::initializeAdministratorOffline(fnd::SecretString{connectionString},
+        command.value(),hasher,encryptionKey,1U,idp::ProviderId{"local"},auditKey));
 
-    auto repeated = bootstrap.value()->initialize(command.value());
+    auto repeated=pg::initializeAdministratorOffline(fnd::SecretString{connectionString},
+        command.value(),hasher,encryptionKey,1U,idp::ProviderId{"local"},auditKey);
     ASSERT_FALSE(repeated);
     EXPECT_EQ(repeated.error().code(), fnd::ErrorCode::AlreadyExists);
 
@@ -1156,6 +1154,39 @@ TEST_F(PostgresIntegrationTest, InitialAdministratorBootstrapIsAtomicAuditedAndO
         fnd::SecretString{"correct-bootstrap-password"}, code, kNow);
     ASSERT_TRUE(verified) << verified.error().internalDetail();
     EXPECT_EQ(verified.value(), local::LocalVerification::PasswordAndTotp);
+}
+
+TEST_F(PostgresIntegrationTest, NativeInitialOwnerRepairRequiresActiveIal2AndIsOneTime)
+{
+    auto auditKey=audit::AuditKey::create(fnd::SecretString{std::string(32U,'a')}).value();
+    const auto repair=[&](){
+        return pg::repairInitialOwnerOffline(fnd::SecretString{connectionString},
+            core::OrganizationId{"org"},core::IdentityId{"identity-1"},idp::ProviderId{"local"},kNow,auditKey);
+    };
+    EXPECT_FALSE(repair());
+    execute("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+            "VALUES('local','repair-fixture','identity-1',1770000000000)");
+    execute("INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) "
+            "VALUES('identity-1','fixture-hash',1770000000000)");
+    execute("INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES('identity-1',decode('00','hex'),1,NULL,1770000000000)");
+    auto absent=repair();
+    ASSERT_FALSE(absent);
+    EXPECT_EQ(absent.error().code(),fnd::ErrorCode::AssuranceInsufficient);
+    execute("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+            "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+            "VALUES('repair-session','identity-1','local',2,3,false,0,decode(repeat('13',32),'hex'),"
+            "1770000000000,1770000000000,1770000000000,1770003600000,600000)");
+    ASSERT_TRUE(repair());
+    EXPECT_FALSE(repair());
+    std::unique_ptr<PGresult,ResultDeleter> result{PQexec(direct.get(),
+        "SELECT (SELECT count(*) FROM openproof.membership_roles WHERE organization_id='org' AND identity_id='identity-1' AND role='owner'),"
+        "(SELECT count(*) FROM openproof.audit_events WHERE action='bootstrap.initial-owner.repair' AND encode(event_hash,'hex')<>repeat('0',64)),"
+        "(SELECT count(*) FROM openproof.security_event_outbox WHERE payload->>'type'='bootstrap.initial-owner.repaired')")};
+    ASSERT_TRUE(result);
+    ASSERT_EQ(PQresultStatus(result.get()),PGRES_TUPLES_OK);
+    ASSERT_EQ(PQntuples(result.get()),1);
+    for (int column=0;column<3;++column) EXPECT_STREQ(PQgetvalue(result.get(),0,column),"1");
 }
 
 TEST_F(PostgresIntegrationTest, OwnerProvisioningIsAtomicAuditedAndDeniedToMembers)

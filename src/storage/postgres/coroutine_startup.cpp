@@ -253,6 +253,99 @@ foundation::Result<NativeMasterRotationReport> rotateMasterKeyOffline(
         io.run();return result.get();
     } catch (const std::exception&) {return foundation::fail(E::Unavailable,"Master key rotation failed.");}
 }
+namespace {
+asio::awaitable<foundation::Result<NativeCredentialRekeyReport>> rekeyTotpAsync(
+    foundation::SecretString dsn,const security::AeadKey& currentKey,unsigned int currentVersion,
+    const security::AeadKey& replacementKey,unsigned int replacementVersion,bool dryRun)
+{
+    if (currentVersion==0U || replacementVersion<=currentVersion || replacementVersion>2147483647U ||
+        currentKey.matches(replacementKey)) co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+std::chrono::minutes{5};
+        auto connection=co_await pg::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        const auto execute=[&](std::string sql,Params args){
+            return connection->query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL SERIALIZABLE",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673316)",{}));
+        static_cast<void>(co_await execute("LOCK TABLE openproof.totp_credentials IN ACCESS EXCLUSIVE MODE",{}));
+        Params duplicateArgs{std::to_string(replacementVersion)};
+        const auto duplicate=co_await execute(
+            "SELECT 1 FROM openproof.credential_key_rotations WHERE purpose='totp' AND to_version=$1",
+            std::move(duplicateArgs));
+        if (!duplicate.rows.empty()) co_return foundation::fail(E::AlreadyExists);
+        NativeCredentialRekeyReport report{0U,0U,dryRun};
+        std::optional<std::string> cursor;
+        // Keyset pagination bounds ciphertext materialization without weakening
+        // the table lock or the all-or-nothing transaction.
+        for (;;) {
+            Params pageArgs{cursor};
+            const auto page=co_await execute(
+                "SELECT identity_id,encode(encrypted_seed,'hex'),key_version FROM openproof.totp_credentials "
+                "WHERE $1::text IS NULL OR identity_id COLLATE \"C\">$1::text COLLATE \"C\" "
+                "ORDER BY identity_id COLLATE \"C\" LIMIT 128 FOR UPDATE",std::move(pageArgs));
+            if (page.rows.empty()) break;
+            for (const auto& row:page.rows) {
+                if (row.size()!=3U || !row[0] || !row[1] || !row[2])
+                    co_return foundation::fail(E::FailedPrecondition);
+                const auto& id=*row[0];
+                const auto& encryptedHex=*row[1];
+                const auto& version=*row[2];
+                if (id.empty() || (cursor && *cursor>=id))
+                    co_return foundation::fail(E::FailedPrecondition);
+                auto envelope=foundation::fromHex(encryptedHex);
+                if (!envelope) co_return foundation::fail(envelope.error());
+                const std::string aad="openproof/totp/v1:"+id;
+                if (version==std::to_string(replacementVersion)) {
+                    auto validated=security::openAes256Gcm(replacementKey,envelope.value(),aad);
+                    if (!validated) co_return foundation::fail(validated.error());
+                    ++report.alreadyCurrent;
+                } else {
+                    if (version!=std::to_string(currentVersion)) co_return foundation::fail(E::FailedPrecondition);
+                    auto plaintext=security::openAes256Gcm(currentKey,envelope.value(),aad);
+                    if (!plaintext) co_return foundation::fail(plaintext.error());
+                    auto encrypted=security::sealAes256Gcm(replacementKey,plaintext.value(),aad);
+                    if (!encrypted) co_return foundation::fail(encrypted.error());
+                    Params args{id,foundation::toHex(encrypted.value()),std::to_string(replacementVersion),
+                        std::to_string(currentVersion),encryptedHex};
+                    const auto updated=co_await execute(
+                        "UPDATE openproof.totp_credentials SET encrypted_seed=decode($2,'hex'),key_version=$3 "
+                        "WHERE identity_id=$1 AND key_version=$4 AND encrypted_seed=decode($5,'hex') RETURNING identity_id",
+                        std::move(args));
+                    if (updated.rows.size()!=1U || updated.rows.front().size()!=1U || updated.rows.front()[0]!=row[0])
+                        co_return foundation::fail(E::Conflict);
+                    ++report.rekeyed;
+                }
+                cursor=id;
+            }
+        }
+        if (dryRun) {
+            const auto rolledBack=co_await execute("ROLLBACK",{});
+            if (rolledBack.commandTag!="ROLLBACK" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+            co_return report;
+        }
+        Params journalArgs{std::to_string(currentVersion),std::to_string(replacementVersion),
+            std::to_string(report.rekeyed),std::to_string(report.alreadyCurrent)};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.credential_key_rotations(purpose,from_version,to_version,rekeyed_rows,unchanged_rows,rotated_at_ms) "
+            "VALUES('totp',$1,$2,$3,$4,(extract(epoch FROM clock_timestamp())*1000)::bigint)",std::move(journalArgs)));
+        const auto committed=co_await execute("COMMIT",{});
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return report;
+    } catch (const std::exception&) {co_return foundation::fail(E::Unavailable,"Native TOTP rekey failed.");}
+}
+}
+foundation::Result<NativeCredentialRekeyReport> rekeyTotpOffline(
+    foundation::SecretString dsn,const security::AeadKey& currentKey,unsigned int currentVersion,
+    const security::AeadKey& replacementKey,unsigned int replacementVersion,bool dryRun)
+{
+    try {
+        asio::io_context io;
+        auto result=asio::co_spawn(io,rekeyTotpAsync(std::move(dsn),currentKey,currentVersion,
+            replacementKey,replacementVersion,dryRun),asio::use_future);
+        io.run();return result.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable,"TOTP rekey failed.");}
+}
 foundation::Status nativeDatabasePreflight(foundation::SecretString dsn,std::filesystem::path directory,
     identity::core::OrganizationId tenant,unsigned int masterVersion,security::Sha256Digest fingerprint)
 {

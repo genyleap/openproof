@@ -1253,9 +1253,17 @@ journal fingerprint validation, exact invalidated-row counts and atomic
 journal insertion. Dry runs roll back; the operation has a five-minute
 SQL deadline. The offline operator contract is unchanged: stop the server
 before rotation and update the configured key before restarting.
-TOTP rekey, bootstrap and initial-owner repair still use the compatibility
-module for their mutations. The strict storage gate remains open until
-the blocking implementation itself is retired.
+TOTP rekey uses keyset-batched envelope validation and re-encryption
+under the original exclusive table lock and a single serializable
+transaction; dry runs roll back. Bootstrap and initial-owner repair use
+native SQL and the shared atomic audit/outbox writer. Repair additionally
+rejects a prior successful repair and requires the qualifying session
+to have already been issued. All database-backed CLI commands and the
+server listener are now composed without the legacy PostgreSQL module.
+The compatibility implementation remains for regression tests; the
+strict storage gate is unchanged and remains open until that code is
+retired. Native C++ build and PostgreSQL integration are required before
+release.
 Native route migration is not proof of a fully nonblocking executable;
 the full C++ build, executable regressions, security and E2E gates must
 also pass.

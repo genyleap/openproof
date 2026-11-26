@@ -1,4 +1,7 @@
 #include "async_pool.hpp"
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -109,6 +112,158 @@ asio::awaitable<foundation::Status> appendRecords(async_detail::AsyncConnection&
     co_return foundation::ok();
 }
 }
+namespace {
+using E=foundation::ErrorCode;
+asio::awaitable<foundation::Status> initializeAdministratorAsync(
+    foundation::SecretString dsn,const adm::InitialAdministrator& administrator,
+    const credentials::PasswordHasher& hasher,const security::AeadKey& totpKey,
+    std::uint32_t keyVersion,const idp::ProviderId& provider,const audit::AuditKey& auditKey)
+{
+    const auto& tenant=administrator.organization();
+    const auto& identityValue=administrator.identity();
+    const auto& link=administrator.link();
+    const auto& membership=administrator.membership();
+    if (keyVersion==0U || provider.empty() || !tenant.isUsable() || !identityValue.canAuthenticate()
+        || identityValue.kind()!=core::SubjectKind::Human || link.state()!=core::LinkState::Linked
+        || link.external().providerId()!=provider || link.owner()!=identityValue.id()
+        || membership.organization()!=tenant.id() || membership.identity()!=identityValue.id()
+        || membership.state()!=organization::MembershipState::Active || !membership.hasRole(organization::Role{"owner"}))
+        co_return foundation::fail(E::FailedPrecondition);
+    auto passwordHash=hasher.hash(administrator.password());
+    if (!passwordHash) co_return foundation::fail(passwordHash.error());
+    const std::string identityId{identityValue.id().value()},tenantId{tenant.id().value()};
+    auto encrypted=security::sealAes256Gcm(totpKey,administrator.totp().bytes(),"openproof/totp/v1:"+identityId);
+    if (!encrypted) co_return foundation::fail(encrypted.error());
+    auto randomId=security::randomTokenBase64Url(24U);
+    if (!randomId) co_return foundation::fail(randomId.error());
+    const std::string eventId="bootstrap-"+randomId.value();
+    auto event=audit::AuditEvent::create(audit::AuditEventId{eventId},identityValue.createdAt(),
+        foundation::CorrelationId{eventId},std::optional<core::OrganizationId>{tenant.id()},
+        std::optional<core::IdentityId>{identityValue.id()},"administration","bootstrap.initial-owner",
+        "success",audit::AuditFields{{"provider",std::string{provider.value()}},{"role","owner"}});
+    if (!event) co_return foundation::fail(event.error());
+    try {
+        const auto deadline=Clock::now()+std::chrono::minutes{5};
+        auto connection=co_await async_detail::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        const auto execute=[&](std::string sql,Params args){
+            return connection->query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL SERIALIZABLE",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673313)",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        if (number(single(co_await execute("SELECT count(*) FROM openproof.organizations",{})))!=0U)
+            co_return foundation::fail(E::AlreadyExists);
+        const auto created=std::to_string(identityValue.createdAt().time_since_epoch().count());
+        static_cast<void>(co_await execute("INSERT INTO openproof.organizations(id,name,state,created_at_ms) VALUES($1,$2,$3,$4)",
+            params(tenantId,std::string{tenant.displayName()},std::to_string(static_cast<unsigned int>(tenant.status())),
+                std::to_string(tenant.createdAt().time_since_epoch().count()))));
+        static_cast<void>(co_await execute("INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) VALUES($1,$2,$3,$4,$5)",
+            params(identityId,tenantId,std::to_string(static_cast<unsigned int>(identityValue.kind())),
+                std::to_string(static_cast<unsigned int>(identityValue.status())),created)));
+        static_cast<void>(co_await execute("INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) VALUES($1,$2,$3,$4)",
+            params(std::string{provider.value()},std::string{link.external().subject().value()},identityId,
+                std::to_string(link.requestedAt().time_since_epoch().count()))));
+        static_cast<void>(co_await execute("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,$3,$4)",
+            params(tenantId,identityId,std::to_string(static_cast<unsigned int>(membership.state())),
+                std::to_string(membership.invitedAt().time_since_epoch().count()))));
+        for (const auto& role:membership.roles())
+            static_cast<void>(co_await execute("INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,$3)",
+                params(tenantId,identityId,std::string{role.value()})));
+        static_cast<void>(co_await execute("INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms) VALUES($1,$2,$3)",
+            params(identityId,std::string{passwordHash->encoded()},created)));
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.totp_credentials(identity_id,encrypted_seed,key_version,last_accepted_step,enrolled_at_ms) "
+            "VALUES($1,decode($2,'hex'),$3,NULL,$4)",
+            params(identityId,foundation::toHex(encrypted.value()),std::to_string(keyVersion),created)));
+        auto auditStatus=co_await appendRecords(*connection,deadline,event.value(),auditKey,"bootstrap.initial-owner",identityId);
+        if (!auditStatus) co_return foundation::fail(auditStatus.error());
+        const auto committed=co_await execute("COMMIT",{});
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return foundation::ok();
+    } catch (const std::exception&) {co_return foundation::fail(E::Unavailable,"Native bootstrap failed.");}
+}
+asio::awaitable<foundation::Status> repairInitialOwnerAsync(
+    foundation::SecretString dsn,const core::OrganizationId& organizationId,const core::IdentityId& identityId,
+    const idp::ProviderId& provider,foundation::Instant now,const audit::AuditKey& auditKey)
+{
+    if (organizationId.empty() || identityId.empty() || provider.empty()) co_return foundation::fail(E::InvalidArgument);
+    auto randomId=security::randomTokenBase64Url(24U);
+    if (!randomId) co_return foundation::fail(randomId.error());
+    const std::string eventId="admin-"+randomId.value(),tenant{organizationId.value()},target{identityId.value()};
+    auto event=audit::AuditEvent::create(audit::AuditEventId{eventId},now,foundation::CorrelationId{eventId},
+        std::optional<core::OrganizationId>{organizationId},std::optional<core::IdentityId>{identityId},
+        "administration","bootstrap.initial-owner.repair","success",
+        audit::AuditFields{{"role","owner"},{"recovery_mode","empty-membership-bootstrap"},{"actor_identity_id",target}});
+    if (!event) co_return foundation::fail(event.error());
+    try {
+        const auto deadline=Clock::now()+std::chrono::minutes{5};
+        auto connection=co_await async_detail::AsyncConnection::connect(std::string{dsn.expose()},remaining(deadline));
+        const auto execute=[&](std::string sql,Params args){
+            return connection->query(std::move(sql),std::move(args),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL SERIALIZABLE",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673313)",{}));
+        static_cast<void>(co_await execute("SELECT pg_advisory_xact_lock(7299730475761673315)",{}));
+        // Block concurrent membership/bootstrap writes and session revocation
+        // until the eligibility checks and audit event commit.
+        static_cast<void>(co_await execute("LOCK TABLE openproof.organizations,openproof.identities,"
+            "openproof.external_identities,openproof.password_credentials,openproof.totp_credentials,"
+            "openproof.memberships,openproof.membership_roles,openproof.sessions IN SHARE ROW EXCLUSIVE MODE",{}));
+        if (number(single(co_await execute("SELECT count(*) FROM openproof.organizations",{})))!=1U
+            || number(single(co_await execute("SELECT count(*) FROM openproof.organizations WHERE id=$1 AND state=0",params(tenant))))!=1U
+            || number(single(co_await execute("SELECT count(*) FROM openproof.memberships",{})))!=0U
+            || number(single(co_await execute("SELECT count(*) FROM openproof.membership_roles WHERE role='owner'",{})))!=0U
+            || number(single(co_await execute("SELECT count(*) FROM openproof.audit_events WHERE action IN "
+                "('bootstrap.initial-owner','bootstrap.initial-owner.repair') AND outcome='success'",{})))!=0U)
+            co_return foundation::fail(E::FailedPrecondition);
+        const auto eligible=co_await execute(
+            "SELECT count(*) FROM openproof.identities i JOIN openproof.external_identities e ON e.identity_id=i.id AND e.provider=$3 "
+            "JOIN openproof.password_credentials p ON p.identity_id=i.id JOIN openproof.totp_credentials t ON t.identity_id=i.id "
+            "WHERE i.organization_id=$1 AND i.id=$2 AND i.kind=0 AND i.status=0",
+            params(tenant,target,std::string{provider.value()}));
+        if (number(single(eligible))!=1U) co_return foundation::fail(E::FailedPrecondition);
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        const auto sessions=co_await execute(
+            "SELECT count(*) FROM openproof.sessions WHERE identity_id=$1 AND state=0 AND assurance>=2 "
+            "AND issued_at_ms<=$2::bigint AND absolute_expires_at_ms>$2::bigint AND last_seen_at_ms+idle_timeout_ms>$2::bigint",
+            params(target,timestamp));
+        if (number(single(sessions))==0U) co_return foundation::fail(E::AssuranceInsufficient);
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) VALUES($1,$2,1,$3)",
+            params(tenant,target,timestamp)));
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",
+            params(tenant,target)));
+        auto auditStatus=co_await appendRecords(*connection,deadline,event.value(),auditKey,"bootstrap.initial-owner.repaired",target);
+        if (!auditStatus) co_return foundation::fail(auditStatus.error());
+        const auto committed=co_await execute("COMMIT",{});
+        if (committed.commandTag!="COMMIT" || !connection->reusable()) co_return foundation::fail(E::Unavailable);
+        co_return foundation::ok();
+    } catch (const std::exception&) {co_return foundation::fail(E::Unavailable,"Native initial-owner repair failed.");}
+}
+}
+foundation::Status initializeAdministratorOffline(
+    foundation::SecretString dsn,const adm::InitialAdministrator& administrator,
+    const credentials::PasswordHasher& hasher,const security::AeadKey& totpKey,
+    std::uint32_t keyVersion,const idp::ProviderId& provider,const audit::AuditKey& auditKey)
+{
+    try {
+        asio::io_context io;
+        auto result=asio::co_spawn(io,initializeAdministratorAsync(std::move(dsn),administrator,hasher,totpKey,keyVersion,provider,auditKey),asio::use_future);
+        io.run();return result.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable);}
+}
+foundation::Status repairInitialOwnerOffline(
+    foundation::SecretString dsn,const core::OrganizationId& organizationId,const core::IdentityId& identityId,
+    const idp::ProviderId& provider,foundation::Instant now,const audit::AuditKey& auditKey)
+{
+    try {
+        asio::io_context io;
+        auto result=asio::co_spawn(io,repairInitialOwnerAsync(std::move(dsn),organizationId,identityId,provider,now,auditKey),asio::use_future);
+        io.run();return result.get();
+    } catch (const std::exception&) {return foundation::fail(E::Unavailable);}
+}
+
 class CoroutineAdminStore::Impl final {
 public:
     Impl(asio::any_io_executor executor,foundation::SecretString dsn,core::OrganizationId org,
