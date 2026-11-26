@@ -1823,6 +1823,109 @@ TEST(PostgresCanonicalCoroutineTest, SignupProvisioningIsAtomicAndNeverCreatesDu
     EXPECT_EQ(count("SELECT count(*) FROM openproof.account_verification_challenges WHERE destination=$1",{broken}),"0");
 }
 
+TEST(PostgresCanonicalCoroutineTest, PasswordResetCommitsHashProofAndSessionRevocationTogether)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace acc=openproof::account;
+    namespace cred=openproof::credentials;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const idp::ProviderId provider{"reset-"+seed.suffix};
+    const std::string destination="reset-"+seed.suffix+"@example.test";
+    auto policy=cred::PasswordPolicy::create(1024U,8U,1U,16U,32U,2U*1024U*1024U);
+    ASSERT_TRUE(policy);
+    auto hasher=cred::PasswordHasher::create(fnd::SecretString{std::string(32U,'p')},policy.value());
+    ASSERT_TRUE(hasher);
+    auto original=hasher->hash(fnd::SecretString{"original-password"});
+    auto replacement=hasher->hash(fnd::SecretString{"replacement-password"});
+    ASSERT_TRUE(original && replacement);
+    auto key=acc::VerificationKey::create(fnd::SecretString{std::string(32U,'v')});
+    ASSERT_TRUE(key);
+    auto query=[&](std::string_view sql,std::initializer_list<std::string> params){
+        return execute(fixture.get(),sql,params);
+    };
+    auto scalar=[&](std::string_view sql,std::initializer_list<std::string> params){
+        auto rows=query(sql,params);
+        return std::string{PQgetvalue(rows.get(),0,0)};
+    };
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms)"
+        " VALUES($1,$2,$3,1770000000000)",{std::string{provider.value()},destination,seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "INSERT INTO openproof.password_credentials(identity_id,password_hash,changed_at_ms)"
+        " VALUES($1,$2,1770000000000)",{seed.owner,std::string{original->encoded()}})));
+    const auto sessionId="reset-session-"+seed.suffix;
+    const auto otherId="other-session-"+seed.suffix;
+    for (const auto& [sessionName,ownerName,hashByte]:
+        {std::tuple{sessionId,seed.owner,"11"},std::tuple{otherId,seed.secondOwner,"22"}}) {
+        ASSERT_NO_THROW(static_cast<void>(query(
+            "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+            "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms)"
+            " VALUES($1,$2,$3,1,1,false,0,decode($4,'hex'),1770000000000,1770000000000,"
+            "1770000000000,1770003600000,600000)",
+            {sessionName,ownerName,std::string{provider.value()},
+            fnd::toHex(openproof::security::sha256(seed.suffix+hashByte).value())})));
+    }
+    asio::io_context io;
+    pg::CoroutineVerificationChallengeStore store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},1U,500ms,1000ms,3000ms};
+    auto run=[&](asio::awaitable<fnd::Status> task){
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    auto proof=acc::VerificationPreparation::prepare(key.value(),ids::IdentityId{seed.owner},
+        acc::VerificationPurpose::PasswordReset,acc::VerificationChannel::Email,destination,kNow,30min);
+    ASSERT_TRUE(proof);
+    ASSERT_TRUE(run(store.replacePublicEmailAsync(proof->first,provider)));
+    const auto id=proof->first.id();
+    const auto idText=std::string{id.value()};
+    const auto digest=proof->first.digest();
+    auto reset=[&](pg::CoroutineVerificationChallengeStore& adapter,acc::VerificationDigest value){
+        return adapter.resetPasswordAsync(provider,id,value,replacement.value(),kNow+1s,3U);
+    };
+    EXPECT_FALSE(run(reset(foreign,digest)));
+    EXPECT_FALSE(run(reset(store,acc::VerificationDigest{std::array<std::byte,32>{}})));
+    EXPECT_EQ(scalar("SELECT attempts FROM openproof.account_verification_challenges WHERE id=$1",{idText}),"1");
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "UPDATE openproof.password_credentials SET changed_at_ms=1770000000001 WHERE identity_id=$1",{seed.owner})));
+    EXPECT_FALSE(run(reset(store,digest)));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "UPDATE openproof.password_credentials SET changed_at_ms=1770000000000 WHERE identity_id=$1",{seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.sessions ADD CONSTRAINT native_reset_fixture_rollback CHECK(state<>1) NOT VALID",{})));
+    EXPECT_FALSE(run(reset(store,digest)));
+    ASSERT_NO_THROW(static_cast<void>(query(
+        "ALTER TABLE openproof.sessions DROP CONSTRAINT native_reset_fixture_rollback",{})));
+    EXPECT_EQ(scalar("SELECT password_hash FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),
+        std::string{original->encoded()});
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{sessionId}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{idText}),"1");
+    io.restart();
+    auto first=asio::co_spawn(io,reset(store,digest),asio::use_future);
+    auto second=asio::co_spawn(io,reset(store,digest),asio::use_future);
+    io.run();
+    const auto firstResult=first.get(),secondResult=second.get();
+    ASSERT_NE(firstResult.has_value(),secondResult.has_value());
+    EXPECT_EQ(scalar("SELECT password_hash FROM openproof.password_credentials WHERE identity_id=$1",{seed.owner}),
+        std::string{replacement->encoded()});
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{sessionId}),"1");
+    EXPECT_EQ(scalar("SELECT state FROM openproof.sessions WHERE id=$1",{otherId}),"0");
+    EXPECT_EQ(scalar("SELECT count(*) FROM openproof.account_verification_challenges WHERE id=$1",{idText}),"0");
+    EXPECT_FALSE(run(reset(store,digest)));
+}
+
 TEST(PostgresCanonicalCoroutineTest, ReapOnlyExpiredUntouchedNativeSignupOwners)
 {
     const auto dsn=disposableDsn();

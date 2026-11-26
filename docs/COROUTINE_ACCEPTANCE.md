@@ -5095,3 +5095,19 @@ canonical profile or owner lifecycle mutation occurs. Legacy and native
 cross-path concurrency still requires acceptance. Expired rows whose
 reservation provenance has been lost remain fail closed for operator
 recovery. No migration change.
+
+### Atomic native password reset persistence
+
+A new digest-only password reset entry accepts a precomputed PasswordHash.
+It locates and locks an active tenant-bound owner, checks only purpose-3
+email proof, expiry and bounded attempts, compares the digest in constant
+time, and locks the current matching local link and password generation.
+A reset proof older than the current password change is rejected. Hash
+replacement, revocation of existing active first-party sessions and exact
+proof consumption commit together; failures roll back the entire unit.
+No authentication grant is issued. OAuth family revocation is not added
+by this change (legacy reset also revokes first-party sessions only).
+The HTTP route remains compatibility until native KDF and callback wiring
+and executable acceptance. Concurrent session creation from an already
+verified login requires separate end-to-end generation fencing.
+No new schema.
