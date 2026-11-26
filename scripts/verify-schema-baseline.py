@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import re
 import subprocess
@@ -22,23 +23,56 @@ NAME = re.compile(r"[0-9]{4}_[a-zA-Z0-9_]+\.sql\Z")
 PORT = "55428"
 
 
-def migration_files() -> list[Path]:
-    directory = ROOT / "migrations"
+def migration_files(root: Path = ROOT) -> list[Path]:
+    directory = root / "migrations"
     archive = directory / "legacy"
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("Missing executable migration directory")
     if not archive.is_dir() or archive.is_symlink():
         raise ValueError("Missing immutable legacy archive")
-    legacy_names = {p.name for p in archive.glob("*.sql")}
-    if not legacy_names:
-        raise ValueError("Empty immutable legacy archive")
+
+    # The pinned source-tag inventory is independently verified in CI.
+    # Match by full filename, not numeric prefix: archived tenant seeds
+    # and later schema migrations may legitimately share a prefix.
+    manifest = json.loads((root / "docs" / "schema-release-inventory.json")
+                          .read_text(encoding="utf-8"))
+    if manifest["format"] != 1 or manifest["source"] != "git-release-tags":
+        raise ValueError("Unsupported release migration inventory")
+    published: dict[str, set[str]] = {}
+    archived: set[str] = set()
+    for relative, variants in manifest["files"].items():
+        path = PurePosixPath(relative)
+        if (not NAME.fullmatch(path.name) or path.parts[0] != "migrations"
+                or (len(path.parts) != 2
+                    and not (len(path.parts) == 3 and path.parts[1] == "legacy"))):
+            raise ValueError(f"Invalid published migration path: {relative}")
+        published.setdefault(path.name, set()).update(variants)
+        if len(path.parts) == 3:
+            archived.add(path.name)
+    if not published or not archived:
+        raise ValueError("Incomplete release migration inventory")
+    for name, digests in published.items():
+        if len(digests) != 1 or any(not re.fullmatch(r"[0-9a-f]{64}", d) for d in digests):
+            raise ValueError(f"Ambiguous or invalid published checksum: {name}")
+
     files = sorted(directory.glob("*.sql"))
+    legacy = sorted(archive.glob("*.sql"))
     if not files or len({p.name[:4] for p in files}) != len(files):
         raise ValueError("Missing or ambiguous schema migration sequence")
-    for path in files:
-        if (not NAME.fullmatch(path.name) or path.is_symlink() or not path.is_file()
-                or path.name in legacy_names):
-            raise ValueError(f"Invalid executable migration: {path.name}")
+    for path in files + legacy:
+        if not NAME.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+            raise ValueError(f"Invalid migration artifact: {path.name}")
+    if {p.name for p in legacy} != archived:
+        raise ValueError("Immutable legacy archive differs from published inventory")
+    active_names = {p.name for p in files}
+    if active_names & archived or not (published.keys() - archived) <= active_names:
+        raise ValueError("Published executable migration missing or archived seed is executable")
+    for path in files + legacy:
+        if path.name in published:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual not in published[path.name]:
+                raise ValueError(f"Published migration checksum changed: {path.name}")
     return files
-
 
 def canonical_dump(raw: bytes) -> bytes:
     # PostgreSQL security-patched pg_dump adds random psql-only guards.
@@ -147,6 +181,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f"FAIL: baseline round-trip: {error}", file=sys.stderr)
         sys.exit(1)
