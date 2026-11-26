@@ -1013,6 +1013,10 @@ AuthenticationService::completeAsync(
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "Canonical identity finalization returned an empty identity.");
     }
+    if (outcome.requiredCanonicalOwner() && *outcome.requiredCanonicalOwner() != identity->value()) {
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "Canonical finalization returned a different credential owner.");
+    }
     co_return VerifiedAuthentication{
         std::move(outcome), std::move(identity).value()};
 }
@@ -1021,6 +1025,9 @@ foundation::Result<VerifiedAuthentication>
 AuthenticationService::finishVerified(CompletedExchange exchange)
 {
     auto outcome = std::move(exchange.outcome);
+    // The legacy path cannot perform atomic owner-bound finalization.
+    if (outcome.requiredCanonicalOwner())
+        return foundation::fail(foundation::ErrorCode::Unavailable);
     const auto completedAt = exchange.completedAt;
     const auto external = externalFromOutcome(outcome);
     foundation::Result<std::optional<identity::core::IdentityId>> owner =
@@ -1225,6 +1232,8 @@ AuthenticationService::completeConnectionAsync(
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "The connection target is invalid.");
     }
+    if (exchange->outcome.requiredCanonicalOwner())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     foundation::Result<identity::core::ExternalIdentityRef> linked =
         foundation::fail(foundation::ErrorCode::Unavailable);
     try {
@@ -1247,6 +1256,8 @@ AuthenticationService::completeConnectionAsync(
 foundation::Result<identity::core::ExternalIdentityRef>
 AuthenticationService::finishConnection(CompletedExchange exchange)
 {
+    if (exchange.outcome.requiredCanonicalOwner())
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     const auto& target = *exchange.connectionTarget;
     auto active = requireActiveIdentity(target);
     if (!active) return foundation::fail(active.error());

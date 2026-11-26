@@ -1,6 +1,7 @@
 #pragma once
 #include <boost/asio/awaitable.hpp>
 #include <optional>
+#include <string>
 import openproof.foundation;
 import openproof.identity.provider;
 import openproof.provider.local;
@@ -9,10 +10,15 @@ namespace openproof::provider::local {
 
 // Implementations must verify the full proof against a current credential
 // generation. The trusted coordinator owns single-use challenge redemption.
+struct LocalCredentialProof final {
+    LocalVerification verification;
+    std::string canonicalOwner;
+};
+
 class CoroutineLocalProofVerifier {
 public:
     virtual ~CoroutineLocalProofVerifier() = default;
-    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<LocalVerification>>
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<LocalCredentialProof>>
     verifyAsync(idp::ExternalSubject subject, foundation::SecretString password,
         std::optional<foundation::SecretString> totp,
         std::optional<foundation::SecretString> recovery, foundation::Instant now) = 0;

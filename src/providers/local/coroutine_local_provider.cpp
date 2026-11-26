@@ -69,21 +69,22 @@ CoroutineLocalAuthenticationProvider::completeAuthenticationAsync(idp::Authentic
         std::move(totp), std::move(recovery), now);
     if (!proof) co_return foundation::fail(proof.error());
     // A verifier may not turn a failed or absent second factor into IAL2.
-    if ((proof.value() != LocalVerification::Password
-        && proof.value() != LocalVerification::PasswordAndTotp
-        && proof.value() != LocalVerification::PasswordAndRecoveryCode)
-        || (proof.value() == LocalVerification::PasswordAndRecoveryCode && !usesRecovery)
-        || (proof.value() == LocalVerification::PasswordAndTotp && !usesTotp)
-        || (usesRecovery && proof.value() != LocalVerification::PasswordAndRecoveryCode))
+    if (proof->canonicalOwner.empty() || (proof->verification != LocalVerification::Password
+        && proof->verification != LocalVerification::PasswordAndTotp
+        && proof->verification != LocalVerification::PasswordAndRecoveryCode)
+        || (proof->verification == LocalVerification::PasswordAndRecoveryCode && !usesRecovery)
+        || (proof->verification == LocalVerification::PasswordAndTotp && !usesTotp)
+        || (usesRecovery && proof->verification != LocalVerification::PasswordAndRecoveryCode))
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     idp::ProviderEvidence evidence;
-    evidence.add("method", proof.value() == LocalVerification::Password ? "password"
-        : proof.value() == LocalVerification::PasswordAndTotp ? "password_totp" : "password_recovery_code");
-    const bool multiFactor = proof.value() != LocalVerification::Password;
+    evidence.add("method", proof->verification == LocalVerification::Password ? "password"
+        : proof->verification == LocalVerification::PasswordAndTotp ? "password_totp" : "password_recovery_code");
+    const bool multiFactor = proof->verification != LocalVerification::Password;
     co_return idp::AuthenticationOutcome::create(m_id, std::move(subject),
         idp::VerifiedClaims{}, multiFactor ? idp::AssuranceLevel::Ial2 : idp::AssuranceLevel::Ial1,
         idp::AuthenticationStrength{multiFactor
             ? idp::AuthenticationFactor::Knowledge | idp::AuthenticationFactor::Possession
-            : idp::AuthenticationFactor::Knowledge, false}, std::move(evidence), now);
+            : idp::AuthenticationFactor::Knowledge, false}, std::move(evidence), now,
+        std::move(proof->canonicalOwner));
 }
 }

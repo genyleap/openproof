@@ -12,7 +12,7 @@ public:
     CoroutinePostgresLocalProofVerifier(CoroutineLocalCredentialStore& store,
         credentials::BoundedPasswordExecutor& passwords, credentials::TotpPolicy totpPolicy,
         security::AeadKey totpKey, unsigned int keyVersion, foundation::SecretString recoveryPepper);
-    [[nodiscard]] boost::asio::awaitable<foundation::Result<provider::local::LocalVerification>>
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<provider::local::LocalCredentialProof>>
     verifyAsync(identity::provider::ExternalSubject subject, foundation::SecretString password,
         std::optional<foundation::SecretString> totp,
         std::optional<foundation::SecretString> recovery, foundation::Instant now) override;

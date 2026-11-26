@@ -4568,3 +4568,16 @@ The provider-neutral canonical lookup must not authenticate the new owner
 of an alias using a proof for its former owner. Also complete runtime
 composition and actual HTTP/password/MFA regression acceptance. No route
 or production flag changes are included here.
+
+
+### Canonical owner constraint for local credential proofs
+
+A native local proof carries an explicit internal owner constraint from the
+credential snapshot, not a client parameter or presentation claim. The
+canonical finalizer rejects an alias whose active tenant-scoped owner has
+changed, before any profile write. The trusted authentication coordinator
+independently rejects a substituted finalizer result. Owner-bound proofs
+are login-only and denied on the legacy synchronous and connection paths.
+Existing unbound provider outcomes retain their prior semantics. The
+disposable regression rebinds the alias between proof and finalization.
+Runtime activation remains pending; no public HTTP route changes.

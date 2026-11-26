@@ -21,14 +21,14 @@ public:
     local::LocalVerification result = local::LocalVerification::Password;
     bool denied = false;
     unsigned int calls = 0U;
-    asio::awaitable<fnd::Result<local::LocalVerification>> verifyAsync(
+    asio::awaitable<fnd::Result<local::LocalCredentialProof>> verifyAsync(
         idp::ExternalSubject subject, fnd::SecretString password,
         std::optional<fnd::SecretString>, std::optional<fnd::SecretString>, fnd::Instant) override
     {
         ++calls;
         if (denied || subject.value() != "alice" || password.expose() != "fixture-password")
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
-        co_return result;
+        co_return local::LocalCredentialProof{result, "fixture-owner"};
     }
 };
 struct Fixture {
@@ -38,9 +38,14 @@ struct Fixture {
     local::CoroutineLocalAuthenticationProvider provider{idp::ProviderId{"local"}, verifier, clock, 5min};
     template<class T> T run(asio::awaitable<T> task) {
         io.restart();
-        auto result = asio::co_spawn(io, std::move(task), asio::use_future);
+        std::optional<T> value;
+        auto capture = [](asio::awaitable<T> pending, std::optional<T>& output) -> asio::awaitable<void> {
+            output.emplace(co_await std::move(pending));
+        };
+        auto result = asio::co_spawn(io, capture(std::move(task), value), asio::use_future);
         io.run();
-        return result.get();
+        result.get();
+        return std::move(value.value());
     }
     static idp::AuthenticationResponse response(bool totp = false, bool recovery = false) {
         idp::AuthenticationResponse value{idp::ChallengeId{"fixture"}, idp::ClientContext{}};
@@ -64,6 +69,8 @@ TEST(NativeLocalProviderTest, ChallengeAndPasswordAssurance)
     auto proof = f.run(f.provider.completeAuthenticationAsync(Fixture::response()));
     ASSERT_TRUE(proof);
     EXPECT_EQ(proof->claimedAssurance(), idp::AssuranceLevel::Ial1);
+    ASSERT_TRUE(proof->requiredCanonicalOwner());
+    EXPECT_EQ(*proof->requiredCanonicalOwner(), "fixture-owner");
     EXPECT_FALSE(proof->strength().isMultiFactor());
     EXPECT_FALSE(f.provider.completeAuthentication(Fixture::response()));
     EXPECT_EQ(f.verifier.calls, 1U);

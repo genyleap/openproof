@@ -30,7 +30,7 @@ CoroutinePostgresLocalProofVerifier::CoroutinePostgresLocalProofVerifier(
     if (keyVersion == 0U || m_recoveryPepper.expose().size() < 32U)
         throw std::invalid_argument{"Invalid local proof verifier configuration"};
 }
-asio::awaitable<foundation::Result<local::LocalVerification>>
+asio::awaitable<foundation::Result<local::LocalCredentialProof>>
 CoroutinePostgresLocalProofVerifier::verifyAsync(identity::provider::ExternalSubject subject,
     foundation::SecretString password, std::optional<foundation::SecretString> totp,
     std::optional<foundation::SecretString> recovery, foundation::Instant now)
@@ -54,6 +54,7 @@ CoroutinePostgresLocalProofVerifier::verifyAsync(identity::provider::ExternalSub
     if (!matches.value() || !found->has_value() || !hash)
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     auto snapshot = std::move(found->value());
+    const std::string verifiedOwner{snapshot.owner.value()};
     auto verified = local::LocalVerification::Password;
     if (!snapshot.encryptedTotpHex) {
         if (recovery) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
@@ -99,6 +100,6 @@ CoroutinePostgresLocalProofVerifier::verifyAsync(identity::provider::ExternalSub
                 std::move(replacement->value())));
         }
     }
-    co_return verified;
+    co_return local::LocalCredentialProof{verified, verifiedOwner};
 }
 }

@@ -98,7 +98,7 @@ public:
             idp::ExternalSubject{externalSubject}, idp::VerifiedClaims{},
             idp::AssuranceLevel::Ial2,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-            idp::ProviderEvidence{}, kNow);
+            idp::ProviderEvidence{}, kNow, requiredOwner);
     }
 
     // Allow a single native provider instance to verify different wallet-like
@@ -106,6 +106,7 @@ public:
     // operator disallows first-time identity creation.
     std::string authorizationUrl{"https://example.test/authorize"};
     std::string externalSubject{"verified-subject"};
+    std::optional<std::string> requiredOwner;
     bool forgedProvider{};
     int nativeBeginCalls{};
     int nativeCompleteCalls{};
@@ -263,6 +264,33 @@ asio::awaitable<void> successfulFlow(auth::AuthenticationService& service,
         && fixture.coroutineProvider->nativeBeginCalls == 1
         && fixture.coroutineProvider->nativeCompleteCalls == 1
         && fixture.coroutineProvider->syncCalls == 0;
+}
+
+asio::awaitable<void> ownerConstraintFlow(auth::AuthenticationService& service,
+    Fixture& fixture, bool& denied)
+{
+    const auto bound = binding("owner-constraint-client");
+    auto started = co_await service.beginAsync(
+        fixture.request(), bound, fnd::CorrelationId{"native-owner-constraint"});
+    if (!started) co_return;
+    auto result = co_await service.completeAsync(
+        started->transactionId(), started->continuationToken().clone(), bound,
+        proof(std::string{started->challenge().id().value()}));
+    denied = !result && result.error().code() == fnd::ErrorCode::AuthenticationFailed
+        && fixture.nativeCanonical.calls == 1;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, RejectsFinalizerSubstitutionOfCredentialOwner)
+{
+    Fixture fixture;
+    fixture.coroutineProvider->requiredOwner = "previous-credential-owner";
+    auto service = fixture.service();
+    bool denied = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(io, ownerConstraintFlow(service, fixture, denied), asio::use_future);
+    io.run();
+    future.get();
+    EXPECT_TRUE(denied);
 }
 
 TEST(TrustedAuthenticationCoroutineTest, VerifiesNativeProofAndConsumesTransactionOnce)

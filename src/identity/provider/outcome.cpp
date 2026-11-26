@@ -157,7 +157,8 @@ AuthenticationOutcome::AuthenticationOutcome(ProviderId provider, ExternalSubjec
                                              AssuranceLevel claimedAssurance,
                                              AuthenticationStrength strength,
                                              ProviderEvidence evidence,
-                                             foundation::Instant verifiedAt)
+                                             foundation::Instant verifiedAt,
+                                             std::optional<std::string> requiredCanonicalOwner)
     : m_provider(std::move(provider))
     , m_subject(std::move(subject))
     , m_claims(std::move(claims))
@@ -165,13 +166,15 @@ AuthenticationOutcome::AuthenticationOutcome(ProviderId provider, ExternalSubjec
     , m_strength(strength)
     , m_evidence(std::move(evidence))
     , m_verifiedAt(verifiedAt)
+    , m_requiredCanonicalOwner(std::move(requiredCanonicalOwner))
 {
 }
 
 foundation::Result<AuthenticationOutcome>
 AuthenticationOutcome::create(ProviderId provider, ExternalSubject subject, VerifiedClaims claims,
                               AssuranceLevel claimedAssurance, AuthenticationStrength strength,
-                              ProviderEvidence evidence, foundation::Instant verifiedAt)
+                              ProviderEvidence evidence, foundation::Instant verifiedAt,
+                              std::optional<std::string> requiredCanonicalOwner)
 {
     if (provider.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -185,10 +188,15 @@ AuthenticationOutcome::create(ProviderId provider, ExternalSubject subject, Veri
             "would bind a session to no identity.");
     }
 
+    if (requiredCanonicalOwner && (requiredCanonicalOwner->empty()
+        || requiredCanonicalOwner->size() > 200U
+        || requiredCanonicalOwner->find('\0') != std::string::npos)) {
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    }
     return AuthenticationOutcome{std::move(provider),  std::move(subject),
                                  std::move(claims),    claimedAssurance,
                                  strength,             std::move(evidence),
-                                 verifiedAt};
+                                 verifiedAt, std::move(requiredCanonicalOwner)};
 }
 
 const ProviderId& AuthenticationOutcome::provider() const noexcept
@@ -219,6 +227,11 @@ const AuthenticationStrength& AuthenticationOutcome::strength() const noexcept
 const ProviderEvidence& AuthenticationOutcome::evidence() const noexcept
 {
     return m_evidence;
+}
+
+const std::optional<std::string>& AuthenticationOutcome::requiredCanonicalOwner() const noexcept
+{
+    return m_requiredCanonicalOwner;
 }
 
 foundation::Instant AuthenticationOutcome::verifiedAt() const noexcept

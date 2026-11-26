@@ -331,6 +331,11 @@ CoroutinePostgresCanonicalFinalizer::finishLoginAsync(
         if (owner.rows.size() != 1U || owner.rows.front().size() != 1U)
             throw std::runtime_error{"Malformed canonical owner result"};
         core::IdentityId identity{required(owner.rows.front().front())};
+        if (outcome.requiredCanonicalOwner() && *outcome.requiredCanonicalOwner() != identity.value()) {
+            co_await rollback(connection, deadline);
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                "The credential owner no longer owns the verified subject.");
+        }
         const auto external = externalRef(outcome);
         if (!(co_await refreshExternal(
                 connection, external, std::string{identity.value()}, deadline))) {
@@ -704,6 +709,9 @@ CoroutinePostgresCanonicalFinalizer::finishConnectionAsync(
     core::IdentityId target,
     foundation::Instant completedAt)
 {
+    if (outcome.requiredCanonicalOwner())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "Owner-bound credentials cannot authorize a link ceremony.");
     if (target.empty() || outcome.provider().empty() || outcome.subject().empty()) {
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
     }

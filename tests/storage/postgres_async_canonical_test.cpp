@@ -1766,9 +1766,14 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
     local::CoroutineLocalAuthenticationProvider provider{id, verifier, clock, 5min};
     auto run = [&]<typename T>(asio::awaitable<T> pending) {
         io.restart();
-        auto complete = asio::co_spawn(io, std::move(pending), asio::use_future);
+        std::optional<T> value;
+        auto capture = [](asio::awaitable<T> task, std::optional<T>& output) -> asio::awaitable<void> {
+            output.emplace(co_await std::move(task));
+        };
+        auto complete = asio::co_spawn(io, capture(std::move(pending), value), asio::use_future);
         io.run();
-        return complete.get();
+        complete.get();
+        return std::move(value.value());
     };
     auto proof = [&](std::string password, std::optional<std::string> totp = std::nullopt,
                      std::optional<std::string> recovery = std::nullopt,
@@ -1783,6 +1788,21 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
     auto first = proof("fixture-password");
     ASSERT_TRUE(first);
     EXPECT_EQ(first->claimedAssurance(), idp::AssuranceLevel::Ial1);
+    ASSERT_TRUE(first->requiredCanonicalOwner());
+    EXPECT_EQ(*first->requiredCanonicalOwner(), seed.owner);
+    pg::CoroutinePostgresCanonicalFinalizer finalizer{io.get_executor(), fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org}, 1U, 500ms, 1000ms, 3000ms};
+    auto owner = run(finalizer.finishLoginAsync(first.value(), kNow));
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(owner->value(), seed.owner);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.external_identities SET identity_id=$2 WHERE provider='native-canonical-provider' "
+        "AND external_subject=$1", {seed.subject, seed.secondOwner})));
+    EXPECT_FALSE(run(finalizer.finishLoginAsync(first.value(), kNow)));
+    EXPECT_FALSE(run(finalizer.finishConnectionAsync(first.value(), ids::IdentityId{seed.secondOwner}, kNow)));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.external_identities SET identity_id=$2 WHERE provider='native-canonical-provider' "
+        "AND external_subject=$1", {seed.subject, seed.owner})));
     EXPECT_FALSE(proof("incorrect-password"));
     EXPECT_FALSE(proof("fixture-password", {}, {}, seed.unlinkedSubject));
     EXPECT_FALSE(proof("fixture-password", {}, {}, seed.foreignSubject));
