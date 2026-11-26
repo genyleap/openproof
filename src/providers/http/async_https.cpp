@@ -195,22 +195,45 @@ asio::awaitable<HttpsResult> AsyncHttpsClient::exchange(HttpsRequest request)
     // before issuing a DNS query or allocating an OpenSSL session.
     if (!validRequest(request)) co_return failure(HttpsFailure::InvalidRequest);
 
+    const auto now = Clock::now();
+    const auto deadline = std::min(
+        now + request.timeout,
+        request.absoluteDeadline.value_or(Clock::time_point::max()));
+    if (deadline <= now) co_return failure(HttpsFailure::Timeout);
+    try {
+        // DNS cancellation and completion share timer state. Serialize
+        // both on a per-exchange strand, not on an unstranded worker
+        // executor. Independent exchanges retain their own strands.
+        auto executor = co_await asio::this_coro::executor;
+        co_return co_await asio::co_spawn(
+            asio::make_strand(executor),
+            exchangeSerialized(std::move(request), deadline),
+            asio::use_awaitable);
+    } catch (const std::exception&) {
+        co_return failure(Clock::now() >= deadline
+            ? HttpsFailure::Timeout : HttpsFailure::Connection);
+    }
+}
+
+asio::awaitable<HttpsResult> AsyncHttpsClient::exchangeSerialized(
+    HttpsRequest request, Clock::time_point deadline)
+{
     try {
         auto executor = co_await asio::this_coro::executor;
-        const auto now = Clock::now();
-        const auto deadline = std::min(
-            now + request.timeout,
-            request.absoluteDeadline.value_or(Clock::time_point::max()));
-        if (deadline <= now) co_return failure(HttpsFailure::Timeout);
+        if (Clock::now() >= deadline) co_return failure(HttpsFailure::Timeout);
         Tcp::resolver resolver{executor};
         boost::system::error_code error;
 
         // The DNS query has the SAME total deadline as connect/handshake/I/O.
         // cancel_after unregisters its timer with the awaitable completion;
         // there is no detached cancellation handler using an expired resolver.
+        const auto remaining = deadline - Clock::now();
+        if (remaining <= Clock::duration::zero()) {
+            co_return failure(HttpsFailure::Timeout);
+        }
         auto endpoints = co_await resolver.async_resolve(
             request.host, std::to_string(request.port),
-            asio::cancel_after(deadline - Clock::now(),
+            asio::cancel_after(remaining,
                 asio::redirect_error(asio::use_awaitable, error)));
         if (error) co_return connectionFailure(error, deadline);
         if (Clock::now() >= deadline) co_return failure(HttpsFailure::Timeout);

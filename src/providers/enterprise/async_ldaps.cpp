@@ -437,10 +437,40 @@ SensitiveString::~SensitiveString() noexcept
     }
 }
 
+class LdapsTrust::Impl final {
+public:
+    ssl::context context{ssl::context::tls_client};
+};
+
+LdapsTrust::LdapsTrust(std::unique_ptr<Impl> implementation) noexcept
+    : m_implementation(std::move(implementation)) {}
+LdapsTrust::~LdapsTrust() = default;
+
+std::shared_ptr<const LdapsTrust> LdapsTrust::load(std::string_view caFile) noexcept
+{
+    try {
+        if (caFile.find('\0') != std::string_view::npos) return {};
+        auto implementation = std::make_unique<Impl>();
+        auto& context = implementation->context;
+        context.set_verify_mode(ssl::verify_peer);
+        // This is startup/configuration work, not request-path work.
+        // Preserve OpenSSL's platform trust defaults when no private CA
+        // is specified. An explicit CA file is loaded into the store now.
+        if (caFile.empty()) context.set_default_verify_paths();
+        else context.load_verify_file(std::string{caFile});
+        SSL_CTX_set_session_cache_mode(context.native_handle(), SSL_SESS_CACHE_OFF);
+        return std::shared_ptr<const LdapsTrust>{
+            new LdapsTrust(std::move(implementation))};
+    } catch (...) {
+        // No certificate path, OpenSSL diagnostics or secrets leave this API.
+        return {};
+    }
+}
+
 asio::awaitable<LdapsResult> AsyncLdapsClient::authenticate(LdapsRequest request)
 {
     const auto endpoint = parseLdapsUri(request.uri);
-    if (!endpoint || !printable(request.baseDn, 2048U)
+    if (!endpoint || !request.trust || !printable(request.baseDn, 2048U)
         || !printable(request.username, 320U)
         || request.userPassword.view().empty()
         || request.userPassword.view().size() > 1024U
@@ -471,12 +501,9 @@ asio::awaitable<LdapsResult> AsyncLdapsClient::authenticateSerialized(
     if (!endpoint) co_return LdapsResult{LdapsFailure::InvalidConfiguration};
     if (Clock::now() >= deadline) co_return LdapsResult{LdapsFailure::Timeout};
     try {
-        // Constructing the SSL context performs no socket operations; all
-        // server I/O is dispatched asynchronously with the same deadline.
-        ssl::context tls{ssl::context::tls_client};
-        tls.set_verify_mode(ssl::verify_peer);
-        if (request.caFile.empty()) tls.set_default_verify_paths();
-        else tls.load_verify_file(request.caFile);
+        // The provider prepared this immutable trust context before the
+        // listener started. Only the independent SSL stream is per request.
+        auto& tls = request.trust->m_implementation->context;
 
         auto executor = co_await asio::this_coro::executor;
         Tcp::resolver resolver{executor};
