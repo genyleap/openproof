@@ -2302,4 +2302,173 @@ CoroutinePostgresCanonicalFinalizer::decideOAuthDeviceAsync(std::string userDige
     }
 }
 
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::pushOAuthAuthorizationAsync(std::string clientId,
+    std::optional<std::string> clientDigest,std::string requestDigest,
+    std::optional<oauth::AuthorizationRequest> direct,VerifyJar verifyJar,
+    foundation::Instant now,foundation::Duration lifetime)
+{
+    using E=foundation::ErrorCode;
+    if (clientId.empty() || clientId.size()>256U || requestDigest.size()!=64U
+        || (clientDigest && clientDigest->size()!=64U) || (direct.has_value()==static_cast<bool>(verifyJar))
+        || lifetime<=foundation::Duration::zero() || lifetime>std::chrono::minutes{10}
+        || now.time_since_epoch().count()<0
+        || now.time_since_epoch().count()>foundation::Duration::max().count()-lifetime.count())
+        co_return foundation::fail(E::InvalidArgument);
+    try {
+        const auto deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        const auto execute=[&](std::string sql,Params params) {
+            return connection.query(std::move(sql),std::move(params),remaining(deadline));
+        };
+        static_cast<void>(co_await execute("BEGIN ISOLATION LEVEL READ COMMITTED",{}));
+        const std::string tenant{m_impl->organization.value()};
+        Params callerParams{clientId,tenant};
+        const auto caller=co_await execute(
+            "SELECT c.kind,encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.organizations o ON o.id=a.organization_id "
+            "WHERE c.id=$1 AND a.organization_id=$2 AND o.state=0 "
+            "AND c.status=0 AND a.status=0 FOR SHARE OF c,a,o",std::move(callerParams));
+        bool authenticated=false;
+        std::int64_t clientKind=-1;
+        if (caller.rows.size()==1U && caller.rows.front().size()==2U) {
+            const auto& row=caller.rows.front();
+            const auto kind=milliseconds(row[0]);
+            clientKind=kind;
+            if ((kind==1 || kind==2) && !row[1] && !clientDigest) authenticated=true;
+            if ((kind==0 || kind==3) && row[1] && clientDigest) {
+                auto presented=foundation::fromHex(*clientDigest);
+                auto stored=foundation::fromHex(*row[1]);
+                authenticated=presented && stored && presented->size()==32U
+                    && stored->size()==32U && security::constantTimeEquals(*presented,*stored);
+            }
+        }
+        if (!authenticated) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::AuthenticationRequired);
+        }
+        std::optional<oauth::NativeJarAuthorization> jar;
+        if (verifyJar) {
+            Params keyArgs{clientId};
+            const auto key=co_await execute(
+                "SELECT key_id,public_key_pem FROM openproof.oauth_client_request_signing_keys "
+                "WHERE client_id=$1 FOR SHARE",std::move(keyArgs));
+            if (key.rows.size()!=1U || key.rows.front().size()!=2U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::InvalidArgument);
+            }
+            auto verified=verifyJar(required(key.rows.front()[0]),required(key.rows.front()[1]),now);
+            if (!verified) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::InvalidArgument);
+            }
+            jar.emplace(std::move(verified).value());
+            verifyJar={};
+        }
+        const auto& request=jar?jar->request:*direct;
+        if (request.clientId().value()!=clientId || clientKind<0 || clientKind>3
+            || !client::RedirectUri::create(std::string{request.redirectUri()},static_cast<client::ClientKind>(clientKind))) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::InvalidArgument);
+        }
+        Params redirectArgs{clientId};
+        const auto redirects=co_await execute(
+            "SELECT redirect_uri FROM openproof.oauth_client_redirect_uris WHERE client_id=$1 "
+            "ORDER BY redirect_uri COLLATE \"C\" LIMIT 257 FOR SHARE",std::move(redirectArgs));
+        if (redirects.rows.size()>256U) throw std::runtime_error{"Oversized redirect registry"};
+        if (!std::ranges::any_of(redirects.rows,[&](const auto& row) {
+            return row.size()==1U && client::matchesRegisteredRedirect(static_cast<client::ClientKind>(clientKind),
+                required(row[0]),request.redirectUri());
+        })) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::InvalidArgument);
+        }
+        Params scopeArgs{clientId};
+        const auto grants=co_await execute(
+            "SELECT scope FROM openproof.oauth_client_scopes WHERE client_id=$1 LIMIT 257 FOR SHARE",
+            std::move(scopeArgs));
+        if (grants.rows.size()>256U) throw std::runtime_error{"Oversized client scope registry"};
+        const auto hasScope=[](const auto& rows,std::string_view scope) {
+            return std::ranges::any_of(rows,[&](const auto& row){return row.size()==1U && required(row[0])==scope;});
+        };
+        if (!std::ranges::all_of(request.scopes(),[&](const auto& scope){return hasScope(grants.rows,scope.value());})) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto oidcOnly=[](std::string_view s) {
+            return s=="openid" || s=="profile" || s=="email" || s=="phone" || s=="offline_access" || s=="account";
+        };
+        if (request.resource()) {
+            Params resourceArgs{*request.resource()};
+            const auto resource=co_await execute(
+                "SELECT id FROM openproof.oauth_resources WHERE audience=$1 AND status=0 FOR SHARE",std::move(resourceArgs));
+            if (resource.rows.size()!=1U || resource.rows.front().size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::PermissionDenied);
+            }
+            Params args{required(resource.rows.front()[0])};
+            const auto allowed=co_await execute(
+                "SELECT scope FROM openproof.oauth_resource_scopes WHERE resource_id=$1 LIMIT 257 FOR SHARE",std::move(args));
+            if (allowed.rows.size()>256U) throw std::runtime_error{"Oversized resource scope registry"};
+            if (!std::ranges::all_of(request.scopes(),[&](const auto& scope) {
+                return oidcOnly(scope.value()) || hasScope(allowed.rows,scope.value());
+            })) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::PermissionDenied);
+            }
+        } else if (!std::ranges::all_of(request.scopes(),[&](const auto& scope){return oidcOnly(scope.value());})) {
+            co_await rollback(connection,deadline);
+            co_return foundation::fail(E::PermissionDenied);
+        }
+        const auto timestamp=std::to_string(now.time_since_epoch().count());
+        if (jar) {
+            if (jar->jwtId.empty() || jar->jwtId.size()>256U || jar->expiresAt<=now
+                || std::ranges::any_of(jar->jwtId,[](unsigned char c){return c<0x20U || c==0x7fU;})
+                || jar->issuedAt>now+std::chrono::seconds{60} || jar->issuedAt<now-std::chrono::minutes{10}
+                || jar->expiresAt<=jar->issuedAt || jar->expiresAt-jar->issuedAt>std::chrono::minutes{10}) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::InvalidArgument);
+            }
+            // Bounded opportunistic cleanup; never wait on unrelated
+            // clients' replay rows or perform a global purge on the reactor.
+            Params purgeArgs{clientId,timestamp};
+            static_cast<void>(co_await execute(
+                "WITH expired AS (SELECT jwt_id FROM openproof.oauth_jar_replays "
+                "WHERE client_id=$1 AND expires_at_ms<=$2 ORDER BY expires_at_ms LIMIT 128 FOR UPDATE SKIP LOCKED) "
+                "DELETE FROM openproof.oauth_jar_replays r USING expired e "
+                "WHERE r.client_id=$1 AND r.jwt_id=e.jwt_id",std::move(purgeArgs)));
+            Params replayArgs{clientId,jar->jwtId,std::to_string(jar->expiresAt.time_since_epoch().count()),timestamp};
+            const auto consumed=co_await execute(
+                "INSERT INTO openproof.oauth_jar_replays(client_id,jwt_id,expires_at_ms) VALUES($1,$2,$3) "
+                "ON CONFLICT(client_id,jwt_id) DO UPDATE SET expires_at_ms=EXCLUDED.expires_at_ms "
+                "WHERE openproof.oauth_jar_replays.expires_at_ms<=$4 RETURNING client_id",std::move(replayArgs));
+            if (consumed.rows.size()!=1U) {
+                co_await rollback(connection,deadline);
+                co_return foundation::fail(E::InvalidArgument);
+            }
+        }
+        Params args{requestDigest,clientId,std::string{request.redirectUri()},std::string{request.codeChallenge().value()},
+            request.state(),request.nonce(),request.maximumAuthenticationAge()
+                ?std::optional<std::string>{std::to_string(request.maximumAuthenticationAge()->count())}:std::nullopt,
+            request.resource(),std::to_string(static_cast<int>(request.responseMode())),timestamp,
+            std::to_string((now+lifetime).time_since_epoch().count())};
+        static_cast<void>(co_await execute(
+            "INSERT INTO openproof.oauth_pushed_authorization_requests "
+            "(request_digest,client_id,redirect_uri,code_challenge,state,nonce,maximum_authentication_age_ms,resource,response_mode,issued_at_ms,expires_at_ms) "
+            "VALUES(decode($1,'hex'),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",std::move(args)));
+        for (const auto& scope:request.scopes()) {
+            Params scopeArgs{requestDigest,std::string{scope.value()}};
+            static_cast<void>(co_await execute(
+                "INSERT INTO openproof.oauth_pushed_authorization_request_scopes(request_digest,scope) "
+                "VALUES(decode($1,'hex'),$2)",std::move(scopeArgs)));
+        }
+        static_cast<void>(co_await execute("COMMIT",{}));
+        co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable,"Native pushed authorization is unavailable.");
+    }
+}
+
 } // namespace openproof::storage::postgres

@@ -28,6 +28,9 @@ enum class ClientKind {
 
 [[nodiscard]] std::string_view clientKindName(ClientKind kind) noexcept;
 [[nodiscard]] bool clientIsPublic(ClientKind kind) noexcept;
+// Shared exact/loopback matching policy for native SQL authorization.
+[[nodiscard]] bool matchesRegisteredRedirect(ClientKind kind,std::string_view registered,
+    std::string_view presented) noexcept;
 
 enum class ClientStatus {
     Active,

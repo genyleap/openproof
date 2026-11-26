@@ -3230,6 +3230,15 @@ addProtectedRoutes(gateway::Router& router,
                         bool approve,std::string consentId) {
                         return reader->decideOAuthDeviceAsync(std::move(digest),std::move(owner),
                             std::move(sessionId),approve,std::move(consentId),clock.now());
+                    }},
+                oauthHttp::CoroutineTokenReadAdapter::ParContext{
+                    std::string{nativeOidcProvider->issuer()},
+                    [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
+                        std::string requestDigest,std::optional<oauth::AuthorizationRequest> direct,
+                        oauthHttp::CoroutineTokenReadAdapter::VerifyJar verify) {
+                        return reader->pushOAuthAuthorizationAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(requestDigest),std::move(direct),std::move(verify),
+                            clock.now(),std::chrono::seconds{90});
                     }});
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
@@ -3237,6 +3246,7 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/oauth/revoke");
             nativePaths.emplace_back("/oauth/device_authorization");
             nativePaths.emplace_back("/oauth/device");
+            nativePaths.emplace_back("/oauth/par");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {

@@ -135,6 +135,13 @@ public:
         std::optional<session::DelegatedSenderConstraint> sender,foundation::Instant now,
         foundation::Duration accessLifetime);
 
+    using VerifyJar=std::function<foundation::Result<oauth::NativeJarAuthorization>(
+        std::string_view,std::string_view,foundation::Instant)>;
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    pushOAuthAuthorizationAsync(std::string clientId,std::optional<std::string> clientDigest,
+        std::string requestDigest,std::optional<oauth::AuthorizationRequest> direct,
+        VerifyJar verifyJar,foundation::Instant now,foundation::Duration lifetime);
+
     [[nodiscard]] boost::asio::awaitable<foundation::Result<oauth::NativeDeviceApproval>>
     readOAuthDeviceApprovalAsync(std::string userDigest,identity::core::IdentityId owner,
         foundation::Instant now);

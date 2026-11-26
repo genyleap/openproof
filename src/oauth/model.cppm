@@ -162,6 +162,12 @@ private:
 
 // Committed native authorization-code exchange result. Raw access and
 // refresh credentials stay with the HTTP caller; persistence sees digests.
+struct NativeJarAuthorization final {
+    AuthorizationRequest request;
+    std::string jwtId;
+    foundation::Instant issuedAt,expiresAt;
+};
+
 struct NativeDeviceApproval final {
     std::string clientName;
     std::optional<std::string> resource;

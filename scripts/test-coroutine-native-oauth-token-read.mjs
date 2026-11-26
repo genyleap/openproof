@@ -284,3 +284,35 @@ test("device browser approval binds CSRF to first-party session and commits cons
   assert.match(app,/nativePaths.emplace_back\("\/oauth\/device"\)/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/Force a consent collision; the device must remain pending/);
 });
+test("PAR authenticates and validates request parameters and pinned JAR before atomic replay and storage",()=>{
+  const body=http.slice(http.indexOf("CoroutineTokenReadAdapter::pushAuthorization("),http.indexOf("CoroutineTokenReadAdapter::deviceBrowser("));
+  for(const term of ["clientSecret.reset()","parameters.size()!=1U","verifyNativeJar(",
+    "*jwt=foundation::SecretString{}","parseParAuthorization(parameters)",
+    "security::sha256(uri.expose())","co_await m_par->push(",'body.add("request_uri",uri.expose())'])
+    assert.ok(body.includes(term),term);
+  assert.ok(body.indexOf("clientSecret.reset()")<body.indexOf("co_await m_par->push("));
+  assert.ok(body.indexOf("co_await m_par->push(")<body.indexOf('body.add("request_uri",uri.expose())'));
+  const jar=http.slice(http.indexOf("verifyNativeJar("),http.indexOf("bool parRoute("));
+  for(const term of ["security::verifyRs256Jwt(pem,compactJwt)",'{"RS256"}',
+    "std::string{expectedKeyId}","std::string{expectedClient.value()}","audienceMatches",
+    "expiresAt<=now","expiresAt-issuedAt>std::chrono::minutes{10}","parseParAuthorization(parameters)"])
+    assert.ok(jar.includes(term),term);
+  const store=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::pushOAuthAuthorizationAsync("));
+  const ordered=["FOR SHARE OF c,a,o","if (!authenticated)","oauth_client_request_signing_keys",
+    "WHERE client_id=$1 FOR SHARE","verifyJar(required","client::matchesRegisteredRedirect",
+    "oauth_client_scopes","oauth_resource_scopes","INSERT INTO openproof.oauth_jar_replays",
+    "ON CONFLICT(client_id,jwt_id) DO UPDATE","WHERE openproof.oauth_jar_replays.expires_at_ms<=$4",
+    "INSERT INTO openproof.oauth_pushed_authorization_requests",
+    "INSERT INTO openproof.oauth_pushed_authorization_request_scopes",'execute("COMMIT",{})'];
+  let previous=-1;
+  for(const term of ordered){
+    const index=store.indexOf(term,previous+1);
+    assert.ok(index>previous,term); previous=index;
+  }
+  assert.match(store,/LIMIT 128 FOR UPDATE SKIP LOCKED/);
+  assert.match(app,/reader->pushOAuthAuthorizationAsync/);
+  assert.match(app,/nativePaths.emplace_back\("\/oauth\/par"\)/);
+  assert.match(read("src/oauth/http/http.cpp"),/m_nativeTokenReadsRequired && path=="\/oauth\/par"/);
+  assert.match(read("src/client/model.cpp"),/return matchesRegisteredRedirect\(m_state->kind,item.value\(\),redirectUri\)/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/NativeParPreservesLoopbackAndCommitsJarReplayAtomically/);
+});

@@ -397,6 +397,58 @@ TEST(NativeOAuthTokenReadTest, DeviceInitiationRetriesCollisionAndReturnsOnlyCom
     EXPECT_EQ(fallback.asyncCalls,0);
 }
 
+TEST(NativeOAuthTokenReadTest, ParRejectsMixedAndMalformedRequestsBeforeStorage)
+{
+    namespace oauth=openproof::oauth;
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    int calls=0;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,
+        fnd::SecretString{std::string(32U,'t')},fnd::SecretString{std::string(32U,'c')},
+        {},{},{},{},{},{},{},15min,std::nullopt,{},std::nullopt,
+        http::CoroutineTokenReadAdapter::ParContext{"https://issuer.example.invalid",
+            [&](std::string id,std::optional<std::string> proof,std::string digest,
+                std::optional<oauth::AuthorizationRequest> direct,http::CoroutineTokenReadAdapter::VerifyJar verify)
+                ->asio::awaitable<fnd::Status> {
+                ++calls;
+                if (id!="fixture-client" || proof) co_return fnd::fail(fnd::ErrorCode::AuthenticationRequired);
+                EXPECT_EQ(digest.size(),64U);
+                if (verify) {
+                    EXPECT_FALSE(direct);
+                    EXPECT_FALSE(verify("fixture-key","not-a-public-key",kNow));
+                    co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
+                }
+                if (!direct) co_return fnd::fail(fnd::ErrorCode::InvalidArgument);
+                EXPECT_EQ(direct->redirectUri(),"http://127.0.0.1:4321/callback");
+                EXPECT_EQ(direct->responseMode(),oauth::AuthorizationResponseMode::Jwt);
+                EXPECT_EQ(direct->maximumAuthenticationAge(),std::optional<fnd::Duration>{60s});
+                co_return fnd::ok();
+            }}};
+    auto run=[&](std::string body){
+        auto input=request(gw::HttpMethod::Post,"/oauth/par",{},std::move(body));
+        EXPECT_TRUE(api.nativeEnabledFor(input));
+        asio::io_context io;
+        std::optional<gw::HttpResponse> response;
+        auto collect=[&]()->asio::awaitable<void>{response.emplace(co_await api.handleAsync(std::move(input)));};
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(response).value();
+    };
+    const std::string form="client_id=fixture-client&response_type=code&scope=openid&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&code_challenge_method=S256&code_challenge="+
+        std::string(43U,'a')+"&response_mode=query.jwt&max_age=60";
+    const auto accepted=run(form);
+    ASSERT_EQ(accepted.status(),201);
+    EXPECT_NE(accepted.body().find("urn:ietf:params:oauth:request_uri:opar_"),std::string::npos);
+    EXPECT_NE(accepted.body().find("\"expires_in\":90"),std::string::npos);
+    EXPECT_EQ(run(form+"&request=malformed").status(),400);
+    EXPECT_EQ(run(form+"&client_id=duplicate").status(),400);
+    EXPECT_EQ(run(form+"&unknown=1").status(),400);
+    EXPECT_EQ(run("client_id=fixture-client&request=malformed").status(),400);
+    EXPECT_EQ(calls,2);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
+
 constexpr std::string_view sessionCookie = "__Host-openproof-session=valid-token";
 constexpr std::string_view csrfCookies =
     "__Host-openproof-session=valid-token; __Host-openproof-consent-csrf=proof";

@@ -1014,8 +1014,17 @@ approval transaction rechecks the active first-party session and tenant.
 Approval records the authentication context and supersedes prior consent
 in the same transaction as the device state change. A failed consent
 write leaves the device pending. Denial is one-time and creates no consent.
-Authorization/login and PAR still require separate migration and executable
-acceptance.
+Pushed authorization initiation at /oauth/par is native, including signed
+JAR requests. The transaction authenticates the tenant-bound client, locks
+the pinned signing key, verifies RS256, issuer, audience and temporal
+claims, checks redirect URI (including native loopback port matching),
+client scopes and resource scope restrictions. JTI consumption and PAR
+storage commit together; a failed insert does not permanently consume the
+JTI. Request URIs use the existing SHA-256 fingerprint and 90-second
+lifetime. Browser authorization still reads and consumes those records
+through the compatibility service; migrating this consumer, front-channel
+JAR, consent submission and login remains required. Executable acceptance
+is still mandatory.
 
 ### Native account TOTP status (coroutine branch only)
 

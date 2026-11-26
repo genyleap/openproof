@@ -60,6 +60,14 @@ public:
         ReadDeviceApproval readApproval{};
         DecideDevice decide{};
     };
+    using VerifyJar=std::function<foundation::Result<NativeJarAuthorization>(
+        std::string_view,std::string_view,foundation::Instant)>;
+    using PushAuthorization=std::function<boost::asio::awaitable<foundation::Status>(
+        std::string,std::optional<std::string>,std::string,std::optional<AuthorizationRequest>,VerifyJar)>;
+    struct ParContext final {
+        std::string issuer;
+        PushAuthorization push;
+    };
     struct CodeExchangeContext final {
         foundation::SecretString codeKey;
         ExchangeCode exchange;
@@ -71,7 +79,8 @@ public:
         Rotate rotate={},PrepareSender prepareSender={},
         foundation::Duration accessLifetime=foundation::Duration{900000},
         std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={},
-        std::optional<DevicePollContext> devicePoll=std::nullopt);
+        std::optional<DevicePollContext> devicePoll=std::nullopt,
+        std::optional<ParContext> par=std::nullopt);
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -94,6 +103,8 @@ private:
     std::optional<CodeExchangeContext> m_codeExchange;
     IssueMachine m_issueMachine;
     std::optional<DevicePollContext> m_devicePoll;
+    std::optional<ParContext> m_par;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pushAuthorization(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> deviceBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> beginDevice(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pollDevice(gateway::HttpRequest);

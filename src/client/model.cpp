@@ -357,12 +357,16 @@ const std::optional<ClientSecretDigest>& Client::secretDigest() const noexcept
 foundation::Instant Client::createdAt() const noexcept { return m_state->createdAt; }
 foundation::Instant Client::updatedAt() const noexcept { return m_state->updatedAt; }
 
+bool matchesRegisteredRedirect(ClientKind kind,std::string_view registered,
+    std::string_view presented) noexcept
+{
+    return registered==presented || (kind==ClientKind::Native
+        && sameNativeLoopbackRedirect(registered,presented));
+}
 bool Client::permitsRedirect(std::string_view redirectUri) const noexcept
 {
     return std::ranges::any_of(m_state->redirectUris, [&](const RedirectUri& item) {
-        if (item.value() == redirectUri) return true;
-        return m_state->kind == ClientKind::Native
-            && sameNativeLoopbackRedirect(item.value(), redirectUri);
+        return matchesRegisteredRedirect(m_state->kind,item.value(),redirectUri);
     });
 }
 

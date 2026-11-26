@@ -1121,18 +1121,22 @@ const checked = segments.map(([name, relative]) => {
     const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
     const legacy=fs.readFileSync(path.join(root,relative),"utf8");
     for(const method of ["loginPage","loginSubmit","authorize","consentSubmit",
-      "pushedAuthorization","tokenEndpoint"]){
+      "tokenEndpoint"]){
       const start=legacy.indexOf("OAuthHttpApi::"+method+"(");
       const end=legacy.indexOf("\ngateway::HttpResponse OAuthHttpApi::",start+1);
       const body=legacy.slice(start,end<0?undefined:end);
       if (/m_(?:authorization|tokens|clients|authentication|sessions|consents|resources|serviceIdentities|devices|pushedAuthorization|jar)->/.test(body))
         issues.push({line:0,kind:"synchronous OAuth lifecycle remains",expression:method});
     }
-    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device"]){
+    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par"]){
       if(!app.includes('nativePaths.emplace_back("'+route+'")'))
         issues.push({line:0,kind:"native OAuth token operation missing strict dispatch",expression:route});
     }
     const native=fs.readFileSync(path.join(root,"src/oauth/http/coroutine_token_read_http.cpp"),"utf8");
+    if(!/m_nativeTokenReadsRequired && path=="\/oauth\/par"/.test(legacy)
+       || !/co_await m_par->push\(/.test(native)
+       || !/reader->pushOAuthAuthorizationAsync/.test(app))
+      issues.push({line:0,kind:"OAuth PAR initiation incomplete",expression:"strict native push and JAR replay"});
     if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/device_authorization" \|\| path=="\/oauth\/device"\)/.test(legacy)
        || !/co_await m_devicePoll->decide\(/.test(native)
        || !/co_await m_devicePoll->readApproval\(/.test(native)

@@ -1,4 +1,9 @@
+#include <boost/json.hpp>
 #include <algorithm>
+#include <charconv>
+#include <limits>
+#include <map>
+#include <memory>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -315,6 +320,162 @@ foundation::Result<std::string> deviceCsrf(const foundation::SecretString& key,
     if (!mac) return foundation::fail(mac.error());
     return std::string{nonce}+"."+foundation::toHex(mac.value());
 }
+using Parameters=std::map<std::string,std::string,std::less<>>;
+std::optional<std::string> optionalPar(const Parameters& values,std::string_view key) {
+    auto it=values.find(key);
+    return it==values.end() || it->second.empty()?std::nullopt:std::optional<std::string>{it->second};
+}
+foundation::Result<AuthorizationRequest> parseParAuthorization(const Parameters& values) {
+    auto type=optionalPar(values,"response_type"),id=optionalPar(values,"client_id"),
+        redirect=optionalPar(values,"redirect_uri"),scope=optionalPar(values,"scope"),
+        challenge=optionalPar(values,"code_challenge"),method=optionalPar(values,"code_challenge_method");
+    if (!type || *type!="code" || !id || id->size()>256U || !redirect || redirect->size()>2048U
+        || !scope || scope->size()>2048U || !challenge || !method || *method!="S256")
+        return foundation::fail(E::InvalidArgument);
+    auto pkce=PkceChallenge::create(*challenge);
+    if (!pkce) return foundation::fail(pkce.error());
+    std::vector<client::Scope> scopes;
+    std::string_view rest{*scope};
+    while (!rest.empty()) {
+        const auto space=rest.find(' ');
+        const auto item=rest.substr(0,space);
+        if (space==std::string_view::npos) rest={}; else rest.remove_prefix(space+1U);
+        if (item.empty()) continue;
+        auto parsed=client::Scope::create(std::string{item});
+        if (!parsed || scopes.size()>=64U) return foundation::fail(E::InvalidArgument);
+        scopes.push_back(std::move(parsed).value());
+    }
+    std::optional<foundation::Duration> age;
+    if (auto value=optionalPar(values,"max_age")) {
+        std::uint64_t seconds{};
+        const auto parsed=std::from_chars(value->data(),value->data()+value->size(),seconds);
+        if (parsed.ec!=std::errc{} || parsed.ptr!=value->data()+value->size() || seconds>86400U*30U)
+            return foundation::fail(E::InvalidArgument);
+        age=std::chrono::seconds{seconds};
+    }
+    auto mode=AuthorizationResponseMode::Query;
+    if (auto requested=optionalPar(values,"response_mode")) {
+        if (*requested=="query.jwt") mode=AuthorizationResponseMode::Jwt;
+        else if (*requested!="query") return foundation::fail(E::InvalidArgument);
+    }
+    return AuthorizationRequest::create(client::ClientId{*id},*redirect,std::move(scopes),
+        std::move(pkce).value(),optionalPar(values,"state"),optionalPar(values,"nonce"),
+        age,optionalPar(values,"resource"),mode);
+}
+std::optional<std::string> jsonString(const boost::json::object& object,std::string_view name) {
+    const auto found=object.find(name);
+    if (found==object.end() || !found->value().is_string()) return std::nullopt;
+    const auto& value=found->value().as_string();
+    return std::string{value.data(),value.size()};
+}
+[[nodiscard]] foundation::Result<NativeJarAuthorization> verifyNativeJar(
+    std::string_view compactJwt, const client::ClientId& expectedClient,
+    std::string_view expectedAudience,std::string_view expectedKeyId,std::string_view pem,foundation::Instant now)
+{
+    auto verified = security::verifyRs256Jwt(pem,compactJwt);
+    if (!verified) return foundation::fail(verified.error());
+    boost::system::error_code headerError;
+    boost::system::error_code payloadError;
+    auto headerValue = boost::json::parse(verified->headerJson(), headerError);
+    auto payloadValue = boost::json::parse(verified->payloadJson(), payloadError);
+    if (headerError || payloadError || !headerValue.is_object() || !payloadValue.is_object()) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The JAR request object is malformed.");
+    }
+    const auto& header = headerValue.as_object();
+    const auto& payload = payloadValue.as_object();
+    const auto algorithm = jsonString(header, "alg");
+    const auto keyId = jsonString(header, "kid");
+    const auto type = jsonString(header, "typ");
+    if (algorithm != std::optional<std::string>{"RS256"}
+        || keyId != std::optional<std::string>{std::string{expectedKeyId}}
+        || (type && *type != "JWT" && *type != "oauth-authz-req+jwt")) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The JAR protected header is invalid.");
+    }
+    const auto issuer = jsonString(payload, "iss");
+    const auto clientId = jsonString(payload, "client_id");
+    const auto jwtId = jsonString(payload, "jti");
+    if (issuer != std::optional<std::string>{std::string{expectedClient.value()}}
+        || clientId != std::optional<std::string>{std::string{expectedClient.value()}}
+        || !jwtId) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The JAR client binding is invalid.");
+    }
+    const auto audienceFound = payload.find("aud");
+    bool audienceMatches = false;
+    if (audienceFound != payload.end()) {
+        if (audienceFound->value().is_string()) {
+            const auto audience = audienceFound->value().as_string();
+            audienceMatches = std::string_view{audience.data(), audience.size()} == expectedAudience;
+        } else if (audienceFound->value().is_array()) {
+            for (const auto& value : audienceFound->value().as_array()) {
+                if (!value.is_string()) continue;
+                const auto audience = value.as_string();
+                if (std::string_view{audience.data(), audience.size()} == expectedAudience) {
+                    audienceMatches = true;
+                    break;
+                }
+            }
+        }
+    }
+    const auto issuedFound = payload.find("iat");
+    const auto expiresFound = payload.find("exp");
+    if (!audienceMatches || issuedFound == payload.end() || expiresFound == payload.end()
+        || !issuedFound->value().is_int64() || !expiresFound->value().is_int64()) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The JAR audience or temporal claims are invalid.");
+    }
+    const auto issuedSeconds = issuedFound->value().as_int64();
+    const auto expiresSeconds = expiresFound->value().as_int64();
+    if (issuedSeconds < 0 || expiresSeconds <= issuedSeconds || expiresSeconds > std::numeric_limits<std::int64_t>::max()/1000) {
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+                                "The JAR temporal claims are invalid.");
+    }
+    const foundation::Instant issuedAt{
+        std::chrono::duration_cast<foundation::Duration>(std::chrono::seconds{issuedSeconds})};
+    const foundation::Instant expiresAt{
+        std::chrono::duration_cast<foundation::Duration>(std::chrono::seconds{expiresSeconds})};
+
+    static constexpr std::string_view requiredClaims[]{
+        "response_type", "redirect_uri", "scope", "code_challenge", "code_challenge_method"};
+    Parameters parameters;
+    parameters.emplace("client_id", std::string{expectedClient.value()});
+    for (const auto name : requiredClaims) {
+        auto value = jsonString(payload, name);
+        if (!value) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The JAR request is missing a required authorization claim.");
+        }
+        parameters.emplace(std::string{name}, std::move(*value));
+    }
+    static constexpr std::string_view optionalClaims[]{
+        "state", "nonce", "resource", "response_mode"};
+    for (const auto name : optionalClaims) {
+        if (auto value = jsonString(payload, name)) {
+            parameters.emplace(std::string{name}, std::move(*value));
+        }
+    }
+    if (const auto maxAge = payload.find("max_age"); maxAge != payload.end()) {
+        if (!maxAge->value().is_int64() || maxAge->value().as_int64() < 0) {
+            return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                    "The JAR max_age claim is invalid.");
+        }
+        parameters.emplace("max_age", std::to_string(maxAge->value().as_int64()));
+    }
+    if (jwtId->empty() || jwtId->size()>256U || expiresAt<=now
+        || issuedAt>now+std::chrono::seconds{60} || issuedAt<now-std::chrono::minutes{10}
+        || expiresAt-issuedAt>std::chrono::minutes{10})
+        return foundation::fail(E::AuthenticationFailed);
+    auto request=parseParAuthorization(parameters);
+    if (!request) return foundation::fail(request.error());
+    return NativeJarAuthorization{std::move(request).value(),*jwtId,issuedAt,expiresAt};
+}
+
+
+bool parRoute(const gateway::HttpRequest& r) noexcept {
+    return r.path()=="/oauth/par" && (r.method()==Method::Post || r.method()==Method::Options);
+}
 bool beginDeviceRoute(const gateway::HttpRequest& r) noexcept {
     return r.path()=="/oauth/device_authorization" &&
         (r.method()==Method::Post || r.method()==Method::Options);
@@ -524,13 +685,13 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
     std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine,
-    std::optional<DevicePollContext> devicePoll)
+    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
       m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)),
-      m_devicePoll(std::move(devicePoll)) {}
+      m_devicePoll(std::move(devicePoll)),m_par(std::move(par)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_access && m_client;
@@ -540,6 +701,7 @@ bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) 
     if (machineRoute(r)) return m_issueMachine && m_prepareSender;
     if (deviceRoute(r)) return m_devicePoll && m_devicePoll->poll && m_prepareSender;
     if (beginDeviceRoute(r)) return m_devicePoll && m_devicePoll->begin && !m_devicePoll->verificationUri.empty();
+    if (parRoute(r)) return m_par && m_par->push && !m_par->issuer.empty();
     if (deviceBrowserRoute(r)) return m_devicePoll && m_devicePoll->authenticate
         && m_devicePoll->readApproval && m_devicePoll->decide;
     return m_fallback->nativeEnabledFor(r);
@@ -548,7 +710,7 @@ gateway::HttpResponse CoroutineTokenReadAdapter::handle(gateway::HttpRequest r) 
     scrub(r); return fail(E::Unavailable,r);
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(gateway::HttpRequest r) {
-    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r)) {
+    if (!userInfoRoute(r) && !introspectRoute(r) && !revokeRoute(r) && !refreshRoute(r) && !codeRoute(r) && !machineRoute(r) && !deviceRoute(r) && !beginDeviceRoute(r) && !deviceBrowserRoute(r) && !parRoute(r)) {
         if (m_fallback->nativeEnabledFor(r))
             co_return co_await m_fallback->handleAsync(std::move(r));
         scrub(r); co_return fail(E::Unavailable,r);
@@ -570,6 +732,7 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::handleAsync(ga
     if (deviceRoute(r)) co_return co_await pollDevice(std::move(r));
     if (beginDeviceRoute(r)) co_return co_await beginDevice(std::move(r));
     if (deviceBrowserRoute(r)) co_return co_await deviceBrowser(std::move(r));
+    if (parRoute(r)) co_return co_await pushAuthorization(std::move(r));
     co_return co_await introspect(std::move(r));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gateway::HttpRequest r) {
@@ -866,6 +1029,89 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::issueMachine(g
         .add("scope",joined(issued->scopes));
     if (exchange) body.add("issued_token_type",kAccessType);
     co_return json(200,std::move(body));
+}
+asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::pushAuthorization(gateway::HttpRequest r) {
+    Scrub wipe{r};
+    const auto oauthError=[](int status,std::string_view code) {
+        foundation::JsonObjectWriter body;
+        body.add("error",code);
+        return json(status,std::move(body));
+    };
+    const auto media=r.header("content-type");
+    if (!media || (*media!="application/x-www-form-urlencoded" &&
+        !media->starts_with("application/x-www-form-urlencoded;"))
+        || r.body().empty() || r.body().size()>32U*1024U)
+        co_return oauthError(400,"invalid_request");
+    Parameters parameters;
+    std::optional<foundation::SecretString> clientSecret,requestObject;
+    auto input=std::string_view{r.body()};
+    while (!input.empty()) {
+        const auto amp=input.find('&');
+        const auto item=input.substr(0,amp);
+        if (amp==std::string_view::npos) input={}; else input.remove_prefix(amp+1U);
+        if (item.empty()) continue;
+        const auto eq=item.find('=');
+        if (eq==std::string_view::npos) co_return oauthError(400,"invalid_request");
+        auto name=decode(item.substr(0,eq),64U);
+        if (!name) co_return oauthError(400,"invalid_request");
+        const auto key=name->expose();
+        auto value=decode(item.substr(eq+1U),key=="request"?24U*1024U:key=="client_secret"?512U:2048U);
+        if (!value) co_return oauthError(400,"invalid_request");
+        if (key=="client_secret" || key=="request") {
+            auto& dest=key=="client_secret"?clientSecret:requestObject;
+            if (dest || value->empty()) co_return oauthError(400,"invalid_request");
+            dest.emplace(std::move(value).value());
+        } else {
+            constexpr std::string_view allowed[]{"response_type","client_id","redirect_uri","scope",
+                "code_challenge","code_challenge_method","state","nonce","max_age","resource","response_mode"};
+            if (std::ranges::find(allowed,key)==std::ranges::end(allowed)
+                || !parameters.emplace(std::string{key},std::string{value->expose()}).second)
+                co_return oauthError(400,"invalid_request");
+        }
+    }
+    scrub(r);
+    auto id=optionalPar(parameters,"client_id");
+    if (!id || id->size()>256U) co_return oauthError(400,"invalid_request");
+    std::optional<std::string> clientDigest;
+    if (clientSecret) {
+        auto digest=security::hmacSha256(m_clientKey,clientSecret->expose());
+        if (!digest) co_return oauthError(503,"temporarily_unavailable");
+        clientDigest.emplace(foundation::toHex(digest.value()));
+        clientSecret.reset();
+    }
+    std::optional<AuthorizationRequest> direct;
+    VerifyJar verifier;
+    if (requestObject) {
+        if (parameters.size()!=1U) co_return oauthError(400,"invalid_request");
+        auto jwt=std::make_shared<foundation::SecretString>(std::move(*requestObject));
+        requestObject.reset();
+        verifier=[jwt,id=*id,issuer=m_par->issuer](std::string_view kid,std::string_view pem,foundation::Instant now) {
+            auto result=verifyNativeJar(jwt->expose(),client::ClientId{id},issuer,kid,pem,now);
+            *jwt=foundation::SecretString{};
+            return result;
+        };
+    } else {
+        auto parsed=parseParAuthorization(parameters);
+        if (!parsed) co_return oauthError(400,"invalid_request");
+        direct.emplace(std::move(parsed).value());
+    }
+    auto random=security::randomTokenBase64Url(32U);
+    if (!random) co_return oauthError(503,"temporarily_unavailable");
+    foundation::SecretString uri{"urn:ietf:params:oauth:request_uri:opar_"+random.value()};
+    foundation::secureWipe(random->data(),random->size());
+    auto digest=security::sha256(uri.expose());
+    if (!digest) co_return oauthError(503,"temporarily_unavailable");
+    auto stored=co_await m_par->push(std::move(*id),std::move(clientDigest),foundation::toHex(digest.value()),
+        std::move(direct),std::move(verifier));
+    if (!stored) {
+        if (stored.error().code()==E::AuthenticationRequired) co_return oauthError(401,"invalid_client");
+        if (stored.error().code()==E::InvalidArgument || stored.error().code()==E::PermissionDenied)
+            co_return oauthError(400,"invalid_request");
+        co_return oauthError(503,"temporarily_unavailable");
+    }
+    foundation::JsonObjectWriter body;
+    body.add("request_uri",uri.expose()).add("expires_in",static_cast<std::int64_t>(90));
+    co_return json(201,std::move(body));
 }
 asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::deviceBrowser(gateway::HttpRequest r) {
     Scrub wipe{r};

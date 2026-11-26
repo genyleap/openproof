@@ -1536,6 +1536,98 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_STREQ(PQgetvalue(finalState.get(),0,3),"1");
 }
 
+TEST(PostgresCanonicalCoroutineTest, NativeParPreservesLoopbackAndCommitsJarReplayAtomically)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace oauth=openproof::oauth;
+    namespace cli=openproof::client;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="par-app-"+seed.suffix,client="par-client-"+seed.suffix;
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(client+std::string{suffix}).value());
+    };
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'par-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) "
+        "VALUES($1,'http://127.0.0.1:1234/callback')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'openid'),($1,'account')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_request_signing_keys(client_id,key_id,public_key_pem,updated_at_ms) "
+        "VALUES($1,'fixture-key','fixture-public-material',1770000000000)",{client}));
+    auto makeRequest=[&](std::string uri,std::string scope) {
+        std::vector<cli::Scope> scopes;
+        scopes.push_back(cli::Scope::create(std::move(scope)).value());
+        return oauth::AuthorizationRequest::create(cli::ClientId{client},std::move(uri),std::move(scopes),
+            oauth::PkceChallenge::create(std::string(43U,'a')).value(),"fixture-state","fixture-nonce",
+            60s,std::nullopt,oauth::AuthorizationResponseMode::Jwt).value();
+    };
+    const auto redirect="http://127.0.0.1:4321/callback";
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    const auto run=[&](auto task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    auto push=[&](auto& store,std::string label,oauth::AuthorizationRequest request,
+        std::optional<std::string> proof=std::nullopt) {
+        return run(store.pushOAuthAuthorizationAsync(client,std::move(proof),fingerprint(label),
+            std::move(request),{},kNow,90s));
+    };
+    EXPECT_FALSE(push(foreign,"-foreign",makeRequest(redirect,"openid")));
+    EXPECT_FALSE(push(native,"-secret",makeRequest(redirect,"openid"),std::string(64U,'0')));
+    EXPECT_FALSE(push(native,"-redirect",makeRequest("http://127.0.0.1:4321/wrong","openid")));
+    EXPECT_FALSE(push(native,"-scope",makeRequest(redirect,"profile")));
+    ASSERT_TRUE(push(native,"-direct",makeRequest(redirect,"openid")));
+    int verified=0;
+    const auto verifier=[&](std::string_view kid,std::string_view pem,fnd::Instant observed)
+        ->fnd::Result<oauth::NativeJarAuthorization> {
+        ++verified;
+        EXPECT_EQ(kid,"fixture-key");
+        EXPECT_EQ(pem,"fixture-public-material");
+        EXPECT_EQ(observed,kNow);
+        return oauth::NativeJarAuthorization{makeRequest(redirect,"account"),"fixture-jti",kNow-1s,kNow+60s};
+    };
+    auto jar=[&](std::string label) {
+        return native.pushOAuthAuthorizationAsync(client,std::nullopt,fingerprint(label),std::nullopt,
+            verifier,kNow,90s);
+    };
+    // Deliberately collide with the direct request. Its failed INSERT must
+    // roll back JTI consumption so the correct subsequent push can succeed.
+    EXPECT_FALSE(run(jar("-direct")));
+    io.restart();
+    auto first=asio::co_spawn(io,jar("-jar-first"),asio::use_future);
+    auto second=asio::co_spawn(io,jar("-jar-second"),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ(verified,3);
+    const auto rows=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_pushed_authorization_requests WHERE client_id=$1 "
+        "AND redirect_uri=$2 AND response_mode=1 AND expires_at_ms=1770000090000)::text,"
+        "(SELECT count(*) FROM openproof.oauth_jar_replays WHERE client_id=$1 AND jwt_id='fixture-jti')::text",
+        {client,redirect});
+    ASSERT_EQ(PQntuples(rows.get()),1);
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,0),"2");
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,1),"1");
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeCodeExchangeConsumesExactlyOnceAndRollsBackFailedSigning)
 {
     const auto dsn=disposableDsn();
