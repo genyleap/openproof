@@ -4943,3 +4943,17 @@ PostgreSQL tests and the native public proxy real-TCP regression.
 The subsequent opp build failed on three contact-issuer lambda parameters
 shadowing an enclosing provider. Renamed those parameters without disabling
 -Werror=shadow; exact repaired executable acceptance remains pending.
+
+### Native delegated access context foundation
+
+The account authorization SQL now shares a bounded, read-only native
+access-context reader with future OAuth protected gateway composition.
+Token and family revocation, expiry, tenant and client/application/identity
+lifecycle, scopes, audiences and sender binding are read in one statement
+snapshot. A lateral union avoids multiplying scope and audience rows;
+more than 256 total grants fail closed rather than being truncated.
+Account authorization continues to require account scope and reject any
+sender constraint. The new context reader does not verify DPoP/mTLS proof:
+a caller must verify it before using a sender-constrained context.
+Protected OAuth gateway dispatch is deliberately unchanged until that
+verification boundary is native. No schema change.

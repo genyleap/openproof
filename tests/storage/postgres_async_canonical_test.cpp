@@ -1359,6 +1359,34 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_TRUE(accepted) << (accepted ? "" : std::string{fnd::errorCodeName(accepted.error().code())});
     EXPECT_EQ(accepted->identity().value(),seed.owner);
     EXPECT_EQ(accepted->id().value(),"delegated-access");
+    const auto readContext=[&]{
+        std::optional<fnd::Result<openproof::session::DelegatedAccess>> result;
+        auto capture=[](auto& adapter,std::string fingerprint,auto& output)->asio::awaitable<void>{
+            output.emplace(co_await adapter.readDelegatedAccessAsync(std::move(fingerprint),kNow));
+        };
+        io.restart();
+        auto done=asio::co_spawn(io,capture(native,digest,result),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'gateway.read')",{family}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_audiences(family_id,audience)"
+        " VALUES($1,'https://gateway.example.test'),($1,'https://other.example.test')",{family}));
+    auto context=readContext();
+    ASSERT_TRUE(context);
+    EXPECT_EQ(context->clientId(),client);
+    EXPECT_EQ(context->scopes().size(),2U);
+    EXPECT_EQ(context->audiences().size(),2U);
+    EXPECT_TRUE(context->permits("gateway.read"));
+    EXPECT_TRUE(context->permitsAudience("https://gateway.example.test"));
+    EXPECT_FALSE(context->permitsAudience("https://wrong.example.test"));
+    EXPECT_FALSE(context->senderConstraint());
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope)"
+        " SELECT $1,'bounded-'||n FROM generate_series(1,257) n",{family}));
+    EXPECT_FALSE(readContext());
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes"
+        " WHERE family_id=$1 AND scope LIKE 'bounded-%'",{family}));
     EXPECT_FALSE(read(foreign));
     EXPECT_FALSE(read(native,kNow+60s));
     ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1",{family}));
@@ -1369,6 +1397,11 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=0,"
         "sender_constraint_value='fixture' WHERE id=$1",{family}));
     EXPECT_FALSE(read(native));
+    auto constrained=readContext();
+    ASSERT_TRUE(constrained);
+    ASSERT_TRUE(constrained->senderConstraint());
+    EXPECT_EQ(constrained->senderConstraint()->kind(),openproof::session::DelegatedSenderConstraintKind::Dpop);
+    EXPECT_EQ(constrained->senderConstraint()->value(),"fixture");
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=NULL,"
         "sender_constraint_value=NULL WHERE id=$1",{family}));
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET status=1 WHERE id=$1",{client}));
