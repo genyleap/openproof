@@ -200,6 +200,33 @@ gtest_discover_tests(openproof_native_oidc_discovery_tests
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "oauth;oidc;coroutines")
 
+# Browser consent management exercises the real native adapter with
+# controlled session and storage callbacks, independent of the SQL fixture.
+add_executable(openproof_native_oauth_consent_tests oauth_native_consent_test.cpp)
+target_compile_features(openproof_native_oauth_consent_tests PRIVATE cxx_std_26)
+target_include_directories(openproof_native_oauth_consent_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include"
+    "${googletest_SOURCE_DIR}/googletest")
+target_compile_definitions(openproof_native_oauth_consent_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_native_oauth_consent_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_native_oauth_consent_tests PRIVATE
+    openproof_oauth_http openproof_gateway_http openproof_gateway openproof_consent
+    openproof_session openproof_client openproof_identity_core openproof_identity_provider
+    openproof_security openproof_foundation Boost::headers GTest::gtest_main
+    openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(oauth_native_consent_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_native_oauth_consent_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_native_oauth_consent_tests
+    TEST_PREFIX "FocusedNativeConsent."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "oauth;async;security" TIMEOUT 20)
+
 # Native public provider catalog uses no SQL/OAuth SPI during request handling.
 add_executable(openproof_native_provider_catalog_tests
     auth_native_provider_catalog_test.cpp)
