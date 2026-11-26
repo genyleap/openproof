@@ -33,7 +33,7 @@ test("Web3 login gets async transaction, canonical and session services without 
   assert.match(runtime, /CoroutinePostgresAuthenticationTransactionStore/);
   assert.match(runtime, /CoroutinePostgresCanonicalFinalizer/);
   assert.match(runtime, /nativeCanonical\.get\(\)/);
-  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\),\s*\[service=nativeSessions\.get\(\)\]/);
+  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\),\s*authenticateNativeWeb3\}/);
   assert.match(app, /runWithScim\(enterpriseApi, nativeWeb3Api\)/);
   assert.match(app, /runWithScim\(enterpriseApi, enterpriseApi\)/);
 });
@@ -131,11 +131,26 @@ test("native wallet connection uses native ownership and never issues a login gr
   assert.match(link,/co_await m_authentication->completeConnectionAsync\(/);
   assert.match(link,/co_return response;/);
   assert.doesNotMatch(link,/issueAsync\(/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/connections\/web3\/start",gateway::HttpMethod::Post\)/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/connections\/web3\/handoff",gateway::HttpMethod::Post\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/account\/connections\/web3\/start"\)/);
+  assert.match(app,/nativePaths.emplace_back\("\/account\/connections\/web3\/handoff"\)/);
   assert.match(app,/nativePaths.emplace_back\("\/account\/connections\/web3\/complete"\)/);
   const service=read("src/authentication/service.cpp");
   const owner=service.slice(service.indexOf("AuthenticationService::completeConnectionAsync("),
     service.indexOf("AuthenticationService::finishConnection("));
   assert.match(owner,/finalizer->updatePresentationAsync\(\s*\*exchange->connectionTarget,/);
+});
+
+test("delegated account authorization uses one native SQL snapshot and preserves scope constraints",()=>{
+  const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
+  const body=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeDelegatedAccountAsync("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync("));
+  for (const required of ["t.state=0","t.expires_at_ms>$2","f.revoked_at_ms IS NULL",
+    "f.sender_constraint_kind IS NULL","f.sender_constraint_value IS NULL",
+    "c.status=0","a.status=0","i.status=0","o.state=0","i.organization_id=$3",
+    "a.organization_id=$3","s.scope='account'","AuthenticatedSession::fromDelegatedAccess"])
+    assert.ok(body.includes(required),required);
+  assert.doesNotMatch(body,/\b(?:INSERT|UPDATE|DELETE)\b/);
+  assert.match(app,/security::hmacSha256\(\*nativeWeb3DelegatedKey,credential.expose\(\)\)/);
+  assert.match(app,/nativeCanonical->authorizeDelegatedAccountAsync\(/);
+  assert.match(app,/openproof\/oauth-token-key\/v1/);
 });

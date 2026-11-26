@@ -82,6 +82,11 @@ public:
                   std::vector<identity::core::ExternalIdentityRef>>>>
     readConnectionsAsync(identity::core::IdentityId owner);
 
+    // Read-only account-scope authorization of an already HMAC-digested
+    // OAuth access credential. Never persists a synthetic session.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::Session>>
+    authorizeDelegatedAccountAsync(std::string digestHex,foundation::Instant now);
+
     /** Read-only TOTP status. nullopt means no configured local-provider link;
      * false means linked but no usable password/TOTP pair. Never read secrets.
      */

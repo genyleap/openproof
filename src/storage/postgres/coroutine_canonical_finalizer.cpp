@@ -786,6 +786,58 @@ CoroutinePostgresCanonicalFinalizer::authorizeConnectionTargetAsync(
     }
 }
 
+asio::awaitable<foundation::Result<session::Session>>
+CoroutinePostgresCanonicalFinalizer::authorizeDelegatedAccountAsync(
+    std::string digestHex,foundation::Instant now)
+{
+    if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
+        return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+    })) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        Params params{std::move(digestHex),std::to_string(now.time_since_epoch().count()),
+            std::string{m_impl->organization.value()}};
+        const auto result=co_await lease.connection().query(
+            "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
+            "f.authenticated_at_ms,t.expires_at_ms,"
+            "EXISTS(SELECT 1 FROM openproof.oauth_token_family_scopes s "
+            "WHERE s.family_id=f.id AND s.scope='account') "
+            "FROM openproof.oauth_access_tokens t "
+            "JOIN openproof.oauth_token_families f ON f.id=t.family_id "
+            "JOIN openproof.oauth_clients c ON c.id=f.client_id "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "JOIN openproof.identities i ON i.id=f.identity_id "
+            "JOIN openproof.organizations o ON o.id=i.organization_id "
+            "WHERE t.token_digest=decode($1,'hex') AND t.state=0 "
+            "AND t.revoked_at_ms IS NULL AND t.issued_at_ms<=$2 AND t.expires_at_ms>$2 "
+            "AND f.revoked_at_ms IS NULL AND f.authenticated_at_ms<=$2 "
+            "AND f.sender_constraint_kind IS NULL AND f.sender_constraint_value IS NULL "
+            "AND c.status=0 AND a.status=0 AND i.status=0 AND o.state=0 "
+            "AND i.organization_id=$3 AND a.organization_id=$3",
+            std::move(params),remaining(deadline));
+        if (result.rows.size()!=1U || result.rows.front().size()!=8U)
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        const auto& row=result.rows.front();
+        const auto assurance=milliseconds(row[2]);
+        const auto factors=milliseconds(row[3]);
+        if (assurance>4 || factors>7)
+            co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+        if (!boolean(row[7]))
+            co_return foundation::fail(foundation::ErrorCode::PermissionDenied);
+        auto authorized=session::AuthenticatedSession::fromDelegatedAccess(
+            core::IdentityId{required(row[0])},idp::ProviderId{required(row[1])},
+            static_cast<idp::AssuranceLevel>(assurance),
+            idp::AuthenticationStrength{static_cast<idp::AuthenticationFactor>(factors),boolean(row[4])},
+            foundation::Instant{foundation::Duration{milliseconds(row[5])}},now,
+            foundation::Instant{foundation::Duration{milliseconds(row[6])}});
+        if (!authorized) co_return foundation::fail(authorized.error());
+        co_return authorized->session();
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
 asio::awaitable<foundation::Status>
 CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync(
     core::IdentityId owner,core::ExternalIdentityRef external)

@@ -1307,6 +1307,80 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
     EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
 }
 
+TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndTenantBound)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr) {
+            FAIL()<<"Explicit disposable database has invalid socket DSN.";
+        }
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto application="delegated-app-"+seed.suffix;
+    const auto client="delegated-client-"+seed.suffix;
+    const auto family="delegated-family-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(family).value());
+    auto sql=[&](const std::string& query,std::initializer_list<std::string> params){
+        static_cast<void>(execute(fixture.get(),query,params));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,"
+        "environment,status,created_at_ms,updated_at_ms) VALUES($1,$2,'delegated-fixture','Fixture',0,0,1770000000000,1770000000000)",
+        {application,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,"
+        "created_at_ms,updated_at_ms) VALUES($1,$2,'Fixture client',1,0,1770000000000,1770000000000)",{client,application}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families(id,client_id,identity_id,provider,"
+        "assurance,factors,phishing_resistant,authenticated_at_ms) VALUES($1,$2,$3,'local',1,1,false,1770000000000)",
+        {family,client,seed.owner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'account')",{family}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_access_tokens(token_digest,family_id,state,issued_at_ms,expires_at_ms)"
+        " VALUES(decode($1,'hex'),$2,0,1770000000000,1770000060000)",{digest,family}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    const auto read=[&](pg::CoroutinePostgresCanonicalFinalizer& store,fnd::Instant now=kNow){
+        std::optional<fnd::Result<openproof::session::Session>> result;
+        auto capture=[](auto& adapter,std::string fingerprint,fnd::Instant time,auto& output)->asio::awaitable<void>{
+            output.emplace(co_await adapter.authorizeDelegatedAccountAsync(std::move(fingerprint),time));
+        };
+        io.restart();
+        auto done=asio::co_spawn(io,capture(store,digest,now,result),asio::use_future);
+        io.run();
+        done.get();
+        return std::move(result.value());
+    };
+    auto accepted=read(native);
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(accepted->identity().value(),seed.owner);
+    EXPECT_EQ(accepted->id().value(),"delegated-access");
+    EXPECT_FALSE(read(foreign));
+    EXPECT_FALSE(read(native,kNow+60s));
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1",{family}));
+    auto scopeDenied=read(native);
+    ASSERT_FALSE(scopeDenied);
+    EXPECT_EQ(scopeDenied.error().code(),fnd::ErrorCode::PermissionDenied);
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'account')",{family}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=0,"
+        "sender_constraint_value='fixture' WHERE id=$1",{family}));
+    EXPECT_FALSE(read(native));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=NULL,"
+        "sender_constraint_value=NULL WHERE id=$1",{family}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET status=1 WHERE id=$1",{client}));
+    EXPECT_FALSE(read(native));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET status=0 WHERE id=$1",{client}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=1 WHERE id=$1",{application}));
+    EXPECT_FALSE(read(native));
+    ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=0 WHERE id=$1",{application}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET revoked_at_ms=1770000000000 WHERE id=$1",{family}));
+    EXPECT_FALSE(read(native));
+}
+
 TEST(PostgresCanonicalCoroutineTest, NativeConsentListAndRevokeAreTenantScopedAndBounded)
 {
     const auto dsn = disposableDsn();

@@ -3060,8 +3060,8 @@ addProtectedRoutes(gateway::Router& router,
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
         if (nativeWeb3Enabled) {
-            nativeMethods.emplace_back("/account/connections/web3/start",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/connections/web3/handoff",gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/connections/web3/start");
+            nativePaths.emplace_back("/account/connections/web3/handoff");
             nativePaths.emplace_back("/account/connections/web3/complete");
         }
         if (nativeFederatedStartEnabled) {
@@ -3159,6 +3159,32 @@ addProtectedRoutes(gateway::Router& router,
         return runWithEvidence(scimApi, nativeEnterprise);
     };
 
+    std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
+    if (nativeWeb3Enabled && platform.oidc().enabled()) {
+        auto key=deriveSecret(platform.security().tokenSigningKey(),"openproof/oauth-token-key/v1");
+        if (!key) {
+            reportStartupFailure(key.error());
+            return ExitCode::ConfigurationError;
+        }
+        nativeWeb3DelegatedKey.emplace(std::move(key).value());
+    }
+    const auto authenticateNativeWeb3=[&](fnd::SecretString credential)
+        -> boost::asio::awaitable<fnd::Result<session::Session>> {
+        if (!nativeSessions || !nativeCanonical)
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        auto authenticated=co_await nativeSessions->authenticate(credential.clone());
+        if (authenticated || !nativeWeb3DelegatedKey)
+            co_return std::move(authenticated);
+        if (credential.empty() || credential.expose().size()>256U)
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
+        credential=fnd::SecretString{};
+        if (!fingerprint) co_return fnd::fail(fingerprint.error());
+        // The native SQL adapter receives only the keyed digest.
+        co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
+            fnd::toHex(fingerprint.value()),clock.now());
+    };
+
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
         authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
             nativeAuthentication ? *nativeAuthentication : authentication,
@@ -3176,9 +3202,7 @@ addProtectedRoutes(gateway::Router& router,
                 authHttp::Web3AuthenticationHttpApi localWeb3Api{
                     *nativeAuthentication, providers, sessions, limiter.value(),
                     localEnterpriseApi, nullptr, nativeSessions.get(),
-                    [service=nativeSessions.get()](fnd::SecretString token) {
-                        return service->authenticate(std::move(token));
-                    }};
+                    authenticateNativeWeb3};
                 return runWithScim(enterpriseApi, localWeb3Api);
             }
             return runWithScim(enterpriseApi, localEnterpriseApi);
@@ -3191,9 +3215,7 @@ addProtectedRoutes(gateway::Router& router,
             authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
                 *nativeAuthentication, providers, sessions, limiter.value(),
                 enterpriseApi, nullptr, nativeSessions.get(),
-                [service=nativeSessions.get()](fnd::SecretString token) {
-                    return service->authenticate(std::move(token));
-                }};
+                authenticateNativeWeb3};
             return runWithScim(enterpriseApi, nativeWeb3Api);
         }
         return runWithScim(enterpriseApi, enterpriseApi);
