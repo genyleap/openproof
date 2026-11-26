@@ -14,6 +14,7 @@ import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;
 import openproof.identity.profile;
+import openproof.organization;
 
 namespace openproof::storage::postgres {
 
@@ -76,6 +77,16 @@ public:
         std::pair<identity::core::IdentityId, std::optional<bool>>>>
     readTotpStatusAsync(identity::core::IdentityId owner,
                         identity::provider::ProviderId localProvider);
+
+    /** Read the authoritative active membership and its roles in one SQL
+     * snapshot. The caller must supply a server-authenticated identity and
+     * the route's organization; a mismatched tenant is denied. This is a
+     * repository read, not a standalone authorization decision.
+     */
+    [[nodiscard]] boost::asio::awaitable<
+        foundation::Result<organization::Membership>>
+    readAuthorizationMembershipAsync(identity::core::IdentityId subject,
+                                     identity::core::OrganizationId tenant);
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) override;

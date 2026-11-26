@@ -29,6 +29,7 @@ import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
 import openproof.identity.provider;
+import openproof.organization;
 
 namespace {
 namespace asio = boost::asio;
@@ -772,6 +773,111 @@ asio::awaitable<bool> concurrentConnectionRead(
     auto linked = co_await canonical.readConnectionsAsync(owner);
     co_return linked && linked->first == owner
         && linked->second.empty() == emptyExpected;
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenantBoundAndFresh)
+{
+    const auto dsn = disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK") != nullptr)
+            FAIL() << "Explicitly requested disposable database has an invalid socket DSN.";
+        GTEST_SKIP() << "Only an explicitly acknowledged disposable database may be used.";
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get()) == CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    for (const auto& [tenant, subject, state] : {
+         std::tuple{seed.org, seed.owner, "1"},
+         std::tuple{seed.org, seed.secondOwner, "2"},
+         std::tuple{seed.org, seed.freshLoginOwner, "0"},
+         std::tuple{seed.org, seed.lockedOwner, "1"},
+         std::tuple{seed.org, seed.emptyConnectionsOwner, "1"},
+         std::tuple{seed.foreignOrg, seed.foreignOwner, "1"},
+         std::tuple{seed.suspendedOrg, seed.suspendedOwner, "1"}}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+            "VALUES($1,$2,$3,1770000000000)", {tenant, subject, state})));
+    }
+    for (const auto& role : {"owner", "auditor"}) {
+        ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+            "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,$3)",
+            {seed.org, seed.owner, role})));
+    }
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer canonical{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    pg::CoroutinePostgresCanonicalFinalizer suspended{
+        io.get_executor(), fnd::SecretString{*dsn}, ids::OrganizationId{seed.suspendedOrg}, 1U,
+        std::chrono::milliseconds{500}, std::chrono::milliseconds{1000},
+        std::chrono::milliseconds{2000}};
+    auto check = [&]() -> asio::awaitable<void> {
+        auto allowed = co_await canonical.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org});
+        if (!allowed) {
+            ADD_FAILURE() << "Expected active tenant membership";
+            co_return;
+        }
+        EXPECT_EQ(allowed->identity().value(), seed.owner);
+        EXPECT_EQ(allowed->organization().value(), seed.org);
+        EXPECT_EQ(allowed->roles().size(), 2U);
+        EXPECT_TRUE(allowed->hasRole(openproof::organization::Role{"owner"}));
+        EXPECT_TRUE(allowed->hasRole(openproof::organization::Role{"auditor"}));
+        auto empty = co_await canonical.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.emptyConnectionsOwner}, ids::OrganizationId{seed.org});
+        EXPECT_TRUE(empty && empty->roles().empty());
+        for (const auto& subject : {seed.secondOwner, seed.freshLoginOwner, seed.lockedOwner,
+                                    seed.foreignOwner, seed.simultaneousOwner}) {
+            auto denied = co_await canonical.readAuthorizationMembershipAsync(
+                ids::IdentityId{subject}, ids::OrganizationId{seed.org});
+            EXPECT_TRUE(!denied && denied.error().code() == fnd::ErrorCode::PermissionDenied);
+        }
+        auto wrongTenant = co_await canonical.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.owner}, ids::OrganizationId{seed.foreignOrg});
+        EXPECT_TRUE(!wrongTenant && wrongTenant.error().code() == fnd::ErrorCode::PermissionDenied);
+        auto inactiveTenant = co_await suspended.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.suspendedOwner}, ids::OrganizationId{seed.suspendedOrg});
+        EXPECT_TRUE(!inactiveTenant && inactiveTenant.error().code() == fnd::ErrorCode::PermissionDenied);
+    };
+    auto done = asio::co_spawn(io, check(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
+        {seed.org, seed.owner})));
+    io.restart();
+    // Boost.Asio 1.88 co_spawn requires a default-constructible completion
+    // value on exception. Membership intentionally has no default state.
+    // Keep that invariant and transfer the result through a void coroutine.
+    std::optional<fnd::Result<openproof::organization::Membership>> refreshedResult;
+    auto refresh = [&]() -> asio::awaitable<void> {
+        refreshedResult.emplace(co_await canonical.readAuthorizationMembershipAsync(
+            ids::IdentityId{seed.owner}, ids::OrganizationId{seed.org}));
+    };
+    auto refreshed = asio::co_spawn(io, refresh(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(refreshed.get());
+    ASSERT_TRUE(refreshedResult);
+    auto& member = *refreshedResult;
+    ASSERT_TRUE(member);
+    EXPECT_FALSE(member->hasRole(openproof::organization::Role{"owner"}));
+    EXPECT_TRUE(member->hasRole(openproof::organization::Role{"auditor"}));
+
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) "
+        "SELECT $1,$2,'role-' || n::text FROM generate_series(1,257) AS n",
+        {seed.org, seed.owner})));
+    io.restart();
+    refreshedResult.reset();
+    auto overflow = asio::co_spawn(io, refresh(), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(overflow.get());
+    ASSERT_TRUE(refreshedResult);
+    auto& bounded = *refreshedResult;
+    EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)
