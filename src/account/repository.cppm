@@ -31,6 +31,18 @@ public:
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity = nullptr) = 0;
 
+    /** Atomic purpose-bound consumption. Unsupported external adapters
+     * fail closed; the compatibility consume API never substitutes for
+     * a purpose check performed under the repository lock.
+     */
+    [[nodiscard]] virtual foundation::Result<VerificationChallenge> consumeForPurpose(
+        const VerificationId&, const VerificationDigest&,
+        foundation::Instant, std::uint32_t, VerificationPurpose,
+        const identity::core::IdentityId* = nullptr)
+    {
+        return foundation::fail(foundation::ErrorCode::NotImplemented);
+    }
+
     /** Reserves an unverified provider subject so two pending accounts cannot claim it. */
     [[nodiscard]] virtual foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
@@ -59,6 +71,11 @@ public:
         const VerificationId& id, const VerificationDigest& presented,
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity = nullptr) override;
+    [[nodiscard]] foundation::Result<VerificationChallenge> consumeForPurpose(
+        const VerificationId& id, const VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        VerificationPurpose expectedPurpose,
+        const identity::core::IdentityId* expectedIdentity = nullptr) override;
     [[nodiscard]] foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& identity,
@@ -71,6 +88,11 @@ public:
         const identity::core::IdentityId& expectedOwner) override;
 
 private:
+    [[nodiscard]] foundation::Result<VerificationChallenge> consumeImpl(
+        const VerificationId& id, const VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity,
+        std::optional<VerificationPurpose> expectedPurpose);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

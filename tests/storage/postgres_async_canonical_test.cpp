@@ -855,9 +855,19 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     auto signup = run(store.replaceAsync(challenge("signup-" + seed.suffix,
         seed.owner, acc::VerificationPurpose::SignupEmail)));
     EXPECT_TRUE(!signup && signup.error().code() == fnd::ErrorCode::InvalidArgument);
+    // Wrong-purpose requests must not consume or exhaust the native proof.
+    const ids::IdentityId expectedOwner{seed.owner};
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        auto wrong = legacy.consumeForPurpose(acc::VerificationId{last},
+            acc::VerificationDigest{std::array<std::byte, 32>{}}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
+        EXPECT_TRUE(!wrong && wrong.error().code() == fnd::ErrorCode::AuthenticationFailed);
+    }
+    auto wrongPurpose = legacy.consumeForPurpose(acc::VerificationId{last},
+        acc::VerificationDigest{digest}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
+    EXPECT_TRUE(!wrongPurpose && wrongPurpose.error().code() == fnd::ErrorCode::AuthenticationFailed);
     // Legacy consumption must still understand the native-issued digest.
-    auto consumed = legacy.consume(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U);
+    auto consumed = legacy.consumeForPurpose(acc::VerificationId{last},
+        acc::VerificationDigest{digest}, kNow, 8U, purpose, &expectedOwner);
     ASSERT_TRUE(consumed);
     EXPECT_EQ(consumed->identity().value(), seed.owner);
     EXPECT_EQ(consumed->purpose(), purpose);

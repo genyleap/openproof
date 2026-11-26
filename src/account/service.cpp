@@ -252,9 +252,9 @@ foundation::Result<VerificationChallenge> AccountService::consume(
 {
     auto fingerprint = digest(id, secret);
     if (!fingerprint.has_value()) return foundation::fail(fingerprint.error());
-    auto challenge = m_repository->consume(
+    auto challenge = m_repository->consumeForPurpose(
         id, fingerprint.value(), m_clock->now(), m_policy.maximumAttempts(),
-        expectedIdentity);
+        purpose, expectedIdentity);
     if (!challenge.has_value()) return foundation::fail(challenge.error());
     if (challenge->purpose() != purpose) {
         return foundation::fail(genericVerificationFailure(

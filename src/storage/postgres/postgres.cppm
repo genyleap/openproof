@@ -473,6 +473,11 @@ public:
         const account::VerificationId& id, const account::VerificationDigest& presented,
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity = nullptr) override;
+    [[nodiscard]] foundation::Result<account::VerificationChallenge> consumeForPurpose(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        account::VerificationPurpose expectedPurpose,
+        const identity::core::IdentityId* expectedIdentity = nullptr) override;
     [[nodiscard]] foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& identity,
@@ -485,6 +490,11 @@ public:
         const identity::core::IdentityId& expectedOwner) override;
 
 private:
+    [[nodiscard]] foundation::Result<account::VerificationChallenge> consumeImpl(
+        const account::VerificationId& id, const account::VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity,
+        std::optional<account::VerificationPurpose> expectedPurpose);
     ConnectionPool* m_pool;
 };
 

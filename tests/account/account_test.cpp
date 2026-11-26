@@ -360,6 +360,11 @@ TEST(AccountPhoneVerificationTest, WrongIdentityCannotConsumeOrExhaustOwnerProof
     auto rejected = fixture.service->completePhoneVerification(other, verification, proof);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        EXPECT_FALSE(fixture.service->completeEmailChange(
+            owner, verification, fnd::SecretString{"wrong-purpose"}));
+    }
+    EXPECT_FALSE(fixture.service->completeEmailChange(owner, verification, proof));
     ASSERT_TRUE(fixture.service->completePhoneVerification(owner, verification, proof));
     EXPECT_FALSE(fixture.service->completePhoneVerification(owner, verification, proof));
     auto saved = fixture.profiles.find(owner);
