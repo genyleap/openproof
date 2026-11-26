@@ -28,7 +28,7 @@ test("native Web3 request guard erases raw proof, authorization and cookie heade
 test("all parsed SIWE and handoff JSON copies are securely wiped",()=>{
   assert.match(guard,/class SensitiveWeb3ParsedGuard final/);
   assert.match(guard,/~SensitiveWeb3ParsedGuard\(\) \{ wipe\(\); \}/);
-  assert.match(guard,/\{"handoff_ticket", "message", "signature"\}/);
+  assert.match(guard,/\{"handoff_ticket", "redeem_ticket", "message", "signature"\}/);
   assert.match(guard,/foundation::secureWipe\(value\.data\(\), value\.size\(\)\)/);
   for(const fn of [start,complete]){
     assert.match(fn,/SensitiveWeb3ParsedGuard wipeParsedOnExit\{body \? &body\.value\(\) : nullptr\}/);
@@ -69,8 +69,26 @@ test("cookie parser makes only one copy after duplicate and format validation",(
   const cookie=source.slice(source.indexOf("std::optional<std::string> cookieValue("),
     source.indexOf("[[nodiscard]] foundation::Result<json::object> parseObject"));
   assert.match(cookie,/std::optional<std::string_view> found/);
-  assert.match(cookie,/if \(!safe \|\| found\) return std::nullopt/);
+  assert.match(cookie,/if \(!safe \|\| found\) \{\s*if \(malformed\) \*malformed=true;\s*return std::nullopt;/);
   assert.match(cookie,/found = value/);
   assert.match(cookie,/std::optional<std::string>\{std::string\{\*found\}\}/);
   assert.doesNotMatch(cookie,/found = std::string\{value\}/);
+});
+
+test("mobile handoff guards tickets before suspension and rejects malformed optional cookies",()=>{
+  const issue=source.slice(source.indexOf("Web3AuthenticationHttpApi::issueAuthenticationHandoffAsync("),
+    source.indexOf("Web3AuthenticationHttpApi::redeemAuthenticationHandoffAsync("));
+  const redeem=source.slice(source.indexOf("Web3AuthenticationHttpApi::redeemAuthenticationHandoffAsync("),
+    source.indexOf("Web3AuthenticationHttpApi::startAsync("));
+  for (const [body,method] of [[issue,"issue"],[redeem,"redeem"]]) {
+    const at=body.indexOf("co_await m_authentication->"+method+"BrowserAuthenticationHandoffAsync(");
+    assert.ok(at>0);
+    assert.ok(body.indexOf("wipeRequestOnExit.wipe()")>=0 && body.indexOf("wipeRequestOnExit.wipe()")<at);
+    assert.ok(body.indexOf("wipeParsedOnExit.wipe()")>=0 && body.indexOf("wipeParsedOnExit.wipe()")<at);
+  }
+  assert.match(redeem,/foundation::SecretString ticket\{std::move\(\*redeemTicket\)\}/);
+  assert.match(complete,/cookieValue\(request, kAuthenticationHandoffCookie, 256U,&malformedMode\)/);
+  assert.ok(complete.indexOf("if (malformedMode)")<complete.indexOf("co_await m_authentication->completeAsync("));
+  const publish=complete.indexOf("co_await m_authentication->publishBrowserAuthenticationHandoffAsync(");
+  assert.ok(publish>0 && complete.indexOf("co_return response;",publish)<complete.indexOf("co_await m_asyncSessions->issueAsync("));
 });

@@ -54,12 +54,14 @@ test("native route overlay has exact opt-in path gates, never implicit LDAP or A
   assert.match(ldap, /nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/);
   assert.match(web3Routes, /nativePaths\.emplace_back\("\/auth\/web3\/start"\)/);
   assert.match(web3Routes, /nativePaths\.emplace_back\("\/auth\/web3\/complete"\)/);
-  assert.doesNotMatch(web3Routes,/\/auth\/web3\/handoff|\/account\/connections/);
+  assert.match(web3Routes,/nativePaths\.emplace_back\("\/auth\/web3\/handoff"\)/);
+  assert.match(web3Routes,/nativePaths\.emplace_back\("\/auth\/web3\/handoff\/redeem"\)/);
+  assert.doesNotMatch(web3Routes,/\/account\/connections/);
   assert.match(account, /nativePaths\.emplace_back\("\/account\/sessions"\)/);
   assert.match(account, /nativePaths\.emplace_back\("\/account\/sessions\/revoke"\)/);
 });
 
-test("native Web3 entry awaits verification and session issuance but cannot redeem handoffs", () => {
+test("native Web3 login and mobile handoff await native verification and session issuance", () => {
   assert.match(web3Api,/session::CoroutineSessionIssuer\* asyncSessions = nullptr/);
   const start = web3.slice(web3.indexOf("Web3AuthenticationHttpApi::nativeEnabledFor("));
   const cap = start.slice(0,start.indexOf("Web3AuthenticationHttpApi::handleAsync("));
@@ -71,10 +73,15 @@ test("native Web3 entry awaits verification and session issuance but cannot rede
     start.indexOf("Web3AuthenticationHttpApi::completeAsync("));
   const complete = start.slice(start.indexOf("Web3AuthenticationHttpApi::completeAsync("));
   assert.match(begin,/co_await m_authentication->beginAsync\(/);
-  assert.match(begin,/if \(handoffTicket\)/);
+  assert.match(begin,/if \(handoffTicket\) publisherTicket.emplace/);
   assert.match(complete,/co_await m_authentication->completeAsync\(/);
   assert.match(complete,/co_await m_asyncSessions->issueAsync\(/);
   assert.match(complete,/if \(authenticationHandoff\)/);
+  assert.match(complete,/co_await m_authentication->publishBrowserAuthenticationHandoffAsync\(/);
+  const native=web3.slice(web3.indexOf("Web3AuthenticationHttpApi::handleAsync("));
+  assert.match(native,/co_await m_authentication->issueBrowserAuthenticationHandoffAsync\(/);
+  assert.match(native,/co_await m_authentication->redeemBrowserAuthenticationHandoffAsync\(/);
+  assert.doesNotMatch(native,/m_authentication->(?:issue|publish|redeem)BrowserAuthenticationHandoff\(/);
   assert.doesNotMatch(complete,/m_sessions->issue\(/);
 });
 
