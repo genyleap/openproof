@@ -16,7 +16,7 @@ assert.ok(start >= 0 && end > start);
 const body = source.slice(start, end);
 
 test("libpq socket is only duplicated after Asio descriptor construction", () => {
-  const wrapper = body.indexOf("asio::posix::stream_descriptor descriptor{executor};");
+  const wrapper = body.indexOf("slot.emplace(executor);");
   const duplicate = body.indexOf("const int fd = ::dup(originalFd);");
   assert.ok(wrapper >= 0 && duplicate > wrapper);
   assert.match(body, /const int originalFd = PQsocket\(connection\)/);
@@ -88,4 +88,21 @@ test("timed PostgreSQL operations are serialized on their current executor", () 
   assert.match(testSource, /TEST\(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor\)/);
   assert.match(testSource, /ASSERT_TRUE\(opening.stopped\(\)\)/);
   assert.match(testSource, /queryOnNextExecutor\(std::move\(connection\)\)/);
+});
+
+test("connected query reuses readiness ownership only within its own executor and lifetime", () => {
+  assert.match(source, /struct QuerySocketReadiness final\s*\{\s*std::optional<asio::posix::stream_descriptor> descriptor;/);
+  assert.match(body, /QuerySocketReadiness\* querySocket = nullptr/);
+  assert.match(body, /auto& slot = querySocket \? querySocket->descriptor : transient/);
+  assert.match(body, /if \(slot.has_value\(\)\)[\s\S]*?if \(querySocket->originalFd != originalFd\)\s*\{\s*throw std::runtime_error/);
+  const connect = source.slice(source.indexOf("AsyncConnection::connectSerialized("),
+    source.indexOf("AsyncConnection::query("));
+  assert.match(connect, /co_await waitForSocket\(/);
+  assert.doesNotMatch(connect, /QuerySocketReadiness|&querySocket/);
+  const query = source.slice(source.indexOf("AsyncConnection::querySerialized("));
+  assert.match(query, /try\s*\{\s*QuerySocketReadiness querySocket;/);
+  for (const direction of ["wait_read", "wait_write"]) {
+    assert.ok(query.includes("asio::posix::stream_descriptor::"+direction+", deadline, &querySocket)"));
+  }
+  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
 });
