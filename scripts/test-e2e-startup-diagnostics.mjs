@@ -92,3 +92,47 @@ test("mixed-read comparator still accepts two historical aggregate-only artifact
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /Mixed-workload per-operation latencies/);
 });
+
+test("repeated mixed-read summary validates all pairs and provenance", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openproof-paired-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const base = "a".repeat(40), candidate = "b".repeat(40);
+  const script = fileURLToPath(new URL("./summarize-mixed-read-bench.mjs", import.meta.url));
+  const run = () => spawnSync(process.execPath, [script, dir, base, candidate],
+    { encoding: "utf8", timeout: 5000 });
+  const file = (c, trial, side) => path.join(dir, [c, trial, side].join("-") + ".json");
+  for (const [c, requests] of [[24,600],[96,1200]]) {
+    for (let trial=1; trial<=4; trial++) {
+      for (const [side, commit] of [["baseline",base],["candidate",candidate]]) {
+        const m = fixtureMetrics(commit, requests);
+        m.concurrency = c;
+        m.serverCpuTicksDelta = 20;
+        m.serverRssKiBEnd = 5000;
+        if (side === "candidate") { m.requestsPerSecond = 110; m.p95Ms = 1.5; }
+        fs.writeFileSync(file(c,trial,side),JSON.stringify(m));
+      }
+    }
+  }
+  const good = run();
+  assert.ifError(good.error);
+  assert.equal(good.status,0,good.stderr);
+  const summary = JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+  assert.deepEqual(summary.workloads.map(w=>w.concurrency),[24,96]);
+  for (const w of summary.workloads) {
+    assert.equal(w.pairs,4);
+    assert.equal(w.metrics.requestsPerSecond.medianPairedChangePercent,10);
+    assert.equal(w.metrics.requestsPerSecond.candidateWins,4);
+    assert.equal(w.metrics.p95Ms.medianPairedChangePercent,-25);
+  }
+  const invalid = file(96,4,"candidate");
+  const record = JSON.parse(fs.readFileSync(invalid,"utf8"));
+  record.commit = base;
+  fs.writeFileSync(invalid,JSON.stringify(record));
+  const bad = run();
+  assert.ifError(bad.error);
+  assert.equal(bad.status,1);
+  fs.unlinkSync(invalid);
+  const missing = run();
+  assert.ifError(missing.error);
+  assert.equal(missing.status,1);
+});
