@@ -15,6 +15,7 @@ import { startLocalDemoPortal } from "./local-demo-portal.mjs";
 import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
 import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-diagnostics.mjs";
 import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
+import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -394,6 +395,8 @@ async function main() {
   let startupFailureCategory;
   let loadResult;
   let loadResourceMetrics = {};
+  let edgePhaseCollector;
+  let edgePhaseMetrics;
   let nativeClientId = "";
   const masterKey = base64Url(crypto.randomBytes(48));
   const ownerPassword = `E2E-owner-${base64Url(crypto.randomBytes(24))}`;
@@ -408,6 +411,7 @@ async function main() {
   const edgeServer = https.createServer(
     { key: privateTlsKey, cert: certificate },
     (request, response) => {
+      const phase = edgePhaseCollector?.start(performance.now());
       const headers = {
         ...request.headers,
         // Preserve the public TLS authority for the same-origin POST
@@ -429,6 +433,7 @@ async function main() {
         ...(process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"
           ? { agent: false } : {}),
       }, (upstream) => {
+        if (phase) phase.headers(performance.now());
         const responseHeaders = { ...upstream.headers };
         responseHeaders["strict-transport-security"] = "max-age=31536000";
         response.writeHead(upstream.statusCode, responseHeaders);
@@ -443,7 +448,11 @@ async function main() {
         if (!socket.connecting) upstreamConnected = true;
         else socket.once("connect", () => { upstreamConnected = true; });
       });
-      forwarded.once("finish", () => { upstreamRequestSent = true; });
+      forwarded.once("finish", () => {
+        upstreamRequestSent = true;
+        if (phase) phase.sent(performance.now());
+      });
+      if (phase) response.once("finish", () => phase.finish(performance.now()));
       forwarded.on("error", (error) => {
         // Expose ONLY a fixed allow-list of transport error categories in
         // this disposable local test proxy. Never include raw socket error
@@ -1732,6 +1741,10 @@ async function main() {
       expectStatus(preflight,204);
     }
 
+    // Keep diagnostics bounded and optional; the acceptance workload and
+    // request mix are unchanged. Both sides use the same fixture.
+    if (metricsFile && mixedLoadRequests <= 10000)
+      edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
       { name: "readiness", run: () => edgeRequest("/health/ready") },
@@ -1750,6 +1763,8 @@ async function main() {
       }) },
     ], mixedLoadRequests, mixedLoadConcurrency);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
+    edgePhaseMetrics = edgePhaseCollector?.report();
+    edgePhaseCollector = undefined;
     loadResourceMetrics = oppUsageDelta(beforeLoadUsage, afterLoadUsage);
 
     const refreshForm = new URLSearchParams({
@@ -1997,6 +2012,7 @@ async function main() {
         timestamp: new Date().toISOString(),
         ...loadResult,
         ...loadResourceMetrics,
+        ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
       }, null, 2) + "\n", { mode: 0o600 });
     }
     if (holdOpen) {
