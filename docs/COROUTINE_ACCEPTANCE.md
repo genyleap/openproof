@@ -4495,3 +4495,745 @@ with both native start/callback switches required together.
 - The strict coroutine static gate remains **NOT_APPROVED** with **17
   findings** and **14/25 areas passing**. The synchronous legacy PostgreSQL,
   provider and HTTP facades still need separate, real nonblocking retirement.
+
+
+### Native local credential storage checkpoint
+
+The native local credential store reads the exact linked active identity,
+tenant, encoded password hash and optional encrypted TOTP generation from
+bounded asynchronous PostgreSQL. It confirms a password-only snapshot
+against the current hash and change timestamp and rejects an intervening
+TOTP enrollment. The TOTP consumption statement compares the password and
+TOTP generation (ciphertext, key version, enrollment timestamp), owner,
+provider, subject and tenant, then atomically advances the replay step.
+
+This is a storage primitive, not an authenticated identity or a complete
+local login implementation. Cryptographic verification, bounded CPU
+admission, recovery-code consumption, password rehash and canonical
+completion/session issuance must be composed before native HTTP activation.
+The dedicated disposable PostgreSQL tests exercise tenant/lifecycle
+isolation, stale credentials, intervening MFA enrollment, concurrent
+same-step consumption and re-enrollment. No runtime route switches changed.
+The full PostgreSQL and authentication coverage gates remain NOT_APPROVED.
+
+
+### Native local recovery redemption and password-policy upgrade
+
+The local credential store now redeems recovery-code digests under the
+same transaction advisory lock used by code-set rotation, checking the
+exact password and enrolled MFA generation, active canonical owner,
+provider subject and tenant in the deletion statement. Failed/stale
+proofs do not consume codes. A separate post-verification password
+rehash uses compare-and-swap on the original encoded hash and password
+change timestamp; successful rehash does not change that timestamp.
+
+The disposable SQL regression covers no-MFA denial, foreign tenant,
+stale password and MFA generations, concurrent single-use redemption,
+preserved unused codes, rehash and locked-account denial. The SQL
+primitives still require bounded cryptographic verification and native
+provider composition before HTTP activation. No production flags changed.
+
+
+### Bounded password cryptographic execution
+
+Password verification and post-factor rehash are isolated from network I/O
+on a dedicated one- or two-worker pool. Admission is immediate and bounded:
+a saturated pool rejects a request rather than queuing unbounded plaintext
+passwords. A permit follows the worker coroutine frame, so cancellation of
+the awaiting HTTP operation cannot prematurely release a running KDF slot.
+Each unknown subject verifies a startup-generated dummy hash and returns
+false even if the dummy password matches. A rehash candidate is generated
+only when requested after factor verification and the original password
+verifies again. The persisted compare-and-swap remains separate.
+
+The worker is an internal credential primitive; native local provider
+composition and HTTP activation are not part of this checkpoint. Callers
+must quiesce before destroying the executor. No Production change.
+
+
+### Native local proof provider composition
+
+The independent local coroutine provider now delegates full factor
+verification to a storage-neutral verifier SPI. PostgreSQL implements
+the SPI using the native credential store, bounded password KDF executor,
+authenticated TOTP ciphertext and recovery-code HMAC. No SQL lease is
+held while hashing. Password-only and possession-factor proofs preserve
+IAL1 and IAL2 respectively; the synchronous completion entry fails closed.
+Recovery-code authentication retains the existing no-rehash policy.
+
+Before runtime activation, bind the verified canonical owner to the
+trusted coordinator's finalization/session boundary: a local alias could
+be rebound after SQL proof confirmation but before canonical finalization.
+The provider-neutral canonical lookup must not authenticate the new owner
+of an alias using a proof for its former owner. Also complete runtime
+composition and actual HTTP/password/MFA regression acceptance. No route
+or production flag changes are included here.
+
+
+### Canonical owner constraint for local credential proofs
+
+A native local proof carries an explicit internal owner constraint from the
+credential snapshot, not a client parameter or presentation claim. The
+canonical finalizer rejects an alias whose active tenant-scoped owner has
+changed, before any profile write. The trusted authentication coordinator
+independently rejects a substituted finalizer result. Owner-bound proofs
+are login-only and denied on the legacy synchronous and connection paths.
+Existing unbound provider outcomes retain their prior semantics. The
+disposable regression rebinds the alias between proof and finalization.
+Runtime activation remains pending; no public HTTP route changes.
+
+
+### Native local HTTP runtime pilot
+
+The opt-in local login route overlay connects the existing native HTTP
+login/verify adapter to the owner-bound local provider, bounded password
+worker, native authentication transactions, canonical finalization and
+atomic session replacement. A separate provider registry preserves legacy
+OAuth behavior without exposing synchronous local completion on the
+selected native routes. Shared LDAP/Web3 and independent session/account
+overlays retain their own flags. The disposable LDAP HTTP workload also
+enables local login and recovery redemption; ordinary baseline remains
+unchanged. Full executable build and real HTTP acceptance are required
+before changing the default. Production remains NOT_APPROVED.
+
+
+### Local disposable Docker HTTP acceptance
+
+The existing identity-platform E2E now additionally tests native local
+unknown and locked subjects, wrong password, cross-browser binding,
+one-time challenge replay, no implicit provisioning, atomic same-browser
+session replacement, and missing/replayed TOTP. These checks run only
+with the native local pilot enabled.
+
+On a restricted development server with Docker and a locally installed
+postgres:16 image, use scripts/run-local-native-login-e2e.py --opp
+PATH_TO_BUILT_OPP. The wrapper creates a unique, memory/CPU-limited
+loopback-only database, checks that it is empty, passes only test
+configuration to the existing E2E, then removes the container and its
+anonymous volume. Use --probe-only to validate creation and cleanup
+without a built executable. This probe is not HTTP acceptance. The
+local workload is for correctness, not comparative throughput.
+
+### Native account password upgrade status
+
+When both the existing native local login and account-session pilots are
+selected, the GET /account/password/upgrade projection uses a tenant-scoped,
+owner-bound native SQL read and metadata-only password policy inspection.
+No KDF is executed, no TOTP material is queried, and no encoded hash is
+returned to HTTP. If Argon2id is not selected, the hash is not retrieved at
+all. A missing local-provider link returns unavailable=false semantics
+(available=false, needs_upgrade=false). First-party cookie authentication
+and owner echo are required; delegated OAuth and POST mutations retain
+legacy behavior. No additional feature flag or schema migration is added.
+Focused HTTP and disposable SQL regressions are included; compiled and
+real HTTP acceptance remains required before changing defaults.
+
+
+### Development runtime artifact and independent server acceptance
+
+After successful Build, Test, isolated E2E, benchmarks and packaging, CI
+preserves the already verified amd64 runtime bundle and a development-only
+provenance manifest containing the exact source tree and SHA-256 digest.
+This is not a release, attestation or authorization to install anything.
+Download only from the trusted OpenProof Actions run. For example:
+
+```sh
+gh run download RUN_ID -R genyleap/openproof -n openproof-tested-development-bundle -D /tmp/opp-development-bundle
+python3 -B scripts/ci/development-bundle.py verify /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+python3 -B scripts/ci/development-bundle.py e2e /tmp/opp-development-bundle/openproof_VERSION_linux_amd64.tar.gz
+```
+
+Run from the exact candidate source tree (PR merge commit or equivalent
+tree); mismatched/tampered bundles and dirty tracked source for E2E are
+denied. Use the verify command for non-executing archive admission and
+the e2e command to run only the real ELF and bundled libraries in a private
+temporary directory with the existing disposable Docker PostgreSQL fixture.
+Do not run installer or service-manager commands. The host needs a
+compatible Linux amd64 glibc, Node, PostgreSQL client and Docker. The
+manifest is integrity metadata, not a cryptographic signature; trust
+the Actions artifact origin. A separate full native local/account HTTP
+workload now checks password-upgrade status with valid and inactive
+identities. The official coroutine migration gate remains unchanged.
+
+### Native explicit password-policy confirmation
+
+The existing local-login and account-session opt-in also covers POST
+/account/password/upgrade for first-party cookies. Retains HTTPS same-origin
+and identity/IP rate limits, strict JSON, delegated OAuth compatibility, and
+no-store. Raw request and parsed password buffers are scrubbed; password
+verification and optional Argon2id generation share a bounded worker permit.
+The tenant/owner/provider/password-generation snapshot is released before
+KDF and checked again by SQL CAS (including already-current hashes).
+No password-reset timestamp, TOTP, recovery code, or session is mutated.
+The C++ regressions exercise wrong passwords, current hashes, real Argon2id
+upgrade and timestamp preservation; HTTP tests cover origin and policy denial.
+No new schema or runtime flag is introduced.
+
+### Native account profile mutation
+
+The existing experimental native account-profile capability now covers
+GET, PATCH and PUT for first-party sessions. PATCH retains the historical
+replacement semantics for presentation fields; delegated OAuth access
+retains the compatibility path. The SQL transaction locks the active
+identity/tenant and profile, uses the existing domain validation, checks
+linked avatar eligibility and only writes presentation columns. It does
+not rewrite verified contact fields, ownership, creation time, credentials
+or sessions. No new schema or feature flag. Missing or foreign profiles,
+invalid avatar selection and untrusted adapter owner echoes fail closed.
+
+### Native OAuth2 connection handoff
+
+The paired federation experiment now includes cookie-authenticated direct
+connection start and ticket issuance/redemption. Native transaction storage
+consumes the short-lived handoff atomically, checks its purpose, and verifies
+the active tenant-bound canonical target before starting a native connection
+proof. A link callback completes the server-bound connection transaction
+without issuing or replacing a login session. The mode cookie does not
+authorize a link; the consumed server transaction must match its purpose.
+Delegated Bearer issuance/start remain on compatibility. SAML/POST and
+OAuth1 are not migrated by this change; provider bridges are intentionally
+not removed until all relevant runtime routes are covered.
+
+### Native X OAuth1 callback and pre-provider ceremony validation
+
+Native GET callback admits exactly one proof family (OAuth2 code/state or
+OAuth1 token/verifier), rejects mixed or control-bearing values before
+dispatch, and binds OAuth1 to the registered X transaction provider.
+The coordinator checks the consumed transaction's login/link purpose
+before either synchronous or asynchronous provider invocation. Mismatched
+ceremonies still burn the proof but cannot cause an outbound exchange.
+Tests cover mismatched provider and wire shape, one-time callback, no
+legacy dispatch, and purpose rejection before provider I/O. SAML POST and
+compatibility bridges remain outside this acceptance increment.
+
+### Transaction-store cutover regression
+
+The synchronous and native PostgreSQL repositories use the same durable
+transaction and metadata tables when configured for the same database.
+The disposable PostgreSQL suite now exercises both directions of repository
+cutover, exact provider/connection/challenge metadata, cross-adapter replay
+denial and binding-failure burn. This test establishes the compatibility
+precondition for retiring legacy federation transport without abandoning
+in-flight browser transactions. It does not by itself authorize default
+activation of native callbacks or removal of compatibility handlers.
+
+### Mandatory native first-party authentication runtime
+
+The authenticated executable now requires native local login, native
+session mutations and native recovery issuance. Their historical flags
+may be unset or 1; explicitly disabling any rejects startup before
+migration. All three AuthenticationHttpApi constructions in opp use
+the native-only constructor, which has no synchronous session,
+credential or recovery dependencies. Six exact paths fail closed rather
+than fall back. Existing library compatibility constructor/methods
+remain for the old in-memory regressions; this increment does not remove
+them from the library or claim a passing global HTTP authentication gate.
+Default candidate E2E exercises native proof and recovery behavior;
+only the pinned historical benchmark sets OPENPROOF_E2E_EXPECT_LEGACY_AUTH.
+Full compiled and disposable HTTP acceptance is required before release.
+
+### Removal of synchronous first-party authentication HTTP implementation
+
+AuthenticationHttpApi no longer exposes a synchronous constructor or
+login/verify/rotation/logout/recovery implementations. Its synchronous
+entry rejects its namespace and delegates only non-authentication paths.
+The native-only constructor accepts a replacing session issuer; exact
+runtime overlays dispatch session mutation and recovery to their existing
+native adapters. The static gate now requires those actual dependencies,
+mandatory pre-migration configuration checks, strict paths and absence
+of old functions/SPIs, rather than expecting the retired methods to exist.
+The in-memory password HTTP regressions now use native test ports; session
+mutation and recovery eligibility wire semantics remain covered by their
+dedicated native C++/PostgreSQL suites and default identity-platform E2E.
+The gate result is source-level evidence; compiled and runtime approval
+still require exact-head tests and benchmarks.
+
+### Native OAuth2 form_post callback
+
+Native callbacks now admit bounded application/x-www-form-urlencoded POST
+responses (including the Apple user payload), without mixing query and body
+proofs. OAuth1 remains GET-only. Duplicate parameters, malformed encoding,
+oversized inputs, alternate proof families and incomplete cookies are denied.
+The parsed credential values and decoded cookie copies are scrubbed on all
+exits. New provider-neutral callback regressions cover successful form POST,
+provider-selection independence, malformed proof rejection and replay.
+SAML assertion verification and full provider transport retirement remain
+separate work; no default cutover for federation is made by this increment.
+
+### Native SAML assertion completion
+
+The existing SAML signature and assertion verifier is reused on a dedicated
+single-worker executor, with one admission permit held in the work frame
+until verification finishes (including waiter cancellation). The provider
+declares the SAML proof family, checked against the consumed transaction
+before dispatch. HTTP POST accepts only an isolated SAMLResponse/RelayState
+pair within the previous 1 MiB encoded body and 900 KiB assertion limits.
+GET and mixed OAuth/SAML proofs are rejected. Tests cover wire dispatch,
+provider mismatch, replay and bounded worker architecture. Full signed
+SAML interoperability, worker cancellation/saturation and exact-head
+compiled acceptance remain required before mandatory federation cutover.
+
+### GitHub blocking exchange retirement
+
+GitHub's duplicated synchronous remote exchange and private io_context
+bridge are removed. The common synchronous completion SPI rejects with
+Unavailable before any remote work. All three remote exchanges now exist
+only in completeAuthenticationAsync. Authenticated runtime mandates both
+native federation legs and strictly overlays the callback route; the
+native callback handles login and connection proof completion. Legacy
+delegated Bearer authorization may still issue a handoff or construct a
+local GitHub redirect challenge, but cannot complete remote proof on a
+blocking worker. The updated source gate checks actual native exchanges
+and runtime wiring as well as absence of the retired bridge. This is
+source-level progress; compiled/runtime verification remains outstanding.
+
+### OIDC and X blocking exchange retirement
+
+Removed duplicated synchronous discovery, token, JWKS, UserInfo and
+OAuth1 request/access token exchanges. Both synchronous remote-provider
+entry points now deny rather than performing network I/O. The authenticated
+runtime compatibility federation handler requires native redirects and
+rejects synchronous callback/redemption; an authorized delegated direct
+connection start instead issues the existing one-time owner-bound handoff.
+The browser follows that local URL without forwarding the Bearer token.
+This is an intentional additional redirect for direct delegated clients.
+The native redemption and callback paths preserve provider/owner binding.
+Source gates require the actual native outbound exchanges and runtime
+handoff wiring. Exact-head runtime and external-provider acceptance remain
+mandatory; source results are not release approval.
+
+### Native mobile wallet handoff domain foundation
+
+Adds coroutine issue, publication and redemption of the existing split
+publisher/redeemer tickets using the same transaction schema and lifetime.
+Publication and redemption independently revalidate the active tenant-bound
+external-account owner using a read-only SQL query; no profile refresh or
+provisioning is performed. Redemption preserves the canonical-owner
+constraint. Tests cover pending, successful redemption, replay and link
+removal before redemption, plus wrong-tenant/owner SQL denial. HTTP wiring,
+presentation metadata, connection flows and exact-head executable tests
+remain pending. The old Web3 RPC facade is intentionally retained until
+these runtime paths preserve all existing behavior.
+
+### Native mobile wallet HTTP handoff
+
+The existing native Web3 opt-in now also overlays POST /auth/web3/handoff
+and /auth/web3/handoff/redeem. Login start retains a wiping publisher
+credential, completion publishes only after verified proof, and redemption
+alone issues a session. Pending/replay response shape remains 202; issuance
+201 and publish/redeem success 200 remain unchanged. Stale mode/publisher
+cookies are cleared on start and malformed or duplicate optional cookies
+cannot silently downgrade a handoff to ordinary login. Native connection
+and presentation persistence remain incomplete; the Web3 RPC bridge is
+not retired. Compiled and disposable end-to-end acceptance are pending.
+
+### Native Web3 login presentation
+
+Wallet login and mobile publication accept the same sanitized presentation
+fields as the legacy path. They never enter the provider proof or trusted
+claims. The post-proof native update locks the active tenant identity,
+conditionally updates only the originally verified owner/provider/subject
+link and refreshes presentation without contact claims. Failure remains
+best effort as in the legacy HTTP contract. Native connection presentation
+and complete Web3 cutover remain pending. No schema change.
+
+### Native wallet connection HTTP lifecycle
+
+Extends the existing native Web3 opt-in to first-party connection handoff
+issuance, direct session-authenticated start, one-time handoff start and
+connection completion. The provider interaction model is checked on ticket
+issue and redemption. Link completion uses the server transaction's
+canonical owner and never issues a login session. Optional presentation
+refresh uses that same owner and stays best effort. Cookie-only initiation
+and completion use native storage; delegated Bearer start/issuance retain
+compatibility authorization. Compiled HTTP and live provider acceptance
+remain required. No schema change.
+
+### Native delegated Web3 account authorization
+
+The native Web3 connection start and handoff issuance now accept both
+first-party and delegated credentials through a native authorization port.
+The delegated token is HMAC-digested using the same derived OAuth token key
+as TokenService. A single bounded SQL snapshot checks active access token,
+family, client, application, identity and tenant, the account scope and
+absence of sender constraints. The synthetic authorization context is not
+persisted as a session. Existing status/response shapes are preserved for
+authorized clients; inactive identities and revoked families fail closed.
+Strict route overlays prevent blocking fallback. Web3 remains opt-in until
+compiled PostgreSQL/HTTP and external-provider tests confirm parity.
+
+### Web3 RPC retirement
+
+Removed the private synchronous RPC executor and duplicate synchronous
+chain, smart-wallet, and Farcaster registry exchange functions.
+Synchronous network-capable provider methods deny before I/O; Wallet
+local challenge construction remains available. All seven Web3 HTTP
+paths are strict native overlays and authenticated startup rejects the
+historical disable flag. Legacy provider regression tests now exercise
+the native API using test-only in-memory verifiers. Native transport
+retains its shared monotonic deadline and smart-account verification
+fallback semantics. Source gate checks actual native probes and mandatory
+runtime wiring. Exact-head compiled, live RPC and E2E acceptance remain
+required before production approval.
+
+### Native contact verification issuance runtime
+
+Account-enabled authenticated deployments now route POST /account/email/change
+and POST /account/phone through native account authorization, native
+generation-bound reservation/challenge storage, and coroutine webhook
+delivery. The authenticated identity alone selects the owner; payload
+fields remain email or phone_number, success remains HTTP 202 accepted.
+Delegated account-scoped credentials use the same native authorization
+port as Web3. Delivery failure compensates only the exact issued generation.
+The remaining signup/resend/password-reset flows still use the legacy
+delivery boundary. The proxy bridge cannot yet be retired; protected
+gateway coverage and those remaining callers require separate migration.
+No new schema migration. Compiled and live delivery acceptance pending.
+
+### Native public email issuance
+
+Resend signup verification and forgotten-password requests now use native
+email lookup, purpose-bound challenge replacement and coroutine delivery.
+A pending signup requires its existing untagged reservation and password
+credential in the same tenant; password reset requires an active local
+link and password credential. Eligibility is rechecked under the owner
+lock before insertion. Resend does not extend or delete the original
+signup reservation. Public responses do not distinguish unknown owners,
+storage or delivery failures (202 for structurally valid requests; invalid
+resend email syntax retains its existing error). This intentionally
+changes legacy delivery-failure status to prevent direct enumeration;
+latency equivalence is not established. No provisioning, schema change,
+or synchronous delivery fallback. Signup itself and protected gateway
+remain blocking proxy callers; compiled/runtime acceptance is pending.
+
+### Native public proxy in authenticated runtimes
+
+Both OIDC and non-OIDC authenticated compositions now select native
+forwarding for explicitly public, scope/audience-free routes under the
+reserved /proxy namespace. The native preparation rechecks the matched
+route, applies rate limiting and the existing header sanitization and
+context sealing. It never enters synchronous session, delegated-token
+or authorization policy evaluation. Protected routes retain their
+existing opt-in/compatibility policy. Real TCP regression exercises
+public forwarding, segment boundary, protected fallback and synchronous
+dispatch refusal. Delegated account SQL was checked directly against an
+isolated PostgreSQL 16 with the complete migration set; C++ integration
+still fails on a previous head and needs diagnosis before OAuth
+protected cutover. No schema changes.
+
+### First-party protected gateway default and SQL fixture repair
+
+The canonical PostgreSQL runner omitted the existing 0010 sender
+constraint migration, although delegated account authorization queries its
+columns. The fixture now applies 0010 and can target an explicit existing
+CMake build directory; no historical migration file changed. An actual
+PostgreSQL 16 fixture with the runner's migration list must return the
+expected delegated authorization row and deny revoked/expired/constrained,
+missing-scope and foreign-tenant credentials.
+
+The existing native first-party protected proxy defaults on for
+authenticated non-OIDC configurations. Explicit disable remains available
+during executable acceptance. Namespace, configured protection, scope,
+audience, policy and denied-decision audit checks remain unchanged.
+Delegated OAuth and proof-of-possession proxy paths are not cut over.
+The source gate remains incomplete; real compiled acceptance is required.
+
+PR 99's workflow 45849207493 passed all 20 isolated canonical
+PostgreSQL tests and the native public proxy real-TCP regression.
+The subsequent opp build failed on three contact-issuer lambda parameters
+shadowing an enclosing provider. Renamed those parameters without disabling
+-Werror=shadow; exact repaired executable acceptance remains pending.
+
+### Native delegated access context foundation
+
+The account authorization SQL now shares a bounded, read-only native
+access-context reader with future OAuth protected gateway composition.
+Token and family revocation, expiry, tenant and client/application/identity
+lifecycle, scopes, audiences and sender binding are read in one statement
+snapshot. A lateral union avoids multiplying scope and audience rows;
+more than 256 total grants fail closed rather than being truncated.
+Account authorization continues to require account scope and reject any
+sender constraint. The new context reader does not verify DPoP/mTLS proof:
+a caller must verify it before using a sender-constrained context.
+Protected OAuth gateway dispatch is deliberately unchanged until that
+verification boundary is native. No schema change.
+
+### Native sender proof replay boundary
+
+Shared DPoP and authenticated mTLS preparation retains signature, method,
+target, token binding, issuer origin and time checks before replay I/O.
+The new native verifier awaits only a callback owning the validated proof
+tuple, not request/credential references. The PostgreSQL consumer uses
+the existing global replay tables, atomic conflict handling, bounded
+64-row expired cleanup and an expiry bound; no schema change. Replayed
+or expired assertions fail closed. Timestamp overflow, control characters
+in replay keys and the exact mTLS expiry boundary are rejected by both
+native and legacy validation. The OIDC protected gateway still uses
+compatibility dispatch until the native verifier is wired end-to-end.
+
+### Native account middleware composition correction
+
+PR 100 built opp and passed 20 canonical PostgreSQL tests; its identity
+E2E failed at Farcaster connection start with 503. Account session
+middleware denied all unowned account paths before the downstream
+Web3 adapter could report its native capability. Exact Web3 and federated
+connection paths now defer to that downstream capability. Method and
+dependency guards remain authoritative there; unrelated account paths
+are not enabled. Added HTTP dispatch regression. The repaired full E2E
+still needs execution.
+
+### Native delegated protected proxy opt-in
+
+The existing protected gateway adapter now supports an explicit OIDC
+runtime opt-in through OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY=1.
+It awaits first-party verification, falls back to native delegated access
+only on authentication failure (not storage outage), checks sender binding,
+required scope/audience, identity rate limit, authoritative policy and
+denial audit, then uses native upstream I/O. Trusted client and scope
+headers are attached before signing; proof headers are ingress-only.
+First-party default is unchanged. OIDC stays opt-in until compiled and
+live DPoP/mTLS proxy acceptance. No schema change. Signup and legacy
+unmigrated paths still prevent complete synchronous proxy retirement.
+
+### Native transaction replay parity and signup KDF foundation
+
+PR 102's workflow 45856448467 passed the delegated gateway real-TCP
+regression, native mTLS verifier and 21/21 isolated canonical PostgreSQL
+tests. Broad CTest discovered 831 tests and reported two failures: native
+Web3 replay fixtures received 412 from the in-memory store, while the
+PostgreSQL native store returns 401 for unknown/non-pending generations.
+The in-memory native entry now rejects unknown/non-pending state atomically
+under its existing mutex, preserving initially pending expiry handling
+and the synchronous contract. Existing HTTP replay expectations remain
+unchanged. Exact repaired CTest/E2E are still pending.
+
+New enrollment KDF API uses the existing shared bounded password worker
+pool and permit, with a fresh salted hash and no SQL lease held. Signup
+HTTP and atomic persistence are not switched over yet. No schema changes.
+
+### Atomic pending signup persistence
+
+Adds a native provisioning operation accepting a precomputed PasswordHash.
+It serializes native same-subject attempts, checks the active tenant,
+globally occupied provider subject/reservation, bounded verified-email
+candidates and local-credential absence, locks the canonical owner, then
+commits deactivated identity/unverified profile (only when needed),
+untagged signup reservation, password hash and digest-only challenge
+together. The existing verified owner is preserved without profile
+mutation. Only a committed operation returns the move-only dispatch.
+No plaintext password or verification secret reaches SQL. Fresh signup
+replaces stale signup proofs under the owner lock. Late errors discard
+the non-idle lease, rolling back the entire unit. No runtime cutover yet:
+delivery failure compensation and verification activation must be
+generation-safe, and cross-path concurrency with legacy signup and
+federated profile updates requires executable acceptance. No schema change.
+
+### Native signup proof activation
+
+Introduces tenant-bound digest-only signup activation. Locate the owner,
+lock the canonical identity before its proof, enforce purpose/channel,
+expiry and maximum attempts, and compare the keyed digest in constant
+time. Under the same transaction, revalidate the live untagged
+reservation, password row, existing local link absence and unchanged
+profile email; atomically attach the local subject, mark email verified,
+activate the owner and consume both proof and reservation. A late error
+rolls back the whole promotion. No session is issued by the persistence
+operation. Native HTTP verification and session issuance still require
+wiring. Compensation deliberately retains pending enrollment and the
+untagged reservation for resend, removing only the exact failed delivery
+challenge. This differs from legacy fresh-signup rollback; expired
+pending-enrollment cleanup and cross-path legacy concurrency remain
+open. Added compiled regressions for wrong tenant, wrong proof, locked
+owner, rollback, concurrent redemption, and stale compensation.
+No migration changes.
+
+### Native signup HTTP composition
+
+OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP=1 selects both POST /account/signup
+and POST /account/email/verify as strict native routes. Bounded KDF
+completes before persistence, webhook delivery follows committed
+provisioning, and failed delivery discards only that proof. Verification
+consumes the proof and commits activation before rechecking the exact
+committed owner/link and minting IAL1 possession authentication and a
+native session. No raw password/proof copies survive the first await in
+the parser; cookie fields are validated before interpolation. The existing
+201/200 response shapes and secure cookie contract remain. Session
+issuance is a separate transaction: a failure after activation requires
+ordinary login rather than replay of the consumed proof. The flag remains
+opt-in until executable acceptance, expired pending cleanup and cross-path
+concurrency are verified. Both isolated native E2E workloads enable it.
+No schema or production change.
+
+### Bounded abandoned fresh native signup collection
+
+New fresh native signup IDs use the reserved opaque opi_signup_ namespace.
+After bounded KDF admission, the opt-in signup route collects at most eight
+untouched, deactivated, unverified fresh accounts in its own tenant after
+48 hours and only when every reservation and signup challenge is expired.
+It locks canonical identity/profile/password, then reservations and proofs,
+and repeats eligibility on a fresh statement snapshot. Active or historical
+IDs, modified profiles or credentials, other verification purposes, external
+links, memberships, sessions, OAuth records, passkeys, SCIM, evidence, and
+audit-associated owners are excluded. Unknown cascading identity FK tables
+fail closed. No historical identity is automatically deleted. Cleanup is
+opportunistic on signup traffic, not a timer; existing verified owners with
+expired pending local enrollment still need a separate retry policy.
+The isolated canonical runner includes the referenced existing schema
+tables. No new migration. Exact-head executable acceptance pending.
+
+### Expired existing-owner enrollment retry
+
+Under the same subject advisory and canonical owner locks, a previously
+verified human owner may retry an expired pending local enrollment only
+when an exact untagged reservation still belongs to that owner and
+provider/subject, no other reservation or live/mismatched verification
+exists, the locked password generation predates reservation expiry, and
+no local link exists. A generation-conditional hash update, renewed
+reservation and replacement proof commit together. Fresh enrollment
+remains insert-only; a bare password row is never overwritten. No
+canonical profile or owner lifecycle mutation occurs. Legacy and native
+cross-path concurrency still requires acceptance. Expired rows whose
+reservation provenance has been lost remain fail closed for operator
+recovery. No migration change.
+
+### Atomic native password reset persistence
+
+A new digest-only password reset entry accepts a precomputed PasswordHash.
+It locates and locks an active tenant-bound owner, checks only purpose-3
+email proof, expiry and bounded attempts, compares the digest in constant
+time, and locks the current matching local link and password generation.
+A reset proof older than the current password change is rejected. Hash
+replacement, revocation of existing active first-party sessions and exact
+proof consumption commit together; failures roll back the entire unit.
+No authentication grant is issued. OAuth family revocation is not added
+by this change (legacy reset also revokes first-party sessions only).
+The HTTP route remains compatibility until native KDF and callback wiring
+and executable acceptance. Concurrent session creation from an already
+verified login requires separate end-to-end generation fencing.
+No new schema.
+
+### Native password reset HTTP composition
+
+The existing opt-in signup workload now also selects strict POST
+/account/password/reset. It bounds and scrubs both submitted secrets,
+derives the proof digest, hashes the new password on the shared bounded
+KDF worker before taking a SQL lease, and invokes the atomic reset.
+Success returns the existing password_reset JSON shape with no session
+or cookie. Added HTTP and live E2E checks for replay denial and old-cookie
+revocation. The route remains opt-in: a previously verified local login
+can still race reset before final session persistence, so credential
+generation fencing is a prerequisite for default cutover.
+
+### Local password generation fence at session commit
+
+The native local proof carries the verified password changed_at_ms
+generation through the internal AuthenticationOutcome. It is not a claim
+or a client-visible field. Fresh and replacing first-party sessions
+both acquire the canonical owner lock, then verify the same provider,
+subject, active owner/organization and locked password generation before
+persisting and committing. Native reset uses the same lock order. If
+login wins, reset revokes the inserted session; if reset wins, login's
+stale generation is denied. Real password changes now advance the
+generation monotonically even for same-ms/backward clock observations,
+including compatibility local/admin password writes. Policy rehash
+preserves generation. Native handoff rejects password-fenced outcomes
+rather than dropping the constraint. Added C++ regression for stale
+insert/replacement, subject mismatch and successful current generation.
+No schema change. This does not yet fence all non-password grants, MFA
+generation transitions or legacy session issuers. Exact compiled/live
+acceptance remains required before enabling signup/reset by default.
+
+### Native owner-bound phone verification completion
+
+The signup opt-in also enables strict POST /account/phone/verify. The
+HTTP handler obtains its owner from native authentication, bounds and
+scrubs the proof before suspension, and never accepts a body owner.
+PostgreSQL independently locks the active tenant owner, exact purpose-2
+SMS proof, checks digest/attempts/expiry and exact generation-tagged
+reservation, inserts only the matching local phone-provider subject,
+updates the existing profile, consumes proof and releases reservation
+in one transaction. Failed/exhausted proof cleanup is generation-scoped.
+Existing same-owner links remain idempotent; historical other phone
+links are retained, matching legacy semantics. Profile response is a
+separate owner-checked native read after commit. No session or identity
+is created. Added compiled regression and source checks. Legacy untagged
+contact reservations are not accepted by native completion. No schema
+change; exact-head executable acceptance pending.
+
+### Atomic native email change completion
+
+The opt-in account workload now selects POST /account/email/change/verify
+with native authentication and exact owner/generation-bound email proof.
+Optional enrollment password uses the bounded KDF before the SQL lease.
+Profile-only verification creates no credential or local link. Initial
+local enrollment is insert-only; existing local accounts retain their
+password hash, and a subject rebind removes only the exact previous
+owner link and advances the credential generation to fence alias ABA.
+Ambiguous local links fail closed. Subject, profile, proof and reservation
+commit together. Contact issuance cannot overwrite a live untagged
+signup reservation even for the same owner. Profile response is a
+separate native read after commit; no session issued. Native completion
+requires tagged reservations, as phone verification does. Legacy
+compatibility writers and exact-head executable acceptance remain open.
+No schema change.
+
+### Native MFA management storage foundation
+
+Owner-bound MFA password confirmation reads a unique active local link
+and current password/factor snapshot, releases its SQL lease, then uses
+the shared bounded KDF. Native factor installation, replacement and
+removal revalidate the exact owner/link, password and factor generation
+under recovery advisory and canonical row locks. TOTP ciphertext,
+accepted step, recovery batch deletion and a monotonic credential
+generation advance commit atomically; no plaintext seed reaches SQL.
+Same-millisecond changes invalidate stale password-authenticated session
+proofs, including enrollment/removal ABA. Old recovery batches are
+invalidated on any factor change. Existing sessions are not revoked
+by this operation, matching the prior MFA session lifecycle policy.
+This is an internal storage boundary: the runtime still needs a bounded
+pending enrollment store, code verification/encryption, IAL2 guards and
+native HTTP dispatch. Recovery issuance currently has a separate
+eligibility/read and rotation boundary; full concurrent issuance
+fencing remains open. Legacy MFA writers do not yet share these locks.
+No schema change. The LDAP implementation applies the existing scoped
+GCC16 no-inlining workaround after PR111's compiler diagnostic; no
+warning is disabled. Exact-head executable acceptance remains pending.
+
+### Native TOTP enrollment ceremony and HTTP composition
+
+The opt-in account workload enables strict POST /account/totp/start,
+/account/totp/complete and /account/totp/disable. First-party native
+sessions only (delegated account tokens are intentionally no longer
+accepted for MFA mutation). Shared per-IP/path and per-identity rate
+admission, bounded body, password/code scrubbing before authentication
+suspension. A process-local enrollment map holds one pending ceremony per
+owner and at most 256 overall, with ten-minute expiry and five code
+attempts. A valid code is verified against the actual generated seed,
+sealed with the existing owner-bound AES-GCM format, and the ceremony is
+burned before durable mutation. The map mutex is not held across I/O or
+KDF. Expired entries are collected on begin or matching completion;
+restart loses pending enrollment, not persisted TOTP. Replacement
+requires IAL2 at both begin and completion; removal requires IAL2 before
+KDF. Existing JSON/status contracts preserved. A failed or ambiguous
+commit requires a new ceremony. Added C++ regressions exercising actual
+generated seed, wrong owner/password, expiry, attempt exhaustion, replay,
+replacement/removal assurance and HTTP first-party routing. No schema
+change. Recovery issuance fencing, legacy MFA writer parity and exact
+compiled/live acceptance remain blockers to default native cutover.
+
+### Generation-fenced recovery batch issuance
+
+Recovery HTTP now uses issueFenced, not two separate boolean eligibility
+checks and an unconditional compensating revocation. A tenant-scoped
+read captures the unique active local subject, credential generation and
+TOTP generation. The batch transaction obtains the recovery advisory
+lock and canonical owner lock, then rechecks and locks the exact
+password, local subject and TOTP generation before any DELETE. A stale
+request returns 412 without deleting any newer recovery batch. Native
+MFA mutation shares those locks and invalidates all prior batches.
+Only committed digests produce plaintext codes; a later MFA change may
+invalidate already-issued codes, as expected. The production coroutine
+repository refuses unfenced nonempty replacements. No change to the
+existing IAL2 session lifetime policy. Legacy factor writers remain a
+separate compatibility concern; exact-head C++/E2E acceptance is pending.
+No schema change.

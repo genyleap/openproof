@@ -14,23 +14,24 @@ const handler=read("src/storage/postgres/coroutine_session_http.cpp");
 const ctest=read("tests/storage/postgres_coroutine_network_test.cpp");
 const cmake=read("apps/opp/CMakeLists.txt");
 
-test("auth session cutover is independently opt-in and rejected before DB migration when malformed",()=>{
+test("auth session cutover is mandatory and rejects invalid or disabled configuration before migration",()=>{
   assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS"\)/);
   assert.match(app,/nativeAuthSessionFlag && \*nativeAuthSessionFlag != "0"/);
-  assert.match(app,/nativeAuthSessionFlag && \*nativeAuthSessionFlag == "1"/);
+  assert.match(app,/const bool nativeAuthSessionEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeAuthSessionFlag && \*nativeAuthSessionFlag == "1"\)/);
+  assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeAuthSessionFlag && \*nativeAuthSessionFlag == "0"/);
   assert.match(app,/nativeAuthSessionEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const begin=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
-  const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",begin);
+  const migrate=app.indexOf("postgres::nativeDatabasePreflight(",begin);
   assert.ok(begin>=0 && migrate>begin);
 });
 
 test("session-only runtime builds async SQL session service without identity canonical/LDAP",()=>{
-  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace/);
-  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\| nativeAuthSessionEnabled\)\s*\{/);
+  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*nativeSessionSecret\.emplace/);
+  assert.match(app,/if \(nativeLdapEnabled \|\| nativeAccountEnabled \|\| nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*\{/);
   const start=app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
   const repo=app.indexOf("nativeSessionRepository = std::make_unique<",start);
   const sessions=app.indexOf("nativeSessions = std::make_unique<",repo);
-  const canonicalGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled)",sessions);
+  const canonicalGate=app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled\n            || nativeAccountProfileEnabled",sessions);
   const canonical=app.indexOf("nativeCanonical = std::make_unique<",canonicalGate);
   assert.ok(start>=0 && repo>start && sessions>repo && canonicalGate>sessions && canonical>canonicalGate);
   assert.match(cmake,/openproof_postgres_async_listener/);
@@ -50,7 +51,7 @@ test("only the three auth session mutations are overlaid; middleware chain canno
   for(const route of ["/auth/session/rotate","/auth/logout","/auth/logout-all"])
     assert.ok(native.includes('nativePaths.emplace_back("'+route+'")'));
   assert.doesNotMatch(native,/\/auth\/login|\/auth\/mfa\/verify|\/auth\/recovery-codes/);
-  assert.match(section.slice(account),/healthApi, \*nativeHandler, limiter\.value\(\)/);
+  assert.match(section.slice(account),/fallback, \*nativeHandler, limiter\.value\(\)/);
   assert.match(app,/std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;/);
 });
 

@@ -15,6 +15,8 @@ export module openproof.gateway.http;
 
 import openproof.foundation;
 import openproof.gateway;
+import openproof.policy;
+import openproof.session;
 
 export namespace openproof::gateway::http {
 
@@ -138,7 +140,7 @@ public:
     send(const Endpoint& endpoint, const HttpRequest& request,
          foundation::Duration timeout) override;
 
-    /** Native nonblocking transport used by the future async gateway path.
+    /** Native nonblocking transport. The legacy send() ABI denies all calls.
      *  Does not call the synchronous ProxyTransport::send implementation.
      *  Input arguments are owned across suspension; launch on an Asio executor.
      */
@@ -181,7 +183,9 @@ public:
                           CoroutineHttpHandler& native,
                           std::vector<std::string> exactNativePaths,
                           std::vector<std::pair<std::string, HttpMethod>>
-                              methodScopedNativePaths = {});
+                              methodScopedNativePaths = {},
+                          std::vector<std::string> strictNativePrefixes = {},
+                          std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes = {});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
         const HttpRequest& request) const noexcept override;
@@ -196,6 +200,9 @@ private:
     CoroutineHttpHandler* m_native;
     std::vector<std::string> m_exactNativePaths;
     std::vector<std::pair<std::string, HttpMethod>> m_methodScopedNativePaths;
+    std::vector<std::string> m_strictNativePrefixes;
+    std::vector<std::pair<std::string, HttpMethod>> m_strictMethodPrefixes;
+    [[nodiscard]] bool strictMethodOverlay(const HttpRequest& request) const noexcept;
 };
 
 class CoroutineMetricsAdapter final : public CoroutineHttpHandler {
@@ -234,6 +241,40 @@ public:
 private:
     Gateway* m_gateway;
     BeastProxyTransport* m_transport;
+};
+
+/** Native public and protected proxy. Configured upstream paths use
+ * asynchronous verification and transport; local protocol middleware
+ * remains authoritative for its reserved namespaces.
+ */
+class CoroutineProtectedGatewayAdapter final : public CoroutineHttpHandler,
+    private GatewayNativePreparationSource {
+public:
+    using Verify = std::function<boost::asio::awaitable<
+        foundation::Result<session::AuthenticatedSession>>(foundation::SecretString)>;
+    using Authorize = std::function<boost::asio::awaitable<policy::AuthorizationDecision>(
+        session::AuthenticatedSession, Route, foundation::CorrelationId)>;
+
+    using VerifyDelegated=std::function<boost::asio::awaitable<
+        foundation::Result<session::DelegatedAccess>>(foundation::SecretString)>;
+    using VerifySender=std::function<boost::asio::awaitable<foundation::Status>(
+        HttpRequest&,session::DelegatedSenderConstraint,foundation::SecretString,bool)>;
+
+    CoroutineProtectedGatewayAdapter(Gateway& gateway, BeastProxyTransport& transport,
+        CoroutineHttpHandler& fallback, Verify verify, Authorize authorize,
+        bool enableProtected = true,VerifyDelegated verifyDelegated={},VerifySender verifySender={});
+    [[nodiscard]] bool nativeEnabledFor(const HttpRequest& request) const noexcept override;
+    [[nodiscard]] HttpResponse handle(HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<HttpResponse> handleAsync(HttpRequest request) override;
+private:
+    Gateway* m_gateway;
+    BeastProxyTransport* m_transport;
+    CoroutineHttpHandler* m_fallback;
+    Verify m_verify;
+    Authorize m_authorize;
+    bool m_enableProtected;
+    VerifyDelegated m_verifyDelegated;
+    VerifySender m_verifySender;
 };
 
 }

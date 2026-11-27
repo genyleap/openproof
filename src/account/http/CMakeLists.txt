@@ -22,9 +22,9 @@ openproof_add_module(openproof_account_http
 # explicitly for this Boost-consuming target.
 target_compile_definitions(openproof_account_http PRIVATE BOOST_HAS_LONG_LONG=1)
 
-# Provider-neutral, opt-in coroutine facade for account session endpoints.
-# Existing synchronous account lifecycle ABI and live wiring are unchanged.
-add_library(openproof_account_async_http STATIC coroutine_session_http.cpp)
+# Native account HTTP lifecycle and pure browser page renderers.
+# The synchronous HTTP ABI is a namespace-only denial boundary.
+add_library(openproof_account_async_http STATIC coroutine_session_http.cpp account_pages.cpp)
 target_compile_features(openproof_account_async_http PUBLIC cxx_std_26)
 target_include_directories(openproof_account_async_http PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -37,7 +37,7 @@ target_compile_definitions(openproof_account_async_http PRIVATE
 target_link_libraries(openproof_account_async_http
     PUBLIC openproof_gateway_http openproof_gateway
         openproof_session openproof_foundation openproof_identity_provider
-        openproof_identity_profile Boost::headers
+        openproof_identity_profile openproof_account openproof_security Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_session_http.cpp

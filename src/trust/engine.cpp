@@ -59,19 +59,26 @@ foundation::Result<TrustAssessment> TrustEngine::assess(
         return foundation::fail(records.error());
     }
 
-    const auto now = m_clock->now();
+    return assessEvidence(identity,records.value(),m_policy,m_clock->now(),std::move(risks));
+}
+
+foundation::Result<TrustAssessment> assessEvidence(
+    const identity::core::IdentityId& identity,const std::vector<evidence::Evidence>& records,
+    const TrustPolicy& policy,foundation::Instant now,std::vector<RiskSignal> risks)
+{
+    if (identity.empty()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
     std::uint64_t weightedConfidence = 0U;
     std::uint64_t totalWeight = 0U;
     std::uint64_t confidenceTotal = 0U;
     std::uint64_t evidenceCount = 0U;
     std::vector<std::string> evidenceIds;
 
-    for (const auto& record : records.value()) {
+    for (const auto& record : records) {
         if (!record.activeAt(now)) {
             continue;
         }
 
-        const auto evidenceWeight = m_policy.weight(record.kind());
+        const auto evidenceWeight = policy.weight(record.kind());
         if (evidenceWeight == 0U) {
             continue;
         }

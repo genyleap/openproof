@@ -8,11 +8,12 @@ import test from "node:test";
 const root = path.resolve(import.meta.dirname, "..");
 const read = name => fs.readFileSync(path.join(root, name), "utf8");
 const native = read("src/storage/postgres/async_session.cpp");
-const legacy = read("src/storage/postgres/postgres.cpp");
-
+test("the retired synchronous session implementation cannot return",()=>{
+  assert.equal(fs.existsSync(path.join(root,"src/storage/postgres/postgres.cpp")),false);
+  assert.doesNotMatch(read("src/storage/postgres/CMakeLists.txt"),/\bopenproof_storage_postgres\b/);
+});
 for (const [name, source, useStart, rotateStart, revokeStart] of [
   ["native", native, "AsyncSessionSql::useToken(", "AsyncSessionSql::rotateToken(", "AsyncSessionSql::revoke("],
-  ["compatibility", legacy, "PostgresSessionRepository::use(", "PostgresSessionRepository::rotate(", "PostgresSessionRepository::revoke("],
 ]) {
   test(name + " session usage cannot roll back last-seen time", () => {
     const use = source.slice(source.indexOf(useStart), source.indexOf(rotateStart));

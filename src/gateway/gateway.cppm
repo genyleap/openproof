@@ -421,6 +421,13 @@ public:
             session::DelegatedAccessAuthenticator* delegatedAccess = nullptr,
             SenderConstraintVerifier* senderConstraintVerifier = nullptr);
 
+    // Native-only composition: the coroutine preparation source supplies
+    // authentication and authorization; no blocking repositories are retained.
+    Gateway(const Router& router,TokenBucketRateLimiter& rateLimiter,
+            ServiceDiscovery& discovery,WeightedRoundRobin& loadBalancer,
+            CircuitBreaker& circuits,TrustedContextSigner& contextSigner,
+            foundation::Duration upstreamTimeout);
+
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
 
     /** Shared authorization/identity-context stage for both synchronous
@@ -441,20 +448,56 @@ public:
     [[nodiscard]] foundation::Duration upstreamTimeout() const noexcept;
 
 private:
+    friend class GatewayNativePreparationSource;
+    [[nodiscard]] std::variant<HttpResponse, GatewayForwardPlan>
+    completeForward(HttpRequest request, const Route& route);
     [[nodiscard]] HttpResponse errorResponse(const foundation::Error& error,
                                              const HttpRequest& request) const;
     const Router* m_router;
-    session::SessionService* m_sessions;
+    session::SessionService* m_sessions{};
     session::DelegatedAccessAuthenticator* m_delegatedAccess{};
     SenderConstraintVerifier* m_senderConstraintVerifier{};
-    AccessController* m_access;
+    AccessController* m_access{};
     TokenBucketRateLimiter* m_rateLimiter;
     ServiceDiscovery* m_discovery;
     WeightedRoundRobin* m_loadBalancer;
     CircuitBreaker* m_circuits;
-    ProxyTransport* m_proxy;
+    ProxyTransport* m_proxy{};
     TrustedContextSigner* m_contextSigner;
     foundation::Duration m_upstreamTimeout;
+};
+
+/** Trusted adapter seam for the native first-party protected-route stage.
+ * The native path is deliberately unavailable with delegated OAuth configured.
+ * Only the dedicated /proxy namespace is eligible; other HTTP middleware
+ * remains authoritative for its own paths. This seam does not accept an
+ * identity or policy decision from a request header.
+ */
+class GatewayNativePreparationSource {
+protected:
+    struct Pending final {
+        HttpRequest request;
+        Route route;
+        foundation::SecretString credential;
+        bool dpopScheme{};
+    };
+    [[nodiscard]] static bool eligible(const Gateway& gateway,
+                                       const HttpRequest& request,bool delegated=false) noexcept;
+    [[nodiscard]] static bool eligiblePublic(const Gateway& gateway,
+        const HttpRequest& request) noexcept;
+    [[nodiscard]] static std::variant<HttpResponse,GatewayForwardPlan>
+    preparePublic(Gateway& gateway,HttpRequest request);
+    [[nodiscard]] static std::variant<HttpResponse, Pending>
+    begin(Gateway& gateway, HttpRequest request,bool delegated=false);
+    [[nodiscard]] static bool admitIdentity(Gateway& gateway,
+        const session::AuthenticatedSession& authenticated);
+    [[nodiscard]] static HttpResponse reject(const Gateway& gateway,
+        const foundation::Error& error, HttpRequest request);
+    [[nodiscard]] static std::variant<HttpResponse, GatewayForwardPlan>
+    finish(Gateway& gateway, Pending pending,
+           const session::AuthenticatedSession& authenticated,
+           const policy::AuthorizationDecision& decision,
+           const session::DelegatedAccess* delegated=nullptr);
 };
 
 }

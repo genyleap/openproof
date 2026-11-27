@@ -1,8 +1,8 @@
 #pragma once
 
-// Provider-neutral, opt-in coroutine HTTP entry for account session and
-// read-only profile management. Keep the existing AccountHttpApi and all
-// mutation routes intact.
+// Provider-neutral coroutine HTTP entry for account session, profile and
+// connection management. Native disconnection is an atomic storage operation.
+// Unmigrated capabilities remain explicitly separate.
 // Native callbacks can be bound to any real asynchronous session repository:
 // this contract never imports PostgreSQL, a vendor, or an operator product.
 #include <boost/asio/awaitable.hpp>
@@ -10,14 +10,17 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+import openproof.account;
 import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.core;
 import openproof.identity.profile;
+import openproof.identity.provider;
 import openproof.session;
 
 namespace openproof::account::http {
@@ -40,10 +43,27 @@ public:
         std::vector<identity::core::ExternalIdentityRef>>;
     using ReadConnections = std::function<boost::asio::awaitable<
         foundation::Result<ConnectionList>>(identity::core::IdentityId)>;
+    using Disconnect = std::function<boost::asio::awaitable<foundation::Status>(
+        identity::core::IdentityId, identity::core::ExternalIdentityRef)>;
 
     using TotpStatus = std::pair<identity::core::IdentityId, std::optional<bool>>;
     using ReadTotpStatus = std::function<boost::asio::awaitable<
         foundation::Result<TotpStatus>>(identity::core::IdentityId)>;
+
+    using PasswordUpgradeStatus = std::pair<identity::core::IdentityId, std::optional<bool>>;
+    using ReadPasswordUpgradeStatus = std::function<boost::asio::awaitable<
+        foundation::Result<PasswordUpgradeStatus>>(identity::core::IdentityId)>;
+
+    using ConfirmPasswordUpgrade = std::function<boost::asio::awaitable<
+        foundation::Result<std::pair<identity::core::IdentityId, bool>>>(
+            identity::core::IdentityId, foundation::SecretString)>;
+
+    struct ProfileUpdate final {
+        std::optional<std::string> displayName, username, locale, picture, avatarSource;
+    };
+    using UpdateProfile = std::function<boost::asio::awaitable<
+        foundation::Result<identity::profile::IdentityProfile>>(
+            identity::core::IdentityId, ProfileUpdate)>;
 
     CoroutineAccountSessionAdapter(
         gateway::HttpHandler& legacyAccount,
@@ -51,7 +71,9 @@ public:
         gateway::TokenBucketRateLimiter& limiter,
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
         ReadProfile readProfile = {}, ReadConnections readConnections = {},
-        ReadTotpStatus readTotpStatus = {});
+        ReadTotpStatus readTotpStatus = {}, ReadPasswordUpgradeStatus readPasswordUpgradeStatus = {},
+        ConfirmPasswordUpgrade confirmPasswordUpgrade = {}, UpdateProfile updateProfile = {},
+        Authenticate authenticateReadBearer = {}, Disconnect disconnect = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -62,6 +84,8 @@ public:
         gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> securityPage(
+        gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionList(
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionRevoke(
@@ -70,7 +94,15 @@ private:
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> connectionsRead(
         gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> disconnect(
+        gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> totpStatusRead(
+        gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> passwordUpgradeStatusRead(
+        gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> passwordUpgradeConfirm(
+        gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> profileUpdate(
         gateway::HttpRequest request);
     [[nodiscard]] static gateway::HttpResponse fail(
         const foundation::Error& failure, const gateway::HttpRequest& request);
@@ -83,6 +115,72 @@ private:
     ReadProfile m_readProfile;
     ReadConnections m_readConnections;
     ReadTotpStatus m_readTotpStatus;
+    ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
+    ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
+    UpdateProfile m_updateProfile;
+    // Profile presentation, connection management and status reads may use
+    // scoped Bearer; password confirmation/session management do not.
+    Authenticate m_authenticateReadBearer;
+    Disconnect m_disconnect;
+};
+
+/** Native contact challenge issuance, independent of session-list opt-ins.
+ * The issuer owns durable reservation and delivery compensation.
+ */
+class CoroutineContactVerificationAdapter final : public gateway::http::CoroutineHttpHandler {
+public:
+    using Authenticate=CoroutineAccountSessionAdapter::Authenticate;
+    using Issue=std::function<boost::asio::awaitable<foundation::Status>(
+        identity::core::IdentityId, VerificationPurpose, std::string)>;
+
+    using PublicIssue=std::function<boost::asio::awaitable<foundation::Status>(VerificationPurpose,std::string)>;
+    using Signup=std::function<boost::asio::awaitable<foundation::Result<identity::core::IdentityId>>(
+        std::string,foundation::SecretString,std::optional<std::string>)>;
+    using VerifySignup=std::function<boost::asio::awaitable<foundation::Result<session::CoroutineIssuedSession>>(
+        VerificationId,foundation::SecretString,identity::provider::ClientContext)>;
+    using ResetPassword=std::function<boost::asio::awaitable<foundation::Status>(
+        VerificationId,foundation::SecretString,foundation::SecretString)>;
+    using VerifyPhone=std::function<boost::asio::awaitable<foundation::Result<identity::profile::IdentityProfile>>(
+        identity::core::IdentityId,VerificationId,foundation::SecretString)>;
+    using VerifyEmailChange=std::function<boost::asio::awaitable<foundation::Result<identity::profile::IdentityProfile>>(
+        identity::core::IdentityId,VerificationId,foundation::SecretString,std::optional<foundation::SecretString>)>;
+    struct TotpCallbacks final {
+        using Start=std::tuple<std::string,foundation::SecretString,foundation::Instant,bool>;
+        Authenticate authenticate;
+        std::function<boost::asio::awaitable<foundation::Result<Start>>(
+            identity::core::IdentityId,foundation::SecretString,identity::provider::AssuranceLevel)> begin;
+        std::function<boost::asio::awaitable<foundation::Status>(
+            identity::core::IdentityId,std::string,foundation::SecretString,identity::provider::AssuranceLevel)> complete;
+        std::function<boost::asio::awaitable<foundation::Status>(
+            identity::core::IdentityId,foundation::SecretString,identity::provider::AssuranceLevel)> disable;
+        [[nodiscard]] explicit operator bool() const noexcept {
+            return authenticate && begin && complete && disable;
+        }
+    };
+    CoroutineContactVerificationAdapter(gateway::http::CoroutineHttpHandler& fallback,
+        gateway::TokenBucketRateLimiter& limiter, Authenticate authenticate, Issue issue,
+        PublicIssue publicIssue = {},Signup signup={},VerifySignup verifySignup={},ResetPassword resetPassword={},VerifyPhone verifyPhone={},VerifyEmailChange verifyEmailChange={},TotpCallbacks totp={});
+    [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest& request) const noexcept override;
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse>
+    handleAsync(gateway::HttpRequest request) override;
+private:
+    [[nodiscard]] static gateway::HttpResponse fail(const foundation::Error& failure,
+        const gateway::HttpRequest& request);
+    gateway::http::CoroutineHttpHandler* m_fallback;
+    gateway::TokenBucketRateLimiter* m_limiter;
+    Authenticate m_authenticate;
+    Issue m_issue;
+    PublicIssue m_publicIssue;
+    Signup m_signup;
+    VerifySignup m_verifySignup;
+    ResetPassword m_resetPassword;
+    VerifyPhone m_verifyPhone;
+    VerifyEmailChange m_verifyEmailChange;
+    TotpCallbacks m_totp;
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> manageTotp(gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> verifyPhone(gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> signupOrVerify(gateway::HttpRequest request);
 };
 
 } // namespace openproof::account::http

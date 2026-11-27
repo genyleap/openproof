@@ -34,6 +34,19 @@ openproof_add_module(openproof_authentication_http
 
 target_compile_definitions(openproof_authentication_http PRIVATE BOOST_HAS_LONG_LONG=1)
 
+add_library(openproof_authentication_async_passkey_http STATIC coroutine_passkey_http.cpp)
+target_compile_features(openproof_authentication_async_passkey_http PUBLIC cxx_std_26)
+set_target_properties(openproof_authentication_async_passkey_http PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_authentication_async_passkey_http PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_authentication_async_passkey_http PUBLIC
+    openproof_authentication_http openproof_authentication openproof_provider_passkey openproof_gateway_http
+    openproof_gateway openproof_session openproof_identity_core openproof_identity_provider
+    openproof_security openproof_foundation Boost::headers PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_passkey_http.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
+
 # Standalone, optional runtime adapter with only gateway dependencies.
 # This does not import the blocking federated AuthenticationHttpApi or SQL.
 add_library(openproof_authentication_async_catalog_http STATIC
@@ -61,7 +74,8 @@ endif()
 # compatibility worker until native callback + session issuance are E2E tested.
 add_library(openproof_authentication_async_federated_start_http STATIC
     coroutine_federated_start_http.cpp
-    coroutine_federated_callback_http.cpp)
+    coroutine_federated_callback_http.cpp
+    boost_json.cpp)
 target_compile_features(openproof_authentication_async_federated_start_http PUBLIC cxx_std_26)
 target_include_directories(openproof_authentication_async_federated_start_http PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -121,4 +135,22 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_recovery_code_http.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
+endif()
+
+# Provider-neutral, read-only owner-authorized administration boundary.
+add_library(openproof_administration_async_http STATIC
+    coroutine_admin_read_http.cpp
+    boost_json.cpp)
+target_compile_features(openproof_administration_async_http PUBLIC cxx_std_26)
+target_include_directories(openproof_administration_async_http PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(openproof_administration_async_http PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_administration_async_http PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_administration_async_http PUBLIC
+    openproof_administration openproof_foundation openproof_gateway openproof_gateway_http
+    openproof_identity_core openproof_identity_provider openproof_organization openproof_session
+    openproof_credentials openproof_security
+    Boost::headers PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_admin_read_http.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()

@@ -4,12 +4,14 @@ module;
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include <boost/asio/awaitable.hpp>
 #include <boost/json.hpp>
 
 #include "protected_header_validation.hpp"
@@ -135,7 +137,14 @@ SenderProofVerifier::SenderProofVerifier(
     DpopService& dpop, MtlsForwardingReplayStore& mtlsReplays,
     const foundation::ClockSource& clock, std::string publicOrigin,
     std::optional<foundation::SecretString> mtlsForwardingKey)
-    : m_dpop(&dpop), m_mtlsReplays(&mtlsReplays), m_clock(&clock),
+    : SenderProofVerifier(dpop,clock,std::move(publicOrigin),std::move(mtlsForwardingKey))
+{
+    m_mtlsReplays=&mtlsReplays;
+}
+
+SenderProofVerifier::SenderProofVerifier(DpopService& dpop,const foundation::ClockSource& clock,
+    std::string publicOrigin,std::optional<foundation::SecretString> mtlsForwardingKey)
+    : m_dpop(&dpop), m_clock(&clock),
       m_publicOrigin(std::move(publicOrigin)),
       m_mtlsForwardingKey(std::move(mtlsForwardingKey))
 {
@@ -149,7 +158,7 @@ std::string SenderProofVerifier::expectedHtu(const gateway::HttpRequest& request
     return m_publicOrigin + std::string{request.path()};
 }
 
-foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyDpop(
+foundation::Result<SenderProofVerifier::ReplayProof> SenderProofVerifier::prepareDpop(
     gateway::HttpRequest& request, const foundation::SecretString* accessToken)
 {
     const auto proof = request.header("dpop");
@@ -195,15 +204,20 @@ foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyDpop(
     }
     auto thumbprint = security::rsaJwkThumbprint(key->first, key->second);
     if (!thumbprint) return foundation::fail(thumbprint.error());
-    auto replay = m_dpop->consume(
-        thumbprint.value(), *jwtId, instantFromUnixSeconds(issuedSeconds.value()));
-    if (!replay) return foundation::fail(replay.error());
+    if (issuedSeconds.value()<0 || issuedSeconds.value()>
+        std::numeric_limits<foundation::Duration::rep>::max()/1000-720)
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    auto window=m_dpop->replayWindow(thumbprint.value(),*jwtId,
+        instantFromUnixSeconds(issuedSeconds.value()));
+    if (!window) return foundation::fail(window.error());
+    auto binding=token::SenderConstraint::create(
+        token::SenderConstraintKind::Dpop,std::move(thumbprint).value());
+    if (!binding) return foundation::fail(binding.error());
     request.eraseHeader("dpop");
-    return token::SenderConstraint::create(
-        token::SenderConstraintKind::Dpop, std::move(thumbprint).value());
+    return ReplayProof{std::move(binding).value(),*jwtId,window->first,window->second,instantFromUnixSeconds(issuedSeconds.value())};
 }
 
-foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwarding(
+foundation::Result<SenderProofVerifier::ReplayProof> SenderProofVerifier::prepareMtlsForwarding(
     gateway::HttpRequest& request)
 {
     const auto thumbprint = request.header("x-forwarded-client-cert-sha256");
@@ -233,7 +247,14 @@ foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwa
     const foundation::Instant assertedAt{foundation::Duration{milliseconds.value()}};
     const auto now = m_clock->now();
     constexpr auto maximumAge = std::chrono::seconds{60};
-    if (assertedAt > now + maximumAge || assertedAt + maximumAge < now) {
+    constexpr auto maximum=std::numeric_limits<foundation::Duration::rep>::max()-120000;
+    if (milliseconds.value()<0 || milliseconds.value()>maximum
+        || now.time_since_epoch().count()<0 || now.time_since_epoch().count()>maximum
+        || assertedAt > now + maximumAge || assertedAt + maximumAge <= now
+        || std::ranges::any_of(*nonce,[](char ch){
+            const auto byte=static_cast<unsigned char>(ch);
+            return byte<0x20U || byte==0x7fU;
+        })) {
         erase();
         return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                                 "The authenticated mTLS forwarding assertion expired.");
@@ -251,20 +272,111 @@ foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwa
         return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
                                 "The authenticated mTLS forwarding assertion signature is invalid.");
     }
-    auto replay = m_mtlsReplays->consumeMtlsForwardingReplay(
-        *thumbprint, *nonce, assertedAt + maximumAge, now);
-    if (!replay) {
-        erase();
-        return foundation::fail(replay.error());
-    }
-    const std::string value{*thumbprint};
+    auto binding=token::SenderConstraint::create(token::SenderConstraintKind::Mtls,
+        std::string{*thumbprint});
+    const std::string identifier{*nonce};
     erase();
-    return token::SenderConstraint::create(token::SenderConstraintKind::Mtls, value);
+    if (!binding) return foundation::fail(binding.error());
+    return ReplayProof{std::move(binding).value(),identifier,assertedAt+maximumAge,now,assertedAt};
+}
+
+foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyDpop(
+    gateway::HttpRequest& request,const foundation::SecretString* accessToken)
+{
+    auto prepared=prepareDpop(request,accessToken);
+    if (!prepared) return foundation::fail(prepared.error());
+    // Legacy callers use exactly the same time window and replay key.
+    auto replay=m_dpop->consume(prepared->binding.value(),prepared->identifier,
+        prepared->issuedAt);
+    if (!replay) return foundation::fail(replay.error());
+    return std::move(prepared->binding);
+}
+
+foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwarding(
+    gateway::HttpRequest& request)
+{
+    auto prepared=prepareMtlsForwarding(request);
+    if (!prepared) return foundation::fail(prepared.error());
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto replay=m_mtlsReplays->consumeMtlsForwardingReplay(prepared->binding.value(),
+        prepared->identifier,prepared->expiresAt,prepared->now);
+    if (!replay) return foundation::fail(replay.error());
+    return std::move(prepared->binding);
+}
+
+boost::asio::awaitable<foundation::Status> SenderProofVerifier::verifyAsync(
+    gateway::HttpRequest& request,const session::DelegatedSenderConstraint& constraint,
+    const foundation::SecretString& accessToken,bool dpopAuthorizationScheme,ConsumeReplay consume)
+{
+    // This function is intentionally not a coroutine: raw credential and
+    // request references cannot survive into the replay coroutine frame.
+    const bool dpop=constraint.kind()==session::DelegatedSenderConstraintKind::Dpop;
+    if (!consume || (constraint.kind()!=session::DelegatedSenderConstraintKind::Dpop
+            && constraint.kind()!=session::DelegatedSenderConstraintKind::Mtls)
+        || dpop!=dpopAuthorizationScheme)
+        return consumePreparedAsync(foundation::fail(foundation::ErrorCode::AuthenticationFailed),{});
+    auto prepared=dpop?prepareDpop(request,&accessToken):prepareMtlsForwarding(request);
+    if (prepared && prepared->binding.value()!=constraint.value())
+        prepared=foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    return consumePreparedAsync(std::move(prepared),std::move(consume));
+}
+
+boost::asio::awaitable<foundation::Status> SenderProofVerifier::consumePreparedAsync(
+    foundation::Result<ReplayProof> proof,ConsumeReplay consume)
+{
+    if (!proof) co_return foundation::fail(proof.error());
+    if (!consume) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    const auto kind=proof->binding.kind()==token::SenderConstraintKind::Dpop
+        ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls;
+    co_return co_await consume(kind,std::string{proof->binding.value()},
+        std::move(proof->identifier),proof->expiresAt,proof->now);
+}
+
+boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+SenderProofVerifier::tokenEndpointConstraintAsync(gateway::HttpRequest& request,ConsumeReplay consume)
+{
+    // Non-coroutine: prepare and erase raw sender proof before suspension.
+    const bool dpop=request.header("dpop").has_value();
+    const bool mtls=request.header("x-forwarded-client-cert-sha256").has_value()
+        || request.header("x-forwarded-client-cert-timestamp").has_value()
+        || request.header("x-forwarded-client-cert-nonce").has_value()
+        || request.header("x-forwarded-client-cert-signature").has_value();
+    const auto erase=[&request] {
+        for (const auto* key:{"dpop","x-forwarded-client-cert-sha256",
+                "x-forwarded-client-cert-timestamp","x-forwarded-client-cert-nonce",
+                "x-forwarded-client-cert-signature"}) request.eraseHeader(key);
+    };
+    if (dpop && mtls) {
+        erase();
+        return consumeTokenProofAsync(foundation::fail(foundation::ErrorCode::InvalidArgument),{});
+    }
+    if (!dpop && !mtls) return consumeTokenProofAsync(std::optional<ReplayProof>{},std::move(consume));
+    auto prepared=dpop?prepareDpop(request,nullptr):prepareMtlsForwarding(request);
+    erase();
+    if (!prepared) return consumeTokenProofAsync(foundation::fail(prepared.error()),{});
+    return consumeTokenProofAsync(std::optional<ReplayProof>{std::move(prepared).value()},std::move(consume));
+}
+
+boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+SenderProofVerifier::consumeTokenProofAsync(foundation::Result<std::optional<ReplayProof>> proof,
+    ConsumeReplay consume)
+{
+    if (!proof) co_return foundation::fail(proof.error());
+    if (!proof->has_value()) co_return std::optional<token::SenderConstraint>{};
+    if (!consume) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto& prepared=proof->value();
+    const auto kind=prepared.binding.kind()==token::SenderConstraintKind::Dpop
+        ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls;
+    auto consumed=co_await consume(kind,std::string{prepared.binding.value()},
+        std::move(prepared.identifier),prepared.expiresAt,prepared.now);
+    if (!consumed) co_return foundation::fail(consumed.error());
+    co_return std::optional<token::SenderConstraint>{std::move(prepared.binding)};
 }
 
 foundation::Result<std::optional<token::SenderConstraint>>
 SenderProofVerifier::tokenEndpointConstraint(gateway::HttpRequest& request)
 {
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
     const bool hasDpop = request.header("dpop").has_value();
     const bool hasMtls = request.header("x-forwarded-client-cert-sha256").has_value()
         || request.header("x-forwarded-client-cert-timestamp").has_value()

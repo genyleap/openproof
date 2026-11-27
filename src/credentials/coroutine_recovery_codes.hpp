@@ -6,6 +6,8 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <cstddef>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -14,6 +16,13 @@ import openproof.foundation;
 import openproof.identity.core;
 
 namespace openproof::credentials {
+
+// Non-secret snapshot of the exact local credential/factor generation.
+struct RecoveryIssuanceFence final {
+    std::string subject;
+    std::string credentialGeneration;
+    std::string factorGeneration;
+};
 
 class CoroutineRecoveryCodeRepository {
 public:
@@ -27,6 +36,18 @@ public:
     [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
     replaceAsync(identity::core::IdentityId identity,
                  std::vector<RecoveryCodeDigest> digests) = 0;
+
+    // Default implementations fail closed for repositories that have not
+    // implemented atomic eligibility and generation fencing.
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Result<RecoveryIssuanceFence>>
+    captureIssuanceAsync(identity::core::IdentityId) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    replaceFencedAsync(identity::core::IdentityId,
+        std::vector<RecoveryCodeDigest>,RecoveryIssuanceFence) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
 
     [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
     consumeAsync(identity::core::IdentityId identity,
@@ -54,7 +75,10 @@ public:
     // after their digests have been durably replaced by the repository.
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<std::vector<foundation::SecretString>>>
-    issue(identity::core::IdentityId identity, std::size_t count);
+    issue(identity::core::IdentityId identity, std::size_t count,
+        std::optional<RecoveryIssuanceFence> fence=std::nullopt);
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::vector<foundation::SecretString>>>
+    issueFenced(identity::core::IdentityId identity,std::size_t count);
 
     // Constant-time keyed digest is calculated before any SQL read; repository
     // redemption is a single identity-scoped atomic DELETE.

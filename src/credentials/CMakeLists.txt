@@ -21,7 +21,8 @@ endif()
 
 # Storage-neutral native coroutine API. Only the repository SPI uses awaitable;
 # none of the CSPRNG/HMAC domain logic calls synchronous persistence.
-add_library(openproof_credentials_async STATIC coroutine_recovery_codes.cpp)
+add_library(openproof_credentials_async STATIC
+    coroutine_recovery_codes.cpp bounded_password_executor.cpp)
 target_compile_features(openproof_credentials_async PUBLIC cxx_std_26)
 target_include_directories(openproof_credentials_async PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -35,6 +36,6 @@ target_link_libraries(openproof_credentials_async
         openproof_security Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(coroutine_recovery_codes.cpp
+    set_source_files_properties(coroutine_recovery_codes.cpp bounded_password_executor.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()

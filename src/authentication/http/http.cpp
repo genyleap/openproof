@@ -131,15 +131,6 @@ private:
     return output;
 }
 
-[[nodiscard]] gateway::HttpResponse emptyResponse(int status)
-{
-    gateway::HttpResponse output{status, {}, {}};
-    output.setHeader("cache-control", "no-store");
-    output.setHeader("x-content-type-options", "nosniff");
-    output.setHeader("referrer-policy", "no-referrer");
-    return output;
-}
-
 [[nodiscard]] std::string cookie(std::string_view name, std::string_view value,
                                  std::string_view path, std::int64_t maximumAge)
 {
@@ -195,11 +186,6 @@ void setSessionCookie(gateway::HttpResponse& output,
 {
     output.addHeader("set-cookie", cookie(
         "__Host-openproof-session", token.expose(), "/", 8 * 60 * 60));
-}
-
-void clearSessionCookie(gateway::HttpResponse& output)
-{
-    output.addHeader("set-cookie", cookie("__Host-openproof-session", "", "/", 0));
 }
 
 [[nodiscard]] foundation::Result<json::object> parseObject(const gateway::HttpRequest& request)
@@ -318,14 +304,10 @@ cookieValue(const gateway::HttpRequest& request, std::string_view wanted,
 }
 
 AuthenticationHttpApi::AuthenticationHttpApi(
-    AuthenticationService& authentication, session::SessionService& sessions,
-    credentials::RecoveryCodeService& recoveryCodes,
-    ::openproof::provider::local::LocalAccountDirectory& localAccounts,
+    AuthenticationService& authentication, session::CoroutineReplacingSessionIssuer& sessions,
     gateway::TokenBucketRateLimiter& rateLimiter, idp::ProviderId provider,
-    gateway::HttpHandler& fallback, session::CoroutineReplacingSessionIssuer* asyncSessions)
-    : m_authentication(&authentication), m_sessions(&sessions),
-      m_asyncSessions(asyncSessions),
-      m_recoveryCodes(&recoveryCodes), m_localAccounts(&localAccounts),
+    gateway::HttpHandler& fallback)
+    : m_authentication(&authentication), m_asyncSessions(&sessions),
       m_rateLimiter(&rateLimiter), m_provider(std::move(provider)), m_fallback(&fallback)
 {
 }
@@ -354,27 +336,12 @@ gateway::HttpResponse AuthenticationHttpApi::handle(gateway::HttpRequest request
     if (request.path() != "/auth" && !request.path().starts_with("/auth/")) {
         return m_fallback->handle(std::move(request));
     }
-    if (!m_rateLimiter->allow(std::string{"auth-ip:"} + std::string{request.remoteAddress()})) {
-        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
-    }
-    if (request.method() != gateway::HttpMethod::Post) {
-        return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
-    }
-    if (request.path() == "/auth/login") return login(std::move(request));
-    if (request.path() == "/auth/mfa/verify") return verify(std::move(request));
-    if (request.path() == "/auth/session/rotate") return rotate(std::move(request));
-    if (request.path() == "/auth/logout") return logout(std::move(request), false);
-    if (request.path() == "/auth/logout-all") return logout(std::move(request), true);
-    if (request.path() == "/auth/recovery-codes") {
-        return issueRecoveryCodes(std::move(request));
-    }
-    return error(foundation::Error{foundation::ErrorCode::NotFound}, request);
+    SensitiveAuthRequestGuard wipeRequestOnExit{request};
+    return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
 }
 
-// Only /auth/login and /auth/mfa/verify are ready for native dispatch.
-// Other auth routes continue on the bounded compatibility worker. Native
-// readiness always requires a trusted provider, native transactions, canonical
-// finalizer and a replacing session issuer, not merely a coroutine-shaped API.
+// The leaf owns only native password challenge and proof verification.
+// The runtime composes session mutations and recovery issuance separately.
 bool AuthenticationHttpApi::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
@@ -416,8 +383,7 @@ AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
     if (request.path() == "/auth/mfa/verify") {
         co_return co_await verifyAsync(std::move(request));
     }
-    // Rotation/logout/recovery-code routes still use synchronous repository
-    // contracts. Never invoke them indirectly on the native I/O executor.
+    // Session and recovery routes are owned by separate native adapters.
     co_return error(foundation::Error{foundation::ErrorCode::Unavailable}, request);
 }
 
@@ -572,205 +538,4 @@ AuthenticationHttpApi::verifyAsync(gateway::HttpRequest request)
     co_return output;
 }
 
-gateway::HttpResponse AuthenticationHttpApi::login(gateway::HttpRequest request)
-{
-    auto body = parseObject(request);
-    if (!body.has_value() || !onlyFields(body.value(), {"subject"})) {
-        return error(body.has_value() ? foundation::Error{foundation::ErrorCode::InvalidArgument}
-                                      : body.error(), request);
-    }
-    auto subject = requiredString(body.value(), "subject", 320U);
-    if (!subject.has_value()) return error(subject.error(), request);
-    if (!m_rateLimiter->allow(std::string{"auth-subject:"} + subject.value())) {
-        return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
-    }
-    auto bindingToken = security::randomTokenBase64Url(32U);
-    if (!bindingToken.has_value()) return error(bindingToken.error(), request);
-    const std::string subjectValue = subject.value();
-    auto binding = preauthBinding(bindingToken.value(), subjectValue);
-    if (!binding.has_value()) return error(binding.error(), request);
-    const std::string encodedSubject = foundation::toBase64Url(
-        std::as_bytes(std::span{subjectValue.data(), subjectValue.size()}));
-    idp::AuthenticationRequest authenticationRequest{m_provider, clientContext(request)};
-    authenticationRequest.setParameter("subject", subjectValue);
-    authenticationRequest.setRequestedAssurance(idp::AssuranceLevel::Ial1);
-    auto started = m_authentication->begin(
-        authenticationRequest, binding.value(), request.correlation());
-    if (!started.has_value()) return error(started.error(), request);
-
-    json::object payload;
-    payload["transaction_id"] = started->transactionId().value();
-    payload["challenge_id"] = started->challenge().id().value();
-    payload["expires_at_ms"] = started->challenge().expiresAt().time_since_epoch().count();
-    auto output = response(202, std::move(payload));
-    output.addHeader("set-cookie", cookie(
-        kPreauthCookie, started->continuationToken().expose(), "/", 300));
-    output.addHeader("set-cookie", cookie(
-        kBindingCookie, bindingToken.value(), "/", 300));
-    output.addHeader("set-cookie", cookie(
-        kSubjectCookie, encodedSubject, "/", 300));
-    return output;
-}
-
-gateway::HttpResponse AuthenticationHttpApi::verify(gateway::HttpRequest request)
-{
-    auto body = parseObject(request);
-    if (!body.has_value()
-        || !onlyFields(body.value(),
-                       {"transaction_id", "challenge_id", "password", "totp", "recovery_code"})) {
-        return error(body.has_value() ? foundation::Error{foundation::ErrorCode::InvalidArgument}
-                                      : body.error(), request, true);
-    }
-    auto transaction = requiredString(body.value(), "transaction_id", 128U);
-    auto challenge = requiredString(body.value(), "challenge_id", 128U);
-    auto knowledgeSecret = requiredString(body.value(), "password", 1024U);
-    auto totp = optionalString(body.value(), "totp", 8U);
-    auto recoveryCode = optionalString(body.value(), "recovery_code", 128U);
-    const auto continuation = cookieValue(request, kPreauthCookie);
-    const auto bindingToken = cookieValue(request, kBindingCookie);
-    const auto encodedSubject = cookieValue(request, kSubjectCookie, 512U);
-    if (!transaction || !challenge || !knowledgeSecret || !totp || !recoveryCode
-        || (totp->has_value() && recoveryCode->has_value())
-        || !continuation.has_value() || !bindingToken.has_value()
-        || !encodedSubject.has_value()) {
-        return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},
-                     request, true);
-    }
-    auto subject = decodePreauthSubject(encodedSubject.value());
-    if (!subject.has_value()) return error(subject.error(), request, true);
-    auto binding = preauthBinding(bindingToken.value(), subject.value());
-    if (!binding.has_value()) return error(binding.error(), request, true);
-    idp::AuthenticationResponse authenticationResponse{
-        idp::ChallengeId{std::move(challenge).value()}, clientContext(request)};
-    authenticationResponse.setParameter(
-        "subject", idp::CredentialValue{subject.value()});
-    authenticationResponse.setParameter(
-        "password", idp::CredentialValue{std::move(knowledgeSecret).value()});
-    if (totp->has_value()) {
-        authenticationResponse.setParameter(
-            "totp", idp::CredentialValue{std::move(totp).value().value()});
-    }
-    if (recoveryCode->has_value()) {
-        authenticationResponse.setParameter(
-            "recovery_code",
-            idp::CredentialValue{std::move(recoveryCode).value().value()});
-    }
-    auto verified = m_authentication->complete(
-        idp::TransactionId{std::move(transaction).value()},
-        foundation::SecretString{continuation.value()}, binding.value(),
-        authenticationResponse);
-    if (!verified.has_value()) return error(verified.error(), request, true);
-    // A retry after a successfully verified login must not leave an additional
-    // active session for the same browser. No session is touched on bad proof.
-    const auto priorCookie = cookieValue(request, "__Host-openproof-session");
-    const std::optional<foundation::SecretString> priorToken =
-        priorCookie && !priorCookie->empty()
-            ? std::optional<foundation::SecretString>{
-                  std::in_place, std::string{*priorCookie}}
-            : std::nullopt;
-    auto grant = m_sessions->issueReplacing(
-        verified.value(), clientContext(request),
-        priorToken ? &*priorToken : nullptr);
-    if (!grant.has_value()) return error(grant.error(), request, true);
-    json::object payload;
-    payload["session_id"] = grant->id().value();
-    payload["assurance"] = idp::assuranceLevelName(
-        verified->outcome().claimedAssurance());
-    auto output = response(200, std::move(payload));
-    clearPreauth(output);
-    setSessionCookie(output, grant->token());
-    return output;
-}
-
-gateway::HttpResponse AuthenticationHttpApi::rotate(gateway::HttpRequest request)
-{
-    auto credential = gateway::takeSessionCredential(request);
-    if (!credential.has_value() || !credential->has_value()) {
-        return error(credential.has_value()
-                         ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
-                         : credential.error(), request);
-    }
-    auto grant = m_sessions->rotate(credential->value());
-    if (!grant.has_value()) return error(grant.error(), request);
-    json::object payload;
-    payload["session_id"] = grant->id().value();
-    auto output = response(200, std::move(payload));
-    setSessionCookie(output, grant->token());
-    return output;
-}
-
-gateway::HttpResponse AuthenticationHttpApi::logout(gateway::HttpRequest request, bool all)
-{
-    auto credential = gateway::takeSessionCredential(request);
-    if (!credential.has_value()) return error(credential.error(), request);
-    if (!credential->has_value()) {
-        auto output = emptyResponse(204);
-        clearSessionCookie(output);
-        return output;
-    }
-    auto authenticated = m_sessions->authenticate(credential->value());
-    if (!authenticated.has_value()) {
-        if (authenticated.error().code() != foundation::ErrorCode::AuthenticationFailed
-            && authenticated.error().code() != foundation::ErrorCode::AuthenticationRequired) {
-            return error(authenticated.error(), request);
-        }
-    } else if (all) {
-        auto revoked = m_sessions->revokeAll(authenticated->session().identity());
-        if (!revoked.has_value()) return error(revoked.error(), request);
-    } else {
-        auto revoked = m_sessions->revoke(authenticated->session().id());
-        if (!revoked.has_value()) return error(revoked.error(), request);
-    }
-    auto output = emptyResponse(204);
-    clearSessionCookie(output);
-    return output;
-}
-
-gateway::HttpResponse AuthenticationHttpApi::issueRecoveryCodes(
-    gateway::HttpRequest request)
-{
-    auto credential = gateway::takeSessionCredential(request);
-    if (!credential.has_value() || !credential->has_value()) {
-        return error(credential.has_value()
-                         ? foundation::Error{foundation::ErrorCode::AuthenticationRequired}
-                         : credential.error(), request);
-    }
-    auto authenticated = m_sessions->authenticate(credential->value());
-    if (!authenticated.has_value()) return error(authenticated.error(), request);
-    if (!idp::meetsAssurance(authenticated->session().assurance(),
-                             idp::AssuranceLevel::Ial2)) {
-        return error(foundation::Error{foundation::ErrorCode::AssuranceInsufficient}, request);
-    }
-    auto connections = m_authentication->connections(authenticated->session().identity());
-    if (!connections.has_value()) return error(connections.error(), request);
-    const auto localConnection = std::ranges::find_if(
-        connections.value(), [&](const auto& external) {
-            return external.providerId() == m_provider;
-        });
-    if (localConnection == connections->end()) {
-        return error(foundation::Error{foundation::ErrorCode::FailedPrecondition}, request);
-    }
-    auto totpEnabled = m_localAccounts->hasTotp(localConnection->subject());
-    if (!totpEnabled.has_value()) return error(totpEnabled.error(), request);
-    if (!totpEnabled.value()) {
-        return error(foundation::Error{foundation::ErrorCode::FailedPrecondition}, request);
-    }
-    auto batch = m_recoveryCodes->issue(authenticated->session().identity(), 10U);
-    if (!batch.has_value()) return error(batch.error(), request);
-    auto stillEnabled = m_localAccounts->hasTotp(localConnection->subject());
-    if (!stillEnabled.has_value() || !stillEnabled.value()) {
-        auto revoked = m_recoveryCodes->revoke(authenticated->session().identity());
-        if (!revoked.has_value()) return error(revoked.error(), request);
-        return error(stillEnabled.has_value()
-                         ? foundation::Error{foundation::ErrorCode::FailedPrecondition}
-                         : stillEnabled.error(),
-                     request);
-    }
-    json::array codes;
-    for (const auto& code : batch->codes()) codes.emplace_back(code.expose());
-    json::object payload;
-    payload["codes"] = std::move(codes);
-    return response(201, std::move(payload));
-}
-
-}
+} // namespace openproof::authentication::http

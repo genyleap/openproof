@@ -26,7 +26,8 @@ public:
         std::size_t maxConnections,
         foundation::Duration acquireTimeout,
         foundation::Duration connectTimeout,
-        foundation::Duration queryTimeout);
+        foundation::Duration queryTimeout,identity::core::OrganizationId tenant,
+        identity::provider::ProviderId localProvider);
     CoroutinePostgresRecoveryCodeRepository(
         const CoroutinePostgresRecoveryCodeRepository&) = delete;
     CoroutinePostgresRecoveryCodeRepository& operator=(
@@ -36,6 +37,12 @@ public:
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     replaceAsync(identity::core::IdentityId identity,
                  std::vector<credentials::RecoveryCodeDigest> digests) override;
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<credentials::RecoveryIssuanceFence>>
+    captureIssuanceAsync(identity::core::IdentityId identity) override;
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    replaceFencedAsync(identity::core::IdentityId identity,
+        std::vector<credentials::RecoveryCodeDigest> digests,credentials::RecoveryIssuanceFence fence) override;
 
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     consumeAsync(identity::core::IdentityId identity,

@@ -42,6 +42,26 @@ public:
     unsigned int consumed{};
     bool failReplace{};
     bool failRevoke{};
+    unsigned int eligibleCalls{};
+    bool eligible{true};
+    bool eligibilityUnavailable{};
+    bool staleFence{};
+    bool fenceUnavailable{};
+    asio::awaitable<fnd::Result<cred::RecoveryIssuanceFence>> captureIssuanceAsync(core::IdentityId identity) override {
+        ++eligibleCalls;
+        if (eligibilityUnavailable) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        if (!eligible || identity.value()!="identity-current")
+            co_return fnd::fail(fnd::ErrorCode::FailedPrecondition);
+        co_return cred::RecoveryIssuanceFence{"fixture-subject","1","2"};
+    }
+    asio::awaitable<fnd::Status> replaceFencedAsync(core::IdentityId identity,
+        std::vector<cred::RecoveryCodeDigest> digests,cred::RecoveryIssuanceFence fence) override {
+        EXPECT_EQ(fence.credentialGeneration,"1");
+        EXPECT_EQ(fence.factorGeneration,"2");
+        if (fenceUnavailable) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        if (staleFence) co_return fnd::fail(fnd::ErrorCode::FailedPrecondition);
+        co_return co_await replaceAsync(std::move(identity),std::move(digests));
+    }
     std::vector<cred::RecoveryCodeDigest> stored;
 
     asio::awaitable<fnd::Status> replaceAsync(
@@ -141,12 +161,7 @@ struct Fixture final {
             store, fnd::SecretString{std::string(32U, 'P')})).value()};
     NativeFallback fallback;
     unsigned int authCalls{};
-    unsigned int eligibleCalls{};
     bool strongAssurance{true};
-    bool eligible{true};
-    bool eligibleOnlyInitially{};
-    bool eligibilityUnavailable{};
-    bool eligibilityUnavailableAfterFirst{};
 
     auth::CoroutineRecoveryCodeHttpAdapter adapter{
         fallback, limiter, service,
@@ -159,20 +174,6 @@ struct Fixture final {
             auto executor = co_await asio::this_coro::executor;
             co_await asio::post(executor, asio::use_awaitable);
             co_return currentSession(strongAssurance);
-        },
-        [this](core::IdentityId identity)
-            -> asio::awaitable<fnd::Result<bool>> {
-            ++eligibleCalls;
-            if (identity.value() != "identity-current") {
-                co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
-            }
-            auto executor = co_await asio::this_coro::executor;
-            co_await asio::post(executor, asio::use_awaitable);
-            if (eligibilityUnavailable
-                || (eligibilityUnavailableAfterFirst && eligibleCalls > 1U)) {
-                co_return fnd::fail(fnd::ErrorCode::Unavailable);
-            }
-            co_return eligible && !(eligibleOnlyInitially && eligibleCalls > 1U);
         }
     };
 
@@ -240,7 +241,7 @@ TEST(CoroutineRecoveryHttpTest, WeakOrMissingSessionNeverIssuesCode)
     fixture.strongAssurance = false;
     EXPECT_EQ(fixture.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token")).status(), 403);
-    EXPECT_EQ(fixture.eligibleCalls, 0U);
+    EXPECT_EQ(fixture.store.eligibleCalls, 0U);
     EXPECT_EQ(fixture.store.replaced, 0U);
 }
 
@@ -257,7 +258,7 @@ TEST(CoroutineRecoveryHttpTest, NativeIssueReturnsTenCodesOnlyAfterPersistence)
     ASSERT_EQ(response.size(), 10U);
     EXPECT_EQ(fixture.store.stored.size(), 10U);
     EXPECT_EQ(fixture.store.replaced, 1U);
-    EXPECT_EQ(fixture.eligibleCalls, 2U);
+    EXPECT_EQ(fixture.store.eligibleCalls, 1U);
     for (std::size_t i=0; i<response.size(); ++i) {
         const auto text = response[i].as_string();
         const auto hashed = sec::hmacSha256(
@@ -272,37 +273,38 @@ TEST(CoroutineRecoveryHttpTest, NativeIssueReturnsTenCodesOnlyAfterPersistence)
 TEST(CoroutineRecoveryHttpTest, MissingTotpStopsBeforeAnyPersistence)
 {
     Fixture fixture;
-    fixture.eligible = false;
+    fixture.store.eligible = false;
     const auto result = fixture.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token"));
     EXPECT_EQ(result.status(), 412);
     EXPECT_EQ(fixture.store.replaced, 0U);
-    EXPECT_EQ(fixture.eligibleCalls, 1U);
+    EXPECT_EQ(fixture.store.eligibleCalls, 1U);
     EXPECT_EQ(result.headers().at("cache-control"), "no-store");
 }
 
-TEST(CoroutineRecoveryHttpTest, RevokedTotpDuringIssueBurnsAllCodes)
+TEST(CoroutineRecoveryHttpTest, ChangedFactorDuringIssuePreservesNewerBatch)
 {
     Fixture fixture;
-    fixture.eligibleOnlyInitially = true;
+    fixture.store.staleFence = true;
+    fixture.store.stored.resize(1U);
     const auto result = fixture.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token"));
     EXPECT_EQ(result.status(), 412);
-    EXPECT_EQ(fixture.store.replaced, 2U);
-    EXPECT_TRUE(fixture.store.stored.empty());
-    EXPECT_EQ(fixture.eligibleCalls, 2U);
+    EXPECT_EQ(fixture.store.replaced, 0U);
+    EXPECT_EQ(fixture.store.stored.size(), 1U);
+    EXPECT_EQ(fixture.store.eligibleCalls, 1U);
     EXPECT_EQ(result.body().find("codes"), std::string::npos);
 }
 
-TEST(CoroutineRecoveryHttpTest, FailedEligibilityRecheckCannotLeakPlaintext)
+TEST(CoroutineRecoveryHttpTest, FailedFencedWriteCannotLeakPlaintext)
 {
     Fixture fixture;
-    fixture.eligibilityUnavailableAfterFirst = true;
+    fixture.store.fenceUnavailable = true;
     fixture.store.failRevoke = true;
     const auto result = fixture.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token"));
     EXPECT_EQ(result.status(), 503);
-    EXPECT_EQ(fixture.store.replaced, 2U);
+    EXPECT_EQ(fixture.store.replaced, 0U);
     EXPECT_EQ(result.headers().at("cache-control"), "no-store");
     EXPECT_EQ(result.body().find("codes"), std::string::npos);
 }
@@ -310,7 +312,7 @@ TEST(CoroutineRecoveryHttpTest, FailedEligibilityRecheckCannotLeakPlaintext)
 TEST(CoroutineRecoveryHttpTest, PersistenceAndEligibilityErrorsFailClosed)
 {
     Fixture noEligibility;
-    noEligibility.eligibilityUnavailable = true;
+    noEligibility.store.eligibilityUnavailable = true;
     EXPECT_EQ(noEligibility.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token")).status(), 503);
     EXPECT_EQ(noEligibility.store.replaced, 0U);
@@ -319,7 +321,7 @@ TEST(CoroutineRecoveryHttpTest, PersistenceAndEligibilityErrorsFailClosed)
     noStore.store.failReplace = true;
     EXPECT_EQ(noStore.run(request(
         gw::HttpMethod::Post, "/auth/recovery-codes", "valid-token")).status(), 503);
-    EXPECT_EQ(noStore.eligibleCalls, 1U);
+    EXPECT_EQ(noStore.store.eligibleCalls, 1U);
     EXPECT_TRUE(noStore.store.stored.empty());
 }
 } // namespace

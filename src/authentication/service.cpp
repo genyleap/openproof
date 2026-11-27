@@ -361,7 +361,7 @@ AuthenticationService::AuthenticationService(
     CoroutineCanonicalIdentityFinalizer* asyncCanonical)
     : m_providers(providers)
     , m_transactions(transactions)
-    , m_identities(identities)
+    , m_identities(&identities)
     , m_clock(clock)
     , m_trustPolicy(std::move(trustPolicy))
     , m_maximumTransactionLifetime(maximumTransactionLifetime)
@@ -371,6 +371,19 @@ AuthenticationService::AuthenticationService(
     , m_asyncCanonical(asyncCanonical)
 {
     foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
+}
+
+AuthenticationService::AuthenticationService(provider::ProviderRegistry& providers,
+    provider::AuthenticationTransactionStore& transactions,const foundation::ClockSource& clock,
+    ProviderTrustPolicy trustPolicy,foundation::Duration maximumTransactionLifetime,
+    CoroutineCanonicalIdentityFinalizer& asyncCanonical)
+    :m_providers(providers),m_transactions(transactions),m_clock(clock),
+     m_trustPolicy(std::move(trustPolicy)),m_maximumTransactionLifetime(maximumTransactionLifetime),
+     m_asyncCanonical(&asyncCanonical)
+{
+    foundation::requireInvariant(maximumTransactionLifetime > foundation::Duration::zero(), "authentication transaction lifetime must be positive");
+    foundation::requireInvariant(dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&transactions)!=nullptr,
+        "native authentication requires a coroutine transaction store");
 }
 
 std::optional<provider::AssuranceLevel> AuthenticationService::effectiveMaximum(
@@ -481,6 +494,7 @@ foundation::Result<AuthenticationStart> AuthenticationService::beginInternal(
     foundation::CorrelationId correlation,
     const identity::core::IdentityId* connectionTarget)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     provider::AuthenticationProvider* const implementation =
         m_providers.find(request.provider());
     if (implementation == nullptr) {
@@ -706,6 +720,7 @@ AuthenticationService::completeExchange(
     const provider::AuthenticationResponse& response,
     bool requireConnection)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     const foundation::Instant now = m_clock.now();
     foundation::Result<provider::AuthenticationTransaction> transaction =
         m_transactions.consume(transactionId, continuationToken, binding, now);
@@ -719,6 +734,13 @@ AuthenticationService::completeExchange(
         return foundation::fail(authenticationFailure(
             "Authentication completion refused: challenge identifier does not match the "
             "server-side transaction."));
+    }
+
+    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
+    const bool isConnection = connection != transaction->metadata().end();
+    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
+        return foundation::fail(authenticationFailure(
+            "Authentication completion refused: ceremony purpose does not match the endpoint."));
     }
 
     provider::AuthenticationProvider* const implementation =
@@ -795,12 +817,6 @@ AuthenticationService::completeExchange(
             "Provider returned a verification timestamp outside the transaction window."));
     }
 
-    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
-    const bool isConnection = connection != transaction->metadata().end();
-    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
-        return foundation::fail(authenticationFailure(
-            "Authentication completion refused: ceremony purpose does not match the endpoint."));
-    }
     std::optional<identity::core::IdentityId> connectionTarget;
     if (isConnection) {
         connectionTarget.emplace(connection->second);
@@ -845,6 +861,13 @@ AuthenticationService::completeExchangeAsync(
             "server-side transaction."));
     }
 
+    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
+    const bool isConnection = connection != transaction->metadata().end();
+    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: ceremony purpose does not match the endpoint."));
+    }
+
     provider::AuthenticationProvider* const implementation =
         m_providers.find(transaction->provider());
     if (implementation == nullptr) {
@@ -868,6 +891,23 @@ AuthenticationService::completeExchangeAsync(
         co_return foundation::fail(authenticationFailure(
             "Authentication provider has no native coroutine capability."));
     }
+    // A provider-neutral redirect capability binds wire proof family to
+    // the implementation selected by the consumed server transaction.
+    const auto& fields=response.parameters();
+    const bool oauth1=fields.contains("oauth_token") || fields.contains("oauth_verifier");
+    const bool saml=fields.contains("SAMLResponse") || fields.contains("RelayState");
+    const bool code=fields.contains("code") || fields.contains("state") || fields.contains("user");
+    const bool redirect=implementation->interactionModel()==provider::InteractionModel::Redirect;
+    const auto kind=native->redirectProofKind();
+    const bool expectsOAuth1=redirect && kind==provider::RedirectProofKind::OAuth1;
+    const bool expectsSaml=redirect && kind==provider::RedirectProofKind::SamlAssertion;
+    if (oauth1!=expectsOAuth1 || saml!=expectsSaml
+        || (oauth1 && (saml || code || !fields.contains("oauth_token")
+            || !fields.contains("oauth_verifier")))
+        || (saml && (oauth1 || code || !fields.contains("SAMLResponse")
+            || !fields.contains("RelayState") || fields.size()!=2U)))
+        co_return foundation::fail(authenticationFailure(
+            "Authentication completion refused: redirect proof family mismatch."));
     foundation::Result<provider::AuthenticationOutcome> outcome =
         foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
@@ -919,12 +959,6 @@ AuthenticationService::completeExchangeAsync(
             "Provider returned a verification timestamp outside the transaction window."));
     }
 
-    const auto connection = transaction->metadata().find(kConnectionIdentityMetadata);
-    const bool isConnection = connection != transaction->metadata().end();
-    if (isConnection != requireConnection || (isConnection && connection->second.empty())) {
-        co_return foundation::fail(authenticationFailure(
-            "Authentication completion refused: ceremony purpose does not match the endpoint."));
-    }
     std::optional<identity::core::IdentityId> connectionTarget;
     if (isConnection) {
         connectionTarget.emplace(connection->second);
@@ -936,6 +970,7 @@ AuthenticationService::completeExchangeAsync(
 foundation::Status AuthenticationService::requireActiveIdentity(
     const identity::core::IdentityId& identity) const
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     if (m_lifecycleRepository == nullptr) return foundation::ok();
     if (m_organization.empty()) {
         return foundation::fail(authenticationFailure(
@@ -964,7 +999,8 @@ foundation::Status AuthenticationService::attachVerified(
     if (!verified) return foundation::fail(verified.error());
     auto completed = link->complete(verifiedAt);
     if (!completed) return foundation::fail(completed.error());
-    return m_identities.attach(link.value());
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
+    return m_identities->attach(link.value());
 }
 
 foundation::Result<VerifiedAuthentication> AuthenticationService::complete(
@@ -1013,6 +1049,10 @@ AuthenticationService::completeAsync(
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "Canonical identity finalization returned an empty identity.");
     }
+    if (outcome.requiredCanonicalOwner() && *outcome.requiredCanonicalOwner() != identity->value()) {
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
+            "Canonical finalization returned a different credential owner.");
+    }
     co_return VerifiedAuthentication{
         std::move(outcome), std::move(identity).value()};
 }
@@ -1020,11 +1060,15 @@ AuthenticationService::completeAsync(
 foundation::Result<VerifiedAuthentication>
 AuthenticationService::finishVerified(CompletedExchange exchange)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto outcome = std::move(exchange.outcome);
+    // The legacy path cannot perform atomic owner-bound finalization.
+    if (outcome.requiredCanonicalOwner())
+        return foundation::fail(foundation::ErrorCode::Unavailable);
     const auto completedAt = exchange.completedAt;
     const auto external = externalFromOutcome(outcome);
     foundation::Result<std::optional<identity::core::IdentityId>> owner =
-        m_identities.ownerOf(external);
+        m_identities->ownerOf(external);
     if (!owner.has_value()) {
         return foundation::fail(authenticationFailure(
             "Authentication completion could not resolve the external identity directory."));
@@ -1139,7 +1183,7 @@ AuthenticationService::finishVerified(CompletedExchange exchange)
     }
     auto active = requireActiveIdentity(identity);
     if (!active) return foundation::fail(active.error());
-    auto presentationSaved = m_identities.updatePresentation(external);
+    auto presentationSaved = m_identities->updatePresentation(external);
     if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(identity);
@@ -1166,7 +1210,8 @@ foundation::Result<VerifiedAuthentication>
 AuthenticationService::acceptVerifiedEmail(
     const identity::core::ExternalIdentityRef& external)
 {
-    auto owner = m_identities.ownerOf(external);
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (!owner->has_value()) {
         return foundation::fail(
@@ -1191,6 +1236,27 @@ AuthenticationService::acceptVerifiedEmail(
         std::move(outcome).value(), std::move(owner).value().value()};
 }
 
+boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+AuthenticationService::acceptVerifiedEmailAsync(identity::core::ExternalIdentityRef external,
+    identity::core::IdentityId expectedOwner)
+{
+    if (!m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto active=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(expectedOwner,external);
+    if (!active) co_return foundation::fail(active.error());
+    provider::VerifiedClaims claims;
+    claims.set(provider::ClaimName::Email,std::string{external.subject().value()});
+    claims.set(provider::ClaimName::EmailVerified,"true");
+    provider::ProviderEvidence evidence;
+    evidence.add("method","email_verification_link");
+    auto outcome=provider::AuthenticationOutcome::create(external.providerId(),external.subject(),
+        std::move(claims),provider::AssuranceLevel::Ial1,
+        provider::AuthenticationStrength{provider::AuthenticationFactor::Possession,false},
+        std::move(evidence),m_clock.now());
+    if (!outcome) co_return foundation::fail(outcome.error());
+    co_return VerifiedAuthentication{std::move(outcome).value(),std::move(expectedOwner)};
+}
+
 foundation::Result<identity::core::ExternalIdentityRef>
 AuthenticationService::completeConnection(
     const provider::TransactionId& transactionId,
@@ -1209,7 +1275,8 @@ AuthenticationService::completeConnectionAsync(
     provider::TransactionId transactionId,
     foundation::SecretString continuationToken,
     provider::BindingDigest binding,
-    provider::AuthenticationResponse response)
+    provider::AuthenticationResponse response,
+    ConnectionPresentation presentation)
 {
     // Reject a non-native directory before consuming single-use link proofs.
     auto* const finalizer = m_asyncCanonical;
@@ -1225,6 +1292,8 @@ AuthenticationService::completeConnectionAsync(
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "The connection target is invalid.");
     }
+    if (exchange->outcome.requiredCanonicalOwner())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     foundation::Result<identity::core::ExternalIdentityRef> linked =
         foundation::fail(foundation::ErrorCode::Unavailable);
     try {
@@ -1241,18 +1310,33 @@ AuthenticationService::completeConnectionAsync(
         co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed,
             "Canonical connection result does not match verified provider proof.");
     }
+    // Best-effort display metadata is bound to the consumed transaction's
+    // original owner, not a fresh owner lookup or client-supplied identity.
+    if (presentation.displayName || presentation.preferredUsername || presentation.pictureUrl) {
+        try {
+            static_cast<void>(co_await finalizer->updatePresentationAsync(
+                *exchange->connectionTarget,identity::core::ExternalIdentityRef{
+                    linked->providerId(),linked->subject(),std::move(presentation.displayName),
+                    std::move(presentation.preferredUsername),std::move(presentation.pictureUrl)},
+                exchange->completedAt));
+        } catch (...) {
+            // The verified connection is already committed.
+        }
+    }
     co_return std::move(linked).value();
 }
 
 foundation::Result<identity::core::ExternalIdentityRef>
 AuthenticationService::finishConnection(CompletedExchange exchange)
 {
+    if (exchange.outcome.requiredCanonicalOwner())
+        return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     const auto& target = *exchange.connectionTarget;
     auto active = requireActiveIdentity(target);
     if (!active) return foundation::fail(active.error());
     const auto external = externalFromOutcome(exchange.outcome);
     const std::lock_guard guard{m_connectionMutex};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (owner->has_value() && owner->value() != target) {
         return foundation::fail(
@@ -1263,7 +1347,7 @@ AuthenticationService::finishConnection(CompletedExchange exchange)
         auto attached = attachVerified(target, external, exchange.completedAt);
         if (!attached) return foundation::fail(attached.error());
     }
-    auto presentationSaved = m_identities.updatePresentation(external);
+    auto presentationSaved = m_identities->updatePresentation(external);
     if (!presentationSaved) return foundation::fail(presentationSaved.error());
     if (m_profileRepository != nullptr) {
         auto stored = m_profileRepository->find(target);
@@ -1295,8 +1379,9 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     std::optional<std::string> preferredUsername,
     std::optional<std::string> pictureUrl)
 {
+    if (!m_identities) return foundation::fail(foundation::ErrorCode::Unavailable);
     const std::lock_guard guard{m_connectionMutex};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (!owner->has_value()) {
         return foundation::fail(foundation::ErrorCode::NotFound,
@@ -1306,7 +1391,7 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     identity::core::ExternalIdentityRef presented{
         external.providerId(), external.subject(), std::move(displayName),
         std::move(preferredUsername), std::move(pictureUrl)};
-    auto connectionSaved = m_identities.updatePresentation(presented);
+    auto connectionSaved = m_identities->updatePresentation(presented);
     if (!connectionSaved) return connectionSaved;
 
     if (m_profileRepository == nullptr) return foundation::ok();
@@ -1345,13 +1430,23 @@ foundation::Status AuthenticationService::updateConnectionPresentation(
     return m_profileRepository->save(profile.value());
 }
 
+boost::asio::awaitable<foundation::Status>
+AuthenticationService::updateConnectionPresentationAsync(identity::core::IdentityId owner,
+    identity::core::ExternalIdentityRef external)
+{
+    if (!m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    co_return co_await m_asyncCanonical->updatePresentationAsync(
+        std::move(owner),std::move(external),m_clock.now());
+}
+
 foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
 AuthenticationService::connections(const identity::core::IdentityId& identity) const
 {
     auto active = requireActiveIdentity(identity);
     if (!active) return foundation::fail(active.error());
     const std::lock_guard guard{m_connectionMutex};
-    auto attached = m_identities.externalIdentitiesOf(identity);
+    auto attached = m_identities->externalIdentitiesOf(identity);
     if (!attached) return foundation::fail(attached.error());
     std::vector<identity::core::ExternalIdentityRef> output;
     output.reserve(attached->size());
@@ -1372,7 +1467,7 @@ foundation::Status AuthenticationService::disconnect(
                                 "Only authentication connections can be disconnected here.");
     }
     const std::lock_guard guard{m_connectionMutex};
-    auto detached = m_identities.detachIfAnotherAuthenticationMethod(
+    auto detached = m_identities->detachIfAnotherAuthenticationMethod(
         external, identity, m_providers.ids());
     if (!detached) return detached;
 
@@ -1471,6 +1566,109 @@ AuthenticationService::consumeBrowserConnectionHandoff(
     auto active = requireActiveIdentity(identity::core::IdentityId{identity->second});
     if (!active) return foundation::fail(active.error());
     return BrowserConnectionTarget{
+        identity::core::IdentityId{identity->second},
+        provider::ProviderId{providerId->second}, returnTarget->second};
+}
+
+boost::asio::awaitable<foundation::Result<BrowserConnectionHandoff>>
+AuthenticationService::issueBrowserConnectionHandoffAsync(
+    identity::core::IdentityId identity,
+    provider::ProviderId providerId,
+    std::string returnTarget,
+    foundation::CorrelationId correlation,
+    provider::InteractionModel expected)
+{
+    if (identity.empty() || providerId.empty() || returnTarget.empty()
+        || returnTarget.size() > 2048U || correlation.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The browser connection handoff is invalid.");
+    }
+    auto* nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical || !m_asyncCanonical->nativeConnectionsEnabled()
+        || !nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto* implementation=m_providers.find(providerId);
+    if (!implementation || implementation->interactionModel()!=expected)
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(identity);
+    if (!active) co_return foundation::fail(active.error());
+    auto generatedId = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto generatedSecret = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    if (!generatedId) co_return foundation::fail(generatedId.error());
+    if (!generatedSecret) co_return foundation::fail(generatedSecret.error());
+
+    provider::TransactionId transactionId{generatedId.value()};
+    foundation::SecretString secret{std::move(generatedSecret).value()};
+    const foundation::Instant now = m_clock.now();
+    const foundation::Duration lifetime =
+        std::min(kBrowserHandoffLifetime, m_maximumTransactionLifetime);
+    auto transaction = provider::AuthenticationTransaction::create(
+        transactionId, provider::ProviderId{std::string{kHandoffProvider}},
+        provider::InteractionModel::Redirect, secret.clone(), provider::BindingDigest{},
+        std::move(correlation), now, lifetime);
+    if (!transaction) co_return foundation::fail(transaction.error());
+    transaction->setMetadata(std::string{kHandoffIdentityMetadata},
+                             std::string{identity.value()});
+    transaction->setMetadata(std::string{kHandoffProviderMetadata},
+                             std::string{providerId.value()});
+    transaction->setMetadata(std::string{kHandoffReturnMetadata},
+                             std::move(returnTarget));
+    auto recorded = co_await nativeTransactions->beginAsync(std::move(transaction).value());
+    if (!recorded) co_return foundation::fail(recorded.error());
+
+    co_return BrowserConnectionHandoff{
+        foundation::SecretString{std::string{transactionId.value()} + "."
+                                 + secret.expose()},
+        now + lifetime};
+}
+
+boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
+AuthenticationService::consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket,
+    provider::InteractionModel expected)
+{
+    const std::string_view presented = ticket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: malformed ticket."));
+    }
+    auto* nativeTransactions =
+        dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical || !m_asyncCanonical->nativeConnectionsEnabled())
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: ticket is unknown, expired, invalid, or already consumed."));
+    }
+    if (consumed->provider().value() != kHandoffProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: transaction purpose mismatch."));
+    }
+    const auto identity = consumed->metadata().find(kHandoffIdentityMetadata);
+    const auto providerId = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto returnTarget = consumed->metadata().find(kHandoffReturnMetadata);
+    if (identity == consumed->metadata().end() || identity->second.empty()
+        || providerId == consumed->metadata().end() || providerId->second.empty()
+        || returnTarget == consumed->metadata().end() || returnTarget->second.empty()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser handoff redemption refused: server-bound state is incomplete."));
+    }
+    if (!nativeProviderAuthenticationEnabled(provider::ProviderId{providerId->second}))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto* implementation=m_providers.find(provider::ProviderId{providerId->second});
+    if (!implementation || implementation->interactionModel()!=expected)
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    auto active = co_await m_asyncCanonical->authorizeConnectionTargetAsync(
+        identity::core::IdentityId{identity->second});
+    if (!active) co_return foundation::fail(active.error());
+    co_return BrowserConnectionTarget{
         identity::core::IdentityId{identity->second},
         provider::ProviderId{providerId->second}, returnTarget->second};
 }
@@ -1701,7 +1899,7 @@ AuthenticationService::redeemBrowserAuthenticationHandoff(
     if (!active) return foundation::fail(active.error());
     identity::core::ExternalIdentityRef external{
         providerId, provider::ExternalSubject{subjectMetadata->second}};
-    auto owner = m_identities.ownerOf(external);
+    auto owner = m_identities->ownerOf(external);
     if (!owner || !owner->has_value() || owner->value() != identity) {
         return foundation::fail(authenticationFailure(
             "Browser authentication handoff redemption refused: identity link changed."));
@@ -1721,6 +1919,270 @@ AuthenticationService::redeemBrowserAuthenticationHandoff(
         foundation::Instant{foundation::Duration{verifiedAtValue}});
     if (!outcome) return foundation::fail(outcome.error());
     return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
+}
+
+boost::asio::awaitable<foundation::Result<BrowserAuthenticationHandoff>>
+AuthenticationService::issueBrowserAuthenticationHandoffAsync(
+    provider::ProviderId providerId,
+    foundation::CorrelationId correlation)
+{
+    if (providerId.empty() || correlation.empty()) {
+        co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                "The browser authentication handoff is invalid.");
+    }
+    auto* implementation = m_providers.find(providerId);
+    if (implementation == nullptr
+        || implementation->interactionModel() != provider::InteractionModel::ChallengeResponse) {
+        co_return foundation::fail(foundation::ErrorCode::NotFound,
+                                "That authentication provider is not available.");
+    }
+
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    if (!nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto publisherIdValue = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto publisherSecretValue = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    auto resultIdValue = security::randomTokenBase64Url(kIdentifierEntropyBytes);
+    auto redeemSecretValue = security::randomTokenBase64Url(kContinuationEntropyBytes);
+    if (!publisherIdValue || !publisherSecretValue || !resultIdValue || !redeemSecretValue) {
+        if (!publisherIdValue) co_return foundation::fail(publisherIdValue.error());
+        if (!publisherSecretValue) co_return foundation::fail(publisherSecretValue.error());
+        if (!resultIdValue) co_return foundation::fail(resultIdValue.error());
+        co_return foundation::fail(redeemSecretValue.error());
+    }
+
+    provider::TransactionId publisherId{publisherIdValue.value()};
+    provider::TransactionId resultId{resultIdValue.value()};
+    foundation::SecretString publisherSecret{std::move(publisherSecretValue).value()};
+    foundation::SecretString redeemSecret{std::move(redeemSecretValue).value()};
+    auto redeemDigest = security::sha256(redeemSecret.expose());
+    if (!redeemDigest) co_return foundation::fail(redeemDigest.error());
+
+    const foundation::Instant now = m_clock.now();
+    const foundation::Duration lifetime =
+        std::min(kBrowserHandoffLifetime, m_maximumTransactionLifetime);
+    auto transaction = provider::AuthenticationTransaction::create(
+        publisherId, provider::ProviderId{std::string{kAuthenticationHandoffProvider}},
+        provider::InteractionModel::Redirect, publisherSecret.clone(),
+        provider::BindingDigest{}, std::move(correlation), now, lifetime);
+    if (!transaction) co_return foundation::fail(transaction.error());
+    transaction->setMetadata(std::string{kHandoffProviderMetadata},
+                             std::string{providerId.value()});
+    transaction->setMetadata(std::string{kAuthenticationHandoffResultIdMetadata},
+                             std::string{resultId.value()});
+    transaction->setMetadata(std::string{kAuthenticationHandoffRedeemDigestMetadata},
+                             digestHex(redeemDigest.value()));
+    auto recorded = co_await nativeTransactions->beginAsync(std::move(transaction).value());
+    if (!recorded) co_return foundation::fail(recorded.error());
+
+    co_return BrowserAuthenticationHandoff{
+        foundation::SecretString{std::string{publisherId.value()} + "."
+                                 + publisherSecret.expose()},
+        foundation::SecretString{std::string{resultId.value()} + "."
+                                 + redeemSecret.expose()},
+        now + lifetime};
+}
+
+boost::asio::awaitable<foundation::Status> AuthenticationService::publishBrowserAuthenticationHandoffAsync(
+    foundation::SecretString publisherTicket,
+    VerifiedAuthentication authentication)
+{
+    if (authentication.outcome().passwordGeneration())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    const std::string_view presented = publisherTicket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: malformed ticket."));
+    }
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) co_return foundation::fail(consumed.error());
+    if (consumed->provider().value() != kAuthenticationHandoffProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: purpose mismatch."));
+    }
+
+    const auto providerMetadata = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto resultIdMetadata =
+        consumed->metadata().find(kAuthenticationHandoffResultIdMetadata);
+    const auto digestMetadata =
+        consumed->metadata().find(kAuthenticationHandoffRedeemDigestMetadata);
+    if (providerMetadata == consumed->metadata().end()
+        || resultIdMetadata == consumed->metadata().end()
+        || digestMetadata == consumed->metadata().end()
+        || providerMetadata->second.empty() || resultIdMetadata->second.empty()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: state is incomplete."));
+    }
+    if (authentication.outcome().provider().value() != providerMetadata->second) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: provider mismatch."));
+    }
+    auto redeemDigest = parseDigestHex(digestMetadata->second);
+    if (!redeemDigest) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff publication refused: invalid redeem digest."));
+    }
+
+    if (authentication.outcome().requiredCanonicalOwner()
+        && *authentication.outcome().requiredCanonicalOwner()!=authentication.identity().value())
+        co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    auto owner=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(
+        authentication.identity(),identity::core::ExternalIdentityRef{
+            authentication.outcome().provider(),authentication.outcome().subject()});
+    if (!owner) co_return foundation::fail(owner.error());
+    const foundation::Instant now = m_clock.now();
+    if (consumed->expiresAt() <= now) {
+        co_return foundation::fail(foundation::ErrorCode::FailedPrecondition,
+                                "This authentication request has expired.");
+    }
+    provider::AttributeMap metadata;
+    metadata.emplace(std::string{kAuthenticationHandoffIdentityMetadata},
+                     std::string{authentication.identity().value()});
+    metadata.emplace(std::string{kHandoffProviderMetadata},
+                     std::string{authentication.outcome().provider().value()});
+    metadata.emplace(std::string{kAuthenticationHandoffSubjectMetadata},
+                     std::string{authentication.outcome().subject().value()});
+    metadata.emplace(std::string{kAuthenticationHandoffAssuranceMetadata},
+                     std::string{provider::assuranceLevelName(
+                         authentication.outcome().claimedAssurance())});
+    metadata.emplace(std::string{kAuthenticationHandoffFactorsMetadata},
+                     std::to_string(static_cast<unsigned int>(
+                         static_cast<std::uint8_t>(
+                             authentication.outcome().strength().factors()))));
+    metadata.emplace(std::string{kAuthenticationHandoffPhishingMetadata},
+                     authentication.outcome().strength().isPhishingResistant()
+                         ? "1" : "0");
+    metadata.emplace(std::string{kAuthenticationHandoffVerifiedAtMetadata},
+                     std::to_string(authentication.outcome().verifiedAt()
+                                        .time_since_epoch().count()));
+
+    auto result = provider::AuthenticationTransaction::restore(
+        provider::TransactionId{resultIdMetadata->second},
+        provider::ProviderId{std::string{kAuthenticationHandoffResultProvider}},
+        provider::InteractionModel::Redirect, *redeemDigest,
+        provider::BindingDigest{}, consumed->correlation(),
+        provider::TransactionState::Pending, now, consumed->expiresAt(),
+        std::move(metadata));
+    if (!result) co_return foundation::fail(result.error());
+    co_return co_await nativeTransactions->beginAsync(std::move(result).value());
+}
+
+boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+AuthenticationService::redeemBrowserAuthenticationHandoffAsync(
+    foundation::SecretString redeemTicket)
+{
+    const std::string_view presented = redeemTicket.expose();
+    const auto separator = presented.find('.');
+    if (separator == std::string_view::npos || separator == 0U
+        || separator + 1U >= presented.size() || presented.size() > 256U
+        || presented.find('.', separator + 1U) != std::string_view::npos) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: malformed ticket."));
+    }
+    auto* nativeTransactions=dynamic_cast<provider::CoroutineAuthenticationTransactionStore*>(&m_transactions);
+    if (!nativeTransactions || !m_asyncCanonical)
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto consumed = co_await nativeTransactions->consumeAsync(
+        provider::TransactionId{std::string{presented.substr(0U, separator)}},
+        foundation::SecretString{std::string{presented.substr(separator + 1U)}},
+        provider::BindingDigest{}, m_clock.now());
+    if (!consumed) co_return foundation::fail(consumed.error());
+    if (consumed->provider().value() != kAuthenticationHandoffResultProvider) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: purpose mismatch."));
+    }
+
+    const auto identityMetadata =
+        consumed->metadata().find(kAuthenticationHandoffIdentityMetadata);
+    const auto providerMetadata = consumed->metadata().find(kHandoffProviderMetadata);
+    const auto subjectMetadata =
+        consumed->metadata().find(kAuthenticationHandoffSubjectMetadata);
+    const auto assuranceMetadata =
+        consumed->metadata().find(kAuthenticationHandoffAssuranceMetadata);
+    const auto factorsMetadata =
+        consumed->metadata().find(kAuthenticationHandoffFactorsMetadata);
+    const auto phishingMetadata =
+        consumed->metadata().find(kAuthenticationHandoffPhishingMetadata);
+    const auto verifiedAtMetadata =
+        consumed->metadata().find(kAuthenticationHandoffVerifiedAtMetadata);
+    if (identityMetadata == consumed->metadata().end()
+        || providerMetadata == consumed->metadata().end()
+        || subjectMetadata == consumed->metadata().end()
+        || assuranceMetadata == consumed->metadata().end()
+        || factorsMetadata == consumed->metadata().end()
+        || phishingMetadata == consumed->metadata().end()
+        || verifiedAtMetadata == consumed->metadata().end()) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: state is incomplete."));
+    }
+
+    const auto assurance = parseAssurance(assuranceMetadata->second);
+    unsigned int factorsValue{};
+    const auto factorsParsed = std::from_chars(
+        factorsMetadata->second.data(),
+        factorsMetadata->second.data() + factorsMetadata->second.size(),
+        factorsValue, 10);
+    std::int64_t verifiedAtValue{};
+    const auto verifiedAtParsed = std::from_chars(
+        verifiedAtMetadata->second.data(),
+        verifiedAtMetadata->second.data() + verifiedAtMetadata->second.size(),
+        verifiedAtValue, 10);
+    if (!assurance
+        || factorsParsed.ec != std::errc{}
+        || factorsParsed.ptr
+            != factorsMetadata->second.data() + factorsMetadata->second.size()
+        || factorsValue > 7U
+        || (phishingMetadata->second != "0" && phishingMetadata->second != "1")
+        || verifiedAtParsed.ec != std::errc{}
+        || verifiedAtParsed.ptr
+            != verifiedAtMetadata->second.data() + verifiedAtMetadata->second.size()
+        || verifiedAtValue < 0) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: result is invalid."));
+    }
+
+    provider::ProviderId providerId{providerMetadata->second};
+    auto* implementation = m_providers.find(providerId);
+    const auto maximum = implementation == nullptr
+        ? std::optional<provider::AssuranceLevel>{}
+        : effectiveMaximum(*implementation, providerId);
+    if (!maximum || !provider::meetsAssurance(*maximum, *assurance)) {
+        co_return foundation::fail(authenticationFailure(
+            "Browser authentication handoff redemption refused: provider trust changed."));
+    }
+
+    identity::core::IdentityId identity{identityMetadata->second};
+    if (!nativeProviderAuthenticationEnabled(providerId))
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto owner=co_await m_asyncCanonical->authorizeHandoffOwnerAsync(identity,
+        identity::core::ExternalIdentityRef{providerId,provider::ExternalSubject{subjectMetadata->second}});
+    if (!owner) co_return foundation::fail(owner.error());
+
+    provider::VerifiedClaims claims;
+    provider::ProviderEvidence evidence;
+    auto outcome = provider::AuthenticationOutcome::create(
+        std::move(providerId),
+        provider::ExternalSubject{subjectMetadata->second},
+        std::move(claims), *assurance,
+        provider::AuthenticationStrength{
+            static_cast<provider::AuthenticationFactor>(
+                static_cast<std::uint8_t>(factorsValue)),
+            phishingMetadata->second == "1"},
+        std::move(evidence),
+        foundation::Instant{foundation::Duration{verifiedAtValue}},std::string{identity.value()});
+    if (!outcome) co_return foundation::fail(outcome.error());
+    co_return VerifiedAuthentication{std::move(outcome).value(), std::move(identity)};
 }
 
 }

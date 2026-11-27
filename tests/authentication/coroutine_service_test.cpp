@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <boost/json.hpp>
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "../../src/authentication/http/coroutine_federated_start_http.hpp"
 #include "../../src/authentication/http/coroutine_federated_callback_http.hpp"
@@ -44,9 +46,11 @@ constexpr fnd::Duration kLifetime{std::chrono::minutes{5}};
 
 class ProofProvider : public idp::AuthenticationProvider {
 public:
-    [[nodiscard]] idp::ProviderId id() const override { return idp::ProviderId{"async-test"}; }
+    [[nodiscard]] idp::ProviderId id() const override { return idp::ProviderId{providerName}; }
+    std::string providerName{"async-test"};
     [[nodiscard]] idp::InteractionModel interactionModel() const noexcept override
-    { return idp::InteractionModel::Redirect; }
+    { return model; }
+    idp::InteractionModel model{idp::InteractionModel::Redirect};
     [[nodiscard]] idp::AssuranceLevel maximumClaimableAssurance() const noexcept override
     { return idp::AssuranceLevel::Ial2; }
     [[nodiscard]] fnd::Result<idp::AuthenticationChallenge>
@@ -68,6 +72,10 @@ public:
 class NativeProofProvider final : public ProofProvider,
                                   public idp::CoroutineAuthenticationProvider {
 public:
+    [[nodiscard]] idp::RedirectProofKind redirectProofKind() const noexcept override
+    { return providerName=="x" ? idp::RedirectProofKind::OAuth1
+        : providerName=="saml" ? idp::RedirectProofKind::SamlAssertion
+                               : idp::RedirectProofKind::AuthorizationCode; }
     [[nodiscard]] asio::awaitable<fnd::Result<idp::AuthenticationChallenge>>
     beginAuthenticationAsync(idp::AuthenticationRequest request) override
     {
@@ -86,19 +94,26 @@ public:
         ++nativeCompleteCalls;
         co_await asio::post(asio::use_awaitable);
         const auto& fields = response.parameters();
+        if (fields.contains("user")) receivedUser=fields.at("user").expose();
         const bool proof = fields.contains("proof");
         const bool oauth2 = fields.contains("code") && fields.contains("state")
             && fields.at("code").expose() == "valid-code"
             && fields.at("state").expose() == "matching-state";
-        if (!proof && !oauth2) {
+        const bool oauth1=providerName=="x" && fields.contains("oauth_token")
+            && fields.contains("oauth_verifier") && fields.at("oauth_token").expose()=="fixture-token"
+            && fields.at("oauth_verifier").expose()=="fixture-verifier";
+        const bool saml=providerName=="saml" && fields.contains("SAMLResponse")
+            && fields.contains("RelayState") && fields.at("SAMLResponse").expose()=="fixture-assertion"
+            && fields.at("RelayState").expose()=="fixture-relay";
+        if (!proof && !oauth2 && !oauth1 && !saml) {
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         }
         co_return idp::AuthenticationOutcome::create(
-            idp::ProviderId{forgedProvider ? "forged" : "async-test"},
+            idp::ProviderId{forgedProvider ? "forged" : providerName},
             idp::ExternalSubject{externalSubject}, idp::VerifiedClaims{},
             idp::AssuranceLevel::Ial2,
             idp::AuthenticationStrength{idp::AuthenticationFactor::Possession, false},
-            idp::ProviderEvidence{}, kNow);
+            idp::ProviderEvidence{}, kNow, requiredOwner);
     }
 
     // Allow a single native provider instance to verify different wallet-like
@@ -106,7 +121,9 @@ public:
     // operator disallows first-time identity creation.
     std::string authorizationUrl{"https://example.test/authorize"};
     std::string externalSubject{"verified-subject"};
+    std::optional<std::string> requiredOwner;
     bool forgedProvider{};
+    std::string receivedUser;
     int nativeBeginCalls{};
     int nativeCompleteCalls{};
 };
@@ -138,6 +155,17 @@ public:
 
     [[nodiscard]] bool nativeConnectionsEnabled() const noexcept override {
         return true;
+    }
+
+    [[nodiscard]] asio::awaitable<fnd::Status>
+    authorizeHandoffOwnerAsync(ids::IdentityId owner,ids::ExternalIdentityRef external) override
+    {
+        co_await asio::post(asio::use_awaitable);
+        auto current=m_directory->ownerOf(external);
+        if (!current) co_return fnd::fail(current.error());
+        if (!current->has_value() || current->value()!=owner)
+            co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return fnd::ok();
     }
 
     [[nodiscard]] asio::awaitable<fnd::Status>
@@ -263,6 +291,88 @@ asio::awaitable<void> successfulFlow(auth::AuthenticationService& service,
         && fixture.coroutineProvider->nativeBeginCalls == 1
         && fixture.coroutineProvider->nativeCompleteCalls == 1
         && fixture.coroutineProvider->syncCalls == 0;
+}
+
+asio::awaitable<void> ownerConstraintFlow(auth::AuthenticationService& service,
+    Fixture& fixture, bool& denied)
+{
+    const auto bound = binding("owner-constraint-client");
+    auto started = co_await service.beginAsync(
+        fixture.request(), bound, fnd::CorrelationId{"native-owner-constraint"});
+    if (!started) co_return;
+    auto result = co_await service.completeAsync(
+        started->transactionId(), started->continuationToken().clone(), bound,
+        proof(std::string{started->challenge().id().value()}));
+    denied = !result && result.error().code() == fnd::ErrorCode::AuthenticationFailed
+        && fixture.nativeCanonical.calls == 1;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, RejectsFinalizerSubstitutionOfCredentialOwner)
+{
+    Fixture fixture;
+    fixture.coroutineProvider->requiredOwner = "previous-credential-owner";
+    auto service = fixture.service();
+    bool denied = false;
+    asio::io_context io;
+    auto future = asio::co_spawn(io, ownerConstraintFlow(service, fixture, denied), asio::use_future);
+    io.run();
+    future.get();
+    EXPECT_TRUE(denied);
+}
+
+asio::awaitable<void> checkNativeWalletHandoff(auth::AuthenticationService& service,
+    Fixture& fixture,bool detachBeforeRedeem,bool& passed)
+{
+    auto ticket=co_await service.issueBrowserAuthenticationHandoffAsync(
+        idp::ProviderId{"async-test"},fnd::CorrelationId{"native-mobile-handoff"});
+    if (!ticket) co_return;
+    EXPECT_NE(ticket->publisherTicket().expose(),ticket->redeemTicket().expose());
+    EXPECT_EQ(ticket->expiresAt(),kNow+std::chrono::minutes{2});
+    auto pending=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    EXPECT_FALSE(pending);
+    const auto bound=binding("native-wallet-browser");
+    auto started=co_await service.beginAsync(fixture.request(),bound,
+        fnd::CorrelationId{"wallet-proof"});
+    if (!started) co_return;
+    auto verified=co_await service.completeAsync(started->transactionId(),
+        started->continuationToken().clone(),bound,
+        proof(std::string{started->challenge().id().value()}));
+    if (!verified) co_return;
+    auto published=co_await service.publishBrowserAuthenticationHandoffAsync(
+        ticket->publisherTicket().clone(),std::move(verified).value());
+    if (!published) co_return;
+    if (detachBeforeRedeem) {
+        const auto detached=fixture.identities.detach(ids::ExternalIdentityRef{
+            idp::ProviderId{"async-test"},idp::ExternalSubject{"verified-subject"}},
+            ids::IdentityId{"canonical-identity"});
+        if (!detached) co_return;
+    }
+    auto redeemed=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    auto replay=co_await service.redeemBrowserAuthenticationHandoffAsync(ticket->redeemTicket().clone());
+    if (detachBeforeRedeem) {
+        passed=!redeemed && redeemed.error().code()==fnd::ErrorCode::AuthenticationFailed && !replay;
+    } else {
+        passed=redeemed && redeemed->identity().value()=="canonical-identity"
+            && redeemed->outcome().requiredCanonicalOwner()==std::optional<std::string>{"canonical-identity"}
+            && !replay;
+    }
+    passed=passed && fixture.coroutineProvider->syncCalls==0;
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeWalletHandoffRedeemsOnceAndRechecksOwner)
+{
+    for (bool detached:{false,true}) {
+        Fixture fixture;
+        fixture.coroutineProvider->model=idp::InteractionModel::ChallengeResponse;
+        auto service=fixture.service();
+        bool passed=false;
+        asio::io_context io;
+        auto done=asio::co_spawn(io,checkNativeWalletHandoff(service,fixture,detached,passed),
+            asio::use_future);
+        io.run();
+        ASSERT_NO_THROW(done.get());
+        EXPECT_TRUE(passed) << "owner detached before redemption: " << detached;
+    }
 }
 
 TEST(TrustedAuthenticationCoroutineTest, VerifiesNativeProofAndConsumesTransactionOnce)
@@ -434,7 +544,7 @@ asio::awaitable<void> wrongPurpose(
         idp::TransactionId{std::string{started->transactionId().value()}},
         started->continuationToken().clone(), bound,
         proof(std::string{started->challenge().id().value()}));
-    denied = !completed && fixture.coroutineProvider->nativeCompleteCalls == 1;
+    denied = !completed && fixture.coroutineProvider->nativeCompleteCalls == 0;
 }
 
 TEST(TrustedAuthenticationCoroutineTest, ConnectionTransactionCannotBecomeLoginSession)
@@ -544,7 +654,7 @@ asio::awaitable<void> loginIsNotConnection(
         idp::TransactionId{std::string{started->transactionId().value()}},
         started->continuationToken().clone(), bound,
         proof(std::string{started->challenge().id().value()}));
-    denied = !connected && fixture.coroutineProvider->nativeCompleteCalls == 1;
+    denied = !connected && fixture.coroutineProvider->nativeCompleteCalls == 0;
 }
 
 TEST(TrustedAuthenticationCoroutineTest, LoginTransactionCannotBecomeConnection)
@@ -933,7 +1043,7 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartUsesNativeProviderNoSyncF
     EXPECT_EQ(response.headers().at("location"), "https://example.test/authorize");
     EXPECT_EQ(response.headers().at("cache-control"), "no-store");
     ASSERT_TRUE(response.headers().contains("set-cookie"));
-    EXPECT_EQ(response.repeatedHeaders().size(), 4U);
+    EXPECT_EQ(response.repeatedHeaders().size(), 5U);
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
@@ -1067,7 +1177,7 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedStartRealHttpLoopbackPreserves
     for (const auto& field : response) {
         if (field.name() == wire::field::set_cookie) ++cookieCount;
     }
-    EXPECT_EQ(cookieCount, 5);
+    EXPECT_EQ(cookieCount, 6);
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls, 1);
     EXPECT_EQ(fixture.coroutineProvider->syncCalls, 0);
     EXPECT_EQ(fallback.syncCalls, 0);
@@ -1113,6 +1223,7 @@ public:
 {
     std::string result;
     const auto append = [&result](std::string_view field) {
+        if (field.find("Max-Age=0")!=std::string_view::npos) return;
         const auto semi = field.find(';');
         if (!result.empty()) result.append("; ");
         result.append(field.substr(0U, semi));
@@ -1206,6 +1317,247 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackConsumesProofAndIssues
     EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls, 1);
 }
 
+TEST(TrustedAuthenticationCoroutineTest, FederatedConnectionHandoffIsSingleUseAndNeverIssuesLogin)
+{
+    namespace gw=openproof::gateway;
+    namespace sess=openproof::session;
+    Fixture fixture;
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{
+        service,fixture.providers,limiter.value(),fallback,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="fixture-session")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return sess::Session::create(sess::SessionId{"link-session"},
+                ids::IdentityId{"canonical-identity"},idp::ProviderId{"local"},
+                idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+                kNow,sess::TokenDigest{binding("fixture-session")},kNow,
+                std::chrono::hours{8},std::chrono::minutes{30});
+        },
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="scoped-fixture")
+                co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+            co_return sess::Session::create(sess::SessionId{"delegated-link-session"},
+                ids::IdentityId{"canonical-identity"},idp::ProviderId{"local"},
+                idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+                kNow,sess::TokenDigest{binding("scoped-fixture")},kNow,
+                std::chrono::hours{8},std::chrono::minutes{30});
+        }};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,fallback};
+    const auto bearerStart=[&](std::string authHeader) {
+        return invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Get,
+            "/account/connections/start?provider=async-test&return_to=%2Faccount",
+            {{"authorization",std::move(authHeader)}},{},"127.0.0.1",
+            fnd::CorrelationId{"scoped-handoff"}).value());
+    };
+    EXPECT_EQ(bearerStart("Bearer no-scope-fixture").status(),403);
+    EXPECT_EQ(bearerStart("DPoP scoped-fixture").status(),401);
+    const auto bearerTicket=bearerStart("Bearer scoped-fixture");
+    ASSERT_EQ(bearerTicket.status(),302);
+    EXPECT_TRUE(bearerTicket.headers().at("location").starts_with("/account/connections/handoff?ticket="));
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
+    const auto bearerPost=invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
+        "/account/connections/handoff",{{"authorization","Bearer scoped-fixture"},{"content-type","application/json"}},
+        R"({"provider":"async-test","return_to":"/account"})","127.0.0.1",fnd::CorrelationId{"scoped-handoff-post"}).value());
+    EXPECT_EQ(bearerPost.status(),201);
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
+    EXPECT_EQ(invokeFederated(start,makeFederatedStart("/account/connections/complete")).status(),204);
+    auto issue=[&](std::string token){
+        return invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
+            "/account/connections/handoff",
+            {{"cookie","__Host-openproof-session="+std::move(token)},{"content-type","application/json"}},
+            R"({"provider":"async-test","return_to":"/account"})",
+            "127.0.0.1",fnd::CorrelationId{"handoff-test"}).value());
+    };
+    EXPECT_EQ(issue("wrong").status(),401);
+    const auto ticket=issue("fixture-session");
+    ASSERT_EQ(ticket.status(),201);
+    const auto handoff=boost::json::parse(ticket.body()).as_object().at("handoff_url").as_string();
+    const std::string target{handoff.data(),handoff.size()};
+    ASSERT_TRUE(target.starts_with("/account/connections/handoff?ticket="));
+    const auto linked=invokeFederated(start,makeFederatedStart(target));
+    ASSERT_EQ(linked.status(),302);
+    const auto cookies=federatedCookies(linked);
+    ASSERT_NE(cookies.find("__Host-openproof-federation-mode=link"),std::string::npos);
+    EXPECT_GE(invokeFederated(start,makeFederatedStart(target)).status(),400);
+    const auto completed=invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",cookies));
+    EXPECT_EQ(completed.status(),302);
+    EXPECT_EQ(completed.headers().at("location"),"/account");
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(federatedCookies(completed).find("__Host-openproof-session="),std::string::npos);
+    const auto replay=invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",cookies));
+    EXPECT_EQ(replay.status(),302);
+    EXPECT_NE(replay.headers().at("location").find("op_error="),std::string::npos);
+    EXPECT_EQ(issuer.calls,0);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,1);
+    EXPECT_EQ(fixture.coroutineProvider->syncCalls,0);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeOAuth1CallbackBindsRegisteredProviderAndConsumesOnce)
+{
+    Fixture fixture;
+    auto x=std::make_unique<NativeProofProvider>();
+    x->providerName="x";
+    auto* nativeX=x.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(x)));
+    ASSERT_TRUE(fixture.policy.trust(idp::ProviderId{"x"},idp::AssuranceLevel::Ial2));
+    auto link=ids::IdentityLink::request(ids::IdentityId{"canonical-identity"},
+        ids::ExternalIdentityRef{idp::ProviderId{"x"},idp::ExternalSubject{"verified-subject"}},
+        kNow,kLifetime);
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(fixture.identities.attach(link.value()));
+    auto service=fixture.service();
+    auto limiter=openproof::gateway::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,fallback};
+    const auto begin=[&](std::string provider){
+        return invokeFederated(start,makeFederatedStart("/auth/federated/start?provider="+provider));
+    };
+    const auto target="/auth/federated/callback?oauth_token=fixture-token&oauth_verifier=fixture-verifier";
+    auto wrong=begin("async-test");
+    ASSERT_EQ(wrong.status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,federatedCookies(wrong))).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    auto wrongShape=begin("x");
+    ASSERT_EQ(wrongShape.status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?code=valid-code&state=matching-state",federatedCookies(wrongShape))).status(),400);
+    EXPECT_EQ(nativeX->nativeCompleteCalls,0);
+    auto started=begin("x");
+    ASSERT_EQ(started.status(),302);
+    auto cookies=federatedCookies(started);
+    EXPECT_EQ(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),302);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(target,cookies)).status(),400);
+    EXPECT_EQ(nativeX->nativeCompleteCalls,1);
+    EXPECT_EQ(nativeX->syncCalls,0);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeSamlPostIsBoundToItsTransactionProvider)
+{
+    namespace gw=openproof::gateway;
+    Fixture fixture;
+    auto saml=std::make_unique<NativeProofProvider>();
+    saml->providerName="saml";
+    auto* nativeSaml=saml.get();
+    ASSERT_TRUE(fixture.providers.registerProvider(std::move(saml)));
+    ASSERT_TRUE(fixture.policy.trust(idp::ProviderId{"saml"},idp::AssuranceLevel::Ial2));
+    auto link=ids::IdentityLink::request(ids::IdentityId{"canonical-identity"},
+        ids::ExternalIdentityRef{idp::ProviderId{"saml"},idp::ExternalSubject{"verified-subject"}},
+        kNow,kLifetime);
+    ASSERT_TRUE(link);
+    ASSERT_TRUE(link->requireVerification(kNow));
+    ASSERT_TRUE(link->markVerified(kNow));
+    ASSERT_TRUE(link->complete(kNow));
+    ASSERT_TRUE(fixture.identities.attach(link.value()));
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,start};
+    const auto begin=[&](std::string provider){
+        return invokeFederated(start,makeFederatedStart("/auth/federated/start?provider="+provider));
+    };
+    const auto post=[](std::string body,std::string cookies){
+        return gw::HttpRequest::create(gw::HttpMethod::Post,"/auth/federated/callback",
+            {{"cookie",std::move(cookies)},{"content-type","application/x-www-form-urlencoded"}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"native-saml-post"}).value();
+    };
+    const std::string proof="SAMLResponse=fixture-assertion&RelayState=fixture-relay";
+    auto wrong=begin("async-test");
+    ASSERT_EQ(wrong.status(),302);
+    EXPECT_GE(invokeCallback(callback,post(proof,federatedCookies(wrong))).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    auto wrongShape=begin("saml");
+    ASSERT_EQ(wrongShape.status(),302);
+    EXPECT_GE(invokeCallback(callback,post("code=valid-code&state=matching-state",
+        federatedCookies(wrongShape))).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,0);
+    auto started=begin("saml");
+    ASSERT_EQ(started.status(),302);
+    const auto cookies=federatedCookies(started);
+    EXPECT_GE(invokeCallback(callback,makeFederatedCallback(
+        "/auth/federated/callback?"+proof,cookies)).status(),400);
+    EXPECT_GE(invokeCallback(callback,post(proof+"&code=ambiguous",cookies)).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,0);
+    EXPECT_EQ(invokeCallback(callback,post(proof,cookies)).status(),302);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies)).status(),400);
+    EXPECT_EQ(nativeSaml->nativeCompleteCalls,1);
+    EXPECT_EQ(nativeSaml->syncCalls,0);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
+TEST(TrustedAuthenticationCoroutineTest, NativeFormPostCallbackPreservesUserAndRejectsAmbiguousProof)
+{
+    namespace gw=openproof::gateway;
+    Fixture fixture;
+    auto service=fixture.service();
+    auto limiter=gw::TokenBucketRateLimiter::create(fixture.clock,100.0,100.0,100U);
+    ASSERT_TRUE(limiter);
+    FederatedNoFallback fallback;
+    auth::http::CoroutineFederatedStartAdapter start{service,fixture.providers,limiter.value(),fallback};
+    FederatedNativeSessionIssuer issuer;
+    auth::http::CoroutineFederatedCallbackAdapter callback{service,issuer,start};
+    const auto begin=[&] {
+        return invokeFederated(start,makeFederatedStart(
+            "/auth/federated/start?provider=async-test&return_to=%2Faccount"));
+    };
+    const auto post=[](std::string body,std::string cookies,
+                       std::string type="application/x-www-form-urlencoded",
+                       std::string target="/auth/federated/callback") {
+        return gw::HttpRequest::create(gw::HttpMethod::Post,std::move(target),
+            {{"cookie",std::move(cookies)},{"content-type",std::move(type)}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"native-form-post"}).value();
+    };
+    auto started=begin();
+    ASSERT_EQ(started.status(),302);
+    const auto cookies=federatedCookies(started);
+    const std::string proof="code=valid-code&state=matching-state&user=%7B%22name%22%3A%22Ada%22%7D";
+    for (const auto& invalid:std::vector<std::string>{
+        "code=valid-code&state=matching-state&state=duplicate",
+        "oauth_token=fixture-token&oauth_verifier=fixture-verifier",
+        "code=valid-code&state=%00",
+        "code=valid-code&state=matching-state&SAMLResponse=ambiguous",
+        "code=valid-code&state=matching-state&user="+std::string(17U*1024U,'x')}) {
+        EXPECT_GE(invokeCallback(callback,post(invalid,cookies)).status(),400);
+    }
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies,
+        "application/x-www-form-urlencoded-invalid")).status(),400);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies,"application/x-www-form-urlencoded",
+        "/auth/federated/callback?code=second&state=second")).status(),400);
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,0);
+    EXPECT_EQ(issuer.calls,0);
+    auto accepted=invokeCallback(callback,post(proof,cookies,
+        "application/x-www-form-urlencoded; charset=UTF-8","/auth/federated/callback?provider=ignored"));
+    EXPECT_EQ(accepted.status(),302);
+    EXPECT_EQ(accepted.headers().at("location"),"/account");
+    EXPECT_EQ(fixture.coroutineProvider->receivedUser,R"({"name":"Ada"})");
+    EXPECT_EQ(fixture.coroutineProvider->nativeCompleteCalls,1);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_GE(invokeCallback(callback,post(proof,cookies)).status(),400);
+    EXPECT_EQ(issuer.calls,1);
+    EXPECT_EQ(fallback.syncCalls,0);
+}
+
 TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMissingState)
 {
     Fixture fixture;
@@ -1221,6 +1573,10 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRejectsMalformedAndMis
         "/auth/federated/callback?code=valid-code&state=matching-state",
         "/auth/federated/callback?code=valid-code&code=again&state=matching-state",
         "/auth/federated/callback?code=valid-code&state=matching-state&oauth_token=ambiguous",
+        "/auth/federated/callback?oauth_token=only",
+        "/auth/federated/callback?oauth_verifier=only",
+        "/auth/federated/callback?oauth_token=a&oauth_verifier=b&code=c",
+        "/auth/federated/callback?oauth_token=a&oauth_verifier=%00",
         "/auth/federated/callback?code=valid-code&state=matching-state&SAMLResponse=ambiguous",
         "/auth/federated/callback?code=valid-code&state=%ZZ",
         "/auth/federated/callback?code=valid-code"}) {
@@ -1291,10 +1647,11 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedCallbackRealHttpLoopbackIssues
         ++count;
         const std::string value{
             field.value().data(), field.value().size()};
+        if (value.find("Max-Age=0")!=std::string::npos) continue;
         if (!cookies.empty()) cookies.append("; ");
         cookies.append(value.substr(0U, value.find(';')));
     }
-    EXPECT_EQ(count, 5U);
+    EXPECT_EQ(count, 6U);
     ASSERT_FALSE(cookies.empty());
 
     auto finished = exchange(

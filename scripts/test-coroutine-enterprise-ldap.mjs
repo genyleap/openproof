@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Legacy LDAP socket operations are retired. A native Asio LDAPS service
-// remains, but LDAP enterprise HTTP runtime integration is a release blocker.
+// is the default for configured directories; full release acceptance remains required.
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
@@ -43,12 +43,13 @@ test("native LDAP still awaits certificate-verified bounded Asio DNS TCP TLS BER
   assert.doesNotMatch(native,/\bldap_\w+\s*\(/);
 });
 
-test("native LDAP runtime has a separate, explicitly gated transactional stack",()=>{
+test("configured native LDAP runtime has a separate, fail-closed transactional stack",()=>{
   assert.match(enterpriseHttp,/co_await\s+m_authentication->beginAsync\s*\(/);
   assert.match(enterpriseHttp,/co_await\s+m_authentication->completeAsync\s*\(/);
   assert.match(enterpriseHttp,/co_await\s+m_asyncSessions->issueReplacingAsync\s*\(/);
   assert.match(app,/environment\.get\("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP"\)/);
-  assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/);
+  assert.match(app,/const\s+auto\s+ldapUri\s*=\s*environment\.get\("OPENPROOF_LDAP_URI"\)/);
+  assert.match(app,/const\s+bool\s+nativeLdapEnabled\s*=\s*nativeLdapFlag\s*\?\s*\*nativeLdapFlag\s*==\s*"1"\s*:\s*ldapUri\s*&&\s*!ldapUri->empty\(\)\s*;/);
   assert.match(app,/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*!=\s*"0"/);
   assert.match(app,/if\s*\(nativeLdapEnabled\)\s*\{/);
   assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresAuthenticationTransactionStore>/);
@@ -56,12 +57,13 @@ test("native LDAP runtime has a separate, explicitly gated transactional stack",
   assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/);
   assert.match(app,/std::make_unique<\s*postgres::CoroutinePostgresSessionService>/);
   assert.match(app,/std::make_unique<auth::AuthenticationService>/);
-  assert.match(app,/nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/);
-  assert.match(app,/fallback, nativeSessions\.get\(\)/);
+  assert.match(app,/localEnterpriseApi\{\s*\*nativeAuthentication,limiter\.value\(\),nativeLocalApi,\*nativeSessions\}/);
+  assert.doesNotMatch(app,/\bpostgres::PostgresSessionRepository sessionRepository\{/);
+  assert.doesNotMatch(app,/\bauth::AuthenticationService authentication\{/);
   assert.match(app,/auto nativeTrust = trust;/);
-  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
+  assert.match(app,/if\s*\(nativeLdapEnabled\s*\|\|\s*nativeAccountEnabled\s*\|\|\s*nativeWeb3Enabled\s*\|\|\s*nativeAuthSessionEnabled\s*\|\|\s*nativeFederatedStartEnabled\s*\|\|\s*nativeProtectedGatewayEnabled\s*\|\|\s*nativeLocalEnabled\)\s*nativeSessionSecret\.emplace\(sessionSecret->clone\(\)\)/);
   const nativeIo = app.indexOf("nativeIo = std::make_unique<boost::asio::thread_pool>");
-  const nativeAuth = app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled) {", nativeIo);
+  const nativeAuth = app.indexOf("if (nativeLdapEnabled || nativeWeb3Enabled || nativeFederatedStartEnabled || nativeLocalEnabled) {", nativeIo);
   const sessionPool = app.indexOf("nativeSessionRepository = std::make_unique<", nativeIo);
   const transactionPool = app.indexOf("nativeTransactions = std::make_unique<", nativeIo);
   assert.ok(nativeIo>=0 && sessionPool>nativeIo && nativeAuth>sessionPool
@@ -71,7 +73,7 @@ test("native LDAP runtime has a separate, explicitly gated transactional stack",
   const server = app.slice(app.indexOf("[[nodiscard]] ExitCode runGatewayServer("));
   assert.ok(server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP") >= 0
        && server.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_LDAP")
-          < server.indexOf("postgres::Migrator migrator{*pool.value()}"),
+          < server.indexOf("postgres::nativeDatabasePreflight("),
     "invalid native flags must fail before any schema migration");
   assert.match(app,/!platform\.auth\(\)\.enabled\(\)\s*\|\|\s*!ldapUri/);
   assert.match(gate,/LDAP native HTTP login not connected to runtime transaction\/canonical\/session stack/);

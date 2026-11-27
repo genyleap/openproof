@@ -54,10 +54,9 @@ CoroutineRecoveryCodeHttpAdapter::CoroutineRecoveryCodeHttpAdapter(
     gateway::http::CoroutineHttpHandler& fallback,
     gateway::TokenBucketRateLimiter& rateLimiter,
     credentials::CoroutineRecoveryCodeService& recoveryCodes,
-    Authenticate authenticate, Eligible eligible)
+    Authenticate authenticate)
     : m_nativeFallback(&fallback), m_rateLimiter(&rateLimiter),
-      m_recoveryCodes(&recoveryCodes), m_authenticate(std::move(authenticate)),
-      m_eligible(std::move(eligible))
+      m_recoveryCodes(&recoveryCodes), m_authenticate(std::move(authenticate))
 {
 }
 
@@ -66,8 +65,7 @@ bool CoroutineRecoveryCodeHttpAdapter::nativeEnabledFor(
 {
     if (request.path() == "/auth/recovery-codes") {
         return isRecoveryRoute(request)
-            && static_cast<bool>(m_authenticate)
-            && static_cast<bool>(m_eligible);
+            && static_cast<bool>(m_authenticate);
     }
     return m_nativeFallback->nativeEnabledFor(request);
 }
@@ -140,27 +138,10 @@ CoroutineRecoveryCodeHttpAdapter::issue(gateway::HttpRequest request)
         co_return fail(foundation::Error{
             foundation::ErrorCode::AssuranceInsufficient}, request);
     }
-    auto eligible = co_await m_eligible(authenticated->identity());
-    if (!eligible) co_return fail(eligible.error(), request);
-    if (!eligible.value()) {
-        co_return fail(foundation::Error{
-            foundation::ErrorCode::FailedPrecondition}, request);
-    }
-
-    auto issued = co_await m_recoveryCodes->issue(authenticated->identity(), 10U);
+    // Eligibility and batch replacement share an exact generation fence.
+    // A stale request must never revoke a newer batch as compensation.
+    auto issued = co_await m_recoveryCodes->issueFenced(authenticated->identity(), 10U);
     if (!issued) co_return fail(issued.error(), request);
-
-    // Same final safety check as the legacy HTTP API. If TOTP eligibility
-    // disappears while the code batch is persisted, invalidate all codes
-    // before returning ANY plaintext to the client.
-    auto stillEligible = co_await m_eligible(authenticated->identity());
-    if (!stillEligible || !stillEligible.value()) {
-        auto revoked = co_await m_recoveryCodes->revoke(authenticated->identity());
-        if (!revoked) co_return fail(revoked.error(), request);
-        if (!stillEligible) co_return fail(stillEligible.error(), request);
-        co_return fail(foundation::Error{
-            foundation::ErrorCode::FailedPrecondition}, request);
-    }
 
     json::array codes;
     codes.reserve(issued->size());

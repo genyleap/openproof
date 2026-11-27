@@ -11,10 +11,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Preserve an in-flight full benchmark/E2E on the experimental branch;
-  # otherwise each small follow-up commit cancels its only complete data set.
+  # Preserve a running full build/benchmark on the consolidated migration PR.
+  # A newer head still needs its own successful run; don't discard the only
+  # completed diagnostic data set whenever another migration patch lands.
   # Mainline and ordinary PRs still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' && github.head_ref != 'integration/native-runtime-schema-20261126' && github.ref != 'refs/heads/integration/native-runtime-schema-20261126' }}
 
 jobs:
   static:
@@ -22,6 +23,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install lint tools
         run: sudo apt-get update -qq && sudo apt-get install -y shellcheck python3
       - name: Shellcheck
@@ -32,6 +35,8 @@ jobs:
             scripts/backup-postgres.sh scripts/restore-postgres.sh
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
+      - name: Pinned release schema checksum inventory
+        run: python3 scripts/inventory-release-schema.py --check
       - name: CSPRNG temporary entropy and zeroization regression
         run: node scripts/test-security-random-wipe.mjs
       - name: OpenAPI coverage
@@ -47,6 +52,8 @@ jobs:
           npm audit --audit-level=moderate
           npm run check
           npm test
+      - name: Development bundle provenance and isolation regressions
+        run: python3 -B scripts/ci/test-development-bundle.py
       - name: Sanitized disposable E2E startup diagnostics
         run: node --test scripts/test-e2e-startup-diagnostics.mjs
       - name: Native account profile tenant and capability contract
@@ -55,15 +62,57 @@ jobs:
           node scripts/test-coroutine-account-profile-contract.mjs
           node scripts/test-coroutine-account-connections-contract.mjs
           node scripts/test-coroutine-account-totp-status-contract.mjs
+          node scripts/test-native-admin-members-contract.mjs
+          node scripts/test-coroutine-admin-authorization.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Native gateway transport retirement contract
+        run: |
+          node scripts/test-gateway-translation-unit-split.mjs
+          node scripts/test-native-gateway-tls-completion.mjs
+      - name: Mandatory native account credential lifecycle contract
+        run: |
+          node scripts/test-coroutine-native-contact-runtime.mjs
+          node scripts/test-coroutine-native-signup-foundation.mjs
+          node scripts/test-coroutine-account-session-http-contract.mjs
+          node scripts/test-coroutine-native-auth-secret-scrub.mjs
+          node scripts/test-native-http-credential-erasure.mjs
+          node scripts/test-coroutine-provider-transports.mjs
+      - name: Native OAuth token read contract
+        run: |
+          node scripts/test-coroutine-native-oauth-token-read.mjs
+          node scripts/test-coroutine-native-health-runtime.mjs
+          node scripts/test-coroutine-native-application-read.mjs
+          node scripts/test-coroutine-native-passkey-account.mjs
+          node scripts/test-coroutine-native-scim-read.mjs
+          node scripts/test-coroutine-native-evidence-runtime.mjs
+      - name: Mandatory native public discovery and provider catalog contract
+        run: |
+          node scripts/test-coroutine-native-oidc-discovery-runtime.mjs
+          node scripts/test-coroutine-native-provider-catalog-runtime.mjs
       - name: Native LDAP disposable fixture and transport contract
         run: |
           node scripts/test-native-enterprise-ldaps.mjs
+          node scripts/test-coroutine-enterprise-ldap.mjs
           node scripts/test-native-ldap-real-e2e-contract.mjs
       - name: Whitespace
         run: git diff --check
       - name: End-to-end coroutine coverage gate
         run: node scripts/verify-coroutine-coverage.mjs
+
+  schema-baseline:
+    name: Disposable schema baseline round-trip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 16 tools
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+      - name: Verify release artifact inventory matching
+        run: python3 scripts/test-verify-migration-artifacts.py
+      - name: Verify baseline migration admission
+        run: python3 scripts/test-verify-schema-baseline.py
+      - name: Verify disposable baseline reconstruction
+        run: python3 scripts/verify-schema-baseline.py
 
   ldap-fixture:
     name: Real LDAPS fixture preflight
@@ -123,7 +172,8 @@ jobs:
           # This is a disposable CI runner; never run migrations or seed
           # records against a shared staging or production database.
           sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
-          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests --parallel 2
+          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_native_only_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_postgres_native_only_tests
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
           ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
 
@@ -141,6 +191,12 @@ jobs:
         run: |
           cmake --build --preset gcc-release --target openproof_account_coroutine_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
+          cmake --build --preset gcc-release --target openproof_admin_coroutine_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_admin_coroutine_http_tests
+          cmake --build --preset gcc-release --target openproof_admin_lifecycle_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_admin_lifecycle_http_tests
+          cmake --build --preset gcc-release --target openproof_native_health_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_native_health_tests
 
       # A dedicated Unix-socket PostgreSQL instance, created and destroyed
       # by the checked-in guard script, validates the new connection SQL
@@ -152,7 +208,18 @@ jobs:
           bash scripts/run-disposable-postgres-canonical-tests.sh
 
       - name: Build opp executable
-        run: cmake --build --preset gcc-release --target opp --parallel 2
+        # Keep compiling independent translation units after the first error
+        # so the next migration fix can address every reported blocker.
+        # Ninja still exits nonzero if any compilation or link fails.
+        run: cmake --build --preset gcc-release --target opp --parallel 2 -- -k 0
+
+      - name: Verify executable has no blocking PostgreSQL symbols
+        run: |
+          nm -C ./cmake-build-gcc-release/apps/opp/opp > "${RUNNER_TEMP}/opp-symbols.txt"
+          if grep -E '(^|[[:space:]])(PQexec(Params)?|PQconnectdb(Params)?|PQreset)(@[^[:space:]]+)?$|openproof::storage::postgres::(ConnectionPool|PostgresAdministrationRepository|PostgresCredentialRekeyer|PostgresMasterKeyRotator)::' "${RUNNER_TEMP}/opp-symbols.txt"; then
+            echo "Blocking PostgreSQL implementation linked into opp"
+            exit 1
+          fi
 
       # Run the ordinary identity-platform HTTP scenarios over real native
       # PostgreSQL profile reads, with a separate disposable database. Keep
@@ -167,7 +234,9 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_profile_e2e_ci
@@ -185,7 +254,9 @@ jobs:
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS: "1"
           OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_connections_e2e_ci
@@ -197,6 +268,10 @@ jobs:
           OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_ldap_e2e_ci
           OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
           OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS: "1"
+          OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_native_ldap_e2e_ci
           node scripts/e2e-identity-platform.mjs
@@ -226,10 +301,28 @@ jobs:
           retention-days: 14
 
       - name: Build
-        run: cmake --build --preset gcc-release --parallel 2
+        run: cmake --build --preset gcc-release --parallel 2 -- -k 0
+
+      - name: Destructive PostgreSQL integration in private socket fixture
+        timeout-minutes: 15
+        run: bash scripts/run-disposable-postgres-integration-tests.sh
 
       - name: Test
-        run: ctest --preset gcc-release --output-on-failure
+        run: ctest --preset gcc-release --output-on-failure -E '^PostgresIntegrationTest\.'
+
+      - name: Consolidated fresh schema and legacy-ledger integration
+        env:
+          OPENPROOF_TEST_BASELINE_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_baseline_ci
+          OPENPROOF_TEST_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture
+          OPENPROOF_TEST_BASELINE_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_baseline_ci
+          cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
+            --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
+          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent'
+          bash scripts/run-disposable-postgres-integration-tests.sh
+
 
       # Paired comparison is deliberately gated on the *full* test suite.
       # The candidate and pinned mainline baseline run on the same runner,
@@ -298,3 +391,31 @@ jobs:
           ./packaging/build-bundle.sh cmake-build-gcc-release dist amd64
           dpkg-deb --info dist/openproof_*_amd64.deb
           tar -tzf dist/openproof_*_linux_amd64.tar.gz | grep -q './opt/openproof/bin/opp.real'
+
+      - name: Build and verify opt-in schema baseline packages
+        env:
+          OPENPROOF_SCHEMA_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-baseline-fixture/baseline
+        run: |
+          mkdir -p dist-baseline
+          ./packaging/build-deb.sh cmake-build-gcc-release dist-baseline amd64
+          ./packaging/build-bundle.sh cmake-build-gcc-release dist-baseline amd64
+          python3 scripts/verify-migration-artifacts.py --source migrations \
+            --baseline-directory "$OPENPROOF_SCHEMA_BASELINE_DIRECTORY" \
+            --deb dist-baseline/openproof_*_amd64.deb \
+            --bundle dist-baseline/openproof_*_linux_amd64.tar.gz
+
+      # A downloadable development candidate, not a published release.
+      # Preserve the tested runtime library closure rather than a bare ELF.
+      - name: Record verified development bundle provenance
+        run: |
+          python3 scripts/ci/development-bundle.py record dist/openproof_*_linux_amd64.tar.gz
+      - name: Preserve verified development bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-tested-development-bundle
+          path: |
+            dist/openproof_*_linux_amd64.tar.gz
+            dist/development-bundle.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

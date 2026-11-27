@@ -157,6 +157,33 @@ struct RegistrationStart final {
     std::string publicKeyOptionsJson;
 };
 
+// Public metadata only; the administrative account listing never reads key coordinates.
+struct CredentialSummary final {
+    std::string credentialId;
+    std::uint32_t signCount{};
+    foundation::Instant createdAt{};
+    foundation::Instant lastUsedAt{};
+};
+
+[[nodiscard]] foundation::Result<RegistrationStart> registrationOptions(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const identity::provider::ChallengeId& ceremony,
+    const std::vector<std::string>& excludedCredentialIds);
+
+// Shared, storage-independent WebAuthn assertion verifier. The caller must
+// compare-and-update the counter against the exact verified credential.
+[[nodiscard]] foundation::Result<std::uint32_t> verifyAssertionProof(
+    const PasskeyConfig& config,const identity::provider::ChallengeId& ceremony,
+    const AssertionResponse& response,const PasskeyCredential& credential);
+[[nodiscard]] foundation::Result<identity::provider::AuthenticationChallenge>
+assertionOptions(const PasskeyConfig& config,foundation::Instant now);
+
+// Pure verification shared by the native and compatibility registration paths.
+[[nodiscard]] foundation::Result<PasskeyCredential> verifyRegistration(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const identity::provider::ChallengeId& ceremony,const RegistrationResponse& response,
+    foundation::Instant now);
+
 /** @brief Authenticated self-service WebAuthn registration/removal service. */
 class PasskeyService final {
 public:

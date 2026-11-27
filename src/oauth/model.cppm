@@ -160,6 +160,44 @@ private:
     std::shared_ptr<const StateData> m_data;
 };
 
+// Committed native authorization-code exchange result. Raw access and
+// refresh credentials stay with the HTTP caller; persistence sees digests.
+enum class NativeAuthorizationDecision { ExistingConsent, Approve, Deny };
+struct NativeAuthorizationResult final {
+    AuthorizationRequest request;
+    std::string clientName;
+    bool consentRequired;
+    std::optional<foundation::SecretString> signedResponse;
+};
+
+struct NativeJarAuthorization final {
+    AuthorizationRequest request;
+    std::string jwtId;
+    foundation::Instant issuedAt,expiresAt;
+};
+
+struct NativeDeviceApproval final {
+    std::string clientName;
+    std::optional<std::string> resource;
+    std::vector<std::string> scopes;
+};
+
+enum class NativeDevicePollState { Pending, SlowDown, Denied, Expired, Issued };
+struct NativeDevicePollResult final {
+    NativeDevicePollState state;
+    std::vector<std::string> scopes;
+};
+
+struct NativeMachineGrantResult final {
+    std::vector<std::string> scopes;
+    foundation::Duration expiresIn;
+};
+
+struct NativeCodeExchangeResult final {
+    std::vector<std::string> scopes;
+    std::optional<foundation::SecretString> idToken;
+};
+
 class AuthorizationGrant final {
 public:
     ~AuthorizationGrant();

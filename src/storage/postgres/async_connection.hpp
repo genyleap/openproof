@@ -19,6 +19,7 @@ namespace openproof::storage::postgres::async_detail {
 struct QueryRows final {
     // SQL NULL is semantically distinct from an empty string.
     std::vector<std::vector<std::optional<std::string>>> rows;
+    std::string commandTag;
 };
 
 class AsyncConnection final {
@@ -43,7 +44,14 @@ public:
         std::string sql, std::vector<std::optional<std::string>> params,
         std::chrono::milliseconds timeout);
 
+    // Startup-only trusted migration artifacts. Request data must always use
+    // the single-statement parameterized query API above. The caller must
+    // own an open transaction and check the final COMMIT command tag.
+    boost::asio::awaitable<void> executeMigrationScript(
+        std::string sql,std::chrono::milliseconds timeout);
+
     [[nodiscard]] bool healthy() const noexcept;
+    [[nodiscard]] bool inTransaction() const noexcept;
 
     // Pool admission must require an idle transaction boundary, not merely
     // CONNECTION_OK. No caller may share the same lease concurrently.
@@ -55,7 +63,7 @@ private:
         std::string connectionString, std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<QueryRows> querySerialized(
         std::string sql, std::vector<std::optional<std::string>> params,
-        std::chrono::steady_clock::time_point deadline);
+        std::chrono::steady_clock::time_point deadline,bool migrationScript=false);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

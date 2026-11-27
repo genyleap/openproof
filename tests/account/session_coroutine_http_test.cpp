@@ -56,7 +56,9 @@ public:
     [[nodiscard]] bool nativeEnabledFor(
         const gw::HttpRequest& request) const noexcept override
     {
-        return request.path() == "/other/api";
+        return request.path() == "/other/api"
+            || (request.method()==gw::HttpMethod::Post
+                && request.path()=="/account/connections/web3/start");
     }
     gw::HttpResponse handle(gw::HttpRequest) override
     {
@@ -122,7 +124,11 @@ asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
 struct Fixture final {
     explicit Fixture(bool profileEnabled = false,
                      bool connectionsEnabled = false,
-                     bool totpStatusEnabled = false)
+                     bool totpStatusEnabled = false,
+                     bool passwordStatusEnabled = false,
+                     bool passwordConfirmEnabled = false,
+                     bool profileWriteEnabled = false,
+                     bool scopedBearerReads = false, bool disconnectEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -219,7 +225,69 @@ struct Fixture final {
                               totpForeign ? core::IdentityId{"identity-foreign"} : owner,
                               totpEnabled};
                       }}
-                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{})
+                  : http::CoroutineAccountSessionAdapter::ReadTotpStatus{},
+              passwordStatusEnabled
+                  ? http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{
+                      [this](core::IdentityId owner) -> asio::awaitable<
+                          fnd::Result<http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus>> {
+                          ++passwordStatusCalls;
+                          if (passwordStatusMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return http::CoroutineAccountSessionAdapter::PasswordUpgradeStatus{
+                              passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              passwordStatus};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ReadPasswordUpgradeStatus{},
+              passwordConfirmEnabled
+                  ? http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{
+                      [this](core::IdentityId owner, fnd::SecretString password) -> asio::awaitable<
+                          fnd::Result<std::pair<core::IdentityId,bool>>> {
+                          ++passwordConfirmCalls;
+                          if (password.expose()!="fixture-password")
+                              co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                          co_return std::pair<core::IdentityId,bool>{
+                              passwordStatusForeign ? core::IdentityId{"identity-foreign"} : owner,true};
+                      }}
+                  : http::CoroutineAccountSessionAdapter::ConfirmPasswordUpgrade{},
+              profileWriteEnabled
+                  ? http::CoroutineAccountSessionAdapter::UpdateProfile{
+                      [this](core::IdentityId owner,http::CoroutineAccountSessionAdapter::ProfileUpdate change)
+                          -> asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+                          ++profileWriteCalls;
+                          if (profileMissing) co_return fnd::fail(fnd::ErrorCode::NotFound);
+                          co_return profile::IdentityProfile::restore(
+                              profileForeign ? core::IdentityId{"identity-foreign"} : owner,
+                              std::move(change.displayName),std::move(change.username),
+                              std::optional<std::string>{"verified@example.invalid"},true,
+                              std::nullopt,false,std::move(change.locale),std::move(change.picture),
+                              kNow,kNow,change.avatarSource.value_or("auto"));
+                      }}
+                  : http::CoroutineAccountSessionAdapter::UpdateProfile{},
+              scopedBearerReads
+                  ? http::CoroutineAccountSessionAdapter::Authenticate{
+                      [this](fnd::SecretString token)
+                          -> asio::awaitable<fnd::Result<sess::Session>> {
+                          ++scopedBearerCalls;
+                          if (token.expose() == "delegated-fixture" || token.expose() == "valid-token")
+                              co_return validSession("current");
+                          if (token.expose() == "no-scope-fixture")
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          if (token.expose() == "unavailable-fixture")
+                              co_return fnd::fail(fnd::ErrorCode::Unavailable);
+                          co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                      }}
+                  : http::CoroutineAccountSessionAdapter::Authenticate{},
+              disconnectEnabled
+                  ? http::CoroutineAccountSessionAdapter::Disconnect{
+                      [this](core::IdentityId owner,core::ExternalIdentityRef external)
+                          -> asio::awaitable<fnd::Status> {
+                          ++disconnectCalls;
+                          if (owner.value()!="identity-current" || external.subject().value()=="foreign")
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          if (external.subject().value()=="last")
+                              co_return fnd::fail(fnd::ErrorCode::FailedPrecondition);
+                          co_return fnd::ok();
+                      }}
+                  : http::CoroutineAccountSessionAdapter::Disconnect{})
     {
     }
 
@@ -237,13 +305,21 @@ struct Fixture final {
     NativeFallback fallback;
     gw::TokenBucketRateLimiter limiter;
     int authenticationCalls{};
+    int scopedBearerCalls{};
     int listCalls{};
     bool includeForeignSession{};
     std::size_t generatedSessionCount{};
     int revokeCalls{};
     int profileReadCalls{};
+    int profileWriteCalls{};
     int connectionsReadCalls{};
+    int disconnectCalls{};
     int totpStatusCalls{};
+    int passwordStatusCalls{};
+    int passwordConfirmCalls{};
+    bool passwordStatusForeign{};
+    bool passwordStatusMissing{};
+    std::optional<bool> passwordStatus{false};
     bool totpForeign{};
     bool totpMissing{};
     std::optional<bool> totpEnabled{false};
@@ -316,6 +392,12 @@ TEST(AccountCoroutineSessionHttpTest, RequestSpecificCapabilityAndNativeFallback
     EXPECT_EQ(response.status(), 209);
     EXPECT_EQ(f.fallback.invoked, 1);
     EXPECT_EQ(f.legacy.invoked, 0);
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/connections/web3/start")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Post,"/account/connections/web3/start")).status(),209);
+    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/connections/web3/start")));
+    EXPECT_FALSE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/connections/web3/complete")));
+    EXPECT_EQ(f.fallback.invoked,2);
+    EXPECT_EQ(f.legacy.invoked,0);
     const auto unavailable = f.run(
         request(gw::HttpMethod::Get, "/account/profile"));
     EXPECT_EQ(unavailable.status(), 503);
@@ -553,6 +635,100 @@ TEST(AccountCoroutineSessionHttpTest, ConnectionsReadIsCookieOnlyAndPreservesLeg
     EXPECT_EQ(f.legacy.invoked, 2);
 }
 
+TEST(AccountCoroutineSessionHttpTest, ScopedBearerReadsNeverDelegateSessionOrCredentialMutations)
+{
+    Fixture f{true, true, true, true, true, true, true};
+    gw::http::CoroutineRouteOverlay overlay{
+        f.legacy, f.api, {}, {{"/account/profile", gw::HttpMethod::Get},
+            {"/account/connections", gw::HttpMethod::Get}}};
+    for (const auto* path : {"/account/profile", "/account/connections"}) {
+        EXPECT_TRUE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get, path, "delegated-fixture")));
+        EXPECT_EQ(overlay.handle(request(gw::HttpMethod::Get, path, "delegated-fixture")).status(), 503);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "delegated-fixture")).status(), 200);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "no-scope-fixture")).status(), 403);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "unavailable-fixture")).status(), 503);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "unknown-fixture")).status(), 401);
+        auto proof = gw::HttpRequest::create(gw::HttpMethod::Get, path,
+            {{"authorization", "DPoP delegated-fixture"}}, {}, "127.0.0.1",
+            fnd::CorrelationId{"account-proof-fixture"}).value();
+        EXPECT_EQ(f.run(std::move(proof)).status(), 401);
+        auto ambiguous = gw::HttpRequest::create(gw::HttpMethod::Get, path,
+            {{"authorization", "Bearer delegated-fixture"}, {"cookie", "__Host-openproof-session=valid-token"}},
+            {}, "127.0.0.1", fnd::CorrelationId{"account-ambiguous-fixture"}).value();
+        EXPECT_EQ(f.run(std::move(ambiguous)).status(), 401);
+    }
+    EXPECT_EQ(f.scopedBearerCalls, 8);
+    EXPECT_EQ(f.profileReadCalls, 1);
+    EXPECT_EQ(f.connectionsReadCalls, 1);
+    EXPECT_EQ(f.run(profileCookieRequest()).status(), 200);
+    EXPECT_EQ(f.authenticationCalls, 1);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/sessions", "delegated-fixture")).status(), 401);
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Patch, "/account/profile", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get, "/account/totp", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post, "/account/password/upgrade", "delegated-fixture")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/totp","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/password/upgrade","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","no-scope-fixture",R"({"display_name":"denied"})")).status(),403);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","delegated-fixture",R"({"display_name":"Allowed"})")).status(),200);
+    auto delegatedUpgrade=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/password/upgrade",
+        {{"authorization","Bearer delegated-fixture"},{"host","example.invalid"},{"origin","https://example.invalid"},
+            {"sec-fetch-site","same-origin"},{"content-type","application/json"}},
+        R"({"password":"fixture-password"})","127.0.0.1",fnd::CorrelationId{"delegated-upgrade"}).value();
+    EXPECT_EQ(f.run(std::move(delegatedUpgrade)).status(),401);
+    EXPECT_EQ(f.passwordConfirmCalls,0);
+    EXPECT_EQ(f.scopedBearerCalls, 12);
+    EXPECT_EQ(f.listCalls, 0);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeSecurityAndRecoveryPagesPreserveCspAndOwnerBoundary)
+{
+    Fixture f{false,false,true,false,false,false,true};
+    auto recovery=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    ASSERT_EQ(recovery.status(),200);
+    EXPECT_EQ(recovery.headers().at("cache-control"),"no-store");
+    EXPECT_NE(recovery.headers().at("content-security-policy").find("frame-ancestors 'none'"),std::string::npos);
+    EXPECT_NE(recovery.body().find("/account/password/reset"),std::string::npos);
+    auto recoveryAgain=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    EXPECT_NE(recovery.headers().at("content-security-policy"),recoveryAgain.headers().at("content-security-policy"));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security")).status(),303);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","delegated-fixture")).status(),303);
+    EXPECT_EQ(f.totpStatusCalls,0);
+    auto security=f.run(request(gw::HttpMethod::Get,"/account/security","valid-token"));
+    ASSERT_EQ(security.status(),200);
+    EXPECT_NE(security.body().find("Account Security"),std::string::npos);
+    EXPECT_NE(security.headers().at("content-security-policy").find("script-src 'nonce-"),std::string::npos);
+    EXPECT_EQ(security.body().find("valid-token"),std::string::npos);
+    EXPECT_EQ(f.totpStatusCalls,1);
+    f.totpForeign=true;
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","valid-token")).status(),503);
+    EXPECT_EQ(f.scopedBearerCalls,0);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack)
+{
+    Fixture f{true,true,true,true,true,true,true,true};
+    const auto call=[&](std::string token,std::string body) {
+        auto input=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/connections/disconnect",
+            {{"authorization","Bearer "+token},{"content-type","application/json"}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"disconnect-fixture"}).value();
+        EXPECT_TRUE(f.api.nativeEnabledFor(input));
+        return f.run(std::move(input));
+    };
+    const std::string good=R"({"provider":"farcaster","subject":"owned"})";
+    EXPECT_EQ(call("no-scope-fixture",good).status(),403);
+    EXPECT_EQ(call("unavailable-fixture",good).status(),503);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"owned","identity_id":"other"})").status(),400);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"foreign"})").status(),403);
+    EXPECT_EQ(call("valid-token",R"({"provider":"local","subject":"last"})").status(),412);
+    const auto result=call("delegated-fixture",good);
+    EXPECT_EQ(result.status(),200);
+    EXPECT_EQ(result.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(f.disconnectCalls,3);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
 TEST(AccountCoroutineSessionHttpTest, ConnectionsReadRejectsForeignAndMissingWithoutDisclosure)
 {
     Fixture f{false, true};
@@ -611,6 +787,403 @@ TEST(AccountCoroutineSessionHttpTest, TotpStatusIsOptInCookieOnlyAndOwnerBound)
     f.totpMissing = true;
     EXPECT_EQ(f.run(totpCookieRequest()).status(), 404);
     EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeStatusIsCookieOnlyReadAndOwnerBound)
+{
+    auto cookieRequest = [](std::string token = "valid-token") {
+        return gw::HttpRequest::create(
+            gw::HttpMethod::Get, "/account/password/upgrade",
+            {{"cookie", "__Host-openproof-session=" + std::move(token)}}, {},
+            "127.0.0.1", fnd::CorrelationId{"native-password-status-test"}).value();
+    };
+    Fixture disabled;
+    EXPECT_FALSE(disabled.api.nativeEnabledFor(cookieRequest()));
+    Fixture f{false, false, false, true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy, f.api, {},
+        {{"/account/password/upgrade", gw::HttpMethod::Get}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(cookieRequest()));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get,
+        "/account/password/upgrade", "delegated-oauth")));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post,
+        "/account/password/upgrade")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/password/upgrade")).status(), 401);
+    EXPECT_EQ(f.run(cookieRequest("invalid-token")).status(), 401);
+    EXPECT_EQ(f.passwordStatusCalls, 0);
+    for (const auto status : {std::optional<bool>{}, std::optional<bool>{false},
+                              std::optional<bool>{true}}) {
+        f.passwordStatus = status;
+        const auto result = f.run(cookieRequest());
+        ASSERT_EQ(result.status(), 200);
+        const auto body = json::parse(result.body()).as_object();
+        EXPECT_EQ(body.size(), 3U);
+        EXPECT_EQ(body.at("available").as_bool(), status.has_value());
+        EXPECT_EQ(body.at("needs_upgrade").as_bool(), status.value_or(false));
+        EXPECT_EQ(body.at("target_algorithm").as_string(), "argon2id");
+        EXPECT_EQ(result.headers().at("cache-control"), "no-store");
+    }
+    f.passwordStatusForeign = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 503);
+    f.passwordStatusForeign = false;
+    f.passwordStatusMissing = true;
+    EXPECT_EQ(f.run(cookieRequest()).status(), 404);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, PasswordUpgradeConfirmRequiresOriginSessionAndStrictBody)
+{
+    auto post = [](std::string origin, std::string token, std::string body,
+                   std::string site = "same-origin", std::string contentType = "application/json") {
+        return gw::HttpRequest::create(gw::HttpMethod::Post, "/account/password/upgrade",
+            {{"cookie", "__Host-openproof-session=" + std::move(token)},
+             {"host", "example.invalid"}, {"origin", std::move(origin)},
+             {"sec-fetch-site", std::move(site)}, {"content-type", std::move(contentType)}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"password-confirm-test"}).value();
+    };
+    constexpr auto origin="https://example.invalid";
+    constexpr auto valid=R"({"password":"fixture-password"})";
+    Fixture off;
+    EXPECT_FALSE(off.api.nativeEnabledFor(post(origin,"valid-token",valid)));
+    Fixture f{false,false,false,true,true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy,f.api,{},
+        {{"/account/password/upgrade",gw::HttpMethod::Post}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(post(origin,"valid-token",valid)));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Post,
+        "/account/password/upgrade","delegated-oauth",valid)));
+    EXPECT_EQ(f.run(post("https://foreign.invalid","valid-token",valid)).status(),403);
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid,"cross-site")).status(),403);
+    EXPECT_EQ(f.run(post(origin,"invalid-token",valid)).status(),401);
+    EXPECT_EQ(f.run(post(origin,"valid-token",R"({"password":"fixture-password","owner":"foreign"})")).status(),400);
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid,"same-origin","application/jsonp")).status(),400);
+    EXPECT_EQ(f.passwordConfirmCalls,0);
+    EXPECT_EQ(f.run(post(origin,"valid-token",R"({"password":"wrong"})")).status(),401);
+    const auto success=f.run(post(origin,"valid-token",valid));
+    ASSERT_EQ(success.status(),200);
+    const auto body=json::parse(success.body()).as_object();
+    EXPECT_TRUE(body.at("upgraded").as_bool());
+    EXPECT_FALSE(body.at("needs_upgrade").as_bool());
+    EXPECT_EQ(success.headers().at("cache-control"),"no-store");
+    f.passwordStatusForeign=true;
+    EXPECT_EQ(f.run(post(origin,"valid-token",valid)).status(),503);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeProfileMutationRequiresOwnerAndPresentationFields)
+{
+    auto mutate=[](gw::HttpMethod method,std::string token,std::string body) {
+        return gw::HttpRequest::create(method,"/account/profile",
+            {{"cookie","__Host-openproof-session="+std::move(token)},
+             {"content-type","application/json"}},std::move(body),
+            "127.0.0.1",fnd::CorrelationId{"profile-write"}).value();
+    };
+    constexpr auto patch=R"({"display_name":"New name","locale":"fa-IR"})";
+    Fixture off{true};
+    EXPECT_FALSE(off.api.nativeEnabledFor(mutate(gw::HttpMethod::Patch,"valid-token",patch)));
+    Fixture f{true,false,false,false,false,true};
+    gw::http::CoroutineRouteOverlay overlay{f.legacy,f.api,{},
+        {{"/account/profile",gw::HttpMethod::Patch},{"/account/profile",gw::HttpMethod::Put}}};
+    EXPECT_TRUE(overlay.nativeEnabledFor(mutate(gw::HttpMethod::Patch,"valid-token",patch)));
+    EXPECT_FALSE(overlay.nativeEnabledFor(request(gw::HttpMethod::Patch,"/account/profile","delegated-oauth",patch)));
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"wrong-token",patch)).status(),401);
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",
+        R"({"email":"attacker@example.invalid","email_verified":true})")).status(),400);
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",R"({"display_name":42})")).status(),400);
+    EXPECT_EQ(f.profileWriteCalls,0);
+    for (auto method:{gw::HttpMethod::Patch,gw::HttpMethod::Put}) {
+        const auto changed=f.run(mutate(method,"valid-token",patch));
+        ASSERT_EQ(changed.status(),200);
+        const auto body=json::parse(changed.body()).as_object();
+        EXPECT_EQ(body.at("display_name").as_string(),"New name");
+        EXPECT_EQ(body.at("email").as_string(),"verified@example.invalid");
+        EXPECT_TRUE(body.at("email_verified").as_bool());
+        EXPECT_EQ(body.at("locale").as_string(),"fa-IR");
+        EXPECT_EQ(changed.headers().at("cache-control"),"no-store");
+    }
+    f.profileForeign=true;
+    EXPECT_EQ(f.run(mutate(gw::HttpMethod::Patch,"valid-token",patch)).status(),503);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
+TEST(NativeContactVerificationHttpTest, AuthorizedOwnerAndPurposeArePassedWithoutLegacyFallback)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int issued=0;
+    bool failDelivery=false;
+    std::string owner,destination;
+    std::optional<account::VerificationPurpose> purpose;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="valid-token") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return validSession("current");
+        },
+        [&](core::IdentityId identity,account::VerificationPurpose kind,std::string target)
+            ->asio::awaitable<fnd::Status> {
+            ++issued;
+            owner=identity.value();
+            purpose=kind;
+            destination=std::move(target);
+            if (failDelivery) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            co_return fnd::ok();
+        }};
+    auto run=[&](gw::HttpRequest input){
+        asio::io_context io;
+        auto result=asio::co_spawn(io,dispatch(api,std::move(input)),asio::use_future);
+        io.run();
+        return std::move(result.get()).value();
+    };
+    const std::string email=R"({"email":"new@example.test"})";
+    const std::string phone=R"({"phone_number":"+12025550123"})";
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","",email)).status(),401);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","wrong-token",email)).status(),401);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/email/change","valid-token",
+        R"({"email":"new@example.test","identity_id":"another-owner"})")).status(),400);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone,
+        "application/json-invalid")).status(),400);
+    EXPECT_EQ(issued,0);
+    const auto accepted=run(request(gw::HttpMethod::Post,"/account/email/change","valid-token",email));
+    EXPECT_EQ(accepted.status(),202);
+    EXPECT_EQ(accepted.headers().at("cache-control"),"no-store");
+    EXPECT_TRUE(json::parse(accepted.body()).as_object().at("accepted").as_bool());
+    EXPECT_EQ(owner,"identity-current");
+    EXPECT_EQ(destination,"new@example.test");
+    EXPECT_EQ(purpose,account::VerificationPurpose::ChangeEmail);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),202);
+    EXPECT_EQ(destination,"+12025550123");
+    EXPECT_EQ(purpose,account::VerificationPurpose::VerifyPhone);
+    failDelivery=true;
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),503);
+    EXPECT_EQ(issued,3);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/phone","valid-token",phone)).status(),503);
+    EXPECT_EQ(issued,3);
+    EXPECT_EQ(fallback.invoked,0);
+}
+
+TEST(NativeContactVerificationHttpTest, PhoneCompletionUsesAuthenticatedOwnerAndNeverDisclosesForeignProfile)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int verified=0;
+    bool wrongProfile=false;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,
+        [](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+            if (token.expose()!="valid-token") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return validSession("current");
+        },{},{},{},{},{},
+        [&](core::IdentityId owner,account::VerificationId id,fnd::SecretString secret)
+            ->asio::awaitable<fnd::Result<profile::IdentityProfile>> {
+            ++verified;
+            EXPECT_EQ(owner.value(),"identity-current");
+            EXPECT_EQ(id.value(),"phone-proof");
+            if (secret.expose()!="123456")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return profile::IdentityProfile::restore(
+                wrongProfile?core::IdentityId{"identity-foreign"}:owner,
+                std::optional<std::string>{"Visible Account"},std::nullopt,std::nullopt,false,
+                std::optional<std::string>{"+12025550123"},true,std::nullopt,std::nullopt,kNow,kNow,"auto");
+        }};
+    auto run=[&](std::string token,std::string body){
+        asio::io_context io;
+        auto task=asio::co_spawn(io,dispatch(api,request(gw::HttpMethod::Post,"/account/phone/verify",
+            std::move(token),std::move(body))),asio::use_future);
+        io.run();
+        return std::move(task.get()).value();
+    };
+    const std::string valid=R"({"verification_id":"phone-proof","secret":"123456"})";
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/phone/verify")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/phone/verify")));
+    EXPECT_EQ(run("",valid).status(),401);
+    EXPECT_EQ(run("wrong-token",valid).status(),401);
+    EXPECT_EQ(run("valid-token",R"({"verification_id":"phone-proof","secret":"123456","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(verified,0);
+    EXPECT_EQ(run("valid-token",R"({"verification_id":"phone-proof","secret":"000000"})").status(),401);
+    wrongProfile=true;
+    EXPECT_EQ(run("valid-token",valid).status(),503);
+    wrongProfile=false;
+    auto response=run("valid-token",valid);
+    ASSERT_EQ(response.status(),200);
+    auto body=json::parse(response.body()).as_object();
+    EXPECT_EQ(body.at("identity_id").as_string(),"identity-current");
+    EXPECT_EQ(body.at("phone_number").as_string(),"+12025550123");
+    EXPECT_TRUE(body.at("phone_number_verified").as_bool());
+    EXPECT_EQ(response.headers().at("cache-control"),"no-store");
+    EXPECT_FALSE(response.headers().contains("set-cookie"));
+    EXPECT_EQ(verified,3);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/phone/verify","valid-token",valid)).status(),503);
+    EXPECT_EQ(fallback.invoked,0);
+}
+
+TEST(NativeContactVerificationHttpTest, TotpMutationsUseFirstPartyAuthenticationAndAssurance)
+{
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int starts=0,completes=0,disables=0,delegatedCalls=0;
+    using Callbacks=http::CoroutineContactVerificationAdapter::TotpCallbacks;
+    Callbacks callbacks;
+    callbacks.authenticate=[](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>>{
+        if (token.expose()=="first-party") co_return validSession("first-party-session");
+        if (token.expose()!="first-party-ial2") co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+        co_return sess::Session::create(sess::SessionId{"ial2-session"},core::IdentityId{"identity-current"},
+            idp::ProviderId{"local"},idp::AssuranceLevel::Ial2,
+            idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge|idp::AuthenticationFactor::Possession,false},
+            kNow,sess::TokenDigest{sec::sha256("fixture-ial2").value()},kNow,std::chrono::hours{8},std::chrono::minutes{30});
+    };
+    callbacks.begin=[&](core::IdentityId owner,fnd::SecretString proof,idp::AssuranceLevel)
+        ->asio::awaitable<fnd::Result<Callbacks::Start>>{
+        ++starts;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(proof.expose(),"fixture-password");
+        co_return Callbacks::Start{"fixture-enrollment",fnd::SecretString{"FIXTUREBASE32"},
+            kNow+std::chrono::minutes{10},false};
+    };
+    callbacks.complete=[&](core::IdentityId owner,std::string enrollment,fnd::SecretString code,idp::AssuranceLevel)
+        ->asio::awaitable<fnd::Status>{
+        ++completes;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(enrollment,"fixture-enrollment");
+        EXPECT_EQ(code.expose(),"123456");
+        co_return fnd::ok();
+    };
+    callbacks.disable=[&](core::IdentityId owner,fnd::SecretString proof,idp::AssuranceLevel assurance)
+        ->asio::awaitable<fnd::Status>{
+        ++disables;
+        EXPECT_EQ(owner.value(),"identity-current");
+        EXPECT_EQ(proof.expose(),"fixture-password");
+        EXPECT_EQ(assurance,idp::AssuranceLevel::Ial2);
+        co_return fnd::ok();
+    };
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,[&](fnd::SecretString)->asio::awaitable<fnd::Result<sess::Session>>{
+            ++delegatedCalls;co_return validSession("delegated");
+        },{},{},{},{},{},{},{},std::move(callbacks)};
+    auto post=[&](std::string path,std::string token,std::string body){
+        asio::io_context io;
+        auto done=asio::co_spawn(io,dispatch(api,request(gw::HttpMethod::Post,std::move(path),
+            std::move(token),std::move(body))),asio::use_future);
+        io.run();
+        return std::move(done.get()).value();
+    };
+    const std::string password=R"({"password":"fixture-password"})";
+    EXPECT_EQ(post("/account/totp/start","delegated",password).status(),401);
+    EXPECT_EQ(post("/account/totp/start","",password).status(),401);
+    EXPECT_EQ(post("/account/totp/start","first-party",R"({"password":"fixture-password","identity_id":"other"})").status(),400);
+    EXPECT_EQ(starts,0);
+    auto started=post("/account/totp/start","first-party",password);
+    ASSERT_EQ(started.status(),201);
+    EXPECT_EQ(started.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(json::parse(started.body()).as_object().at("enrollment_id").as_string(),"fixture-enrollment");
+    EXPECT_EQ(post("/account/totp/complete","first-party",R"({"enrollment_id":"fixture-enrollment","code":"abcdef"})").status(),400);
+    EXPECT_EQ(completes,0);
+    EXPECT_EQ(post("/account/totp/complete","first-party",R"({"enrollment_id":"fixture-enrollment","code":"123456"})").status(),200);
+    EXPECT_EQ(post("/account/totp/disable","first-party",password).status(),403);
+    EXPECT_EQ(disables,0);
+    auto disabled=post("/account/totp/disable","first-party-ial2",password);
+    ASSERT_EQ(disabled.status(),200);
+    EXPECT_TRUE(json::parse(disabled.body()).as_object().at("recovery_codes_revoked").as_bool());
+    EXPECT_EQ(starts,1);EXPECT_EQ(completes,1);EXPECT_EQ(disables,1);
+    EXPECT_EQ(delegatedCalls,0);EXPECT_EQ(fallback.invoked,0);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/totp/start","first-party",password)).status(),503);
+}
+
+TEST(NativeSignupHttpTest, NativePairPreservesHttpContractAndNeverIssuesCookieOnFailure)
+{
+    namespace account=openproof::account;
+    fnd::ManualClockSource clock{kNow};
+    NativeFallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,100.0,100.0,100U).value();
+    int signups=0,verifications=0,resets=0;
+    bool deliveryFailure=false,invalidGrant=false;
+    http::CoroutineContactVerificationAdapter api{
+        fallback,limiter,{},{},{},
+        [&](std::string email,fnd::SecretString password,std::optional<std::string> name)
+            ->asio::awaitable<fnd::Result<core::IdentityId>> {
+            ++signups;
+            EXPECT_EQ(email,"new@example.test");
+            EXPECT_EQ(password.expose(),"fixture-password");
+            if (name) { EXPECT_EQ(*name,"Fixture"); }
+            if (deliveryFailure) co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            co_return core::IdentityId{"new-owner"};
+        },
+        [&](account::VerificationId id,fnd::SecretString proof,idp::ClientContext)
+            ->asio::awaitable<fnd::Result<sess::CoroutineIssuedSession>> {
+            ++verifications;
+            EXPECT_EQ(id.value(),"fixture-proof");
+            if (proof.expose()!="valid-secret")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return sess::CoroutineIssuedSession{sess::SessionId{"verified-session"},
+                fnd::SecretString{invalidGrant?"bad;cookie":"session-bearer"}};
+        },
+        [&](account::VerificationId id,fnd::SecretString proof,fnd::SecretString password)
+            ->asio::awaitable<fnd::Status> {
+            ++resets;
+            EXPECT_EQ(id.value(),"fixture-proof");
+            EXPECT_EQ(password.expose(),"replacement-password");
+            if (proof.expose()!="valid-secret")
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            co_return fnd::ok();
+        }};
+    auto run=[&](gw::HttpRequest input){
+        asio::io_context io;
+        auto result=asio::co_spawn(io,dispatch(api,std::move(input)),asio::use_future);
+        io.run();
+        return std::move(result.get()).value();
+    };
+    const auto post=[&](std::string path,std::string body){
+        return run(request(gw::HttpMethod::Post,std::move(path),"",std::move(body)));
+    };
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/signup")));
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/email/verify")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/signup")));
+    EXPECT_EQ(post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(signups,0);
+    auto created=post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","display_name":"Fixture"})");
+    ASSERT_EQ(created.status(),201);
+    EXPECT_TRUE(json::parse(created.body()).as_object().at("verification_required").as_bool());
+    EXPECT_EQ(json::parse(created.body()).as_object().at("identity_id").as_string(),"new-owner");
+    EXPECT_EQ(created.body().find("fixture-password"),std::string::npos);
+    EXPECT_EQ(created.headers().at("cache-control"),"no-store");
+    deliveryFailure=true;
+    EXPECT_EQ(post("/account/signup",R"({"email":"new@example.test","password":"fixture-password","display_name":null})").status(),503);
+    EXPECT_EQ(signups,2);
+    const auto rejected=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"wrong-secret"})");
+    EXPECT_EQ(rejected.status(),401);
+    EXPECT_FALSE(rejected.headers().contains("set-cookie"));
+    invalidGrant=true;
+    const auto malformed=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"valid-secret"})");
+    EXPECT_EQ(malformed.status(),500);
+    EXPECT_FALSE(malformed.headers().contains("set-cookie"));
+    invalidGrant=false;
+    const auto verified=post("/account/email/verify",R"({"verification_id":"fixture-proof","secret":"valid-secret"})");
+    ASSERT_EQ(verified.status(),200);
+    EXPECT_TRUE(json::parse(verified.body()).as_object().at("verified").as_bool());
+    EXPECT_EQ(json::parse(verified.body()).as_object().at("session_id").as_string(),"verified-session");
+    EXPECT_EQ(verified.body().find("session-bearer"),std::string::npos);
+    EXPECT_EQ(verified.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(verifications,3);
+    EXPECT_TRUE(api.nativeEnabledFor(request(gw::HttpMethod::Post,"/account/password/reset")));
+    EXPECT_FALSE(api.nativeEnabledFor(request(gw::HttpMethod::Get,"/account/password/reset")));
+    EXPECT_EQ(post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"short"})").status(),400);
+    EXPECT_EQ(post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"replacement-password","identity_id":"foreign"})").status(),400);
+    EXPECT_EQ(resets,0);
+    auto deniedReset=post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"wrong-secret","new_password":"replacement-password"})");
+    EXPECT_EQ(deniedReset.status(),401);
+    EXPECT_FALSE(deniedReset.headers().contains("set-cookie"));
+    auto completedReset=post("/account/password/reset",R"({"verification_id":"fixture-proof","secret":"valid-secret","new_password":"replacement-password"})");
+    EXPECT_EQ(completedReset.status(),200);
+    EXPECT_TRUE(json::parse(completedReset.body()).as_object().at("password_reset").as_bool());
+    EXPECT_FALSE(completedReset.headers().contains("set-cookie"));
+    EXPECT_EQ(completedReset.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(resets,2);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/password/reset")).status(),503);
+    EXPECT_EQ(api.handle(request(gw::HttpMethod::Post,"/account/signup")).status(),503);
+    EXPECT_EQ(fallback.invoked,0);
 }
 
 } // namespace

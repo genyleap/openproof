@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "coroutine_session_http.hpp"
+#include "account_pages.hpp"
 
 import openproof.identity.provider;
 
@@ -57,16 +58,104 @@ private:
         && request.path() == "/account/profile";
 }
 
+[[nodiscard]] bool profileUpdateRoute(const gateway::HttpRequest& request) noexcept
+{
+    return (request.method()==gateway::HttpMethod::Patch || request.method()==gateway::HttpMethod::Put)
+        && request.path()=="/account/profile";
+}
+
 [[nodiscard]] bool connectionsReadRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
         && request.path() == "/account/connections";
 }
 
+[[nodiscard]] bool disconnectRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && request.path()=="/account/connections/disconnect";
+}
+
 [[nodiscard]] bool totpStatusReadRoute(const gateway::HttpRequest& request) noexcept
 {
     return request.method() == gateway::HttpMethod::Get
         && request.path() == "/account/totp";
+}
+
+[[nodiscard]] bool passwordUpgradeStatusReadRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Get
+        && request.path() == "/account/password/upgrade";
+}
+
+[[nodiscard]] bool passwordUpgradeConfirmRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method() == gateway::HttpMethod::Post
+        && request.path() == "/account/password/upgrade";
+}
+
+[[nodiscard]] bool trustedPasswordUpgradeOrigin(const gateway::HttpRequest& request)
+{
+    const auto origin = request.header("origin");
+    const auto host = request.header("host");
+    if (!origin || !host || host->empty()) return false;
+    if (host->find_first_of("/\\\r\n") != std::string_view::npos) return false;
+    if (*origin != ("https://" + std::string{*host})) return false;
+    const auto site = request.header("sec-fetch-site");
+    return !site || *site == "same-origin";
+}
+
+class PasswordRequestGuard final {
+public:
+    explicit PasswordRequestGuard(gateway::HttpRequest& request) noexcept : m_request(request) {}
+    ~PasswordRequestGuard() { m_request.wipeBody(); }
+    PasswordRequestGuard(const PasswordRequestGuard&) = delete;
+    PasswordRequestGuard& operator=(const PasswordRequestGuard&) = delete;
+private:
+    gateway::HttpRequest& m_request;
+};
+
+class ParsedPasswordGuard final {
+public:
+    explicit ParsedPasswordGuard(json::value& parsed) noexcept : m_parsed(parsed) {}
+    ~ParsedPasswordGuard() {
+        if (m_parsed.is_object()) {
+            for (const auto name:{"password","secret","new_password","code"}) {
+                if (auto* value=m_parsed.as_object().if_contains(name);value && value->is_string()) {
+                    auto& text=value->as_string();
+                    foundation::secureWipe(text.data(),text.size());
+                    text.clear();
+                }
+            }
+        }
+    }
+    ParsedPasswordGuard(const ParsedPasswordGuard&) = delete;
+    ParsedPasswordGuard& operator=(const ParsedPasswordGuard&) = delete;
+private:
+    json::value& m_parsed;
+};
+
+[[nodiscard]] foundation::Result<foundation::SecretString> passwordUpgradeSecret(gateway::HttpRequest& request)
+{
+    PasswordRequestGuard wipeBody{request};
+    const auto type = request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    boost::system::error_code ec;
+    auto parsed = json::parse(request.body(),ec);
+    ParsedPasswordGuard wipeParsed{parsed};
+    if (ec || !parsed.is_object() || parsed.as_object().size()!=1U)
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    auto* field = parsed.as_object().if_contains("password");
+    if (!field || !field->is_string())
+        return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    const std::string_view value{field->as_string().data(),field->as_string().size()};
+    if (value.empty() || value.size()>1024U || std::ranges::any_of(value,[](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte<0x20U || byte==0x7FU;
+    })) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    return foundation::SecretString{std::string{value}};
 }
 
 [[nodiscard]] bool accountNamespace(const gateway::HttpRequest& request) noexcept
@@ -135,42 +224,75 @@ CoroutineAccountSessionAdapter::CoroutineAccountSessionAdapter(
     gateway::TokenBucketRateLimiter& limiter,
     Authenticate authenticate, List list, RevokeOwned revokeOwned,
     ReadProfile readProfile, ReadConnections readConnections,
-    ReadTotpStatus readTotpStatus)
+    ReadTotpStatus readTotpStatus, ReadPasswordUpgradeStatus readPasswordUpgradeStatus,
+    ConfirmPasswordUpgrade confirmPasswordUpgrade, UpdateProfile updateProfile,
+    Authenticate authenticateReadBearer, Disconnect disconnect)
     : m_legacyAccount(&legacyAccount), m_asyncFallback(&asyncFallback),
       m_limiter(&limiter), m_authenticate(std::move(authenticate)),
       m_list(std::move(list)), m_revokeOwned(std::move(revokeOwned)),
       m_readProfile(std::move(readProfile)),
       m_readConnections(std::move(readConnections)),
-      m_readTotpStatus(std::move(readTotpStatus))
+      m_readTotpStatus(std::move(readTotpStatus)),
+      m_readPasswordUpgradeStatus(std::move(readPasswordUpgradeStatus)),
+      m_confirmPasswordUpgrade(std::move(confirmPasswordUpgrade)),
+      m_updateProfile(std::move(updateProfile)),
+      m_authenticateReadBearer(std::move(authenticateReadBearer)),
+      m_disconnect(std::move(disconnect))
 {
 }
 
 bool CoroutineAccountSessionAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
-    if (!accountNamespace(request)) {
+    // These exact connection ceremonies are owned by downstream native
+    // Web3/federation handlers, not the account session/profile adapter.
+    if (!accountNamespace(request)
+        || request.path()=="/account/connections/web3/start"
+        || request.path()=="/account/connections/web3/complete"
+        || request.path()=="/account/connections/web3/handoff"
+        || request.path()=="/account/connections/start"
+        || request.path()=="/account/connections/complete"
+        || request.path()=="/account/connections/handoff") {
         return m_asyncFallback->nativeEnabledFor(request);
     }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/recover")
+        return true;
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/security")
+        return m_authenticate && m_readTotpStatus;
     if (profileReadRoute(request)) {
-        // Legacy AccountHttpApi also accepts delegated OAuth Bearer grants.
-        // Native PostgreSQL session authentication supports first-party
-        // sessions only. Preserve delegated OAuth semantics on the bounded
-        // compatibility worker; do not misclassify Bearer as a session.
-        return !request.header("authorization").has_value()
+        // A separately injected account-scoped verifier admits Bearer reads.
+        // Without it, preserve the standalone adapter's cookie-only contract.
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readProfile);
     }
+    if (profileUpdateRoute(request)) {
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
+            && static_cast<bool>(m_authenticate) && static_cast<bool>(m_updateProfile);
+    }
     if (connectionsReadRoute(request)) {
-        // Delegated OAuth Bearer grants are still authenticated only by the
-        // compatibility route; native reads accept first-party cookies.
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readConnections);
     }
+    if (disconnectRoute(request)) {
+        return m_authenticate && m_disconnect
+            && (!request.header("authorization").has_value() || m_authenticateReadBearer);
+    }
     if (totpStatusReadRoute(request)) {
-        return !request.header("authorization").has_value()
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
             && static_cast<bool>(m_authenticate)
             && static_cast<bool>(m_readTotpStatus);
+    }
+    if (passwordUpgradeStatusReadRoute(request)) {
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_readPasswordUpgradeStatus);
+    }
+    if (passwordUpgradeConfirmRoute(request)) {
+        return (!request.header("authorization").has_value() || m_authenticateReadBearer)
+            && static_cast<bool>(m_authenticate)
+            && static_cast<bool>(m_confirmPasswordUpgrade);
     }
     return static_cast<bool>(m_authenticate)
         && static_cast<bool>(m_list)
@@ -181,8 +303,9 @@ bool CoroutineAccountSessionAdapter::nativeEnabledFor(
 gateway::HttpResponse CoroutineAccountSessionAdapter::handle(
     gateway::HttpRequest request)
 {
-    // The existing synchronous AccountHttpApi remains the default ABI for
-    // every route until the listener explicitly selects this native adapter.
+    // Production supplies the namespace-only account denial boundary.
+    // Standalone callers can inject their own compatibility handler; native
+    // dispatch never invokes it.
     return m_legacyAccount->handle(std::move(request));
 }
 
@@ -212,8 +335,18 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     // Check again after dispatch: downstream capability may have been
     // withdrawn, or a caller may have invoked this entry point directly.
     if (!nativeEnabledFor(request)) {
+        if (passwordUpgradeConfirmRoute(request)) request.wipeBody();
         co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/recover") {
+        request.wipeBody();
+        request.wipeTargetQuery();
+        if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+            co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+        co_return renderRecoveryPage();
+    }
+    if (request.method()==gateway::HttpMethod::Get && request.path()=="/account/security")
+        co_return co_await securityPage(std::move(request));
     if (sessionListRoute(request)) {
         co_return co_await sessionList(std::move(request));
     }
@@ -223,15 +356,62 @@ CoroutineAccountSessionAdapter::handleAsync(gateway::HttpRequest request)
     if (profileReadRoute(request)) {
         co_return co_await profileRead(std::move(request));
     }
+    if (profileUpdateRoute(request)) {
+        co_return co_await profileUpdate(std::move(request));
+    }
     if (connectionsReadRoute(request)) {
         co_return co_await connectionsRead(std::move(request));
+    }
+    if (disconnectRoute(request)) {
+        co_return co_await disconnect(std::move(request));
     }
     if (totpStatusReadRoute(request)) {
         co_return co_await totpStatusRead(std::move(request));
     }
-    // Only non-account requests can reach the fallback's native entry.
-    // No synchronous AccountHttpApi method executes on the reactor.
+    if (passwordUpgradeStatusReadRoute(request)) {
+        co_return co_await passwordUpgradeStatusRead(std::move(request));
+    }
+    if (passwordUpgradeConfirmRoute(request)) {
+        co_return co_await passwordUpgradeConfirm(std::move(request));
+    }
+    // Only requests explicitly admitted by the downstream native handler
+    // reach this branch; never invoke synchronous AccountHttpApi here.
     co_return co_await m_asyncFallback->handleAsync(std::move(request));
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::securityPage(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    request.wipeTargetQuery();
+    using E=foundation::ErrorCode;
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{E::RateLimited},request);
+    const auto redirect=[] {
+        return gateway::HttpResponse{303,gateway::Headers{
+            {"location","/login?return_to=%2Faccount%2Fsecurity"},
+            {"cache-control","no-store"},{"pragma","no-cache"},
+            {"x-content-type-options","nosniff"},{"referrer-policy","no-referrer"}},{}};
+    };
+    // Browser security pages accept only a first-party session; the
+    // delegated-account verifier is deliberately not consulted.
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return redirect();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential || !credential->has_value()) co_return redirect();
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) {
+        if (actor.error().code()==E::AuthenticationFailed || actor.error().code()==E::AuthenticationRequired)
+            co_return redirect();
+        co_return fail(actor.error(),request);
+    }
+    auto status=co_await m_readTotpStatus(actor->identity());
+    if (!status) co_return fail(status.error(),request);
+    if (status->first!=actor->identity()) co_return fail(foundation::Error{E::Unavailable},request);
+    co_return renderSecurityPage(status->second,identity::provider::meetsAssurance(
+        actor->assurance(),identity::provider::AssuranceLevel::Ial2),
+        identity::provider::assuranceLevelName(actor->assurance()));
 }
 
 asio::awaitable<gateway::HttpResponse>
@@ -321,15 +501,18 @@ CoroutineAccountSessionAdapter::profileRead(gateway::HttpRequest request)
     if (!m_limiter->allow(rateKey)) {
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+    const auto& authenticate = request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value()) {
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
     }
-    // Never authorize a read based only on the requested identity or a
-    // caller-supplied HTTP parameter. The owner must come from the verified
-    // native session and the repository must independently verify tenancy.
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    // Never authorize a read from a caller-supplied identity. The selected
+    // verifier must authenticate the owner before the tenant-scoped lookup.
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto value = co_await m_readProfile(authenticated->identity());
     if (!value) co_return fail(value.error(), request);
@@ -361,12 +544,16 @@ CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed}, request);
+    const auto& authenticate = request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value())
         co_return fail(foundation::Error{
             foundation::ErrorCode::AuthenticationRequired}, request);
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto connections = co_await m_readConnections(authenticated->identity());
     if (!connections) co_return fail(connections.error(), request);
@@ -412,6 +599,53 @@ CoroutineAccountSessionAdapter::connectionsRead(gateway::HttpRequest request)
 }
 
 asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::disconnect(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipe{request};
+    PasswordRequestGuard bodyWipe{request};
+    using E=foundation::ErrorCode;
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{E::RateLimited},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{E::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value()) co_return fail(foundation::Error{E::AuthenticationRequired},request);
+    auto actor=co_await authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    const auto mime=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !mime
+        || (*mime!="application/json" && !mime->starts_with("application/json;")))
+        co_return fail(foundation::Error{E::InvalidArgument},request);
+    boost::system::error_code ec;
+    const auto parsed=json::parse(request.body(),ec);
+    request.wipeBody();
+    if (ec || !parsed.is_object() || parsed.as_object().size()!=2U)
+        co_return fail(foundation::Error{E::InvalidArgument},request);
+    const auto field=[&](std::string_view name,std::size_t maximum)->std::optional<std::string> {
+        const auto* value=parsed.as_object().if_contains(name);
+        if (!value || !value->is_string()) return std::nullopt;
+        const std::string_view text{value->as_string().data(),value->as_string().size()};
+        if (text.empty() || text.size()>maximum || std::ranges::any_of(text,[](char c) {
+            const auto byte=static_cast<unsigned char>(c);
+            return byte<0x20U || byte==0x7fU;
+        })) return std::nullopt;
+        return std::string{text};
+    };
+    auto provider=field("provider",128U);
+    auto subject=field("subject",512U);
+    if (!provider || !subject) co_return fail(foundation::Error{E::InvalidArgument},request);
+    identity::core::ExternalIdentityRef external{
+        identity::provider::ProviderId{std::move(*provider)},
+        identity::provider::ExternalSubject{std::move(*subject)}};
+    auto result=co_await m_disconnect(actor->identity(),std::move(external));
+    if (!result) co_return fail(result.error(),request);
+    co_return jsonResponse(200,json::object{{"disconnected",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
 CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
 {
     SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
@@ -419,11 +653,15 @@ CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
         + ":" + std::string{request.path()};
     if (!m_limiter->allow(rateKey))
         co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
     auto credential = gateway::takeSessionCredential(request);
     if (!credential) co_return fail(credential.error(), request);
     if (!credential->has_value())
         co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
-    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    auto authenticated = co_await authenticate(std::move(credential->value()));
     if (!authenticated) co_return fail(authenticated.error(), request);
     auto status = co_await m_readTotpStatus(authenticated->identity());
     if (!status) co_return fail(status.error(), request);
@@ -433,6 +671,536 @@ CoroutineAccountSessionAdapter::totpStatusRead(gateway::HttpRequest request)
         {"available", status->second.has_value()},
         {"enabled", status->second.value_or(false)},
         {"assurance", identity::provider::assuranceLevelName(authenticated->assurance())}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::passwordUpgradeStatusRead(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeadersOnExit{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(), request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired}, request);
+    auto authenticated = co_await authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(), request);
+    auto status = co_await m_readPasswordUpgradeStatus(authenticated->identity());
+    if (!status) co_return fail(status.error(), request);
+    if (status->first != authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable}, request);
+    co_return jsonResponse(200, json::object{
+        {"available", status->second.has_value()},
+        {"needs_upgrade", status->second.value_or(false)},
+        {"target_algorithm", "argon2id"}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::passwordUpgradeConfirm(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    const std::string rateKey = "account:" + std::string{request.remoteAddress()}
+        + ":" + std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (!trustedPasswordUpgradeOrigin(request))
+        co_return fail(foundation::Error{foundation::ErrorCode::PermissionDenied},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    auto credential = gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    // Parse/wipe raw password before any asynchronous database work.
+    auto secret = passwordUpgradeSecret(request);
+    auto authenticated = co_await m_authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(),request);
+    if (!m_limiter->allow("account:password-upgrade:identity:"
+            + std::string{authenticated->identity().value()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (!secret) co_return fail(secret.error(),request);
+    auto result = co_await m_confirmPasswordUpgrade(authenticated->identity(),
+                                                   std::move(secret).value());
+    if (!result) co_return fail(result.error(),request);
+    if (result->first!=authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    co_return jsonResponse(200,json::object{{"upgraded",result->second},{"needs_upgrade",false}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineAccountSessionAdapter::profileUpdate(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    const std::string rateKey="account:"+std::string{request.remoteAddress()}
+        +":"+std::string{request.path()};
+    if (!m_limiter->allow(rateKey))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() && m_authenticateReadBearer
+        ? m_authenticateReadBearer : m_authenticate;
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    auto authenticated=co_await authenticate(std::move(credential->value()));
+    if (!authenticated) co_return fail(authenticated.error(),request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    boost::system::error_code ec;
+    const auto parsed=json::parse(request.body(),ec);
+    if (ec || !parsed.is_object())
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    ProfileUpdate change;
+    // Match legacy replacement semantics: omitted/null/empty fields clear
+    // presentation data; omitted avatar source preserves its existing value.
+    for (const auto& entry:parsed.as_object()) {
+        std::optional<std::string>* target=nullptr;
+        std::size_t maximum=0U;
+        const std::string_view name{entry.key().data(),entry.key().size()};
+        if (name=="display_name") {target=&change.displayName;maximum=256U;}
+        else if (name=="preferred_username") {target=&change.username;maximum=128U;}
+        else if (name=="locale") {target=&change.locale;maximum=64U;}
+        else if (name=="picture") {target=&change.picture;maximum=2048U;}
+        else if (name=="avatar_source") {target=&change.avatarSource;maximum=128U;}
+        else co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto& field=entry.value();
+        if (field.is_null()) continue;
+        if (!field.is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view text{field.as_string().data(),field.as_string().size()};
+        if (text.empty()) continue;
+        if (text.size()>maximum || std::ranges::any_of(text,[](char ch){
+            const auto byte=static_cast<unsigned char>(ch);
+            return byte<0x20U || byte==0x7FU;
+        })) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        *target=std::string{text};
+    }
+    auto result=co_await m_updateProfile(authenticated->identity(),std::move(change));
+    if (!result) co_return fail(result.error(),request);
+    if (result->identity()!=authenticated->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    const auto& value=result.value();
+    json::object body;
+    body["identity_id"] = value.identity().value();
+    if (value.displayName()) body["display_name"] = *value.displayName();
+    if (value.preferredUsername()) {
+        body["preferred_username"] = *value.preferredUsername();
+    }
+    if (value.email()) body["email"] = *value.email();
+    body["email_verified"] = value.emailVerified();
+    if (value.phoneNumber()) body["phone_number"] = *value.phoneNumber();
+    body["phone_number_verified"] = value.phoneNumberVerified();
+    if (value.locale()) body["locale"] = *value.locale();
+    if (value.pictureUrl()) body["picture"] = *value.pictureUrl();
+    body["avatar_source"] = value.avatarSource();
+    co_return jsonResponse(200, std::move(body));
+}
+
+namespace {
+[[nodiscard]] bool totpMutationRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post &&
+        (request.path()=="/account/totp/start" || request.path()=="/account/totp/complete"
+            || request.path()=="/account/totp/disable");
+}
+[[nodiscard]] bool emailChangeVerifyRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/email/change/verify";
+}
+[[nodiscard]] bool phoneVerifyRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/phone/verify";
+}
+[[nodiscard]] bool resetRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post && request.path()=="/account/password/reset";
+}
+[[nodiscard]] bool signupRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && (request.path()=="/account/signup" || request.path()=="/account/email/verify");
+}
+[[nodiscard]] bool contactIssueRoute(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Post
+        && (request.path()=="/account/email/change" || request.path()=="/account/phone"
+            || request.path()=="/account/email/resend" || request.path()=="/account/password/forgot");
+}
+[[nodiscard]] bool publicEmailIssue(const gateway::HttpRequest& request) noexcept
+{
+    return request.path()=="/account/email/resend" || request.path()=="/account/password/forgot";
+}
+}
+
+CoroutineContactVerificationAdapter::CoroutineContactVerificationAdapter(
+    gateway::http::CoroutineHttpHandler& fallback,gateway::TokenBucketRateLimiter& limiter,
+    Authenticate authenticate,Issue issue,PublicIssue publicIssue,Signup signup,VerifySignup verifySignup,ResetPassword resetPassword,VerifyPhone verifyPhone,VerifyEmailChange verifyEmailChange,TotpCallbacks totp)
+    : m_fallback(&fallback),m_limiter(&limiter),m_authenticate(std::move(authenticate)),
+      m_issue(std::move(issue)),m_publicIssue(std::move(publicIssue)),
+      m_signup(std::move(signup)),m_verifySignup(std::move(verifySignup)),m_resetPassword(std::move(resetPassword)),m_verifyPhone(std::move(verifyPhone)),m_verifyEmailChange(std::move(verifyEmailChange)),m_totp(std::move(totp)) {}
+
+bool CoroutineContactVerificationAdapter::nativeEnabledFor(const gateway::HttpRequest& request) const noexcept
+{
+    if (totpMutationRoute(request) && m_totp) return true;
+    if (emailChangeVerifyRoute(request) && m_verifyEmailChange) return static_cast<bool>(m_authenticate);
+    if (phoneVerifyRoute(request) && m_verifyPhone) return static_cast<bool>(m_authenticate);
+    if (resetRoute(request) && m_resetPassword) return true;
+    if (signupRoute(request) && (m_signup || m_verifySignup)) return m_signup && m_verifySignup;
+    if (contactIssueRoute(request)) return publicEmailIssue(request) ? static_cast<bool>(m_publicIssue)
+        : static_cast<bool>(m_authenticate) && static_cast<bool>(m_issue);
+    return m_fallback->nativeEnabledFor(request);
+}
+
+gateway::HttpResponse CoroutineContactVerificationAdapter::fail(
+    const foundation::Error& failure,const gateway::HttpRequest& request)
+{
+    gateway::HttpResponse response{foundation::errorHttpStatus(failure.code()),
+        gateway::Headers{{"content-type","application/json"}},
+        foundation::toClientJson(failure,request.correlation().value())};
+    response.setHeader("cache-control","no-store");
+    response.setHeader("pragma","no-cache");
+    response.setHeader("x-content-type-options","nosniff");
+    response.setHeader("referrer-policy","no-referrer");
+    if (response.status()==401) response.setHeader("www-authenticate","Bearer");
+    return response;
+}
+
+gateway::HttpResponse CoroutineContactVerificationAdapter::handle(gateway::HttpRequest request)
+{
+    if (!contactIssueRoute(request) && !(signupRoute(request) && (m_signup || m_verifySignup))
+        && !(resetRoute(request) && m_resetPassword) && !(phoneVerifyRoute(request) && m_verifyPhone)
+        && !(emailChangeVerifyRoute(request) && m_verifyEmailChange) && !(totpMutationRoute(request) && m_totp))
+        return m_fallback->handle(std::move(request));
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::handleAsync(gateway::HttpRequest request)
+{
+    if (totpMutationRoute(request) && m_totp) co_return co_await manageTotp(std::move(request));
+    if ((phoneVerifyRoute(request) && m_verifyPhone) || (emailChangeVerifyRoute(request) && m_verifyEmailChange))
+        co_return co_await verifyPhone(std::move(request));
+    if ((signupRoute(request) && (m_signup || m_verifySignup)) || (resetRoute(request) && m_resetPassword))
+        co_return co_await signupOrVerify(std::move(request));
+    if (!contactIssueRoute(request)) {
+        if (m_fallback->nativeEnabledFor(request))
+            co_return co_await m_fallback->handleAsync(std::move(request));
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    const bool publicRequest=publicEmailIssue(request);
+    if (publicRequest ? !m_publicIssue : (!m_authenticate || !m_issue))
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    std::optional<session::Session> actor;
+    if (!publicRequest) {
+        auto credential=gateway::takeSessionCredential(request);
+        if (!credential) co_return fail(credential.error(),request);
+        if (!credential->has_value())
+            co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+        auto authenticated=co_await m_authenticate(std::move(credential->value()));
+        if (!authenticated) co_return fail(authenticated.error(),request);
+        actor.emplace(std::move(authenticated).value());
+    } else {
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+    }
+    const bool email=request.path()!="/account/phone";
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    std::string destination;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        if (ec || !parsed.is_object() || parsed.as_object().size()!=1U)
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto* field=parsed.as_object().if_contains(email?"email":"phone_number");
+        if (!field || !field->is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view value{field->as_string().data(),field->as_string().size()};
+        if (value.empty() || value.size()>(email?320U:32U)
+            || std::ranges::any_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7FU;
+            })) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        destination.assign(value);
+    }
+    request.wipeBody();
+    if (publicRequest) {
+        auto status=co_await m_publicIssue(request.path()=="/account/email/resend"
+            ? VerificationPurpose::SignupEmail:VerificationPurpose::PasswordReset,std::move(destination));
+        if (!status) co_return fail(status.error(),request);
+        co_return jsonResponse(202,json::object{{"accepted",true}});
+    }
+    auto status=co_await m_issue(actor->identity(),
+        email?VerificationPurpose::ChangeEmail:VerificationPurpose::VerifyPhone,
+        std::move(destination));
+    if (!status) co_return fail(status.error(),request);
+    co_return jsonResponse(202,json::object{{"accepted",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::manageTotp(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    if (!m_totp) co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const bool completing=request.path()=="/account/totp/complete";
+    const bool starting=request.path()=="/account/totp/start";
+    std::string enrollmentId;
+    foundation::SecretString proof;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object() || parsed.as_object().size()!=(completing?2U:1U))
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const auto read=[&](const char* name,std::size_t limit)->std::optional<std::string_view>{
+            const auto* value=parsed.as_object().if_contains(name);
+            if (!value || !value->is_string()) return std::nullopt;
+            const std::string_view field{value->as_string().data(),value->as_string().size()};
+            if (field.empty() || field.size()>limit || std::ranges::any_of(field,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);return byte<0x20U || byte==0x7fU;
+            })) return std::nullopt;
+            return field;
+        };
+        const auto supplied=read(completing?"code":"password",completing?6U:1024U);
+        if (!supplied) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (completing) {
+            const auto id=read("enrollment_id",200U);
+            if (!id || supplied->size()!=6U || !std::ranges::all_of(*supplied,[](char ch){return ch>='0' && ch<='9';}))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            enrollmentId.assign(*id);
+        }
+        proof=foundation::SecretString{std::string{*supplied}};
+    }
+    request.wipeBody();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    // Sensitive MFA changes require a first-party session. Do not use the
+    // delegated-account authentication callback.
+    auto actor=co_await m_totp.authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    if (!m_limiter->allow("account:totp:identity:"+std::string{actor->identity().value()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    if (starting) {
+        auto started=co_await m_totp.begin(actor->identity(),std::move(proof),actor->assurance());
+        if (!started) co_return fail(started.error(),request);
+        auto& [id,seed,expiry,replacing]=started.value();
+        co_return jsonResponse(201,json::object{{"enrollment_id",id},{"secret_base32",seed.expose()},
+            {"expires_at_ms",expiry.time_since_epoch().count()},{"replacing",replacing}});
+    }
+    if (completing) {
+        auto status=co_await m_totp.complete(actor->identity(),std::move(enrollmentId),std::move(proof),actor->assurance());
+        if (!status) co_return fail(status.error(),request);
+        co_return jsonResponse(200,json::object{{"enabled",true}});
+    }
+    if (!identity::provider::meetsAssurance(actor->assurance(),identity::provider::AssuranceLevel::Ial2))
+        co_return fail(foundation::Error{foundation::ErrorCode::AssuranceInsufficient},request);
+    auto status=co_await m_totp.disable(actor->identity(),std::move(proof),actor->assurance());
+    if (!status) co_return fail(status.error(),request);
+    co_return jsonResponse(200,json::object{{"enabled",false},{"recovery_codes_revoked",true}});
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::verifyPhone(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    const bool email=emailChangeVerifyRoute(request);
+    if (!m_authenticate || (email ? !m_verifyEmailChange : !m_verifyPhone))
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    std::string generation;
+    foundation::SecretString proof;
+    std::optional<foundation::SecretString> enrollment;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object() || parsed.as_object().size()<2U
+            || parsed.as_object().size()>(email?3U:2U))
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        for (const auto& entry:parsed.as_object()) {
+            if (entry.key()!="verification_id" && entry.key()!="secret" && !(email && entry.key()=="password"))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        }
+        const auto* id=parsed.as_object().if_contains("verification_id");
+        const auto* secret=parsed.as_object().if_contains("secret");
+        if (!id || !secret || !id->is_string() || !secret->is_string())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        const std::string_view identifier{id->as_string().data(),id->as_string().size()};
+        const std::string_view value{secret->as_string().data(),secret->as_string().size()};
+        const auto valid=[](std::string_view text,std::size_t maximum) {
+            return !text.empty() && text.size()<=maximum && std::ranges::none_of(text,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);return byte<0x20U || byte==0x7fU;
+            });
+        };
+        if (!valid(identifier,200U) || !valid(value,email?512U:64U))
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (email) {
+            if (const auto* field=parsed.as_object().if_contains("password");field && !field->is_null()) {
+                if (!field->is_string())
+                    co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+                const std::string_view supplied{field->as_string().data(),field->as_string().size()};
+                if (!valid(supplied,1024U) || supplied.size()<8U)
+                    co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+                enrollment.emplace(std::string{supplied});
+            }
+        }
+        generation.assign(identifier);
+        proof=foundation::SecretString{std::string{value}};
+    }
+    request.wipeBody();
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential) co_return fail(credential.error(),request);
+    if (!credential->has_value())
+        co_return fail(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) co_return fail(actor.error(),request);
+    foundation::Result<identity::profile::IdentityProfile> value=foundation::fail(foundation::ErrorCode::Unavailable);
+    if (email) value=co_await m_verifyEmailChange(actor->identity(),VerificationId{std::move(generation)},std::move(proof),std::move(enrollment));
+    else value=co_await m_verifyPhone(actor->identity(),VerificationId{std::move(generation)},std::move(proof));
+    if (!value) co_return fail(value.error(),request);
+    if (value->identity()!=actor->identity())
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    json::object body;
+    body["identity_id"]=value->identity().value();
+    if (value->displayName()) body["display_name"]=*value->displayName();
+    if (value->preferredUsername()) body["preferred_username"]=*value->preferredUsername();
+    if (value->email()) body["email"]=*value->email();
+    body["email_verified"]=value->emailVerified();
+    if (value->phoneNumber()) body["phone_number"]=*value->phoneNumber();
+    body["phone_number_verified"]=value->phoneNumberVerified();
+    if (value->locale()) body["locale"]=*value->locale();
+    if (value->pictureUrl()) body["picture"]=*value->pictureUrl();
+    body["avatar_source"]=value->avatarSource();
+    co_return jsonResponse(200,std::move(body));
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineContactVerificationAdapter::signupOrVerify(gateway::HttpRequest request)
+{
+    SensitiveSessionHeadersGuard wipeHeaders{request};
+    PasswordRequestGuard wipeBody{request};
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    const bool reset=resetRoute(request);
+    if (reset ? !m_resetPassword : (!m_signup || !m_verifySignup))
+        co_return fail(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_limiter->allow("account:"+std::string{request.remoteAddress()}+":"+std::string{request.path()}))
+        co_return fail(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    const auto type=request.header("content-type");
+    if (request.body().empty() || request.body().size()>32U*1024U || !type
+        || (*type!="application/json" && !type->starts_with("application/json;")))
+        co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const bool signup=request.path()=="/account/signup";
+    std::string identifier;
+    std::optional<std::string> displayName;
+    foundation::SecretString proof;
+    foundation::SecretString newPassword;
+    {
+        boost::system::error_code ec;
+        auto parsed=json::parse(request.body(),ec);
+        ParsedPasswordGuard wipeParsed{parsed};
+        if (ec || !parsed.is_object())
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        auto& object=parsed.as_object();
+        for (const auto& entry:object) {
+            if (signup ? (entry.key()!="email" && entry.key()!="password" && entry.key()!="display_name")
+                       : (entry.key()!="verification_id" && entry.key()!="secret"
+                          && !(reset && entry.key()=="new_password")))
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        }
+        const auto bounded=[&](const char* name,std::size_t maximum)->std::optional<std::string_view>{
+            const auto* field=object.if_contains(name);
+            if (!field || !field->is_string()) return std::nullopt;
+            const std::string_view value{field->as_string().data(),field->as_string().size()};
+            if (value.empty() || value.size()>maximum || std::ranges::any_of(value,[](char ch){
+                const auto byte=static_cast<unsigned char>(ch);
+                return byte<0x20U || byte==0x7fU;
+            })) return std::nullopt;
+            return value;
+        };
+        const auto name=bounded(signup?"email":"verification_id",signup?320U:200U);
+        const auto secret=bounded(signup?"password":"secret",signup?1024U:512U);
+        if (!name || !secret)
+            co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        if (signup && object.contains("display_name") && !object.at("display_name").is_null()) {
+            const auto label=bounded("display_name",256U);
+            if (!label) co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            displayName=std::string{*label};
+        }
+        if (reset) {
+            const auto password=bounded("new_password",1024U);
+            if (!password || password->size()<8U)
+                co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+            newPassword=foundation::SecretString{std::string{*password}};
+        }
+        identifier.assign(*name);
+        proof=foundation::SecretString{std::string{*secret}};
+    }
+    request.wipeBody();
+    if (reset) {
+        auto changed=co_await m_resetPassword(VerificationId{std::move(identifier)},
+            std::move(proof),std::move(newPassword));
+        if (!changed) co_return fail(changed.error(),request);
+        co_return jsonResponse(200,json::object{{"password_reset",true}});
+    }
+    if (signup) {
+        auto owner=co_await m_signup(std::move(identifier),std::move(proof),std::move(displayName));
+        if (!owner) co_return fail(owner.error(),request);
+        if (owner->empty()) co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+        co_return jsonResponse(201,json::object{{"identity_id",owner->value()},{"verification_required",true}});
+    }
+    identity::provider::ClientContext client;
+    client.setRemoteAddress(std::string{request.remoteAddress()});
+    if (const auto agent=request.header("user-agent"))
+        client.setUserAgent(std::string{agent->substr(0U,1024U)});
+    auto issued=co_await m_verifySignup(VerificationId{std::move(identifier)},std::move(proof),std::move(client));
+    if (!issued) co_return fail(issued.error(),request);
+    const auto safe=[](std::string_view value){
+        return !value.empty() && value.size()<=128U && std::ranges::all_of(value,[](char ch){
+            return (ch>='a' && ch<='z') || (ch>='A' && ch<='Z')
+                || (ch>='0' && ch<='9') || ch=='-' || ch=='_';
+        });
+    };
+    if (!safe(issued->id.value()) || !safe(issued->token.expose()))
+        co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+    auto response=jsonResponse(200,json::object{{"verified",true},{"session_id",issued->id.value()},
+        {"assurance",identity::provider::assuranceLevelName(identity::provider::AssuranceLevel::Ial1)}});
+    response.addHeader("set-cookie","__Host-openproof-session="+std::string{issued->token.expose()}
+        +"; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Strict");
+    co_return response;
 }
 
 } // namespace openproof::account::http

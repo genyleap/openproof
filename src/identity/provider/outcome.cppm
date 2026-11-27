@@ -182,7 +182,9 @@ public:
     [[nodiscard]] static foundation::Result<AuthenticationOutcome>
     create(ProviderId provider, ExternalSubject subject, VerifiedClaims claims,
            AssuranceLevel claimedAssurance, AuthenticationStrength strength,
-           ProviderEvidence evidence, foundation::Instant verifiedAt);
+           ProviderEvidence evidence, foundation::Instant verifiedAt,
+           std::optional<std::string> requiredCanonicalOwner = std::nullopt,
+           std::optional<foundation::Instant> passwordGeneration = std::nullopt);
 
     [[nodiscard]] const ProviderId& provider() const noexcept;
     [[nodiscard]] const ExternalSubject& subject() const noexcept;
@@ -194,11 +196,18 @@ public:
     [[nodiscard]] const AuthenticationStrength& strength() const noexcept;
     [[nodiscard]] const ProviderEvidence& evidence() const noexcept;
     [[nodiscard]] foundation::Instant verifiedAt() const noexcept;
+    // Optional internal constraint, not a claim or authority to provision.
+    // Trusted finalization must resolve the subject to this existing owner.
+    [[nodiscard]] const std::optional<std::string>& requiredCanonicalOwner() const noexcept;
+    // Internal proof constraint. Not a claim, not serialized to clients.
+    [[nodiscard]] std::optional<foundation::Instant> passwordGeneration() const noexcept;
 
 private:
     AuthenticationOutcome(ProviderId provider, ExternalSubject subject, VerifiedClaims claims,
                           AssuranceLevel claimedAssurance, AuthenticationStrength strength,
-                          ProviderEvidence evidence, foundation::Instant verifiedAt);
+                          ProviderEvidence evidence, foundation::Instant verifiedAt,
+                          std::optional<std::string> requiredCanonicalOwner,
+                          std::optional<foundation::Instant> passwordGeneration);
 
     ProviderId m_provider;
     ExternalSubject m_subject;
@@ -207,6 +216,8 @@ private:
     AuthenticationStrength m_strength;
     ProviderEvidence m_evidence;
     foundation::Instant m_verifiedAt{};
+    std::optional<std::string> m_requiredCanonicalOwner;
+    std::optional<foundation::Instant> m_passwordGeneration;
 };
 
 }

@@ -28,6 +28,9 @@ enum class ClientKind {
 
 [[nodiscard]] std::string_view clientKindName(ClientKind kind) noexcept;
 [[nodiscard]] bool clientIsPublic(ClientKind kind) noexcept;
+// Shared exact/loopback matching policy for native SQL authorization.
+[[nodiscard]] bool matchesRegisteredRedirect(ClientKind kind,std::string_view registered,
+    std::string_view presented) noexcept;
 
 enum class ClientStatus {
     Active,
@@ -95,6 +98,18 @@ public:
 
 private:
     std::array<std::byte, 32> m_digest{};
+};
+
+enum class ManagementMutation { Create, Suspend, Activate, Revoke, RotateSecret };
+struct ManagementMutationCommand final {
+    ManagementMutation operation;
+    ClientId id;
+    std::optional<application::ApplicationId> applicationId;
+    std::string name;
+    ClientKind kind=ClientKind::Web;
+    std::vector<RedirectUri> redirects;
+    std::vector<Scope> scopes;
+    std::optional<ClientSecretDigest> digest;
 };
 
 /**

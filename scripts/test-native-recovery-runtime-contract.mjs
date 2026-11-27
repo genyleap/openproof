@@ -6,10 +6,11 @@ const root = path.resolve(import.meta.dirname, "..");
 const read = p => fs.readFileSync(path.join(root,p), "utf8");
 const app = read("apps/opp/main.cpp");
 const http = read("src/authentication/http/coroutine_recovery_code_http.cpp");
-test("recovery issuance is an independent, disabled-by-default method-scoped capability", () => {
-  assert.match(app, /nativeRecoveryFlag && \*nativeRecoveryFlag == "1"/);
+test("recovery issuance is mandatory with a strict fail-closed runtime route", () => {
+  assert.match(app, /const bool nativeRecoveryEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\| \(nativeRecoveryFlag && \*nativeRecoveryFlag == "1"\)/);
+  assert.match(app, /platform\.auth\(\)\.enabled\(\) && nativeRecoveryFlag && \*nativeRecoveryFlag == "0"/);
   assert.match(app, /nativeRecoveryEnabled && \(!nativeAuthSessionEnabled \|\| !platform\.auth\(\)\.enabled\(\)\)/);
-  assert.match(app, /nativeMethods\.emplace_back\("\/auth\/recovery-codes", gateway::HttpMethod::Post\)/);
+  assert.match(app, /nativePaths\.emplace_back\("\/auth\/recovery-codes"\)/);
   assert.match(app, /#ifndef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP\s+if \(nativeRecoveryEnabled\)/);
   assert.match(app, /if \(nativeRecoveryEnabled\) nativeRecoverySecret\.emplace\(recoverySecret->clone\(\)\)/);
   assert.match(read("apps/opp/CMakeLists.txt"), /if\(TARGET openproof_authentication_async_recovery_http\)/);
@@ -17,18 +18,42 @@ test("recovery issuance is an independent, disabled-by-default method-scoped cap
 test("runtime injects genuine native session and tenant-scoped eligibility, never synchronous stores", () => {
   const body = app.slice(app.indexOf("asyncRecovery = std::make_unique<"), app.indexOf("nativeHandler = asyncRecovery.get()"));
   assert.match(body, /return service->authenticate\(std::move\(bearer\)\)/);
-  assert.match(body, /co_await canonical->readTotpStatusAsync\(owner, providerId\)/);
-  assert.match(body, /status->first != owner/);
-  assert.match(body, /status->second\.value_or\(false\)/);
+  assert.match(body, /\*nativeHandler, limiter\.value\(\), \*nativeRecoveryCodes/);
+  assert.doesNotMatch(body, /readTotpStatusAsync|eligibleAsync/);
+  const wiring = app.slice(app.indexOf("nativeRecoveryRepository = std::make_unique<"), app.indexOf("nativeRecoveryCodes.emplace"));
+  assert.match(wiring, /CoroutinePostgresRecoveryCodeRepository/);
+  assert.match(wiring, /platform\.auth\(\)\.organizationId\(\)\}\},\s*providerId/);
+  assert.match(wiring, /CoroutineRecoveryCodeService::create\(\s*\*nativeRecoveryRepository/);
+  assert.match(http, /co_await m_recoveryCodes->issueFenced\(authenticated->identity\(\), 10U\)/);
+  assert.doesNotMatch(http, /m_recoveryCodes->issue\(/);
+  const service = read("src/credentials/coroutine_recovery_codes.cpp");
+  assert.match(service, /co_await m_repository->captureIssuanceAsync\(identity\)/);
+  assert.match(service, /co_await m_repository->replaceFencedAsync\(/);
+  const repo = read("src/storage/postgres/coroutine_recovery_code_repository.cpp");
+  assert.match(repo, /i\.id=\$1 AND i\.organization_id=\$2 AND e\.provider=\$3/);
+  assert.match(repo, /co_await m_impl->sql\.replaceFenced\(/);
+  const sql = read("src/storage/postgres/async_recovery_code.cpp");
+  assert.match(sql, /p\.changed_at_ms=\$4::bigint AND t\.enrolled_at_ms=\$5::bigint/);
+  assert.ok(sql.indexOf("FOR SHARE OF p,e,t") >= 0 && sql.indexOf("FOR SHARE OF p,e,t") < sql.indexOf('"DELETE FROM "'));
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"), /RecoveryIssuanceFenceRejectsChangedFactorWithoutDeletingNewBatch/);
+  assert.match(read("tests/authentication/coroutine_recovery_code_http_test.cpp"), /FailedFencedWriteCannotLeakPlaintext/);
   assert.match(http, /if \(request\.path\(\) == "\/auth\/recovery-codes"\)/);
   assert.match(http, /m_nativeFallback->nativeEnabledFor\(request\)/);
   assert.match(http, /co_await m_nativeFallback->handleAsync\(std::move\(request\)\)/);
   assert.doesNotMatch(http, /m_nativeFallback->handle\(/);
   assert.match(read("tests/authentication/coroutine_recovery_code_http_test.cpp"), /OtherNativeAuthCapabilityIsPreserved/);
 });
-test("CI exercises two real database E2Es and legacy one-time redemption", () => {
-  assert.equal((read(".github/workflows/ci.yml").match(/OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/g) ?? []).length, 2);
+test("CI exercises native redemption by default, with historic baseline explicitly separated", () => {
+  const ci = read(".github/workflows/ci.yml");
+  assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/g) ?? []).length, 3);
+  const pilot = ci.slice(ci.indexOf("- name: Native LDAP TLS and PostgreSQL HTTP E2E"),
+    ci.indexOf("- name: Isolated OpenProof PostgreSQL E2E"));
+  assert.match(pilot, /OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"/);
+  assert.match(pilot, /OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES: "1"/);
+  assert.equal((ci.match(/OPENPROOF_EXPERIMENTAL_NATIVE_LOCAL_LOGIN: "1"/g) ?? []).length, 1);
   const e2e = read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e, /OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1"/);
+  assert.match(read("scripts/ci/run-paired-e2e-baseline.sh"), /OPENPROOF_E2E_EXPECT_LEGACY_AUTH="1"/);
   assert.match(e2e, /await recover\(old\[0\], 401\)/);
   assert.match(e2e, /await recover\(fresh\[0\], 200\)/);
   assert.match(e2e, /await recover\(fresh\[0\], 401\)/);

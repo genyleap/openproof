@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace openproof::storage::postgres::async_detail {
@@ -32,6 +33,19 @@ public:
         std::vector<std::string> digestsHex,
         std::chrono::milliseconds timeout);
 
+    struct IssuanceScope final {
+        std::string tenant;
+        std::string provider;
+        std::string subject;
+        std::string credentialGeneration;
+        std::string factorGeneration;
+    };
+    // Lock the same owner and factor generation as MFA mutation, before
+    // touching the old batch. False leaves that batch entirely unchanged.
+    [[nodiscard]] boost::asio::awaitable<bool> replaceFenced(
+        AsyncConnection& conn,std::string identityId,std::vector<std::string> digestsHex,
+        IssuanceScope scope,std::chrono::milliseconds timeout);
+
     // Atomic DELETE ... RETURNING, false for missing, used or foreign codes.
     // A replay can never succeed, even with concurrent clients.
     [[nodiscard]] boost::asio::awaitable<bool> consume(
@@ -51,6 +65,9 @@ public:
         std::string localProviderId, std::chrono::milliseconds timeout);
 
 private:
+    [[nodiscard]] boost::asio::awaitable<bool> replaceImpl(
+        AsyncConnection& conn,std::string identityId,std::vector<std::string> digestsHex,
+        std::optional<IssuanceScope> scope,std::chrono::milliseconds timeout);
     Table m_table;
 };
 } // namespace openproof::storage::postgres::async_detail

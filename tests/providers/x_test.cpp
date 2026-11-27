@@ -77,7 +77,7 @@ TEST(XAuthenticationProviderTest, RejectsWrongProviderBeforeNetwork)
     EXPECT_EQ(challenge.error().code(), fnd::ErrorCode::InvalidArgument);
 }
 
-TEST(XAuthenticationProviderTest, RejectsIncompleteOauth1CallbackBeforeNetwork)
+TEST(XAuthenticationProviderTest, RetiredSynchronousCallbackAlwaysRejectsBeforeNetwork)
 {
     auto configured = configuration(
         "https://identity.example.test/auth/federated/callback");
@@ -94,7 +94,7 @@ TEST(XAuthenticationProviderTest, RejectsIncompleteOauth1CallbackBeforeNetwork)
     auto outcome = provider.completeAuthentication(response);
 
     ASSERT_FALSE(outcome);
-    EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(outcome.error().code(), fnd::ErrorCode::Unavailable);
 }
 
 } // namespace

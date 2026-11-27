@@ -58,13 +58,17 @@ test("the same gateway library links all three C++26 implementation files",()=>{
   assert.match(cmake,/openproof_add_module\(openproof_gateway_http/);
 });
 
-test("scanner covers all implementation units and keeps blocking legacy proxy finding",()=>{
+test("scanner covers all implementation units and requires retirement of blocking proxy",()=>{
   for(const file of ["src/gateway/http.cpp","src/gateway/http_proxy.cpp",
                      "src/gateway/http_coroutine.cpp"])
     assert.ok(scanner.includes('"'+file+'"'));
   assert.match(scanner,/legacy proxy facade still blocks a calling thread/);
-  assert.match(proxy,/context\.run\(\)/);
-  assert.match(proxy,/co_await sendAsync\(std::move\(endpoint\)/);
+  assert.doesNotMatch(proxy,/context\.run\(\)|asio::use_future|sendResultAsync/);
+  const sync=proxy.slice(proxy.indexOf("BeastProxyTransport::send("),proxy.indexOf("BeastProxyTransport::sendAsync("));
+  assert.match(sync,/return foundation::fail\(foundation::ErrorCode::Unavailable/);
+  assert.doesNotMatch(sync,/co_spawn|m_implementation->/);
+  assert.match(proxy,/co_await m_implementation->sendAsync\(/);
+  assert.match(scanner,/proxy synchronous ABI or production native wiring is not retired/);
   assert.match(middleware,/co_await m_transport->sendAsync\(/);
 });
 

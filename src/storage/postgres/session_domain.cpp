@@ -10,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.provider;

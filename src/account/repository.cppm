@@ -31,6 +31,18 @@ public:
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity = nullptr) = 0;
 
+    /** Atomic purpose-bound consumption. Unsupported external adapters
+     * fail closed; the compatibility consume API never substitutes for
+     * a purpose check performed under the repository lock.
+     */
+    [[nodiscard]] virtual foundation::Result<VerificationChallenge> consumeForPurpose(
+        const VerificationId&, const VerificationDigest&,
+        foundation::Instant, std::uint32_t, VerificationPurpose,
+        const identity::core::IdentityId* = nullptr)
+    {
+        return foundation::fail(foundation::ErrorCode::NotImplemented);
+    }
+
     /** Reserves an unverified provider subject so two pending accounts cannot claim it. */
     [[nodiscard]] virtual foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
@@ -44,6 +56,22 @@ public:
     [[nodiscard]] virtual foundation::Status releaseSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& expectedOwner) = 0;
+
+    /** Generation-aware reservation access for a consumed verification proof.
+     * Untagged adapters retain their legacy behavior.
+     */
+    [[nodiscard]] virtual foundation::Result<std::optional<identity::core::IdentityId>>
+    reservedOwnerForChallenge(const identity::core::ExternalIdentityRef& external,
+                              foundation::Instant now, const VerificationId&) const
+    {
+        return reservedOwner(external, now);
+    }
+    [[nodiscard]] virtual foundation::Status releaseSubjectForChallenge(
+        const identity::core::ExternalIdentityRef& external,
+        const identity::core::IdentityId& expectedOwner, const VerificationId&)
+    {
+        return releaseSubject(external, expectedOwner);
+    }
 
 protected:
     AccountRepository() = default;
@@ -59,6 +87,11 @@ public:
         const VerificationId& id, const VerificationDigest& presented,
         foundation::Instant now, std::uint32_t maximumAttempts,
         const identity::core::IdentityId* expectedIdentity = nullptr) override;
+    [[nodiscard]] foundation::Result<VerificationChallenge> consumeForPurpose(
+        const VerificationId& id, const VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        VerificationPurpose expectedPurpose,
+        const identity::core::IdentityId* expectedIdentity = nullptr) override;
     [[nodiscard]] foundation::Status reserveSubject(
         const identity::core::ExternalIdentityRef& external,
         const identity::core::IdentityId& identity,
@@ -71,6 +104,11 @@ public:
         const identity::core::IdentityId& expectedOwner) override;
 
 private:
+    [[nodiscard]] foundation::Result<VerificationChallenge> consumeImpl(
+        const VerificationId& id, const VerificationDigest& presented,
+        foundation::Instant now, std::uint32_t maximumAttempts,
+        const identity::core::IdentityId* expectedIdentity,
+        std::optional<VerificationPurpose> expectedPurpose);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

@@ -19,7 +19,6 @@ const repository=read("src/storage/postgres/coroutine_recovery_code_repository.c
 test("recovery-code native HTTP is a per-route Asio handler without sync fallback",()=>{
   assert.match(header,/public gateway::http::CoroutineHttpHandler/);
   assert.match(header,/using Authenticate = std::function<boost::asio::awaitable</);
-  assert.match(header,/using Eligible = std::function<boost::asio::awaitable</);
   assert.match(header,/nativeEnabled\(\) const noexcept override \{ return false; \}/);
   assert.match(code,/request\.method\(\) == gateway::HttpMethod::Post/);
   assert.match(code,/request\.path\(\) ==/);
@@ -47,23 +46,17 @@ test("native route verifies bearer, IAL2 and DB TOTP eligibility before issuing 
     /co_await m_authenticate\(/,
     /idp::meetsAssurance\(authenticated->assurance\(\)/,
     /idp::AssuranceLevel::Ial2/,
-    /co_await m_eligible\(authenticated->identity\(\)\)/,
-    /co_await m_recoveryCodes->issue\(authenticated->identity\(\), 10U\)/,
-    /co_await m_recoveryCodes->revoke\(authenticated->identity\(\)\)/,
+    /co_await m_recoveryCodes->issueFenced\(authenticated->identity\(\), 10U\)/,
     /codes\.emplace_back\(code\.expose\(\)\)/,
     /co_return jsonResponse\(201/,
   ]) assert.match(issue,re);
-  const firstCheck=issue.indexOf("co_await m_eligible");
-  const issueAt=issue.indexOf("co_await m_recoveryCodes->issue");
-  const secondCheck=issue.lastIndexOf("co_await m_eligible");
-  const revokeAt=issue.indexOf("co_await m_recoveryCodes->revoke");
+  const issueAt=issue.indexOf("co_await m_recoveryCodes->issueFenced");
+  const denied=issue.indexOf("if (!issued)");
   const responseAt=issue.indexOf("co_return jsonResponse(201");
-  assert.ok(firstCheck>=0 && issueAt>firstCheck && secondCheck>issueAt
-            && revokeAt>secondCheck && responseAt>revokeAt);
+  assert.ok(issueAt>=0 && denied>issueAt && responseAt>denied);
   assert.match(file,/cache-control/);
   assert.match(file,/no-store/);
-  assert.match(issue,/co_await m_recoveryCodes->issue\(/);
-  assert.match(issue,/co_await m_recoveryCodes->revoke\(/);
+  assert.doesNotMatch(issue,/m_recoveryCodes->revoke|m_eligible/);
 });
 
 test("native SQL eligibility binds canonical active identity and configured local provider",()=>{
@@ -93,8 +86,8 @@ test("HTTP GTests cover negative and cross-check revocation before any secret re
     "WeakOrMissingSessionNeverIssuesCode",
     "NativeIssueReturnsTenCodesOnlyAfterPersistence",
     "MissingTotpStopsBeforeAnyPersistence",
-    "RevokedTotpDuringIssueBurnsAllCodes",
-    "FailedEligibilityRecheckCannotLeakPlaintext",
+    "ChangedFactorDuringIssuePreservesNewerBatch",
+    "FailedFencedWriteCannotLeakPlaintext",
     "PersistenceAndEligibilityErrorsFailClosed",
   ]) assert.match(fixture,new RegExp("TEST\\(CoroutineRecoveryHttpTest, "+name+"\\)"));
   assert.match(fixture,/fnd::SecretString\{std::string\(32U, 'P'\)\}/);

@@ -15,7 +15,6 @@
 // Import modules only after all transitive textual standard/Asio headers.
 #include "coroutine_session_repository.hpp"
 
-import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.session;
@@ -59,11 +58,44 @@ captureSessionRecord(const session::Session& value)
     };
 }
 
+// The identity lock precedes the password/link lock, matching reset.
+// The second READ COMMITTED statement sees changes committed while
+// waiting for the owner lock. Locks survive through session persistence.
+asio::awaitable<bool> lockPasswordGeneration(
+    async_detail::AsyncConnection& connection,const async_detail::AsyncSessionSql::NewSession& row,
+    const CoroutinePostgresSessionRepository::PasswordFence& fence,Deadline deadline)
+{
+    if (fence.subject.empty() || fence.subject.value().size()>1000U
+        || fence.subject.value().find('\0')!=std::string_view::npos
+        || fence.generation.time_since_epoch().count()<0)
+        co_return false;
+    using Params=std::vector<std::optional<std::string>>;
+    Params owner{row.identityId};
+    const auto active=co_await connection.query(
+        "SELECT i.id FROM openproof.identities i JOIN openproof.organizations o ON o.id=i.organization_id "
+        "WHERE i.id=$1 AND i.kind=0 AND i.status=0 AND o.state=0 FOR UPDATE OF i FOR SHARE OF o",
+        std::move(owner),remaining(deadline));
+    const auto exact=[&](const auto& result) {
+        return result.rows.size()==1U && result.rows.front().size()==1U
+            && result.rows.front().front()==row.identityId;
+    };
+    if (!exact(active)) co_return false;
+    Params credential{row.identityId,row.provider,std::string{fence.subject.value()},
+        std::to_string(fence.generation.time_since_epoch().count())};
+    const auto generation=co_await connection.query(
+        "SELECT p.identity_id FROM openproof.password_credentials p "
+        "JOIN openproof.external_identities e ON e.identity_id=p.identity_id "
+        "WHERE p.identity_id=$1 AND e.provider=$2 AND e.external_subject=$3 "
+        "AND p.changed_at_ms=$4 FOR SHARE OF p,e",std::move(credential),remaining(deadline));
+    co_return exact(generation);
+}
+
 asio::awaitable<foundation::Status> insertCapturedSession(
     async_detail::AsyncConnectionPool& pool,
     async_detail::AsyncSessionSql& sql,
     foundation::Duration timeout,
-    std::optional<async_detail::AsyncSessionSql::NewSession> row)
+    std::optional<async_detail::AsyncSessionSql::NewSession> row,
+    std::optional<CoroutinePostgresSessionRepository::PasswordFence> fence=std::nullopt)
 {
     if (!row) {
         co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
@@ -72,7 +104,16 @@ asio::awaitable<foundation::Status> insertCapturedSession(
     try {
         const Deadline deadline = Clock::now() + timeout;
         auto lease = co_await pool.acquire(deadline);
-        co_await sql.add(lease.connection(), std::move(*row), remaining(deadline));
+        auto& connection=lease.connection();
+        if (fence) {
+            static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+            if (!(co_await lockPasswordGeneration(connection,*row,*fence,deadline))) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+            }
+        }
+        co_await sql.add(connection, std::move(*row), remaining(deadline));
+        if (fence) static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
@@ -165,9 +206,18 @@ CoroutinePostgresSessionRepository::add(session::Session value)
 }
 
 asio::awaitable<foundation::Status>
+CoroutinePostgresSessionRepository::addFenced(session::Session value,PasswordFence fence)
+{
+    std::optional<async_detail::AsyncSessionSql::NewSession> row;
+    if (value.state()==session::SessionState::Active) row.emplace(captureSessionRecord(value));
+    return insertCapturedSession(m_impl->pool,m_impl->sql,m_impl->queryTimeout,
+        std::move(row),std::move(fence));
+}
+
+asio::awaitable<foundation::Status>
 CoroutinePostgresSessionRepository::replace(
     session::Session value, session::SessionId previousId,
-    session::TokenDigest previousDigest, foundation::Instant now)
+    session::TokenDigest previousDigest, foundation::Instant now,std::optional<PasswordFence> fence)
 {
     if (value.state() != session::SessionState::Active
         || value.id() == previousId) {
@@ -179,15 +229,25 @@ CoroutinePostgresSessionRepository::replace(
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
         auto row = captureSessionRecord(value);
         auto lease = co_await m_impl->pool.acquire(deadline);
+        auto& connection=lease.connection();
+        if (fence) {
+            static_cast<void>(co_await connection.query("BEGIN ISOLATION LEVEL READ COMMITTED",{},remaining(deadline)));
+            if (!(co_await lockPasswordGeneration(connection,row,*fence,deadline))) {
+                static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
+                co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+            }
+        }
         const bool replaced = co_await m_impl->sql.replace(
-            lease.connection(), std::move(row), std::string{previousId.value()},
+            connection, std::move(row), std::string{previousId.value()},
             foundation::toHex(previousDigest.bytes()),
             now.time_since_epoch().count(), remaining(deadline));
         if (!replaced) {
+            if (fence) static_cast<void>(co_await connection.query("ROLLBACK",{},remaining(deadline)));
             co_return foundation::fail(
                 foundation::ErrorCode::FailedPrecondition,
                 "The previous session is no longer active.");
         }
+        if (fence) static_cast<void>(co_await connection.query("COMMIT",{},remaining(deadline)));
         co_return foundation::ok();
     } catch (const std::exception&) {
         co_return foundation::fail(

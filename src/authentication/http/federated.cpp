@@ -286,9 +286,10 @@ FederatedAuthenticationHttpApi::FederatedAuthenticationHttpApi(
     AuthenticationService& authentication, idp::ProviderRegistry& providers,
     session::SessionService& sessions, gateway::TokenBucketRateLimiter& rateLimiter,
     gateway::HttpHandler& fallback,
-    session::DelegatedAccessAuthenticator* delegated)
+    session::DelegatedAccessAuthenticator* delegated, bool nativeRedirectsRequired)
     : m_authentication(&authentication), m_providers(&providers), m_sessions(&sessions),
-      m_delegated(delegated), m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
+      m_delegated(delegated), m_rateLimiter(&rateLimiter), m_fallback(&fallback),
+      m_nativeRedirectsRequired(nativeRedirectsRequired) {}
 
 gateway::HttpResponse FederatedAuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request,
@@ -304,6 +305,16 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::error(
 
 gateway::HttpResponse FederatedAuthenticationHttpApi::handle(gateway::HttpRequest request)
 {
+    if (m_nativeRedirectsRequired &&
+        (request.path()=="/auth/federated/start"
+         || request.path()=="/auth/federated/callback"
+         || request.path()=="/account/connections/start"
+         || request.path()=="/account/connections/handoff"
+         || request.path()=="/account/connections/complete")) {
+        request.wipeTargetQuery(); request.wipeBody();
+        request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request,true);
+    }
     if (request.path() == "/auth/providers" && request.method() == gateway::HttpMethod::Get) {
         return providers();
     }
@@ -391,6 +402,28 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::start(
             credential->value(), m_delegated, "account");
         if (!authenticated) return error(authenticated.error(), request, true);
         connectionTarget.emplace(authenticated->session().identity());
+    }
+    if (m_nativeRedirectsRequired) {
+        // Authorization has already passed the existing account scope and
+        // sender-constraint checks. Turn that authorization into the same
+        // single-use owner-bound ticket as POST /account/connections/handoff.
+        // Only the native redemption route may start remote provider I/O.
+        const idp::ProviderId providerId{providerIt->second};
+        auto* implementation=m_providers->find(providerId);
+        if (!implementation || implementation->interactionModel()!=idp::InteractionModel::Redirect
+            || !dynamic_cast<idp::CoroutineAuthenticationProvider*>(implementation))
+            return error(foundation::Error{foundation::ErrorCode::NotFound},request,true);
+        if (!connectionTarget)
+            return error(foundation::Error{foundation::ErrorCode::Unavailable},request,true);
+        auto issued=m_authentication->issueBrowserConnectionHandoff(*connectionTarget,
+            providerId,returnTarget,request.correlation());
+        if (!issued) return error(issued.error(),request,true);
+        request.wipeTargetQuery(); request.wipeBody();
+        request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        gateway::HttpResponse response{302,gateway::Headers{{"location",
+            "/account/connections/handoff?ticket="+issued->ticket().expose()}},{}};
+        secure(response);
+        return response;
     }
     return startPrepared(std::move(request), idp::ProviderId{providerIt->second},
                          returnTarget, std::move(connectionTarget));

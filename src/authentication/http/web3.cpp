@@ -67,7 +67,7 @@ public:
     ~SensitiveWeb3ParsedGuard() { wipe(); }
     void wipe() noexcept {
         if (!m_body) return;
-        for (std::string_view key : {"handoff_ticket", "message", "signature"}) {
+        for (std::string_view key : {"handoff_ticket", "redeem_ticket", "message", "signature"}) {
             if (auto* field=m_body->if_contains(key); field && field->is_string()) {
                 auto& value=field->as_string();
                 foundation::secureWipe(value.data(), value.size());
@@ -141,7 +141,8 @@ void clearState(gateway::HttpResponse& response)
 }
 
 [[nodiscard]] std::optional<std::string> cookieValue(
-    const gateway::HttpRequest& request, std::string_view wanted, std::size_t maximum)
+    const gateway::HttpRequest& request, std::string_view wanted, std::size_t maximum,
+    bool* malformed = nullptr)
 {
     const auto header = request.header("cookie");
     if (!header) return std::nullopt;
@@ -162,7 +163,10 @@ void clearState(gateway::HttpResponse& response)
                        return (symbol >= 'A' && symbol <= 'Z') || (symbol >= 'a' && symbol <= 'z')
                            || (symbol >= '0' && symbol <= '9') || symbol == '-' || symbol == '_' || symbol == '.';
                    });
-            if (!safe || found) return std::nullopt;
+            if (!safe || found) {
+                if (malformed) *malformed=true;
+                return std::nullopt;
+            }
             found = value;
         }
         if (end == std::string_view::npos) break;
@@ -255,10 +259,18 @@ Web3AuthenticationHttpApi::Web3AuthenticationHttpApi(
     session::SessionService& sessions, gateway::TokenBucketRateLimiter& rateLimiter,
     gateway::HttpHandler& fallback,
     session::DelegatedAccessAuthenticator* delegated,
-    session::CoroutineSessionIssuer* asyncSessions)
+    session::CoroutineSessionIssuer* asyncSessions, Authenticate authenticate)
     : m_authentication(&authentication), m_providers(&providers), m_sessions(&sessions),
       m_delegated(delegated), m_asyncSessions(asyncSessions),
+      m_authenticate(std::move(authenticate)),
       m_rateLimiter(&rateLimiter), m_fallback(&fallback) {}
+
+Web3AuthenticationHttpApi::Web3AuthenticationHttpApi(
+    AuthenticationService& authentication,idp::ProviderRegistry& providers,
+    gateway::TokenBucketRateLimiter& rateLimiter,gateway::HttpHandler& fallback,
+    session::CoroutineSessionIssuer& asyncSessions,Authenticate authenticate)
+    :m_authentication(&authentication),m_providers(&providers),m_asyncSessions(&asyncSessions),
+     m_authenticate(std::move(authenticate)),m_rateLimiter(&rateLimiter),m_fallback(&fallback) {}
 
 gateway::HttpResponse Web3AuthenticationHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request,
@@ -274,6 +286,13 @@ gateway::HttpResponse Web3AuthenticationHttpApi::error(
 
 gateway::HttpResponse Web3AuthenticationHttpApi::handle(gateway::HttpRequest request)
 {
+    if (!m_sessions) {
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request,true);
+    }
     if (request.path() == "/auth/web3/handoff"
         && request.method() == gateway::HttpMethod::Post) {
         return issueAuthenticationHandoff(std::move(request));
@@ -622,18 +641,25 @@ gateway::HttpResponse Web3AuthenticationHttpApi::complete(
     return response;
 }
 
-// Request-scoped native capability preserves the legacy browser-handoff and
-// connection routes while allowing native wallet login with async persistence.
+// Request-scoped native capability covers wallet login and mobile login
+// handoff; connection routes still require their native dependencies.
 // An unrelated downstream request is native only when the next handler also
 // explicitly advertises native support for that same request.
 bool Web3AuthenticationHttpApi::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
     const auto path = request.path();
-    if (path == "/auth/web3/start" || path == "/auth/web3/complete") {
+    if (path == "/auth/web3/start" || path == "/auth/web3/complete"
+        || path == "/auth/web3/handoff" || path == "/auth/web3/handoff/redeem") {
         return request.method() == gateway::HttpMethod::Post
             && m_asyncSessions != nullptr
             && m_authentication->nativeCanonicalCompletionEnabled();
+    }
+    if (path=="/account/connections/web3/start" || path=="/account/connections/web3/handoff"
+        || path=="/account/connections/web3/complete") {
+        return request.method()==gateway::HttpMethod::Post
+            && m_authentication->nativeConnectionCompletionEnabled()
+            && static_cast<bool>(m_authenticate);
     }
     if (path.starts_with("/auth/web3/")
         || path.starts_with("/account/connections/web3/")) return false;
@@ -646,18 +672,23 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
 {
     const auto path = request.path();
     const auto method = request.method();
+    if (path == "/auth/web3/handoff" && method == gateway::HttpMethod::Post)
+        co_return co_await issueAuthenticationHandoffAsync(std::move(request));
+    if (path == "/auth/web3/handoff/redeem" && method == gateway::HttpMethod::Post)
+        co_return co_await redeemAuthenticationHandoffAsync(std::move(request));
     if (path == "/auth/web3/start" && method == gateway::HttpMethod::Post)
         co_return co_await startAsync(std::move(request), false);
     if (path == "/auth/web3/complete" && method == gateway::HttpMethod::Post)
         co_return co_await completeAsync(std::move(request), false);
+    if (path=="/account/connections/web3/handoff" && method==gateway::HttpMethod::Post)
+        co_return co_await issueConnectionHandoffAsync(std::move(request));
     if (path == "/account/connections/web3/start"
         && method == gateway::HttpMethod::Post)
         co_return co_await startAsync(std::move(request), true);
     if (path == "/account/connections/web3/complete"
         && method == gateway::HttpMethod::Post)
         co_return co_await completeAsync(std::move(request), true);
-    // Browser handoff endpoints still use synchronous token/session storage,
-    // so never dispatch them through the I/O reactor as a hidden fallback.
+    // Unsupported connection handoff routes must never fall back on the reactor.
     if (path.starts_with("/auth/web3/")
         || path.starts_with("/account/connections/web3/")) {
         co_return error(
@@ -674,6 +705,130 @@ Web3AuthenticationHttpApi::handleAsync(gateway::HttpRequest request)
                     request);
 }
 
+boost::asio::awaitable<gateway::HttpResponse>
+Web3AuthenticationHttpApi::issueAuthenticationHandoffAsync(
+    gateway::HttpRequest request)
+{
+    SensitiveWeb3RequestGuard wipeRequestOnExit{request};
+    if (!nativeEnabledFor(request)) co_return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_rateLimiter->allow("web3-auth-handoff-ip:" + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto body = parseObject(request);
+    SensitiveWeb3ParsedGuard wipeParsedOnExit{body ? &body.value() : nullptr};
+    if (!body || !onlyFields(body.value(), {"provider"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request);
+    }
+    auto providerName = stringField(body.value(), "provider", 64U);
+    if (!providerName || *providerName != "ethereum-wallet") {
+        co_return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    wipeParsedOnExit.wipe(); wipeRequestOnExit.wipe();
+    auto issued = co_await m_authentication->issueBrowserAuthenticationHandoffAsync(
+        idp::ProviderId{*providerName}, request.correlation());
+    if (!issued) co_return error(issued.error(), request);
+
+    json::object payload;
+    payload["publisher_ticket"] = issued->publisherTicket().expose();
+    payload["redeem_ticket"] = issued->redeemTicket().expose();
+    payload["expires_at"] = foundation::toIso8601(issued->expiresAt());
+    gateway::HttpResponse response{
+        201, gateway::Headers{{"content-type", "application/json"}},
+        json::serialize(payload)};
+    secure(response);
+    co_return response;
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+Web3AuthenticationHttpApi::redeemAuthenticationHandoffAsync(
+    gateway::HttpRequest request)
+{
+    SensitiveWeb3RequestGuard wipeRequestOnExit{request};
+    if (!nativeEnabledFor(request)) co_return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_rateLimiter->allow("web3-auth-redeem-ip:" + std::string{request.remoteAddress()})) {
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request);
+    }
+    auto body = parseObject(request);
+    SensitiveWeb3ParsedGuard wipeParsedOnExit{body ? &body.value() : nullptr};
+    if (!body || !onlyFields(body.value(), {"redeem_ticket"})) {
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
+                     request);
+    }
+    auto redeemTicket = stringField(body.value(), "redeem_ticket", 256U);
+    SensitiveWeb3CopyGuard wipeTicketOnExit{redeemTicket};
+    if (!redeemTicket || !validTicket(*redeemTicket)) {
+        co_return error(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
+    }
+    foundation::SecretString ticket{std::move(*redeemTicket)};
+    auto client=clientContext(request);
+    wipeTicketOnExit.wipe(); wipeParsedOnExit.wipe(); wipeRequestOnExit.wipe();
+    auto verified = co_await m_authentication->redeemBrowserAuthenticationHandoffAsync(std::move(ticket));
+    if (!verified) {
+        if (verified.error().code() == foundation::ErrorCode::AuthenticationFailed
+            || verified.error().code() == foundation::ErrorCode::NotFound) {
+            json::object payload;
+            payload["pending"] = true;
+            gateway::HttpResponse response{
+                202, gateway::Headers{{"content-type", "application/json"}},
+                json::serialize(payload)};
+            secure(response);
+            co_return response;
+        }
+        co_return error(verified.error(), request);
+    }
+    auto issued = co_await m_asyncSessions->issueAsync(verified.value(),std::move(client));
+    if (!issued) co_return error(issued.error(), request);
+    if (!validSessionCredential(issued->id.value()) || !validSessionCredential(issued->token.expose()))
+        co_return error(foundation::Error{foundation::ErrorCode::Internal},request);
+
+    json::object payload;
+    payload["authenticated"] = true;
+    payload["identity_id"] = verified->identity().value();
+    gateway::HttpResponse response{
+        200, gateway::Headers{{"content-type", "application/json"}},
+        json::serialize(payload)};
+    secure(response);
+    response.addHeader("set-cookie", sessionCookie(issued->token.expose(), 8 * 60 * 60));
+    co_return response;
+}
+
+boost::asio::awaitable<gateway::HttpResponse>
+Web3AuthenticationHttpApi::issueConnectionHandoffAsync(gateway::HttpRequest request)
+{
+    SensitiveWeb3RequestGuard wipeRequestOnExit{request};
+    if (!nativeEnabledFor(request))
+        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    if (!m_rateLimiter->allow("web3-handoff-ip:"+std::string{request.remoteAddress()}))
+        co_return error(foundation::Error{foundation::ErrorCode::RateLimited},request);
+    auto body=parseObject(request);
+    SensitiveWeb3ParsedGuard wipeParsedOnExit{body ? &body.value() : nullptr};
+    if (!body || !onlyFields(body.value(),{"provider"}))
+        co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),request);
+    auto providerName=stringField(body.value(),"provider",64U);
+    if (!providerName || *providerName!="ethereum-wallet")
+        co_return error(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const idp::ProviderId providerId{*providerName};
+    auto* implementation=m_providers->find(providerId);
+    if (!implementation || implementation->interactionModel()!=idp::InteractionModel::ChallengeResponse)
+        co_return error(foundation::Error{foundation::ErrorCode::NotFound},request);
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential || !credential->has_value())
+        co_return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    wipeParsedOnExit.wipe(); wipeRequestOnExit.wipe();
+    auto actor=co_await m_authenticate(std::move(credential->value()));
+    if (!actor) co_return error(actor.error(),request);
+    auto handoff=co_await m_authentication->issueBrowserConnectionHandoffAsync(
+        actor->identity(),providerId,"/account",request.correlation(),idp::InteractionModel::ChallengeResponse);
+    if (!handoff) co_return error(handoff.error(),request);
+    json::object payload;
+    payload["handoff_ticket"]=handoff->ticket().expose();
+    payload["expires_at"]=foundation::toIso8601(handoff->expiresAt());
+    gateway::HttpResponse response{201,gateway::Headers{{"content-type","application/json"}},json::serialize(payload)};
+    secure(response);
+    co_return response;
+}
+
 boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAsync(
     gateway::HttpRequest request, bool connection)
 {
@@ -685,8 +840,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
-    if (connection || m_asyncSessions == nullptr
-        || !m_authentication->nativeCanonicalCompletionEnabled()) {
+    if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
@@ -702,6 +856,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     auto chainId = stringField(body.value(), "chain_id", 32U);
     auto fid = stringField(body.value(), "fid", 32U);
     auto handoffTicket = stringField(body.value(), "handoff_ticket", 256U);
+    SensitiveWeb3CopyGuard wipeTicketOnExit{handoffTicket};
     // Present-but-malformed optional parameters are not absent parameters.
     // Never silently discard an invalid handoff ticket or wallet selector.
     if ((body->contains("address") && !address)
@@ -721,12 +876,18 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
         || implementation->interactionModel() != idp::InteractionModel::ChallengeResponse) {
         co_return error(foundation::Error{foundation::ErrorCode::NotFound}, request, true);
     }
-    // Native browser handoff consumption/publication still has synchronous
-    // persistence. Do not start a challenge which cannot be completed.
-    if (handoffTicket) {
-        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
-                        request, true);
+    // Connection tickets and login publisher tickets have different
+    // purposes. Only the server's consumed transaction selects the owner.
+    std::optional<foundation::SecretString> publisherTicket;
+    if (handoffTicket) publisherTicket.emplace(std::move(*handoffTicket));
+    std::optional<foundation::SecretString> actorToken;
+    if (connection && !publisherTicket) {
+        auto credential=gateway::takeSessionCredential(request);
+        if (!credential || !credential->has_value())
+            co_return error(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request,true);
+        actorToken.emplace(std::move(credential->value()));
     }
+    wipeTicketOnExit.wipe();
     auto bindingToken = security::randomTokenBase64Url(32U);
     if (!bindingToken) co_return error(bindingToken.error(), request, true);
     foundation::SecretString bindingSecret{std::move(bindingToken).value()};
@@ -744,9 +905,29 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     // Scrub rejected browser tickets and raw cookies before suspending.
     wipeParsedOnExit.wipe();
     wipeRequestOnExit.wipe();
-    auto started = co_await m_authentication->beginAsync(
-        std::move(authenticationRequest), binding.value(),
-        request.correlation());
+    std::optional<identity::core::IdentityId> connectionTarget;
+    if (connection) {
+        if (publisherTicket) {
+            auto target=co_await m_authentication->consumeBrowserConnectionHandoffAsync(
+                std::move(*publisherTicket),idp::InteractionModel::ChallengeResponse);
+            publisherTicket.reset();
+            if (!target || target->providerId!=providerId || target->returnTarget!="/account")
+                co_return error(target ? foundation::Error{foundation::ErrorCode::AuthenticationFailed}
+                    : target.error(),request,true);
+            connectionTarget.emplace(std::move(target->identity));
+        } else {
+            auto actor=co_await m_authenticate(std::move(*actorToken));
+            if (!actor) co_return error(actor.error(),request,true);
+            connectionTarget.emplace(actor->identity());
+        }
+    }
+    foundation::Result<AuthenticationStart> started=foundation::fail(foundation::ErrorCode::Unavailable);
+    if (connectionTarget)
+        started=co_await m_authentication->beginConnectionAsync(
+            std::move(authenticationRequest),binding.value(),request.correlation(),std::move(*connectionTarget));
+    else
+        started=co_await m_authentication->beginAsync(
+            std::move(authenticationRequest),binding.value(),request.correlation());
     if (!started) co_return error(started.error(), request, true);
     const auto message = challengeParameter(started->challenge(), "message");
     if ((message && (message->empty() || message->size() > 8192U))
@@ -775,6 +956,11 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::startAs
     response.addHeader("set-cookie", cookie(kBindingCookie, bindingSecret.expose(), 600));
     response.addHeader("set-cookie", cookie(kTransactionCookie, started->transactionId().value(), 600));
     response.addHeader("set-cookie", cookie(kChallengeCookie, started->challenge().id().value(), 600));
+    // Clear stale link and publisher cookies even for ordinary login.
+    response.addHeader("set-cookie",connection ? cookie(kModeCookie,"link",600) : cookie(kModeCookie,"",0));
+    response.addHeader("set-cookie",publisherTicket
+        ? cookie(kAuthenticationHandoffCookie,publisherTicket->expose(),180)
+        : cookie(kAuthenticationHandoffCookie,"",0));
     co_return response;
 }
 
@@ -787,8 +973,7 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     if (!m_rateLimiter->allow("web3-ip:" + std::string{request.remoteAddress()})) {
         co_return error(foundation::Error{foundation::ErrorCode::RateLimited}, request, true);
     }
-    if (connection || m_asyncSessions == nullptr
-        || !m_authentication->nativeCanonicalCompletionEnabled()) {
+    if (!nativeEnabledFor(request)) {
         co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
                         request, true);
     }
@@ -799,14 +984,11 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
         co_return error(body ? foundation::Error{foundation::ErrorCode::InvalidArgument} : body.error(),
                      request, true);
     }
-    // Profile presentation persistence is still synchronous. Reject these
-    // fields before burning the one-time proof on the native route.
-    if (body->contains("display_name")
-        || body->contains("preferred_username")
-        || body->contains("picture_url")) {
-        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
-                        request, true);
-    }
+    // These values are unverified presentation only, just as in legacy
+    // Web3. Never place them in the provider proof or trust decision.
+    auto displayName=detail::presentationText(stringField(body.value(),"display_name",256U),256U);
+    auto preferredUsername=detail::presentationText(stringField(body.value(),"preferred_username",128U),128U);
+    auto pictureUrl=detail::presentationPictureUrl(stringField(body.value(),"picture_url",2048U));
     auto message = stringField(body.value(), "message", 8192U);
     SensitiveWeb3CopyGuard wipeMessageOnExit{message};
     auto signature = stringField(body.value(), "signature", 8192U);
@@ -819,16 +1001,18 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     SensitiveWeb3CopyGuard wipeTransactionOnExit{transaction};
     auto challenge = cookieValue(request, kChallengeCookie, 512U);
     SensitiveWeb3CopyGuard wipeChallengeOnExit{challenge};
-    auto mode = cookieValue(request, kModeCookie, 16U);
+    bool malformedMode=false;
+    auto mode = cookieValue(request, kModeCookie, 16U,&malformedMode);
     SensitiveWeb3CopyGuard wipeModeOnExit{mode};
     auto authenticationHandoff =
-        cookieValue(request, kAuthenticationHandoffCookie, 256U);
+        cookieValue(request, kAuthenticationHandoffCookie, 256U,&malformedMode);
     SensitiveWeb3CopyGuard wipeHandoffOnExit{authenticationHandoff};
-    // Browser handoff publication still requires synchronous token storage.
-    // Reject it before burning the one-time authentication challenge.
+    if (malformedMode) co_return error(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request,true);
+    std::optional<foundation::SecretString> publisherTicket;
     if (authenticationHandoff) {
-        co_return error(foundation::Error{foundation::ErrorCode::Unavailable},
-                        request, true);
+        if (connection || !validTicket(*authenticationHandoff))
+            co_return error(foundation::Error{foundation::ErrorCode::InvalidArgument},request,true);
+        publisherTicket.emplace(std::move(*authenticationHandoff));
     }
     if (!message || !signature || !continuation || !bindingToken || !transaction || !challenge
         || (connection && (!mode || *mode != "link")) || (!connection && mode.has_value())) {
@@ -862,10 +1046,45 @@ boost::asio::awaitable<gateway::HttpResponse> Web3AuthenticationHttpApi::complet
     wipeModeOnExit.wipe();
     wipeHandoffOnExit.wipe();
 
+    if (connection) {
+        auto connected=co_await m_authentication->completeConnectionAsync(
+            std::move(transactionId),std::move(continuationSecret),binding.value(),
+            std::move(authenticationResponse),AuthenticationService::ConnectionPresentation{
+                std::move(displayName),std::move(preferredUsername),std::move(pictureUrl)});
+        if (!connected) co_return error(connected.error(),request,true);
+        json::object payload{{"connected",true},{"provider",connected->providerId().value()},
+            {"subject",connected->subject().value()}};
+        gateway::HttpResponse response{200,gateway::Headers{{"content-type","application/json"}},json::serialize(payload)};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
     auto verified = co_await m_authentication->completeAsync(
         std::move(transactionId), std::move(continuationSecret),
         binding.value(), std::move(authenticationResponse));
     if (!verified) co_return error(verified.error(), request, true);
+    if (displayName || preferredUsername || pictureUrl) {
+        // Preserve the legacy best-effort presentation behavior, but
+        // never update a link that changed owners during verification.
+        static_cast<void>(co_await m_authentication->updateConnectionPresentationAsync(
+            verified->identity(),identity::core::ExternalIdentityRef{
+                verified->outcome().provider(),verified->outcome().subject(),
+                std::move(displayName),std::move(preferredUsername),std::move(pictureUrl)}));
+    }
+    if (publisherTicket) {
+        const std::string provider{verified->outcome().provider().value()};
+        auto published=co_await m_authentication->publishBrowserAuthenticationHandoffAsync(
+            std::move(*publisherTicket),std::move(verified).value());
+        if (!published) co_return error(published.error(),request,true);
+        json::object payload;
+        payload["published"]=true;
+        payload["provider"]=provider;
+        gateway::HttpResponse response{200,gateway::Headers{{"content-type","application/json"}},
+            json::serialize(payload)};
+        secure(response);
+        clearState(response);
+        co_return response;
+    }
     auto issued = co_await m_asyncSessions->issueAsync(
         verified.value(), std::move(client));
     if (!issued) co_return error(issued.error(), request, true);

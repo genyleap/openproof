@@ -1,0 +1,275 @@
+{
+  "files": {
+    "migrations/0001_identity_auth_gateway.sql": {
+      "33adf84e63878fd143b1691b9c74e941cf96483c640c71e2b67a8e70c84b4d91": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0002_memberships.sql": {
+      "3a0b39a9395d76dd4a702f6bd0df787229d04bf92e981fc12b42e671898f982e": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0003_identity_provider.sql": {
+      "3bd0eb912fcdca7121673e54f1b340ebb838757ed2d63680c2f8e5c3154ba944": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0004_trust_evidence.sql": {
+      "091a310bcdeed25378175022d4f6125bd82bb96523e37deebe8aad8e0bbdc4ac": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0005_account_lifecycle.sql": {
+      "fa50738d588e6aa4b4c8d7519a411d2403dfbb7c8b997f98fdfdbc60d6f236da": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0006_resource_consent.sql": {
+      "ea78e9843d097c1312f394756986b72ba36780b6bc2de45cf725ef6a13de0f7f": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0007_oauth_device_flow.sql": {
+      "86eeaad091652125ec963049c3e3b26ebdc43b5cd1da21ef23c6a97c84d73837": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0008_oauth_par.sql": {
+      "1fe1c9cfd535ea0ca164b0a1a00bb3f55e5a9383f7b566bc95691dd08a7dae72": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0009_oauth_jar.sql": {
+      "9b57d393e9ff74b56cce6fffb276b178cd12ab55f1b794989d118cd31188ea8d": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0010_oauth_sender_constraints.sql": {
+      "f112d29533a7c81a7d291ac75dcbc33061e42eefe981cd93b765fd9ae5b57e04": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0011_webauthn_passkeys.sql": {
+      "b31d35b7972ed0ab6bf2b45ed4e46bf1da033357d67a0f5cfff83ef7e868a545": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0012_enterprise_scim.sql": {
+      "6bc073e9a523c2f6e4df6e4708f0786850f7a4520f22ba17ae7931610ae0e6ae": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0013_evidence_verification.sql": {
+      "69b1af53e93dd603cd616d192d1bf6a0e4d841a26854489e47c20aa0ea888019": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0014_credential_key_rotation.sql": {
+      "76cda07a31bca7523aa9ad553d8008d989f019b39118572459d17fdf0a87991f": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0015_master_key_rotation.sql": {
+      "a69fdd21b3c1b596639a70e125aa758a9b0ca1f8b7e678630b7d171776ece77d": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0016_master_rotation_passkey_ceremonies.sql": {
+      "48f0d1f4d2a355664b797c0c294c9e5e848258f8418aaba610dce350fc6397e3": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0017_session_client_metadata.sql": {
+      "185f2173a0cde7fe041e39e1fdf17d0df188b0b19ef20d2ea6476d3f1b82f48c": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0018_profile_avatar_sources.sql": {
+      "2e4fb132f0057c758f297b9b21d12477d607b2767bc9ea8ff0c68b53056fdf29": [
+        "v1.1.0-rc1",
+        "v1.1.0-rc2",
+        "v1.1.0-rc3",
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0019_farcaster_profile_seed.sql": {
+      "a1f10766b5cb28d020c25949da82f085a1e87285c0bc84c7f0abf5257c2c9481": [
+        "v1.1.0-rc4",
+        "v1.1.0-rc5",
+        "v1.1.0-rc6",
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/0020_genycaster_native_client.sql": {
+      "b94bd75abaf5b1afc0ea740804d04a5c7518358321df5734b3e6084d4af97fa1": [
+        "v1.1.0-rc5",
+        "v1.1.0-rc6"
+      ]
+    },
+    "migrations/0021_genycaster_production_environment.sql": {
+      "7a9eef141267ace4d953cb3368ba4e8ad34ab7e31c32aa8652198fa4ee05b57a": [
+        "v1.1.0-rc5",
+        "v1.1.0-rc6"
+      ]
+    },
+    "migrations/0022_tegra_cms_browser_client.sql": {
+      "529b0db2f75ae80e98c421e252e4462d5a0d6b3265d7798e0823eb9d37379015": [
+        "v1.1.0-rc5",
+        "v1.1.0-rc6"
+      ]
+    },
+    "migrations/legacy/0020_genycaster_native_client.sql": {
+      "b94bd75abaf5b1afc0ea740804d04a5c7518358321df5734b3e6084d4af97fa1": [
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/legacy/0021_genycaster_production_environment.sql": {
+      "7a9eef141267ace4d953cb3368ba4e8ad34ab7e31c32aa8652198fa4ee05b57a": [
+        "v1.1.0-rc7"
+      ]
+    },
+    "migrations/legacy/0022_tegra_cms_browser_client.sql": {
+      "529b0db2f75ae80e98c421e252e4462d5a0d6b3265d7798e0823eb9d37379015": [
+        "v1.1.0-rc7"
+      ]
+    }
+  },
+  "format": 1,
+  "releases": {
+    "v1.1.0-rc1": {
+      "commit": "808372ac34ddcb9fb703056ab1a7e11ed27d671f",
+      "tag_object": "04ee2df5e281ff4edee68f74cf4046bfe5929f4b"
+    },
+    "v1.1.0-rc2": {
+      "commit": "ccc83ca8a279bf33214d4b99698f861777e5e9a6",
+      "tag_object": "59773d71c810210933a9ac4288b148dd3887322c"
+    },
+    "v1.1.0-rc3": {
+      "commit": "45390c08b1de893bbf84097273d83fd66b3601f4",
+      "tag_object": "c67ec71d1f4b743b2b2bcecf01522f8a82dba3a2"
+    },
+    "v1.1.0-rc4": {
+      "commit": "5a3bf17a620d13c07471e763a4191fa23f5d1ee8",
+      "tag_object": "81abcbcba0fc33b462561960d84c24fdbb24af9c"
+    },
+    "v1.1.0-rc5": {
+      "commit": "256f970aba84a406d4f7bb906dbb011252719f2e",
+      "tag_object": "bd199db32b9c93428c4127eada483f10e074075b"
+    },
+    "v1.1.0-rc6": {
+      "commit": "cbc8c9a3520165e34d4a5fd53696533138ceb9f6",
+      "tag_object": "14c3aef47da6db745a19ff2d0dad8888002436cc"
+    },
+    "v1.1.0-rc7": {
+      "commit": "3635f83c1ae683a4f83d3dbd8f0fb1c82b85690c",
+      "tag_object": "c829e56498ab08a66aec65a486b1e4c8fb78dc57"
+    }
+  },
+  "source": "git-release-tags"
+}

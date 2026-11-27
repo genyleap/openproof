@@ -214,6 +214,20 @@ public:
     [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
     authorizeConnectionTargetAsync(identity::core::IdentityId target) = 0;
 
+    // Read-only revalidation for handoff redemption. An implementation that
+    // has not migrated authoritative ownership must refuse rather than write
+    // a profile or fall back to a synchronous repository.
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    authorizeHandoffOwnerAsync(identity::core::IdentityId,
+                              identity::core::ExternalIdentityRef)
+    { co_return foundation::fail(foundation::ErrorCode::Unavailable); }
+
+    // Unverified presentation metadata, never authentication claims.
+    [[nodiscard]] virtual boost::asio::awaitable<foundation::Status>
+    updatePresentationAsync(identity::core::IdentityId,
+        identity::core::ExternalIdentityRef, foundation::Instant)
+    { co_return foundation::fail(foundation::ErrorCode::Unavailable); }
+
     /** Atomically attach or confirm a verified link; never reassign owners. */
     [[nodiscard]] virtual boost::asio::awaitable<
         foundation::Result<identity::core::ExternalIdentityRef>>
@@ -248,6 +262,12 @@ public:
                           identity::core::OrganizationId organization = {},
                           identity::profile::IdentityProfileRepository* profileRepository = nullptr,
                           CoroutineCanonicalIdentityFinalizer* asyncCanonical = nullptr);
+    // Native-only coordinator: no synchronous identity or profile repositories.
+    AuthenticationService(provider::ProviderRegistry& providers,
+                          provider::AuthenticationTransactionStore& transactions,
+                          const foundation::ClockSource& clock,ProviderTrustPolicy trustPolicy,
+                          foundation::Duration maximumTransactionLifetime,
+                          CoroutineCanonicalIdentityFinalizer& asyncCanonical);
 
     AuthenticationService(const AuthenticationService&) = delete;
     AuthenticationService& operator=(const AuthenticationService&) = delete;
@@ -334,6 +354,12 @@ public:
     [[nodiscard]] foundation::Result<VerifiedAuthentication>
     acceptVerifiedEmail(const identity::core::ExternalIdentityRef& external);
 
+    // Called only by the trusted signup activation boundary, after its
+    // atomic proof consumption. Never resolve a different current owner.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+    acceptVerifiedEmailAsync(identity::core::ExternalIdentityRef external,
+        identity::core::IdentityId expectedOwner);
+
     /**
      * @brief Completes a server-bound connection ceremony without creating a session.
      *
@@ -348,6 +374,10 @@ public:
                        const provider::BindingDigest& binding,
                        const provider::AuthenticationResponse& response);
 
+    struct ConnectionPresentation final {
+        std::optional<std::string> displayName, preferredUsername, pictureUrl;
+    };
+
     /** Completes a native coroutine connection with the exact same purpose,
      * single-use transaction and canonical ownership constraints as the
      * synchronous compatibility API.
@@ -357,7 +387,8 @@ public:
     completeConnectionAsync(provider::TransactionId transactionId,
                             foundation::SecretString continuationToken,
                             provider::BindingDigest binding,
-                            provider::AuthenticationResponse response);
+                            provider::AuthenticationResponse response,
+                            ConnectionPresentation presentation = {});
 
     /**
      * @brief Refreshes display-only metadata for an already verified connection.
@@ -372,6 +403,10 @@ public:
         std::optional<std::string> displayName,
         std::optional<std::string> preferredUsername,
         std::optional<std::string> pictureUrl);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    updateConnectionPresentationAsync(identity::core::IdentityId owner,
+        identity::core::ExternalIdentityRef external);
 
     /** @brief Lists the authentication-capable external accounts attached to an identity. */
     [[nodiscard]] foundation::Result<std::vector<identity::core::ExternalIdentityRef>>
@@ -399,6 +434,16 @@ public:
     [[nodiscard]] foundation::Result<BrowserConnectionTarget>
     consumeBrowserConnectionHandoff(const foundation::SecretString& ticket);
 
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionHandoff>>
+    issueBrowserConnectionHandoffAsync(identity::core::IdentityId identity,
+        provider::ProviderId providerId, std::string returnTarget,
+        foundation::CorrelationId correlation,
+        provider::InteractionModel expected = provider::InteractionModel::Redirect);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserConnectionTarget>>
+    consumeBrowserConnectionHandoffAsync(foundation::SecretString ticket,
+        provider::InteractionModel expected = provider::InteractionModel::Redirect);
+
     /**
      * @brief Issues separated publisher/redeemer credentials for mobile wallet login.
      *
@@ -419,6 +464,17 @@ public:
     [[nodiscard]] foundation::Result<VerifiedAuthentication>
     redeemBrowserAuthenticationHandoff(
         const foundation::SecretString& redeemTicket);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<BrowserAuthenticationHandoff>>
+    issueBrowserAuthenticationHandoffAsync(provider::ProviderId providerId,
+        foundation::CorrelationId correlation);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    publishBrowserAuthenticationHandoffAsync(foundation::SecretString publisherTicket,
+        VerifiedAuthentication authentication);
+
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<VerifiedAuthentication>>
+    redeemBrowserAuthenticationHandoffAsync(foundation::SecretString redeemTicket);
 
 private:
     struct CompletedExchange final {
@@ -473,7 +529,7 @@ private:
 
     provider::ProviderRegistry& m_providers;
     provider::AuthenticationTransactionStore& m_transactions;
-    identity::core::ExternalIdentityDirectory& m_identities;
+    identity::core::ExternalIdentityDirectory* m_identities{};
     const foundation::ClockSource& m_clock;
     const ProviderTrustPolicy m_trustPolicy;
     foundation::Duration m_maximumTransactionLifetime;

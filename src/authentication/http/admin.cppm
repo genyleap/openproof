@@ -13,8 +13,9 @@ import openproof.organization;
 import openproof.session;
 
 export namespace openproof::administration::http {
-
-/** Owner-only administrative HTTP plane mounted under `/admin`. */
+/** Retired synchronous administrative HTTP ABI. All /admin requests deny
+ *  without reading or mutating storage; use the native coroutine adapter.
+ */
 class AdministrationHttpApi final : public gateway::HttpHandler {
 public:
     AdministrationHttpApi(
@@ -27,34 +28,9 @@ public:
         identity::provider::ProviderId provider,
         const foundation::ClockSource& clock,
         gateway::HttpHandler& fallback);
-
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
-
 private:
-    [[nodiscard]] gateway::HttpResponse listLocalMembers(gateway::HttpRequest request);
-    [[nodiscard]] gateway::HttpResponse createLocalMember(
-        gateway::HttpRequest request,
-        const identity::core::IdentityId& actor);
-    [[nodiscard]] gateway::HttpResponse replaceRoles(
-        gateway::HttpRequest request, const identity::core::IdentityId& actor);
-    [[nodiscard]] gateway::HttpResponse changeLifecycle(
-        gateway::HttpRequest request, const identity::core::IdentityId& actor,
-        MemberLifecycleAction action);
-    [[nodiscard]] gateway::HttpResponse resetCredentials(
-        gateway::HttpRequest request, const identity::core::IdentityId& actor);
-    [[nodiscard]] gateway::HttpResponse error(
-        const foundation::Error& failure,
-        const gateway::HttpRequest& request) const;
-
-    session::SessionService* m_sessions;
-    LocalMemberAdministrator* m_members;
-    identity::core::IdentityRepository* m_identities;
-    organization::MembershipRepository* m_memberships;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
-    identity::core::OrganizationId m_organization;
-    identity::provider::ProviderId m_provider;
-    const foundation::ClockSource* m_clock;
     gateway::HttpHandler* m_fallback;
 };
-
 }

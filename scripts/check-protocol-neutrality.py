@@ -41,10 +41,22 @@ def audit() -> list[str]:
     for file in archive.glob("*.sql"):
         if file.name not in HISTORICAL:
             findings.append(f"Unreviewed archived migration: {file.name}")
-    engine = (ROOT / "src/storage/postgres/postgres.cpp").read_text(encoding="utf-8")
-    if "legacyDirectory" not in engine or "historic->second != hex" not in engine:
-        findings.append("Migrator lacks checksum-preserving historical SQL exclusion")
-    if "SELECT 1 FROM openproof.organizations WHERE id='genyleap'" in engine:
+    # Scope the source contract to the only remaining migration implementation.
+    # Runtime PostgreSQL regression tests independently exercise the invariant.
+    if (ROOT / "src/storage/postgres/postgres.cpp").exists():
+        findings.append("Retired synchronous migration engine still exists")
+    package = (ROOT / "src/storage/postgres/migration_package.cpp").read_text(encoding="utf-8")
+    native = (ROOT / "src/storage/postgres/coroutine_startup.cpp").read_text(encoding="utf-8")
+    contracts = (
+        (package, ('existing->checksum != hex', 'load(directory / "legacy", true)', 'load(directory, false)')),
+        (native, ('migration::loadPackage(directory)', 'existing->checksum!=*row[1]',
+                  'if (migration.archived || migration.recorded) continue;', 'executeMigrationScript(migration.sql')),
+    )
+    for implementation, required in contracts:
+        positions = [implementation.find(fragment) for fragment in required]
+        if -1 in positions or positions != sorted(positions):
+            findings.append("Migrator lacks checksum-preserving historical SQL exclusion")
+    if "SELECT 1 FROM openproof.organizations WHERE id='genyleap'" in native or "SELECT 1 FROM openproof.organizations WHERE id='genyleap'" in package:
         findings.append("Vendor tenant lookup still exists in shared migrator")
     return findings
 

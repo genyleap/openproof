@@ -343,6 +343,35 @@ TEST(AccountEmailLinkingTest, WrongIdentityDoesNotConsumeEmailProof)
     EXPECT_TRUE(saved->value().emailVerified());
 }
 
+TEST(AccountPhoneVerificationTest, WrongIdentityCannotConsumeOrExhaustOwnerProof)
+{
+    Fixture fixture;
+    const auto owner = fixture.addActiveIdentity("id-phone-owner");
+    const auto other = fixture.addActiveIdentity("id-phone-other");
+    ASSERT_TRUE(fixture.service->beginPhoneVerification(owner, "+15551234567"));
+    const account::VerificationId verification{fixture.delivery.id};
+    const fnd::SecretString proof{fixture.delivery.secret};
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        auto rejected = fixture.service->completePhoneVerification(
+            other, verification, fnd::SecretString{"wrong-proof"});
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    }
+    auto rejected = fixture.service->completePhoneVerification(other, verification, proof);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), fnd::ErrorCode::AuthenticationFailed);
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        EXPECT_FALSE(fixture.service->completeEmailChange(
+            owner, verification, fnd::SecretString{"wrong-purpose"}));
+    }
+    EXPECT_FALSE(fixture.service->completeEmailChange(owner, verification, proof));
+    ASSERT_TRUE(fixture.service->completePhoneVerification(owner, verification, proof));
+    EXPECT_FALSE(fixture.service->completePhoneVerification(owner, verification, proof));
+    auto saved = fixture.profiles.find(owner);
+    ASSERT_TRUE(saved && saved->has_value());
+    EXPECT_TRUE(saved->value().phoneNumberVerified());
+}
+
 TEST(AccountEmailLinkingTest, InvalidPasswordDoesNotConsumeEmailProof)
 {
     Fixture fixture;

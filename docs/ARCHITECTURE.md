@@ -20,7 +20,7 @@ graph TD
     sess["openproof.session<br/>opaque sessions"]
     cred["openproof.credentials<br/>password, TOTP, recovery"]
     gw["openproof.gateway.http<br/>bounded edge and proxy"]
-    pg["openproof.storage.postgres<br/>durable atomic stores"]
+    pg["Native PostgreSQL adapters<br/>durable atomic stores"]
     audit["openproof.audit / telemetry"]
     idp["openproof.identity.provider<br/>authentication SPI"]
     core["openproof.identity.core<br/>canonical identity"]
@@ -90,7 +90,7 @@ every other layer may assume.
 | `openproof.administration` / `.http` | — | Validated bootstrap, enrollment, role, membership-state and credential-rotation commands plus IAL2 administrative HTTP boundary |
 | `openproof.provider.local` | — | Concrete password and password+TOTP provider |
 | `openproof.gateway` / `.http` | — | Routing, enforcement, throttling, discovery, load balancing, circuits and Beast transport |
-| `openproof.storage.postgres` | — | Bounded pool, migrations, durable auth/identity stores and atomic owner-authorized administration adapter |
+| Native PostgreSQL adapters | async I/O, startup, repositories | Socket-driven bounded pool, migrations, durable auth/identity stores and atomic owner-authorized administration; blocking module retired |
 | `openproof.audit` / `.telemetry` | — | HMAC audit chain, security events, bounded metrics and trace context; the composition root wraps the complete listener with authenticated low-cardinality Prometheus instrumentation |
 
 81 project module interface units (`.cppm`) and 65 project implementation/test-example integration units (`.cpp`) across the identity platform, SDK and reference consumer surfaces.

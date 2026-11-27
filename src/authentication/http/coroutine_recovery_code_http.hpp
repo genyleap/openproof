@@ -1,7 +1,7 @@
 #pragma once
 
 // Provider/storage-neutral native /auth/recovery-codes route. Inject ONLY
-// actual awaitable session-authentication and eligibility checks: synchronous
+// actual awaitable session-authentication and fenced repository operations: synchronous
 // SPI callbacks must never be wrapped in co_return on the I/O executor.
 #include <boost/asio/awaitable.hpp>
 
@@ -23,25 +23,18 @@ public:
     using Authenticate = std::function<boost::asio::awaitable<
         foundation::Result<session::Session>>(foundation::SecretString)>;
 
-    // A positive result must prove active canonical identity, an attached
-    // configured local provider, existing local password and enabled TOTP
-    // credentials; the second check must read fresh committed state.
-    using Eligible = std::function<boost::asio::awaitable<
-        foundation::Result<bool>>(identity::core::IdentityId)>;
-
     CoroutineRecoveryCodeHttpAdapter(
         gateway::http::CoroutineHttpHandler& nativeFallback,
         gateway::TokenBucketRateLimiter& rateLimiter,
         credentials::CoroutineRecoveryCodeService& recoveryCodes,
-        Authenticate authenticate, Eligible eligible);
+        Authenticate authenticate);
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
 
     [[nodiscard]] bool nativeEnabledFor(
         const gateway::HttpRequest& request) const noexcept override;
 
-    // There is NO synchronous recovery-code compatibility path here. Existing
-    // AuthenticationHttpApi still owns legacy routes on their bounded workers.
+    // There is no synchronous recovery-code compatibility path.
     [[nodiscard]] gateway::HttpResponse
     handle(gateway::HttpRequest request) override;
 
@@ -59,7 +52,6 @@ private:
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     credentials::CoroutineRecoveryCodeService* m_recoveryCodes;
     Authenticate m_authenticate;
-    Eligible m_eligible;
 };
 
 } // namespace openproof::authentication::http

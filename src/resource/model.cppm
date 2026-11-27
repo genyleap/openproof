@@ -18,6 +18,15 @@ using ResourceId = foundation::StrongId<ResourceIdTag>;
 
 enum class ResourceStatus { Active, Suspended, Revoked };
 
+enum class ResourceMutation { Create, Suspend, Activate, Revoke };
+struct ResourceMutationCommand final {
+    ResourceMutation operation;
+    ResourceId id;
+    std::string audience;
+    std::string name;
+    std::vector<std::string> scopes;
+};
+
 /** @brief Registered OAuth resource server and its audience/scope boundary. */
 class ResourceServer final {
 public:
@@ -46,6 +55,15 @@ private:
     explicit ResourceServer(std::shared_ptr<State> state);
     std::shared_ptr<State> m_state;
     void detach();
+};
+
+enum class ServiceMutation { Provision, Activate, Deactivate };
+struct ServiceMutationCommand final {
+    ServiceMutation operation;
+    client::ClientId clientId;
+    identity::core::IdentityId identityId;
+    std::vector<std::string> audiences;
+    std::vector<std::string> scopes;
 };
 
 /** @brief Mapping from a confidential service client to one canonical service identity. */

@@ -10,7 +10,7 @@ import { cppExecutableText } from "./cpp-lexical-scan.mjs";
 const root = path.resolve(import.meta.dirname, "..");
 const segments = [
   ["HTTP listener + proxy", "src/gateway/http.cpp"],
-  ["PostgreSQL storage", "src/storage/postgres/postgres.cpp"],
+  ["PostgreSQL storage", "src/storage/postgres/coroutine_startup.cpp"],
   ["GitHub OAuth", "src/providers/github/github.cpp"],
   ["OIDC federation", "src/providers/oidc/oidc.cpp"],
   ["X provider", "src/providers/x/x.cpp"],
@@ -37,7 +37,7 @@ const segments = [
 ];
 
 const forbidden = [
-  ["blocking PostgreSQL", /\bPQ(?:exec|execParams|connectdb|reset)\s*\(/g],
+  ["blocking PostgreSQL", /\bPQ(?:exec|execParams|execPrepared|connectdb|connectdbParams|reset|setdbLogin)\s*\(/g],
   ["blocking HTTP transport", /\b(?:beastHttp|http)::(?:read|write)\s*\(/g],
   ["blocking DNS", /\b(?:resolver|m_resolver)\.resolve\s*\(/g],
   ["blocking stream connect", /\b(?:stream|m_stream)\.connect\s*\(/g],
@@ -54,7 +54,20 @@ const checked = segments.map(([name, relative]) => {
   const sourcePaths = relative === "src/gateway/http.cpp"
     ? ["src/gateway/http.cpp", "src/gateway/http_proxy.cpp",
        "src/gateway/http_coroutine.cpp"]
-    : [relative];
+    : relative === "src/authentication/http/admin.cpp"
+      ? [relative, "src/authentication/http/coroutine_admin_read_http.cpp",
+         "src/storage/postgres/coroutine_admin_store.cpp"]
+      : relative === "src/oauth/http/http.cpp"
+        ? [relative,"src/oauth/http/coroutine_token_read_http.cpp",
+           "src/oauth/http/coroutine_consent_http.cpp","src/oauth/http/coroutine_discovery_http.cpp"]
+      : relative === "src/account/http/http.cpp"
+        ? [relative,"src/account/http/coroutine_session_http.cpp","src/account/http/account_pages.cpp",
+           "src/authentication/http/coroutine_federated_start_http.cpp"]
+        : relative === "src/storage/postgres/coroutine_startup.cpp"
+          ? fs.readdirSync(path.join(root,"src/storage/postgres"))
+              .filter(file=>/\.(?:cpp|cppm|cc|cxx|h|hpp|hxx)$/.test(file))
+              .map(file=>"src/storage/postgres/"+file)
+          : [relative];
   const source = sourcePaths.map(file =>
     fs.readFileSync(path.join(root,file),"utf8")).join("\n");
   const executable = cppExecutableText(source);
@@ -68,14 +81,47 @@ const checked = segments.map(([name, relative]) => {
   const awaitCount=[...executable.matchAll(/\bco_await\b/g)].length;
   // The named boundary must have directly auditable coroutine implementation.
   if(awaitCount===0)issues.push({line:0,kind:"no native coroutine",expression:"co_await missing"});
+  if(relative==="src/storage/postgres/coroutine_startup.cpp"){
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const retired=["src/storage/postgres/postgres.cpp","src/storage/postgres/postgres.cppm"];
+    for(const file of retired) if(fs.existsSync(path.join(root,file)))
+      issues.push({line:0,kind:"retired PostgreSQL source still present",expression:file});
+    const cmakes=["src/storage/postgres/CMakeLists.txt","apps/opp/CMakeLists.txt","tests/CMakeLists.txt","src/operations/http/CMakeLists.txt"];
+    for(const file of cmakes) if(/\bopenproof_storage_postgres\b/.test(fs.readFileSync(path.join(root,file),"utf8")))
+      issues.push({line:0,kind:"retired PostgreSQL build target referenced",expression:file});
+    if(/import\s+openproof\.storage\.postgres\s*;/.test(cppExecutableText(app+"\n"+source)))
+      issues.push({line:0,kind:"retired PostgreSQL module imported",expression:"openproof.storage.postgres"});
+    for(const call of ["nativeDatabasePreflight","migrateSchemaBeforeListener","verifyMasterKeyBeforeListener",
+      "rotateMasterKeyOffline","rekeyTotpOffline","initializeAdministratorOffline","repairInitialOwnerOffline"])
+      if(!app.includes("postgres::"+call+"("))
+        issues.push({line:0,kind:"native database entry point missing",expression:call});
+    for(const primitive of ["PQconnectStart","PQconnectPoll","PQsendQueryParams","PQconsumeInput","PQgetResult"])
+      if(!new RegExp("\\b"+primitive+"\\s*\\(").test(executable))
+        issues.push({line:0,kind:"native libpq primitive missing",expression:primitive});
+    if(!/co_await\s+connection->executeMigrationScript/.test(executable)
+       || !/co_await\s+connection->query/.test(executable)
+       || /\bpostgres::(?:PoolConfig|ConnectionPool|Migrator|Postgres\w+Repository|Postgres\w+Store)\b/.test(cppExecutableText(app)))
+      issues.push({line:0,kind:"native startup/CLI SQL or retirement boundary is missing",expression:"native database preflight and mutations"});
+  }
   if(relative==="src/gateway/http.cpp"){
     if(!/asyncHandler\s*&&\s*asyncHandler->nativeEnabledFor\s*\(\s*operation\s*\)/.test(source))
       issues.push({line:0,kind:"missing request-scoped coroutine dispatch guard",
         expression:"asyncHandler->nativeEnabledFor(operation)"});
-    if(!/asio::co_spawn\s*\(\s*context\s*,\s*sendResultAsync\s*\(/.test(source)
-       || !/co_await\s+sendAsync\s*\(\s*std::move\(endpoint\)/.test(source))
-      issues.push({line:0,kind:"synchronous proxy compatibility bypasses native transport",
-        expression:"co_spawn(context, sendResultAsync(...)) -> co_await sendAsync"});
+    const syncProxy=executable.slice(executable.indexOf("BeastProxyTransport::send("),
+      executable.indexOf("BeastProxyTransport::sendAsync("));
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    // Require a retired synchronous ABI AND actual native runtime wiring.
+    // Removing the nested event loop alone must never pass this boundary.
+    if(!/return foundation::fail\(foundation::ErrorCode::Unavailable,/.test(syncProxy)
+       || /co_spawn|sendAsync|m_implementation->|\.get\s*\(/.test(syncProxy)
+       || !/co_await m_implementation->sendAsync\s*\(/.test(executable)
+       || !/co_await m_transport->sendAsync\s*\(/.test(executable)
+       || !/const bool nativeProtectedGatewayEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\|/.test(app)
+       || !/platform\.auth\(\)\.enabled\(\) && nativeProtectedGatewayFlag && \*nativeProtectedGatewayFlag == "0"/.test(app)
+       || !/createCoroutineWebhookVerificationDelivery\(/.test(app)
+       || /createWebhookVerificationDelivery\(/.test(app))
+      issues.push({line:0,kind:"proxy synchronous ABI or production native wiring is not retired",
+        expression:"deny synchronous send; mandatory native proxy and delivery"});
     // Private io_context.run() still occupies a legacy handler thread.
     // A coroutine-only migration cannot approve this compatibility facade.
     if(/\bcontext\.run\s*\(\s*\)/.test(executable))
@@ -126,16 +172,83 @@ const checked = segments.map(([name, relative]) => {
     "src/providers/x/x.cpp",
     "src/providers/web3/web3.cpp"
   ].includes(relative)){
-    const target = relative.endsWith("/web3.cpp") ? "rpcAsync" : "httpsRequestAsync";
-    const legacyBridge = /asio::co_spawn\s*\(\s*io\s*,\s*(?:httpsRequestAsync|rpcAsync)\s*\(/;
-    if(!legacyBridge.test(source))
-      issues.push({line:0,kind:"legacy provider I/O bypasses coroutine HTTPS",
-        expression:"co_spawn(io, "+target+"(...))"});
+    // All network provider bridges must be retired, not moved to a helper.
     // Even with native transport, this legacy facade waits synchronously
     // for the future; do not mark its caller nonblocking until retired.
     if(/\bio\.run\s*\(\s*\)/.test(executable))
       issues.push({line:0,kind:"legacy provider facade still blocks a calling thread",
         expression:"io.run()"});
+  }
+  if (relative==="src/providers/web3/web3.cpp") {
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const native=fs.readFileSync(path.join(root,"src/authentication/http/web3.cpp"),"utf8");
+    const syncWallet=executable.slice(executable.indexOf("WalletAuthenticationProvider::completeAuthentication("),
+      executable.indexOf("WalletAuthenticationProvider::beginAuthenticationAsync("));
+    const syncFarcaster=executable.slice(executable.indexOf("FarcasterAuthenticationProvider::beginAuthentication("),
+      executable.indexOf("FarcasterAuthenticationProvider::beginAuthenticationAsync("));
+    if (!/return foundation::fail\(foundation::ErrorCode::Unavailable,/.test(syncWallet)
+        || (syncFarcaster.match(/return foundation::fail\(foundation::ErrorCode::Unavailable,/g)||[]).length!==2
+        || /\b(?:rpc|rpcString|rpcChainMatches|contractWalletValid|universalSignatureValid|farcasterIdOf|farcasterAuthAddressValid|io_context|use_future)\s*\(/.test(executable)
+        || !/co_await client.exchange\(/.test(executable)
+        || (executable.match(/co_await rpcStringAsync\(/g)||[]).length!==6
+        || !executable.includes("co_await universalSignatureValidAsync(")
+        || !executable.includes("co_await contractWalletValidAsync(")
+        || !executable.includes("co_await native->authorizeSignerAsync(")
+        || !executable.includes("co_await native->verifySignatureAsync("))
+      issues.push({line:0,kind:"Web3 synchronous network path remains or native verification is incomplete",
+        expression:"native EOA/ERC1271/ERC6492 and Farcaster signer probes"});
+    const startup=app.slice(app.indexOf("const auto nativeWeb3Flag"),app.indexOf("const auto nativeAuthSessionFlag"));
+    if (!startup.includes('platform.auth().enabled() && nativeWeb3Flag && *nativeWeb3Flag == "0"')
+        || !startup.includes("const bool nativeWeb3Enabled = platform.auth().enabled()")
+        || !startup.includes("return ExitCode::ConfigurationError;")
+        || !app.includes("nativeCanonical->authorizeDelegatedAccountAsync("))
+      issues.push({line:0,kind:"native Web3 runtime may be disabled or lacks delegated access",
+        expression:"mandatory native Web3 startup"});
+    for (const route of ["/auth/web3/start","/auth/web3/complete","/auth/web3/handoff",
+        "/auth/web3/handoff/redeem","/account/connections/web3/start",
+        "/account/connections/web3/handoff","/account/connections/web3/complete"]) {
+      if (!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"missing strict Web3 route overlay",expression:route});
+    }
+    for (const method of ["beginAsync","completeAsync","beginConnectionAsync","completeConnectionAsync",
+      "issueBrowserAuthenticationHandoffAsync","redeemBrowserAuthenticationHandoffAsync",
+      "publishBrowserAuthenticationHandoffAsync","issueBrowserConnectionHandoffAsync","consumeBrowserConnectionHandoffAsync"]) {
+      if (!native.includes("co_await m_authentication->"+method+"("))
+        issues.push({line:0,kind:"missing native Web3 lifecycle operation",expression:method});
+    }
+  }
+  if (["src/providers/oidc/oidc.cpp","src/providers/x/x.cpp"].includes(relative)) {
+    const oidc=relative.includes("/oidc/");
+    const type=oidc?"OidcAuthenticationProvider":"XAuthenticationProvider";
+    const sync=executable.slice(executable.indexOf(type+"::beginAuthentication("),
+      executable.indexOf(type+"::beginAuthenticationAsync("));
+    const native=executable.slice(executable.indexOf(type+"::beginAuthenticationAsync("));
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const legacy=fs.readFileSync(path.join(root,"src/authentication/http/federated.cpp"),"utf8");
+    const nativeStart=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_start_http.cpp"),"utf8");
+    const nativeCallback=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+    if ((sync.match(/return foundation::fail\(foundation::ErrorCode::Unavailable,/g)||[]).length!==2
+        || /\b(?:httpsRequest|io_context|use_future|completion\.get|discovery)\s*\(/.test(executable)
+        || (executable.match(/co_await httpsRequestAsync\(/g)||[]).length!==(oidc?4:2)
+        || (oidc && (native.match(/co_await m_implementation->discoveryAsync\(/g)||[]).length!==2))
+      issues.push({line:0,kind:"redirect provider retains a blocking path or misses native exchanges",
+        expression:type+" native start and completion"});
+    if ((app.match(/return runWithAccount\(administrationApi\);/g)||[]).length!==2
+        || /\bFederatedAuthenticationHttpApi\s+\w+\s*\{/.test(app)
+        || /\bauth::AuthenticationService authentication\{/.test(app)
+        || /\btoken::TokenService\s+\w+\s*\{/.test(app)
+        || /\bclient::ClientManager\s+\w+\s*\{/.test(app)
+        || !app.includes('nativePaths.emplace_back("/account/connections/handoff")')
+        || !app.includes('nativePaths.emplace_back("/account/connections/start")')
+        || !legacy.includes('|| request.path()=="/account/connections/handoff"')
+        || !legacy.includes('|| request.path()=="/account/connections/start"')
+        || !nativeStart.includes("co_await m_authentication->issueBrowserConnectionHandoffAsync(")
+        || !nativeStart.includes("m_authenticateBearer")
+        || !nativeStart.includes("co_await m_authentication->consumeBrowserConnectionHandoffAsync(")
+        || !nativeStart.includes("co_await m_authentication->beginConnectionAsync(")
+        || !nativeCallback.includes("co_await m_authentication->completeConnectionAsync("))
+      issues.push({line:0,kind:"delegated connection initiation can bypass native federation",
+        expression:"runtime-required native browser handoff and callback"});
   }
   if(relative==="src/providers/x/x.cpp"){
     const signing=source.slice(source.indexOf("oauthAuthorization("),
@@ -150,6 +263,39 @@ const checked = segments.map(([name, relative]) => {
         expression:"RAII volatile secret scrub on normal and exceptional exits"});
   }
   if(relative==="src/providers/github/github.cpp"){
+    // The retired synchronous GitHub SPI must reject unconditionally.
+    // Require the actual native exchanges AND mandatory runtime routing,
+    // not merely absence of the io.run spelling.
+    const sync = executable.slice(
+      executable.indexOf("GitHubAuthenticationProvider::completeAuthentication("),
+      executable.indexOf("GitHubAuthenticationProvider::beginAuthenticationAsync("));
+    const complete = executable.slice(executable.indexOf("GitHubAuthenticationProvider::completeAuthenticationAsync("));
+    const completeWithLiterals = source.slice(source.indexOf("GitHubAuthenticationProvider::completeAuthenticationAsync("));
+    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const callback = fs.readFileSync(path.join(root,
+      "src/authentication/http/coroutine_federated_callback_http.cpp"),"utf8");
+    const startup = app.slice(app.indexOf("const auto nativeFederatedStartFlag"),
+      app.indexOf("if (nativeCatalogEnabled && !platform.auth().enabled())"));
+    if (!/return\s+foundation::fail\(foundation::ErrorCode::Unavailable,/.test(sync)
+        || /\bhttpsRequest\s*\(/.test(executable)
+        || /\b(?:io_context|use_future|completion\.get)\b/.test(executable)
+        || (complete.match(/co_await\s+httpsRequestAsync\s*\(/g)||[]).length!==3
+        || !completeWithLiterals.includes('"/login/oauth/access_token"')
+        || !completeWithLiterals.includes('"/user"')
+        || !completeWithLiterals.includes('"/user/emails?per_page=100"'))
+      issues.push({line:0,kind:"GitHub completion still has a synchronous path or missing native exchange",
+        expression:"reject sync SPI; await token, user and email exchanges"});
+    for (const leg of ["Start","Callback"]) {
+      if (!startup.includes("const bool nativeFederated"+leg+"Enabled = platform.auth().enabled()")
+          || !startup.includes("platform.auth().enabled() && nativeFederated"+leg+'Flag && *nativeFederated'+leg+'Flag == "0"')
+          || !app.includes('nativePaths.emplace_back("/auth/federated/'+leg.toLowerCase()+'")'))
+        issues.push({line:0,kind:"GitHub native federation runtime is optional or lacks strict route",
+          expression:leg});
+    }
+    if (!callback.includes("co_await m_authentication->completeAsync(")
+        || !callback.includes("co_await m_authentication->completeConnectionAsync("))
+      issues.push({line:0,kind:"native federated callback cannot complete both login and connection",
+        expression:"completeAsync and completeConnectionAsync"});
     // All four native OAuth providers share one awaitable HTTPS transport.
     // Completing a verified and framed HTTP response must not wait for the
     // peer's optional TLS close_notify before returning the result.
@@ -181,10 +327,8 @@ const checked = segments.map(([name, relative]) => {
     // LDAP is a ChallengeResponse provider: /auth/ldap/start and
     // /auth/ldap/complete live in enterprise.cpp, not in the federated
     // redirect callback. Never count unrelated OAuth work as LDAP coverage.
-    // The dev HTTP and composition now contain an opt-in native stack.
-    // Do not confuse source-level dependency wiring with build/E2E acceptance
-    // or automatic production enablement. A default-disabled experimental
-    // feature is still a migration blocker until explicitly certified.
+    // The configured directory must use the native stack. Source-level
+    // wiring is not a replacement for build/E2E or production acceptance.
     const enterpriseHttp = cppExecutableText(fs.readFileSync(
       path.join(root,"src/authentication/http/enterprise.cpp"),"utf8"));
     const ldapNative = enterpriseHttp.slice(
@@ -200,25 +344,33 @@ const checked = segments.map(([name, relative]) => {
       && /std::make_unique<\s*postgres::CoroutinePostgresSessionRepository>/.test(app)
       && /std::make_unique<\s*postgres::CoroutinePostgresSessionService>/.test(app)
       && /std::make_unique<auth::AuthenticationService>/.test(app)
-      && /nativeCanonical.get\(\)/.test(app)
-      && /nativeAuthentication\s*\?\s*\*nativeAuthentication\s*:\s*authentication/.test(app)
-      && /fallback, nativeSessions.get\(\)/.test(app)
+      && /std::move\(nativeTrust\),std::chrono::minutes\{5\},\*nativeCanonical/.test(app)
+      && /localEnterpriseApi\{\s*\*nativeAuthentication,limiter\.value\(\),nativeLocalApi,\*nativeSessions\}/.test(app)
+      && !/\bauth::AuthenticationService authentication\{/.test(app)
+      && !/\bpostgres::PostgresSessionRepository sessionRepository\{/.test(app)
       && /auto nativeTrust = trust;/.test(app)
       && /CoroutineRouteOverlay nativeRoutes/.test(app)
       && /runListener\(platform, nativeRoutes, logger\)/.test(app)
-      && /runWithScim\(enterpriseApi, enterpriseApi\)/.test(app)
-      // Exact paths must be added ONLY when LDAP is explicitly enabled.
-      // An independent Web3 opt-in may share native transaction/canonical
-      // storage but must not automatically expose LDAP authentication.
+      && /runWithEvidence\(fallback,localEnterpriseApi\)/.test(app)
+      // Exact paths must be added ONLY for enabled LDAP configuration.
+      // An independent Web3 opt-in must not expose an unconfigured directory.
       && /if\s*\(nativeLdapEnabled\)\s*\{\s*nativePaths\.emplace_back\("\/auth\/ldap\/start"\);\s*nativePaths\.emplace_back\("\/auth\/ldap\/complete"\)/.test(appSource)
       && /nativeHandler\s*=\s*&nativeEnterprise/.test(app)
-      && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*healthApi\s*,\s*\*nativeHandler\s*,\s*std::move\(nativePaths\)/.test(app);
+      && /CoroutineRouteOverlay\s+nativeRoutes\s*\{\s*fallback\s*,\s*nativeHealth\s*,\s*std::move\(nativePaths\)/.test(app)
+      && /CoroutineHealthAdapter nativeHealth\{\*nativeHandler,/.test(app);
     if (!nativeWiring)
       issues.push({line:0,kind:"LDAP native HTTP login not connected to runtime transaction/canonical/session stack",
         expression:"real /auth/ldap start+complete -> native auth + canonical finalizer + PostgreSQL session issuer"});
-    else if (/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*==\s*"1"/.test(appSource))
-      issues.push({line:0,kind:"LDAP native runtime remains experimental and disabled by default",
-        expression:"complete GCC16 build, real LDAP/PostgreSQL HTTP E2E and security acceptance before production enablement"});
+    // Configured LDAP must select the native-only path by default.
+    // Require the positive configuration predicate, explicit override,
+    // validation and fail-closed dependency check, not just absence of the
+    // previous experimental expression. Full live E2E remains mandatory.
+    else if (!/const\s+auto\s+ldapUri\s*=\s*environment\.get\("OPENPROOF_LDAP_URI"\)/.test(appSource)
+      || !/const\s+bool\s+nativeLdapEnabled\s*=\s*nativeLdapFlag\s*\?\s*\*nativeLdapFlag\s*==\s*"1"\s*:\s*ldapUri\s*&&\s*!ldapUri->empty\(\)\s*;/.test(appSource)
+      || !/nativeLdapFlag\s*&&\s*\*nativeLdapFlag\s*!=\s*"0"\s*&&\s*\*nativeLdapFlag\s*!=\s*"1"/.test(appSource)
+      || !/if\s*\(nativeLdapEnabled\)\s*\{\s*if\s*\(!platform\.auth\(\)\.enabled\(\)\s*\|\|\s*!ldapUri\s*\|\|\s*ldapUri->empty\(\)\)/.test(appSource))
+      issues.push({line:0,kind:"LDAP configured native default or fail-closed override is missing",
+        expression:"configured LDAP -> native by default; explicit 0 disables; invalid configuration fails closed"});
 
     const iface = fs.readFileSync(
       path.join(root,"src/providers/enterprise/enterprise.cppm"),"utf8");
@@ -600,23 +752,55 @@ const checked = segments.map(([name, relative]) => {
         expression:"CoroutineSessionListenerAdapter::nativeEnabled() true"});
   }
   if(relative==="src/authentication/http/http.cpp"){
-    const legacy = source.slice(source.indexOf("AuthenticationHttpApi::login("));
-    // co_await on login/verify does not migrate logout, rotation, recovery
-    // issuance, or the legacy public handler. Keep this entire HTTP boundary
-    // blocking until every route and production caller has a native port.
-    // Native capability is per-handler, so partial route migrations must
-    // not be activated for all /auth requests.
+    // The login leaf must have no synchronous credential or session SPI.
+    // The executable must compose all six strict native auth paths, with
+    // no legacy constructor or runtime opt-out in authenticated mode.
     const nativeInterface = fs.readFileSync(
       path.join(root,"src/authentication/http/http.cppm"),"utf8");
-    if(!/static\s+constexpr\s+bool\s+kAllAuthRoutesNative\s*=\s*false/.test(nativeInterface)
-       || !/return\s+kAllAuthRoutesNative\s*&&\s*m_asyncSessions\s*!=\s*nullptr/.test(nativeInterface))
-      issues.push({line:0,kind:"partially native authentication handler enabled before all routes migrate",
-        expression:"kAllAuthRoutesNative=false"});
-    if(/\bm_sessions->(?:issueReplacing|authenticate|rotate|revoke|revokeAll)\s*\(/.test(legacy)
-       || /\bm_recoveryCodes->issue\s*\(/.test(legacy)
-       || /\bm_authentication->(?:begin|complete)\s*\(/.test(legacy))
-      issues.push({line:0,kind:"legacy HTTP authentication routes still use synchronous services",
-        expression:"AuthenticationHttpApi::login/verify/rotate/logout/recoveryCodes"});
+    const app = fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const runtime = cppExecutableText(app);
+    const authConstructors = [...runtime.matchAll(/authHttp::AuthenticationHttpApi\s+\w+\s*\{([\s\S]*?)\};/g)];
+    const syncEntry = executable.slice(executable.indexOf("AuthenticationHttpApi::handle("),
+      executable.indexOf("AuthenticationHttpApi::nativeEnabledFor("));
+    if (!/bool\s+nativeEnabled\s*\(\)\s*const\s*noexcept\s*override\s*\{\s*return\s+false;\s*\}/.test(nativeInterface)
+        || /\b(?:m_sessions|m_recoveryCodes|m_localAccounts)\b/.test(nativeInterface)
+        || /\b(?:session::SessionService|credentials::RecoveryCodeService|LocalAccountDirectory)\b/.test(nativeInterface)
+        || /AuthenticationHttpApi::(?:login|verify|rotate|logout|issueRecoveryCodes)\s*\(/.test(executable)
+        || /\bm_authentication->(?:begin|complete)\s*\(/.test(executable)
+        || !/SensitiveAuthRequestGuard\s+wipeRequestOnExit\{request\}/.test(syncEntry)
+        || !/return\s+error\(foundation::Error\{foundation::ErrorCode::Unavailable\}/.test(syncEntry)
+        || authConstructors.length !== 1
+        || authConstructors.some(([,args]) => !/^\s*\*nativeLocalAuthentication,\s*\*nativeSessions,/.test(args)))
+      issues.push({line:0,kind:"synchronous authentication HTTP entry or dependency remains reachable",
+        expression:"native-only login leaf and fail-closed synchronous entry"});
+    const flagStart=app.indexOf("const auto nativeLocalFlag");
+    const serveMigration=app.indexOf("postgres::nativeDatabasePreflight(",flagStart);
+    const beforeMigration=flagStart>=0 && serveMigration>flagStart
+      ? app.slice(flagStart,serveMigration) : "";
+
+    for (const [enabled,flag] of [["nativeLocalEnabled","nativeLocalFlag"],
+        ["nativeAuthSessionEnabled","nativeAuthSessionFlag"],["nativeRecoveryEnabled","nativeRecoveryFlag"]]) {
+      const declaration="const bool "+enabled+" = platform.auth().enabled()";
+      const rejection=beforeMigration.indexOf("if (platform.auth().enabled() && "+flag+' && *'+flag+' == "0") {');
+      const rejectionEnd=beforeMigration.indexOf("}",beforeMigration.indexOf("return ExitCode::ConfigurationError;",rejection));
+      const rejectBlock=rejection>=0 && rejectionEnd>rejection
+        ? beforeMigration.slice(rejection,rejectionEnd) : "";
+      if (!beforeMigration.includes(declaration)
+          || !rejectBlock.includes("return ExitCode::ConfigurationError;"))
+        issues.push({line:0,kind:"authenticated runtime can disable native auth dependency",expression:enabled});
+    }
+    for (const route of ["/auth/login","/auth/mfa/verify","/auth/session/rotate",
+        "/auth/logout","/auth/logout-all","/auth/recovery-codes"]) {
+      if (!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"missing strict native authentication overlay",expression:route});
+    }
+    if (!runtime.includes("std::make_unique<postgres::CoroutineSessionListenerStack>")
+        || !runtime.includes("std::make_unique<authHttp::CoroutineRecoveryCodeHttpAdapter>")
+        || !runtime.includes("nativeHandler = &asyncAuthSessions->handler()")
+        || !runtime.includes("nativeHandler = asyncRecovery.get()")
+        || !runtime.includes("gatewayHttp::CoroutineRouteOverlay nativeRoutes{"))
+      issues.push({line:0,kind:"native session and recovery handlers missing from runtime composition",
+        expression:"strict native route overlay with session listener and recovery adapter"});
     const preauth=source.slice(source.indexOf("preauthBinding("),
       source.indexOf("decodePreauthSubject(",source.indexOf("preauthBinding(")));
     if(!source.includes("class SensitiveBindingMaterialGuard final")
@@ -626,8 +810,7 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"preauthentication HMAC secret input is not scrubbed on all exits",
         expression:"RAII secureWipe of browser-bound binding HMAC material"});
     const nativeSection = source.slice(
-      source.indexOf("AuthenticationHttpApi::handleAsync("),
-      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+      source.indexOf("AuthenticationHttpApi::handleAsync("));
     for(const [kind,regex] of [
       ["native provider capability guard", /nativeEnabledFor\s*\(request\)/],
       ["native challenge start", /co_await\s+m_authentication->beginAsync\s*\(/],
@@ -645,8 +828,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"reference returned SecretString::expose(), never copy into plain std::string"});
     const localLogin=source.slice(source.indexOf("AuthenticationHttpApi::loginAsync("),
       source.indexOf("AuthenticationHttpApi::verifyAsync("));
-    const localVerify=source.slice(source.indexOf("AuthenticationHttpApi::verifyAsync("),
-      source.indexOf("gateway::HttpResponse AuthenticationHttpApi::login("));
+    const localVerify=source.slice(source.indexOf("AuthenticationHttpApi::verifyAsync("));
     const awaited=localVerify.indexOf("co_await m_authentication->completeAsync(");
     const rawGuard=source.slice(source.indexOf("class SensitiveAuthRequestGuard final"),
       source.indexOf("class SensitiveParsedAuthSecretsGuard final"));
@@ -744,10 +926,11 @@ const checked = segments.map(([name, relative]) => {
       executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
     const issue=executable.slice(
       executable.indexOf("CoroutineRecoveryCodeHttpAdapter::issue("));
-    const firstCheck=issue.indexOf("co_await m_eligible(");
-    const issuance=issue.indexOf("co_await m_recoveryCodes->issue(");
-    const secondCheck=issue.lastIndexOf("co_await m_eligible(");
-    const revocation=issue.indexOf("co_await m_recoveryCodes->revoke(");
+    const issuance=issue.indexOf("co_await m_recoveryCodes->issueFenced(");
+    const denied=issue.indexOf("if (!issued)");
+    const domain=fs.readFileSync(path.join(root,"src/credentials/coroutine_recovery_codes.cpp"),"utf8");
+    const fenced=domain.slice(domain.indexOf("CoroutineRecoveryCodeService::issueFenced("),
+      domain.indexOf("CoroutineRecoveryCodeService::consume("));
     const response=issue.indexOf("co_return jsonResponse(201");
     if(!/CoroutineRecoveryCodeHttpAdapter final/.test(header)
        || !/nativeEnabled\(\) const noexcept override \{ return false; \}/.test(header)
@@ -760,13 +943,16 @@ const checked = segments.map(([name, relative]) => {
        || !/gateway::takeSessionCredential\(request\)/.test(issue)
        || !/co_await m_authenticate\(/.test(issue)
        || !/idp::AssuranceLevel::Ial2/.test(issue)
-       || firstCheck<0 || issuance<firstCheck || secondCheck<issuance
-       || revocation<secondCheck || response<revocation
+       || issuance<0 || denied<issuance || response<denied
+       || /m_recoveryCodes->revoke\(/.test(issue)
+       || !/co_await m_repository->captureIssuanceAsync\(/.test(fenced)
+       || !/co_await issue\(std::move\(identity\),count,std::move\(fence\).value\(\)\)/.test(fenced)
+       || !/co_await m_repository->replaceFencedAsync\(/.test(domain)
        || !/co_return fail\(/.test(issue)
        || !/cache-control/.test(source)
        || !/no-store/.test(source))
       issues.push({line:0,kind:"native recovery HTTP permits synchronous fallback or unverified plaintext issuance",
-        expression:"native bearer + IAL2 + dual eligibility + atomic recovery issue/revoke before JSON"});
+        expression:"native bearer + IAL2 + generation-fenced atomic issue before JSON"});
     const guard=source.slice(source.indexOf("class SensitiveSessionHeadersGuard final"),
       source.indexOf("[[nodiscard]] bool isRecoveryRoute("));
     if(!guard.includes("m_request.wipeAuthorizationHeader()")
@@ -799,7 +985,7 @@ const checked = segments.map(([name, relative]) => {
         expression:"CSPRNG + keyed digest + await atomic persistence before returning secrets"});
   }
   if(relative==="src/storage/postgres/coroutine_recovery_code_repository.cpp"){
-    const entryPoints=["replaceAsync","consumeAsync","remainingAsync","eligibleAsync"];
+    const entryPoints=["replaceAsync","consumeAsync","remainingAsync","eligibleAsync","captureIssuanceAsync","replaceFencedAsync"];
     const bounded = entryPoints.every(name=>{
       const start = source.indexOf(
         "CoroutinePostgresRecoveryCodeRepository::"+name+"(");
@@ -807,7 +993,7 @@ const checked = segments.map(([name, relative]) => {
         start+name.length+3);
       const part=source.slice(start,end < 0 ? undefined:end);
       return start>=0
-        && /const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/.test(part)
+        && /const Deadline deadline\s*=\s*Clock::now\(\)\s*\+\s*m_impl->queryTimeout/.test(part)
         && /co_await m_impl->pool\.acquire\(deadline\)/.test(part)
         && /remaining\(deadline\)/.test(part)
         && !/m_impl->pool\.acquire\(\)/.test(part);
@@ -847,12 +1033,17 @@ const checked = segments.map(([name, relative]) => {
        || !/canonicalDigest\(std::move\(digest\)\)/.test(replace)
        || !/std::adjacent_find/.test(replace)
        || !/const Deadline deadline = Clock::now\(\) \+ timeout/.test(replace)
-       || !/co_await conn\.query\(\s*"BEGIN", \{\}, remainingBudget\(deadline\)\)/.test(replace)
+       || !/co_await conn\.query\(\s*"BEGIN ISOLATION LEVEL READ COMMITTED", \{\}, remainingBudget\(deadline\)\)/.test(replace)
        || !/pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/.test(replace)
        || replace.indexOf("pg_advisory_xact_lock") > replace.indexOf('"DELETE FROM "')
        || !/co_await conn\.query\(\s*"COMMIT", \{\}, remainingBudget\(deadline\)\)/.test(replace)
        || !/std::move\(sql\), std::move\(parameters\), remainingBudget\(deadline\)/.test(replace)
-       || (replace.match(/\bco_await\b/g) || []).length !== 5
+       || !/FOR UPDATE OF i FOR SHARE OF o/.test(replace)
+       || !/p.changed_at_ms=\$4::bigint AND t.enrolled_at_ms=\$5::bigint/.test(replace)
+       || !/FOR SHARE OF p,e,t/.test(replace)
+       || replace.indexOf("FOR SHARE OF p,e,t") > replace.indexOf('"DELETE FROM "')
+       || !/if \(!exact\(factor\)\)[\s\S]*?co_return false/.test(replace)
+       || (replace.match(/\bco_await\b/g) || []).length !== 11
        || !/WHERE identity_id=\$1 AND code_digest=decode\(\$2,'hex'\)/.test(consume)
        || !/RETURNING identity_id/.test(consume)
        || !/co_return !rows\.rows\.empty\(\)/.test(consume))
@@ -905,28 +1096,15 @@ const checked = segments.map(([name, relative]) => {
        || /\b(?:DROP|TRUNCATE|DELETE|UPDATE|INSERT|CONCURRENTLY)\b/i.test(activeSessionIndex))
       issues.push({line:0,kind:"active session pagination lacks a matching partial index",
         expression:"additive identity+recency index WHERE state=0, no table rewrites"});
-    // Concurrency can reorder requests after they capture timestamps. Both
-    // native and compatibility SQL must preserve a monotonic idle clock.
-    const legacySessions = fs.readFileSync(
-      path.join(root,"src/storage/postgres/postgres.cpp"),"utf8");
-    for (const [implementationName,sql] of [
-      ["native",source],["compatibility",legacySessions]
-    ]) {
-      const current = sql.slice(
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::useToken(" : "PostgresSessionRepository::use("),
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("));
-      const rotation = sql.slice(
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::rotateToken(" : "PostgresSessionRepository::rotate("),
-        sql.indexOf(implementationName==="native"
-          ? "AsyncSessionSql::revoke(" : "PostgresSessionRepository::revoke("));
-      if (!current.includes("GREATEST(last_seen_at_ms,$2::bigint)")
-          || !rotation.includes("GREATEST(last_seen_at_ms,$4::bigint)")) {
-        issues.push({line:0,kind:implementationName+" session idle clock can regress",
-          expression:"GREATEST(last_seen_at_ms, request timestamp) on use and rotate"});
-      }
+    // Preserve the monotonic idle clock in the only SQL implementation.
+    const current=source.slice(source.indexOf("AsyncSessionSql::useToken("),
+        source.indexOf("AsyncSessionSql::rotateToken("));
+    const rotation=source.slice(source.indexOf("AsyncSessionSql::rotateToken("),
+        source.indexOf("AsyncSessionSql::revoke("));
+    if (!current.includes("GREATEST(last_seen_at_ms,$2::bigint)")
+        || !rotation.includes("GREATEST(last_seen_at_ms,$4::bigint)")) {
+      issues.push({line:0,kind:"native session idle clock can regress",
+        expression:"GREATEST(last_seen_at_ms, request timestamp) on use and rotate"});
     }
     // An owner check before an unrestricted UPDATE is a TOCTOU security
     // bug: require ownership in the SQL mutation itself, and in the
@@ -954,20 +1132,140 @@ const checked = segments.map(([name, relative]) => {
       issues.push({line:0,kind:"native owned revocation still checks then revokes across await",
         expression:"service -> repository -> atomic AsyncSessionSql::revokeOwned"});
   }
+  if(relative==="src/oauth/http/http.cpp"){
+    // Compatibility code may remain for offline tests, but the running
+    // server must not construct the synchronous OAuth handler at all.
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    const runtime=app.slice(app.indexOf("ExitCode runGatewayServer("));
+    if (/\bOAuthHttpApi\s+[\w]+\s*\{|make_(?:unique|shared)<[^>]*OAuthHttpApi>/.test(runtime))
+      issues.push({line:0,kind:"synchronous OAuth handler constructed by server",expression:"OAuthHttpApi"});
+    if (!/co_await service->beginAsync\(/.test(runtime) ||
+        !/co_await service->completeAsync\(/.test(runtime) ||
+        !/co_await sessions->issueReplacingAsync\(/.test(runtime))
+      issues.push({line:0,kind:"native OAuth login incomplete",expression:"native authentication and atomic session replacement"});
+    for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke","/oauth/device_authorization","/oauth/device","/oauth/par","/oauth/authorize","/oauth/consent","/login","/oauth/token"]){
+      if(!app.includes('nativePaths.emplace_back("'+route+'")'))
+        issues.push({line:0,kind:"native OAuth token operation missing strict dispatch",expression:route});
+    }
+    const native=fs.readFileSync(path.join(root,"src/oauth/http/coroutine_token_read_http.cpp"),"utf8");
+    if(!/m_nativeTokenReadsRequired && path=="\/login"/.test(legacy)
+       || !/co_await m_login\(/.test(native)
+       || !/if \(tokenRoute\(r\)\) return true/.test(native)
+       || !/unsupported_grant_type/.test(native)
+       || !/co_await refresh\(std::move\(r\)\)/.test(native)
+       || !/co_await exchangeCode\(std::move\(r\)\)/.test(native)
+       || !/co_await issueMachine\(std::move\(r\)\)/.test(native)
+       || !/co_await pollDevice\(std::move\(r\)\)/.test(native))
+      issues.push({line:0,kind:"OAuth native login or complete token dispatch incomplete",expression:"all grants and invalid requests handled natively"});
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/authorize" \|\| path=="\/oauth\/consent"\)/.test(legacy)
+       || !/co_await m_par->complete\(/.test(native)
+       || !/reader->completeOAuthAuthorizationAsync/.test(app))
+      issues.push({line:0,kind:"OAuth browser authorization incomplete",expression:"strict authorization and consent completion"});
+    if(!/m_nativeTokenReadsRequired && path=="\/oauth\/par"/.test(legacy)
+       || !/co_await m_par->push\(/.test(native)
+       || !/reader->pushOAuthAuthorizationAsync/.test(app))
+      issues.push({line:0,kind:"OAuth PAR initiation incomplete",expression:"strict native push and JAR replay"});
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/device_authorization" \|\| path=="\/oauth\/device"\)/.test(legacy)
+       || !/co_await m_devicePoll->decide\(/.test(native)
+       || !/co_await m_devicePoll->readApproval\(/.test(native)
+       || !/reader->decideOAuthDeviceAsync/.test(app)
+       || !/reader->readOAuthDeviceApprovalAsync/.test(app))
+      issues.push({line:0,kind:"OAuth device browser approval incomplete",expression:"strict native browser approval and atomic consent"});
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/device_authorization"/.test(legacy)
+       || !/co_await m_devicePoll->begin\(/.test(native)
+       || !/reader->beginOAuthDeviceAsync/.test(app))
+      issues.push({line:0,kind:"OAuth device initiation has incomplete native retirement",expression:"strict device initiation and runtime storage binding"});
+    if(!/m_nativeTokenReadsRequired && \(path=="\/oauth\/userinfo"/.test(legacy)
+       || !/co_await m_revoke\(/.test(native)
+       || !/reader->revokeOAuthTokenAsync/.test(app))
+      issues.push({line:0,kind:"OAuth token revocation has incomplete native retirement",expression:"strict revocation and runtime storage binding"});
+  }
+  if(relative==="src/account/http/http.cpp"){
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    const http=fs.readFileSync(path.join(root,"src/account/http/coroutine_session_http.cpp"),"utf8");
+    const pages=fs.readFileSync(path.join(root,"src/account/http/account_pages.cpp"),"utf8");
+    const federation=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_federated_start_http.cpp"),"utf8");
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const paths=["/account/sessions","/account/sessions/revoke","/account/recover","/account/security",
+      "/account/profile","/account/connections","/account/connections/disconnect","/account/totp",
+      "/account/password/upgrade","/account/signup","/account/email/verify","/account/email/change",
+      "/account/email/change/verify","/account/email/resend","/account/phone","/account/phone/verify",
+      "/account/password/forgot","/account/password/reset","/account/totp/start","/account/totp/complete",
+      "/account/totp/disable","/account/connections/start","/account/connections/complete",
+      "/account/connections/handoff","/account/connections/web3/start","/account/connections/web3/handoff",
+      "/account/connections/web3/complete"];
+    const strict=app.slice(app.indexOf('nativePaths.emplace_back("/account/sessions")'),
+      app.indexOf("if (nativeAdminReadEnabled) {",app.indexOf('nativePaths.emplace_back("/account/sessions")')));
+    const boundary=http.slice(http.indexOf("CoroutineAccountSessionAdapter::handleAsync("),
+      http.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+    const security=http.slice(http.indexOf("CoroutineAccountSessionAdapter::securityPage("),
+      http.indexOf("CoroutineAccountSessionAdapter::sessionList("));
+    const confirm=http.slice(http.indexOf("CoroutineAccountSessionAdapter::passwordUpgradeConfirm("),
+      http.indexOf("CoroutineAccountSessionAdapter::profileUpdate("));
+    if(!/E::Unavailable/.test(legacy) || /m_accounts->|m_sessions->|m_authentication->|m_delegated->/.test(legacy)
+       || /account::AccountService accountService|PostgresAccountRepository accountRepository/.test(app)
+       || !/AccountHttpApi accountApi\{limiter.value\(\),fallback\}/.test(app)
+       || !paths.every(route=>strict.includes('"'+route+'"'))
+       || /nativeMethods\.emplace_back\("\/account\//.test(app)
+       || !/co_return renderRecoveryPage\(\)/.test(boundary)
+       || !/co_await securityPage\(/.test(boundary)
+       || !/co_await m_authenticate\(/.test(security)
+       || !/co_await m_readTotpStatus\(actor->identity\(\)\)/.test(security)
+       || !/status->first!=actor->identity\(\)/.test(security)
+       || !/co_return renderSecurityPage\(/.test(security)
+       || !/co_await m_authenticate\(/.test(confirm) || /m_authenticateReadBearer/.test(confirm)
+       || !/trustedPasswordUpgradeOrigin/.test(confirm)
+       || !/co_await m_disconnect\(/.test(http) || !/co_await m_updateProfile\(/.test(http)
+       || !/co_await m_authentication->issueBrowserConnectionHandoffAsync\(/.test(federation)
+       || !/co_await m_authentication->consumeBrowserConnectionHandoffAsync\(/.test(federation)
+       || !/m_authenticateBearer/.test(federation)
+       || /m_authentication->(?:issueBrowserConnectionHandoff|consumeBrowserConnectionHandoff|beginConnection)\(/.test(federation)
+       || /m_sessions->|m_accounts->|m_authentication->|co_await/.test(pages))
+      issues.push({line:0,kind:"account native lifecycle, strict dispatch or legacy retirement incomplete",
+        expression:"strict account paths -> native auth/storage and pure page renderers; no synchronous account service"});
+  }
   if(relative==="src/authentication/http/admin.cpp"){
-    // The actual HTTP implementation is under authentication/http/admin.cpp.
-    // administration/administration.cpp is pure command validation and should
-    // not be mistaken for the synchronous administrative HTTP service.
-    const handle = source.slice(
-      source.indexOf("AdministrationHttpApi::handle("),
-      source.indexOf("AdministrationHttpApi::listLocalMembers("));
-    if(!/m_memberships->find\s*\(\s*m_organization\s*,\s*actor\s*\)/.test(handle)
-       || !/membership->value\s*\(\s*\)\.hasRole\s*\(/.test(handle)
-       || !/organization::Role\s*\{\s*"owner"\s*\}/.test(handle)
-       || !/ErrorCode::PermissionDenied/.test(handle)
-       || handle.indexOf("m_memberships->find") > handle.indexOf("listLocalMembers(std::move(request))"))
-      issues.push({line:0,kind:"admin member listing lacks tenant-scoped active owner authorization",
-        expression:"m_memberships->find(m_organization, actor) / hasRole(owner) before listing"});
+    // Scan both the retired ABI and the real HTTP + SQL implementations.
+    // Pure command validation in administration.cpp never counts as I/O.
+    const legacy=fs.readFileSync(path.join(root,relative),"utf8");
+    const http=fs.readFileSync(path.join(root,"src/authentication/http/coroutine_admin_read_http.cpp"),"utf8");
+    const sql=fs.readFileSync(path.join(root,"src/storage/postgres/coroutine_admin_store.cpp"),"utf8");
+    const app=fs.readFileSync(path.join(root,"apps/opp/main.cpp"),"utf8");
+    const runtime=app.slice(app.indexOf("ExitCode runGatewayServer("));
+    const routes=runtime.slice(runtime.indexOf('for (const auto* path : {"/admin/local-members"'),
+      runtime.indexOf("nativePaths.emplace_back(path);",runtime.indexOf('for (const auto* path : {"/admin/local-members"')));
+    const requiredRoutes=["/admin/local-members","/admin/local-members/roles","/admin/local-members/suspend",
+      "/admin/local-members/reinstate","/admin/local-members/remove","/admin/local-members/credentials/reset"];
+    const mutation=sql.slice(sql.indexOf("CoroutineAdminStore::mutateAsync("));
+    const write=mutation.indexOf('execute("BEGIN ISOLATION LEVEL READ COMMITTED"');
+    const authorize=mutation.indexOf('std::string{ownerSql}+" FOR UPDATE OF o,i,m,r"');
+    const record=mutation.indexOf("co_await appendRecords(");
+    const commit=mutation.indexOf('execute("COMMIT"');
+    const auth= http.indexOf("co_await m_authenticate(");
+    const assurance=http.indexOf("idp::AssuranceLevel::Ial2",auth);
+    const read=http.indexOf("co_await m_read(actor)",assurance);
+    const mutate=http.indexOf("co_await m_mutation->mutate(");
+    if(!/ErrorCode::Unavailable/.test(legacy) || /m_sessions->|m_members->|m_memberships->|m_identities->/.test(legacy)
+       || /AdministrationHttpApi administrationApi|PostgresAdministrationRepository::create\(/.test(runtime)
+       || !/const bool nativeAdminReadEnabled = platform\.auth\(\)\.enabled\(\)\s*\|\|/.test(runtime)
+       || !/nativeAdminReadFlag && \*nativeAdminReadFlag == "0"/.test(runtime)
+       || !/store->mutateAsync\(std::move\(actor\),command\)/.test(runtime)
+       || !requiredRoutes.every(route=>routes.includes('"'+route+'"'))
+       || !(auth>=0 && assurance>auth && read>assurance && mutate>read)
+       || !/listing->actor != actor/.test(http) || !/role\.value\(\) == "owner"/.test(http)
+       || /m_fallback->handle\(/.test(http)
+       || !(write>=0 && authorize>write && record>authorize && commit>record)
+       || !/pg_advisory_xact_lock\(7299730475761673315\)/.test(mutation)
+       || !/m\.identity_id<>\$2 AND m\.state=1 AND i\.status=0/.test(mutation)
+       || !/FOR UPDATE OF m,i,r/.test(mutation)
+       || !/UPDATE openproof\.sessions SET state=1/.test(mutation)
+       || !/pg_advisory_xact_lock\(7299730475761673314\)/.test(sql)
+       || !/audit::computeAuditRecordHash/.test(sql)
+       || !/INSERT INTO openproof\.security_event_outbox/.test(sql)
+       || !/co_await m_impl->passwords->hashAsync/.test(mutation))
+      issues.push({line:0,kind:"admin HTTP lifecycle has incomplete native authorization, persistence or retirement",
+        expression:"strict native HTTP -> IAL2/owner -> atomic async mutation, audit and outbox"});
   }
   if(relative==="src/authentication/http/web3.cpp"){
     // Native session grants expose a token field rather than token().
@@ -1014,15 +1312,28 @@ const checked = segments.map(([name, relative]) => {
         issues.push({line:0,kind:"blocking native HTTP fallback",expression:"m_fallback->handle("});
       for(const expression of [
         /\bm_sessions->(?:issue|authenticate|issueReplacing)\s*\(/,
-        /\bm_authentication->(?:publishBrowserAuthenticationHandoff|consumeBrowserConnectionHandoff|updateConnectionPresentation)\s*\(/
+        /\bm_authentication->(?:issueBrowserAuthenticationHandoff|redeemBrowserAuthenticationHandoff|publishBrowserAuthenticationHandoff|issueBrowserConnectionHandoff|consumeBrowserConnectionHandoff|updateConnectionPresentation|beginConnection|completeConnection)\s*\(/
       ]){
         if(expression.test(nativeSection))
           issues.push({line:0,kind:"legacy blocking call in native Web3 handler",expression:expression.source});
       }
       if(!/\bco_await\s+m_asyncSessions->issueAsync\s*\(/.test(nativeSection))
         issues.push({line:0,kind:"missing native session persistence",expression:"m_asyncSessions->issueAsync("});
-      if(!/if\s*\(connection\s*\|\|\s*m_asyncSessions\s*==\s*nullptr\s*\|\|\s*!m_authentication->nativeCanonicalCompletionEnabled\s*\(\)/.test(nativeSection))
-        issues.push({line:0,kind:"missing fail-closed session/connection gate",expression:"connection || m_asyncSessions == nullptr || !nativeCanonicalCompletionEnabled()"});
+      const capability=source.slice(source.indexOf("Web3AuthenticationHttpApi::nativeEnabledFor("),nativeIndex);
+      const start=nativeSection.slice(nativeSection.indexOf("Web3AuthenticationHttpApi::startAsync("),
+        nativeSection.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+      const complete=nativeSection.slice(nativeSection.indexOf("Web3AuthenticationHttpApi::completeAsync("));
+      const link=complete.slice(complete.indexOf("if (connection) {"),complete.indexOf("co_await m_authentication->completeAsync("));
+      if(!/m_asyncSessions\s*!=\s*nullptr\s*&&\s*m_authentication->nativeCanonicalCompletionEnabled\(\)/.test(capability)
+          || !/m_authentication->nativeConnectionCompletionEnabled\(\)\s*&&\s*static_cast<bool>\(m_authenticate\)/.test(capability)
+          || !/if\s*\(!nativeEnabledFor\(request\)\)/.test(start)
+          || !/if\s*\(!nativeEnabledFor\(request\)\)/.test(complete)
+          || !/co_await m_authentication->beginConnectionAsync\(/.test(start)
+          || !/co_await m_authentication->consumeBrowserConnectionHandoffAsync\(/.test(start)
+          || !/co_await m_authentication->completeConnectionAsync\(/.test(link)
+          || !/co_return response;/.test(link)
+          || /m_asyncSessions->issueAsync\(/.test(link))
+        issues.push({line:0,kind:"missing fail-closed native session/connection gate",expression:"request capability, native handoff and link completion without session issuance"});
     }
   }
   return {name,file:relative,coAwaitCount:awaitCount,issues};

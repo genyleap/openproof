@@ -7,7 +7,6 @@ export module openproof.operations.http;
 
 import openproof.foundation;
 import openproof.gateway;
-import openproof.storage.postgres;
 import openproof.telemetry;
 
 export namespace openproof::operations::http {
@@ -21,15 +20,6 @@ public:
     [[nodiscard]] virtual foundation::Status check() = 0;
 protected:
     ReadinessCheck() = default;
-};
-
-/** PostgreSQL readiness check that performs a bounded `SELECT 1`. */
-class PostgresReadinessCheck final : public ReadinessCheck {
-public:
-    explicit PostgresReadinessCheck(storage::postgres::ConnectionPool& pool);
-    [[nodiscard]] foundation::Status check() override;
-private:
-    storage::postgres::ConnectionPool* m_pool;
 };
 
 /** Unauthenticated liveness/readiness endpoints for container orchestration. */

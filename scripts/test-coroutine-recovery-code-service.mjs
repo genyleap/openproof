@@ -20,7 +20,7 @@ const slice=(text,begin,end)=> {
 
 test("recovery coroutine repository interface is independent of PostgreSQL vendor",()=>{
   assert.match(iface,/class CoroutineRecoveryCodeRepository/);
-  for(const operation of ["replaceAsync","consumeAsync","remainingAsync"]) {
+  for(const operation of ["replaceAsync","consumeAsync","remainingAsync","captureIssuanceAsync","replaceFencedAsync"]) {
     assert.match(iface,new RegExp(operation+"\\("));
   }
   assert.doesNotMatch(cppExecutableText(iface),/postgres|libpq|PQexec|ConnectionPool/i);
@@ -33,6 +33,8 @@ test("issue generates CSPRNG and keyed digests before awaiting atomic replacemen
   assert.match(issued,/security::hmacSha256\(m_pepper, code\.expose\(\)\)/);
   assert.match(issued,/count > 32U/);
   assert.match(issued,/co_await m_repository->replaceAsync\(/);
+  assert.match(issued,/co_await m_repository->replaceFencedAsync\(/);
+  assert.match(issued,/co_await m_repository->captureIssuanceAsync\(/);
   assert.match(issued,/if \(!saved\) co_return foundation::fail\(saved\.error\(\)\)/);
   assert.ok(issued.indexOf("co_await m_repository->replaceAsync") <
             issued.indexOf("co_return foundation::Result<std::vector<foundation::SecretString>>"));
@@ -47,12 +49,12 @@ test("consume is one keyed digest and a scoped awaitable atomic store redemption
 });
 
 test("native PostgreSQL adapter has one deadline across queue and all SQL",()=>{
-  for(const name of ["replaceAsync","consumeAsync","remainingAsync"]) {
+  for(const name of ["replaceAsync","consumeAsync","remainingAsync","captureIssuanceAsync","replaceFencedAsync"]) {
     const from=bridge.indexOf("CoroutinePostgresRecoveryCodeRepository::"+name+"(");
     const to=bridge.indexOf("CoroutinePostgresRecoveryCodeRepository::",from+name.length+3);
     const method=bridge.slice(from,to<0?undefined:to);
     assert.ok(from>=0);
-    assert.match(method,/const Deadline deadline = Clock::now\(\) \+ m_impl->queryTimeout/);
+    assert.match(method,/const Deadline deadline\s*=\s*Clock::now\(\)\s*\+\s*m_impl->queryTimeout/);
     assert.match(method,/co_await m_impl->pool\.acquire\(deadline\)/);
     assert.match(method,/remaining\(deadline\)/);
   }

@@ -10,6 +10,7 @@
 #include <utility>
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/json.hpp>
 
 #include "coroutine_federated_start_http.hpp"
 
@@ -20,7 +21,21 @@ namespace openproof::authentication::http {
 namespace {
 namespace idp = identity::provider;
 namespace asio = boost::asio;
+namespace json = boost::json;
 using Parameters = std::map<std::string, std::string, std::less<>>;
+class SensitiveQueryValues final {
+public:
+    explicit SensitiveQueryValues(Parameters& values) noexcept : m_values(values) {}
+    ~SensitiveQueryValues() {
+        for (auto& entry:m_values) {
+            foundation::secureWipe(entry.second.data(),entry.second.size());
+        }
+    }
+    SensitiveQueryValues(const SensitiveQueryValues&)=delete;
+    SensitiveQueryValues& operator=(const SensitiveQueryValues&)=delete;
+private:
+    Parameters& m_values;
+};
 
 constexpr std::string_view kContinuationCookie = "__Host-openproof-federation-continuation";
 constexpr std::string_view kBindingCookie = "__Host-openproof-federation-binding";
@@ -54,6 +69,15 @@ private:
 {
     return request.method() == gateway::HttpMethod::Get
         && request.path() == "/auth/federated/start";
+}
+
+[[nodiscard]] bool isConnectionStart(const gateway::HttpRequest& request) noexcept
+{
+    return request.method()==gateway::HttpMethod::Get && request.path()=="/account/connections/start";
+}
+[[nodiscard]] bool isHandoff(const gateway::HttpRequest& request) noexcept
+{
+    return request.path()=="/account/connections/handoff";
 }
 
 [[nodiscard]] gateway::HttpResponse unavailable()
@@ -139,6 +163,7 @@ void clearState(gateway::HttpResponse& response)
     std::string_view input = target.substr(question + 1U);
     if (input.size() > 8192U) return std::nullopt;
     Parameters result;
+    SensitiveQueryValues wipeValues{result};
     while (!input.empty()) {
         const auto amp = input.find('&');
         const auto pair = input.substr(0U, amp);
@@ -146,8 +171,10 @@ void clearState(gateway::HttpResponse& response)
         if (equals == std::string_view::npos) return std::nullopt;
         auto key = decode(pair.substr(0U, equals));
         auto value = decode(pair.substr(equals + 1U));
-        if (!key || !value || key->empty() || result.contains(*key))
+        if (!key || !value || key->empty() || result.contains(*key)) {
+            if (value) foundation::secureWipe(value->data(),value->size());
             return std::nullopt;
+        }
         result.emplace(std::move(*key), std::move(*value));
         if (amp == std::string_view::npos) break;
         input.remove_prefix(amp + 1U);
@@ -189,16 +216,27 @@ CoroutineFederatedStartAdapter::CoroutineFederatedStartAdapter(
     AuthenticationService& authentication,
     idp::ProviderRegistry& providers,
     gateway::TokenBucketRateLimiter& limiter,
-    gateway::http::CoroutineHttpHandler& fallback)
+    gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate,
+    Authenticate authenticateBearer)
     : m_authentication(&authentication), m_providers(&providers),
-      m_limiter(&limiter), m_fallback(&fallback)
+      m_limiter(&limiter), m_fallback(&fallback), m_authenticate(std::move(authenticate)),
+      m_authenticateBearer(std::move(authenticateBearer))
 {
 }
 
 bool CoroutineFederatedStartAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
-    return isStart(request) || m_fallback->nativeEnabledFor(request);
+    if (isStart(request)) return true;
+    if (request.path()=="/account/connections/complete" && request.method()==gateway::HttpMethod::Get)
+        return true;
+    if (isHandoff(request) && request.method()==gateway::HttpMethod::Get)
+        return static_cast<bool>(m_authenticate);
+    if (isConnectionStart(request) || isHandoff(request)) {
+        return static_cast<bool>(m_authenticate)
+            && (!request.header("authorization").has_value() || m_authenticateBearer);
+    }
+    return m_fallback->nativeEnabledFor(request);
 }
 
 gateway::HttpResponse CoroutineFederatedStartAdapter::handle(
@@ -215,7 +253,13 @@ gateway::HttpResponse CoroutineFederatedStartAdapter::handle(
 asio::awaitable<gateway::HttpResponse>
 CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
 {
-    if (!isStart(request)) {
+    if (request.path()=="/account/connections/complete" && request.method()==gateway::HttpMethod::Get) {
+        SensitiveFederatedStartRequestGuard wipe{request};
+        gateway::HttpResponse response{204,{},{}};
+        secure(response);
+        co_return response;
+    }
+    if (!isStart(request) && !isConnectionStart(request) && !isHandoff(request)) {
         if (m_fallback->nativeEnabledFor(request))
             co_return co_await m_fallback->handleAsync(std::move(request));
         request.wipeBody();
@@ -225,14 +269,49 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
     }
     SensitiveFederatedStartRequestGuard wipeRequestOnExit{request};
 
+    if (!nativeEnabledFor(request)) co_return unavailable();
+    if (isHandoff(request)) {
+        if (!m_limiter->allow("federation-handoff-ip:"+std::string{request.remoteAddress()}))
+            co_return denied(foundation::Error{foundation::ErrorCode::RateLimited},request);
+        if (request.method()==gateway::HttpMethod::Post)
+            co_return co_await issueHandoff(std::move(request));
+        if (request.header("authorization").has_value())
+            co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        auto params=query(request);
+        if (!params)
+            co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        SensitiveQueryValues wipeParams{*params};
+        if (params->size()!=1U || !params->contains("ticket"))
+            co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        auto& ticket=params->at("ticket");
+        if (ticket.empty() || ticket.size()>256U || !std::ranges::all_of(ticket,[](char c){
+            return (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9')
+                || c=='-' || c=='_' || c=='.';
+        })) {
+            foundation::secureWipe(ticket.data(),ticket.size());
+            co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+        }
+        foundation::SecretString secret{std::move(ticket)};
+        request.wipeTargetQuery(); request.wipeBody();
+        request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        try {
+            auto target=co_await m_authentication->consumeBrowserConnectionHandoffAsync(std::move(secret));
+            if (!target) co_return denied(target.error(),request);
+            if (!validLocalReturn(target->returnTarget))
+                co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+            co_return co_await startPrepared(std::move(request),std::move(target->providerId),
+                std::move(target->returnTarget),std::move(target->identity));
+        } catch (...) {
+            co_return denied(foundation::Error{foundation::ErrorCode::Unavailable},request);
+        }
+    }
+
     if (!m_limiter->allow(
             std::string{"federation-ip:"} + std::string{request.remoteAddress()})) {
         co_return denied(foundation::Error{foundation::ErrorCode::RateLimited}, request);
     }
     const auto params = query(request);
-    // Native federation is login-only. Reject ambiguous or unsupported
-    // parameters rather than silently treating a requested connection or
-    // alternative ceremony as a fresh login transaction.
+    // Purpose comes from the route, not a caller-supplied query field.
     if (!params || params->size() > 2U
         || std::ranges::any_of(*params, [](const auto& entry) {
             return entry.first != "provider" && entry.first != "return_to";
@@ -250,7 +329,50 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
     if (!validLocalReturn(returnTarget)) {
         co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument}, request);
     }
-    idp::ProviderId providerId{provider->second};
+    std::optional<identity::core::IdentityId> target;
+    if (isConnectionStart(request)) {
+        const bool explicitBearer=request.header("authorization").has_value();
+        if (request.header("authorization").value_or("").starts_with("DPoP "))
+            co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+        const auto& authenticate=explicitBearer ? m_authenticateBearer : m_authenticate;
+        auto credential=gateway::takeSessionCredential(request);
+        if (!credential || !credential->has_value())
+            co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+        try {
+            auto actor=co_await authenticate(std::move(credential->value()));
+            if (!actor) co_return denied(actor.error(),request);
+            if (explicitBearer) {
+                // Never initiate a browser-bound remote proof using an API
+                // credential directly. Issue an owner-bound single-use ticket.
+                const idp::ProviderId selected{provider->second};
+                auto* implementation=m_providers->find(selected);
+                if (!implementation || implementation->interactionModel()!=idp::InteractionModel::Redirect
+                    || !m_authentication->nativeProviderAuthenticationEnabled(selected))
+                    co_return denied(foundation::Error{foundation::ErrorCode::NotFound},request);
+                request.wipeTargetQuery(); request.wipeBody();
+                request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+                auto issued=co_await m_authentication->issueBrowserConnectionHandoffAsync(
+                    actor->identity(),selected,returnTarget,request.correlation());
+                if (!issued) co_return denied(issued.error(),request);
+                gateway::HttpResponse response{302,gateway::Headers{{"location",
+                    "/account/connections/handoff?ticket="+issued->ticket().expose()}},{}};
+                secure(response);
+                co_return response;
+            }
+            target.emplace(actor->identity());
+        } catch (...) {
+            co_return denied(foundation::Error{foundation::ErrorCode::Unavailable},request);
+        }
+    }
+    co_return co_await startPrepared(std::move(request),idp::ProviderId{provider->second},
+        returnTarget,std::move(target));
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineFederatedStartAdapter::startPrepared(gateway::HttpRequest request,idp::ProviderId providerId,
+    std::string returnTarget,std::optional<identity::core::IdentityId> connectionTarget)
+{
+    SensitiveFederatedStartRequestGuard wipeRequestOnExit{request};
     auto* implementation = m_providers->find(providerId);
     if (implementation == nullptr
         || implementation->interactionModel() != idp::InteractionModel::Redirect) {
@@ -279,8 +401,12 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
     foundation::Result<AuthenticationStart> started =
         foundation::fail(foundation::ErrorCode::Unavailable);
     try {
-        started = co_await m_authentication->beginAsync(
-            std::move(begin), binding.value(), request.correlation());
+        if (connectionTarget)
+            started=co_await m_authentication->beginConnectionAsync(
+                std::move(begin),binding.value(),request.correlation(),std::move(*connectionTarget));
+        else
+            started = co_await m_authentication->beginAsync(
+                std::move(begin), binding.value(), request.correlation());
     } catch (...) {
         co_return denied(foundation::Error{foundation::ErrorCode::Unavailable}, request);
     }
@@ -306,7 +432,55 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
         kChallengeCookie, encoded(started->challenge().id().value()), 600, sameSite));
     response.addHeader("set-cookie", cookie(
         kReturnCookie, encoded(returnTarget), 600, sameSite));
+    if (connectionTarget)
+        response.addHeader("set-cookie",cookie(kModeCookie,"link",600,sameSite));
+    else
+        response.addHeader("set-cookie",cookie(kModeCookie,"",0,sameSite));
     co_return response;
+}
+
+asio::awaitable<gateway::HttpResponse>
+CoroutineFederatedStartAdapter::issueHandoff(gateway::HttpRequest request)
+{
+    SensitiveFederatedStartRequestGuard wipeRequestOnExit{request};
+    const auto type=request.header("content-type");
+    if (!type || (*type!="application/json" && !type->starts_with("application/json;"))
+        || request.body().empty() || request.body().size()>8192U)
+        co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    boost::system::error_code ec;
+    auto parsed=json::parse(request.body(),ec);
+    if (ec || !parsed.is_object() || parsed.as_object().size()!=2U)
+        co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const auto* provider=parsed.as_object().if_contains("provider");
+    const auto* returning=parsed.as_object().if_contains("return_to");
+    if (!provider || !provider->is_string() || !returning || !returning->is_string())
+        co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    const std::string providerText{provider->as_string()},returnTarget{returning->as_string()};
+    if (providerText.empty() || providerText.size()>128U || !validLocalReturn(returnTarget))
+        co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() ? m_authenticateBearer : m_authenticate;
+    auto credential=gateway::takeSessionCredential(request);
+    if (!credential || !credential->has_value())
+        co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
+    request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+    try {
+        auto actor=co_await authenticate(std::move(credential->value()));
+        if (!actor) co_return denied(actor.error(),request);
+        auto issued=co_await m_authentication->issueBrowserConnectionHandoffAsync(
+            actor->identity(),idp::ProviderId{providerText},returnTarget,request.correlation());
+        if (!issued) co_return denied(issued.error(),request);
+        json::object body;
+        body["handoff_url"]="/account/connections/handoff?ticket="+issued->ticket().expose();
+        body["expires_at"]=foundation::toIso8601(issued->expiresAt());
+        gateway::HttpResponse response{201,gateway::Headers{{"content-type","application/json"}},
+            json::serialize(body)};
+        secure(response);
+        co_return response;
+    } catch (...) {
+        co_return denied(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
 }
 
 } // namespace openproof::authentication::http

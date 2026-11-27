@@ -83,16 +83,6 @@ struct MetricsHttpApi::MetricsState final {
     std::atomic<std::uint64_t> successfulScrapes{};
 };
 
-PostgresReadinessCheck::PostgresReadinessCheck(storage::postgres::ConnectionPool& pool)
-    : m_pool(&pool)
-{
-}
-
-foundation::Status PostgresReadinessCheck::check()
-{
-    return m_pool->healthCheck();
-}
-
 HealthHttpApi::HealthHttpApi(ReadinessCheck& readiness, gateway::HttpHandler& fallback)
     : m_readiness(&readiness), m_fallback(&fallback)
 {

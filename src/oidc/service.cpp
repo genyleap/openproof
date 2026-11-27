@@ -80,7 +80,7 @@ namespace {
         instant.time_since_epoch()).count();
 }
 
-[[nodiscard]] std::string amrJson(const oauth::RedeemedAuthorization& authorization)
+[[nodiscard]] std::string amrJson(const identity::provider::AuthenticationStrength& strength)
 {
     std::string result{"["};
     bool comma = false;
@@ -89,7 +89,6 @@ namespace {
         result.append(q(value));
         comma = true;
     };
-    const auto& strength = authorization.strength();
     const auto factors = strength.factors();
     if (identity::provider::containsFactor(
             factors, identity::provider::AuthenticationFactor::Knowledge)) {
@@ -211,6 +210,12 @@ OpenIdProvider::OpenIdProvider(
       m_publishedVerificationJwks(std::move(publishedVerificationJwks)),
       m_profiles(&profiles), m_policy(policy) {}
 
+OpenIdProvider::OpenIdProvider(Issuer issuer,const foundation::ClockSource& clock,
+    security::RsaSha256Signer signer,OidcPolicy policy,
+    std::vector<PublishedVerificationJwk> publishedVerificationJwks)
+    :m_issuer(std::move(issuer)),m_clock(&clock),m_signer(std::move(signer)),
+     m_publishedVerificationJwks(std::move(publishedVerificationJwks)),m_policy(policy) {}
+
 std::string OpenIdProvider::discoveryDocument() const
 {
     const auto issuer = m_issuer.value();
@@ -259,8 +264,26 @@ foundation::Result<std::string> OpenIdProvider::jwksDocument() const
 foundation::Result<std::string> OpenIdProvider::issueIdToken(
     const oauth::RedeemedAuthorization& authorization) const
 {
+    return signIdToken(authorization.clientId(),authorization.identity(),authorization.scopes(),
+        authorization.nonce(),authorization.assurance(),authorization.strength(),authorization.authenticatedAt());
+}
+
+foundation::Result<std::string> OpenIdProvider::issueIdTokenForNativeExchange(
+    const oauth::AuthorizationCode& authorization) const
+{
+    return signIdToken(authorization.clientId(),authorization.identity(),authorization.scopes(),
+        authorization.nonce(),authorization.assurance(),authorization.strength(),authorization.authenticatedAt());
+}
+
+foundation::Result<std::string> OpenIdProvider::signIdToken(
+    const client::ClientId& client,const identity::core::IdentityId& subject,
+    const std::vector<client::Scope>& scopes,const std::optional<std::string>& nonce,
+    identity::provider::AssuranceLevel assurance,
+    const identity::provider::AuthenticationStrength& strength,
+    foundation::Instant authenticatedAt) const
+{
     bool openid = false;
-    for (const auto& scope : authorization.scopes()) {
+    for (const auto& scope : scopes) {
         if (scope.value() == "openid") { openid = true; break; }
     }
     if (!openid) {
@@ -271,15 +294,15 @@ foundation::Result<std::string> OpenIdProvider::issueIdToken(
     const auto expires = now + m_policy.idTokenLifetime();
     std::string payload{"{"};
     payload += "\"iss\":" + q(m_issuer.value());
-    payload += ",\"sub\":" + q(authorization.identity().value());
-    payload += ",\"aud\":" + q(authorization.clientId().value());
+    payload += ",\"sub\":" + q(subject.value());
+    payload += ",\"aud\":" + q(client.value());
     payload += ",\"iat\":" + std::to_string(seconds(now));
     payload += ",\"exp\":" + std::to_string(seconds(expires));
-    payload += ",\"auth_time\":" + std::to_string(seconds(authorization.authenticatedAt()));
-    payload += ",\"acr\":" + q(identity::provider::assuranceLevelName(authorization.assurance()));
-    payload += ",\"amr\":" + amrJson(authorization);
-    if (authorization.nonce().has_value()) {
-        payload += ",\"nonce\":" + q(authorization.nonce().value());
+    payload += ",\"auth_time\":" + std::to_string(seconds(authenticatedAt));
+    payload += ",\"acr\":" + q(identity::provider::assuranceLevelName(assurance));
+    payload += ",\"amr\":" + amrJson(strength);
+    if (nonce.has_value()) {
+        payload += ",\"nonce\":" + q(nonce.value());
     }
     payload.push_back('}');
     return m_signer.signJwt(payload);
@@ -318,6 +341,7 @@ foundation::Result<std::string> OpenIdProvider::userInfo(
                                 "The access token cannot access UserInfo.");
     }
     std::string result{"{\"sub\":" + q(claims.context().identity().value())};
+    if (!m_profiles) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto profile = m_profiles->find(claims.context().identity());
     if (!profile.has_value()) return foundation::fail(profile.error());
     if (profile->has_value()) {

@@ -1,25 +1,34 @@
 #pragma once
 
-// Native GET /auth/federated/start path. The legacy callback and connection
-// ceremonies remain on the compatibility worker until they have equivalent
-// native session issuance and full OAuth E2E acceptance.
+// Native OAuth2 login and connection start, including single-use browser
+// handoff. Explicit account-scoped Bearer uses a separate verifier and
+// never starts a browser-bound provider ceremony without a one-time ticket.
+#include <functional>
+#include <optional>
+#include <string>
 #include <boost/asio/awaitable.hpp>
 
 import openproof.authentication;
+import openproof.foundation;
 import openproof.gateway;
 import openproof.gateway.http;
 import openproof.identity.provider;
+import openproof.identity.core;
+import openproof.session;
 
 namespace openproof::authentication::http {
 
 class CoroutineFederatedStartAdapter final
     : public gateway::http::CoroutineHttpHandler {
 public:
+    using Authenticate = std::function<boost::asio::awaitable<
+        foundation::Result<session::Session>>(foundation::SecretString)>;
     CoroutineFederatedStartAdapter(
         AuthenticationService& authentication,
         identity::provider::ProviderRegistry& providers,
         gateway::TokenBucketRateLimiter& limiter,
-        gateway::http::CoroutineHttpHandler& fallback);
+        gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate = {},
+        Authenticate authenticateBearer = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -29,10 +38,16 @@ public:
     handleAsync(gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> startPrepared(
+        gateway::HttpRequest request, identity::provider::ProviderId provider,
+        std::string returnTarget, std::optional<identity::core::IdentityId> connectionTarget);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> issueHandoff(gateway::HttpRequest request);
     AuthenticationService* m_authentication;
     identity::provider::ProviderRegistry* m_providers;
     gateway::TokenBucketRateLimiter* m_limiter;
     gateway::http::CoroutineHttpHandler* m_fallback;
+    Authenticate m_authenticate;
+    Authenticate m_authenticateBearer;
 };
 
 } // namespace openproof::authentication::http
