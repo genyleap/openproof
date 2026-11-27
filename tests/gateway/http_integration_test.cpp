@@ -818,6 +818,65 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnection)
+{
+    // Keep the handler alive after the server and its two executors are
+    // destroyed. The suspended coroutine must release its local state
+    // even when its completion cannot be delivered to the stopped strand.
+    class SuspendedHandler final : public httpAdapter::CoroutineHttpHandler {
+    public:
+        [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
+        [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+        {
+            synchronousCalls.fetch_add(1, std::memory_order_relaxed);
+            return gw::HttpResponse{500, {}, "unexpected synchronous dispatch"};
+        }
+        [[nodiscard]] asio::awaitable<gw::HttpResponse>
+        handleAsync(gw::HttpRequest) override
+        {
+            struct Lifetime final {
+                std::atomic<int>& destroyed;
+                ~Lifetime() { destroyed.fetch_add(1, std::memory_order_relaxed); }
+            } lifetime{destroyed};
+            asio::steady_timer timer{co_await asio::this_coro::executor};
+            timer.expires_after(std::chrono::seconds{30});
+            entered.set_value();
+            co_await timer.async_wait(asio::use_awaitable);
+            completed.fetch_add(1, std::memory_order_relaxed);
+            co_return gw::HttpResponse{200, {}, "late response"};
+        }
+        std::promise<void> entered;
+        std::atomic<int> destroyed{0};
+        std::atomic<int> completed{0};
+        std::atomic<int> synchronousCalls{0};
+    } handler;
+
+    auto entered = handler.entered.get_future();
+    asio::io_context clientIo;
+    Tcp::socket client{clientIo};
+    {
+        httpAdapter::BeastHttpServer server{handler, serverConfig()};
+        ASSERT_TRUE(server.start());
+        client.connect(Tcp::endpoint{asio::ip::make_address("127.0.0.1"), server.boundPort()});
+        beastHttp::request<beastHttp::empty_body> request{beastHttp::verb::get, "/", 11U};
+        request.set(beastHttp::field::host, "127.0.0.1");
+        request.keep_alive(false);
+        static_cast<void>(beastHttp::write(client, request));
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds{5}), std::future_status::ready);
+        const auto start = std::chrono::steady_clock::now();
+        server.stop();
+        EXPECT_FALSE(server.running());
+        EXPECT_EQ(server.boundPort(), 0U);
+        // Destroying the server must not wait for the original I/O deadline.
+        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
+    }
+    EXPECT_EQ(handler.destroyed.load(), 1);
+    EXPECT_EQ(handler.completed.load(), 0);
+    EXPECT_EQ(handler.synchronousCalls.load(), 0);
+    boost::system::error_code ignored;
+    client.close(ignored);
+}
+
 TEST(BeastHttpIntegrationTest, NativeHttpConcurrentResponsesUseIndependentStrands)
 {
     // Production can use 32 reactor threads, unlike the ordinary 2-thread
