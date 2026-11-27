@@ -30,6 +30,10 @@ assert.equal(candidate.requests, baseline.requests,
   "Workload request counts must match");
 assert.equal(candidate.concurrency, baseline.concurrency,
   "Workload concurrency must match");
+if (baseline.normalizedResponseChecks !== undefined || candidate.normalizedResponseChecks !== undefined) {
+  assert.equal(baseline.normalizedResponseChecks, baseline.requests, "Incomplete baseline response validation");
+  assert.equal(candidate.normalizedResponseChecks, candidate.requests, "Incomplete candidate response validation");
+}
 if (baseline.commit === candidate.commit) {
   console.error("Warning: the two input artifacts record the same commit.");
 }
