@@ -1414,6 +1414,12 @@ async function main() {
       const mfaGrant = await login("consumer@e2e.invalid", replacementPassword, mfaJar,
         await nextTotp(setup.secret_base32, code));
       assert.equal(mfaGrant.assurance, "ial2");
+      // An authenticated IAL2 non-owner must reach the owner check, not
+      // the step-up redirect. Exercise it before disabling the factor.
+      const nonOwnerConsole = await edgeRequest("/admin/console", { jar: mfaJar });
+      expectStatus(nonOwnerConsole, 403);
+      assert.doesNotMatch(nonOwnerConsole.body, /OpenProof Admin Console/);
+      assert.equal(nonOwnerConsole.headers["cache-control"], "no-store");
       const removed = await jsonRequest("/account/totp/disable", "POST",
         { password: replacementPassword }, mfaJar);
       expectStatus(removed, 200);
@@ -1516,9 +1522,14 @@ async function main() {
       expectStatus(guestConsole, 303);
       assert.equal(guestConsole.headers.location, "/login?return_to=%2Fadmin%2Fconsole");
       assert.doesNotMatch(guestConsole.body, /OpenProof Admin Console/);
-      const nonOwnerConsole = await edgeRequest("/admin/console", { jar: consumerJarAfterReset });
-      expectStatus(nonOwnerConsole, 403);
-      assert.doesNotMatch(nonOwnerConsole.body, /OpenProof Admin Console/);
+      // IAL1 sessions intentionally receive a step-up redirect, matching
+      // the existing console contract. Never serve console markup.
+      const lowAssuranceConsole = await edgeRequest("/admin/console", { jar: consumerJarAfterReset });
+      expectStatus(lowAssuranceConsole, 303);
+      assert.equal(lowAssuranceConsole.headers.location, "/account/security");
+      assert.equal(lowAssuranceConsole.headers["cache-control"], "no-store");
+      assert.equal(lowAssuranceConsole.headers["set-cookie"], undefined);
+      assert.doesNotMatch(lowAssuranceConsole.body, /OpenProof Admin Console/);
     }
     const localMemberResponse = await jsonRequest("/admin/local-members", "POST", {
       identity_id: "e2e-dispatcher",

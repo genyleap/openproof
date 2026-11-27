@@ -203,5 +203,9 @@ test("console rendering is gated by native owner authorization and the synchrono
   assert.doesNotMatch(renderer,/m_\w+->/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/EXPECT_FALSE\(read\(Read::Console\)\)/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/expectStatus\(guestConsole, 303\)/);
-  assert.match(read("scripts/e2e-identity-platform.mjs"),/expectStatus\(nonOwnerConsole, 403\)/);
+  const e2e=read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e,/nonOwnerConsole = await edgeRequest\("\/admin\/console", \{ jar: mfaJar \}\)/);
+  assert.match(e2e,/expectStatus\(nonOwnerConsole, 403\)/);
+  assert.match(e2e,/expectStatus\(lowAssuranceConsole, 303\)/);
+  assert.match(e2e,/lowAssuranceConsole.headers.location, "\/account\/security"/);
 });
