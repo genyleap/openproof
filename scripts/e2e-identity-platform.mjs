@@ -16,6 +16,7 @@ import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
 import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-diagnostics.mjs";
 import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
 import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
+import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -228,6 +229,7 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
 }
 
 async function main() {
+  const executionProfile = requestedExecutionProfile(process.env);
   if (!databaseUrl) fail("OPENPROOF_E2E_POSTGRES must name a disposable empty PostgreSQL database");
   if (databaseAck !== "YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE") {
     fail("set OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE");
@@ -2013,6 +2015,7 @@ async function main() {
         ...loadResult,
         ...loadResourceMetrics,
         ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
+        ...(executionProfile ? { executionProfile } : {}),
       }, null, 2) + "\n", { mode: 0o600 });
     }
     if (holdOpen) {

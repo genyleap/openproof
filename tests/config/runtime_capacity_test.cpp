@@ -19,6 +19,7 @@ TEST(RuntimeCapacityTest, StrictQuotaParsingAndBoundedWorkers)
     EXPECT_FALSE(capacity::quotaWorkers("1000", "0"));
     EXPECT_FALSE(capacity::quotaWorkers("-1", "100000"));
     EXPECT_FALSE(capacity::quotaWorkers("1000x", "100000"));
+    EXPECT_FALSE(capacity::positiveCount({}));
     EXPECT_FALSE(capacity::positiveCount("99999999999999999999999999999999"));
     EXPECT_EQ(capacity::effectiveWorkers(64U, 8U, 2U), 2U);
     EXPECT_EQ(capacity::effectiveWorkers(64U, std::nullopt, std::nullopt), 32U);

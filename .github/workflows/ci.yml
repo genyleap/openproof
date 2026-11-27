@@ -79,6 +79,7 @@ jobs:
       - name: Native gateway transport retirement contract
         run: |
           node scripts/test-gateway-translation-unit-split.mjs
+          node --test scripts/test-executor-profile-summary.mjs
           node scripts/test-native-gateway-tls-completion.mjs
       - name: Mandatory native account credential lifecycle contract
         run: |

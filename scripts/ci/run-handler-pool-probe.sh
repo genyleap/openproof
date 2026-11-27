@@ -28,7 +28,7 @@ run_trial() {
         OPENPROOF_E2E_POSTGRES="postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/$db" \
         OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE \
         OPENPROOF_E2E_OPP="$binary" OPENPROOF_E2E_COMMIT="$GITHUB_SHA" \
-        OPENPROOF_E2E_EXPECT_LEGACY_AUTH=0 \
+        OPENPROOF_E2E_EXPECT_LEGACY_AUTH=0 OPENPROOF_E2E_EXECUTION_PROFILE="$profile" \
         OPENPROOF_E2E_LOAD_REQUESTS=600 OPENPROOF_E2E_LOAD_CONCURRENCY=24 \
         OPENPROOF_E2E_METRICS_FILE="$output/$profile-$trial.json" \
         node "$ROOT/scripts/e2e-identity-platform.mjs"
@@ -42,6 +42,7 @@ run_trial budget 2
 run_trial reactor 2
 run_trial two 2
 run_trial auto 2
+node "$ROOT/scripts/summarize-executor-profiles.mjs" "$output" "$GITHUB_SHA"
 for trial in 1 2; do
     echo "Exploratory same-binary handler pool comparison: pair $trial (auto vs two)"
     node "$ROOT/scripts/compare-e2e-metrics.mjs" \

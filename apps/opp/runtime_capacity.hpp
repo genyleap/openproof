@@ -22,9 +22,10 @@ namespace openproof::app::runtime_capacity {
 [[nodiscard]] inline std::optional<std::size_t> positiveCount(
     std::string_view value) noexcept
 {
+    if (value.empty()) return std::nullopt;
     std::size_t count{};
     const auto parsed = std::from_chars(value.data(), value.data() + value.size(), count);
-    if (value.empty() || parsed.ec != std::errc{}
+    if (parsed.ec != std::errc{}
         || parsed.ptr != value.data() + value.size() || count == 0U)
         return std::nullopt;
     return count;
