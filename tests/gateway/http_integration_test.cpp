@@ -854,6 +854,7 @@ TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnecti
     auto entered = handler.entered.get_future();
     asio::io_context clientIo;
     Tcp::socket client{clientIo};
+    std::chrono::steady_clock::time_point shutdownStarted;
     {
         httpAdapter::BeastHttpServer server{handler, serverConfig()};
         ASSERT_TRUE(server.start());
@@ -863,13 +864,13 @@ TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnecti
         request.keep_alive(false);
         static_cast<void>(beastHttp::write(client, request));
         ASSERT_EQ(entered.wait_for(std::chrono::seconds{5}), std::future_status::ready);
-        const auto start = std::chrono::steady_clock::now();
+        shutdownStarted = std::chrono::steady_clock::now();
         server.stop();
         EXPECT_FALSE(server.running());
         EXPECT_EQ(server.boundPort(), 0U);
-        // Destroying the server must not wait for the original I/O deadline.
-        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds{10});
     }
+    // Include destruction of both execution contexts, not only stop().
+    EXPECT_LT(std::chrono::steady_clock::now() - shutdownStarted, std::chrono::seconds{10});
     EXPECT_EQ(handler.destroyed.load(), 1);
     EXPECT_EQ(handler.completed.load(), 0);
     EXPECT_EQ(handler.synchronousCalls.load(), 0);
