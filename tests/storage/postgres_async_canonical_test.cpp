@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "../../src/gateway/asio_service_ids_extern.hpp"
 #include <boost/asio/detail/call_stack.hpp>
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio.hpp>
