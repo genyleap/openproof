@@ -2225,9 +2225,17 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     };
     const auto userInfo=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string fingerprint,
         fnd::Instant now=kNow) {
+        using Result=fnd::Result<std::pair<openproof::session::DelegatedAccess,
+            std::optional<openproof::identity::profile::IdentityProfile>>>;
+        std::optional<Result> output;
+        const auto capture=[](auto& adapter,std::string value,fnd::Instant time,
+            auto& result)->asio::awaitable<void>{
+            result.emplace(co_await adapter.readBearerUserInfoAsync(std::move(value),time));
+        };
         io.restart();
-        auto pending=asio::co_spawn(io,store.readBearerUserInfoAsync(std::move(fingerprint),now),asio::use_future);
-        io.run(); return pending.get();
+        auto pending=asio::co_spawn(io,capture(store,std::move(fingerprint),now,output),asio::use_future);
+        io.run(); pending.get();
+        return std::move(output.value());
     };
     auto accountOnly=userInfo(native,digest);
     ASSERT_TRUE(accountOnly);
@@ -2242,10 +2250,16 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_TRUE(unbound->first.permits("openid"));
     EXPECT_TRUE(unbound->first.permits("profile"));
     // The seeded owner has a profile; match the independent live read.
+    std::optional<fnd::Result<openproof::identity::profile::IdentityProfile>> profileOutput;
+    const auto captureProfile=[](auto& adapter,ids::IdentityId owner,
+        auto& result)->asio::awaitable<void>{
+        result.emplace(co_await adapter.readProfileAsync(std::move(owner)));
+    };
     io.restart();
-    auto expectedProfile=asio::co_spawn(io,native.readProfileAsync(ids::IdentityId{seed.owner}),asio::use_future);
+    auto expectedProfile=asio::co_spawn(io,captureProfile(native,ids::IdentityId{seed.owner},profileOutput),asio::use_future);
     io.run();
-    auto expected=expectedProfile.get();
+    expectedProfile.get();
+    auto expected=std::move(profileOutput.value());
     ASSERT_TRUE(expected);
     ASSERT_TRUE(unbound->second);
     EXPECT_EQ(unbound->second->identity(),expected->identity());
