@@ -525,11 +525,11 @@ jobs:
         timeout-minutes: 30
         env:
           OPENPROOF_E2E_OPP: ${{ github.workspace }}/cmake-build-${{ matrix.preset }}/apps/opp/opp
-          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_hardening_e2e
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_native_ldap_e2e_ci
           OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
           OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
           OPENPROOF_E2E_LOAD_REQUESTS: "24"
           OPENPROOF_E2E_LOAD_CONCURRENCY: "4"
         run: |
-          sudo -u postgres createdb -O openproof_ci openproof_hardening_e2e
+          sudo -u postgres createdb -O openproof_ci openproof_native_ldap_e2e_ci
           node scripts/e2e-identity-platform.mjs
