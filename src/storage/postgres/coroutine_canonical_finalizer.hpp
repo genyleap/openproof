@@ -3,6 +3,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -30,6 +31,7 @@ import openproof.evidence;
 import openproof.evidence.verifiers;
 
 namespace openproof::storage::postgres {
+namespace async_detail { class AsyncConnection; }
 
 /**
  * Native PostgreSQL canonical identity finalizer.
@@ -175,6 +177,12 @@ public:
     authenticateConfidentialClientAsync(std::string clientId,
         std::string digestHex);
 
+    // Authenticate first, then read the live token on the same exclusive SQL
+    // lease. An empty successful result means inactive; caller denial is an error.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::optional<session::DelegatedAccess>>>
+    introspectAccessAsync(std::string clientId,std::string clientDigest,
+        std::string tokenDigest,const foundation::ClockSource& clock,foundation::Instant* issuedAt);
+
     // RFC 7009: authenticate public or confidential client inside the same
     // transaction as its token revocation. Unknown/foreign tokens are no-ops.
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
@@ -300,6 +308,13 @@ public:
         foundation::Instant completedAt) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
+    readDelegatedAccessOnLease(async_detail::AsyncConnection& connection,
+        std::string digestHex,foundation::Instant now,foundation::Instant* issuedAt,
+        std::chrono::steady_clock::time_point deadline);
+    [[nodiscard]] boost::asio::awaitable<foundation::Status>
+    authenticateConfidentialClientOnLease(async_detail::AsyncConnection& connection,
+        std::string clientId,std::string digestHex,std::chrono::steady_clock::time_point deadline);
     class Impl;
     std::unique_ptr<Impl> m_impl;
 };

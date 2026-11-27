@@ -22,6 +22,8 @@ class CoroutineTokenReadAdapter final : public gateway::http::CoroutineHttpHandl
 public:
     using ReadAccess=std::function<boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>(
         std::string,foundation::Instant*)>;
+    using IntrospectAccess=std::function<boost::asio::awaitable<foundation::Result<std::optional<session::DelegatedAccess>>>(
+        std::string,std::string,std::string,foundation::Instant*)>;
     using AuthenticateClient=std::function<boost::asio::awaitable<foundation::Status>(std::string,std::string)>;
     using ReadProfile=std::function<boost::asio::awaitable<foundation::Result<identity::profile::IdentityProfile>>(
         identity::core::IdentityId)>;
@@ -91,7 +93,7 @@ public:
         foundation::Duration accessLifetime=foundation::Duration{900000},
         std::optional<CodeExchangeContext> codeExchange=std::nullopt,IssueMachine issueMachine={},
         std::optional<DevicePollContext> devicePoll=std::nullopt,
-        std::optional<ParContext> par=std::nullopt,Login login={});
+        std::optional<ParContext> par=std::nullopt,Login login={},IntrospectAccess introspectAccess={});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(const gateway::HttpRequest&) const noexcept override;
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest) override;
@@ -116,6 +118,7 @@ private:
     std::optional<DevicePollContext> m_devicePoll;
     std::optional<ParContext> m_par;
     Login m_login;
+    IntrospectAccess m_introspectAccess;
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> loginBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> authorizeBrowser(gateway::HttpRequest);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> pushAuthorization(gateway::HttpRequest);

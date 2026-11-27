@@ -848,16 +848,17 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
     std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine,
-    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par,Login login)
+    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par,Login login,IntrospectAccess introspectAccess)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
       m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)),
-      m_devicePoll(std::move(devicePoll)),m_par(std::move(par)),m_login(std::move(login)) {}
+      m_devicePoll(std::move(devicePoll)),m_par(std::move(par)),m_login(std::move(login)),
+      m_introspectAccess(std::move(introspectAccess)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
-    if (introspectRoute(r)) return m_access && m_client;
+    if (introspectRoute(r)) return m_introspectAccess || (m_access && m_client);
     if (revokeRoute(r)) return static_cast<bool>(m_revoke);
     if (refreshRoute(r)) return m_rotate && m_prepareSender;
     if (codeRoute(r)) return m_codeExchange && m_codeExchange->exchange && m_prepareSender;
@@ -994,14 +995,25 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::introspect(gat
     input->secret=foundation::SecretString{};
     input->token=foundation::SecretString{};
     if (!clientDigest || !tokenDigest) co_return fail(E::Unavailable,r);
-    auto caller=co_await m_client(std::move(input->clientId),foundation::toHex(clientDigest.value()));
-    if (!caller) co_return fail(caller.error().code(),r);
     foundation::Instant issued{};
-    auto access=co_await m_access(foundation::toHex(tokenDigest.value()),&issued);
+    std::optional<session::DelegatedAccess> access;
+    if (m_introspectAccess) {
+        auto checked=co_await m_introspectAccess(std::move(input->clientId),
+            foundation::toHex(clientDigest.value()),foundation::toHex(tokenDigest.value()),&issued);
+        if (!checked) co_return fail(checked.error().code(),r);
+        if (checked->has_value()) access.emplace(std::move(checked->value()));
+    } else {
+        // Compatibility for independently composed native adapters only.
+        // The production composition supplies the shared-lease operation.
+        auto caller=co_await m_client(std::move(input->clientId),foundation::toHex(clientDigest.value()));
+        if (!caller) co_return fail(caller.error().code(),r);
+        auto found=co_await m_access(foundation::toHex(tokenDigest.value()),&issued);
+        if (found) access.emplace(std::move(found).value());
+        else if (found.error().code()!=E::AuthenticationFailed && found.error().code()!=E::NotFound)
+            co_return fail(E::Unavailable,r);
+    }
     foundation::JsonObjectWriter body;
     if (!access) {
-        if (access.error().code()!=E::AuthenticationFailed && access.error().code()!=E::NotFound)
-            co_return fail(E::Unavailable,r);
         body.add("active",false);
         co_return json(200,std::move(body));
     }

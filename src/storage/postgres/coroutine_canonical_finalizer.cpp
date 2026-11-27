@@ -808,19 +808,35 @@ asio::awaitable<foundation::Result<session::DelegatedAccess>>
 CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
     std::string digestHex,foundation::Instant now,foundation::Instant* issuedAt)
 {
-    constexpr std::size_t maximumGrants=256U;
     if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
         return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
     })) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
         const Deadline deadline=Clock::now()+m_impl->queryTimeout;
         auto lease=co_await m_impl->pool.acquire(deadline);
+        co_return co_await readDelegatedAccessOnLease(lease.connection(),std::move(digestHex),
+            now,issuedAt,deadline);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Result<session::DelegatedAccess>>
+CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
+    async_detail::AsyncConnection& connection,std::string digestHex,
+    foundation::Instant now,foundation::Instant* issuedAt,Deadline deadline)
+{
+    constexpr std::size_t maximumGrants=256U;
+    if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
+        return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+    })) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
+    try {
         Params params{std::move(digestHex),std::to_string(now.time_since_epoch().count()),
             std::string{m_impl->organization.value()}};
         // One statement snapshot: never assemble a grant from separately
         // observed token, lifecycle, scope or audience state. The lateral
         // union avoids the scope/audience Cartesian product.
-        const auto result=co_await lease.connection().query(
+        const auto result=co_await connection.query(
             "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
             "f.authenticated_at_ms,t.expires_at_ms,c.id,"
             "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,t.issued_at_ms "
@@ -1213,8 +1229,26 @@ CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientAsync(
     try {
         const auto deadline=Clock::now()+m_impl->queryTimeout;
         auto lease=co_await m_impl->pool.acquire(deadline);
+        co_return co_await authenticateConfidentialClientOnLease(lease.connection(),
+            std::move(clientId),std::move(digestHex),deadline);
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Status>
+CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientOnLease(
+    async_detail::AsyncConnection& connection,std::string clientId,
+    std::string digestHex,Deadline deadline)
+{
+    using E=foundation::ErrorCode;
+    if (clientId.empty() || clientId.size()>256U || digestHex.size()!=64U)
+        co_return foundation::fail(E::AuthenticationFailed);
+    auto presented=foundation::fromHex(digestHex);
+    if (!presented || presented->size()!=32U) co_return foundation::fail(E::AuthenticationFailed);
+    try {
         Params params{std::move(clientId),std::string{m_impl->organization.value()}};
-        const auto result=co_await lease.connection().query(
+        const auto result=co_await connection.query(
             "SELECT encode(c.secret_digest,'hex') FROM openproof.oauth_clients c "
             "JOIN openproof.applications a ON a.id=c.application_id "
             "JOIN openproof.organizations o ON o.id=a.organization_id "
@@ -1229,6 +1263,37 @@ CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientAsync(
         if (!security::constantTimeEquals(*presented,*stored))
             co_return foundation::fail(E::AuthenticationFailed);
         co_return foundation::ok();
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
+    }
+}
+
+asio::awaitable<foundation::Result<std::optional<session::DelegatedAccess>>>
+CoroutinePostgresCanonicalFinalizer::introspectAccessAsync(std::string clientId,
+    std::string clientDigest,std::string tokenDigest,const foundation::ClockSource& clock,
+    foundation::Instant* issuedAt)
+{
+    using E=foundation::ErrorCode;
+    if (clientId.empty() || clientId.size()>256U || clientDigest.size()!=64U
+        || !std::ranges::all_of(clientDigest,[](char ch){
+            return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+        })) co_return foundation::fail(E::AuthenticationFailed);
+    try {
+        // Authenticate before touching token state, using one exclusive lease
+        // and one absolute deadline. No cached credentials or authorization.
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto caller=co_await authenticateConfidentialClientOnLease(lease.connection(),
+            std::move(clientId),std::move(clientDigest),deadline);
+        if (!caller) co_return foundation::fail(caller.error());
+        auto access=co_await readDelegatedAccessOnLease(lease.connection(),
+            std::move(tokenDigest),clock.now(),issuedAt,deadline);
+        if (!access) {
+            if (access.error().code()==E::AuthenticationFailed || access.error().code()==E::NotFound)
+                co_return std::optional<session::DelegatedAccess>{};
+            co_return foundation::fail(E::Unavailable);
+        }
+        co_return std::optional<session::DelegatedAccess>{std::move(access).value()};
     } catch (const std::exception&) {
         co_return foundation::fail(E::Unavailable);
     }

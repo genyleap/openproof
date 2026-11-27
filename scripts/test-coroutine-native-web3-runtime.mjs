@@ -162,7 +162,8 @@ test("native delegated context is snapshot-consistent, bounded and preserves sen
   const source=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const start=source.indexOf("CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(");
   const body=source.slice(start,source.indexOf("CoroutinePostgresCanonicalFinalizer::consumeSenderReplayAsync(",start));
-  assert.equal([...body.matchAll(/co_await lease.connection\(\).query\(/g)].length,1);
+  assert.equal([...body.matchAll(/co_await connection\.query\(/g)].length,1);
+  assert.match(body,/co_return co_await readDelegatedAccessOnLease\(lease.connection\(\),std::move\(digestHex\),\s*now,issuedAt,deadline\)/);
   assert.match(body,/LEFT JOIN LATERAL/);
   assert.match(body,/UNION ALL/);
   assert.match(body,/oauth_token_family_audiences/);

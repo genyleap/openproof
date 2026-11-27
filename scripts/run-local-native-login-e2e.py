@@ -35,7 +35,13 @@ def main():
                         default=ROOT / "cmake-build-gcc-release/apps/opp/opp")
     parser.add_argument("--probe-only", action="store_true",
                         help="Check isolated DB creation and cleanup, without claiming HTTP acceptance.")
+    parser.add_argument("--load-requests", type=int, default=6,
+                        help="Bounded mixed-read requests, up to 600 on this local fixture.")
+    parser.add_argument("--load-concurrency", type=int, default=1,
+                        help="Bounded mixed-read concurrency, up to 24.")
     args = parser.parse_args()
+    if not 1 <= args.load_concurrency <= min(24, args.load_requests) or not 1 <= args.load_requests <= 600:
+        parser.error("Require 1..600 requests and 1..24 concurrent requests, concurrency <= requests.")
     binary = args.opp.resolve()
     if not args.probe_only and not (binary.is_file() and os.access(binary, os.X_OK)):
         parser.error("Build the opp executable first, or pass --opp.")
@@ -97,11 +103,11 @@ def main():
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS": "1",
             "OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS": "1",
             "OPENPROOF_EXPERIMENTAL_NATIVE_RECOVERY_CODES": "1",
-            "OPENPROOF_E2E_LOAD_REQUESTS": "6",
-            "OPENPROOF_E2E_LOAD_CONCURRENCY": "1",
+            "OPENPROOF_E2E_LOAD_REQUESTS": str(args.load_requests),
+            "OPENPROOF_E2E_LOAD_CONCURRENCY": str(args.load_concurrency),
         })
         # Existing E2E handles service termination in finally. This is a
-        # correctness workload, not a comparative performance benchmark.
+        # bounded diagnostic workload, not a comparative performance claim.
         return subprocess.run(["node", "scripts/e2e-identity-platform.mjs"],
                               cwd=ROOT, env=env, check=False, timeout=1200).returncode
     finally:

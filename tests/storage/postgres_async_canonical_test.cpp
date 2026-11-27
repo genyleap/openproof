@@ -2173,7 +2173,38 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_TRUE(authenticateClient(native,clientProof));
     EXPECT_FALSE(authenticateClient(foreign,clientProof));
     EXPECT_FALSE(authenticateClient(native,std::string(64U,'0')));
+    const auto introspect=[&](pg::CoroutinePostgresCanonicalFinalizer& store,
+        std::string proof,std::string token,fnd::Instant now=kNow) {
+        fnd::Instant issued{};
+        io.restart();
+        fnd::ManualClockSource observedClock{now};
+        auto done=asio::co_spawn(io,store.introspectAccessAsync(client,std::move(proof),
+            std::move(token),observedClock,&issued),asio::use_future);
+        io.run();
+        auto result=done.get();
+        if (result && result->has_value()) EXPECT_EQ(issued,kNow);
+        return result;
+    };
+    auto activeIntrospection=introspect(native,clientProof,digest);
+    ASSERT_TRUE(activeIntrospection && activeIntrospection->has_value());
+    EXPECT_EQ(activeIntrospection->value().clientId(),client);
+    EXPECT_EQ(activeIntrospection->value().authenticated().session().identity().value(),seed.owner);
+    auto badClient=introspect(native,std::string(64U,'0'),digest);
+    ASSERT_FALSE(badClient);
+    EXPECT_EQ(badClient.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    auto crossTenant=introspect(foreign,clientProof,digest);
+    ASSERT_FALSE(crossTenant);
+    EXPECT_EQ(crossTenant.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    auto unknown=introspect(native,clientProof,std::string(64U,'0'));
+    ASSERT_TRUE(unknown);
+    EXPECT_FALSE(unknown->has_value());
+    auto expired=introspect(native,clientProof,digest,kNow+60s);
+    ASSERT_TRUE(expired);
+    EXPECT_FALSE(expired->has_value());
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET kind=1,secret_digest=NULL WHERE id=$1",{client}));
+    auto publicDenied=introspect(native,clientProof,digest);
+    ASSERT_FALSE(publicDenied);
+    EXPECT_EQ(publicDenied.error().code(),fnd::ErrorCode::AuthenticationFailed);
     auto accepted=read(native);
     ASSERT_TRUE(accepted) << (accepted ? "" : std::string{fnd::errorCodeName(accepted.error().code())});
     EXPECT_EQ(accepted->identity().value(),seed.owner);

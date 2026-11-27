@@ -12,7 +12,7 @@ test("OIDC token reads are strict native and use durable sender replay",()=>{
   for(const route of ["/oauth/userinfo","/oauth/introspect","/oauth/revoke"])
     assert.ok(app.includes('nativePaths.emplace_back("'+route+'")'));
   for(const call of ["reader->readDelegatedAccessAsync(","reader->authenticateConfidentialClientAsync(",
-    "reader->readProfileAsync(","sender->verifyAsync(","reader->consumeSenderReplayAsync("])
+    "reader->readProfileAsync(","sender->verifyAsync(","reader->consumeSenderReplayAsync(","reader->introspectAccessAsync("])
     assert.ok(app.includes(call),call);
   assert.doesNotMatch(cppExecutableText(http),/m_fallback->handle\(|PQexec|m_tokens->|m_clients->|m_oidc->/);
 });
@@ -43,7 +43,17 @@ test("introspection requires confidential client and erases raw form credentials
     assert.ok(index>previous,term);
     previous=index;
   }
-  assert.match(body,/E::AuthenticationFailed && access.error\(\).code\(\)!=E::NotFound/);
+  assert.match(body,/E::AuthenticationFailed && found.error\(\).code\(\)!=E::NotFound/);
+  assert.match(body,/if \(m_introspectAccess\) \{[\s\S]*?co_await m_introspectAccess[\s\S]*?if \(!checked\) co_return fail\(checked.error\(\).code\(\),r\)/);
+  assert.ok(body.indexOf("input->token=foundation::SecretString{}") < body.indexOf("co_await m_introspectAccess("));
+  const shared=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::introspectAccessAsync("),sql.indexOf("CoroutinePostgresCanonicalFinalizer::revokeOAuthTokenAsync("));
+  assert.equal([...shared.matchAll(/co_await m_impl->pool.acquire\(deadline\)/g)].length,1);
+  const auth=shared.indexOf("co_await authenticateConfidentialClientOnLease("), denied=shared.indexOf("if (!caller)"), token=shared.indexOf("co_await readDelegatedAccessOnLease(");
+  assert.ok(auth>=0 && denied>auth && token>denied);
+  assert.match(shared,/readDelegatedAccessOnLease\(lease.connection\(\),\s*std::move\(tokenDigest\),clock.now\(\),issuedAt,deadline\)/);
+  assert.match(shared,/access.error\(\).code\(\)==E::AuthenticationFailed \|\| access.error\(\).code\(\)==E::NotFound/);
+  assert.match(shared,/co_return std::optional<session::DelegatedAccess>\{\}/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/introspect\(foreign,clientProof,digest\)/);
   assert.match(body,/body.add\("active",false\)/);
   assert.match(body,/\.add\("iat",seconds\(issued\)\)/);
   const client=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authenticateConfidentialClientAsync("));

@@ -3141,6 +3141,10 @@ addProtectedRoutes(gateway::Router& router,
                         binding.value(),std::move(response));
                     if (!verified) co_return fnd::fail(verified.error());
                     co_return co_await sessions->issueReplacingAsync(verified.value(),std::move(client),std::move(prior));
+                },
+                [reader,&clock](std::string clientId,std::string clientDigest,std::string tokenDigest,fnd::Instant* issued) {
+                    return reader->introspectAccessAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(tokenDigest),clock,issued);
                 });
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");
