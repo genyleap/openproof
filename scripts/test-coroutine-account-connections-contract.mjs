@@ -226,11 +226,11 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   // The read coroutine is started on the socket strand and awaits the
   // bounded handler pool. Its associated executor resumes the write.
   assert.match(gateway, /asio::co_spawn\(m_stream\.get_executor\(\),\s*readRequest\(\)/);
-  const read = gateway.slice(gateway.indexOf("asio::awaitable<void> readRequest()"),
+  const readerBody = gateway.slice(gateway.indexOf("asio::awaitable<void> readRequest()"),
     gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
-  assert.match(read, /co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
-  assert.ok(read.indexOf("m_response.emplace(std::move(wire))") > read.indexOf("co_await asio::co_spawn("));
-  assert.ok(read.indexOf("co_await writeResponse(headRequest);") > read.indexOf("m_response.emplace(std::move(wire))"));
+  assert.match(readerBody, /co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.ok(readerBody.indexOf("m_response.emplace(std::move(wire))") > readerBody.indexOf("co_await asio::co_spawn("));
+  assert.ok(readerBody.indexOf("co_await writeResponse(headRequest);") > readerBody.indexOf("m_response.emplace(std::move(wire))"));
   assert.doesNotMatch(gateway, /asio::post\(m_owner->m_context,/);
   const integration = read("tests/gateway/http_integration_test.cpp");
   const start = integration.indexOf(
