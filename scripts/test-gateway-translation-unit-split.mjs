@@ -50,6 +50,9 @@ test("GCC16 Asio coroutine allocation workaround is isolated without suppressing
   assert.match(cmake,/if\(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17"\)/);
   assert.match(cmake,/set_source_files_properties\(\s*http_coroutine\.cpp http_proxy\.cpp http\.cpp\s*PROPERTIES COMPILE_OPTIONS "-fno-inline"\)/);
   assert.doesNotMatch(cmake,/-Wno-error|-Wno-mismatched-new-delete/);
+  assert.match(cmake,/option\(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING[\s\S]*?OFF\)/);
+  assert.match(cmake,/if\(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING\)[\s\S]*?if\(NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo"\)/);
+  assert.match(cmake,/set_source_files_properties\(http_proxy\.cpp http\.cpp PROPERTIES COMPILE_OPTIONS\s*"-fno-inline-small-functions;-fno-inline-functions-called-once;-fno-early-inlining"\)/);
 });
 
 test("the same gateway library links all three C++26 implementation files",()=>{

@@ -497,6 +497,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Isolated experiment after publishing the untouched control artifacts.
+      - name: Link and qualify limited-inlining Gateway against same-source control
+        if: github.head_ref == 'perf/gateway-limited-inlining-20261127'
+        timeout-minutes: 30
+        run: bash scripts/ci/run-gateway-inline-pairs.sh
+      - name: Preserve limited-inlining runtime qualification
+        if: always() && github.head_ref == 'perf/gateway-limited-inlining-20261127'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-gateway-inline-runtime
+          path: gateway-inline-pairs/
+          if-no-files-found: ignore
+          retention-days: 14
+
   dev-hardening:
     name: Development hardening (${{ matrix.preset }})
     if: github.ref == 'refs/heads/dev'
