@@ -2,6 +2,8 @@
 
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/cancellation_state.hpp>
+#include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/redirect_error.hpp>
@@ -65,7 +67,9 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
     // Each timer is accessed on its own serialized executor. A release
     // selects one waiter; cancellation hands an unused notification onward.
     struct Waiter final {
-        explicit Waiter(asio::any_io_executor executor) : timer(std::move(executor)) {}
+        explicit Waiter(asio::any_io_executor executorValue)
+            : executor(std::move(executorValue)), timer(executor) {}
+        const asio::any_io_executor executor;
         asio::steady_timer timer;
         bool notified = false; // accessed only on the timer's strand
     };
@@ -81,7 +85,8 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
         }
         // Posting, not dispatching, also protects registration followed by
         // the second try_receive and async_wait initiation from lost wakeups.
-        auto executor = selected->timer.get_executor();
+        // Read immutable executor metadata, not the concurrently used timer.
+        auto executor = selected->executor;
         asio::post(executor, [selected = std::move(selected)] {
             selected->notified = true;
             selected->timer.cancel();
@@ -91,7 +96,6 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
     struct Registration final {
         State& state;
         std::shared_ptr<Waiter> waiter;
-        bool consumed = false;
 
         Registration(State& owner, std::shared_ptr<Waiter> value)
             : state(owner), waiter(std::move(value))
@@ -108,9 +112,10 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
                 selected = it == state.waiters.end();
                 if (!selected) state.waiters.erase(it);
             }
-            // A cancelled or expired selected waiter must not strand
-            // an available permit behind other sleeping waiters.
-            if (selected && !consumed) state.notifyWaiter();
+            // Pass a still-available permit onward, including when this
+            // waiter consumed a different permit just before selection.
+            // Never circulate wakeups while the channel is exhausted.
+            if (selected && state.slots.ready()) state.notifyWaiter();
         }
         Registration(const Registration&) = delete;
         Registration& operator=(const Registration&) = delete;
@@ -147,7 +152,6 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
             if (permit) {
                 if (std::chrono::steady_clock::now() >= deadline)
                     throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
-                registration.consumed = true;
                 co_return std::move(permit);
             }
             boost::system::error_code error;
@@ -159,8 +163,14 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
             if (error != asio::error::operation_aborted || !waiter->notified
                 || cancellation.cancelled() != asio::cancellation_type::none)
                 throw std::runtime_error{"Async PostgreSQL pool acquisition cancelled"};
-            // The notification does not own a permit. Retry via the same
-            // channel; if another request took it, register again.
+            // The notification does not own a permit. Try the channel
+            // before deregistration; the guard forwards spare capacity.
+            permit = state->tryTake();
+            if (permit) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+                co_return std::move(permit);
+            }
         }
     }
 

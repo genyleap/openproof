@@ -261,7 +261,8 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /std::list<std::shared_ptr<Waiter>> waiters/);
   assert.match(implementation, /asio::post\(executor, \[selected = std::move\(selected\)\]/);
   assert.match(implementation, /selected->timer\.cancel\(\)/);
-  assert.match(implementation, /if \(selected && !consumed\) state\.notifyWaiter\(\)/);
+  assert.match(implementation, /if \(selected && state\.slots\.ready\(\)\) state\.notifyWaiter\(\)/);
+  assert.match(implementation, /auto executor = selected->executor;/);
   assert.match(implementation, /Registration registration\{\*state, waiter\}/);
   assert.ok(implementation.indexOf("Registration registration{*state, waiter}") <
     implementation.indexOf("auto permit = state->tryTake()",implementation.indexOf("Registration registration{*state, waiter}")));
