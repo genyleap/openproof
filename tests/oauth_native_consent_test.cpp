@@ -220,9 +220,9 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
         {{"authorization","DPoP fixture-bound"}},{},"127.0.0.1",fnd::CorrelationId{"fixture"}).value();
     EXPECT_EQ(run(std::move(proof)).status(),200);
     EXPECT_EQ(senderCalls,2);
-    auto inspect=[&](std::string proof,std::string token){
+    auto inspect=[&](std::string clientProof,std::string token){
         return run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
-            "client_id=fixture-client&client_secret="+proof+"&token="+token));
+            "client_id=fixture-client&client_secret="+clientProof+"&token="+token));
     };
     const auto before=accessCalls;
     EXPECT_EQ(inspect("wrong","fixture-access").status(),401);
@@ -378,7 +378,7 @@ TEST(NativeOAuthTokenReadTest, DeviceInitiationRetriesCollisionAndReturnsOnlyCom
         const auto start=result.body().find(marker);
         if (start==std::string::npos) return std::string{};
         const auto pos=start+marker.size();
-        return result.body().substr(pos,result.body().find('"',pos)-pos);
+        return std::string{result.body().substr(pos,result.body().find('"',pos)-pos)};
     };
     const auto device=field("device_code"),user=field("user_code");
     EXPECT_TRUE(device.starts_with("opd_"));
