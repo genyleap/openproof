@@ -997,9 +997,17 @@ TEST(BeastHttpIntegrationTest, CoroutineExceptionIsRedactedAfterSuspension)
     CoroutineThrowingHandler handler;
     httpAdapter::BeastHttpServer server{handler, serverConfig()};
     ASSERT_TRUE(server.start());
-    const auto response = sendRequest(server.boundPort(), beastHttp::verb::get, "/");
-    EXPECT_EQ(response.result(), beastHttp::status::internal_server_error);
-    EXPECT_EQ(response.body().find("sensitive"), std::string::npos);
+    // The two-worker server admits at most 64 pending handlers. More
+    // sequential failures than that limit must never leak admission slots
+    // when a suspended coroutine throws and returns a sanitized response.
+    for (std::size_t attempt = 0U; attempt < 80U; ++attempt) {
+        SCOPED_TRACE(attempt);
+        const auto response = sendRequest(server.boundPort(), beastHttp::verb::get, "/");
+        ASSERT_EQ(response.result(), beastHttp::status::internal_server_error);
+        EXPECT_EQ(response.at("cache-control"), "no-store");
+        EXPECT_EQ(response.at("x-content-type-options"), "nosniff");
+        EXPECT_EQ(response.body().find("sensitive"), std::string::npos);
+    }
     server.stop();
 }
 
