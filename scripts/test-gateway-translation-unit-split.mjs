@@ -117,7 +117,13 @@ test("handler pool sizing is bounded, opt-in and preserves the historical defaul
   assert.match(app,/handlerThreads < 1U \|\| handlerThreads > 16U/);
   assert.match(app,/platform\.server\(\)\.trustProxyClientIp\(\), handlerThreads, reactorPublicReads\)/);
   assert.match(probe,/env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS/);
-  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial reactor 1\s+run_trial budget 1\s+run_trial budget 2\s+run_trial reactor 2\s+run_trial two 2\s+run_trial auto 2/);
+  const order = probe.match(/^profiles=\(([^)]+)\)$/m);
+  assert.ok(order, "explicit profile order");
+  assert.deepEqual(order[1].split(/\s+/), ["auto","two","reactor","budget","compact","minimal"]);
+  assert.match(probe,/for profile in "\$\{profiles\[@\]\}"; do run_trial "\$profile" 1; done/);
+  assert.match(probe,/for \(\(i=\$\{#profiles\[@\]\}-1; i>=0; --i\)\); do run_trial "\$\{profiles\[i\]\}" 2; done/);
+  assert.match(probe,/compact\) override=\(OPENPROOF_EXPERIMENTAL_CPU_BUDGET=1 OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2 OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1\)/);
+  assert.match(probe,/minimal\) override=\(OPENPROOF_EXPERIMENTAL_REACTOR_THREADS=1 OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2 OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1\)/);
   assert.match(probe,/OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
 });
 
