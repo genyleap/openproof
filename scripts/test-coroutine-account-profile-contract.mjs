@@ -84,7 +84,12 @@ test("delegated Bearer reads use the native scope verifier when configured", () 
   assert.match(account, /\(!request\.header\("authorization"\)\.has_value\(\) \|\| m_authenticateReadBearer\)/);
   assert.match(main, /std::move\(passwordUpgradeConfirm\), std::move\(profileWriter\),\s*authenticateNativeWeb3/);
   assert.match(main, /authenticated \|\| authenticated\.error\(\)\.code\(\)!=fnd::ErrorCode::AuthenticationFailed/);
-  assert.ok(main.indexOf("auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose())") < main.indexOf("auto authenticated=co_await nativeSessions->authenticate(std::move(credential))"));
+  const digest=main.indexOf("auto delegatedFingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose())");
+  const authenticate=main.indexOf("auto authenticated=co_await nativeSessions->authenticate(std::move(credential))",digest);
+  const delegate=main.indexOf("fnd::toHex(delegatedFingerprint.value()),clock.now()",authenticate);
+  assert.ok(digest>=0 && authenticate>digest && delegate>authenticate);
+  assert.match(main,/const auto masterFingerprint=masterKeyFingerprint\(platform.security\(\)\)/);
+  assert.match(main,/platform.security\(\).masterKeyVersion\(\),masterFingerprint.value\(\)/);
   for (const name of ["profileRead", "connectionsRead"]) {
     const start=account.indexOf("CoroutineAccountSessionAdapter::"+name+"(");
     const body=account.slice(start,account.indexOf("co_return jsonResponse(200",start));

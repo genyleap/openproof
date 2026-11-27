@@ -1839,18 +1839,20 @@ addProtectedRoutes(gateway::Router& router,
     }
 
     // Native SQL preflight finishes before any listener or request worker exists.
-    const auto fingerprint=masterKeyFingerprint(platform.security());
-    if (!fingerprint) {
-        reportStartupFailure(fingerprint.error());
-        return ExitCode::ConfigurationError;
-    }
-    const auto preflight=postgres::nativeDatabasePreflight(
-        platform.database().connectionString().clone(),platform.database().migrationDirectory(),
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        platform.security().masterKeyVersion(),fingerprint.value());
-    if (!preflight) {
-        reportStartupFailure(preflight.error());
-        return ExitCode::ConfigurationError;
+    {
+        const auto masterFingerprint=masterKeyFingerprint(platform.security());
+        if (!masterFingerprint) {
+            reportStartupFailure(masterFingerprint.error());
+            return ExitCode::ConfigurationError;
+        }
+        const auto preflight=postgres::nativeDatabasePreflight(
+            platform.database().connectionString().clone(),platform.database().migrationDirectory(),
+            identity::OrganizationId{std::string{platform.auth().organizationId()}},
+            platform.security().masterKeyVersion(),masterFingerprint.value());
+        if (!preflight) {
+            reportStartupFailure(preflight.error());
+            return ExitCode::ConfigurationError;
+        }
     }
 
     auto passwordSecret = passwordPepperMaterial(platform.security());
