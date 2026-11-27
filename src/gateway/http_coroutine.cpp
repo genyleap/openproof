@@ -133,17 +133,21 @@ HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)
 boost::asio::awaitable<HttpResponse>
 CoroutineRouteOverlay::handleAsync(HttpRequest request)
 {
-    if (!nativeEnabledFor(request)) {
-        // Defense in depth for callers bypassing the listener's capability
-        // dispatch. Never invoke synchronous middleware on an Asio worker.
-        request.wipeBody();
-        request.wipeAuthorizationHeader();
-        request.wipeCookieHeader();
-        co_return unavailable(request);
+    // Resolve the immutable exact route once. Keep the independent
+    // per-request capability check at this dispatch boundary; a direct
+    // route that declines must never fall through to another handler.
+    if (auto* direct=directHandler(request)) {
+        if (direct->nativeEnabledFor(request))
+            co_return co_await direct->handleAsync(std::move(request));
+    } else if (overlays(request) && m_native->nativeEnabledFor(request)) {
+        co_return co_await m_native->handleAsync(std::move(request));
     }
-    if (auto* direct=directHandler(request))
-        co_return co_await direct->handleAsync(std::move(request));
-    co_return co_await m_native->handleAsync(std::move(request));
+    // Defense in depth for callers bypassing the listener's capability
+    // dispatch. Never invoke synchronous middleware on an Asio worker.
+    request.wipeBody();
+    request.wipeAuthorizationHeader();
+    request.wipeCookieHeader();
+    co_return unavailable(request);
 }
 
 CoroutineMetricsAdapter::CoroutineMetricsAdapter(
