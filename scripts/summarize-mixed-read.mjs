@@ -72,10 +72,33 @@ if (records.every(r => schedulingKeys.every(k => validCounter(r[k])) &&
     r.serverStableThreadCount > 0)) {
   for (const key of schedulingKeys) diagnosticMetrics[key] = summarize(key);
 }
+// Edge diagnostics have their own completeness contract. A zero duration
+// is valid at clock resolution, but a zero baseline has no percentage ratio.
+const edgePhases = ["edgeForwardSend", "edgeUpstreamResponseHeaders",
+  "edgeResponseFinish", "edgeTotal"];
+const latencyKeys = ["p50Ms","p95Ms","p99Ms"];
+const validEdge = r => {
+  const edge = r.edgePhaseMetrics;
+  if (!edge || edge.samples !== r.requests ||
+      !edge.phases || Object.keys(edge.phases).length !== edgePhases.length)
+    return false;
+  return edgePhases.every(name => {
+    const phase = edge.phases[name];
+    return phase && latencyKeys.every(k => Number.isFinite(phase[k]) && phase[k] >= 0) &&
+      phase.p50Ms <= phase.p95Ms && phase.p95Ms <= phase.p99Ms &&
+      latencyKeys.every(k => Number.isFinite(edge.phases.edgeTotal?.[k]) &&
+        phase[k] <= edge.phases.edgeTotal[k]);
+  });
+};
+const edgePhaseComparison = records.every(validEdge)
+  ? Object.fromEntries(edgePhases.map(name => [name,Object.fromEntries(
+      latencyKeys.map(k => [k,summarize(k,r=>r.edgePhaseMetrics.phases[name])]))]))
+  : null;
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
   pairCount:5,requestsPerRun:600,concurrency:24,
   metrics:Object.fromEntries(fields.map(k=>[k,summarize(k)])),
   diagnosticMetrics,
+  ...(edgePhaseComparison ? {edgePhaseComparison} : {}),
   routes:Object.fromEntries(routes.map(name=>[name,Object.fromEntries(
     ["p50Ms","p95Ms","p99Ms"].map(k=>[k,summarize(k,r=>r.routes.find(x=>x.name===name))]))])),
   caveat:"Exploratory paired medians; not full coroutine acceptance or production qualification."};
@@ -93,6 +116,16 @@ console.log("|---|---:|---:|---:|");
 for (const [name, metrics] of Object.entries(report.routes)) {
   console.log("| " + name + " | " + ["p50Ms","p95Ms","p99Ms"].map(
     key => metrics[key].pairedChangePct.toFixed(2) + "%").join(" | ") + " |");
+}
+if (edgePhaseComparison) {
+  console.log("| Edge phase (ms) | Percentile | Baseline median | Candidate median | Median paired change |");
+  console.log("|---|---|---:|---:|---:|");
+  for (const [name, metrics] of Object.entries(edgePhaseComparison)) {
+    for (const [key,v] of Object.entries(metrics))
+      console.log("| "+name+" | "+key+" | "+v.baselineMedian.toFixed(2)+" | "+
+        v.candidateMedian.toFixed(2)+" | "+(v.pairedChangePct===null?"n/a":v.pairedChangePct.toFixed(2)+"%")+" |");
+  }
+  console.log("Edge timings include transport and fixture scheduling; they are not isolated OPP service time. Percentiles are not additive.");
 }
 console.log("Positive change means an increase; lower latency/CPU/RSS is favorable.");
 console.log(report.caveat);
