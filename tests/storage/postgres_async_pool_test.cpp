@@ -73,6 +73,40 @@ asio::awaitable<void> boundedAcquireAndReuse(
         && rows.rows[0][0] == "7";
 }
 
+asio::awaitable<void> directAcquirePreservesLazyAdmissionAndDeadline(
+    std::string connectionString)
+{
+    using Clock = std::chrono::steady_clock;
+    pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
+        std::move(connectionString), 1U, 100ms, 2s};
+    {
+        // Construct and discard an unstarted awaitable. It must not take
+        // the only slot or initiate any connection establishment.
+        auto abandoned = pool.acquire();
+        EXPECT_TRUE(abandoned.valid());
+        auto first = co_await pool.acquire(Clock::now() + 2s);
+        EXPECT_TRUE(first.connection().reusable());
+    }
+    auto expired = pool.acquire(Clock::now() - 1ms);
+    bool denied = false;
+    try {
+        auto lease = co_await std::move(expired);
+        static_cast<void>(lease);
+    } catch (const std::runtime_error&) {
+        denied = true;
+    }
+    EXPECT_TRUE(denied);
+    auto next = co_await pool.acquire(Clock::now() + 2s);
+    const auto result = co_await next.connection().query("SELECT 31::text", {}, 2s);
+    EXPECT_EQ(result.rows.size(), 1U);
+    if (result.rows.size() == 1U && result.rows.front().size() == 1U) {
+        EXPECT_EQ(result.rows.front().front(), "31");
+    } else {
+        ADD_FAILURE() << "Unexpected PostgreSQL result shape";
+    }
+    EXPECT_TRUE(next.connection().reusable());
+}
+
 asio::awaitable<void> recycledLeaseClearsSessionState(
     std::string connectionString, bool& cleared)
 {
@@ -177,6 +211,20 @@ TEST(PostgresAsyncPoolTest, TimedAcquireReturnsPermitForSubsequentLease)
     ASSERT_NO_THROW(done.get());
     EXPECT_TRUE(timedOut);
     EXPECT_TRUE(reused);
+}
+
+TEST(PostgresAsyncPoolTest, DirectAcquirePreservesLazyAdmissionAndDeadline)
+{
+    const char* connectionString = disposableDatabase();
+    if (!connectionString || !*connectionString) {
+        requireDisposableDatabase();
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context io;
+    auto done = asio::co_spawn(io,
+        directAcquirePreservesLazyAdmissionAndDeadline(connectionString), asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
 }
 
 TEST(PostgresAsyncPoolTest, RecycledConnectionClearsPriorTenantSessionState)
