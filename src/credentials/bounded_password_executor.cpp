@@ -1,3 +1,4 @@
+#include "../gateway/asio_service_ids_extern.hpp"
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>

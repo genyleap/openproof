@@ -7,6 +7,7 @@
 //
 // The `server` subcommand composes and runs the bounded HTTP reverse gateway.
 
+#include "../../src/gateway/asio_service_ids_extern.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>

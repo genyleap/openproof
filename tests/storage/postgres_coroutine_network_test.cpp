@@ -1,3 +1,4 @@
+#include "../../src/gateway/asio_service_ids_extern.hpp"
 #include <gtest/gtest.h>
 
 #include <atomic>

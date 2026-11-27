@@ -1,5 +1,6 @@
 module;
 
+#include "../../gateway/asio_service_ids_extern.hpp"
 #include <algorithm>
 #include <atomic>
 #include <array>

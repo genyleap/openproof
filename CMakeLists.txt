@@ -62,6 +62,33 @@ endif()
 
 find_package(tomlplusplus REQUIRED)
 find_package(Boost 1.88 REQUIRED)
+# Work around GCC 16/Boost.Asio service-ID linkage in Debug only. Keep
+# one explicit non-module instantiation per linked binary, including small
+# PostgreSQL/provider test executables that never link the gateway library.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17")
+    add_library(openproof_asio_service_ids STATIC EXCLUDE_FROM_ALL
+        src/gateway/asio_service_ids.cpp)
+    target_compile_features(openproof_asio_service_ids PRIVATE cxx_std_26)
+    set_target_properties(openproof_asio_service_ids PROPERTIES
+        CXX_SCAN_FOR_MODULES OFF CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(openproof_asio_service_ids PRIVATE Boost::headers)
+    target_compile_definitions(openproof_asio_service_ids PRIVATE
+        BOOST_ASIO_DISABLE_THREAD_KEYWORD_EXTENSION=1 BOOST_HAS_LONG_LONG=1)
+    target_compile_options(openproof_asio_service_ids PRIVATE
+        -Og -Wall -Wextra -Werror -fno-common -fstack-protector-strong)
+    if(OPENPROOF_ENABLE_SANITIZERS)
+        target_compile_options(openproof_asio_service_ids PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+    endif()
+    target_compile_definitions(openproof_compile_options INTERFACE
+        $<$<CONFIG:Debug>:OPENPROOF_ASIO_SINGLE_SERVICE_IDS=1>)
+    target_link_libraries(openproof_compile_options INTERFACE
+        $<$<CONFIG:Debug>:openproof_asio_service_ids>)
+endif()
+
 find_program(OPENPROOF_PG_CONFIG NAMES pg_config REQUIRED)
 execute_process(COMMAND "${OPENPROOF_PG_CONFIG}" --includedir
     OUTPUT_VARIABLE OPENPROOF_LIBPQ_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE

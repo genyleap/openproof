@@ -1,3 +1,4 @@
+#include "../../gateway/asio_service_ids_extern.hpp"
 #include "async_ldaps.hpp"
 
 #include <boost/asio.hpp>
