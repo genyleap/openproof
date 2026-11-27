@@ -179,13 +179,19 @@ public:
     // Strict path overlays always fail closed for every HTTP method.
     // Method-scoped overlays migrate read-only routes without breaking
     // compatible mutations on the same path.
+    struct DirectRoute final {
+        std::string path;
+        HttpMethod method;
+        CoroutineHttpHandler* handler;
+    };
     CoroutineRouteOverlay(HttpHandler& compatibility,
                           CoroutineHttpHandler& native,
                           std::vector<std::string> exactNativePaths,
                           std::vector<std::pair<std::string, HttpMethod>>
                               methodScopedNativePaths = {},
                           std::vector<std::string> strictNativePrefixes = {},
-                          std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes = {});
+                          std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes = {},
+                          std::vector<DirectRoute> directRoutes = {});
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
         const HttpRequest& request) const noexcept override;
@@ -196,8 +202,10 @@ private:
     [[nodiscard]] bool overlays(std::string_view path) const noexcept;
     [[nodiscard]] bool overlays(const HttpRequest& request) const noexcept;
     [[nodiscard]] static HttpResponse unavailable(const HttpRequest& request);
+    [[nodiscard]] CoroutineHttpHandler* directHandler(const HttpRequest& request) const noexcept;
     HttpHandler* m_compatibility;
     CoroutineHttpHandler* m_native;
+    std::vector<DirectRoute> m_directRoutes;
     std::vector<std::string> m_exactNativePaths;
     std::vector<std::pair<std::string, HttpMethod>> m_methodScopedNativePaths;
     std::vector<std::string> m_strictNativePrefixes;

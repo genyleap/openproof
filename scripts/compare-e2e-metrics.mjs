@@ -71,6 +71,35 @@ for (const [label, key] of [
       "% favorable |");
   }
 }
+if (baseline.routes || candidate.routes) {
+  const validated = (record) => {
+    assert.ok(Array.isArray(record.routes), "Route metrics must be present on both sides");
+    const routes = new Map();
+    let count = 0;
+    for (const route of record.routes) {
+      assert.match(route.name, /^[a-z-]+$/);
+      assert.ok(!routes.has(route.name), "Duplicate benchmark route");
+      assert.ok(Number.isInteger(route.requests) && route.requests > 0);
+      assert.ok([route.p50Ms, route.p95Ms, route.p99Ms].every(v => Number.isFinite(v) && v > 0));
+      assert.ok(route.p50Ms <= route.p95Ms && route.p95Ms <= route.p99Ms);
+      routes.set(route.name, route);
+      count += route.requests;
+    }
+    assert.equal(count, record.requests, "Route sample count mismatch");
+    return routes;
+  };
+  const before = validated(baseline), after = validated(candidate);
+  assert.equal(before.size, after.size, "Route workloads must match");
+  console.log("\n| Route | Requests | Baseline p50 / p95 / p99 (ms) | Candidate p50 / p95 / p99 (ms) |");
+  console.log("|---|---:|---:|---:|");
+  const format = r => [r.p50Ms, r.p95Ms, r.p99Ms].map(v => v.toFixed(2)).join(" / ");
+  for (const [name, old] of before) {
+    const current = after.get(name);
+    assert.ok(current, "Missing matching route");
+    assert.equal(old.requests, current.requests, "Route request counts must match");
+    console.log(`| ${name} | ${old.requests} | ${format(old)} | ${format(current)} |`);
+  }
+}
 console.log("");
 console.log("NOT APPROVED: this tool compares point estimates, not statistically " +
   "significant results. The same hardware, build flags, warmed-up state, " +

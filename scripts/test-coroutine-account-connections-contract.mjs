@@ -250,10 +250,13 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /recovered\.release\(\)/);
   assert.match(implementation, /new Slot\{weak_from_this\(\), \{\}\}/);
   assert.match(implementation, /const bool received = state->slots\.try_receive\(/);
-  assert.match(implementation, /asio::steady_timer retryTimer\{executor\}/);
+  assert.match(implementation, /std::optional<asio::steady_timer> retryTimer/);
   assert.match(implementation, /constexpr auto retryInterval = std::chrono::milliseconds\{4\}/);
-  assert.match(implementation, /retryTimer\.expires_at\(std::min\(admissionDeadline, now \+ retryInterval\)\)/);
-  assert.match(implementation, /co_await retryTimer\.async_wait/);
+  assert.match(implementation, /retryTimer->expires_at\(std::min\(admissionDeadline, now \+ retryInterval\)\)/);
+  assert.match(implementation, /co_await retryTimer->async_wait/);
+  assert.ok(implementation.indexOf('if (!retryTimer) retryTimer.emplace') > implementation.indexOf('if (received)'));
+  assert.match(implementation, /if \(!retryTimer\) retryTimer.emplace\(co_await asio::this_coro::executor\)/);
+  assert.match(implementation, /"DISCARD ALL"/);
   assert.doesNotMatch(implementation, /slots\.async_receive\(/);
   assert.match(implementation, /auto connection = std::move\(slot->connection\)/);
   assert.match(implementation, /slot->connection = std::move\(m_connection\)/);

@@ -3408,9 +3408,23 @@ addProtectedRoutes(gateway::Router& router,
             [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
         nativePaths.emplace_back("/health/live");
         nativePaths.emplace_back("/health/ready");
+        // Exact hot routes already own every security check in their native
+        // adapters. Keep the protected Gateway and metrics wrappers outside
+        // this dispatch; skip only unrelated protocol adapters.
+        std::vector<gatewayHttp::CoroutineRouteOverlay::DirectRoute> directRoutes{
+            {"/health/ready",gateway::HttpMethod::Get,&nativeHealth},
+            {"/health/live",gateway::HttpMethod::Get,&nativeHealth}};
+        if (asyncOidc) {
+            directRoutes.push_back({"/.well-known/openid-configuration",gateway::HttpMethod::Get,asyncOidc.get()});
+            directRoutes.push_back({"/.well-known/jwks.json",gateway::HttpMethod::Get,asyncOidc.get()});
+        }
+        if (asyncTokenRead) {
+            directRoutes.push_back({"/oauth/userinfo",gateway::HttpMethod::Get,asyncTokenRead.get()});
+            directRoutes.push_back({"/oauth/introspect",gateway::HttpMethod::Post,asyncTokenRead.get()});
+        }
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
             fallback, nativeHealth, std::move(nativePaths),
-            std::move(nativeMethods),std::move(strictNativePrefixes)};
+            std::move(nativeMethods),std::move(strictNativePrefixes),{},std::move(directRoutes)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,

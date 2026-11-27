@@ -187,6 +187,7 @@ function verifyIdToken(compact, jwks, expected) {
 async function concurrentSmoke(operations, requestCount = 600, concurrency = 24) {
   assert.ok(operations.length > 0);
   const latencies = [];
+  const byRoute = operations.map(({ name }) => ({ name, latencies: [] }));
   let cursor = 0;
   const startedAt = performance.now();
   const workers = Array.from({ length: concurrency }, async () => {
@@ -194,25 +195,33 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
       const index = cursor++;
       if (index >= requestCount) return;
       const requestStarted = performance.now();
-      const response = await operations[index % operations.length]();
+      const operationIndex = index % operations.length;
+      const response = await operations[operationIndex].run();
       expectStatus(response, 200);
-      latencies.push(performance.now() - requestStarted);
+      const latency = performance.now() - requestStarted;
+      latencies.push(latency);
+      byRoute[operationIndex].latencies.push(latency);
     }
   });
   await Promise.all(workers);
   const elapsedMs = performance.now() - startedAt;
   latencies.sort((left, right) => left - right);
-  const percentile = (fraction) => latencies[Math.min(
-    latencies.length - 1,
-    Math.ceil(latencies.length * fraction) - 1,
+  const percentile = (values, fraction) => values[Math.min(
+    values.length - 1,
+    Math.ceil(values.length * fraction) - 1,
   )];
   return {
     requests: requestCount,
     concurrency,
     requestsPerSecond: requestCount / (elapsedMs / 1000),
-    p50Ms: percentile(0.50),
-    p95Ms: percentile(0.95),
-    p99Ms: percentile(0.99),
+    p50Ms: percentile(latencies, 0.50),
+    p95Ms: percentile(latencies, 0.95),
+    p99Ms: percentile(latencies, 0.99),
+    routes: byRoute.filter(({ latencies: samples }) => samples.length > 0).map(({ name, latencies: samples }) => {
+      samples.sort((a, b) => a - b);
+      return { name, requests: samples.length, p50Ms: percentile(samples, 0.50),
+        p95Ms: percentile(samples, 0.95), p99Ms: percentile(samples, 0.99) };
+    }),
   };
 }
 
@@ -1743,20 +1752,20 @@ async function main() {
 
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
-      () => edgeRequest("/health/ready"),
-      () => edgeRequest("/.well-known/openid-configuration"),
-      () => edgeRequest("/.well-known/jwks.json"),
-      () => edgeRequest("/oauth/userinfo", {
+      { name: "readiness", run: () => edgeRequest("/health/ready") },
+      { name: "discovery", run: () => edgeRequest("/.well-known/openid-configuration") },
+      { name: "jwks", run: () => edgeRequest("/.well-known/jwks.json") },
+      { name: "userinfo", run: () => edgeRequest("/oauth/userinfo", {
         headers: { authorization: `Bearer ${firstTokens.access_token}` },
-      }),
-      () => edgeRequest("/api/ping", {
+      }) },
+      { name: "protected-proxy", run: () => edgeRequest("/api/ping", {
         headers: { authorization: `Bearer ${firstTokens.access_token}` },
-      }),
-      () => edgeRequest("/oauth/introspect", {
+      }) },
+      { name: "introspection", run: () => edgeRequest("/oauth/introspect", {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: introspectionForm.toString(),
-      }),
+      }) },
     ], mixedLoadRequests, mixedLoadConcurrency);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     if (beforeLoadUsage && afterLoadUsage) {
@@ -2000,6 +2009,9 @@ async function main() {
     console.log(`- mixed read load smoke: ${loadResult.requests} requests at concurrency ${loadResult.concurrency}, `+
       `${loadResult.requestsPerSecond.toFixed(1)} req/s, p50 ${loadResult.p50Ms.toFixed(1)} ms, `+
       `p95 ${loadResult.p95Ms.toFixed(1)} ms, p99 ${loadResult.p99Ms.toFixed(1)} ms`);
+    for (const route of loadResult.routes) {
+      console.log(`- mixed read route ${route.name}: ${route.requests} requests, p50 ${route.p50Ms.toFixed(1)} ms, p95 ${route.p95Ms.toFixed(1)} ms, p99 ${route.p99Ms.toFixed(1)} ms`);
+    }
     console.log(`Disposable database retained for inspection: ${databaseName}`);
     if (metricsFile) {
       // Only non-sensitive aggregate metrics; no tokens, passwords or addresses.

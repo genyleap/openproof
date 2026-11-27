@@ -7,6 +7,7 @@ module;
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -25,13 +26,34 @@ CoroutineRouteOverlay::CoroutineRouteOverlay(
     std::vector<std::string> exactNativePaths,
     std::vector<std::pair<std::string, HttpMethod>> methodScopedNativePaths,
     std::vector<std::string> strictNativePrefixes,
-    std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes)
+    std::vector<std::pair<std::string, HttpMethod>> strictMethodPrefixes,
+    std::vector<DirectRoute> directRoutes)
     : m_compatibility(&compatibility), m_native(&native),
+      m_directRoutes(std::move(directRoutes)),
       m_exactNativePaths(std::move(exactNativePaths)),
       m_methodScopedNativePaths(std::move(methodScopedNativePaths)),
       m_strictNativePrefixes(std::move(strictNativePrefixes)),
       m_strictMethodPrefixes(std::move(strictMethodPrefixes))
 {
+    // Direct dispatch is only allowed for already registered strict paths.
+    // No request-controlled handler choice or synchronous fallback is added.
+    for (std::size_t i=0; i<m_directRoutes.size(); ++i) {
+        const auto& route=m_directRoutes[i];
+        bool exact=false;
+        for (const auto& path:m_exactNativePaths) exact=exact || path==route.path;
+        if (!route.handler || !exact)
+            throw std::invalid_argument{"Invalid direct native route"};
+        for (std::size_t j=0; j<i; ++j)
+            if (m_directRoutes[j].path==route.path && m_directRoutes[j].method==route.method)
+                throw std::invalid_argument{"Duplicate direct native route"};
+    }
+}
+
+CoroutineHttpHandler* CoroutineRouteOverlay::directHandler(const HttpRequest& request) const noexcept
+{
+    for (const auto& route:m_directRoutes)
+        if (route.method==request.method() && route.path==request.path()) return route.handler;
+    return nullptr;
 }
 
 bool CoroutineRouteOverlay::overlays(std::string_view path) const noexcept
@@ -68,6 +90,7 @@ bool CoroutineRouteOverlay::overlays(const HttpRequest& request) const noexcept
 
 bool CoroutineRouteOverlay::nativeEnabledFor(const HttpRequest& request) const noexcept
 {
+    if (auto* direct=directHandler(request)) return direct->nativeEnabledFor(request);
     if (!overlays(request)) return false;
     try {
         return m_native->nativeEnabledFor(request);
@@ -118,6 +141,8 @@ CoroutineRouteOverlay::handleAsync(HttpRequest request)
         request.wipeCookieHeader();
         co_return unavailable(request);
     }
+    if (auto* direct=directHandler(request))
+        co_return co_await direct->handleAsync(std::move(request));
     co_return co_await m_native->handleAsync(std::move(request));
 }
 

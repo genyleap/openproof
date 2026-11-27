@@ -193,8 +193,10 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
     // operation; when the bounded pool is exhausted suspend on an Asio timer,
     // never a condition_variable or a busy loop. This trades at most 4 ms
     // admission latency under contention for cancellation-safe capacity.
-    auto executor = co_await asio::this_coro::executor;
-    asio::steady_timer retryTimer{executor};
+    // Most acquisitions find an idle permit immediately. Avoid registering
+    // a timer with the reactor on that path; contention keeps the same
+    // bounded, cancellation-safe wait and deadline.
+    std::optional<asio::steady_timer> retryTimer;
     State::SlotToken permit;
     constexpr auto retryInterval = std::chrono::milliseconds{4};
     for (;;) {
@@ -218,9 +220,10 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         const auto now = std::chrono::steady_clock::now();
         if (now >= admissionDeadline)
             throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
-        retryTimer.expires_at(std::min(admissionDeadline, now + retryInterval));
+        if (!retryTimer) retryTimer.emplace(co_await asio::this_coro::executor);
+        retryTimer->expires_at(std::min(admissionDeadline, now + retryInterval));
         boost::system::error_code error;
-        co_await retryTimer.async_wait(
+        co_await retryTimer->async_wait(
             asio::redirect_error(asio::use_awaitable, error));
         if (error)
             throw std::runtime_error{"Async PostgreSQL pool acquisition cancelled"};

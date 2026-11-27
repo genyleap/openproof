@@ -685,6 +685,35 @@ TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStric
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, ExactDirectRoutePreservesStrictDenialAndMethodIsolation)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native, direct;
+    DisabledCoroutineHandler disabled;
+    using Overlay=httpAdapter::CoroutineRouteOverlay;
+    EXPECT_THROW((Overlay{compatibility,native,{"/native"},{},{},{},
+        {{"/unregistered",gw::HttpMethod::Get,&direct}}}),std::invalid_argument);
+    EXPECT_THROW((Overlay{compatibility,native,{"/native"},{},{},{},
+        {{"/native",gw::HttpMethod::Get,&direct},{"/native",gw::HttpMethod::Get,&disabled}}}),std::invalid_argument);
+    Overlay overlay{compatibility,native,{"/native"},{},{},{},
+        {{"/native",gw::HttpMethod::Get,&direct},{"/native",gw::HttpMethod::Post,&disabled}}};
+    httpAdapter::BeastHttpServer server{overlay,serverConfig()};
+    ASSERT_TRUE(server.start());
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/native").body(),"native");
+    const auto denied=sendRequest(server.boundPort(),beastHttp::verb::post,"/native","fixture");
+    EXPECT_EQ(denied.result_int(),503U);
+    EXPECT_EQ(denied.at("cache-control"),"no-store");
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::patch,"/native").body(),"native");
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/native-other").body(),"fast");
+    EXPECT_EQ(direct.asynchronousCalls.load(),1);
+    EXPECT_EQ(native.asynchronousCalls.load(),1);
+    EXPECT_EQ(disabled.asynchronousCalls.load(),0);
+    EXPECT_EQ(disabled.synchronousCalls.load(),0);
+    EXPECT_EQ(direct.synchronousCalls.load(),0);
+    EXPECT_EQ(compatibility.received.load(),1);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler)
 {
     CountingFastHandler compatibility;
