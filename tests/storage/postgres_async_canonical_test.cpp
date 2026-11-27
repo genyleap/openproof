@@ -654,7 +654,7 @@ asio::awaitable<bool> queryOnNextExecutor(
     // A bounded result much larger than one PostgreSQL protocol buffer
     // exercises repeated readiness waits on the current executor.
     const auto streamed = co_await connection->query(
-        "SELECT i::text, repeat('x', 1024) FROM generate_series(1, 512) AS series(i)",
+        "SELECT i::text, repeat('x', 1024) FROM generate_series(1, 512) AS series(i) ORDER BY i",
         {}, std::chrono::seconds{2});
     if (streamed.rows.size() != 512U) co_return false;
     const std::string payload(1024U, 'x');
@@ -665,9 +665,19 @@ asio::awaitable<bool> queryOnNextExecutor(
     }
     const auto after = co_await connection->query(
         "SELECT 'reuse-after-stream'::text", {}, std::chrono::seconds{1});
-    co_return connection->reusable() && after.rows.size() == 1U
-        && after.rows.front().size() == 1U
-        && after.rows.front().front() == "reuse-after-stream";
+    if (!connection->reusable() || after.rows.size() != 1U
+        || after.rows.front().size() != 1U
+        || after.rows.front().front() != "reuse-after-stream") co_return false;
+    // A server error after emitting a large prefix of single-row results
+    // must discard every partial row and poison the physical connection.
+    try {
+        static_cast<void>(co_await connection->query(
+            "SELECT repeat('x', 1024), 1 / (512-i) FROM generate_series(1,512) AS series(i)",
+            {}, std::chrono::seconds{2}));
+    } catch (const std::runtime_error&) {
+        co_return !connection->reusable();
+    }
+    co_return false;
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
@@ -692,7 +702,7 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
 
     auto result = asio::co_spawn(next,
         queryOnNextExecutor(std::move(connection)), asio::use_future);
-    next.run_for(std::chrono::seconds{3});
+    next.run_for(std::chrono::seconds{6});
     const bool ready = result.wait_for(std::chrono::seconds{0})
         == std::future_status::ready;
     EXPECT_TRUE(ready) << "Query did not complete on its current executor.";
