@@ -216,9 +216,9 @@ TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverU
     EXPECT_EQ(run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-access")).status(),503);
     foreign=false;
     EXPECT_EQ(run(request(gw::HttpMethod::Get,"/oauth/userinfo",{}, {},{},"fixture-bound")).status(),401);
-    auto proof=gw::HttpRequest::create(gw::HttpMethod::Get,"/oauth/userinfo",
+    auto dpopRequest=gw::HttpRequest::create(gw::HttpMethod::Get,"/oauth/userinfo",
         {{"authorization","DPoP fixture-bound"}},{},"127.0.0.1",fnd::CorrelationId{"fixture"}).value();
-    EXPECT_EQ(run(std::move(proof)).status(),200);
+    EXPECT_EQ(run(std::move(dpopRequest)).status(),200);
     EXPECT_EQ(senderCalls,2);
     auto inspect=[&](std::string proof,std::string token){
         return run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
@@ -378,7 +378,7 @@ TEST(NativeOAuthTokenReadTest, DeviceInitiationRetriesCollisionAndReturnsOnlyCom
         const auto start=result.body().find(marker);
         if (start==std::string::npos) return std::string{};
         const auto pos=start+marker.size();
-        return result.body().substr(pos,result.body().find('"',pos)-pos);
+        return std::string{result.body().substr(pos,result.body().find('"',pos)-pos)};
     };
     const auto device=field("device_code"),user=field("user_code");
     EXPECT_TRUE(device.starts_with("opd_"));
