@@ -104,12 +104,20 @@ using ResultPointer = std::unique_ptr<PGresult, ResultDeleter>;
     return now + timeout;
 }
 
+// A query on an already-connected PGconn owns its readiness descriptor
+// for that operation only. Connect polling must not reuse it: libpq may
+// replace the physical socket while trying connection addresses.
+struct QuerySocketReadiness final {
+    std::optional<asio::posix::stream_descriptor> descriptor;
+    int originalFd{-1};
+};
+
 asio::awaitable<void> waitForSocket(
     asio::any_io_executor executor, PGconn* connection,
-    asio::posix::stream_descriptor::wait_type direction, Deadline deadline)
+    asio::posix::stream_descriptor::wait_type direction, Deadline deadline,
+    QuerySocketReadiness* querySocket = nullptr)
 {
-    // PQsocket belongs to libpq; register a *duplicate* with Asio so the
-    // descriptor destructor cannot accidentally close libpq's original FD.
+    // PQsocket belongs to libpq; register only a duplicate with Asio.
     if (Clock::now() >= deadline) {
         throw std::runtime_error{"PostgreSQL operation timed out"};
     }
@@ -117,22 +125,31 @@ asio::awaitable<void> waitForSocket(
     if (originalFd < 0) {
         throw std::runtime_error{"PostgreSQL socket is unavailable"};
     }
-    // Construct the Asio wrapper before duplicating the libpq descriptor.
-    // If its executor/service allocation throws, no extra OS fd exists.
-    asio::posix::stream_descriptor descriptor{executor};
-    const int fd = ::dup(originalFd);
-    if (fd < 0) {
-        throw std::runtime_error{"Unable to duplicate PostgreSQL socket"};
+    std::optional<asio::posix::stream_descriptor> transient;
+    auto& slot = querySocket ? querySocket->descriptor : transient;
+    if (slot.has_value()) {
+        // A connected query cannot switch sockets. Fail closed instead of
+        // waiting on stale readiness or attempting a transparent reconnect.
+        if (querySocket->originalFd != originalFd) {
+            throw std::runtime_error{"PostgreSQL socket changed during query"};
+        }
+    } else {
+        // Construct the Asio wrapper before duplicating the libpq descriptor.
+        slot.emplace(executor);
+        auto& descriptor = *slot;
+        const int fd = ::dup(originalFd);
+        if (fd < 0) {
+            throw std::runtime_error{"Unable to duplicate PostgreSQL socket"};
+        }
+        boost::system::error_code assignmentError;
+        descriptor.assign(fd, assignmentError);
+        if (assignmentError) {
+            (void)::close(fd);
+            throw std::runtime_error{"Unable to adopt PostgreSQL socket"};
+        }
+        if (querySocket) querySocket->originalFd = originalFd;
     }
-    // assign() takes ownership only on success. Its error_code overload
-    // lets us close the duplicate explicitly on failure; the original
-    // libpq-owned socket is never closed by this coroutine.
-    boost::system::error_code assignmentError;
-    descriptor.assign(fd, assignmentError);
-    if (assignmentError) {
-        (void)::close(fd);
-        throw std::runtime_error{"Unable to adopt PostgreSQL socket"};
-    }
+    auto& descriptor = *slot;
     boost::system::error_code error;
     // Cancellation and timeout are scoped to this one readiness wait.
     // A single absolute deadline is shared across all flush/read cycles.
@@ -505,6 +522,9 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         || sql.size()>16U*1024U*1024U))
         throw std::invalid_argument{"Invalid PostgreSQL migration script boundary"};
     try {
+        // Lazily register the socket once per query; destroy the duplicate
+        // before the catch handler discards a failed libpq connection.
+        QuerySocketReadiness querySocket;
         // Validation and parameter materialization consume the same absolute
         // deadline as libpq I/O; never submit an already-expired operation.
         if (Clock::now() >= deadline) {
@@ -550,7 +570,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
                 throw std::runtime_error{"PostgreSQL query flush failed"};
             }
             co_await waitForSocket(executor, connection,
-                asio::posix::stream_descriptor::wait_write, deadline);
+                asio::posix::stream_descriptor::wait_write, deadline, &querySocket);
         }
 
         QueryRows output;
@@ -570,7 +590,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
             }
             if (PQisBusy(connection) != 0) {
                 co_await waitForSocket(executor, connection,
-                    asio::posix::stream_descriptor::wait_read, deadline);
+                    asio::posix::stream_descriptor::wait_read, deadline, &querySocket);
                 continue;
             }
             ResultPointer result{PQgetResult(connection)};
