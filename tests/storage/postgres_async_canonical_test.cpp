@@ -2223,6 +2223,59 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         }
         return result;
     };
+    const auto userInfo=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string fingerprint,
+        fnd::Instant now=kNow) {
+        using UserInfoResult=fnd::Result<std::pair<openproof::session::DelegatedAccess,
+            std::optional<openproof::identity::profile::IdentityProfile>>>;
+        std::optional<UserInfoResult> output;
+        const auto capture=[](auto& adapter,std::string value,fnd::Instant time,
+            auto& result)->asio::awaitable<void>{
+            result.emplace(co_await adapter.readBearerUserInfoAsync(std::move(value),time));
+        };
+        io.restart();
+        auto pending=asio::co_spawn(io,capture(store,std::move(fingerprint),now,output),asio::use_future);
+        io.run(); pending.get();
+        return std::move(output.value());
+    };
+    auto accountOnly=userInfo(native,digest);
+    ASSERT_TRUE(accountOnly);
+    EXPECT_FALSE(accountOnly->second.has_value());
+    EXPECT_FALSE(accountOnly->first.permits("openid"));
+    EXPECT_FALSE(userInfo(foreign,digest));
+    EXPECT_FALSE(userInfo(native,std::string(64U,'0')));
+    EXPECT_FALSE(userInfo(native,digest,kNow+60s));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'openid'),($1,'profile')",{family}));
+    auto unbound=userInfo(native,digest);
+    ASSERT_TRUE(unbound);
+    EXPECT_TRUE(unbound->first.permits("openid"));
+    EXPECT_TRUE(unbound->first.permits("profile"));
+    // The seeded owner has a profile; match the independent live read.
+    std::optional<fnd::Result<openproof::identity::profile::IdentityProfile>> profileOutput;
+    const auto captureProfile=[](auto& adapter,ids::IdentityId owner,
+        auto& result)->asio::awaitable<void>{
+        result.emplace(co_await adapter.readProfileAsync(std::move(owner)));
+    };
+    io.restart();
+    auto expectedProfile=asio::co_spawn(io,captureProfile(native,ids::IdentityId{seed.owner},profileOutput),asio::use_future);
+    io.run();
+    expectedProfile.get();
+    auto expected=std::move(profileOutput.value());
+    ASSERT_TRUE(expected);
+    ASSERT_TRUE(unbound->second);
+    EXPECT_EQ(unbound->second->identity(),expected->identity());
+    EXPECT_EQ(unbound->second->displayName(),expected->displayName());
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=0,"
+        "sender_constraint_value='fixture' WHERE id=$1",{family}));
+    auto senderBound=userInfo(native,digest);
+    ASSERT_TRUE(senderBound);
+    ASSERT_TRUE(senderBound->first.senderConstraint());
+    EXPECT_FALSE(senderBound->second.has_value()); // Never read claims before sender proof.
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=NULL,"
+        "sender_constraint_value=NULL WHERE id=$1",{family}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.identities SET status=2 WHERE id=$1",{seed.owner}));
+    EXPECT_FALSE(userInfo(native,digest));
+    ASSERT_NO_THROW(sql("UPDATE openproof.identities SET status=0 WHERE id=$1",{seed.owner}));
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope IN ('openid','profile')",{family}));
     auto activeIntrospection=introspect(native,clientProof,digest);
     ASSERT_TRUE(activeIntrospection && activeIntrospection->has_value());
     EXPECT_EQ(activeIntrospection->value().clientId(),client);
