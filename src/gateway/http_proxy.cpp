@@ -216,20 +216,33 @@ private:
             co_return foundation::fail(foundation::ErrorCode::Timeout,
                                         "The upstream request timed out.");
         }
-        auto resolver = std::make_shared<Tcp::resolver>(executor);
-        asio::steady_timer resolverDeadline{executor};
-        resolverDeadline.expires_at(deadline);
-        resolverDeadline.async_wait(
-            [weak = std::weak_ptr<Tcp::resolver>{resolver}](boost::system::error_code error) {
-                if (!error) {
-                    if (auto active = weak.lock()) active->cancel();
-                }
-            });
         boost::system::error_code error;
-        auto endpoints = co_await resolver->async_resolve(
-            std::string{endpoint.host()}, std::to_string(endpoint.port()),
-            asio::redirect_error(asio::use_awaitable, error));
-        resolverDeadline.cancel();
+        Tcp::resolver::results_type endpoints;
+        const std::string host{endpoint.host()};
+        const auto service = std::to_string(endpoint.port());
+        boost::system::error_code addressError;
+        const auto address = asio::ip::make_address(host, addressError);
+        if (!addressError && address.is_v4()) {
+            // A literal IPv4 destination needs no DNS worker, resolver
+            // allocation or cancellation timer. Preserve the original
+            // hostname for HTTP authority and TLS peer verification.
+            endpoints = Tcp::resolver::results_type::create(
+                Tcp::endpoint{address, endpoint.port()}, host, service);
+        } else {
+            // Keep existing hostname and scoped IPv6 resolution semantics.
+            auto resolver = std::make_shared<Tcp::resolver>(executor);
+            asio::steady_timer resolverDeadline{executor};
+            resolverDeadline.expires_at(deadline);
+            resolverDeadline.async_wait(
+                [weak = std::weak_ptr<Tcp::resolver>{resolver}](boost::system::error_code timerError) {
+                    if (!timerError) {
+                        if (auto active = weak.lock()) active->cancel();
+                    }
+                });
+            endpoints = co_await resolver->async_resolve(
+                host, service, asio::redirect_error(asio::use_awaitable, error));
+            resolverDeadline.cancel();
+        }
         // A successful DNS result does not imply that the overall request
         // deadline is still valid: cancellation can race a resolver result.
         // Never start TCP/TLS or contact a retry target after that deadline.
@@ -258,7 +271,6 @@ private:
         }
 
         beast::ssl_stream<beast::tcp_stream> stream{executor, m_tlsContext};
-        const std::string host{endpoint.host()};
         if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
                      TLSEXT_NAMETYPE_host_name,
                      const_cast<char*>(host.c_str())) != 1) {
