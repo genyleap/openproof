@@ -1,6 +1,11 @@
 #include "async_pool.hpp"
 
 #include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/cancellation_state.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/strand.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
@@ -13,6 +18,8 @@
 #include <optional>
 #include <cstddef>
 #include <memory>
+#include <list>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -53,6 +60,118 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
             delete static_cast<Slot*>(recovered.release());
             std::terminate();
         }
+        state->notifyWaiter();
+    }
+
+    // The wait queue carries notifications only, never exclusive permits.
+    // Each timer is accessed on its own serialized executor. A release
+    // selects one waiter; cancellation hands an unused notification onward.
+    struct Waiter final {
+        explicit Waiter(asio::any_io_executor executorValue)
+            : executor(std::move(executorValue)), timer(executor) {}
+        const asio::any_io_executor executor;
+        asio::steady_timer timer;
+        bool notified = false; // accessed only on the timer's strand
+    };
+
+    void notifyWaiter() noexcept
+    {
+        std::shared_ptr<Waiter> selected;
+        {
+            std::lock_guard guard{waitersMutex};
+            if (waiters.empty()) return;
+            selected = std::move(waiters.front());
+            waiters.pop_front();
+        }
+        // Posting, not dispatching, also protects registration followed by
+        // the second try_receive and async_wait initiation from lost wakeups.
+        // Read immutable executor metadata, not the concurrently used timer.
+        auto executor = selected->executor;
+        asio::post(executor, [selected = std::move(selected)] {
+            selected->notified = true;
+            selected->timer.cancel();
+        });
+    }
+
+    struct Registration final {
+        State& state;
+        std::shared_ptr<Waiter> waiter;
+
+        Registration(State& owner, std::shared_ptr<Waiter> value)
+            : state(owner), waiter(std::move(value))
+        {
+            std::lock_guard guard{state.waitersMutex};
+            state.waiters.push_back(waiter);
+        }
+        ~Registration() noexcept
+        {
+            bool selected = false;
+            {
+                std::lock_guard guard{state.waitersMutex};
+                const auto it = std::find(state.waiters.begin(), state.waiters.end(), waiter);
+                selected = it == state.waiters.end();
+                if (!selected) state.waiters.erase(it);
+            }
+            // Pass a still-available permit onward, including when this
+            // waiter consumed a different permit just before selection.
+            // Never circulate wakeups while the channel is exhausted.
+            if (selected && state.slots.ready()) state.notifyWaiter();
+        }
+        Registration(const Registration&) = delete;
+        Registration& operator=(const Registration&) = delete;
+    };
+
+    SlotToken tryTake()
+    {
+        SlotToken permit;
+        boost::system::error_code channelError;
+        const bool received = slots.try_receive(
+            [&](boost::system::error_code error, SlotToken value) {
+                channelError = error;
+                permit = std::move(value);
+            });
+        if (received && (channelError || !permit))
+            throw std::runtime_error{"Async PostgreSQL pool returned an invalid permit"};
+        return permit;
+    }
+
+    static asio::awaitable<SlotToken> waitForPermit(
+        std::shared_ptr<State> state, std::chrono::steady_clock::time_point deadline)
+    {
+        auto executor = co_await asio::this_coro::executor;
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+            auto waiter = std::make_shared<Waiter>(executor);
+            waiter->timer.expires_at(deadline);
+            Registration registration{*state, waiter};
+            // Register BEFORE checking availability a second time. A return
+            // before registration is observed here; a later return posts a
+            // wakeup on this same strand, after async_wait is initiated.
+            auto permit = state->tryTake();
+            if (permit) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+                co_return std::move(permit);
+            }
+            boost::system::error_code error;
+            co_await waiter->timer.async_wait(
+                asio::redirect_error(asio::use_awaitable, error));
+            if (!error || std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+            const auto cancellation = co_await asio::this_coro::cancellation_state;
+            if (error != asio::error::operation_aborted || !waiter->notified
+                || cancellation.cancelled() != asio::cancellation_type::none)
+                throw std::runtime_error{"Async PostgreSQL pool acquisition cancelled"};
+            // The notification does not own a permit. Try the channel
+            // before deregistration; the guard forwards spare capacity.
+            permit = state->tryTake();
+            if (permit) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+                co_return std::move(permit);
+            }
+        }
     }
 
     State(asio::any_io_executor executor, std::string connectionStringValue,
@@ -90,6 +209,8 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
     }
 
     SlotChannel slots;
+    std::mutex waitersMutex;
+    std::list<std::shared_ptr<Waiter>> waiters;
     // Required for lazy reconnection; never expose, emit to logs or serialize.
     // Before public repository adoption, replace this string with the
     // foundation's secret-storage abstraction and avoid excess copies.
@@ -119,6 +240,7 @@ AsyncConnectionPool::Lease::~Lease() noexcept
     // If channel lifetime/slot accounting breaks, fail closed rather than
     // accidentally sharing the same physical connection with another lease.
     if (!returned) std::terminate();
+    m_state->notifyWaiter();
 }
 
 AsyncConnection& AsyncConnectionPool::Lease::connection() const noexcept
@@ -187,47 +309,19 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         ? std::chrono::steady_clock::time_point::max()
         : startedAt + admissionTimeout;
 
-    // Asio's cancellable async_receive may leave an in-flight channel waiter
-    // stranded after a release/cancellation race on a multithreaded executor.
-    // Only take permits through the synchronous, internally locked try_receive
-    // operation; when the bounded pool is exhausted suspend on an Asio timer,
-    // never a condition_variable or a busy loop. This trades at most 4 ms
-    // admission latency under contention for cancellation-safe capacity.
-    // Most acquisitions find an idle permit immediately. Avoid registering
-    // a timer with the reactor on that path; contention keeps the same
-    // bounded, cancellation-safe wait and deadline.
-    std::optional<asio::steady_timer> retryTimer;
-    State::SlotToken permit;
-    constexpr auto retryInterval = std::chrono::milliseconds{4};
-    for (;;) {
-        if (std::chrono::steady_clock::now() >= admissionDeadline)
-            throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
-        boost::system::error_code channelError;
-        const bool received = state->slots.try_receive(
-            [&](boost::system::error_code error, State::SlotToken value) {
-                channelError = error;
-                permit = std::move(value);
-            });
-        if (received) {
-            if (channelError || !permit)
-                throw std::runtime_error{"Async PostgreSQL pool returned an invalid permit"};
-            // Even an immediate queue delivery cannot extend an expired
-            // deadline. The RAII token safely returns itself if we reject it.
-            if (std::chrono::steady_clock::now() >= admissionDeadline)
-                throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
-            break;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= admissionDeadline)
-            throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
-        if (!retryTimer) retryTimer.emplace(co_await asio::this_coro::executor);
-        retryTimer->expires_at(std::min(admissionDeadline, now + retryInterval));
-        boost::system::error_code error;
-        co_await retryTimer->async_wait(
-            asio::redirect_error(asio::use_awaitable, error));
-        if (error)
-            throw std::runtime_error{"Async PostgreSQL pool acquisition cancelled"};
+    // Preserve the cancellation-safe synchronous channel handoff. Only
+    // contended acquisitions register a separate notification timer. The
+    // fast path allocates no waiter, strand or periodic polling timer.
+    if (std::chrono::steady_clock::now() >= admissionDeadline)
+        throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
+    auto permit = state->tryTake();
+    if (!permit) {
+        auto executor = co_await asio::this_coro::executor;
+        permit = co_await asio::co_spawn(asio::make_strand(executor),
+            State::waitForPermit(state, admissionDeadline), asio::use_awaitable);
     }
+    if (!permit || std::chrono::steady_clock::now() >= admissionDeadline)
+        throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
     auto* slot = static_cast<State::Slot*>(permit.get());
     auto connection = std::move(slot->connection);
     Lease lease{state, std::move(permit), std::move(connection)};
