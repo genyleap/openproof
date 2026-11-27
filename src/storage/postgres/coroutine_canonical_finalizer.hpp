@@ -132,6 +132,10 @@ public:
     [[nodiscard]] boost::asio::awaitable<
         foundation::Result<identity::profile::IdentityProfile>>
     readProfileAsync(identity::core::IdentityId owner);
+    // Unbound bearer only: read live access first, then authorized profile
+    // on the same exclusive lease. Sender-bound grants never prefetch profile.
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<std::pair<session::DelegatedAccess,std::optional<identity::profile::IdentityProfile>>>>
+    readBearerUserInfoAsync(std::string digestHex,foundation::Instant now);
     // Existing-profile mutation only. Contact verification and ownership
     // remain unchanged; lifecycle and avatar eligibility share a transaction.
     [[nodiscard]] boost::asio::awaitable<
@@ -308,6 +312,9 @@ public:
         foundation::Instant completedAt) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<foundation::Result<identity::profile::IdentityProfile>>
+    readProfileOnLease(async_detail::AsyncConnection& connection,identity::core::IdentityId owner,
+        std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
     readDelegatedAccessOnLease(async_detail::AsyncConnection& connection,
         std::string digestHex,foundation::Instant now,foundation::Instant* issuedAt,

@@ -2223,6 +2223,33 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         }
         return result;
     };
+    const auto userInfo=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string fingerprint,
+        fnd::Instant now=kNow) {
+        io.restart();
+        auto pending=asio::co_spawn(io,store.readBearerUserInfoAsync(std::move(fingerprint),now),asio::use_future);
+        io.run(); return pending.get();
+    };
+    auto accountOnly=userInfo(native,digest);
+    ASSERT_TRUE(accountOnly);
+    EXPECT_FALSE(accountOnly->second.has_value());
+    EXPECT_FALSE(accountOnly->first.permits("openid"));
+    EXPECT_FALSE(userInfo(foreign,digest));
+    EXPECT_FALSE(userInfo(native,std::string(64U,'0')));
+    EXPECT_FALSE(userInfo(native,digest,kNow+60s));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'openid'),($1,'profile')",{family}));
+    auto unbound=userInfo(native,digest);
+    ASSERT_TRUE(unbound);
+    EXPECT_TRUE(unbound->first.permits("openid"));
+    EXPECT_TRUE(unbound->first.permits("profile"));
+    // The existing fixture may not contain a profile; compare against the
+    // independent read, including owner and absence semantics.
+    io.restart();
+    auto expectedProfile=asio::co_spawn(io,native.readProfileAsync(ids::IdentityId{seed.owner}),asio::use_future);
+    io.run();
+    auto expected=expectedProfile.get();
+    EXPECT_EQ(unbound->second.has_value(),expected.has_value());
+    if (expected && unbound->second) EXPECT_EQ(unbound->second->identity(),expected->identity());
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope IN ('openid','profile')",{family}));
     auto activeIntrospection=introspect(native,clientProof,digest);
     ASSERT_TRUE(activeIntrospection && activeIntrospection->has_value());
     EXPECT_EQ(activeIntrospection->value().clientId(),client);

@@ -848,14 +848,15 @@ CoroutineTokenReadAdapter::CoroutineTokenReadAdapter(gateway::http::CoroutineHtt
     ReadProfile profile,VerifySender sender,Revoke revoke,Rotate rotate,
     PrepareSender prepareSender,foundation::Duration accessLifetime,
     std::optional<CodeExchangeContext> codeExchange,IssueMachine issueMachine,
-    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par,Login login,IntrospectAccess introspectAccess)
+    std::optional<DevicePollContext> devicePoll,std::optional<ParContext> par,Login login,IntrospectAccess introspectAccess,
+    ReadBearerUserInfo bearerUserInfo)
     : m_fallback(&fallback),m_limiter(&limiter),m_tokenKey(std::move(tokenKey)),
       m_clientKey(std::move(clientKey)),m_access(std::move(access)),m_client(std::move(client)),
       m_profile(std::move(profile)),m_sender(std::move(sender)),m_revoke(std::move(revoke)),
       m_rotate(std::move(rotate)),m_prepareSender(std::move(prepareSender)),m_accessLifetime(accessLifetime),
       m_codeExchange(std::move(codeExchange)),m_issueMachine(std::move(issueMachine)),
       m_devicePoll(std::move(devicePoll)),m_par(std::move(par)),m_login(std::move(login)),
-      m_introspectAccess(std::move(introspectAccess)) {}
+      m_introspectAccess(std::move(introspectAccess)),m_bearerUserInfo(std::move(bearerUserInfo)) {}
 bool CoroutineTokenReadAdapter::nativeEnabledFor(const gateway::HttpRequest& r) const noexcept {
     if (userInfoRoute(r)) return m_access && m_profile && m_sender;
     if (introspectRoute(r)) return m_introspectAccess || (m_access && m_client);
@@ -950,7 +951,20 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gatew
     r.wipeAuthorizationHeader(); r.wipeCookieHeader(); r.wipeBody();
     auto digest=security::hmacSha256(m_tokenKey,credential.expose());
     if (!digest) co_return fail(E::Unavailable,r);
-    auto access=co_await m_access(foundation::toHex(digest.value()),nullptr);
+    std::optional<identity::profile::IdentityProfile> prefetched;
+    bool prefetchedUnbound=false;
+    foundation::Result<session::DelegatedAccess> access=foundation::fail(E::Unavailable);
+    if (!dpop && m_bearerUserInfo) {
+        auto combined=co_await m_bearerUserInfo(foundation::toHex(digest.value()));
+        if (combined) {
+            prefetchedUnbound=!combined->first.senderConstraint();
+            if (prefetchedUnbound && combined->second)
+                prefetched.emplace(std::move(*combined->second));
+            access=std::move(combined->first);
+        } else access=foundation::fail(combined.error());
+    } else {
+        access=co_await m_access(foundation::toHex(digest.value()),nullptr);
+    }
     if (!access) {
         if (access.error().code()==E::Unavailable) co_return fail(E::Unavailable,r);
         co_return invalidBearer();
@@ -968,7 +982,10 @@ asio::awaitable<gateway::HttpResponse> CoroutineTokenReadAdapter::userInfo(gatew
     foundation::JsonObjectWriter body;
     body.add("sub",owner.value());
     if (access->permits("profile") || access->permits("email")) {
-        auto profile=co_await m_profile(owner);
+        auto profile=prefetchedUnbound
+            ? (prefetched ? foundation::Result<identity::profile::IdentityProfile>{std::move(*prefetched)}
+                : foundation::Result<identity::profile::IdentityProfile>{foundation::fail(E::NotFound)})
+            : co_await m_profile(owner);
         if (!profile) {
             if (profile.error().code()!=E::NotFound) co_return fail(E::Unavailable,r);
         } else {
