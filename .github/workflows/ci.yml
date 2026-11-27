@@ -32,6 +32,7 @@ jobs:
           shellcheck --severity=error installer/bootstrap.sh installer/setup.sh installer/openproof \
             packaging/build-deb.sh packaging/build-bundle.sh scripts/ci/install-build-deps.sh \
             scripts/ci/run-paired-e2e-baseline.sh \
+            scripts/ci/run-repeated-mixed-read.sh \
             scripts/backup-postgres.sh scripts/restore-postgres.sh
       - name: Protocol independence gate
         run: python3 scripts/check-protocol-neutrality.py
@@ -160,6 +161,9 @@ jobs:
 
       - name: Repeated Gateway benchmark analysis regression
         run: node tests/scripts/gateway-bench-summary-test.mjs
+
+      - name: Repeated mixed-read benchmark analysis regression
+        run: node tests/scripts/mixed-read-summary-test.mjs
 
       - name: Read-only deployment readiness probe regression
         run: node tests/scripts/live-readiness-test.mjs
@@ -381,6 +385,22 @@ jobs:
         with:
           name: openproof-gateway-tcp-benchmark
           path: gateway-bench/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Repeated matched HTTP measurements remain exploratory, not release
+      # approval. Preserve original point and Gateway measurements.
+      - name: Repeated paired mixed-read E2E benchmark
+        if: github.ref == 'refs/heads/dev'
+        timeout-minutes: 30
+        run: bash scripts/ci/run-repeated-mixed-read.sh
+
+      - name: Preserve repeated mixed-read measurements
+        if: always() && github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-mixed-read-paired-benchmark
+          path: mixed-read-bench/
           if-no-files-found: ignore
           retention-days: 14
 
