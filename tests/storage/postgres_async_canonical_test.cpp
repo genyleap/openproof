@@ -654,14 +654,22 @@ asio::awaitable<bool> queryOnNextExecutor(
     // A bounded result much larger than one PostgreSQL protocol buffer
     // exercises repeated readiness waits on the current executor.
     const auto streamed = co_await connection->query(
-        "SELECT i::text, repeat('x', 1024) FROM generate_series(1, 512) AS series(i) ORDER BY i",
+        // Qualify the input column: unqualified ORDER BY i resolves to the
+        // text output column i, which sorts 1, 10, 100 rather than numerically.
+        "SELECT series.i::text, repeat('x', 1024) FROM generate_series(1, 512) AS series(i) ORDER BY series.i",
         {}, std::chrono::seconds{2});
-    if (streamed.rows.size() != 512U) co_return false;
+    if (streamed.rows.size() != 512U) {
+        ADD_FAILURE() << "Unexpected streamed row count: " << streamed.rows.size();
+        co_return false;
+    }
     const std::string payload(1024U, 'x');
     for (std::size_t index = 0U; index < streamed.rows.size(); ++index) {
         const auto& row = streamed.rows[index];
         if (row.size() != 2U || row[0] != std::to_string(index + 1U)
-            || row[1] != payload) co_return false;
+            || row[1] != payload) {
+            ADD_FAILURE() << "Incorrect bounded stream row at index " << index;
+            co_return false;
+        }
     }
     const auto after = co_await connection->query(
         "SELECT 'reuse-after-stream'::text", {}, std::chrono::seconds{1});
