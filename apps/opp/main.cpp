@@ -8,6 +8,7 @@
 // The `server` subcommand composes and runs the bounded HTTP reverse gateway.
 
 #include "../../src/gateway/asio_service_ids_extern.hpp"
+#include "runtime_capacity.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -1283,8 +1284,31 @@ addProtectedRoutes(gateway::Router& router,
                                    const obs::Logger& logger)
 {
     const unsigned int detected = std::thread::hardware_concurrency();
-    const std::size_t workers = std::clamp<std::size_t>(
+    std::size_t workers = std::clamp<std::size_t>(
         detected == 0U ? 2U : static_cast<std::size_t>(detected), 2U, 32U);
+    // Qualification only; preserve the established default until paired
+    // benchmarks establish an acceptable CPU/latency/throughput profile.
+    bool budgeted = false;
+    if (const char* raw = std::getenv("OPENPROOF_EXPERIMENTAL_CPU_BUDGET")) {
+        const std::string_view value{raw};
+        if (value != "0" && value != "1") {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_EXPERIMENTAL_CPU_BUDGET must be 0 or 1."});
+            return ExitCode::ConfigurationError;
+        }
+        budgeted = value == "1";
+    }
+    if (budgeted)
+        workers = openproof::app::runtime_capacity::detect(detected).workers;
+    if (const char* raw = std::getenv("OPENPROOF_EXPERIMENTAL_REACTOR_THREADS")) {
+        const auto count = openproof::app::runtime_capacity::positiveCount(raw);
+        if (!count || *count > 32U) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_EXPERIMENTAL_REACTOR_THREADS must be an integer from 1 to 32."});
+            return ExitCode::ConfigurationError;
+        }
+        workers = *count;
+    }
     // Explicit operator-only qualification override. Absence preserves the
     // established pool sizing policy; no request can alter thread capacity.
     std::size_t handlerThreads = 0U;
@@ -1299,6 +1323,8 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
     }
+    if (budgeted && handlerThreads == 0U)
+        handlerThreads = std::min<std::size_t>(workers, 16U);
     bool reactorPublicReads = false;
     if (const char* raw = std::getenv("OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS")) {
         const std::string_view value{raw};
@@ -1344,6 +1370,7 @@ addProtectedRoutes(gateway::Router& router,
             listenerHandler = asyncMetricsApi.get();
         }
     }
+    const auto actualHandlerThreads = serverConfig->handlerThreads();
     gatewayHttp::BeastHttpServer server{
         *listenerHandler, std::move(serverConfig).value()};
     const fnd::Status started = server.start();
@@ -1353,6 +1380,9 @@ addProtectedRoutes(gateway::Router& router,
     }
     const std::vector<obs::LogField> listenerFields{
         obs::LogField::integer("bound_port", static_cast<std::int64_t>(server.boundPort())),
+        obs::LogField::integer("reactor_threads", static_cast<std::int64_t>(workers)),
+        obs::LogField::integer("handler_threads", static_cast<std::int64_t>(actualHandlerThreads)),
+        obs::LogField::boolean("reactor_public_reads", reactorPublicReads),
         obs::LogField::text("upstream_host", std::string{platform.gateway().upstreamHost()}),
         obs::LogField::boolean("upstream_tls", platform.gateway().upstreamTls()),
         obs::LogField::boolean("authentication_enabled", platform.auth().enabled()),

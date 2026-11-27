@@ -117,7 +117,7 @@ test("handler pool sizing is bounded, opt-in and preserves the historical defaul
   assert.match(app,/handlerThreads < 1U \|\| handlerThreads > 16U/);
   assert.match(app,/platform\.server\(\)\.trustProxyClientIp\(\), handlerThreads, reactorPublicReads\)/);
   assert.match(probe,/env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS/);
-  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial reactor 1\s+run_trial reactor 2\s+run_trial two 2\s+run_trial auto 2/);
+  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial reactor 1\s+run_trial budget 1\s+run_trial budget 2\s+run_trial reactor 2\s+run_trial two 2\s+run_trial auto 2/);
   assert.match(probe,/OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
 });
 
@@ -159,4 +159,17 @@ test("reactor affinity is explicitly qualified and cannot select synchronous fal
   assert.match(app,/\{"\/health\/live",gateway::HttpMethod::Get,&nativeHealth,true\}/);
   assert.doesNotMatch(app,/\{"\/health\/ready",gateway::HttpMethod::Get,&nativeHealth,true\}/);
   assert.doesNotMatch(app,/\{"\/oauth\/(?:userinfo|introspect)"[^\n]*,true\}/);
+});
+
+test("CPU-budget qualification remains startup-only and opt-in",()=>{
+  const app=read("apps/opp/main.cpp");
+  const capacity=read("apps/opp/runtime_capacity.hpp");
+  assert.match(app,/bool budgeted = false;/);
+  assert.match(app,/if \(budgeted\)\s*workers = openproof::app::runtime_capacity::detect\(detected\)\.workers/);
+  assert.match(app,/OPENPROOF_EXPERIMENTAL_REACTOR_THREADS/);
+  assert.match(app,/if \(!count \|\| \*count > 32U\)/);
+  assert.match(app,/if \(budgeted && handlerThreads == 0U\)/);
+  assert.match(capacity,/::sched_getaffinity\(/);
+  assert.match(capacity,/current \/ "cpu\.max"/);
+  assert.match(capacity,/part == "\.\."/);
 });

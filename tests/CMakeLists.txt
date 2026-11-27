@@ -15,6 +15,7 @@ add_executable(openproof_tests
     hardening/hardening_test.cpp
     operations/health_test.cpp
     config/config_test.cpp
+    config/runtime_capacity_test.cpp
     identity/repository_test.cpp
     identity/provider_test.cpp
     identity/core_test.cpp

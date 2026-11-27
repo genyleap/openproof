@@ -482,9 +482,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Probe smaller handler pool and reactor public reads on the tested binary
+      - name: Probe handler pool, reactor public reads and CPU budget on the tested binary
         if: success() && github.ref == 'refs/heads/dev'
-        timeout-minutes: 25
+        timeout-minutes: 30
         continue-on-error: true
         run: bash scripts/ci/run-handler-pool-probe.sh
       - name: Preserve handler pool measurements

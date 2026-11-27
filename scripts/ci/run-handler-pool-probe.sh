@@ -17,12 +17,14 @@ run_trial() {
         auto) ;;
         two) override=(OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2) ;;
         reactor) override=(OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1) ;;
+        budget) override=(OPENPROOF_EXPERIMENTAL_CPU_BUDGET=1) ;;
         *) return 2 ;;
     esac
     db="openproof_e2e_pool_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${trial}_${profile}"
     [[ ${#db} -le 63 ]] || exit 2
     sudo -u postgres createdb -O openproof_ci "$db"
-    env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS -u OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS "${override[@]}" \
+    env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS -u OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS \
+        -u OPENPROOF_EXPERIMENTAL_CPU_BUDGET -u OPENPROOF_EXPERIMENTAL_REACTOR_THREADS "${override[@]}" \
         OPENPROOF_E2E_POSTGRES="postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/$db" \
         OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE \
         OPENPROOF_E2E_OPP="$binary" OPENPROOF_E2E_COMMIT="$GITHUB_SHA" \
@@ -35,6 +37,8 @@ run_trial() {
 run_trial auto 1
 run_trial two 1
 run_trial reactor 1
+run_trial budget 1
+run_trial budget 2
 run_trial reactor 2
 run_trial two 2
 run_trial auto 2
@@ -45,4 +49,7 @@ for trial in 1 2; do
     echo "Exploratory same-binary reactor public-read comparison: pair $trial (auto vs reactor)"
     node "$ROOT/scripts/compare-e2e-metrics.mjs" \
         "$output/auto-$trial.json" "$output/reactor-$trial.json"
+    echo "Exploratory same-binary CPU budget comparison: pair $trial (auto vs budget)"
+    node "$ROOT/scripts/compare-e2e-metrics.mjs" \
+        "$output/auto-$trial.json" "$output/budget-$trial.json"
 done
