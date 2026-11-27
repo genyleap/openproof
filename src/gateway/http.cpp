@@ -217,71 +217,75 @@ public:
             static_cast<void>(co_await beastHttp::async_read(
                 m_stream, m_buffer, *m_parser,
                 asio::redirect_error(asio::use_awaitable, error)));
-            onRead(error);
-        }
-        void onRead(const boost::system::error_code& error)
-        {
             if (error) {
                 if (error != beastHttp::error::end_of_stream
                     && error != asio::error::operation_aborted) {
                     write(parserFailure(error, 11U));
                 }
-                return;
+                co_return;
             }
-            auto incoming = m_parser->release();
-            auto method = parseHttpMethod(incoming.method_string());
-            std::vector<std::pair<std::string, std::string>> headers;
-            std::optional<std::string> forwardedClientIp;
-            for (const auto& field : incoming.base()) {
-                if (beast::iequals(field.name_string(), "x-forwarded-for")) {
-                    if (m_owner->m_config.trustProxyClientIp()
-                        && !forwardedClientIp.has_value()) {
-                        forwardedClientIp.emplace(field.value());
+            std::optional<HttpRequest> operation;
+            unsigned int version = 11U;
+            bool headRequest = false;
+            {
+                auto incoming = m_parser->release();
+                auto method = parseHttpMethod(incoming.method_string());
+                std::vector<std::pair<std::string, std::string>> headers;
+                std::optional<std::string> forwardedClientIp;
+                for (const auto& field : incoming.base()) {
+                    if (beast::iequals(field.name_string(), "x-forwarded-for")) {
+                        if (m_owner->m_config.trustProxyClientIp()
+                            && !forwardedClientIp.has_value()) {
+                            forwardedClientIp.emplace(field.value());
+                        }
+                        continue;
                     }
-                    continue;
+                    headers.emplace_back(std::string{field.name_string()},
+                                         std::string{field.value()});
                 }
-                headers.emplace_back(std::string{field.name_string()},
-                                     std::string{field.value()});
-            }
-            boost::system::error_code endpointError;
-            const Tcp::endpoint remote = m_stream.socket().remote_endpoint(endpointError);
-            auto correlation = security::randomTokenBase64Url(16U);
-            if (!method.has_value() || endpointError || !correlation.has_value()) {
-                write(parserFailure(make_error_code(boost::system::errc::invalid_argument),
-                                    incoming.version()));
-                return;
-            }
-            std::string remoteAddress = remote.address().to_string();
-            if (m_owner->m_config.trustProxyClientIp()) {
-                boost::system::error_code forwardedError;
-                if (!forwardedClientIp.has_value()
-                    || forwardedClientIp->empty()
-                    || forwardedClientIp->contains(',')
-                    || forwardedClientIp->contains(' ')
-                    || forwardedClientIp->contains('\t')) {
-                    write(parserFailure(
-                        make_error_code(boost::system::errc::invalid_argument),
-                        incoming.version()));
-                    return;
+                boost::system::error_code endpointError;
+                const Tcp::endpoint remote = m_stream.socket().remote_endpoint(endpointError);
+                auto correlation = security::randomTokenBase64Url(16U);
+                if (!method.has_value() || endpointError || !correlation.has_value()) {
+                    write(parserFailure(make_error_code(boost::system::errc::invalid_argument),
+                                        incoming.version()));
+                    co_return;
                 }
-                const asio::ip::address forwarded = asio::ip::make_address(
-                    *forwardedClientIp, forwardedError);
-                if (forwardedError) {
-                    write(parserFailure(
-                        make_error_code(boost::system::errc::invalid_argument),
-                        incoming.version()));
-                    return;
+                std::string remoteAddress = remote.address().to_string();
+                if (m_owner->m_config.trustProxyClientIp()) {
+                    boost::system::error_code forwardedError;
+                    if (!forwardedClientIp.has_value()
+                        || forwardedClientIp->empty()
+                        || forwardedClientIp->contains(',')
+                        || forwardedClientIp->contains(' ')
+                        || forwardedClientIp->contains('\t')) {
+                        write(parserFailure(
+                            make_error_code(boost::system::errc::invalid_argument),
+                            incoming.version()));
+                        co_return;
+                    }
+                    const asio::ip::address forwarded = asio::ip::make_address(
+                        *forwardedClientIp, forwardedError);
+                    if (forwardedError) {
+                        write(parserFailure(
+                            make_error_code(boost::system::errc::invalid_argument),
+                            incoming.version()));
+                        co_return;
+                    }
+                    remoteAddress = forwarded.to_string();
                 }
-                remoteAddress = forwarded.to_string();
-            }
-            auto request = HttpRequest::create(
-                method.value(), std::string{incoming.target()}, std::move(headers),
-                std::move(incoming.body()), std::move(remoteAddress),
-                foundation::CorrelationId{std::move(correlation).value()});
-            if (!request.has_value()) {
-                write(parserFailure(make_error_code(boost::system::errc::invalid_argument),
-                                    incoming.version()));
-                return;
+                auto request = HttpRequest::create(
+                    method.value(), std::string{incoming.target()}, std::move(headers),
+                    std::move(incoming.body()), std::move(remoteAddress),
+                    foundation::CorrelationId{std::move(correlation).value()});
+                if (!request.has_value()) {
+                    write(parserFailure(make_error_code(boost::system::errc::invalid_argument),
+                                        incoming.version()));
+                    co_return;
+                }
+                version = incoming.version();
+                headRequest = incoming.method() == beastHttp::verb::head;
+                operation.emplace(std::move(request).value());
             }
             // Guard the executor queue: a slow provider/database must not turn
             // the maximum HTTP connection count into an unbounded work backlog.
@@ -292,40 +296,46 @@ public:
             if (outstanding >= pendingLimit) {
                 m_owner->m_pendingHandlers.fetch_sub(1U, std::memory_order_acq_rel);
                 beastHttp::response<beastHttp::string_body> overload{
-                    beastHttp::status::service_unavailable, incoming.version()};
+                    beastHttp::status::service_unavailable, version};
                 overload.set(beastHttp::field::content_type, "application/json");
                 overload.set(beastHttp::field::cache_control, "no-store");
                 overload.set(beastHttp::field::retry_after, "1");
                 overload.set("x-content-type-options", "nosniff");
-                if (incoming.method() != beastHttp::verb::head) {
+                if (!headRequest) {
                     overload.body() = "{\"error\":{\"code\":\"UNAVAILABLE\","
                                       "\"message\":\"The server is busy.\"}}";
                 }
                 overload.keep_alive(false);
                 overload.prepare_payload();
                 write(std::move(overload));
-                return;
+                co_return;
             }
-            // Run both legacy handlers and native coroutine handlers on
-            // the bounded execution context, never on the socket reactor.
-            // A suspended CoroutineHttpHandler does not occupy a pool worker.
-            const unsigned int version = incoming.version();
-            const bool headRequest = incoming.method() == beastHttp::verb::head;
-            asio::co_spawn(m_owner->m_handlerPool,
-                dispatchHandler(std::move(request).value(), version, headRequest),
-                [self = shared_from_this()](std::exception_ptr coroutineError) {
-                    // The operation owns request state and its connection is
-                    // pinned by this completion callback until it finishes.
-                    if (coroutineError) {
-                        self->m_owner->m_pendingHandlers.fetch_sub(
-                            1U, std::memory_order_acq_rel);
-                        try { std::rethrow_exception(coroutineError); }
-                        catch (...) {}
+            // Keep the bounded worker pool, but await its result on the
+            // connection strand. A successful request now has one listener
+            // coroutine for both read and write, not a second posted write
+            // coroutine. The outer co_spawn completion pins the connection.
+            {
+                // Own exactly one admission slot until the handler finishes,
+                // including exceptions during initiation or shutdown.
+                struct PendingHandlerGuard final {
+                    std::atomic<std::size_t>& pending;
+                    ~PendingHandlerGuard() {
+                        pending.fetch_sub(1U, std::memory_order_acq_rel);
                     }
-                });
+                } guard{m_owner->m_pendingHandlers};
+                auto wire = co_await asio::co_spawn(m_owner->m_handlerPool,
+                    dispatchHandler(std::move(*operation), version, headRequest),
+                    asio::use_awaitable);
+                operation.reset();
+                if (!m_owner->m_running.load(std::memory_order_acquire)) co_return;
+                m_response.emplace(std::move(wire));
+            }
+            // Completion is associated with this coroutine's executor, the
+            // connection strand. No handler worker touches the Beast stream.
+            co_await writeResponse(headRequest);
         }
 
-        asio::awaitable<void> dispatchHandler(
+        asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler(
             HttpRequest operation, unsigned int version, bool headRequest)
         {
             beastHttp::response<beastHttp::string_body> wire;
@@ -355,21 +365,7 @@ public:
                 failure.prepare_payload();
                 wire = std::move(failure);
             }
-            // Post the completion first. If posting fails, co_spawn's
-            // exception callback owns the pending-handler decrement; doing
-            // the decrement earlier would underflow the admission counter.
-            // Dispatch was executed on the independent handler pool. The
-            // response must be posted to this *connection's strand*, not
-            // an arbitrary HTTP reactor worker: Beast's stream timer and
-            // socket operations are not thread-safe across executors.
-            asio::post(m_stream.get_executor(),
-                [self = shared_from_this(), result = std::move(wire), headRequest]() mutable {
-                    if (self->m_owner->m_running.load(std::memory_order_acquire)) {
-                        self->write(std::move(result), headRequest);
-                    }
-                });
-            m_owner->m_pendingHandlers.fetch_sub(
-                1U, std::memory_order_acq_rel);
+            co_return wire;
         }
 
         void write(beastHttp::response<beastHttp::string_body> response, bool headRequest = false)
