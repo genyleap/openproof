@@ -58,14 +58,19 @@ function summarize(key, selector=r=>r) {
 }
 // Optional scheduling diagnostics are comparable only if both sides of
 // every trial provide valid measurements. Missing is never treated as zero.
-const diagnosticKeys = ["serverUserCpuTicksDelta","serverSystemCpuTicksDelta",
-  "serverVoluntaryContextSwitchesDelta","serverInvoluntaryContextSwitchesDelta",
-  "serverStableThreadCount"];
+const cpuKeys = ["serverUserCpuTicksDelta","serverSystemCpuTicksDelta"];
+const schedulingKeys = ["serverVoluntaryContextSwitchesDelta",
+  "serverInvoluntaryContextSwitchesDelta","serverStableThreadCount"];
 const diagnosticMetrics = {};
-for (const key of diagnosticKeys) {
-  const present = pairs.every(p => [p.baseline,p.candidate].every(
-    r => Number.isSafeInteger(r[key]) && r[key] >= (key==="serverStableThreadCount"?1:0)));
-  if (present) diagnosticMetrics[key] = summarize(key);
+const records = pairs.flatMap(p => [p.baseline,p.candidate]);
+const validCounter = n => Number.isSafeInteger(n) && n >= 0;
+if (records.every(r => cpuKeys.every(k => validCounter(r[k])) &&
+    r[cpuKeys[0]] + r[cpuKeys[1]] === r.serverCpuTicksDelta)) {
+  for (const key of cpuKeys) diagnosticMetrics[key] = summarize(key);
+}
+if (records.every(r => schedulingKeys.every(k => validCounter(r[k])) &&
+    r.serverStableThreadCount > 0)) {
+  for (const key of schedulingKeys) diagnosticMetrics[key] = summarize(key);
 }
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
   pairCount:5,requestsPerRun:600,concurrency:24,
@@ -82,6 +87,12 @@ for (const [k,v] of Object.entries({...report.metrics,...report.diagnosticMetric
   const fmt=x=>x===null?"n/a":x.toFixed(2)+"%";
   console.log("| "+k+" | "+v.baselineMedian.toFixed(2)+" | "+v.candidateMedian.toFixed(2)+" | "+
     fmt(v.pairedChangePct)+" | "+(v.pairedRangePct?v.pairedRangePct.map(fmt).join(" to "):"n/a")+" |");
+}
+console.log("| Route | Paired p50 change | Paired p95 change | Paired p99 change |");
+console.log("|---|---:|---:|---:|");
+for (const [name, metrics] of Object.entries(report.routes)) {
+  console.log("| " + name + " | " + ["p50Ms","p95Ms","p99Ms"].map(
+    key => metrics[key].pairedChangePct.toFixed(2) + "%").join(" | ") + " |");
 }
 console.log("Positive change means an increase; lower latency/CPU/RSS is favorable.");
 console.log(report.caveat);
