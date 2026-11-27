@@ -46,6 +46,13 @@ public:
         return nativeEnabled();
     }
 
+    // Stronger than nativeEnabledFor: the exact route and all downstream
+    // middleware must have bounded reactor-safe work and no blocking I/O,
+    // unbounded compute, or synchronous fallback. Default deny.
+    [[nodiscard]] virtual bool reactorSafeFor(
+        const gateway::HttpRequest& request) const noexcept
+    { (void)request; return false; }
+
     [[nodiscard]] virtual boost::asio::awaitable<gateway::HttpResponse>
     handleAsync(gateway::HttpRequest request) = 0;
 protected:
@@ -60,7 +67,7 @@ public:
            foundation::Duration readTimeout, foundation::Duration writeTimeout,
            std::size_t maximumConnections, std::size_t workerThreads,
            bool trustProxyClientIp = false,
-           std::size_t handlerThreads = 0U);
+           std::size_t handlerThreads = 0U, bool reactorPublicReads = false);
 
     [[nodiscard]] std::string_view bindAddress() const noexcept;
     [[nodiscard]] std::uint16_t port() const noexcept;
@@ -73,13 +80,15 @@ public:
     // Zero at creation selects the historical automatic sizing policy.
     [[nodiscard]] std::size_t handlerThreads() const noexcept;
     [[nodiscard]] bool trustProxyClientIp() const noexcept;
+    [[nodiscard]] bool reactorPublicReads() const noexcept;
 
 private:
     ServerConfig(std::string bindAddress, std::uint16_t port,
                  std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
                  foundation::Duration readTimeout, foundation::Duration writeTimeout,
                  std::size_t maximumConnections, std::size_t workerThreads,
-                 bool trustProxyClientIp, std::size_t handlerThreads);
+                 bool trustProxyClientIp, std::size_t handlerThreads,
+                 bool reactorPublicReads);
     std::string m_bindAddress;
     std::uint16_t m_port{};
     std::size_t m_headerLimitBytes{};
@@ -90,6 +99,7 @@ private:
     std::size_t m_workerThreads{};
     std::size_t m_handlerThreads{};
     bool m_trustProxyClientIp{};
+    bool m_reactorPublicReads{};
 };
 
 class BeastHttpServer final {
@@ -187,6 +197,9 @@ public:
         std::string path;
         HttpMethod method;
         CoroutineHttpHandler* handler;
+        // Composition-time proof: immutable public response only, never
+        // credential processing, provider I/O, or arbitrary native routing.
+        bool reactorSafe = false;
     };
     CoroutineRouteOverlay(HttpHandler& compatibility,
                           CoroutineHttpHandler& native,
@@ -199,6 +212,7 @@ public:
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
         const HttpRequest& request) const noexcept override;
+    [[nodiscard]] bool reactorSafeFor(const HttpRequest& request) const noexcept override;
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse>
     handleAsync(HttpRequest request) override;
@@ -222,7 +236,8 @@ public:
     using Observer = std::function<void(HttpMethod, int, double)>;
 
     CoroutineMetricsAdapter(HttpHandler& metricsFacade,
-                            CoroutineHttpHandler& fallback, Observer observer);
+                            CoroutineHttpHandler& fallback, Observer observer,
+                            bool reactorSafeObserver = false);
     [[nodiscard]] bool nativeEnabled() const noexcept override {
         return m_fallback->nativeEnabled();
     }
@@ -232,6 +247,10 @@ public:
         return request.path() != "/metrics"
             && m_fallback->nativeEnabledFor(request);
     }
+    [[nodiscard]] bool reactorSafeFor(const HttpRequest& request) const noexcept override {
+        return m_reactorSafeObserver && request.path() != "/metrics"
+            && m_fallback->reactorSafeFor(request);
+    }
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse>
     handleAsync(HttpRequest request) override;
@@ -240,6 +259,7 @@ private:
     HttpHandler* m_metricsFacade;
     CoroutineHttpHandler* m_fallback;
     Observer m_observer;
+    bool m_reactorSafeObserver;
 };
 
 class CoroutineGatewayAdapter final : public CoroutineHttpHandler {
@@ -276,6 +296,7 @@ public:
         CoroutineHttpHandler& fallback, Verify verify, Authorize authorize,
         bool enableProtected = true,VerifyDelegated verifyDelegated={},VerifySender verifySender={});
     [[nodiscard]] bool nativeEnabledFor(const HttpRequest& request) const noexcept override;
+    [[nodiscard]] bool reactorSafeFor(const HttpRequest& request) const noexcept override;
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
     [[nodiscard]] boost::asio::awaitable<HttpResponse> handleAsync(HttpRequest request) override;
 private:

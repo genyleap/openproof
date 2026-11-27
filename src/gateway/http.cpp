@@ -107,14 +107,16 @@ ServerConfig::ServerConfig(std::string bindAddress, std::uint16_t port,
                            foundation::Duration readTimeout,
                            foundation::Duration writeTimeout,
                            std::size_t maximumConnections, std::size_t workerThreads,
-                           bool trustProxyClientIp, std::size_t handlerThreads)
+                           bool trustProxyClientIp, std::size_t handlerThreads,
+                           bool reactorPublicReads)
     : m_bindAddress(std::move(bindAddress)), m_port(port),
       m_headerLimitBytes(headerLimitBytes), m_bodyLimitBytes(bodyLimitBytes),
       m_readTimeout(readTimeout), m_writeTimeout(writeTimeout),
       m_maximumConnections(maximumConnections), m_workerThreads(workerThreads),
       m_handlerThreads(handlerThreads == 0U
           ? std::clamp<std::size_t>(workerThreads * 4U, 4U, 16U) : handlerThreads),
-      m_trustProxyClientIp(trustProxyClientIp)
+      m_trustProxyClientIp(trustProxyClientIp),
+      m_reactorPublicReads(reactorPublicReads)
 {
 }
 
@@ -123,7 +125,7 @@ foundation::Result<ServerConfig> ServerConfig::create(
     std::size_t bodyLimitBytes, foundation::Duration readTimeout,
     foundation::Duration writeTimeout, std::size_t maximumConnections,
     std::size_t workerThreads, bool trustProxyClientIp,
-    std::size_t handlerThreads)
+    std::size_t handlerThreads, bool reactorPublicReads)
 {
     boost::system::error_code addressError;
     const asio::ip::address bindAddressValue = asio::ip::make_address(
@@ -140,7 +142,7 @@ foundation::Result<ServerConfig> ServerConfig::create(
     }
     return ServerConfig{std::move(bindAddress), port, headerLimitBytes, bodyLimitBytes,
                         readTimeout, writeTimeout, maximumConnections, workerThreads,
-                        trustProxyClientIp, handlerThreads};
+                        trustProxyClientIp, handlerThreads, reactorPublicReads};
 }
 
 std::string_view ServerConfig::bindAddress() const noexcept { return m_bindAddress; }
@@ -153,6 +155,7 @@ std::size_t ServerConfig::maximumConnections() const noexcept { return m_maximum
 std::size_t ServerConfig::workerThreads() const noexcept { return m_workerThreads; }
 std::size_t ServerConfig::handlerThreads() const noexcept { return m_handlerThreads; }
 bool ServerConfig::trustProxyClientIp() const noexcept { return m_trustProxyClientIp; }
+bool ServerConfig::reactorPublicReads() const noexcept { return m_reactorPublicReads; }
 
 class BeastHttpServer::Implementation final {
 public:
@@ -328,9 +331,21 @@ public:
                         pending.fetch_sub(1U, std::memory_order_acq_rel);
                     }
                 } guard{m_owner->m_pendingHandlers};
-                auto wire = co_await asio::co_spawn(m_owner->m_handlerPool,
-                    dispatchHandler(std::move(*operation), version, headRequest),
-                    asio::use_awaitable);
+                beastHttp::response<beastHttp::string_body> wire;
+                auto* asyncHandler = m_owner->m_config.reactorPublicReads()
+                    ? dynamic_cast<CoroutineHttpHandler*>(m_owner->m_handler) : nullptr;
+                // Never move large request-body scrubbing or arbitrary native
+                // providers onto the connection strand. An explicit capability
+                // is required in addition to native dispatch readiness.
+                if (asyncHandler && operation->body().empty()
+                    && asyncHandler->reactorSafeFor(*operation)) {
+                    wire = co_await dispatchHandler(
+                        std::move(*operation), version, headRequest, true);
+                } else {
+                    wire = co_await asio::co_spawn(m_owner->m_handlerPool,
+                        dispatchHandler(std::move(*operation), version, headRequest),
+                        asio::use_awaitable);
+                }
                 operation.reset();
                 if (!m_owner->m_running.load(std::memory_order_acquire)) co_return;
                 m_response.emplace(std::move(wire));
@@ -341,7 +356,8 @@ public:
         }
 
         asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler(
-            HttpRequest operation, unsigned int version, bool headRequest)
+            HttpRequest operation, unsigned int version, bool headRequest,
+            bool reactorOnly = false)
         {
             beastHttp::response<beastHttp::string_body> wire;
             try {
@@ -349,8 +365,21 @@ public:
                     dynamic_cast<CoroutineHttpHandler*>(m_owner->m_handler);
                 // Keep legacy routing unchanged for a coroutine-capable
                 // adapter whose native storage dependencies are not enabled.
-                auto response = asyncHandler
-                        && asyncHandler->nativeEnabledFor(operation)
+                const bool native = asyncHandler
+                    && asyncHandler->nativeEnabledFor(operation);
+                if (reactorOnly && (!native || !asyncHandler->reactorSafeFor(operation))) {
+                    // A revoked capability must never select synchronous
+                    // fallback on the reactor, even during a routing change.
+                    operation.wipeBody();
+                    operation.wipeAuthorizationHeader();
+                    operation.wipeCookieHeader();
+                    operation.wipeTargetQuery();
+                    co_return wireResponse(HttpResponse{503,
+                        Headers{{"cache-control", "no-store"},
+                                {"x-content-type-options", "nosniff"}}, {}},
+                        version, headRequest);
+                }
+                auto response = native
                     ? co_await asyncHandler->handleAsync(std::move(operation))
                     : m_owner->m_handler->handle(std::move(operation));
                 wire = wireResponse(std::move(response), version, headRequest);

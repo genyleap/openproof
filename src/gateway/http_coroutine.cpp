@@ -99,6 +99,14 @@ bool CoroutineRouteOverlay::nativeEnabledFor(const HttpRequest& request) const n
     }
 }
 
+bool CoroutineRouteOverlay::reactorSafeFor(const HttpRequest& request) const noexcept
+{
+    for (const auto& route : m_directRoutes)
+        if (route.method == request.method() && route.path == request.path())
+            return route.reactorSafe && route.handler->nativeEnabledFor(request);
+    return false;
+}
+
 HttpResponse CoroutineRouteOverlay::unavailable(const HttpRequest& request)
 {
     HttpResponse denied{
@@ -151,9 +159,10 @@ CoroutineRouteOverlay::handleAsync(HttpRequest request)
 }
 
 CoroutineMetricsAdapter::CoroutineMetricsAdapter(
-    HttpHandler& metricsFacade, CoroutineHttpHandler& fallback, Observer observer)
+    HttpHandler& metricsFacade, CoroutineHttpHandler& fallback, Observer observer,
+    bool reactorSafeObserver)
     : m_metricsFacade(&metricsFacade), m_fallback(&fallback),
-      m_observer(std::move(observer))
+      m_observer(std::move(observer)), m_reactorSafeObserver(reactorSafeObserver)
 {
 }
 
@@ -270,6 +279,19 @@ bool CoroutineProtectedGatewayAdapter::nativeEnabledFor(const HttpRequest& reque
     return eligiblePublic(*m_gateway,request)
         || (m_enableProtected && m_verify && m_authorize && eligible(*m_gateway, request,static_cast<bool>(m_verifyDelegated)))
         || m_fallback->nativeEnabledFor(request);
+}
+
+bool CoroutineProtectedGatewayAdapter::reactorSafeFor(const HttpRequest& request) const noexcept
+{
+    // The exact local protocol paths below are already reserved from
+    // public/protected upstream dispatch. Do not grant reactor affinity
+    // to arbitrary upstream routes or authentication callbacks.
+    const auto path = request.path();
+    if (path != "/health/live" && path != "/.well-known/openid-configuration"
+        && path != "/.well-known/jwks.json") return false;
+    return !eligiblePublic(*m_gateway, request)
+        && !eligible(*m_gateway, request, static_cast<bool>(m_verifyDelegated))
+        && m_fallback->reactorSafeFor(request);
 }
 
 HttpResponse CoroutineProtectedGatewayAdapter::handle(HttpRequest request)

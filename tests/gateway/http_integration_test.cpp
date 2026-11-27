@@ -859,6 +859,54 @@ TEST(BeastHttpIntegrationTest, NativeHandlersSuspendWithOneExplicitHandlerWorker
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, ExplicitReactorSafeReadProgressesWhileCompatibilityWorkerIsOccupied)
+{
+    class MixedHandler final : public httpAdapter::CoroutineHttpHandler {
+    public:
+        bool nativeEnabledFor(const gw::HttpRequest& request) const noexcept override
+        { return request.path() == "/public"; }
+        bool reactorSafeFor(const gw::HttpRequest& request) const noexcept override
+        { return request.path() == "/public"; }
+        gw::HttpResponse handle(gw::HttpRequest) override
+        {
+            entered.set_value();
+            static_cast<void>(release.wait_for(std::chrono::seconds{5}));
+            return gw::HttpResponse{200, {}, "compatibility"};
+        }
+        asio::awaitable<gw::HttpResponse> handleAsync(gw::HttpRequest) override
+        { co_return gw::HttpResponse{200, {}, "reactor"}; }
+        std::promise<void> entered;
+        std::shared_future<void> release;
+    } handler;
+    std::promise<void> release;
+    handler.release = release.get_future().share();
+    auto entered = handler.entered.get_future();
+    auto config = httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U, std::chrono::seconds{8},
+        std::chrono::seconds{8}, 64U, 2U, false, 1U, true);
+    ASSERT_TRUE(config);
+    EXPECT_FALSE(serverConfig().reactorPublicReads());
+    EXPECT_TRUE(config->reactorPublicReads());
+    httpAdapter::BeastHttpServer server{handler, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+    const auto port = server.boundPort();
+    auto compatibility = std::async(std::launch::async, [port] {
+        return sendRequest(port, beastHttp::verb::get, "/compatibility");
+    });
+    const bool workerEntered = entered.wait_for(std::chrono::seconds{2})
+        == std::future_status::ready;
+    auto publicRead = std::async(std::launch::async, [port] {
+        return sendRequest(port, beastHttp::verb::get, "/public");
+    });
+    const auto readStatus = publicRead.wait_for(std::chrono::seconds{2});
+    release.set_value();
+    EXPECT_TRUE(workerEntered);
+    EXPECT_EQ(readStatus, std::future_status::ready);
+    EXPECT_EQ(publicRead.get().body(), "reactor");
+    EXPECT_EQ(compatibility.get().body(), "compatibility");
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnection)
 {
     // Keep the handler alive after the server and its two executors are

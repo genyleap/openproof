@@ -1299,11 +1299,21 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
     }
+    bool reactorPublicReads = false;
+    if (const char* raw = std::getenv("OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS")) {
+        const std::string_view value{raw};
+        if (value != "0" && value != "1") {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS must be 0 or 1."});
+            return ExitCode::ConfigurationError;
+        }
+        reactorPublicReads = value == "1";
+    }
     auto serverConfig = gatewayHttp::ServerConfig::create(
         std::string{platform.server().bindAddress()}, platform.server().port(),
         64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
         std::chrono::seconds{15}, 4'096U, workers,
-        platform.server().trustProxyClientIp(), handlerThreads);
+        platform.server().trustProxyClientIp(), handlerThreads, reactorPublicReads);
     if (!serverConfig) {
         reportStartupFailure(serverConfig.error());
         return ExitCode::ConfigurationError;
@@ -1330,7 +1340,7 @@ addProtectedRoutes(gateway::Router& router,
                 [observer = metricsApi.get()](
                     gateway::HttpMethod method, int status, double elapsed) noexcept {
                     observer->observeAsyncResponse(method, status, elapsed);
-                });
+                }, true); // Fixed-size atomic counters; no scrape or external I/O.
             listenerHandler = asyncMetricsApi.get();
         }
     }
@@ -3432,10 +3442,10 @@ addProtectedRoutes(gateway::Router& router,
         // this dispatch; skip only unrelated protocol adapters.
         std::vector<gatewayHttp::CoroutineRouteOverlay::DirectRoute> directRoutes{
             {"/health/ready",gateway::HttpMethod::Get,&nativeHealth},
-            {"/health/live",gateway::HttpMethod::Get,&nativeHealth}};
+            {"/health/live",gateway::HttpMethod::Get,&nativeHealth,true}};
         if (asyncOidc) {
-            directRoutes.push_back({"/.well-known/openid-configuration",gateway::HttpMethod::Get,asyncOidc.get()});
-            directRoutes.push_back({"/.well-known/jwks.json",gateway::HttpMethod::Get,asyncOidc.get()});
+            directRoutes.push_back({"/.well-known/openid-configuration",gateway::HttpMethod::Get,asyncOidc.get(),true});
+            directRoutes.push_back({"/.well-known/jwks.json",gateway::HttpMethod::Get,asyncOidc.get(),true});
         }
         if (asyncTokenRead) {
             directRoutes.push_back({"/oauth/userinfo",gateway::HttpMethod::Get,asyncTokenRead.get()});

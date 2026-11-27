@@ -115,9 +115,9 @@ test("handler pool sizing is bounded, opt-in and preserves the historical defaul
   assert.match(app,/std::getenv\("OPENPROOF_EXPERIMENTAL_HANDLER_THREADS"\)/);
   assert.match(app,/parsed\.ptr != value\.data\(\) \+ value\.size\(\)/);
   assert.match(app,/handlerThreads < 1U \|\| handlerThreads > 16U/);
-  assert.match(app,/platform\.server\(\)\.trustProxyClientIp\(\), handlerThreads\)/);
+  assert.match(app,/platform\.server\(\)\.trustProxyClientIp\(\), handlerThreads, reactorPublicReads\)/);
   assert.match(probe,/env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS/);
-  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial two 2\s+run_trial auto 2/);
+  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial reactor 1\s+run_trial reactor 2\s+run_trial two 2\s+run_trial auto 2/);
   assert.match(probe,/OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
 });
 
@@ -143,4 +143,20 @@ test("owned request header normalization preserves validation and case-insensiti
   assert.match(create,/position->second\.append\(position->first == "cookie" \? "; " : ","\)\.append\(value\)/);
   assert.match(create,/normalized\.contains\("content-length"\) && normalized\.contains\("transfer-encoding"\)/);
   assert.match(gateway,/auto found = m_headers\.find\(name\);[\s\S]*?found = m_headers\.find\(lowercase\(name\)\);/);
+});
+
+test("reactor affinity is explicitly qualified and cannot select synchronous fallback",()=>{
+  const api=read("src/gateway/http.cppm");
+  const app=read("apps/opp/main.cpp");
+  assert.match(api,/virtual bool reactorSafeFor\([\s\S]*?\{ \(void\)request; return false; \}/);
+  assert.match(api,/bool reactorPublicReads = false/);
+  assert.match(api,/bool reactorSafeObserver = false/);
+  assert.match(server,/operation->body\(\)\.empty\(\)\s*&& asyncHandler->reactorSafeFor\(\*operation\)/);
+  assert.match(server,/if \(reactorOnly && \(!native \|\| !asyncHandler->reactorSafeFor\(operation\)\)\)[\s\S]*?co_return wireResponse\(HttpResponse\{503/);
+  assert.match(server,/auto response = native\s*\? co_await asyncHandler->handleAsync/);
+  assert.match(middleware,/return route\.reactorSafe && route\.handler->nativeEnabledFor\(request\)/);
+  assert.match(app,/bool reactorPublicReads = false;/);
+  assert.match(app,/\{"\/health\/live",gateway::HttpMethod::Get,&nativeHealth,true\}/);
+  assert.doesNotMatch(app,/\{"\/health\/ready",gateway::HttpMethod::Get,&nativeHealth,true\}/);
+  assert.doesNotMatch(app,/\{"\/oauth\/(?:userinfo|introspect)"[^\n]*,true\}/);
 });
