@@ -302,6 +302,7 @@ HttpResponse::repeatedHeaders() const noexcept
     return m_repeatedHeaders;
 }
 std::string_view HttpResponse::body() const noexcept { return m_body; }
+std::string HttpResponse::takeBody() && noexcept { return std::move(m_body); }
 void HttpResponse::addHeader(std::string name, std::string value)
 {
     name = lowercase(name);

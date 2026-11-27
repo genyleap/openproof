@@ -120,3 +120,14 @@ test("handler pool sizing is bounded, opt-in and preserves the historical defaul
   assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial two 2\s+run_trial auto 2/);
   assert.match(probe,/OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
 });
+
+test("terminal HTTP serialization transfers the owned response body after HEAD handling",()=>{
+  const gateway=read("src/gateway/gateway.cpp");
+  const api=read("src/gateway/gateway.cppm");
+  const wire=server.slice(server.indexOf("wireResponse(HttpResponse response"),
+    server.indexOf("parserFailure("));
+  assert.match(api,/std::string takeBody\(\) && noexcept;/);
+  assert.match(gateway,/HttpResponse::takeBody\(\) && noexcept \{ return std::move\(m_body\); \}/);
+  assert.match(wire,/if \(headRequest\)[\s\S]*?return output;[\s\S]*?output\.body\(\) = std::move\(response\)\.takeBody\(\);[\s\S]*?output\.prepare_payload\(\);/);
+  assert.doesNotMatch(wire,/std::string\{response\.body\(\)\}/);
+});

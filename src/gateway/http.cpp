@@ -76,7 +76,7 @@ wireResponse(HttpResponse response, unsigned int version, bool headRequest)
         }
         return output;
     }
-    output.body() = std::string{response.body()};
+    output.body() = std::move(response).takeBody();
     output.prepare_payload();
     return output;
 }

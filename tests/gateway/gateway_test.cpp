@@ -303,6 +303,20 @@ TEST(PolicyAccessControllerTest, UsesDurableRolesAssuranceAndAuditsDenials)
     EXPECT_EQ(auditSink.requestId, "assurance-denied");
 }
 
+TEST(HttpResponseTest, TerminalTransportTakesOwnedPayloadWithoutChangingMetadata)
+{
+    std::string payload(8192U, 'x');
+    payload[4096U] = '\0';
+    gw::HttpResponse response{200, gw::Headers{{"content-type", "application/octet-stream"}}, payload};
+    response.addHeader("set-cookie", "first=test-only");
+    response.addHeader("set-cookie", "second=test-only");
+    auto body = std::move(response).takeBody();
+    EXPECT_EQ(body, payload);
+    EXPECT_EQ(response.status(), 200);
+    EXPECT_EQ(response.headers().at("content-type"), "application/octet-stream");
+    EXPECT_EQ(response.repeatedHeaders().size(), 1U);
+}
+
 TEST(HttpRequestTest, RejectsAbsoluteFormControlCharactersAndAmbiguousFraming)
 {
     EXPECT_FALSE(gw::HttpRequest::create(gw::HttpMethod::Get, "http://evil/", {}, "",

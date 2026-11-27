@@ -85,6 +85,10 @@ public:
     [[nodiscard]] const std::vector<std::pair<std::string, std::string>>&
     repeatedHeaders() const noexcept;
     [[nodiscard]] std::string_view body() const noexcept;
+    /** Transfer the owned payload to a terminal transport without copying.
+     *  Consume only an rvalue response; headers and status remain intact.
+     */
+    [[nodiscard]] std::string takeBody() && noexcept;
     /** Appends a field without collapsing legal repeated fields such as Set-Cookie. */
     void addHeader(std::string name, std::string value);
     void setHeader(std::string name, std::string value);
