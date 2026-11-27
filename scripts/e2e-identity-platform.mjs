@@ -186,33 +186,46 @@ function verifyIdToken(compact, jwks, expected) {
 
 async function concurrentSmoke(operations, requestCount = 600, concurrency = 24) {
   assert.ok(operations.length > 0);
+  assert.equal(new Set(operations.map(({ label }) => label)).size, operations.length);
   const latencies = [];
+  const perOperation = operations.map(() => []);
   let cursor = 0;
   const startedAt = performance.now();
   const workers = Array.from({ length: concurrency }, async () => {
     while (true) {
       const index = cursor++;
       if (index >= requestCount) return;
+      const operationIndex = index % operations.length;
       const requestStarted = performance.now();
-      const response = await operations[index % operations.length]();
+      const response = await operations[operationIndex].run();
       expectStatus(response, 200);
-      latencies.push(performance.now() - requestStarted);
+      const duration = performance.now() - requestStarted;
+      latencies.push(duration);
+      perOperation[operationIndex].push(duration);
     }
   });
   await Promise.all(workers);
   const elapsedMs = performance.now() - startedAt;
-  latencies.sort((left, right) => left - right);
-  const percentile = (fraction) => latencies[Math.min(
-    latencies.length - 1,
-    Math.ceil(latencies.length * fraction) - 1,
-  )];
+  function summarize(samples) {
+    assert.ok(samples.length > 0);
+    samples.sort((left, right) => left - right);
+    const percentile = fraction => samples[Math.ceil(samples.length * fraction) - 1];
+    return {
+      requests: samples.length,
+      p50Ms: percentile(0.50),
+      p95Ms: percentile(0.95),
+      p99Ms: percentile(0.99),
+    };
+  }
+  assert.equal(latencies.length, requestCount);
   return {
-    requests: requestCount,
+    ...summarize(latencies),
     concurrency,
     requestsPerSecond: requestCount / (elapsedMs / 1000),
-    p50Ms: percentile(0.50),
-    p95Ms: percentile(0.95),
-    p99Ms: percentile(0.99),
+    // Latencies include contention in the same mixed workload, not isolated
+    // route capacity. Labels are fixed fixture names, never request data.
+    byOperation: Object.fromEntries(operations.map(({ label }, i) =>
+      [label, summarize(perOperation[i])])),
   };
 }
 
@@ -1740,20 +1753,20 @@ async function main() {
 
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
-      () => edgeRequest("/health/ready"),
-      () => edgeRequest("/.well-known/openid-configuration"),
-      () => edgeRequest("/.well-known/jwks.json"),
-      () => edgeRequest("/oauth/userinfo", {
+      { label: "readiness", run: () => edgeRequest("/health/ready") },
+      { label: "discovery", run: () => edgeRequest("/.well-known/openid-configuration") },
+      { label: "jwks", run: () => edgeRequest("/.well-known/jwks.json") },
+      { label: "userinfo", run: () => edgeRequest("/oauth/userinfo", {
         headers: { authorization: `Bearer ${firstTokens.access_token}` },
-      }),
-      () => edgeRequest("/api/ping", {
+      }) },
+      { label: "gateway", run: () => edgeRequest("/api/ping", {
         headers: { authorization: `Bearer ${firstTokens.access_token}` },
-      }),
-      () => edgeRequest("/oauth/introspect", {
+      }) },
+      { label: "introspection", run: () => edgeRequest("/oauth/introspect", {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: introspectionForm.toString(),
-      }),
+      }) },
     ], mixedLoadRequests, mixedLoadConcurrency);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     if (beforeLoadUsage && afterLoadUsage) {
@@ -1763,6 +1776,11 @@ async function main() {
         serverRssKiBEnd: afterLoadUsage.rssKiB,
       };
     }
+
+    // Preserve non-sensitive diagnostic evidence even if a later security
+    // scenario fails. Only the final successful E2E writes the metrics file.
+    console.log("- provisional mixed-read route latency (not release approval): " +
+      JSON.stringify(loadResult.byOperation));
 
     const refreshForm = new URLSearchParams({
       grant_type: "refresh_token",
