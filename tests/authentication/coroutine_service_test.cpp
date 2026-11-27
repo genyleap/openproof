@@ -1360,7 +1360,34 @@ TEST(TrustedAuthenticationCoroutineTest, FederatedConnectionHandoffIsSingleUseAn
     EXPECT_EQ(bearerStart("DPoP scoped-fixture").status(),401);
     const auto bearerTicket=bearerStart("Bearer scoped-fixture");
     ASSERT_EQ(bearerTicket.status(),302);
-    EXPECT_TRUE(bearerTicket.headers().at("location").starts_with("/account/connections/handoff?ticket="));
+    const std::string prefix="/account/connections/handoff?ticket=";
+    const std::string bearerLocation{bearerTicket.headers().at("location")};
+    ASSERT_TRUE(bearerLocation.starts_with(prefix));
+    EXPECT_EQ(bearerTicket.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
+    // An API credential must not be presented during browser redemption.
+    EXPECT_EQ(invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Get,
+        bearerLocation,{{"authorization","Bearer scoped-fixture"}},{},"127.0.0.1",
+        fnd::CorrelationId{"bearer-redemption"}).value()).status(),400);
+    // The rejected request did not burn the ticket. Verify the native
+    // durable state binds its owner, provider and return target exactly once.
+    asio::io_context handoffIo;
+    auto checkTicket=[&]()->asio::awaitable<void> {
+        auto target=co_await service.consumeBrowserConnectionHandoffAsync(
+            fnd::SecretString{bearerLocation.substr(prefix.size())});
+        EXPECT_TRUE(target);
+        if (target) {
+            EXPECT_EQ(target->identity.value(),"canonical-identity");
+            EXPECT_EQ(target->providerId.value(),"async-test");
+            EXPECT_EQ(target->returnTarget,"/account");
+        }
+        auto replay=co_await service.consumeBrowserConnectionHandoffAsync(
+            fnd::SecretString{bearerLocation.substr(prefix.size())});
+        EXPECT_FALSE(replay);
+    };
+    auto checked=asio::co_spawn(handoffIo,checkTicket(),asio::use_future);
+    handoffIo.run();
+    checked.get();
     EXPECT_EQ(fixture.coroutineProvider->nativeBeginCalls,0);
     const auto bearerPost=invokeFederated(start,gw::HttpRequest::create(gw::HttpMethod::Post,
         "/account/connections/handoff",{{"authorization","Bearer scoped-fixture"},{"content-type","application/json"}},
