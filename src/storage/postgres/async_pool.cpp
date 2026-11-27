@@ -145,13 +145,15 @@ AsyncConnectionPool::AsyncConnectionPool(
 
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire()
 {
-    co_return co_await acquireImpl(std::nullopt);
+    // Forward the lazy awaitable directly: no additional coroutine frame,
+    // suspension or cancellation boundary for an otherwise empty wrapper.
+    return acquireImpl(std::nullopt);
 }
 
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire(
     std::chrono::steady_clock::time_point deadline)
 {
-    co_return co_await acquireImpl(deadline);
+    return acquireImpl(deadline);
 }
 
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
