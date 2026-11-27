@@ -511,6 +511,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Qualify combined Minimal Executor and limited inlining under warmed load matrix
+        if: github.head_ref == 'perf/gateway-combined-executor-inline-20261128'
+        timeout-minutes: 80
+        run: bash scripts/ci/run-gateway-inline-pairs.sh combined
+      - name: Preserve combined Gateway performance evidence
+        if: always() && github.head_ref == 'perf/gateway-combined-executor-inline-20261128'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-gateway-combined-runtime
+          path: gateway-inline-pairs/
+          if-no-files-found: ignore
+          retention-days: 14
+
   dev-hardening:
     name: Development hardening (${{ matrix.preset }})
     if: github.ref == 'refs/heads/dev'

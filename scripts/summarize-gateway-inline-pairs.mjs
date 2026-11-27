@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-const [dir,commit] = process.argv.slice(2);
+import {profiles} from "./ci/executor-profiles.mjs";
+const [dir,commit,load] = process.argv.slice(2);
+assert.ok(process.argv.length===4 || process.argv.length===5);
+const combined=load!==undefined;
+if(combined) assert.ok(["1","8","32","128"].includes(load));
+const concurrency=combined?Number(load):24;
+const requests=combined?1536:600;
+const warmupRequests=combined?6*Math.ceil(Math.max(24,2*concurrency)/6):0;
 assert.ok(dir && /^[a-f0-9]{40}$/.test(commit ?? ""));
 const lines = fs.readFileSync(path.join(dir,"provenance.txt"),"utf8").trim().split("\n");
 assert.equal(lines.length,3);
@@ -17,13 +24,19 @@ function read(side,i){
   const r=JSON.parse(fs.readFileSync(path.join(dir,side+"-"+i+".json"),"utf8"));
   assert.equal(r.commit,commit);
   assert.equal(r.benchmark,"openproof-isolated-e2e-mixed-read");
-  assert.equal(r.requests,600); assert.equal(r.concurrency,24);
+  assert.equal(r.requests,requests); assert.equal(r.concurrency,concurrency);
+  assert.equal(r.warmupRequests??0,warmupRequests);
+  if(combined){
+    const name=side==="control"?"auto":"minimal";
+    assert.deepEqual(r.executionProfile,{name,requestedOverrides:profiles[name]});
+    assert.ok(Number.isSafeInteger(r.serverStableThreadCount)&&r.serverStableThreadCount>0);
+  }
   for(const k of keys) assert.ok(Number.isFinite(r[k]) && r[k]>=0,k);
   assert.ok(r.requestsPerSecond>0 && r.serverRssKiBEnd>0);
   const latency=x=>assert.ok(x.p50Ms>0 && x.p50Ms<=x.p95Ms && x.p95Ms<=x.p99Ms && Number.isFinite(x.p99Ms));
   latency(r);
   assert.deepEqual(r.routes.map(x=>x.name).sort(),[...routes].sort());
-  for(const route of r.routes){assert.equal(route.requests,100);latency(route);}
+  for(const route of r.routes){assert.equal(route.requests,requests/routes.length);latency(route);}
   return r;
 }
 const pairs=[1,2,3,4].map(i=>[read("control",i),read("candidate",i)]);
@@ -34,10 +47,13 @@ function metric(get){
   return {controlMedian:median(before),candidateMedian:median(after),
     medianPairedChangePercent:change.includes(null)?null:median(change),pairedChanges:change};
 }
-const report={commit,controlHash,candidateHash,pairs:4,requests:600,concurrency:24,
+const report={commit,controlHash,candidateHash,pairs:4,requests,concurrency,
+  ...(combined?{warmupRequests,controlProfile:"auto",candidateProfile:"minimal",
+    threads:metric(r=>r.serverStableThreadCount)}:{}),
   metrics:Object.fromEntries(keys.map(k=>[k,metric(r=>r[k])])),
   routes:Object.fromEntries(routes.map(name=>[name,Object.fromEntries(["p50Ms","p95Ms","p99Ms"].map(k=>
     [k,metric(r=>r.routes.find(x=>x.name===name)[k])]))])),
-  qualified:false,caveat:"Same-source experimental compile flag comparison; not release acceptance."};
+  qualified:false,caveat:combined?"Same-source combined compiler and executor comparison; not release acceptance.":
+    "Same-source experimental compile flag comparison; not release acceptance."};
 fs.writeFileSync(path.join(dir,"summary.json"),JSON.stringify(report,null,2)+"\n",{mode:0o600});
 console.log(JSON.stringify(report,null,2));
