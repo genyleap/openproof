@@ -333,6 +333,29 @@ TEST(HttpRequestTest, RejectsAbsoluteFormControlCharactersAndAmbiguousFraming)
                                          "192.0.2.1", fnd::CorrelationId{}));
 }
 
+TEST(HttpRequestTest, OwnedHeaderNormalizationPreservesCaseInsensitiveSingletonsAndOrdering)
+{
+    const auto request = gw::HttpRequest::create(
+        gw::HttpMethod::Get, "/case?query=1",
+        {{"X-Example-Long-Header", "first"}, {"x-EXAMPLE-long-header", "second"},
+         {"CoOkIe", "a=1"}, {"COOKIE", "b=2"}, {"Host", "localhost"}},
+        {}, "127.0.0.1", fnd::CorrelationId{"header-normalization"});
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->path(), "/case");
+    EXPECT_EQ(request->header("x-example-long-header"), "first,second");
+    EXPECT_EQ(request->header("X-EXAMPLE-LONG-HEADER"), "first,second");
+    EXPECT_EQ(request->header("Cookie"), "a=1; b=2");
+    EXPECT_FALSE(request->header("Missing"));
+    for (const std::string_view singleton : {"authorization", "host", "content-length", "transfer-encoding"}) {
+        std::string uppercase{singleton};
+        uppercase[0] = static_cast<char>(uppercase[0] - 'a' + 'A');
+        EXPECT_FALSE(gw::HttpRequest::create(
+            gw::HttpMethod::Get, "/case",
+            {{std::string{singleton}, "first"}, {uppercase, "second"}},
+            {}, "127.0.0.1", fnd::CorrelationId{"duplicate-singleton"}));
+    }
+}
+
 TEST(HttpRequestTest, SensitivePayloadCanBeWipedWithoutChangingRouting)
 {
     auto request = gw::HttpRequest::create(

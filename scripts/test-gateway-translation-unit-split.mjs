@@ -131,3 +131,16 @@ test("terminal HTTP serialization transfers the owned response body after HEAD h
   assert.match(wire,/if \(headRequest\)[\s\S]*?return output;[\s\S]*?output\.body\(\) = std::move\(response\)\.takeBody\(\);[\s\S]*?output\.prepare_payload\(\);/);
   assert.doesNotMatch(wire,/std::string\{response\.body\(\)\}/);
 });
+
+test("owned request header normalization preserves validation and case-insensitive singleton rejection",()=>{
+  const gateway=read("src/gateway/gateway.cpp");
+  const create=gateway.slice(gateway.indexOf("HttpRequest::create("),
+    gateway.indexOf("HttpMethod HttpRequest::method()"));
+  assert.match(create,/!isHeaderName\(rawName\) \|\| hasControl\(value\)/);
+  assert.match(create,/for \(char& symbol : rawName\)/);
+  assert.match(create,/normalized\.try_emplace\(std::move\(rawName\), std::move\(value\)\)/);
+  assert.match(create,/if \(!inserted\)[\s\S]*?isAmbiguousSingleton\(position->first\)/);
+  assert.match(create,/position->second\.append\(position->first == "cookie" \? "; " : ","\)\.append\(value\)/);
+  assert.match(create,/normalized\.contains\("content-length"\) && normalized\.contains\("transfer-encoding"\)/);
+  assert.match(gateway,/auto found = m_headers\.find\(name\);[\s\S]*?found = m_headers\.find\(lowercase\(name\)\);/);
+});

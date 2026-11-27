@@ -213,7 +213,7 @@ foundation::Result<HttpRequest> HttpRequest::create(
                                 "The HTTP request target is invalid.");
     }
     const std::size_t query = target.find('?');
-    const std::string path = target.substr(0U, query);
+    std::string path = target.substr(0U, query);
     if (path.empty()) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The HTTP request path is invalid.");
@@ -225,22 +225,28 @@ foundation::Result<HttpRequest> HttpRequest::create(
             return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                     "The HTTP request contains an invalid header.");
         }
-        std::string name = lowercase(rawName);
-        if (normalized.contains(name) && isAmbiguousSingleton(name)) {
-            return foundation::fail(foundation::ErrorCode::InvalidArgument,
-                                    "The HTTP request contains an ambiguous header.");
+        // The incoming name is already owned by this function. Normalize
+        // it in place and use one map insertion/search. try_emplace leaves
+        // both arguments intact when the normalized name already exists.
+        for (char& symbol : rawName) {
+            if (symbol >= 'A' && symbol <= 'Z')
+                symbol = static_cast<char>(symbol - 'A' + 'a');
         }
-        if (normalized.contains(name)) {
-            normalized[name].append(name == "cookie" ? "; " : ",").append(value);
-        } else {
-            normalized.emplace(std::move(name), std::move(value));
+        const auto [position, inserted] =
+            normalized.try_emplace(std::move(rawName), std::move(value));
+        if (!inserted) {
+            if (isAmbiguousSingleton(position->first)) {
+                return foundation::fail(foundation::ErrorCode::InvalidArgument,
+                                        "The HTTP request contains an ambiguous header.");
+            }
+            position->second.append(position->first == "cookie" ? "; " : ",").append(value);
         }
     }
     if (normalized.contains("content-length") && normalized.contains("transfer-encoding")) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The HTTP request framing is ambiguous.");
     }
-    return HttpRequest{method, std::move(target), path, std::move(normalized),
+    return HttpRequest{method, std::move(target), std::move(path), std::move(normalized),
                        std::move(body), std::move(remoteAddress), std::move(correlation)};
 }
 
@@ -280,7 +286,14 @@ const foundation::CorrelationId& HttpRequest::correlation() const noexcept { ret
 const Headers& HttpRequest::headers() const noexcept { return m_headers; }
 std::optional<std::string_view> HttpRequest::header(std::string_view name) const
 {
-    const auto found = m_headers.find(lowercase(name));
+    // Most protocol callers use canonical lowercase header literals.
+    // Transparent lookup avoids allocating a temporary string on that path.
+    auto found = m_headers.find(name);
+    if (found == m_headers.end() && std::ranges::any_of(name, [](char symbol) {
+            return symbol >= 'A' && symbol <= 'Z';
+        })) {
+        found = m_headers.find(lowercase(name));
+    }
     return found == m_headers.end() ? std::nullopt
                                     : std::optional<std::string_view>{found->second};
 }
