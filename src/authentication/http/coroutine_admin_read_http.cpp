@@ -86,8 +86,7 @@ bool onlyFields(const json::object& body,std::initializer_list<std::string_view>
 gateway::HttpResponse credentialResponse(int status,std::string_view owner,
     const foundation::SecretString& password,const credentials::TotpSecret& seed) {
     auto base32=seed.enrollmentBase32();
-    json::object body{{"identity_id",std::string{owner}},
-        {"initial_password",password.expose()},{"totp_secret_base32",base32.expose()}};
+    json::object body{{"identity_id",std::string{owner}}};
     struct Wipe final {
         json::object& body;
         ~Wipe() {
@@ -99,6 +98,10 @@ gateway::HttpResponse credentialResponse(int status,std::string_view owner,
             }
         }
     } wipe{body};
+    // Install the wiping guard before the first credential copy, so a
+    // failed allocation while inserting the second field also scrubs the first.
+    body["initial_password"] = password.expose();
+    body["totp_secret_base32"] = base32.expose();
     gateway::HttpResponse response{status, gateway::Headers{{"content-type","application/json"}},
         json::serialize(body)};
     secureHeaders(response);
@@ -238,25 +241,33 @@ CoroutineAdministrationReadAdapter::mutate(gateway::HttpRequest request,identity
         auto subject=requiredString(body,"subject",320U);
         if (!roles || !subject || !onlyFields(body,{"identity_id","subject","roles"}))
             co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
-        auto password=security::randomTokenBase64Url(32U);
+        auto generated=security::randomTokenBase64Url(32U);
+        if (!generated)
+            co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+        // Take wiping ownership before another operation can fail or throw.
+        foundation::SecretString password{std::move(generated).value()};
         auto totp=credentials::TotpSecret::generate();
-        if (!password || !totp)
+        if (!totp)
             co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
         auto enrollment=LocalMemberEnrollment::create(m_mutation->organization,std::move(targetId),
             m_mutation->provider,idp::ExternalSubject{std::move(subject).value()},
-            std::move(roles).value(),foundation::SecretString{std::move(password).value()},
+            std::move(roles).value(),std::move(password),
             std::move(totp).value(),now);
         if (!enrollment) co_return fail(enrollment.error(),request);
         command.emplace(std::in_place_type<LocalMemberEnrollment>,std::move(enrollment).value());
     } else if (path=="/admin/local-members/credentials/reset") {
         if (!onlyFields(body,{"identity_id"}))
             co_return fail(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
-        auto password=security::randomTokenBase64Url(32U);
+        auto generated=security::randomTokenBase64Url(32U);
+        if (!generated)
+            co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
+        // Take wiping ownership before another operation can fail or throw.
+        foundation::SecretString password{std::move(generated).value()};
         auto totp=credentials::TotpSecret::generate();
-        if (!password || !totp)
+        if (!totp)
             co_return fail(foundation::Error{foundation::ErrorCode::Internal},request);
         auto reset=LocalCredentialReset::create(m_mutation->organization,std::move(targetId),
-            foundation::SecretString{std::move(password).value()},std::move(totp).value(),now);
+            std::move(password),std::move(totp).value(),now);
         if (!reset) co_return fail(reset.error(),request);
         command.emplace(std::in_place_type<LocalCredentialReset>,std::move(reset).value());
     } else {

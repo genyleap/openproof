@@ -84,3 +84,26 @@ test("actual C++ and real PostgreSQL/HTTP regressions remain scheduled", () => {
   assert.match(read("scripts/e2e-identity-platform.mjs"), /edgeRequest\("\/admin\/local-members", \{ jar: dispatcherJar \}\), 403/);
   assert.equal((read(".github/workflows/ci.yml").match(/OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS: "1"/g) ?? []).length, 2);
 });
+
+test("generated admin credentials have wiping ownership before subsequent fallible work", () => {
+  const http=read("src/authentication/http/coroutine_admin_read_http.cpp");
+  const response=http.slice(http.indexOf("gateway::HttpResponse credentialResponse("),
+    http.indexOf("CoroutineAdministrationReadAdapter::CoroutineAdministrationReadAdapter("));
+  const guard=response.indexOf("} wipe{body};");
+  assert.ok(guard>0);
+  for (const key of ["initial_password","totp_secret_base32"]) {
+    const copy=response.indexOf("body["+JSON.stringify(key)+"] = ");
+    assert.ok(copy>guard,key);
+    assert.ok(copy<response.indexOf("json::serialize(body)"),key);
+  }
+  const mutations=http.slice(http.indexOf("CoroutineAdministrationReadAdapter::mutate("));
+  const generated=[...mutations.matchAll(/auto generated=security::randomTokenBase64Url\(32U\);/g)];
+  assert.equal(generated.length,2);
+  for (const match of generated) {
+    const part=mutations.slice(match.index,mutations.indexOf("command.emplace",match.index));
+    const ownership=part.indexOf("foundation::SecretString password{std::move(generated).value()}");
+    assert.ok(ownership>part.indexOf("if (!generated)"));
+    assert.ok(ownership<part.indexOf("credentials::TotpSecret::generate()"));
+    assert.ok(part.indexOf("std::move(password)")>part.indexOf("if (!totp)"));
+  }
+});
