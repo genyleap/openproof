@@ -67,7 +67,10 @@ def main():
     if version != "16.2.0":
         raise RuntimeError("Unqualified probe compiler: " + version)
     variants = {"normal": [], "noinline": ["-fno-inline"],
-                "narrow": ["-fno-inline-functions-called-once"]}
+                "narrow": ["-fno-inline-functions-called-once"],
+                "limited-no-early": ["-fno-inline-small-functions",
+                                     "-fno-inline-functions-called-once",
+                                     "-fno-early-inlining"]}
     common = ["-std=c++26", "-O2", "-g0", "-DNDEBUG", "-Wall", "-Wextra",
               "-Wpedantic", "-Werror", "-fstack-protector-strong", "-fno-common",
               "-D_FORTIFY_SOURCE=2", "-DBOOST_HAS_LONG_LONG=1",

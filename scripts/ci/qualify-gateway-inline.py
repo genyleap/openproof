@@ -18,6 +18,11 @@ import time
 
 UNITS = ("http_coroutine.cpp", "http.cpp", "http_proxy.cpp")
 VARIANTS = {
+    # A real isolated listener object compiled with this combination and
+    # unchanged hardening flags. All latest units still require validation.
+    "limited-no-early": ("-fno-inline-small-functions",
+                         "-fno-inline-functions-called-once",
+                         "-fno-early-inlining"),
     "narrow": ("-fno-inline-functions-called-once",),
     "normal": (),
 }

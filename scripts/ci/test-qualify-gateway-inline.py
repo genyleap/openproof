@@ -49,6 +49,13 @@ class QualificationTest(unittest.TestCase):
             self.assertNotIn("-MD", result)
             self.assertNotIn("-fdeps-format=p1689r5", result)
             self.assertTrue((build / "unit.o").is_file())
+            limited = probe.candidate_command(entry, build, "http.cpp", output,
+                                              probe.VARIANTS["limited-no-early"])
+            for flag in ("-fno-inline-small-functions",
+                         "-fno-inline-functions-called-once", "-fno-early-inlining",
+                         "-Werror", "-O2", "-fstack-protector-strong"):
+                self.assertIn(flag, limited)
+            self.assertNotIn("-fno-inline", limited)
             for invalid in ("-Wno-error=mismatched-new-delete", "-MF bad.d",
                             "-fmodule-only", "@opaque.rsp"):
                 with self.subTest(invalid=invalid):

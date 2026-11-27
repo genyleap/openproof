@@ -469,7 +469,7 @@ jobs:
       # is published; these diagnostic results never confer release approval.
       - name: Qualify real Gateway translation unit inlining
         if: success() && github.ref == 'refs/heads/dev'
-        timeout-minutes: 22
+        timeout-minutes: 32
         continue-on-error: true
         run: |
           python3 scripts/ci/qualify-gateway-inline.py \
