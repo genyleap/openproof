@@ -482,6 +482,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Probe smaller handler pool on the tested binary
+        if: success() && github.ref == 'refs/heads/dev'
+        timeout-minutes: 15
+        continue-on-error: true
+        run: bash scripts/ci/run-handler-pool-probe.sh
+      - name: Preserve handler pool measurements
+        if: always() && github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-handler-pool-probe
+          path: handler-pool-probe/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   dev-hardening:
     name: Development hardening (${{ matrix.preset }})
     if: github.ref == 'refs/heads/dev'

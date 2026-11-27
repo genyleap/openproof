@@ -1285,11 +1285,25 @@ addProtectedRoutes(gateway::Router& router,
     const unsigned int detected = std::thread::hardware_concurrency();
     const std::size_t workers = std::clamp<std::size_t>(
         detected == 0U ? 2U : static_cast<std::size_t>(detected), 2U, 32U);
+    // Explicit operator-only qualification override. Absence preserves the
+    // established pool sizing policy; no request can alter thread capacity.
+    std::size_t handlerThreads = 0U;
+    if (const char* raw = std::getenv("OPENPROOF_EXPERIMENTAL_HANDLER_THREADS")) {
+        const std::string_view value{raw};
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(),
+                                            handlerThreads);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()
+            || handlerThreads < 1U || handlerThreads > 16U) {
+            reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument,
+                "OPENPROOF_EXPERIMENTAL_HANDLER_THREADS must be an integer from 1 to 16."});
+            return ExitCode::ConfigurationError;
+        }
+    }
     auto serverConfig = gatewayHttp::ServerConfig::create(
         std::string{platform.server().bindAddress()}, platform.server().port(),
         64U * 1024U, 8U * 1024U * 1024U, std::chrono::seconds{15},
         std::chrono::seconds{15}, 4'096U, workers,
-        platform.server().trustProxyClientIp());
+        platform.server().trustProxyClientIp(), handlerThreads);
     if (!serverConfig) {
         reportStartupFailure(serverConfig.error());
         return ExitCode::ConfigurationError;

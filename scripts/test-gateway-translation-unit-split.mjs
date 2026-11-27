@@ -104,3 +104,19 @@ test("normal HTTP completion awaits the bounded pool and writes on the connectio
   assert.match(server,/asio::make_strand\(m_context\)/);
   assert.match(server,/beastHttp::async_write_header\(/);
 });
+
+test("handler pool sizing is bounded, opt-in and preserves the historical default",()=>{
+  const app=read("apps/opp/main.cpp");
+  const probe=read("scripts/ci/run-handler-pool-probe.sh");
+  assert.match(server,/handlerThreads == 0U\s*\?\s*std::clamp<std::size_t>\(workerThreads \* 4U, 4U, 16U\)/);
+  assert.match(server,/handlerThreads > 16U/);
+  assert.match(server,/m_handlerPool\(m_config\.handlerThreads\(\)\)/);
+  assert.match(app,/std::size_t handlerThreads = 0U;/);
+  assert.match(app,/std::getenv\("OPENPROOF_EXPERIMENTAL_HANDLER_THREADS"\)/);
+  assert.match(app,/parsed\.ptr != value\.data\(\) \+ value\.size\(\)/);
+  assert.match(app,/handlerThreads < 1U \|\| handlerThreads > 16U/);
+  assert.match(app,/platform\.server\(\)\.trustProxyClientIp\(\), handlerThreads\)/);
+  assert.match(probe,/env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS/);
+  assert.match(probe,/run_trial auto 1\s+run_trial two 1\s+run_trial two 2\s+run_trial auto 2/);
+  assert.match(probe,/OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
+});
