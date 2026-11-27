@@ -3,6 +3,7 @@
 // A numeric improvement is not a release approval or a significance test.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import {validateConnectionMetrics,connectionLegs} from "./ci/mixed-read-connections.mjs";
 
 const [baselinePath, candidatePath] = process.argv.slice(2);
 if (!baselinePath || !candidatePath) {
@@ -105,6 +106,16 @@ if (baseline.routes || candidate.routes) {
   }
 }
 console.log("");
+if (baseline.connectionMetrics !== undefined || candidate.connectionMetrics !== undefined) {
+  validateConnectionMetrics(baseline.connectionMetrics,baseline.requests);
+  validateConnectionMetrics(candidate.connectionMetrics,candidate.requests);
+  console.log("\n| Transport leg | Baseline first-seen / reused assignments | Candidate first-seen / reused assignments |");
+  console.log("|---|---:|---:|");
+  for(const leg of connectionLegs){
+    const a=baseline.connectionMetrics[leg],b=candidate.connectionMetrics[leg];
+    console.log(`| ${leg} | ${a.firstSeenSockets} / ${a.reusedAssignments} | ${b.firstSeenSockets} / ${b.reusedAssignments} |`);
+  }
+}
 console.log("NOT APPROVED: this tool compares point estimates, not statistically " +
   "significant results. The same hardware, build flags, warmed-up state, " +
   "multiple paired repetitions, security tests and full Coroutine release gate " +
