@@ -79,3 +79,27 @@ test("LDAP real HTTP acceptance covers tenant isolation, lifecycle, replacement 
   assert.match(e2e, /const results = await Promise\.all\(browsers\.map/);
   assert.match(e2e, /assert\.equal\(activeCount\(\), 0\)/);
 });
+
+test("hardening matrix provisions the exact databases admitted by existing fixtures", () => {
+  const ci = read(".github/workflows/ci.yml");
+  const hardening = ci.slice(ci.indexOf("name: Development hardening"));
+  const domainFixture = read("tests/storage/postgres_coroutine_repository_integration_test.cpp");
+  const admittedDsn = domainFixture.match(/kDisposableDatabase\s*=\s*"([^"]+)"/)?.[1];
+  assert.ok(admittedDsn, "Domain fixture must declare its exact admitted CI DSN");
+  const domain = hardening.slice(hardening.indexOf("name: Native SQL domain against an exclusive disposable database"),
+    hardening.indexOf("name: Native canonical SQL and destructive integration"));
+  assert.ok(domain.includes("OPENPROOF_TEST_POSTGRES_DOMAIN: " + admittedDsn));
+  assert.ok(domain.includes("createdb -O openproof_ci " + new URL(admittedDsn).pathname.slice(1)));
+  assert.match(domain, /OPENPROOF_TEST_POSTGRES_DOMAIN_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE/);
+  const ldapPath = read("scripts/e2e-identity-platform.mjs")
+    .match(/url\.pathname !== "(\/openproof_[^"]+)"/)?.[1];
+  assert.ok(ldapPath, "LDAPS fixture must retain exact database admission");
+  const ldap = hardening.slice(hardening.indexOf("name: Execute real HTTP E2E under hardening profile"));
+  const ldapDsn = ldap.match(/OPENPROOF_E2E_POSTGRES: (\S+)/)?.[1];
+  assert.ok(ldapDsn);
+  assert.equal(new URL(ldapDsn).pathname, ldapPath);
+  assert.equal(new URL(ldapDsn).hostname, "127.0.0.1");
+  assert.ok(ldap.includes("createdb -O openproof_ci " + ldapPath.slice(1)));
+  assert.match(ldap, /OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"/);
+  assert.match(ldap, /OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE/);
+});
