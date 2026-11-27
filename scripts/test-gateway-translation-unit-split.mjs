@@ -84,3 +84,23 @@ test("network layer retains bounded request and response framing",()=>{
   assert.match(proxy,/SSL_CTRL_SET_TLSEXT_HOSTNAME/);
   assert.match(proxy,/host_name_verification\{host\}/);
 });
+
+test("normal HTTP completion awaits the bounded pool and writes on the connection strand",()=>{
+  const read=server.slice(server.indexOf("asio::awaitable<void> readRequest()"),
+    server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
+  const dispatch=server.slice(server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("),
+    server.indexOf("void write(beastHttp::response"));
+  assert.ok(read.length>0 && dispatch.length>0);
+  assert.match(read,/m_pendingHandlers\.fetch_add\(/);
+  assert.match(read,/struct PendingHandlerGuard final[\s\S]*?pending\.fetch_sub\(1U, std::memory_order_acq_rel\)/);
+  assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  const completion=read.indexOf("m_response.emplace(std::move(wire))");
+  assert.ok(completion>read.indexOf("co_await asio::co_spawn("));
+  assert.ok(read.indexOf("co_await writeResponse(headRequest);")>completion);
+  assert.match(read,/if \(!m_owner->m_running.load\(std::memory_order_acquire\)\) co_return;/);
+  assert.match(dispatch,/asyncHandler->nativeEnabledFor\(operation\)/);
+  assert.match(dispatch,/co_return wire;/);
+  assert.doesNotMatch(dispatch,/m_stream|asio::post\(|writeResponse\(/);
+  assert.match(server,/asio::make_strand\(m_context\)/);
+  assert.match(server,/beastHttp::async_write_header\(/);
+});
