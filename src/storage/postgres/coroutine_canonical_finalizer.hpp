@@ -318,7 +318,8 @@ private:
     [[nodiscard]] boost::asio::awaitable<foundation::Result<session::DelegatedAccess>>
     readDelegatedAccessOnLease(async_detail::AsyncConnection& connection,
         std::string digestHex,foundation::Instant now,foundation::Instant* issuedAt,
-        std::chrono::steady_clock::time_point deadline);
+        std::chrono::steady_clock::time_point deadline,
+        std::optional<identity::profile::IdentityProfile>* selectedProfile=nullptr);
     [[nodiscard]] boost::asio::awaitable<foundation::Status>
     authenticateConfidentialClientOnLease(async_detail::AsyncConnection& connection,
         std::string clientId,std::string digestHex,std::chrono::steady_clock::time_point deadline);
