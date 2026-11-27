@@ -106,3 +106,17 @@ test("connected query reuses readiness ownership only within its own executor an
   }
   assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
 });
+
+test("single-row results drain buffered input without an unconditional socket read per row", () => {
+  const query = source.slice(source.indexOf("QueryRows output;"));
+  const guard = query.indexOf("if (needInput || PQisBusy(connection) != 0)");
+  const consume = query.indexOf("PQconsumeInput(connection)");
+  const wait = query.indexOf("co_await waitForSocket(");
+  const result = query.indexOf("PQgetResult(connection)");
+  assert.match(query, /bool needInput = true;/);
+  assert.ok(guard >= 0 && consume > guard && wait > consume && result > wait);
+  assert.match(query, /co_await waitForSocket\([\s\S]*?needInput = true;\s*continue;/);
+  assert.match(query, /needInput = false;\s*\}/);
+  assert.match(query, /if \(!result\)\s*\{\s*if \(!finished\)/);
+  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
+});
