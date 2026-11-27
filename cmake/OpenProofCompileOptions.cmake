@@ -112,6 +112,15 @@ target_compile_definitions(openproof_compile_options INTERFACE
     OPENPROOF_MODULE_BUILD_FINGERPRINT=0x${OPENPROOF_MODULE_BUILD_FINGERPRINT_SHORT}ULL
     $<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Linux>>:BOOST_ASIO_DISABLE_THREAD_KEYWORD_EXTENSION=1>)
 
+# GCC 16.2 + Boost.Asio 1.88 emits duplicate internal-linkage CPO
+# labels (prefer/require/query) at -O0 in named module partitions and
+# their importing modules. Reproduced in transaction.cppm and provider.cppm.
+# Use GCC debug-friendly optimization uniformly on Linux Debug builds,
+# including ASan/UBSan. Retain -g, assertions, instrumentation and -Werror.
+# Release options are unchanged; no diagnostic or sanitizer is disabled.
+target_compile_options(openproof_compile_options INTERFACE
+    $<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Linux>,$<CONFIG:Debug>>:-Og>)
+
 message(STATUS
     "OpenProof: module source fingerprint = ${OPENPROOF_MODULE_SOURCE_FINGERPRINT_SHORT}")
 message(STATUS
