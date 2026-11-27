@@ -118,3 +118,20 @@ test("real gateway C++ regression uses ephemeral pinned TLS and held-open peer",
     /EXPECT_EQ\(response->value\(\)\.body\(\), "gateway-tls-complete"\)/
   ]) assert.match(server,item);
 });
+
+test("literal IPv4 bypasses DNS but retains common deadline and TLS verification",()=>{
+  const parse = native.indexOf("asio::ip::make_address(host, addressError)");
+  const branch = native.indexOf("if (!addressError && address.is_v4())",parse);
+  const literal = native.indexOf("Tcp::resolver::results_type::create(",branch);
+  const fallback = native.indexOf("} else {",literal);
+  const resolve = native.indexOf("co_await resolver->async_resolve(",fallback);
+  const commonDeadline = native.indexOf("if (std::chrono::steady_clock::now() >= deadline)",resolve);
+  const tcp = native.indexOf("if (!endpoint.tls())",commonDeadline);
+  assert.ok(parse >= 0 && branch > parse && literal > branch && fallback > literal &&
+    resolve > fallback && commonDeadline > resolve && tcp > commonDeadline);
+  assert.doesNotMatch(native.slice(branch,fallback),/co_await|async_wait|async_resolve/);
+  assert.match(native.slice(branch,fallback),/Tcp::endpoint\{address, endpoint\.port\(\)\}, host, service/);
+  assert.match(tls,/ssl::host_name_verification\{host\}/);
+  assert.match(server,/concurrent-hostname/);
+  assert.match(server,/targetIndex\+\+ % 2U == 0U/);
+});
