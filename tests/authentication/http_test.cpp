@@ -70,7 +70,9 @@ public:
 };
 class HandoffDelegatedAccess final : public sess::DelegatedAccessAuthenticator {
 public:
+    int calls{};
     fnd::Result<sess::DelegatedAccess> authenticateDelegated(const fnd::SecretString& token) override {
+        ++calls;
         if (token.expose()!="fixture-delegated") return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         auto actor=sess::AuthenticatedSession::fromDelegatedAccess(core::IdentityId{"identity-current"},
             idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
@@ -948,7 +950,7 @@ TEST(Web3AuthenticationHttpApiTest, MobileWalletHandoffSeparatesBrowserRedeemCre
     EXPECT_TRUE(cookieValue(pending, "__Host-openproof-session").empty());
 }
 
-TEST(FederatedAuthenticationHttpApiTest, RuntimeDelegatedStartUsesOneTimeHandoffWithoutProviderIo)
+TEST(FederatedAuthenticationHttpApiTest, RetiredRuntimeDelegatedStartFailsClosedWithoutProviderOrStorageIo)
 {
     fnd::ManualClockSource clock{kNow};
     idp::ProviderRegistry registry;
@@ -976,24 +978,16 @@ TEST(FederatedAuthenticationHttpApiTest, RuntimeDelegatedStartUsesOneTimeHandoff
             fnd::CorrelationId{"handoff-test"}).value();
     };
     const std::string route="/account/connections/start?provider=handoff-test&return_to=%2Faccount";
-    EXPECT_EQ(api.handle(request(route,"wrong-token")).status(),401);
+    EXPECT_EQ(api.handle(request(route,"wrong-token")).status(),503);
     const auto response=api.handle(request(route,"fixture-delegated"));
-    ASSERT_EQ(response.status(),302) << response.body();
-    const auto location=response.headers().at("location");
-    const std::string prefix="/account/connections/handoff?ticket=";
-    ASSERT_TRUE(location.starts_with(prefix));
+    EXPECT_EQ(response.status(),503);
+    EXPECT_FALSE(response.headers().contains("location"));
     EXPECT_EQ(response.headers().at("cache-control"),"no-store");
-    EXPECT_EQ(api.handle(request(location,"fixture-delegated")).status(),503);
-    auto consumed=authentication.consumeBrowserConnectionHandoff(
-        fnd::SecretString{location.substr(prefix.size())});
-    ASSERT_TRUE(consumed);
-    EXPECT_EQ(consumed->identity.value(),"identity-current");
-    EXPECT_EQ(consumed->providerId.value(),"handoff-test");
-    EXPECT_EQ(consumed->returnTarget,"/account");
-    EXPECT_FALSE(authentication.consumeBrowserConnectionHandoff(
-        fnd::SecretString{location.substr(prefix.size())}));
-    EXPECT_EQ(observed->syncCalls,0);
+    EXPECT_EQ(api.handle(request("/account/connections/handoff?ticket=fixture","fixture-delegated")).status(),503);
     EXPECT_EQ(api.handle(getRequest("/auth/federated/callback?code=never")).status(),503);
+    EXPECT_EQ(delegated.calls,0);
+    EXPECT_EQ(transactions.size(),0U);
+    EXPECT_EQ(observed->syncCalls,0);
 }
 
 TEST(FederatedAuthenticationHttpApiTest, ProviderDiscoverySeparatesRedirectAndChallengeProviders)
