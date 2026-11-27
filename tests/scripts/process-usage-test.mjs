@@ -50,6 +50,25 @@ try {
     assert.equal(readOppUsage(42,root),null);
     assert.equal(readOppUsage(-1,root),null);
   }
+  // Exercise the real kernel format as well as the synthetic snapshots.
+  // A quiet process may legitimately consume zero whole CPU ticks, and
+  // transient threads may make scheduling counters unavailable.
+  if (process.platform === "linux") {
+    const before = readOppUsage(process.pid);
+    const after = readOppUsage(process.pid);
+    assert.ok(before && after, "Current Linux process must be readable");
+    const actual = oppUsageDelta(before, after);
+    assert.ok(Number.isSafeInteger(actual.serverCpuTicksDelta));
+    assert.ok(actual.serverCpuTicksDelta >= 0);
+    assert.equal(actual.serverCpuTicksDelta,
+      actual.serverUserCpuTicksDelta + actual.serverSystemCpuTicksDelta);
+    assert.ok(actual.serverRssKiBEnd > 0);
+    if (actual.serverStableThreadCount !== undefined) {
+      assert.ok(actual.serverStableThreadCount > 0);
+      assert.ok(Number.isSafeInteger(actual.serverVoluntaryContextSwitchesDelta));
+      assert.ok(Number.isSafeInteger(actual.serverInvoluntaryContextSwitchesDelta));
+    }
+  }
   assert.deepEqual(oppUsageDelta(null,null),{});
   console.log("Process usage diagnostics regression: PASSED");
 } finally { fs.rmSync(root,{recursive:true,force:true}); }
