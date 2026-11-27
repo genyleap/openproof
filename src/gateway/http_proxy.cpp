@@ -218,18 +218,18 @@ private:
         }
         boost::system::error_code error;
         Tcp::resolver::results_type endpoints;
+        std::optional<Tcp::endpoint> literalEndpoint;
         const std::string host{endpoint.host()};
-        const auto service = std::to_string(endpoint.port());
         boost::system::error_code addressError;
         const auto address = asio::ip::make_address(host, addressError);
         if (!addressError && address.is_v4()) {
-            // A literal IPv4 destination needs no DNS worker, resolver
-            // allocation or cancellation timer. Preserve the original
-            // hostname for HTTP authority and TLS peer verification.
-            endpoints = Tcp::resolver::results_type::create(
-                Tcp::endpoint{address, endpoint.port()}, host, service);
+            // A literal IPv4 destination needs neither a resolver nor a
+            // heap-backed resolver result sequence. Preserve the original
+            // host for HTTP authority, SNI and TLS peer verification.
+            literalEndpoint.emplace(address, endpoint.port());
         } else {
             // Keep existing hostname and scoped IPv6 resolution semantics.
+            const auto service = std::to_string(endpoint.port());
             auto resolver = std::make_shared<Tcp::resolver>(executor);
             asio::steady_timer resolverDeadline{executor};
             resolverDeadline.expires_at(deadline);
@@ -257,8 +257,13 @@ private:
         if (!endpoint.tls()) {
             beast::tcp_stream stream{executor};
             stream.expires_at(deadline);
-            static_cast<void>(co_await stream.async_connect(endpoints,
-                asio::redirect_error(asio::use_awaitable, error)));
+            if (literalEndpoint) {
+                co_await stream.async_connect(*literalEndpoint,
+                    asio::redirect_error(asio::use_awaitable, error));
+            } else {
+                static_cast<void>(co_await stream.async_connect(endpoints,
+                    asio::redirect_error(asio::use_awaitable, error)));
+            }
             if (std::chrono::steady_clock::now() >= deadline) {
                 co_return foundation::fail(foundation::ErrorCode::Timeout,
                                             "The upstream request timed out.");
@@ -279,8 +284,13 @@ private:
         }
         stream.set_verify_callback(ssl::host_name_verification{host});
         beast::get_lowest_layer(stream).expires_at(deadline);
-        static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
-            endpoints, asio::redirect_error(asio::use_awaitable, error)));
+        if (literalEndpoint) {
+            co_await beast::get_lowest_layer(stream).async_connect(*literalEndpoint,
+                asio::redirect_error(asio::use_awaitable, error));
+        } else {
+            static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
+                endpoints, asio::redirect_error(asio::use_awaitable, error)));
+        }
         if (std::chrono::steady_clock::now() >= deadline) {
             co_return foundation::fail(foundation::ErrorCode::Timeout,
                                         "The upstream request timed out.");

@@ -122,7 +122,7 @@ test("real gateway C++ regression uses ephemeral pinned TLS and held-open peer",
 test("literal IPv4 bypasses DNS but retains common deadline and TLS verification",()=>{
   const parse = native.indexOf("asio::ip::make_address(host, addressError)");
   const branch = native.indexOf("if (!addressError && address.is_v4())",parse);
-  const literal = native.indexOf("Tcp::resolver::results_type::create(",branch);
+  const literal = native.indexOf("literalEndpoint.emplace(address, endpoint.port())",branch);
   const fallback = native.indexOf("} else {",literal);
   const resolve = native.indexOf("co_await resolver->async_resolve(",fallback);
   const commonDeadline = native.indexOf("if (std::chrono::steady_clock::now() >= deadline)",resolve);
@@ -130,7 +130,17 @@ test("literal IPv4 bypasses DNS but retains common deadline and TLS verification
   assert.ok(parse >= 0 && branch > parse && literal > branch && fallback > literal &&
     resolve > fallback && commonDeadline > resolve && tcp > commonDeadline);
   assert.doesNotMatch(native.slice(branch,fallback),/co_await|async_wait|async_resolve/);
-  assert.match(native.slice(branch,fallback),/Tcp::endpoint\{address, endpoint\.port\(\)\}, host, service/);
+  assert.doesNotMatch(native.slice(branch,fallback),/results_type::create|std::to_string/);
+  const plain = native.slice(tcp,native.indexOf("beast::ssl_stream<beast::tcp_stream> stream",tcp));
+  assert.match(plain,/stream\.expires_at\(deadline\)[\s\S]*?co_await stream\.async_connect\(\*literalEndpoint,/);
+  assert.match(plain,/co_await stream\.async_connect\(endpoints,/);
+  assert.match(tls,/expires_at\(deadline\)[\s\S]*?co_await beast::get_lowest_layer\(stream\)\.async_connect\(\*literalEndpoint,/);
+  assert.match(tls,/async_connect\(\s*endpoints,/);
+  for (const transport of [plain,tls]) {
+    const afterConnect=transport.slice(transport.indexOf("async_connect(endpoints,") >= 0
+      ? transport.indexOf("async_connect(endpoints,") : transport.indexOf("async_connect(\n"));
+    assert.match(afterConnect,/if \(std::chrono::steady_clock::now\(\) >= deadline\)[\s\S]*?if \(error\)/);
+  }
   assert.match(tls,/ssl::host_name_verification\{host\}/);
   assert.match(server,/concurrent-hostname/);
   assert.match(server,/targetIndex\+\+ % 2U == 0U/);
