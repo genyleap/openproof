@@ -2244,7 +2244,12 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_FALSE(userInfo(foreign,digest));
     EXPECT_FALSE(userInfo(native,std::string(64U,'0')));
     EXPECT_FALSE(userInfo(native,digest,kNow+60s));
-    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'openid'),($1,'profile')",{family}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'openid')",{family}));
+    auto openidOnly=userInfo(native,digest);
+    ASSERT_TRUE(openidOnly);
+    EXPECT_TRUE(openidOnly->first.permits("openid"));
+    EXPECT_FALSE(openidOnly->second.has_value());
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'profile')",{family}));
     auto unbound=userInfo(native,digest);
     ASSERT_TRUE(unbound);
     EXPECT_TRUE(unbound->first.permits("openid"));
@@ -2264,6 +2269,16 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_TRUE(unbound->second);
     EXPECT_EQ(unbound->second->identity(),expected->identity());
     EXPECT_EQ(unbound->second->displayName(),expected->displayName());
+    EXPECT_EQ(unbound->second->email(),expected->email());
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope='profile'",{family}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'email')",{family}));
+    auto emailOnly=userInfo(native,digest);
+    ASSERT_TRUE(emailOnly && emailOnly->second);
+    EXPECT_TRUE(emailOnly->first.permits("email"));
+    EXPECT_FALSE(emailOnly->first.permits("profile"));
+    EXPECT_EQ(emailOnly->second->email(),expected->email());
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope='email'",{family}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'profile')",{family}));
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=0,"
         "sender_constraint_value='fixture' WHERE id=$1",{family}));
     auto senderBound=userInfo(native,digest);
