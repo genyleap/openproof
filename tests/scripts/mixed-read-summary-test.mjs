@@ -39,6 +39,32 @@ try {
   r=run();assert.equal(r.status,0,r.stderr);
   report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
   assert.deepEqual(report.diagnosticMetrics,{},"Inconsistent diagnostic groups must be omitted");
+  const phase = (n) => ({p50Ms:n,p95Ms:n+1,p99Ms:n+2});
+  const edgePhaseMetrics = {samples:600,phases:{
+    edgeForwardSend:phase(0),edgeUpstreamResponseHeaders:phase(10),
+    edgeResponseFinish:phase(2),edgeTotal:phase(20)}};
+  const candidateEdge = {...edgePhaseMetrics,phases:{...edgePhaseMetrics.phases,
+    edgeUpstreamResponseHeaders:phase(8)}};
+  for(let i=1;i<=5;i++){
+    write("baseline",i,{...source,edgePhaseMetrics});
+    write("candidate",i,{...candidate,edgePhaseMetrics:candidateEdge});
+  }
+  r=run();assert.equal(r.status,0,r.stderr);
+  report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+  assert.equal(report.edgePhaseComparison.edgeForwardSend.p50Ms.pairedChangePct,null);
+  assert.ok(Math.abs(report.edgePhaseComparison.edgeUpstreamResponseHeaders.p50Ms.pairedChangePct+20)<1e-9);
+  assert.match(r.stdout,/Percentiles are not additive/);
+  for(const invalid of [
+    {...candidateEdge,samples:599},
+    {...candidateEdge,phases:{...candidateEdge.phases,edgeTotal:phase(1)}},
+    {...candidateEdge,phases:{...candidateEdge.phases,edgeForwardSend:phase(-1)}},
+    undefined
+  ]) {
+    write("candidate",3,{...candidate,edgePhaseMetrics:invalid});
+    r=run();assert.equal(r.status,0,r.stderr);
+    report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+    assert.equal(report.edgePhaseComparison,undefined);
+  }
   for(let i=1;i<=5;i++){write("baseline",i,source);write("candidate",i,candidate);}
   for(const invalid of [
     {...candidate,commit:a},
