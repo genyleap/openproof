@@ -2225,9 +2225,9 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     };
     const auto userInfo=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string fingerprint,
         fnd::Instant now=kNow) {
-        using Result=fnd::Result<std::pair<openproof::session::DelegatedAccess,
+        using UserInfoResult=fnd::Result<std::pair<openproof::session::DelegatedAccess,
             std::optional<openproof::identity::profile::IdentityProfile>>>;
-        std::optional<Result> output;
+        std::optional<UserInfoResult> output;
         const auto capture=[](auto& adapter,std::string value,fnd::Instant time,
             auto& result)->asio::awaitable<void>{
             result.emplace(co_await adapter.readBearerUserInfoAsync(std::move(value),time));
