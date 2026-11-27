@@ -228,7 +228,8 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   assert.match(gateway, /asio::co_spawn\(m_stream\.get_executor\(\),\s*readRequest\(\)/);
   const readerBody = gateway.slice(gateway.indexOf("asio::awaitable<void> readRequest()"),
     gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
-  assert.match(readerBody, /co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.match(readerBody, /auto requestStrand = asio::make_strand\(\s*asio::any_io_executor\{m_owner->m_handlerPool.get_executor\(\)\}\)/);
+  assert.match(readerBody, /co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
   assert.ok(readerBody.indexOf("m_response.emplace(std::move(wire))") > readerBody.indexOf("co_await asio::co_spawn("));
   assert.ok(readerBody.indexOf("co_await writeResponse(headRequest);") > readerBody.indexOf("m_response.emplace(std::move(wire))"));
   assert.doesNotMatch(gateway, /asio::post\(m_owner->m_context,/);
