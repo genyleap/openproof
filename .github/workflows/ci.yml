@@ -183,6 +183,9 @@ jobs:
       - name: Repeated mixed-read benchmark analysis regression
         run: node tests/scripts/mixed-read-summary-test.mjs
 
+      - name: Linux process usage diagnostics regression
+        run: node tests/scripts/process-usage-test.mjs
+
       - name: Read-only deployment readiness probe regression
         run: node tests/scripts/live-readiness-test.mjs
 
