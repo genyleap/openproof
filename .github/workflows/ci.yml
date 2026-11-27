@@ -159,6 +159,24 @@ jobs:
           cmake --preset gcc-release \
             -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
 
+      # Diagnostic only: compare compiler inlining on a bounded synthetic
+      # workload. A failed probe never weakens warnings, sanitizers or the
+      # required native executable and integration gates below.
+      - name: Asio coroutine inlining diagnostic
+        if: github.ref == 'refs/heads/dev'
+        timeout-minutes: 10
+        continue-on-error: true
+        run: python3 scripts/ci/probe-asio-inline.py
+
+      - name: Preserve Asio inlining diagnostic
+        if: always() && github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-asio-inline-probe
+          path: asio-inline-probe.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Repeated Gateway benchmark analysis regression
         run: node tests/scripts/gateway-bench-summary-test.mjs
 
