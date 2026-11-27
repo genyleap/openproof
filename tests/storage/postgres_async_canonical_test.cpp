@@ -648,9 +648,26 @@ asio::awaitable<bool> queryOnNextExecutor(
     const auto rows = co_await connection->query(
         "SELECT 'executor-handoff'::text FROM pg_sleep(0.05)", {},
         std::chrono::seconds{1});
-    co_return connection->reusable() && rows.rows.size() == 1U
-        && rows.rows.front().size() == 1U
-        && rows.rows.front().front() == "executor-handoff";
+    if (!connection->reusable() || rows.rows.size() != 1U
+        || rows.rows.front().size() != 1U
+        || rows.rows.front().front() != "executor-handoff") co_return false;
+    // A bounded result much larger than one PostgreSQL protocol buffer
+    // exercises repeated readiness waits on the current executor.
+    const auto streamed = co_await connection->query(
+        "SELECT i::text, repeat('x', 1024) FROM generate_series(1, 512) AS series(i)",
+        {}, std::chrono::seconds{2});
+    if (streamed.rows.size() != 512U) co_return false;
+    const std::string payload(1024U, 'x');
+    for (std::size_t index = 0U; index < streamed.rows.size(); ++index) {
+        const auto& row = streamed.rows[index];
+        if (row.size() != 2U || row[0] != std::to_string(index + 1U)
+            || row[1] != payload) co_return false;
+    }
+    const auto after = co_await connection->query(
+        "SELECT 'reuse-after-stream'::text", {}, std::chrono::seconds{1});
+    co_return connection->reusable() && after.rows.size() == 1U
+        && after.rows.front().size() == 1U
+        && after.rows.front().front() == "reuse-after-stream";
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseConnectionUsesCurrentExecutor)
