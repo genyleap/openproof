@@ -14,6 +14,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { startLocalDemoPortal } from "./local-demo-portal.mjs";
 import { startNativeLdapFixture } from "./ci/native-ldap-fixture.mjs";
 import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-diagnostics.mjs";
+import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -223,25 +224,6 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
         p95Ms: percentile(samples, 0.95), p99Ms: percentile(samples, 0.99) };
     }),
   };
-}
-
-// Optional Linux-only process metrics: these measure the *opp server*,
-// not the Node.js load generator. The same runner provides the same tick
-// frequency for a paired baseline. No credentials or request data are saved.
-function readOppUsage(pid) {
-  if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return null;
-  try {
-    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const tail = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/);
-    const userTicks = Number(tail[11]); // procfs fields 14 / 15
-    const systemTicks = Number(tail[12]);
-    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
-    const rssKiB = Number(status.match(/^VmRSS:\s*(\d+)\s+kB$/m)?.[1]);
-    if (![userTicks, systemTicks, rssKiB].every(Number.isFinite)) return null;
-    return { cpuTicks: userTicks + systemTicks, rssKiB };
-  } catch {
-    return null;
-  }
 }
 
 async function main() {
@@ -1768,13 +1750,7 @@ async function main() {
       }) },
     ], mixedLoadRequests, mixedLoadConcurrency);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
-    if (beforeLoadUsage && afterLoadUsage) {
-      loadResourceMetrics = {
-        serverCpuTicksDelta: Math.max(0,
-          afterLoadUsage.cpuTicks - beforeLoadUsage.cpuTicks),
-        serverRssKiBEnd: afterLoadUsage.rssKiB,
-      };
-    }
+    loadResourceMetrics = oppUsageDelta(beforeLoadUsage, afterLoadUsage);
 
     const refreshForm = new URLSearchParams({
       grant_type: "refresh_token",
