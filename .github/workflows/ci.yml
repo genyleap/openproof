@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ concurrency:
   # A newer head still needs its own successful run; don't discard the only
   # completed diagnostic data set whenever another migration patch lands.
   # Mainline and ordinary PRs still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' && github.head_ref != 'integration/native-runtime-schema-20261126' && github.ref != 'refs/heads/integration/native-runtime-schema-20261126' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' && github.head_ref != 'integration/native-runtime-schema-20261126' && github.ref != 'refs/heads/integration/native-runtime-schema-20261126' }}
 
 jobs:
   static:
