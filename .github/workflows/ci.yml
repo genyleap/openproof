@@ -328,8 +328,17 @@ jobs:
       # The candidate and pinned mainline baseline run on the same runner,
       # with distinct disposable databases and the same E2E workload.
       - name: Paired baseline E2E benchmark
-        timeout-minutes: 35
+        timeout-minutes: 65
         run: bash scripts/ci/run-paired-e2e-baseline.sh
+
+      - name: Preserve repeated mixed-read qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-mixed-read-paired
+          path: mixed-read-bench/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Preserve pinned baseline benchmark metrics
         if: always()
