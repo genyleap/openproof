@@ -46,11 +46,15 @@ run_trial() (
     set -euo pipefail
     local side="$1" concurrency="$2" trial="$3" requests="$4"
     local db="opbench_e2e_${GITHUB_RUN_ID}_${concurrency}_${trial}_${side}"
-    local binary commit legacy
+    local binary commit
     if [[ "${side}" == "baseline" ]]; then
-        binary="${BASE_BIN}"; commit="${BASE_SHA}"; legacy=1
+        binary="${BASE_BIN}"; commit="${BASE_SHA}"
+        export OPENPROOF_E2E_EXPECT_LEGACY_AUTH="1"
+    elif [[ "${side}" == "candidate" ]]; then
+        binary="${CANDIDATE_BIN}"; commit="${CANDIDATE_SHA}"
+        export OPENPROOF_E2E_EXPECT_LEGACY_AUTH="0"
     else
-        binary="${CANDIDATE_BIN}"; commit="${CANDIDATE_SHA}"; legacy=0
+        exit 2
     fi
     sudo -u postgres createdb -O openproof_ci "${db}"
     trap 'sudo -u postgres dropdb --if-exists "${db}"' EXIT
@@ -60,7 +64,6 @@ run_trial() (
     OPENPROOF_E2E_LOAD_REQUESTS="${requests}" \
     OPENPROOF_E2E_LOAD_CONCURRENCY="${concurrency}" \
     OPENPROOF_E2E_METRICS_FILE="${OUT}/${concurrency}-${trial}-${side}.json" \
-    OPENPROOF_E2E_EXPECT_LEGACY_AUTH="${legacy}" \
     OPENPROOF_E2E_COMMIT="${commit}" \
         node "${ROOT}/scripts/e2e-identity-platform.mjs"
 )
