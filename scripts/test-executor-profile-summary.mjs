@@ -15,6 +15,10 @@ test("requested profile verifies exact overrides and default remains absent",()=
     assert.deepEqual(requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:name,...overrides}),
       {name,requestedOverrides:overrides});
   assert.throws(()=>requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:"two"}));
+  assert.throws(()=>requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:"compact",
+    ...profiles.compact, OPENPROOF_EXPERIMENTAL_REACTOR_THREADS:"1"}));
+  assert.throws(()=>requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:"minimal",
+    ...profiles.minimal, OPENPROOF_EXPERIMENTAL_CPU_BUDGET:"1"}));
   assert.throws(()=>requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:"auto",
     OPENPROOF_EXPERIMENTAL_REACTOR_THREADS:"2"}));
   assert.throws(()=>requestedExecutionProfile({OPENPROOF_E2E_EXECUTION_PROFILE:"constructor"}));
@@ -40,6 +44,9 @@ test("paired profile summary rejects stale/mislabeled records and preserves perc
     assert.ok(Math.abs(report.comparisons.two.metrics.requestsPerSecond.pairedChangePct-15)<1e-9);
     assert.equal(report.comparisons.two.metrics.serverCpuTicksDelta.pairedChangePct,null);
     assert.equal(report.comparisons.two.diagnostics.serverStableThreadCount.profileMedian,12);
+    assert.deepEqual(report.comparisons.compact.requestedOverrides,profiles.compact);
+    assert.deepEqual(report.comparisons.minimal.requestedOverrides,profiles.minimal);
+    assert.equal(report.comparisons.minimal.diagnostics.serverStableThreadCount.profileMedian,12);
     assert.equal(report.qualified,false);
     const original=row("two",1);
     for(const invalid of [{...original,commit:"b".repeat(40)},

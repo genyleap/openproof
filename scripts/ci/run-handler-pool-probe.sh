@@ -18,6 +18,8 @@ run_trial() {
         two) override=(OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2) ;;
         reactor) override=(OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1) ;;
         budget) override=(OPENPROOF_EXPERIMENTAL_CPU_BUDGET=1) ;;
+        compact) override=(OPENPROOF_EXPERIMENTAL_CPU_BUDGET=1 OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2 OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1) ;;
+        minimal) override=(OPENPROOF_EXPERIMENTAL_REACTOR_THREADS=1 OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2 OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1) ;;
         *) return 2 ;;
     esac
     db="openproof_e2e_pool_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${trial}_${profile}"
@@ -34,14 +36,11 @@ run_trial() {
         node "$ROOT/scripts/e2e-identity-platform.mjs"
     [[ -s "$output/$profile-$trial.json" ]]
 }
-run_trial auto 1
-run_trial two 1
-run_trial reactor 1
-run_trial budget 1
-run_trial budget 2
-run_trial reactor 2
-run_trial two 2
-run_trial auto 2
+profiles=(auto two reactor budget compact minimal)
+for profile in "${profiles[@]}"; do run_trial "$profile" 1; done
+# Reverse the entire order so both composite profiles share the same
+# same-binary control and symmetric position as the individual overrides.
+for ((i=${#profiles[@]}-1; i>=0; --i)); do run_trial "${profiles[i]}" 2; done
 node "$ROOT/scripts/summarize-executor-profiles.mjs" "$output" "$GITHUB_SHA"
 for trial in 1 2; do
     echo "Exploratory same-binary handler pool comparison: pair $trial (auto vs two)"
@@ -50,7 +49,9 @@ for trial in 1 2; do
     echo "Exploratory same-binary reactor public-read comparison: pair $trial (auto vs reactor)"
     node "$ROOT/scripts/compare-e2e-metrics.mjs" \
         "$output/auto-$trial.json" "$output/reactor-$trial.json"
-    echo "Exploratory same-binary CPU budget comparison: pair $trial (auto vs budget)"
-    node "$ROOT/scripts/compare-e2e-metrics.mjs" \
-        "$output/auto-$trial.json" "$output/budget-$trial.json"
+    for profile in budget compact minimal; do
+        echo "Exploratory same-binary execution profile: pair $trial (auto vs $profile)"
+        node "$ROOT/scripts/compare-e2e-metrics.mjs" \
+            "$output/auto-$trial.json" "$output/$profile-$trial.json"
+    done
 done
