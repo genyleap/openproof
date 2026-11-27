@@ -107,11 +107,13 @@ ServerConfig::ServerConfig(std::string bindAddress, std::uint16_t port,
                            foundation::Duration readTimeout,
                            foundation::Duration writeTimeout,
                            std::size_t maximumConnections, std::size_t workerThreads,
-                           bool trustProxyClientIp)
+                           bool trustProxyClientIp, std::size_t handlerThreads)
     : m_bindAddress(std::move(bindAddress)), m_port(port),
       m_headerLimitBytes(headerLimitBytes), m_bodyLimitBytes(bodyLimitBytes),
       m_readTimeout(readTimeout), m_writeTimeout(writeTimeout),
       m_maximumConnections(maximumConnections), m_workerThreads(workerThreads),
+      m_handlerThreads(handlerThreads == 0U
+          ? std::clamp<std::size_t>(workerThreads * 4U, 4U, 16U) : handlerThreads),
       m_trustProxyClientIp(trustProxyClientIp)
 {
 }
@@ -120,7 +122,8 @@ foundation::Result<ServerConfig> ServerConfig::create(
     std::string bindAddress, std::uint16_t port, std::size_t headerLimitBytes,
     std::size_t bodyLimitBytes, foundation::Duration readTimeout,
     foundation::Duration writeTimeout, std::size_t maximumConnections,
-    std::size_t workerThreads, bool trustProxyClientIp)
+    std::size_t workerThreads, bool trustProxyClientIp,
+    std::size_t handlerThreads)
 {
     boost::system::error_code addressError;
     const asio::ip::address bindAddressValue = asio::ip::make_address(
@@ -130,13 +133,14 @@ foundation::Result<ServerConfig> ServerConfig::create(
         || readTimeout <= foundation::Duration::zero()
         || writeTimeout <= foundation::Duration::zero()
         || maximumConnections == 0U || workerThreads == 0U || workerThreads > 256U
+        || handlerThreads > 16U
         || (trustProxyClientIp && (addressError || !bindAddressValue.is_loopback()))) {
         return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                 "The HTTP server configuration is invalid.");
     }
     return ServerConfig{std::move(bindAddress), port, headerLimitBytes, bodyLimitBytes,
                         readTimeout, writeTimeout, maximumConnections, workerThreads,
-                        trustProxyClientIp};
+                        trustProxyClientIp, handlerThreads};
 }
 
 std::string_view ServerConfig::bindAddress() const noexcept { return m_bindAddress; }
@@ -147,13 +151,14 @@ foundation::Duration ServerConfig::readTimeout() const noexcept { return m_readT
 foundation::Duration ServerConfig::writeTimeout() const noexcept { return m_writeTimeout; }
 std::size_t ServerConfig::maximumConnections() const noexcept { return m_maximumConnections; }
 std::size_t ServerConfig::workerThreads() const noexcept { return m_workerThreads; }
+std::size_t ServerConfig::handlerThreads() const noexcept { return m_handlerThreads; }
 bool ServerConfig::trustProxyClientIp() const noexcept { return m_trustProxyClientIp; }
 
 class BeastHttpServer::Implementation final {
 public:
     Implementation(HttpHandler& handler, ServerConfig config)
         : m_handler(&handler), m_config(std::move(config)), m_acceptor(m_context),
-          m_handlerPool(std::clamp<std::size_t>(m_config.workerThreads() * 4U, 4U, 16U))
+          m_handlerPool(m_config.handlerThreads())
     {
     }
 

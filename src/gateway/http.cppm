@@ -59,7 +59,8 @@ public:
            std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
            foundation::Duration readTimeout, foundation::Duration writeTimeout,
            std::size_t maximumConnections, std::size_t workerThreads,
-           bool trustProxyClientIp = false);
+           bool trustProxyClientIp = false,
+           std::size_t handlerThreads = 0U);
 
     [[nodiscard]] std::string_view bindAddress() const noexcept;
     [[nodiscard]] std::uint16_t port() const noexcept;
@@ -69,6 +70,8 @@ public:
     [[nodiscard]] foundation::Duration writeTimeout() const noexcept;
     [[nodiscard]] std::size_t maximumConnections() const noexcept;
     [[nodiscard]] std::size_t workerThreads() const noexcept;
+    // Zero at creation selects the historical automatic sizing policy.
+    [[nodiscard]] std::size_t handlerThreads() const noexcept;
     [[nodiscard]] bool trustProxyClientIp() const noexcept;
 
 private:
@@ -76,7 +79,7 @@ private:
                  std::size_t headerLimitBytes, std::size_t bodyLimitBytes,
                  foundation::Duration readTimeout, foundation::Duration writeTimeout,
                  std::size_t maximumConnections, std::size_t workerThreads,
-                 bool trustProxyClientIp);
+                 bool trustProxyClientIp, std::size_t handlerThreads);
     std::string m_bindAddress;
     std::uint16_t m_port{};
     std::size_t m_headerLimitBytes{};
@@ -85,6 +88,7 @@ private:
     foundation::Duration m_writeTimeout{};
     std::size_t m_maximumConnections{};
     std::size_t m_workerThreads{};
+    std::size_t m_handlerThreads{};
     bool m_trustProxyClientIp{};
 };
 

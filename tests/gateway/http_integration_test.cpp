@@ -818,6 +818,47 @@ TEST(BeastHttpIntegrationTest, CoroutineHandlerSuspendsWithoutOccupyingPoolWorke
     server.stop();
 }
 
+TEST(BeastHttpIntegrationTest, NativeHandlersSuspendWithOneExplicitHandlerWorker)
+{
+    CoroutineWaitingHandler handler;
+    auto config = httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 64U, 2U, false, 1U);
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->handlerThreads(), 1U);
+    EXPECT_EQ(serverConfig().handlerThreads(), 8U);
+    EXPECT_FALSE(httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 64U, 2U, false, 17U));
+    httpAdapter::BeastHttpServer server{handler, std::move(config).value()};
+    ASSERT_TRUE(server.start());
+    std::atomic<int> success{0};
+    std::latch simultaneousStart{17};
+    std::vector<std::thread> clients;
+    clients.reserve(16);
+    for (int index = 0; index < 16; ++index) {
+        clients.emplace_back([&] {
+            simultaneousStart.count_down();
+            simultaneousStart.wait();
+            try {
+                const auto response = sendRequest(server.boundPort(),
+                    beastHttp::verb::get, "/");
+                if (response.result() == beastHttp::status::ok
+                    && response.body() == "async") {
+                    success.fetch_add(1, std::memory_order_relaxed);
+                }
+            } catch (...) {}
+        });
+    }
+    simultaneousStart.count_down();
+    simultaneousStart.wait();
+    for (auto& client : clients) client.join();
+    EXPECT_EQ(success.load(), 16);
+    // A single worker must still permit overlapping native suspensions.
+    EXPECT_GT(handler.peak(), 8);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnection)
 {
     // Keep the handler alive after the server and its two executors are
