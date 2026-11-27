@@ -3200,6 +3200,9 @@ addProtectedRoutes(gateway::Router& router,
                 [reader,&clock](std::string clientId,std::string clientDigest,std::string tokenDigest,fnd::Instant* issued) {
                     return reader->introspectAccessAsync(std::move(clientId),std::move(clientDigest),
                         std::move(tokenDigest),clock,issued);
+                },
+                [reader,&clock](std::string digest) {
+                    return reader->readBearerUserInfoAsync(std::move(digest),clock.now());
                 });
             nativeHandler=asyncTokenRead.get();
             nativePaths.emplace_back("/oauth/userinfo");

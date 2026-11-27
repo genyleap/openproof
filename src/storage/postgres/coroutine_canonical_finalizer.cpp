@@ -371,10 +371,23 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     try {
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
         auto lease = co_await m_impl->pool.acquire(deadline);
+        co_return co_await readProfileOnLease(lease.connection(),std::move(owner),deadline);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native account profile lookup is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<profile::IdentityProfile>>
+CoroutinePostgresCanonicalFinalizer::readProfileOnLease(
+    async_detail::AsyncConnection& connection,core::IdentityId owner,Deadline deadline)
+{
+    if (owner.empty()) co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
         Params params{
             std::string{owner.value()},
             std::string{m_impl->organization.value()}};
-        const auto result = co_await lease.connection().query(
+        const auto result = co_await connection.query(
             "SELECT p.display_name,p.preferred_username,p.email,p.email_verified,"
             "p.phone_number,p.phone_number_verified,p.locale,p.picture_url,"
             "p.avatar_source,p.created_at_ms,p.updated_at_ms "
@@ -405,6 +418,35 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
             "Native account profile lookup is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<std::pair<session::DelegatedAccess,std::optional<identity::profile::IdentityProfile>>>>
+CoroutinePostgresCanonicalFinalizer::readBearerUserInfoAsync(std::string digestHex,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
+        return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+    })) co_return foundation::fail(E::AuthenticationFailed);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto access=co_await readDelegatedAccessOnLease(lease.connection(),
+            std::move(digestHex),now,nullptr,deadline);
+        if (!access) co_return foundation::fail(access.error());
+        std::optional<profile::IdentityProfile> selected;
+        // No profile read before sender proof verification. Release this
+        // lease before the adapter enters its existing replay/proof path.
+        if (!access->senderConstraint() && access->permits("openid")
+            && (access->permits("profile") || access->permits("email"))) {
+            auto loaded=co_await readProfileOnLease(lease.connection(),
+                access->authenticated().session().identity(),deadline);
+            if (loaded) selected.emplace(std::move(loaded).value());
+            else if (loaded.error().code()!=E::NotFound) co_return foundation::fail(E::Unavailable);
+        }
+        co_return std::pair{std::move(access).value(),std::move(selected)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
     }
 }
 
