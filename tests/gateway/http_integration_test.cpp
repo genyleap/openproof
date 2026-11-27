@@ -719,15 +719,22 @@ TEST(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler)
 {
     CountingFastHandler compatibility;
     SelectiveCoroutineHandler native;
-    httpAdapter::CoroutineRouteOverlay overlay{compatibility, native, {"/native"}};
+    DisabledCoroutineHandler disabled;
+    httpAdapter::CoroutineRouteOverlay overlay{compatibility, native, {"/native"},{},{},{},
+        {{"/native",gw::HttpMethod::Post,&disabled}}};
     asio::io_context io;
-    std::optional<gw::HttpResponse> result;
+    std::optional<gw::HttpResponse> result, deniedDirect;
     auto call = [&]() -> asio::awaitable<void> {
         auto request = gw::HttpRequest::create(
             gw::HttpMethod::Post, "/legacy", {},
             "sensitive-test-body", "127.0.0.1",
             fnd::CorrelationId{"overlay-direct-deny"}).value();
         result.emplace(co_await overlay.handleAsync(std::move(request)));
+        auto strictRequest = gw::HttpRequest::create(
+            gw::HttpMethod::Post, "/native", {},
+            "sensitive-test-body", "127.0.0.1",
+            fnd::CorrelationId{"overlay-disabled-direct-deny"}).value();
+        deniedDirect.emplace(co_await overlay.handleAsync(std::move(strictRequest)));
     };
     auto future = asio::co_spawn(io, call(), asio::use_future);
     io.run();
@@ -735,6 +742,11 @@ TEST(BeastHttpIntegrationTest, DirectRouteOverlayAsyncCannotCallLegacyHandler)
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->status(), 503);
     EXPECT_EQ(result->headers().at("cache-control"), "no-store");
+    ASSERT_TRUE(deniedDirect.has_value());
+    EXPECT_EQ(deniedDirect->status(), 503);
+    EXPECT_EQ(deniedDirect->headers().at("cache-control"), "no-store");
+    EXPECT_EQ(disabled.asynchronousCalls.load(), 0);
+    EXPECT_EQ(disabled.synchronousCalls.load(), 0);
     EXPECT_EQ(compatibility.received.load(), 0);
     EXPECT_EQ(native.asynchronousCalls.load(), 0);
 }
