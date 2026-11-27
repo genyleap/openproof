@@ -9,6 +9,7 @@
 
 #include <libpq-fe.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -89,6 +90,27 @@ struct ResultDeleter final {
     }
 };
 using ResultPointer = std::unique_ptr<PGresult, ResultDeleter>;
+
+// libpq consumes the pointer table during PQsendQueryParams. Keep the
+// small table in a synchronous stack frame (not a suspended coroutine),
+// with an owned heap fallback for arbitrary larger parameter counts.
+// The caller validates count and NUL boundaries before entering this helper.
+int submitParameterized(PGconn* connection, const std::string& sql,
+    const std::vector<std::optional<std::string>>& params)
+{
+    constexpr std::size_t inlineCapacity = 16U;
+    std::array<const char*, inlineCapacity> local{};
+    std::vector<const char*> overflow;
+    const char** values = local.data();
+    if (params.size() > local.size()) {
+        overflow.resize(params.size());
+        values = overflow.data();
+    }
+    for (std::size_t i = 0; i < params.size(); ++i)
+        values[i] = params[i] ? params[i]->c_str() : nullptr;
+    return PQsendQueryParams(connection,sql.c_str(),static_cast<int>(params.size()),nullptr,
+        params.empty()?nullptr:values,nullptr,nullptr,0);
+}
 
 [[nodiscard]] Deadline makeDeadline(std::chrono::milliseconds timeout)
 {
@@ -530,14 +552,8 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         if (Clock::now() >= deadline) {
             throw std::runtime_error{"PostgreSQL operation timed out"};
         }
-        std::vector<const char*> values;
-        values.reserve(params.size());
-        for (const auto& parameter : params) {
-            values.push_back(parameter.has_value() ? parameter->c_str() : nullptr);
-        }
         const int submitted=migrationScript?PQsendQuery(connection,sql.c_str()):
-            PQsendQueryParams(connection,sql.c_str(),static_cast<int>(values.size()),nullptr,
-                values.empty()?nullptr:values.data(),nullptr,nullptr,0);
+            submitParameterized(connection,sql,params);
         if (submitted==0) {
             throw std::runtime_error{"PostgreSQL query could not be submitted"};
         }

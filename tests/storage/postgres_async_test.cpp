@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 namespace asio = boost::asio;
@@ -260,6 +261,42 @@ TEST(PostgresNativeCoroutineTest, SqlNullIsDistinctFromEmptyText)
     EXPECT_FALSE(rows->rows.front()[0].has_value());
     ASSERT_TRUE(rows->rows.front()[1].has_value());
     EXPECT_EQ(rows->rows.front()[1].value(), "");
+}
+
+TEST(PostgresNativeCoroutineTest, ParameterPointerTablePreservesInlineAndOverflowSemantics)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    auto exercise = [](std::string dsn) -> asio::awaitable<void> {
+        auto connection = co_await pg::AsyncConnection::connect(std::move(dsn), 2s);
+        for (const std::size_t count : {1U, 15U, 16U, 17U, 40U}) {
+            std::string sql = "SELECT ";
+            std::vector<std::optional<std::string>> params;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (i != 0U) sql += ",";
+                sql += "$" + std::to_string(i + 1U) + "::text";
+                if (i % 3U == 0U) params.emplace_back(std::nullopt);
+                else if (i % 3U == 1U) params.emplace_back(std::string{});
+                else params.emplace_back("value-" + std::to_string(i));
+            }
+            const auto expected = params;
+            auto reply = co_await connection->query(std::move(sql), std::move(params), 2s);
+            EXPECT_EQ(reply.rows.size(), 1U);
+            if (reply.rows.size() == 1U) {
+                EXPECT_EQ(reply.rows.front(), expected);
+            }
+            EXPECT_TRUE(connection->reusable());
+        }
+    };
+    auto result = asio::co_spawn(context, exercise(connectionString), asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
 }
 
 TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
