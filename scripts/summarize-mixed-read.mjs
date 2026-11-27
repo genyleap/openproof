@@ -56,9 +56,21 @@ function summarize(key, selector=r=>r) {
     pairedChangePct:changes?median(changes):null,
     pairedRangePct:changes?[Math.min(...changes),Math.max(...changes)]:null};
 }
+// Optional scheduling diagnostics are comparable only if both sides of
+// every trial provide valid measurements. Missing is never treated as zero.
+const diagnosticKeys = ["serverUserCpuTicksDelta","serverSystemCpuTicksDelta",
+  "serverVoluntaryContextSwitchesDelta","serverInvoluntaryContextSwitchesDelta",
+  "serverStableThreadCount"];
+const diagnosticMetrics = {};
+for (const key of diagnosticKeys) {
+  const present = pairs.every(p => [p.baseline,p.candidate].every(
+    r => Number.isSafeInteger(r[key]) && r[key] >= (key==="serverStableThreadCount"?1:0)));
+  if (present) diagnosticMetrics[key] = summarize(key);
+}
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
   pairCount:5,requestsPerRun:600,concurrency:24,
   metrics:Object.fromEntries(fields.map(k=>[k,summarize(k)])),
+  diagnosticMetrics,
   routes:Object.fromEntries(routes.map(name=>[name,Object.fromEntries(
     ["p50Ms","p95Ms","p99Ms"].map(k=>[k,summarize(k,r=>r.routes.find(x=>x.name===name))]))])),
   caveat:"Exploratory paired medians; not full coroutine acceptance or production qualification."};
@@ -66,7 +78,7 @@ fs.writeFileSync(path.join(dir,"summary.json"),JSON.stringify(report,null,2)+"\n
 console.log("# Matched mixed-read: five alternating pairs, 600 requests / concurrency 24");
 console.log("| Metric | Baseline median | Candidate median | Median paired change | Range |");
 console.log("|---|---:|---:|---:|---:|");
-for (const [k,v] of Object.entries(report.metrics)) {
+for (const [k,v] of Object.entries({...report.metrics,...report.diagnosticMetrics})) {
   const fmt=x=>x===null?"n/a":x.toFixed(2)+"%";
   console.log("| "+k+" | "+v.baselineMedian.toFixed(2)+" | "+v.candidateMedian.toFixed(2)+" | "+
     fmt(v.pairedChangePct)+" | "+(v.pairedRangePct?v.pairedRangePct.map(fmt).join(" to "):"n/a")+" |");
