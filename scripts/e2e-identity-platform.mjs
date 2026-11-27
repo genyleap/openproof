@@ -29,6 +29,7 @@ const mixedLoadRequests = Number.parseInt(
 const mixedLoadConcurrency = Number.parseInt(
   process.env.OPENPROOF_E2E_LOAD_CONCURRENCY ?? "24", 10,
 );
+const mixedLoadWarmup = Number(process.env.OPENPROOF_E2E_LOAD_WARMUP ?? "0");
 const holdOpen = process.env.OPENPROOF_E2E_HOLD_OPEN === "1";
 const connectionFile = process.env.OPENPROOF_E2E_CONNECTION_FILE ?? "";
 const realAuthMode = holdOpen && process.env.OPENPROOF_E2E_REAL_AUTH === "1";
@@ -237,7 +238,10 @@ async function main() {
   if (!Number.isSafeInteger(mixedLoadRequests) || mixedLoadRequests < 6
       || mixedLoadRequests > 1_000_000
       || !Number.isSafeInteger(mixedLoadConcurrency) || mixedLoadConcurrency < 1
-      || mixedLoadConcurrency > 1_000) {
+      || mixedLoadConcurrency > 1_000
+      || !Number.isSafeInteger(mixedLoadWarmup) || mixedLoadWarmup < 0
+      || mixedLoadWarmup > 10_000 || mixedLoadWarmup % 6 !== 0
+      || (mixedLoadWarmup !== 0 && mixedLoadWarmup < mixedLoadConcurrency)) {
     fail("E2E load requests/concurrency are outside the safe supported bounds");
   }
   if (!fs.existsSync(binary)) fail(`opp binary is missing at ${binary}`);
@@ -1745,10 +1749,7 @@ async function main() {
 
     // Keep diagnostics bounded and optional; the acceptance workload and
     // request mix are unchanged. Both sides use the same fixture.
-    if (metricsFile && mixedLoadRequests <= 10000)
-      edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
-    const beforeLoadUsage = readOppUsage(oppProcess?.pid);
-    loadResult = await concurrentSmoke([
+    const mixedOperations = [
       { name: "readiness", run: () => edgeRequest("/health/ready") },
       { name: "discovery", run: () => edgeRequest("/.well-known/openid-configuration") },
       { name: "jwks", run: () => edgeRequest("/.well-known/jwks.json") },
@@ -1763,7 +1764,15 @@ async function main() {
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: introspectionForm.toString(),
       }) },
-    ], mixedLoadRequests, mixedLoadConcurrency);
+    ];
+    // Warmup uses exactly the same operations; exclude all of its timings,
+    // socket accounting and process deltas from the measured interval.
+    if (mixedLoadWarmup > 0)
+      await concurrentSmoke(mixedOperations, mixedLoadWarmup, mixedLoadConcurrency);
+    if (metricsFile && mixedLoadRequests <= 10000)
+      edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
+    const beforeLoadUsage = readOppUsage(oppProcess?.pid);
+    loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     edgePhaseMetrics = edgePhaseCollector?.report();
     edgePhaseCollector = undefined;
@@ -2013,6 +2022,7 @@ async function main() {
         commit: process.env.OPENPROOF_E2E_COMMIT ?? process.env.GITHUB_SHA ?? "local",
         timestamp: new Date().toISOString(),
         ...loadResult,
+        ...(mixedLoadWarmup > 0 ? { warmupRequests: mixedLoadWarmup } : {}),
         ...loadResourceMetrics,
         ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
         ...(executionProfile ? { executionProfile } : {}),
