@@ -2241,14 +2241,26 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_TRUE(unbound);
     EXPECT_TRUE(unbound->first.permits("openid"));
     EXPECT_TRUE(unbound->first.permits("profile"));
-    // The existing fixture may not contain a profile; compare against the
-    // independent read, including owner and absence semantics.
+    // The seeded owner has a profile; match the independent live read.
     io.restart();
     auto expectedProfile=asio::co_spawn(io,native.readProfileAsync(ids::IdentityId{seed.owner}),asio::use_future);
     io.run();
     auto expected=expectedProfile.get();
-    EXPECT_EQ(unbound->second.has_value(),expected.has_value());
-    if (expected && unbound->second) EXPECT_EQ(unbound->second->identity(),expected->identity());
+    ASSERT_TRUE(expected);
+    ASSERT_TRUE(unbound->second);
+    EXPECT_EQ(unbound->second->identity(),expected->identity());
+    EXPECT_EQ(unbound->second->displayName(),expected->displayName());
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=0,"
+        "sender_constraint_value='fixture' WHERE id=$1",{family}));
+    auto senderBound=userInfo(native,digest);
+    ASSERT_TRUE(senderBound);
+    ASSERT_TRUE(senderBound->first.senderConstraint());
+    EXPECT_FALSE(senderBound->second.has_value()); // Never read claims before sender proof.
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=NULL,"
+        "sender_constraint_value=NULL WHERE id=$1",{family}));
+    ASSERT_NO_THROW(sql("UPDATE openproof.identities SET status=2 WHERE id=$1",{seed.owner}));
+    EXPECT_FALSE(userInfo(native,digest));
+    ASSERT_NO_THROW(sql("UPDATE openproof.identities SET status=0 WHERE id=$1",{seed.owner}));
     ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope IN ('openid','profile')",{family}));
     auto activeIntrospection=introspect(native,clientProof,digest);
     ASSERT_TRUE(activeIntrospection && activeIntrospection->has_value());
