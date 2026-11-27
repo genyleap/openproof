@@ -419,3 +419,79 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  dev-hardening:
+    name: Development hardening (${{ matrix.preset }})
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [gcc-debug, gcc-asan]
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache qualified GCC and Boost
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openproof/boost-1.88.0
+          key: boost-1.88.0-${{ runner.os }}-${{ runner.arch }}
+      - name: Install verified toolchain and disposable PostgreSQL
+        run: ./scripts/ci/install-build-deps.sh
+      - name: Configure hardening profile
+        run: |
+          cmake --preset ${{ matrix.preset }} \
+            -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install"
+      - name: Build all targets
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 2 -- -k 0
+      - name: Verify actual sanitizer instrumentation
+        if: matrix.preset == 'gcc-asan'
+        run: |
+          ldd ./cmake-build-gcc-asan/apps/opp/opp
+          ldd ./cmake-build-gcc-asan/apps/opp/opp | grep -q libasan
+          ldd ./cmake-build-gcc-asan/apps/opp/opp | grep -q libubsan
+      - name: Execute CTest suite
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure -E '^PostgresIntegrationTest\.'
+      - name: Native SQL domain against an exclusive disposable database
+        env:
+          OPENPROOF_TEST_POSTGRES_DOMAIN: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_hardening_domain
+          OPENPROOF_TEST_POSTGRES_DOMAIN_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_hardening_domain
+          ./cmake-build-${{ matrix.preset }}/tests/openproof_postgres_domain_tests \
+            --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
+      - name: Native canonical SQL and destructive integration
+        run: |
+          bash scripts/run-disposable-postgres-canonical-tests.sh "./cmake-build-${{ matrix.preset }}"
+          bash scripts/run-disposable-postgres-integration-tests.sh "./cmake-build-${{ matrix.preset }}"
+      - name: Fresh schema and historical ledger upgrade
+        env:
+          OPENPROOF_TEST_BASELINE_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_hardening_baseline
+          OPENPROOF_TEST_BASELINE_DIRECTORY: ${{ runner.temp }}/openproof-hardening-baseline
+          OPENPROOF_TEST_BASELINE_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_hardening_baseline
+          cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
+          python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
+            --runtime-upgrade-tests ./cmake-build-${{ matrix.preset }}/tests/openproof_tests
+          ./cmake-build-${{ matrix.preset }}/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent'
+          bash scripts/run-disposable-postgres-integration-tests.sh "./cmake-build-${{ matrix.preset }}"
+      - name: Install and build isolated LDAP fixture
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ldap-utils
+          docker build --tag openproof-ldap-fixture:ci --file scripts/ci/native-ldap-fixture.Dockerfile scripts/ci
+      - name: Execute real HTTP E2E under hardening profile
+        timeout-minutes: 30
+        env:
+          OPENPROOF_E2E_OPP: ${{ github.workspace }}/cmake-build-${{ matrix.preset }}/apps/opp/opp
+          OPENPROOF_E2E_POSTGRES: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_hardening_e2e
+          OPENPROOF_E2E_DATABASE_ACK: YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE
+          OPENPROOF_E2E_NATIVE_LDAP_FIXTURE: "1"
+          OPENPROOF_E2E_LOAD_REQUESTS: "24"
+          OPENPROOF_E2E_LOAD_CONCURRENCY: "4"
+        run: |
+          sudo -u postgres createdb -O openproof_ci openproof_hardening_e2e
+          node scripts/e2e-identity-platform.mjs

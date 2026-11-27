@@ -61,5 +61,5 @@ jobs:
       - name: Independence and unchanged release gate status
         run: |
           python3 scripts/check-protocol-neutrality.py
-          node scripts/verify-coroutine-coverage.mjs --json > coroutine-coverage.json || test "$?" -eq 1
-          python3 -c 'import json; v=json.load(open("coroutine-coverage.json")); assert v["releaseApproved"] is False and v["blockingFindings"] > 0, "Update this pre-release workflow when acceptance becomes complete"'
+          node scripts/verify-coroutine-coverage.mjs --json > coroutine-coverage.json
+          python3 -c 'import json; v=json.load(open("coroutine-coverage.json")); assert v["releaseApproved"] is False and v["blockingFindings"] == 0 and v["status"] == "STATIC_GATE_PASSED_REQUIRES_DYNAMIC_VALIDATION", "Static gate is not dynamic release approval"'
