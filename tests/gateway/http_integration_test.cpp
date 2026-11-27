@@ -1233,17 +1233,22 @@ TEST(BeastHttpIntegrationTest, NativeProxySharedTransportCompletesOnFourThreads)
     auto endpoint = gw::Endpoint::create(gw::EndpointId{"concurrent-upstream"},
         "127.0.0.1", upstream.boundPort(), false, 1U);
     ASSERT_TRUE(endpoint);
+    auto hostname = gw::Endpoint::create(gw::EndpointId{"concurrent-hostname"},
+        "localhost", upstream.boundPort(), false, 1U);
+    ASSERT_TRUE(hostname);
 
     asio::io_context io;
     std::vector<std::optional<fnd::Result<gw::HttpResponse>>> results(8U);
     std::vector<std::future<void>> completions;
+    std::size_t targetIndex = 0U;
     for (auto& result : results) {
+        const auto& target = (targetIndex++ % 2U == 0U) ? endpoint.value() : hostname.value();
         auto request = gw::HttpRequest::create(gw::HttpMethod::Get,
             "/native-concurrent-proxy", {}, {}, "127.0.0.1",
             fnd::CorrelationId{"concurrent-proxy-test"});
         ASSERT_TRUE(request);
         completions.push_back(asio::co_spawn(io, collectAsyncProxyResponse(
-            *proxy.value(), endpoint.value(), std::move(request).value(),
+            *proxy.value(), target, std::move(request).value(),
             std::chrono::seconds{3}, result), asio::use_future));
     }
     std::vector<std::jthread> workers;
