@@ -56,7 +56,7 @@ asio::awaitable<foundation::Status> validateAsync(foundation::SecretString dsn,
                 !bytes || bytes->size()!=fingerprint.size() ||
                 !security::constantTimeEquals(std::span<const std::byte>{bytes->data(),bytes->size()},
                     std::span<const std::byte>{fingerprint.data(),fingerprint.size()}))
-                co_return foundation::fail(E::FailedPrecondition,"Configured master key does not match the committed journal.");
+                co_return foundation::fail(E::FailedPrecondition,"Configured master key does not match the committed rotation journal.");
         }
         if (tenant) {
             Params args{std::string{tenant->value()}};

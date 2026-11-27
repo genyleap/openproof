@@ -1899,10 +1899,10 @@ async function main() {
     );
     assert.notEqual(retiredMasterStart.error?.code, "ETIMEDOUT",
       "server accepted the retired master and remained running");
-    assert.notEqual(retiredMasterStart.status, 0);
+    assert.equal(retiredMasterStart.status, 3, "retired master must fail with a configuration error");
     assert.match(
       `${retiredMasterStart.stderr ?? ""}${retiredMasterStart.stdout ?? ""}`,
-      /does not match the committed rotation journal/i,
+      /does not match the committed rotation journal.*FAILED_PRECONDITION/i,
     );
     childEnvironment.OPENPROOF_TOKEN_SIGNING_KEY = replacementMasterKey;
     writeConfiguration(

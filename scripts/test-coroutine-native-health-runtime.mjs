@@ -38,6 +38,12 @@ test("server preflight and listener use no blocking PostgreSQL repository",()=>{
     assert.ok(index>previous,term);previous=index;
   }
   assert.match(startup,/security::constantTimeEquals/);
+  const validate=startup.slice(startup.indexOf("validateAsync("),startup.indexOf("migrateSchemaAsync("));
+  assert.match(validate,/storedVersion!=version/);
+  assert.match(validate,/E::FailedPrecondition,"Configured master key does not match the committed rotation journal\."/);
+  const e2e=read("scripts/e2e-identity-platform.mjs");
+  assert.match(e2e,/assert.equal\(retiredMasterStart.status, 3,/);
+  assert.match(e2e,/does not match the committed rotation journal\.\*FAILED_PRECONDITION/);
   assert.match(startup,/WHERE id=\$1 AND state=0/);
   assert.doesNotMatch(cppExecutableText(startup),/PQexec|PQconnectdb|PQreset|condition_variable/);
   const transport=read("src/storage/postgres/async_connection.cpp");
