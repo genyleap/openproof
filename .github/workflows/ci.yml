@@ -495,10 +495,10 @@ jobs:
         run: ctest --preset ${{ matrix.preset }} --output-on-failure -E '^PostgresIntegrationTest\.'
       - name: Native SQL domain against an exclusive disposable database
         env:
-          OPENPROOF_TEST_POSTGRES_DOMAIN: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_hardening_domain
+          OPENPROOF_TEST_POSTGRES_DOMAIN: postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/openproof_coroutine_ci
           OPENPROOF_TEST_POSTGRES_DOMAIN_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
         run: |
-          sudo -u postgres createdb -O openproof_ci openproof_hardening_domain
+          sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
           ./cmake-build-${{ matrix.preset }}/tests/openproof_postgres_domain_tests \
             --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
       - name: Native canonical SQL and destructive integration
