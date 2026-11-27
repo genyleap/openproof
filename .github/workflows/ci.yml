@@ -71,6 +71,7 @@ jobs:
       - name: Benchmark measurement and reporting contracts
         run: |
           python3 -m py_compile scripts/ci/probe-asio-inline.py
+          python3 -B scripts/ci/test-qualify-gateway-inline.py
           node tests/scripts/process-usage-test.mjs
           node tests/scripts/gateway-bench-summary-test.mjs
           node tests/scripts/mixed-read-summary-test.mjs
@@ -459,6 +460,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+
+      # Keep the original qualified executable, benchmark and package untouched.
+      # Compile alternate real implementation objects only after primary evidence
+      # is published; these diagnostic results never confer release approval.
+      - name: Qualify real Gateway translation unit inlining
+        if: success() && github.ref == 'refs/heads/dev'
+        timeout-minutes: 22
+        continue-on-error: true
+        run: |
+          python3 scripts/ci/qualify-gateway-inline.py \
+            --build cmake-build-gcc-release --output gateway-inline-qualification.json
+      - name: Preserve real Gateway inlining qualification
+        if: always() && github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-gateway-inline-qualification
+          path: gateway-inline-qualification.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   dev-hardening:
     name: Development hardening (${{ matrix.preset }})
