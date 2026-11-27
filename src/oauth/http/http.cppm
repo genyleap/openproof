@@ -36,7 +36,7 @@ public:
                  JarService& jar,
                  SenderProofVerifier& senderProof,
                  gateway::TokenBucketRateLimiter& limiter,
-                 gateway::HttpHandler& fallback);
+                 gateway::HttpHandler& fallback, bool nativeTokenReadsRequired=false);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
 
@@ -73,6 +73,7 @@ private:
     SenderProofVerifier* m_senderProof;
     gateway::TokenBucketRateLimiter* m_limiter;
     gateway::HttpHandler* m_fallback;
+    bool m_nativeTokenReadsRequired;
 };
 
 }

@@ -16,7 +16,7 @@ test("contact issuance is native in account-enabled runtime with durable reserva
   assert.match(app,/nativeContactIssuer=&contactIssuer;/);
   assert.match(app,/CoroutineContactVerificationAdapter>\(/);
   for (const route of ["/account/email/change","/account/phone"])
-    assert.ok(app.includes('nativeMethods.emplace_back("'+route+'",gateway::HttpMethod::Post)'));
+    assert.ok(app.slice(app.indexOf("if (!nativeContactIssuer || !nativeSignup"),app.indexOf("nativePaths.emplace_back(path);",app.indexOf("if (!nativeContactIssuer || !nativeSignup"))).includes('"'+route+'"'));
   const native=http.slice(http.indexOf("CoroutineContactVerificationAdapter::handleAsync("));
   assert.match(native,/co_await m_authenticate\(/);
   assert.match(native,/co_await m_issue\(actor->identity\(\)/);
@@ -45,5 +45,5 @@ test("public email issuance uses native eligibility and rechecks owner before re
   assert.match(issuer,/co_await deliverPrepared\(/);
   assert.match(app,/contactIssuer.configurePublicEmail\(/);
   for (const route of ["/account/email/resend","/account/password/forgot"])
-    assert.ok(app.includes('nativeMethods.emplace_back("'+route+'",gateway::HttpMethod::Post)'));
+    assert.ok(app.slice(app.indexOf("if (!nativeContactIssuer || !nativeSignup"),app.indexOf("nativePaths.emplace_back(path);",app.indexOf("if (!nativeContactIssuer || !nativeSignup"))).includes('"'+route+'"'));
 });

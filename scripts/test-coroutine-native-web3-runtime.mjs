@@ -20,7 +20,7 @@ test("authenticated runtime requires native Web3 before database operations", ()
   assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeWeb3Flag && \*nativeWeb3Flag == "0"/);
   assert.match(app,/const bool nativeWeb3Enabled = platform\.auth\(\)\.enabled\(\)/);
   const start = app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_WEB3_LOGIN");
-  const migrator = app.indexOf("postgres::Migrator migrator{*pool.value()}", start);
+  const migrator = app.indexOf("postgres::nativeDatabasePreflight(", start);
   assert.ok(start >= 0 && migrator > start);
 });
 
@@ -35,9 +35,9 @@ test("Web3 login gets async transaction, canonical and session services without 
   assert.match(runtime, /CoroutinePostgresAuthenticationTransactionStore/);
   assert.match(runtime, /CoroutinePostgresCanonicalFinalizer/);
   assert.match(runtime, /nativeCanonical\.get\(\)/);
-  assert.match(app, /authHttp::Web3AuthenticationHttpApi nativeWeb3Api\{\s*\*nativeAuthentication, providers, sessions, limiter\.value\(\),\s*enterpriseApi, nullptr, nativeSessions\.get\(\),\s*authenticateNativeWeb3\}/);
-  assert.match(app, /runWithScim\(enterpriseApi, nativeWeb3Api\)/);
-  assert.match(app, /runWithScim\(enterpriseApi, enterpriseApi\)/);
+  assert.match(app, /authHttp::Web3AuthenticationHttpApi localWeb3Api\{\s*\*nativeAuthentication,providers,limiter\.value\(\),\s*localEnterpriseApi,\*nativeSessions,authenticateNativeWeb3\}/);
+  assert.match(app, /runWithEvidence\(fallback,localWeb3Api\)/);
+  assert.match(app, /runWithEvidence\(fallback,localEnterpriseApi\)/);
 });
 
 test("native route overlay has exact opt-in path gates, never implicit LDAP or Account activation", () => {
@@ -97,7 +97,7 @@ test("native wallet handoff owns the two one-time tickets and revalidates owners
   assert.equal([...native.matchAll(/co_await nativeTransactions->beginAsync\(/g)].length,2);
   assert.equal([...native.matchAll(/co_await nativeTransactions->consumeAsync\(/g)].length,2);
   assert.equal([...native.matchAll(/co_await m_asyncCanonical->authorizeHandoffOwnerAsync\(/g)].length,2);
-  assert.doesNotMatch(native,/m_transactions\.(?:begin|consume)\(|m_identities\.ownerOf\(|requireActiveIdentity\(/);
+  assert.doesNotMatch(native,/m_transactions\.(?:begin|consume)\(|m_identities(?:\.|->)ownerOf\(|requireActiveIdentity\(/);
   const sql=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
   const owner=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::authorizeHandoffOwnerAsync("),
     sql.indexOf("CoroutinePostgresCanonicalFinalizer::updatePresentationAsync("));

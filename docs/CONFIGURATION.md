@@ -711,14 +711,28 @@ standalone `*`. Omitting this setting retains historical convergence behavior
 for backwards compatibility. Deployments with stricter linking requirements
 should use `*` until providers' email verification guarantees are reviewed.
 
-### Experimental native account connections read (coroutine branch only)
+### Native account and credential lifecycle (coroutine branch only)
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS=1` selects only
-`GET /account/connections` for first-party authenticated session cookies.
-The default is `0` (disabled). Enabling it requires
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS=1` and the account API;
-invalid values or missing prerequisites reject startup. Profile reads have a
-**separate** opt-in and do not become native merely by enabling connections.
+An enabled account API requires native sessions, profile, connection reads,
+TOTP status, signup, password reset, email and phone verification, and
+TOTP enrollment/disable. The historical configuration flags
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS`,
+`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS`, and
+`OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP` accept unset or 1 when accounts are
+enabled. Explicit 0, invalid values, or missing required dependencies
+reject startup. Explicit 1 is invalid if account management is disabled.
+
+Signup, contact challenge issuance and verification, password reset and TOTP
+mutation paths are exact native overlays. Unsupported methods or missing
+native capability fail closed instead of dispatching legacy credential SQL.
+Password hashing remains on the bounded KDF executor. The account HTTP
+boundary has no synchronous AccountService or verification repository in
+the server composition root. All registered account paths use strict
+native overlays, including profile, session management, TOTP status,
+password upgrade, recovery and security pages, and connection ceremonies.
+Unsupported methods or unavailable capabilities fail closed.
 
 The native implementation verifies the session before a tenant-scoped,
 read-only asynchronous PostgreSQL query; it checks active identity and
@@ -728,12 +742,33 @@ The response retains the established JSON `connections` array, including
 numeric Farcaster `fid` and `profile_url` fields. No identity, provider
 connection, or authentication transaction is created by the read.
 
-**Compatibility:** OAuth delegated Bearer grants for this endpoint continue
-to use the existing bounded synchronous compatibility worker; the new native
-reader cannot authenticate those grants. Non-GET connection routes remain on
-legacy compatibility handlers. Do not enable the feature in production until
-GCC16/CTest and disposable PostgreSQL HTTP E2E have passed, followed by the
-usual global Coroutine migration release gate.
+Explicit Bearer credentials for profile reads/writes, connection reads,
+TOTP status and password-upgrade status use the native account-scoped
+verifier. It checks the first-party session first, only tries delegated
+OAuth after an authentication failure, and requires an active, tenant-bound
+grant with the account scope. Sender-constrained tokens are rejected
+because these routes have no proof verification boundary. Cookie reads
+retain first-party verification. Session management, password-upgrade
+confirmation, the authenticated security page and TOTP enrollment/disable
+require first-party sessions; password confirmation also requires the
+existing same-origin check and identity-wide rate limit.
+
+The public recovery page is rendered without storage access. The security
+page obtains owner-bound TOTP status asynchronously before rendering;
+unauthenticated requests redirect to sign-in and storage failures remain
+errors rather than being mistaken for unauthenticated users. Both retain
+the original HTML, per-response CSP nonce and no-store headers.
+POST `/account/connections/disconnect` also uses the account-scoped verifier
+for explicit Bearer credentials and the first-party verifier for cookies.
+The exact native overlay cannot dispatch to the synchronous detach service.
+One tenant-scoped transaction locks the active identity and a surviving
+registered sign-in method, checks exact external ownership, deletes the
+connection, and resets its selected avatar source to auto. Verification-only
+providers cannot satisfy the last-sign-in-method guard. Concurrent detach
+requests share the existing advisory lock; one cannot remove the last
+registered method. Other connection ceremonies retain their separate
+dispatch contracts. Full GCC16/CTest and disposable PostgreSQL HTTP E2E,
+followed by the global migration release gate, remain mandatory.
 
 ### Native federated browser authentication
 
@@ -743,11 +778,13 @@ OPENPROOF_EXPERIMENTAL_NATIVE_FEDERATED_CALLBACK accept unset or 1;
 setting either to 0 rejects startup. Native browser redirects support
 OAuth2 GET/form POST, OAuth1 GET and SAML POST, using the same durable
 transaction schema. GitHub, OIDC and X synchronous network SPIs are retired.
-Delegated Bearer connection start and handoff issuance retain their
-compatibility authorization path. Direct delegated connection start now
-redirects to a short-lived one-time local handoff URL; navigate to that URL
-in the browser without the Authorization header. Native redemption starts
-the external provider exchange and callback completion stays native. This
+Delegated Bearer connection start and handoff issuance use the native
+account-scoped verifier and asynchronous owner-bound transaction storage.
+Direct Bearer connection start redirects to a short-lived one-time local
+handoff URL; navigate to that URL in the browser without the Authorization
+header. Native redemption starts the external provider exchange and
+callback completion stays native. Native-required legacy federation
+dispatch denies account start, handoff and completion. This
 candidate is not approved for production until compiled, signed-assertion
 and full federation runtime acceptance are complete.
 
@@ -899,31 +936,139 @@ service; caller-provided scope headers are removed at the gateway boundary.
 
 See `examples/openproof.toml` for a complete deployment sample.
 
-### Experimental native account TOTP status (coroutine branch only)
+### Native OAuth UserInfo, introspection and revocation
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS=1` enables only
-`GET /account/totp` with a first-party authenticated cookie. Default is disabled;
-requires native account sessions and the account API. Authorization header
-requests and all TOTP enrollment, replacement and disable operations retain
-compatibility dispatch. A single native PostgreSQL read checks active tenant,
+OIDC-enabled runtimes use strict native overlays for `/oauth/userinfo` (GET,
+POST and OPTIONS), `/oauth/introspect` (POST) and `/oauth/revoke` (POST). No synchronous token
+repository is called on these paths. UserInfo requires the openid scope
+and discloses presentation claims only with profile scope, email only
+with email scope. Sender-constrained tokens use the native DPoP/mTLS
+verifier and shared durable replay store.
+
+Introspection authenticates an active confidential client in the configured
+tenant using the same server-keyed client-secret digest as token issuance.
+It reads the access-token context, issued/expiry timestamps and scopes
+from a bounded SQL snapshot. Unknown/inactive tokens return active=false;
+storage failures are reported as unavailable, not inactive. Raw form
+credentials are erased before database suspension. The existing same-tenant
+confidential-client introspection policy is preserved; public clients are
+denied.
+
+Revocation authenticates public or confidential clients and locks the
+token family within one tenant-scoped transaction. Unknown and other
+clients' tokens return the same empty success response. Access token
+revocation affects only that token; refresh token revocation invalidates
+the entire family, including existing successors. Legacy rotation and
+revocation acquire the family lock before token rows and refuse rotation
+of a revoked family. This preserves the concurrency invariant during
+migration. Refresh rotation is native on the shared `/oauth/token` POST
+endpoint when the decoded grant type is refresh_token. Other grant types
+retain the compatibility path; a native-required synchronous handler
+explicitly denies refresh. Client/tenant and sender bindings are checked
+under the family lock; replay or expiry commits family revocation.
+Successful rotation consumes the old credential and inserts both new
+token digests in a single transaction while preserving the original
+refresh expiry and scopes. DPoP/mTLS proofs use the shared native replay
+store. The refresh request accepts the existing client and refresh
+credential fields (extra fields are rejected).
+
+Authorization-code exchange also uses native grant-scoped dispatch.
+The code fingerprint is computed with the existing authorization-code
+HMAC key and the PKCE verifier is validated and hashed locally; neither
+raw secret crosses a database suspension. A bounded transaction checks
+client authentication, exact redirect URI, S256 challenge, expiration,
+identity and tenant lifecycle, and locks the one-time code. It preserves
+the code's original scopes, audience, authentication context and nonce,
+signs the ID token for openid using the existing OIDC signer, persists the
+initial access and refresh token family, and consumes the code atomically.
+The signed ID token and raw credentials are released only after commit.
+A signing or persistence failure must not consume the code. Replaying
+the same code after success returns invalid_grant.
+
+Client credentials and RFC 8693 access-token exchange also use native
+grant-scoped dispatch. Machine grants authenticate the client and lock
+the active resource and service identity or source token family in one
+transaction. The target audience and every requested (or default) scope
+must be permitted by both the source grant and the current resource.
+Exchange requires the same client, tenant and sender binding as the
+source, and cannot extend the source access token's expiry. Both grants
+issue only access tokens, never refresh tokens. As before, an exchanged
+token is a separate family; revocation of the source after a successful
+exchange does not cascade to previously issued families. Native-required
+legacy dispatch rejects these grants. Device-code polling also uses native
+grant dispatch and the existing device authorization HMAC key. Poll
+interval changes and pending polls are committed before their responses.
+Approved codes are locked and consumed in the same transaction as initial
+access/refresh family issuance, so a failed insert cannot lose approval.
+All supported token grants now have native paths; the synchronous token
+handler rejects them when native mode is required and denies unknown grants
+without synchronous authentication. Device initiation is also native:
+the client, requested scopes and resource are validated under transaction
+locks; only HMAC fingerprints of the device and user codes are persisted.
+User code generation uses unbiased sampling and at most three attempts
+on unique-code collisions. The existing ten-minute lifetime and five-second
+poll interval are preserved. Device browser approval and denial are native
+and cookie-only. The existing page style and CSP are preserved. The CSRF
+token is bound by HMAC to the session and the specific device code; the
+approval transaction rechecks the active first-party session and tenant.
+Approval records the authentication context and supersedes prior consent
+in the same transaction as the device state change. A failed consent
+write leaves the device pending. Denial is one-time and creates no consent.
+Pushed authorization initiation at /oauth/par is native, including signed
+JAR requests. The transaction authenticates the tenant-bound client, locks
+the pinned signing key, verifies RS256, issuer, audience and temporal
+claims, checks redirect URI (including native loopback port matching),
+client scopes and resource scope restrictions. JTI consumption and PAR
+storage commit together; a failed insert does not permanently consume the
+JTI. Request URIs use the existing SHA-256 fingerprint and 90-second
+lifetime. Browser authorization and consent submission now use native
+transactions for both direct and pushed requests. Front-channel JAR is
+converted to PAR after pinned-signature validation, without accepting
+client secrets in the browser. The exact browser session and current
+client/resource registrations are rechecked inside the transaction.
+Consent prompts preserve the unconsumed PAR record; the CSRF token is
+bound to the session and complete authorization target. Approval,
+consent supersession, code insertion, and one-time PAR consumption commit
+together. Denial consumes PAR without issuing a code. JARM signing happens
+before commit and failure leaves the PAR and consent unchanged.
+Browser login now uses native authentication begin/completion and
+atomic first-party session replacement. Login CSRF is bound to the
+allowlisted return target. Password and optional TOTP remain in wiping
+credential owners, and raw request buffers are cleared before suspension.
+All token grants, unsupported grants, malformed requests and preflight
+requests are owned by the native token endpoint. The server no longer
+constructs the synchronous OAuth HTTP API; the compatibility library
+remains for isolated tests and non-runtime use. Executable acceptance
+is still mandatory.
+
+### Native account TOTP status (coroutine branch only)
+
+`GET /account/totp` defaults to the native first-party cookie verifier in
+account-enabled runtimes. Explicit Bearer credentials are checked by the
+native account-scoped verifier. TOTP enrollment, replacement and disable use
+the strict native credential lifecycle described above.
+A single native PostgreSQL read checks active tenant,
 identity and the configured local provider. It returns only availability,
 enrollment status and the authenticated session's assurance; no password hash,
 TOTP seed or recovery code is queried or returned. No identity is provisioned.
 
 ### Native protected gateway (coroutine branch only)
 
-Authenticated runtimes without OIDC default to native first-party
-protected reverse proxy. OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY
-accepts 0 or 1. Explicit 0 retains compatibility dispatch. Explicit 1
-requires authentication and also enables native delegated access for OIDC
-runtimes; OIDC stays opt-in until end-to-end executable acceptance.
+Authenticated runtimes require native protected reverse proxy, including
+OIDC delegated access. The historical
+`OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY` flag accepts unset or 1
+when authentication is enabled. Explicit 0 fails startup; explicit 1
+requires authentication.
 
-The flag adds no routes. Native dispatch is limited to the configured
-protected routes under the reserved /proxy segment namespace. In
-non-OIDC mode, scope/audience-constrained routes remain on compatibility
-dispatch. In OIDC opt-in mode, scope and audience requirements are
-checked against the trusted token context; first-party sessions cannot
-satisfy delegated-only grants.
+The flag adds no routes. Native dispatch uses configured method/path
+matches, including /api and /proxy, but preserves local protocol namespaces
+(auth, admin, account, oauth, login, .well-known, evidence, scim, health and
+metrics) for their authoritative middleware. First-party sessions cannot
+satisfy delegated-only scope/audience requirements, even with OIDC disabled.
+No synchronous network fallback exists: BeastProxyTransport::send rejects
+all calls without opening a connection. Account verification webhooks use
+the native asynchronous transport exclusively. Full executable acceptance
+is still required before release.
 
 The native gateway verifies credentials with PostgreSQL asynchronously,
 validates DPoP/mTLS sender binding and consumes the durable replay key,
@@ -934,18 +1079,231 @@ Proof headers are ingress-only and stripped before forwarding. The
 existing retry deadline and circuit-breaker decisions are preserved.
 This is not full migration acceptance.
 
-### Experimental native owner-only member listing
+### Native health probes
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS=1` enables only
-`GET /admin/local-members`; default is disabled. Requires the authentication
-API and native authentication sessions. A single asynchronous tenant-scoped
+For authenticated runtimes, /health/live is independent of PostgreSQL and
+/health/ready awaits SELECT 1 on the bounded native canonical pool, using
+one monotonic deadline for admission, connect/reset and query. Storage
+failure or pool exhaustion produces a sanitized 503; non-GET methods
+return 405. Both paths have strict native ownership, with no synchronous
+readiness fallback. This also checks the actual request-processing pool
+rather than a separate legacy connection pool.
+
+Application management GET endpoints for applications, clients, JAR keys,
+resources and service identities now use a bounded native read-only
+repeatable-read snapshot. The exact first-party session, IAL2 assurance,
+active identity, organization, membership and owner role are checked
+inside the snapshot. Client secrets are never selected. Resource registry
+visibility remains platform-wide as in the existing schema; applications,
+clients, JAR keys and service identities are tenant-bound. Oversized
+results fail closed rather than returning a misleading truncated list.
+
+Application creation, suspension, activation and revocation also run
+natively, with strict ownership of all four endpoint paths. The write
+transaction serializes owner lifecycle changes using the shared advisory
+lock, locks the active session and owner membership, and locks the
+target application before applying the existing domain transitions.
+Duplicate identifiers are rejected and revoked applications cannot be
+reactivated. Concurrent transitions cannot overwrite each other through
+the native HTTP path.
+
+OAuth client creation, lifecycle transitions and secret rotation now
+also use native owner- and session-locked transactions. Creation locks
+the active parent application and commits the client, redirect URIs
+and scopes together. Mutations lock the tenant-bound client and restore
+the canonical domain model. Only HMAC digests cross the storage boundary;
+the newly generated secret is returned once, after commit, and never
+for a public client. Revoked clients cannot be reactivated or rotated.
+The existing token-family lifetime policy is unchanged.
+
+JAR key registration, rotation and removal also use the owner/session
+transaction and lock the same tenant-bound client as native JAR
+verification. Exactly one RSA public PEM envelope is accepted; invalid
+keys, trailing material, stale updates and registration on revoked clients
+are rejected. Removal remains idempotent and replay records are retained
+across key rotation and removal.
+
+Resource creation, suspension, activation and revocation now use native
+transactions. The registry remains platform-wide; its administrative
+actor must hold an active owner session with IAL2 assurance in the
+configured tenant. Resource lifecycle changes lock the resource row
+used by native grant validation and preserve the scope registry instead
+of replacing it. Duplicate audiences, stale status changes and
+reactivation of revoked resources are rejected.
+
+Service identity provisioning, activation and deactivation now use
+native owner/session-locked transactions. Provisioning creates the
+canonical service identity, client mapping, audience grants and scope
+grants in one transaction; failed provisioning leaves no orphan
+identity. The exclusive client lock serializes provisioning and state
+changes with native machine-grant admission. Activation revalidates
+the active client, application, service identity and every registered
+resource/scope grant. Deactivation remains available for inactive
+parents and does not replace grants or change already-issued token
+lifetime policy.
+
+The administration console now uses the native first-party owner/IAL2
+session check before rendering. Its existing HTML and operation forms
+are shared with the compatibility renderer, with a fresh per-response
+CSP nonce and no-store caching. Unauthenticated browsers are redirected
+to login and insufficient assurance to account security. The server no
+longer constructs the synchronous application management HTTP API,
+application registry, resource registry, service identity service or JAR
+management service. The synchronous client manager and compatibility token service are no
+longer composed by the server. Web3 native dispatch uses only the
+coroutine session issuer and native delegated-account reader; its
+synchronous entry point fails closed without a compatibility session
+service.
+
+Passkey credential listing and registration-options creation use native
+first-party session authentication and the configured tenant. The
+transaction verifies the exact active human identity/session, returns
+only bounded credential metadata, and creates a short-lived registration
+ceremony under the shared per-identity advisory lock. Expired ceremonies
+are pruned in bounded batches and at most 32 unconsumed, unexpired
+ceremonies are allowed per identity. WebAuthn challenge derivation,
+RP configuration and required user verification are shared with the
+existing provider implementation. Registration completion now verifies
+attestation using the shared verifier and atomically consumes the ceremony,
+inserts the credential and attaches the canonical passkey link. Removal
+uses the same per-identity advisory lock as disconnection and registration;
+the final credential is protected while its authentication link remains.
+Exact and slash-delimited prefix route ownership prevents synchronous
+fallback for account passkey operations. Assertion authentication uses
+the native broker's one-time transaction and binding digest, a shared
+WebAuthn signature verifier, and a tenant-bound SQL transaction locking
+the credential and its current canonical ownership before updating the
+signature counter. Successful proof is owner-bound; session issuance
+atomically replaces a previous first-party session. The proof counter
+transaction commits before session issuance; a failed issuance requires
+a new assertion ceremony. The server no longer constructs synchronous
+passkey repositories, services or HTTP handlers.
+
+Enabled SCIM GET routes (Users, Groups, item and equality-filter reads,
+and service discovery) use native dispatch and the same operator bearer
+token and rate limiter. The directory projection is a tenant-bound
+read-only repeatable-read snapshot, including canonical identity status,
+profile and group membership. It preserves SCIM JSON, ETags and
+discovery responses. Results beyond 10,000 resources/members or the
+8,380,000-byte aggregate projection budget fail closed rather than
+silently truncating. Existing list behavior is preserved; pagination
+is not introduced by this migration. User creation, replacement, patch
+and removal, group creation/replacement/patch/removal and member changes
+now use native transactions. Provisioning commits identity, membership,
+profile and SCIM metadata together. Writes check If-Match inside the
+locked transaction; versions advance monotonically even for same-tick
+updates. Deactivation revokes first-party sessions and OAuth token
+families; removed or security-locked identities cannot be reactivated
+by SCIM, and the last active tenant owner is protected. Removing a SCIM
+user removes its group membership and advances the affected group ETags.
+Group additions are idempotent; membership validation and mutation are
+atomic. The synchronous SCIM service and directory repository are no
+longer constructed by the server.
+
+Evidence challenge issuance, proof verification, listing and trust
+assessment now use native first-party session authentication and
+tenant-bound SQL transactions. Challenges are digest-only, expire
+after five minutes, and have at most 32 active records per identity.
+The one-time challenge is consumed before proof verification, matching
+the previous burn-on-attempt behavior. A single admitted worker handles
+JWT/X.509 verification, including CA/CRL file reads, outside the HTTP
+reactor. Evidence batch persistence rechecks the active session and
+identity, accepts only evidence for the selected identity/provider,
+and commits the whole batch or none. Listing and trust computation
+share a bounded consistent snapshot and the existing trust policy.
+The server no longer constructs the synchronous evidence HTTP API,
+challenge store, evidence service or trust engine.
+
+Authenticated gateway forwarding is composed without the synchronous
+session, policy/audit, delegated-token or proxy interfaces. A direct
+compatibility call on that core fails closed. The trust namespace
+cannot be captured by an operator-defined upstream route.
+
+The authenticated listener no longer constructs synchronous
+AuthenticationService, SessionService, LocalAccountDirectory, recovery
+service or federated HTTP middleware. LDAP and Web3 share the native
+authentication coordinator and session issuer. The native local provider
+is registered in discovery and connection admission as before. Unknown
+or unavailable routes reach a repository-free fail-closed fallback.
+
+OIDC signing/discovery, DPoP time-window validation and native sender
+proof verification no longer require synchronous profile or replay
+repositories. Native authentication coordinators likewise receive only
+the coroutine transaction store and canonical finalizer. Legacy entry
+points fail closed when the corresponding synchronous repository is
+absent. Native UserInfo and durable replay handling remain in the
+coroutine PostgreSQL storage layer.
+
+Authenticated startup now uses native socket-driven libpq for schema
+application, master-key journal validation and organization validation.
+The native migrator uses a checksum-validated package loader. Trusted
+deployment SQL artifacts use a startup-only multi-command operation;
+normal request queries remain single-statement and parameterized.
+Schema migration has a five-minute SQL deadline and a shared advisory
+lock; final COMMIT and transaction state are checked. Master-key and
+organization checks use a separate bounded read-only snapshot.
+The finite startup event loop completes before the listener is created;
+filesystem loading occurs only before serving requests. Deployment SQL
+files are trusted administrative artifacts, not untrusted request data.
+All four database-backed CLI subcommands now share the native schema
+migration and master-key journal validation. Offline master-key rotation
+uses a dedicated native libpq connection with a serializable transaction,
+the original advisory lock and exclusive table locks, constant-time
+journal fingerprint validation, exact invalidated-row counts and atomic
+journal insertion. Dry runs roll back; the operation has a five-minute
+SQL deadline. The offline operator contract is unchanged: stop the server
+before rotation and update the configured key before restarting.
+TOTP rekey uses keyset-batched envelope validation and re-encryption
+under the original exclusive table lock and a single serializable
+transaction; dry runs roll back. Bootstrap and initial-owner repair use
+native SQL and the shared atomic audit/outbox writer. Repair additionally
+rejects a prior successful repair and requires the qualifying session
+to have already been issued. All database-backed CLI commands and the
+server listener are now composed without the legacy PostgreSQL module.
+The synchronous PostgreSQL module and its CMake target are retired.
+All original repository integration test cases now target native
+repositories, with direct SQL restricted to disposable test fixtures
+and persisted-state assertions. The Passkey counter regression uses
+real signed ES256 assertions. Schema, historical reservation,
+credential-policy upgrades, key rotation, owner protection and OAuth
+replay tests retain their original security invariants. The strict
+source gate requires absence of the retired module, scans every storage
+implementation and retains the global blocking-I/O inventory.
+Destructive repository integration tests require the dedicated
+`scripts/run-disposable-postgres-integration-tests.sh` runner. It creates
+a private Unix-socket-only PostgreSQL cluster, strips ambient libpq
+environment defaults, runs serially and rejects missing or skipped test
+results. The test fixture refuses arbitrary DSNs before migration or
+TRUNCATE. CI and the release workflow use this runner separately from
+ordinary CTest; the schema-baseline CI step also runs the snapshot-specific
+regression. Static source acceptance does not approve a release:
+exact-head C++ build, PostgreSQL integration, executable symbol checks,
+security and E2E regressions and comparative benchmarks remain mandatory.
+
+### Native owner-only local member administration
+
+Authenticated runtimes require the native local-member administration API.
+The historical `OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS` flag accepts
+unset or 1; setting it to 0 rejects startup. A single asynchronous tenant-scoped
 SQL snapshot verifies active owner membership before enumerating members.
 The read preserves identity status, membership state and sorted roles; it
 never selects credential material. Maximum 256 members and 16 roles per
 member; oversized or malformed results fail closed with 503 rather than
-silently truncating. All administrative mutations remain on compatibility
-routes. This bounded experimental projection requires full acceptance before
-default activation.
+silently truncating.
+
+Member creation, role replacement, suspend, reinstate, removal and credential
+reset use the native transaction store. The HTTP boundary requires IAL2 and
+a first-party session. The store rechecks active tenant ownership inside a
+bounded transaction, serializes administrative changes using the shared
+advisory lock, locks a surviving owner before removing an active owner,
+and commits session revocation, audit-chain sealing and security outbox
+records atomically with each mutation. Credential generation uses the shared
+bounded KDF executor outside a SQL lease; secrets are returned only after
+successful commit. The synchronous HTTP administration ABI is retired and
+cannot call storage. Offline bootstrap/rekey operations are unaffected.
+Application and OAuth client administration are separate API boundaries;
+this change does not migrate them. Full executable acceptance remains
+mandatory before release.
 
 ### Native public authentication and OIDC metadata
 
@@ -964,13 +1322,15 @@ the corresponding flag to 0 in that case fails startup. Explicitly enabling
 a route when its parent subsystem is disabled also fails startup. Unsupported
 methods on these strict native paths fail closed.
 
-### Experimental native OAuth consent management
+### Native OAuth consent management
 
-`OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS=1` selects only GET
-`/oauth/consents` and POST `/oauth/consents/revoke`. Default is disabled.
-It requires enabled authentication, OIDC and native authentication sessions
-(`OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS=1`). Values other than 0 or 1,
-or missing dependencies, fail startup before database changes.
+OIDC-enabled runtimes require native GET `/oauth/consents` and POST
+`/oauth/consents/revoke`. The historical flag
+`OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS` accepts 0 or 1; setting it to
+0 when OIDC is enabled fails startup rather than restoring blocking SQL.
+Explicit enablement requires authentication, OIDC and native sessions.
+Invalid flags or missing configuration dependencies fail before database
+changes. Other methods on these two strict native paths fail closed.
 
 The adapter uses the first-party browser session cookie (not delegated OAuth
 Bearer credentials), the same OAuth IP rate-limit namespace, constant-time
@@ -985,9 +1345,8 @@ rejects malformed or oversized grants rather than truncating the response,
 and revokes only the exact owner/consent/application tenant. Repeated
 revocations retain the original timestamp. No schema migration is needed.
 Authorization, token issuance, introspection, token revocation, device flow
-and other OAuth methods retain the existing compatibility path. Do not
-enable this experimental option before exact-head compiled and real
-PostgreSQL/HTTP acceptance has passed.
+and other OAuth methods retain the existing compatibility path. Release
+still requires exact-head compiled and real PostgreSQL/HTTP acceptance.
 
 ### Native recovery-code issuance
 

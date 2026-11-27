@@ -23,6 +23,10 @@ public:
                                     gateway::TokenBucketRateLimiter& rateLimiter,
                                     gateway::HttpHandler& fallback,
                                     session::CoroutineReplacingSessionIssuer* asyncSessions = nullptr);
+    EnterpriseAuthenticationHttpApi(AuthenticationService& authentication,
+                                    gateway::TokenBucketRateLimiter& rateLimiter,
+                                    gateway::HttpHandler& fallback,
+                                    session::CoroutineReplacingSessionIssuer& asyncSessions);
 
     [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override;
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
@@ -43,7 +47,6 @@ private:
                                               bool clearState = false) const;
 
     AuthenticationService* m_authentication;
-    session::SessionService* m_sessions;
     session::CoroutineReplacingSessionIssuer* m_asyncSessions;
     gateway::TokenBucketRateLimiter* m_rateLimiter;
     gateway::HttpHandler* m_fallback;

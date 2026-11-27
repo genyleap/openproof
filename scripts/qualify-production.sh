@@ -17,8 +17,9 @@ fail() {
 [[ "${OPENPROOF_E2E_DATABASE_ACK:-}" == "YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE" ]] \
     || fail "set OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
 
-# The PostgreSQL integration fixture truncates OpenProof tables. Never point this
-# script at production, staging, or a shared development database.
+# Native SQL tests require a disposable database; destructive repository
+# integration runs separately in an ephemeral private socket cluster.
+# Never point any qualification database at production, staging or shared data.
 printf 'OpenProof %s production qualification\n' "$(tr -d '[:space:]' < "${ROOT_DIR}/VERSION")"
 printf 'PostgreSQL target: configured (value intentionally not printed)\n'
 
@@ -35,7 +36,7 @@ run_preset() {
 
     local ctest_log
     ctest_log="$(mktemp)"
-    if ! ctest --preset "${preset}" 2>&1 | tee "${ctest_log}"; then
+    if ! ctest --preset "${preset}" -E '^PostgresIntegrationTest\.' 2>&1 | tee "${ctest_log}"; then
         rm -f "${ctest_log}"
         fail "CTest failed for ${preset}"
     fi
@@ -50,7 +51,7 @@ run_preset() {
     [[ -x "${test_binary}" ]] || fail "test binary is missing for ${preset}"
     local pg_log
     pg_log="$(mktemp)"
-    if ! "${test_binary}" --gtest_filter='PostgresIntegrationTest.*' 2>&1 | tee "${pg_log}"; then
+    if ! bash "${ROOT_DIR}/scripts/run-disposable-postgres-integration-tests.sh" "${build_dir}" 2>&1 | tee "${pg_log}"; then
         rm -f "${pg_log}"
         fail "PostgreSQL integration tests failed for ${preset}"
     fi

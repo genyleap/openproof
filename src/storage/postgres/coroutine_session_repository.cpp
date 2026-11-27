@@ -15,7 +15,6 @@
 // Import modules only after all transitive textual standard/Asio headers.
 #include "coroutine_session_repository.hpp"
 
-import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.session;

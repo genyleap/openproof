@@ -53,6 +53,15 @@ protected:
     ChallengeStore() = default;
 };
 
+enum class AccountOperation { List, Issue, Consume, Persist };
+struct AccountCommand final {
+    AccountOperation operation;
+    identity::provider::ProviderId provider;
+    ChallengeDigest digest;
+    foundation::Instant expiresAt{};
+    std::vector<Evidence> records;
+};
+
 struct IssuedChallenge final {
     foundation::SecretString token;
     foundation::Instant expiresAt{};

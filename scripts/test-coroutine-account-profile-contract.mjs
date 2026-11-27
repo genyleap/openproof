@@ -15,7 +15,7 @@ const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 const main = read("apps/opp/main.cpp");
 
-test("native profile routes are method scoped and disabled by default", () => {
+test("native profile routes are strict-path scoped and mandatory for enabled account API", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadProfile readProfile = \{\}/);
   assert.match(header, /nativeEnabled\(\) const noexcept override \{ return false; \}/);
@@ -24,7 +24,7 @@ test("native profile routes are method scoped and disabled by default", () => {
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE/);
   assert.match(main, /nativeAccountProfileFlag && \*nativeAccountProfileFlag == "1"/);
   assert.match(main, /nativeAccountProfileEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Get\)/);
+  assert.match(main, /if \(nativeAccountProfileEnabled\) \{\s*nativePaths.emplace_back\("\/account\/profile"\)/);
   const overlay = read("src/gateway/http_coroutine.cpp");
   assert.match(overlay, /m_methodScopedNativePaths/);
   assert.match(overlay, /method == request\.method\(\)/);
@@ -58,7 +58,7 @@ test("native HTTP authenticates session before lookup and checks returned identi
   const start = accountNative.indexOf("CoroutineAccountSessionAdapter::profileRead(");
   assert.ok(start >= 0);
   const code = accountNative.slice(start);
-  const auth = code.indexOf("co_await m_authenticate(std::move(credential->value()))");
+  const auth = code.indexOf("co_await authenticate(std::move(credential->value()))");
   const readIndex = code.indexOf("co_await m_readProfile(authenticated->identity())");
   const identityCheck = code.indexOf("value->identity() != authenticated->identity()");
   const serialize = code.indexOf("json::object body;");
@@ -80,13 +80,24 @@ test("profile route is isolated from OAuth transaction provisioning", () => {
   assert.match(main, /reader->readProfileAsync\(std::move\(owner\)\)/);
 });
 
-test("delegated Bearer profile access preserves compatibility without blocking reactor", () => {
-  assert.match(account, /!request\.header\("authorization"\)\.has_value\(\)/);
+test("delegated Bearer reads use the native scope verifier when configured", () => {
+  assert.match(account, /\(!request\.header\("authorization"\)\.has_value\(\) \|\| m_authenticateReadBearer\)/);
+  assert.match(main, /std::move\(passwordUpgradeConfirm\), std::move\(profileWriter\),\s*authenticateNativeWeb3/);
+  assert.match(main, /authenticated \|\| authenticated\.error\(\)\.code\(\)!=fnd::ErrorCode::AuthenticationFailed/);
+  assert.ok(main.indexOf("auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose())") < main.indexOf("auto authenticated=co_await nativeSessions->authenticate(std::move(credential))"));
+  for (const name of ["profileRead", "connectionsRead"]) {
+    const start=account.indexOf("CoroutineAccountSessionAdapter::"+name+"(");
+    const body=account.slice(start,account.indexOf("co_return jsonResponse(200",start));
+    assert.match(body,/value_or\(""\)\.starts_with\("DPoP "\)/);
+    assert.match(body,/m_authenticateReadBearer : m_authenticate/);
+    assert.match(body,/co_await authenticate\(std::move\(credential->value\(\)\)\)/);
+  }
+  assert.match(read("tests/account/session_coroutine_http_test.cpp"), /ScopedBearerReadsNeverDelegateSessionOrCredentialMutations/);
   const gateway = read("src/gateway/http_coroutine.cpp");
   const sync = gateway.slice(
     gateway.indexOf("HttpResponse CoroutineRouteOverlay::handle(HttpRequest request)"),
     gateway.indexOf("boost::asio::awaitable<HttpResponse>\nCoroutineRouteOverlay::handleAsync("));
-  assert.match(sync, /overlays\(request\.path\(\)\) \|\| nativeEnabledFor\(request\)/);
+  assert.match(sync, /overlays\(request\.path\(\)\) \|\| strictMethodOverlay\(request\) \|\| nativeEnabledFor\(request\)/);
   assert.match(sync, /return m_compatibility->handle\(std::move\(request\)\)/);
   const asyncMethod = gateway.slice(
     gateway.indexOf("CoroutineRouteOverlay::handleAsync("),
@@ -128,7 +139,7 @@ test("profile mutation locks the owner and profile and only writes presentation 
     body.indexOf("RETURNING identity_id"));
   for (const forbidden of ["email", "phone_number", "created_at", "password_hash"])
     assert.ok(!mutation.includes(forbidden), forbidden);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Patch\)/);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/profile", gateway::HttpMethod::Put\)/);
+  assert.match(main, /nativePaths.emplace_back\("\/account\/profile"\)/);
+  assert.match(account,/request.method\(\)==gateway::HttpMethod::Patch \|\| request.method\(\)==gateway::HttpMethod::Put/);
   assert.match(account, /co_await m_updateProfile\(authenticated->identity\(\)/);
 });

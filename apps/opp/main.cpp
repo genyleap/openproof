@@ -31,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <version>
 
@@ -44,8 +45,15 @@
 #include "../../src/gateway/asio_thread_context_extern.hpp"
 #include <boost/asio/thread_pool.hpp>
 #include <boost/json.hpp>
+#include "../../src/storage/postgres/coroutine_startup.hpp"
 #include "../../src/storage/postgres/coroutine_auth_transaction_store.hpp"
 #include "../../src/storage/postgres/coroutine_canonical_finalizer.hpp"
+#include "../../src/operations/http/coroutine_health_http.hpp"
+#include "../../src/authentication/http/coroutine_passkey_http.hpp"
+#include "../../src/enterprise/scim/http/coroutine_read_http.hpp"
+#include "../../src/evidence/http/coroutine_evidence_http.hpp"
+#include "../../src/application/http/coroutine_management_read_http.hpp"
+#include "../../src/storage/postgres/coroutine_admin_store.hpp"
 #include "../../src/storage/postgres/coroutine_verification_challenge_store.hpp"
 #include "../../src/storage/postgres/coroutine_session_authenticator.hpp"
 #include "../../src/storage/postgres/coroutine_authorization_audit.hpp"
@@ -55,6 +63,7 @@
 #include "../../src/account/http/coroutine_session_http.hpp"
 #include "../../src/oauth/http/coroutine_discovery_http.hpp"
 #include "../../src/oauth/http/coroutine_consent_http.hpp"
+#include "../../src/oauth/http/coroutine_token_read_http.hpp"
 #include "../../src/storage/postgres/coroutine_consent_store.hpp"
 #include "../../src/storage/postgres/coroutine_local_proof_verifier.hpp"
 #include "../../src/authentication/http/coroutine_provider_catalog_http.hpp"
@@ -70,7 +79,6 @@ import openproof.account;
 import openproof.account.delivery;
 import openproof.account.http;
 import openproof.administration;
-import openproof.administration.http;
 import openproof.application;
 import openproof.application.http;
 import openproof.client;
@@ -91,7 +99,6 @@ import openproof.enterprise.scim;
 import openproof.enterprise.scim.http;
 import openproof.evidence;
 import openproof.evidence.verifiers;
-import openproof.evidence.http;
 import openproof.trust;
 import openproof.identity.provider;
 import openproof.identity.profile;
@@ -112,7 +119,6 @@ import openproof.provider.web3;
 import openproof.provider.enterprise;
 import openproof.security;
 import openproof.session;
-import openproof.storage.postgres;
 import openproof.telemetry;
 import openproof.token;
 
@@ -573,6 +579,33 @@ extern "C" void requestShutdown(int) noexcept
     g_shutdownRequested = 1;
 }
 
+// Preserve local administration namespace ownership without constructing
+// any legacy SQL-backed HTTP administrator. Application-management routes
+// are owned by the native route overlay before this boundary.
+class LocalAdministrationFallback final : public gateway::HttpHandler {
+public:
+    LocalAdministrationFallback(gateway::HttpHandler& fallback, gateway::TokenBucketRateLimiter& limiter)
+        : m_fallback(&fallback), m_limiter(&limiter) {}
+    [[nodiscard]] gateway::HttpResponse handle(gateway::HttpRequest request) override
+    {
+        if (request.path()!="/admin" && !request.path().starts_with("/admin/"))
+            return m_fallback->handle(std::move(request));
+        const auto error=m_limiter->allow("admin-ip:"+std::string{request.remoteAddress()})
+            ? fnd::ErrorCode::NotFound : fnd::ErrorCode::RateLimited;
+        request.wipeBody();
+        request.wipeAuthorizationHeader();
+        request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return gateway::HttpResponse{fnd::errorHttpStatus(error),
+            gateway::Headers{{"content-type","application/json"},{"cache-control","no-store"},
+                {"pragma","no-cache"},{"x-content-type-options","nosniff"},{"referrer-policy","no-referrer"}},
+            fnd::toClientJson(fnd::Error{error},request.correlation().value())};
+    }
+private:
+    gateway::HttpHandler* m_fallback;
+    gateway::TokenBucketRateLimiter* m_limiter;
+};
+
 class DenyAccess final : public gateway::AccessController {
 public:
     [[nodiscard]] policy::AuthorizationDecision authorize(
@@ -734,13 +767,13 @@ addProtectedRoutes(gateway::Router& router,
 }
 
 [[nodiscard]] fnd::Status verifyActiveMasterKey(
-    postgres::ConnectionPool& pool, const cfg::SecurityConfig& configuration)
+    const cfg::PlatformConfig& platform)
 {
-    auto fingerprint = masterKeyFingerprint(configuration);
+    auto fingerprint=masterKeyFingerprint(platform.security());
     if (!fingerprint) return fnd::fail(fingerprint.error());
-    postgres::PostgresMasterKeyRotator rotator{pool};
-    return rotator.verifyActive(
-        configuration.masterKeyVersion(), fingerprint.value());
+    return postgres::verifyMasterKeyBeforeListener(
+        platform.database().connectionString().clone(),
+        platform.security().masterKeyVersion(),fingerprint.value());
 }
 
 [[nodiscard]] ExitCode runPersistentKeyMaterialization(
@@ -984,32 +1017,19 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
     if (!migrations) {
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
+    const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresCredentialRekeyer rekeyer{*pool.value()};
-    auto report = rekeyer.rotateTotp(
+    auto report = postgres::rekeyTotpOffline(
+        platform.database().connectionString().clone(),
         currentKey.value(), platform.security().credentialEncryptionKeyVersion(),
         replacementKey.value(), commandLine.newKeyVersion(), commandLine.dryRun());
     if (!report) {
@@ -1078,32 +1098,21 @@ addProtectedRoutes(gateway::Router& router,
             "The replacement master key must use different key material."});
         return ExitCode::ConfigurationError;
     }
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
     if (!migrations) {
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresMasterKeyRotator rotator{*pool.value()};
-    const fnd::Status activeMaster = rotator.verifyActive(
-        securityConfig.masterKeyVersion(), currentFingerprint.value());
+    const fnd::Status activeMaster = postgres::verifyMasterKeyBeforeListener(
+        platform.database().connectionString().clone(),
+        securityConfig.masterKeyVersion(),currentFingerprint.value());
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
     }
-    auto report = rotator.rotate(
+    auto report = postgres::rotateMasterKeyOffline(
+        platform.database().connectionString().clone(),
         securityConfig.masterKeyVersion(), currentFingerprint.value(),
         commandLine.newKeyVersion(), replacementFingerprint.value(),
         commandLine.dryRun());
@@ -1149,26 +1158,13 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
     if (!migrations) {
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
+    const fnd::Status activeMaster = verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
@@ -1203,17 +1199,10 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(administrator.error());
         return ExitCode::ConfigurationError;
     }
-    auto repository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        idp::ProviderId{std::string{platform.auth().providerId()}},
-        std::move(auditKey).value());
-    if (!repository) {
-        reportStartupFailure(repository.error());
-        return ExitCode::InternalError;
-    }
-    const fnd::Status initialized = repository.value()->initialize(administrator.value());
+    const fnd::Status initialized = postgres::initializeAdministratorOffline(
+        platform.database().connectionString().clone(),administrator.value(),
+        passwordHasher.value(),totpKey.value(),platform.security().credentialEncryptionKeyVersion(),
+        idp::ProviderId{std::string{platform.auth().providerId()}},auditKey.value());
     if (!initialized) {
         reportStartupFailure(initialized.error());
         return initialized.error().code() == fnd::ErrorCode::AlreadyExists
@@ -1240,26 +1229,14 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
-        return ExitCode::ConfigurationError;
-    }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
+    auto migrations=postgres::migrateSchemaBeforeListener(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory());
     if (!migrations) {
         reportStartupFailure(migrations.error());
         return ExitCode::ConfigurationError;
     }
     const fnd::Status activeMaster =
-        verifyActiveMasterKey(*pool.value(), platform.security());
+        verifyActiveMasterKey(platform);
     if (!activeMaster) {
         reportStartupFailure(activeMaster.error());
         return ExitCode::ConfigurationError;
@@ -1282,20 +1259,11 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::InternalError;
     }
 
-    auto repository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        idp::ProviderId{std::string{platform.auth().providerId()}},
-        std::move(auditKey).value());
-    if (!repository) {
-        reportStartupFailure(repository.error());
-        return ExitCode::InternalError;
-    }
-
-    const fnd::Status repaired = repository.value()->repairInitialOwnerMembership(
+    const fnd::Status repaired = postgres::repairInitialOwnerOffline(
+        platform.database().connectionString().clone(),
         identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        identity::IdentityId{commandLine.identityId()}, clock.now());
+        identity::IdentityId{commandLine.identityId()},
+        idp::ProviderId{std::string{platform.auth().providerId()}},clock.now(),auditKey.value());
     if (!repaired) {
         reportStartupFailure(repaired.error());
         return repaired.error().code() == fnd::ErrorCode::FailedPrecondition
@@ -1394,7 +1362,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeSignupEnabled=nativeSignupFlag && *nativeSignupFlag=="1";
+    if (platform.account().enabled() && nativeSignupFlag && *nativeSignupFlag=="0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native signup and credential lifecycle."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeSignupEnabled=platform.account().enabled()
+        || (nativeSignupFlag && *nativeSignupFlag=="1");
     if (nativeSignupEnabled && (!platform.auth().enabled() || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native signup requires authentication and account API."});
@@ -1411,9 +1385,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_PROTECTED_GATEWAY must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeProtectedGatewayEnabled = nativeProtectedGatewayFlag
-        ? *nativeProtectedGatewayFlag == "1"
-        : platform.auth().enabled() && !platform.oidc().enabled();
+    if (platform.auth().enabled() && nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Authenticated proxy requires native gateway transport."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeProtectedGatewayEnabled = platform.auth().enabled()
+        || (nativeProtectedGatewayFlag && *nativeProtectedGatewayFlag == "1");
     if (nativeProtectedGatewayEnabled
         && !platform.auth().enabled()) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -1455,9 +1433,8 @@ addProtectedRoutes(gateway::Router& router,
     const bool nativeLdapEnabled = nativeLdapFlag
         ? *nativeLdapFlag == "1"
         : ldapUri && !ldapUri->empty();
-    // Account session management must not depend on whether enterprise LDAP
-    // is configured. Keep its native SQL path independently opt-in until
-    // compiled listener and disposable-PostgreSQL acceptance is complete.
+    // Account session management is mandatory whenever the account API
+    // is enabled, independent of the enterprise directory configuration.
     const auto nativeAccountFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS");
     if (nativeAccountFlag && *nativeAccountFlag != "0"
@@ -1467,11 +1444,14 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountEnabled =
-        nativeAccountFlag && *nativeAccountFlag == "1";
-    // Profile reads use the same native session authority and a separately
-    // tenant-scoped coroutine profile reader. Opt in explicitly; enabling
-    // session management alone must not migrate another account route.
+    if (platform.account().enabled() && nativeAccountFlag && *nativeAccountFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native session management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountEnabled = platform.account().enabled()
+        || (nativeAccountFlag && *nativeAccountFlag == "1");
+    // Profile management shares native sessions and tenant-scoped storage.
     const auto nativeAccountProfileFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE");
     if (nativeAccountProfileFlag && *nativeAccountProfileFlag != "0"
@@ -1481,8 +1461,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountProfileEnabled =
-        nativeAccountProfileFlag && *nativeAccountProfileFlag == "1";
+    if (platform.account().enabled() && nativeAccountProfileFlag && *nativeAccountProfileFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native profile management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountProfileEnabled = platform.account().enabled()
+        || (nativeAccountProfileFlag && *nativeAccountProfileFlag == "1");
     if (nativeAccountProfileEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{
@@ -1490,9 +1475,8 @@ addProtectedRoutes(gateway::Router& router,
             "Native account profile requires enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
-    // Read-only connection enumeration is separately gated. It may share
-    // the active tenant canonical reader with profile but never enables
-    // identity creation, linking or connection mutation.
+    // Connection enumeration shares the tenant reader, never provisioning
+    // identities or mutating links.
     const auto nativeAccountConnectionsFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS");
     if (nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag != "0"
@@ -1502,8 +1486,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountConnectionsEnabled =
-        nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "1";
+    if (platform.account().enabled() && nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native connection reads."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountConnectionsEnabled = platform.account().enabled()
+        || (nativeAccountConnectionsFlag && *nativeAccountConnectionsFlag == "1");
     if (nativeAccountConnectionsEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{
@@ -1511,8 +1500,8 @@ addProtectedRoutes(gateway::Router& router,
             "Native account connections require enabled account sessions and account API."});
         return ExitCode::ConfigurationError;
     }
-    // Status is read-only and independently gated; enrollment and disable
-    // remain on the compatibility implementation until migrated separately.
+    // TOTP status reads only boolean credential metadata. Mutations use
+    // the native credential lifecycle selected above.
     const auto nativeAccountTotpStatusFlag =
         environment.get("OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS");
     if (nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag != "0"
@@ -1521,8 +1510,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAccountTotpStatusEnabled =
-        nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "1";
+    if (platform.account().enabled() && nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled account management requires native TOTP status."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAccountTotpStatusEnabled = platform.account().enabled()
+        || (nativeAccountTotpStatusFlag && *nativeAccountTotpStatusFlag == "1");
     if (nativeAccountTotpStatusEnabled
         && (!nativeAccountEnabled || !platform.account().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -1570,7 +1564,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeAdminReadEnabled = nativeAdminReadFlag && *nativeAdminReadFlag == "1";
+    if (platform.auth().enabled() && nativeAdminReadFlag && *nativeAdminReadFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Authenticated runtime requires native administration."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeAdminReadEnabled = platform.auth().enabled()
+        || (nativeAdminReadFlag && *nativeAdminReadFlag == "1");
     if (nativeAdminReadEnabled && (!nativeAuthSessionEnabled || !platform.auth().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native administration reads require native authentication sessions and authentication API."});
@@ -1631,7 +1631,13 @@ addProtectedRoutes(gateway::Router& router,
             "OPENPROOF_EXPERIMENTAL_NATIVE_OAUTH_CONSENTS must be 0 or 1."});
         return ExitCode::ConfigurationError;
     }
-    const bool nativeConsentEnabled = nativeConsentFlag && *nativeConsentFlag == "1";
+    if (platform.oidc().enabled() && nativeConsentFlag && *nativeConsentFlag == "0") {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Enabled OIDC requires native browser consent management."});
+        return ExitCode::ConfigurationError;
+    }
+    const bool nativeConsentEnabled = platform.oidc().enabled()
+        || (nativeConsentFlag && *nativeConsentFlag == "1");
     if (nativeConsentEnabled && (!nativeAuthSessionEnabled
         || !platform.auth().enabled() || !platform.oidc().enabled())) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -1832,51 +1838,18 @@ addProtectedRoutes(gateway::Router& router,
         return runListener(platform, asyncGateway, logger);
     }
 
-    auto poolConfig = postgres::PoolConfig::create(
-        platform.database().connectionString().clone(), platform.database().poolSize(),
-        std::chrono::seconds{5});
-    if (!poolConfig) {
-        reportStartupFailure(poolConfig.error());
+    // Native SQL preflight finishes before any listener or request worker exists.
+    const auto fingerprint=masterKeyFingerprint(platform.security());
+    if (!fingerprint) {
+        reportStartupFailure(fingerprint.error());
         return ExitCode::ConfigurationError;
     }
-    auto pool = postgres::ConnectionPool::create(std::move(poolConfig).value());
-    if (!pool) {
-        reportStartupFailure(pool.error());
-        return ExitCode::ConfigurationError;
-    }
-    postgres::Migrator migrator{*pool.value()};
-    auto migrations = migrator.applyDirectory(platform.database().migrationDirectory());
-    if (!migrations) {
-        reportStartupFailure(migrations.error());
-        return ExitCode::ConfigurationError;
-    }
-    const fnd::Status activeMaster = verifyActiveMasterKey(
-        *pool.value(), platform.security());
-    if (!activeMaster) {
-        reportStartupFailure(activeMaster.error());
-        return ExitCode::ConfigurationError;
-    }
-
-    postgres::PostgresIdentityRepository identities{*pool.value()};
-    postgres::PostgresExternalIdentityDirectory externalIdentities{*pool.value()};
-    postgres::PostgresOrganizationRepository organizations{*pool.value()};
-    postgres::PostgresMembershipRepository memberships{*pool.value()};
-    postgres::PostgresSessionRepository sessionRepository{*pool.value()};
-    postgres::PostgresAuthenticationTransactionStore transactions{*pool.value()};
-    postgres::PostgresRecoveryCodeRepository recoveryRepository{*pool.value()};
-    postgres::PostgresPasskeyRepository passkeyRepository{*pool.value()};
-
-    auto configuredOrganization = organizations.findById(
-        identity::OrganizationId{std::string{platform.auth().organizationId()}});
-    if (!configuredOrganization) {
-        reportStartupFailure(configuredOrganization.error());
-        return ExitCode::ConfigurationError;
-    }
-    if (!configuredOrganization->has_value()
-        || !configuredOrganization->value().isUsable()) {
-        reportStartupFailure(fnd::Error{
-            fnd::ErrorCode::FailedPrecondition,
-            "The configured authentication organization is absent or inactive."});
+    const auto preflight=postgres::nativeDatabasePreflight(
+        platform.database().connectionString().clone(),platform.database().migrationDirectory(),
+        identity::OrganizationId{std::string{platform.auth().organizationId()}},
+        platform.security().masterKeyVersion(),fingerprint.value());
+    if (!preflight) {
+        reportStartupFailure(preflight.error());
         return ExitCode::ConfigurationError;
     }
 
@@ -1910,53 +1883,23 @@ addProtectedRoutes(gateway::Router& router,
         nativeLocalTotpKey.emplace(std::move(key).value());
         nativeLocalRecoveryPepper.emplace(recoverySecret->clone());
     }
-    auto administrationPasswordHasher = credentials::PasswordHasher::create(
-        passwordSecret->clone(), credentials::PasswordPolicy::recommended(),
-        std::string{platform.security().passwordHashAlgorithm()});
     auto administrationTotpKey = security::AeadKey::create(totpSecret->clone());
     auto administrationAuditKey = audit::AuditKey::create(auditSecret->clone());
     auto authorizationAuditKey = audit::AuditKey::create(
         std::move(auditSecret).value());
-    auto passwordHasher = credentials::PasswordHasher::create(
-        std::move(passwordSecret).value(), credentials::PasswordPolicy::recommended(),
-        std::string{platform.security().passwordHashAlgorithm()});
-    auto totpKey = security::AeadKey::create(std::move(totpSecret).value());
-    if (!passwordHasher || !totpKey || !administrationPasswordHasher
-        || !administrationTotpKey || !administrationAuditKey
-        || !authorizationAuditKey) {
+    if (!administrationTotpKey || !administrationAuditKey || !authorizationAuditKey) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
     const idp::ProviderId providerId{std::string{platform.auth().providerId()}};
-    auto accounts = postgres::PostgresLocalAccountDirectory::create(
-        *pool.value(), std::move(passwordHasher).value(),
-        credentials::TotpPolicy::recommended(), std::move(totpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(),
-        providerId);
 #ifdef OPENPROOF_HAS_NATIVE_RECOVERY_HTTP
     std::optional<fnd::SecretString> nativeRecoverySecret;
     if (nativeRecoveryEnabled) nativeRecoverySecret.emplace(recoverySecret->clone());
 #endif
-    auto recoveryCodes = credentials::RecoveryCodeService::create(
-        recoveryRepository, std::move(recoverySecret).value());
-    auto administrationRepository = postgres::PostgresAdministrationRepository::create(
-        *pool.value(), std::move(administrationPasswordHasher).value(),
-        std::move(administrationTotpKey).value(),
-        platform.security().credentialEncryptionKeyVersion(), providerId,
-        std::move(administrationAuditKey).value());
-    if (!accounts || !recoveryCodes || !administrationRepository) {
-        reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
-        return ExitCode::InternalError;
-    }
-
     idp::ProviderRegistry providers;
-    auto provider = std::make_unique<local::LocalAuthenticationProvider>(
-        providerId, *accounts.value(), clock, std::chrono::minutes{5},
-        &externalIdentities, &recoveryCodes.value());
-    const fnd::Status registered = providers.registerProvider(std::move(provider));
     auth::ProviderTrustPolicy trust;
     const fnd::Status trusted = trust.trust(providerId, idp::AssuranceLevel::Ial2);
-    if (!registered || !trusted) {
+    if (!trusted) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
@@ -1986,12 +1929,7 @@ addProtectedRoutes(gateway::Router& router,
             return ExitCode::ConfigurationError;
         }
         passkeyConfig.emplace(std::move(configured).value());
-        auto implementation = std::make_unique<passkey::PasskeyAuthenticationProvider>(
-            passkeyRepository, clock, *passkeyConfig);
-        auto status = providers.registerProvider(std::move(implementation));
-        if (status) {
-            status = trust.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2);
-        }
+        auto status = trust.trust(idp::ProviderId{"passkey"}, idp::AssuranceLevel::Ial2);
         if (!status) {
             reportStartupFailure(status.error());
             return ExitCode::ConfigurationError;
@@ -2550,19 +2488,9 @@ addProtectedRoutes(gateway::Router& router,
         }
     }
 
-    postgres::PostgresIdentityProviderStore identityProviderStore{*pool.value()};
-    // Retain the original synchronous AuthenticationService for the existing
-    // OAuth, account, SAML and other compatibility handlers. LDAP's native
-    // coordinator receives its own identical operator trust policy.
+    // Native coordinators share the operator's trust policy.
     auto nativeTrust = trust;
     auto nativeLocalTrust = trust;
-    auth::AuthenticationService authentication{
-        providers, transactions, externalIdentities, clock, std::move(trust),
-        std::chrono::minutes{5}, &identities,
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        &identityProviderStore};
-    session::SessionService sessions{
-        sessionRepository, clock, std::move(sessionKey).value(), sessionPolicy};
 
     // Native LDAP is deliberately opt-in until the complete compiler
     // and real-login E2E acceptance criteria have passed.
@@ -2575,13 +2503,14 @@ addProtectedRoutes(gateway::Router& router,
         nativeTransactions;
     std::unique_ptr<postgres::CoroutinePostgresCanonicalFinalizer>
         nativeCanonical;
+    std::unique_ptr<postgres::CoroutineAdminStore> nativeAdminStore;
     std::unique_ptr<postgres::CoroutinePostgresSessionRepository>
         nativeSessionRepository;
     std::unique_ptr<postgres::CoroutinePostgresSessionService>
         nativeSessions;
     std::unique_ptr<auth::AuthenticationService> nativeAuthentication;
     // Destroy coordinator and registry before their verifier/store. The
-    // ordinary registry retains the synchronous provider for legacy OAuth.
+    // ordinary registry also advertises the native local provider in discovery.
     std::unique_ptr<postgres::CoroutineLocalCredentialStore> nativeLocalStore;
     std::unique_ptr<postgres::CoroutinePostgresLocalProofVerifier> nativeLocalVerifier;
     std::unique_ptr<idp::ProviderRegistry> nativeLocalProviders;
@@ -2627,6 +2556,19 @@ addProtectedRoutes(gateway::Router& router,
             postgres::CoroutinePostgresSessionService>(
                 *nativeSessionRepository, clock,
                 std::move(*nativeSessionSecret), sessionPolicy);
+        if (nativeAdminReadEnabled) {
+            if (!nativeLocalPasswords) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native administration requires the bounded password executor."});
+                return ExitCode::ConfigurationError;
+            }
+            nativeAdminStore=std::make_unique<postgres::CoroutineAdminStore>(
+                executor,platform.database().connectionString().clone(),
+                identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                providerId,*nativeLocalPasswords,std::move(administrationTotpKey).value(),
+                platform.security().credentialEncryptionKeyVersion(),std::move(administrationAuditKey).value(),
+                nativeConnections,acquireDeadline,connectDeadline,queryDeadline);
+        }
         if (nativeConsentEnabled) {
             nativeConsentStore = std::make_unique<postgres::CoroutineConsentStore>(
                 executor, platform.database().connectionString().clone(),
@@ -2664,13 +2606,24 @@ addProtectedRoutes(gateway::Router& router,
                 postgres::CoroutinePostgresAuthenticationTransactionStore>(
                     executor, platform.database().connectionString().clone(),
                     nativeConnections, acquireDeadline, connectDeadline, queryDeadline);
+            if (passkeyConfig) {
+                if (!nativeCanonical) {
+                    reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition});
+                    return ExitCode::ConfigurationError;
+                }
+                auto status=providers.registerProvider(std::make_unique<authHttp::CoroutinePasskeyProvider>(
+                    *passkeyConfig,clock,[reader=nativeCanonical.get(),&config=*passkeyConfig](
+                        idp::ChallengeId challenge,passkey::AssertionResponse assertion,fnd::Instant now) {
+                        return reader->verifyPasskeyAssertionAsync(config,std::move(challenge),std::move(assertion),now);
+                    }));
+                if (!status) {
+                    reportStartupFailure(status.error());
+                    return ExitCode::ConfigurationError;
+                }
+            }
             nativeAuthentication = std::make_unique<auth::AuthenticationService>(
-                providers, *nativeTransactions, externalIdentities, clock,
-                std::move(nativeTrust), std::chrono::minutes{5},
-                &identities,
-                identity::OrganizationId{
-                    std::string{platform.auth().organizationId()}},
-                &identityProviderStore, nativeCanonical.get());
+                providers,*nativeTransactions,clock,
+                std::move(nativeTrust),std::chrono::minutes{5},*nativeCanonical);
         }
         if (nativeLocalEnabled) {
             nativeLocalStore = std::make_unique<postgres::CoroutineLocalCredentialStore>(
@@ -2689,11 +2642,16 @@ addProtectedRoutes(gateway::Router& router,
                 reportStartupFailure(status.error());
                 return ExitCode::ConfigurationError;
             }
+            auto catalogStatus=providers.registerProvider(
+                std::make_unique<local::CoroutineLocalAuthenticationProvider>(
+                    providerId,*nativeLocalVerifier,clock,std::chrono::minutes{5}));
+            if (!catalogStatus) {
+                reportStartupFailure(catalogStatus.error());
+                return ExitCode::ConfigurationError;
+            }
             nativeLocalAuthentication = std::make_unique<auth::AuthenticationService>(
-                *nativeLocalProviders, *nativeTransactions, externalIdentities, clock,
-                std::move(nativeLocalTrust), std::chrono::minutes{5}, &identities,
-                identity::OrganizationId{std::string{platform.auth().organizationId()}},
-                &identityProviderStore, nativeCanonical.get());
+                *nativeLocalProviders,*nativeTransactions,clock,
+                std::move(nativeLocalTrust),std::chrono::minutes{5},*nativeCanonical);
             if (!nativeLocalAuthentication->nativeProviderAuthenticationEnabled(providerId)) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
                     "Native local login capability is unavailable."});
@@ -2706,7 +2664,7 @@ addProtectedRoutes(gateway::Router& router,
     // six endpoints. Validate the complete dependency set before composing
     // any HTTP middleware or starting the listener.
     if (!nativeLocalEnabled || !nativeAuthSessionEnabled || !nativeRecoveryEnabled
-        || !nativeLocalAuthentication || !nativeSessions || !nativeCanonical) {
+        || !nativeLocalAuthentication || !nativeAuthentication || !nativeSessions || !nativeCanonical) {
         reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
             "Native first-party authentication runtime is incomplete."});
         return ExitCode::ConfigurationError;
@@ -2718,9 +2676,11 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 #endif
-    std::optional<passkey::PasskeyService> passkeyService;
-    if (passkeyConfig) {
-        passkeyService.emplace(passkeyRepository, externalIdentities, clock, *passkeyConfig);
+    if (passkeyConfig && (!nativeAuthentication ||
+        !nativeAuthentication->nativeProviderAuthenticationEnabled(idp::ProviderId{"passkey"}))) {
+        reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+            "Native passkey authentication runtime is incomplete."});
+        return ExitCode::ConfigurationError;
     }
     auto memberPolicy = policy::RolePolicyEngine::create(
         std::move(authorizationRules));
@@ -2728,17 +2688,7 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(memberPolicy.error());
         return ExitCode::ConfigurationError;
     }
-    postgres::PostgresAuthorizationDecisionSink authorizationAudit{
-        *pool.value(), std::move(authorizationAuditKey).value(), clock};
-    gateway::PolicyAccessController access{
-        memberPolicy->get(), organizations, identities, memberships,
-        &authorizationAudit};
-
-    postgres::PostgresEvidenceChallengeStore evidenceChallengeStore{*pool.value()};
-    evidence::EvidenceService evidenceService{identityProviderStore, clock};
-    evidenceVerification::ChallengeService evidenceChallenges{
-        evidenceChallengeStore, clock, std::chrono::minutes{5}};
-    std::set<std::string, std::less<>> evidenceProviders;
+    std::vector<std::unique_ptr<evidence::EvidenceVerifier>> evidenceVerifiers;
 
     if (const auto publicKey = environment.get("OPENPROOF_EVIDENCE_JWT_PUBLIC_KEY_PEM");
         publicKey && !publicKey->empty()) {
@@ -2756,12 +2706,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(verifier.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = evidenceService.registerVerifier(std::move(verifier).value());
-        if (!status) {
-            reportStartupFailure(status.error());
-            return ExitCode::ConfigurationError;
-        }
-        evidenceProviders.emplace("signed-jwt-evidence");
+        evidenceVerifiers.push_back(std::move(verifier).value());
     }
 
     if (const auto caFile = environment.get("OPENPROOF_EVIDENCE_X509_CA_FILE");
@@ -2773,12 +2718,7 @@ addProtectedRoutes(gateway::Router& router,
             reportStartupFailure(verifier.error());
             return ExitCode::ConfigurationError;
         }
-        auto status = evidenceService.registerVerifier(std::move(verifier).value());
-        if (!status) {
-            reportStartupFailure(status.error());
-            return ExitCode::ConfigurationError;
-        }
-        evidenceProviders.emplace("x509-evidence");
+        evidenceVerifiers.push_back(std::move(verifier).value());
     }
 
     trustModel::TrustPolicy evidenceTrustPolicy;
@@ -2788,13 +2728,7 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
-    trustModel::TrustEngine evidenceTrust{identityProviderStore, clock, std::move(evidenceTrustPolicy)};
 
-    postgres::PostgresAccountRepository accountRepository{*pool.value()};
-    postgres::PostgresScimDirectoryRepository scimDirectory{*pool.value()};
-    scim::Service scimService{
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        scimDirectory, identities, identityProviderStore, memberships, clock};
     std::optional<fnd::SecretString> scimBearerToken;
     if (auto configuredScimToken = environment.get("OPENPROOF_SCIM_BEARER_TOKEN");
         configuredScimToken && !configuredScimToken->empty()) {
@@ -2806,10 +2740,13 @@ addProtectedRoutes(gateway::Router& router,
         scimBearerToken.emplace(std::move(*configuredScimToken));
     }
 
-    operationsHttp::PostgresReadinessCheck readiness{*pool.value()};
     const oidc::OpenIdProvider* nativeOidcProvider = nullptr;
     gateway::Gateway* nativeGatewayCore = nullptr;
     oauthHttp::SenderProofVerifier* nativeGatewaySender=nullptr;
+    std::optional<fnd::SecretString> nativeOAuthClientKey;
+    std::optional<fnd::SecretString> nativeOAuthCodeKey;
+    std::optional<fnd::SecretString> nativeOAuthDeviceKey;
+    fnd::Duration nativeOAuthAccessLifetime{},nativeOAuthRefreshLifetime{};
 
     std::optional<fnd::SecretString> nativeWeb3DelegatedKey;
     if (nativeWeb3Enabled && platform.oidc().enabled()) {
@@ -2824,17 +2761,20 @@ addProtectedRoutes(gateway::Router& router,
         -> boost::asio::awaitable<fnd::Result<session::Session>> {
         if (!nativeSessions || !nativeCanonical)
             co_return fnd::fail(fnd::ErrorCode::Unavailable);
-        auto authenticated=co_await nativeSessions->authenticate(credential.clone());
-        if (authenticated || !nativeWeb3DelegatedKey)
-            co_return std::move(authenticated);
+        if (!nativeWeb3DelegatedKey)
+            co_return co_await nativeSessions->authenticate(std::move(credential));
         if (credential.empty() || credential.expose().size()>256U)
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
-        auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
-        credential=fnd::SecretString{};
-        if (!fingerprint) co_return fnd::fail(fingerprint.error());
+        // Compute the delegated digest before suspension. The session verifier
+        // consumes the raw credential synchronously before its own SQL await.
+        auto delegatedFingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
+        if (!delegatedFingerprint) co_return fnd::fail(delegatedFingerprint.error());
+        auto authenticated=co_await nativeSessions->authenticate(std::move(credential));
+        if (authenticated || authenticated.error().code()!=fnd::ErrorCode::AuthenticationFailed)
+            co_return std::move(authenticated);
         // The native SQL adapter receives only the keyed digest.
         co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
-            fnd::toHex(fingerprint.value()),clock.now());
+            fnd::toHex(delegatedFingerprint.value()),clock.now());
     };
 
     accountDelivery::CoroutineContactVerificationIssuer* nativeContactIssuer=nullptr;
@@ -2848,21 +2788,14 @@ addProtectedRoutes(gateway::Router& router,
     const auto runWithEvidence = [&](
         gateway::HttpHandler& fallback,
         gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
-        evidenceHttp::Api evidenceApi{
-            evidenceService, identityProviderStore, evidenceChallenges, evidenceTrust,
-            sessions, evidenceProviders, limiter.value(), fallback};
-        operationsHttp::HealthHttpApi healthApi{readiness, evidenceApi};
-        // Legacy health, evidence and SCIM middleware remain the authoritative
-        // compatibility chain. Exact native routes bypass it only when their
-        // independently verified coroutine dependencies are available.
-        // Only opt-in native PostgreSQL sessions can serve account session
-        // routes without blocking the HTTP reactor on the legacy libpq pool.
-        // All other account routes remain on the compatibility worker.
+        // Protocol routes own their native dispatch boundary. Legacy
+        // compatibility is retained only for explicitly remaining callers.
         std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;
         std::unique_ptr<accountHttp::CoroutineAccountSessionAdapter> asyncAccount;
         std::unique_ptr<accountHttp::CoroutineContactVerificationAdapter> asyncContact;
         std::unique_ptr<oauthHttp::CoroutineOidcDiscoveryAdapter> asyncOidc;
         std::unique_ptr<oauthHttp::CoroutineConsentAdapter> asyncConsent;
+        std::unique_ptr<oauthHttp::CoroutineTokenReadAdapter> asyncTokenRead;
         std::unique_ptr<authHttp::CoroutineProviderCatalogAdapter> asyncCatalog;
         std::unique_ptr<authHttp::CoroutineFederatedStartAdapter> asyncFederated;
         std::unique_ptr<authHttp::CoroutineFederatedCallbackAdapter> asyncFederatedCallback;
@@ -2995,7 +2928,7 @@ addProtectedRoutes(gateway::Router& router,
                 };
             }
             asyncAccount = std::make_unique<accountHttp::CoroutineAccountSessionAdapter>(
-                healthApi, *nativeHandler, limiter.value(),
+                fallback, *nativeHandler, limiter.value(),
                 [service](fnd::SecretString bearer) {
                     return service->authenticate(std::move(bearer));
                 },
@@ -3006,12 +2939,19 @@ addProtectedRoutes(gateway::Router& router,
                     return service->revokeOwned(std::move(owner), std::move(target));
                 }, std::move(profileReader), std::move(connectionsReader),
                 std::move(totpStatusReader), std::move(passwordStatusReader),
-                std::move(passwordUpgradeConfirm), std::move(profileWriter));
+                std::move(passwordUpgradeConfirm), std::move(profileWriter),
+                authenticateNativeWeb3,
+                [reader=nativeCanonical.get(),registered=providers.ids(),&clock](
+                    identity::IdentityId owner,identity::ExternalIdentityRef external) {
+                    return reader->disconnectAsync(std::move(owner),std::move(external),
+                        registered,clock.now());
+                });
             nativeHandler = asyncAccount.get();
             nativePaths.emplace_back("/account/sessions");
             nativePaths.emplace_back("/account/sessions/revoke");
-            // Profile reads and writes are method scoped below; delegated
-            // OAuth credentials remain on the compatibility worker.
+            nativePaths.emplace_back("/account/recover");
+            nativePaths.emplace_back("/account/security");
+            // All self-service account paths are strict native overlays.
         }
         if (nativeContactIssuer) {
             asyncContact=std::make_unique<accountHttp::CoroutineContactVerificationAdapter>(
@@ -3044,6 +2984,173 @@ addProtectedRoutes(gateway::Router& router,
                     return store->revokeAsync(std::move(id), std::move(owner), now);
                 });
             nativeHandler = asyncConsent.get();
+        }
+        if (platform.oidc().enabled()) {
+            if (!nativeCanonical || !nativeWeb3DelegatedKey || !nativeOAuthClientKey || !nativeGatewaySender
+                || !nativeOAuthCodeKey || !nativeOAuthDeviceKey || !nativeOidcProvider
+                || nativeOAuthAccessLifetime<=fnd::Duration::zero()
+                || nativeOAuthRefreshLifetime<=nativeOAuthAccessLifetime) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native OAuth token reads require native storage and sender verification."});
+                return ExitCode::ConfigurationError;
+            }
+            auto* reader=nativeCanonical.get();
+            asyncTokenRead=std::make_unique<oauthHttp::CoroutineTokenReadAdapter>(
+                *nativeHandler,limiter.value(),nativeWeb3DelegatedKey->clone(),nativeOAuthClientKey->clone(),
+                [reader,&clock](std::string digest,fnd::Instant* issued) {
+                    return reader->readDelegatedAccessAsync(std::move(digest),clock.now(),issued);
+                },
+                [reader](std::string clientId,std::string digest) {
+                    return reader->authenticateConfidentialClientAsync(std::move(clientId),std::move(digest));
+                },
+                [reader](identity::IdentityId owner) {
+                    return reader->readProfileAsync(std::move(owner));
+                },
+                [reader,sender=nativeGatewaySender](gateway::HttpRequest& request,
+                    session::DelegatedSenderConstraint constraint,fnd::SecretString token,bool dpop) {
+                    return sender->verifyAsync(request,constraint,token,dpop,
+                        [reader](session::DelegatedSenderConstraintKind kind,std::string thumbprint,
+                            std::string identifier,fnd::Instant expires,fnd::Instant observed) {
+                            return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
+                                std::move(identifier),expires,observed);
+                        });
+                },
+                [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
+                    std::string tokenDigest) {
+                    return reader->revokeOAuthTokenAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(tokenDigest),clock.now());
+                },
+                [reader,&clock,nativeOAuthAccessLifetime](std::string clientId,
+                    std::optional<std::string> clientDigest,std::string presented,std::string accessDigest,
+                    std::string refreshDigest,std::optional<session::DelegatedSenderConstraint> sender) {
+                    return reader->rotateOAuthRefreshAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(presented),std::move(accessDigest),std::move(refreshDigest),
+                        std::move(sender),clock.now(),nativeOAuthAccessLifetime);
+                },
+                [reader,sender=nativeGatewaySender](gateway::HttpRequest& request) {
+                    return sender->tokenEndpointConstraintAsync(request,
+                        [reader](session::DelegatedSenderConstraintKind kind,std::string thumbprint,
+                            std::string identifier,fnd::Instant expires,fnd::Instant observed) {
+                            return reader->consumeSenderReplayAsync(kind,std::move(thumbprint),
+                                std::move(identifier),expires,observed);
+                        });
+                },nativeOAuthAccessLifetime,
+                oauthHttp::CoroutineTokenReadAdapter::CodeExchangeContext{
+                    nativeOAuthCodeKey->clone(),
+                    [reader,&clock,oidc=nativeOidcProvider,nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime](
+                        std::string clientId,std::optional<std::string> clientDigest,std::string codeDigest,
+                        std::string redirectUri,std::string challenge,std::string family,
+                        std::string accessDigest,std::string refreshDigest,
+                        std::optional<session::DelegatedSenderConstraint> sender) {
+                        return reader->exchangeOAuthCodeAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(codeDigest),std::move(redirectUri),std::move(challenge),std::move(family),
+                            std::move(accessDigest),std::move(refreshDigest),std::move(sender),
+                            clock.now(),nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime,
+                            [oidc](const oauth::AuthorizationCode& code) {
+                                return oidc->issueIdTokenForNativeExchange(code);
+                            });
+                    }},
+                [reader,&clock,nativeOAuthAccessLifetime](std::string clientId,std::optional<std::string> clientDigest,
+                    std::optional<std::string> subjectDigest,std::string audience,std::vector<std::string> scopes,
+                    std::string family,std::string accessDigest,std::optional<session::DelegatedSenderConstraint> sender) {
+                    return reader->issueOAuthMachineGrantAsync(std::move(clientId),std::move(clientDigest),
+                        std::move(subjectDigest),std::move(audience),std::move(scopes),std::move(family),
+                        std::move(accessDigest),std::move(sender),clock.now(),nativeOAuthAccessLifetime);
+                },
+                oauthHttp::CoroutineTokenReadAdapter::DevicePollContext{
+                    nativeOAuthDeviceKey->clone(),
+                    [reader,&clock,nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime](
+                        std::string clientId,std::optional<std::string> clientDigest,std::string deviceDigest,
+                        std::string family,std::string accessDigest,std::string refreshDigest,
+                        std::optional<session::DelegatedSenderConstraint> sender) {
+                        return reader->pollOAuthDeviceAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(deviceDigest),std::move(family),std::move(accessDigest),std::move(refreshDigest),
+                            std::move(sender),clock.now(),nativeOAuthAccessLifetime,nativeOAuthRefreshLifetime);
+                    },
+                    [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
+                        std::string deviceDigest,std::string userDigest,std::vector<std::string> scopes,
+                        std::optional<std::string> resource) {
+                        return reader->beginOAuthDeviceAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(deviceDigest),std::move(userDigest),std::move(scopes),std::move(resource),
+                            clock.now(),std::chrono::minutes{10},std::chrono::seconds{5});
+                    },std::string{nativeOidcProvider->issuer()}+"/oauth/device",
+                    [service=nativeSessions.get()](fnd::SecretString credential) {
+                        return service->authenticate(std::move(credential));
+                    },
+                    [reader,&clock](std::string digest,identity::IdentityId owner) {
+                        return reader->readOAuthDeviceApprovalAsync(std::move(digest),std::move(owner),clock.now());
+                    },
+                    [reader,&clock](std::string digest,identity::IdentityId owner,session::SessionId sessionId,
+                        bool approve,std::string consentId) {
+                        return reader->decideOAuthDeviceAsync(std::move(digest),std::move(owner),
+                            std::move(sessionId),approve,std::move(consentId),clock.now());
+                    }},
+                oauthHttp::CoroutineTokenReadAdapter::ParContext{
+                    std::string{nativeOidcProvider->issuer()},
+                    [reader,&clock](std::string clientId,std::optional<std::string> clientDigest,
+                        std::string requestDigest,std::optional<oauth::AuthorizationRequest> direct,
+                        oauthHttp::CoroutineTokenReadAdapter::VerifyJar verify,bool signedFrontChannel) {
+                        return reader->pushOAuthAuthorizationAsync(std::move(clientId),std::move(clientDigest),
+                            std::move(requestDigest),std::move(direct),std::move(verify),
+                            clock.now(),std::chrono::seconds{90},signedFrontChannel);
+                    },
+                    [reader,&clock](std::string clientId,std::optional<std::string> parDigest,
+                        std::optional<oauth::AuthorizationRequest> direct,identity::IdentityId owner,
+                        session::SessionId sessionId,oauth::NativeAuthorizationDecision decision,
+                        std::string consentId,std::string codeDigest,
+                        postgres::CoroutinePostgresCanonicalFinalizer::SignAuthorizationResponse sign) {
+                        return reader->completeOAuthAuthorizationAsync(std::move(clientId),std::move(parDigest),
+                            std::move(direct),std::move(owner),std::move(sessionId),decision,
+                            std::move(consentId),std::move(codeDigest),clock.now(),std::chrono::minutes{5},std::move(sign));
+                    },
+                    [oidc=nativeOidcProvider](const oauth::AuthorizationRequest& request,bool denied,std::string_view code) {
+                        return oidc->issueAuthorizationResponse(request.clientId(),
+                            denied?std::nullopt:std::optional<std::string_view>{code},
+                            request.state()?std::optional<std::string_view>{*request.state()}:std::nullopt,
+                            denied?std::optional<std::string_view>{"access_denied"}:std::nullopt);
+                    }},
+                [service=nativeLocalAuthentication.get(),sessions=nativeSessions.get(),providerId](
+                    std::string subject,fnd::SecretString password,std::optional<fnd::SecretString> totp,
+                    std::optional<fnd::SecretString> prior,idp::ClientContext client,
+                    fnd::CorrelationId correlation)
+                    ->boost::asio::awaitable<fnd::Result<session::CoroutineIssuedSession>> {
+                    auto raw=security::randomTokenBase64Url(32U);
+                    if (!raw) co_return fnd::fail(raw.error());
+                    fnd::SecretString bindingSecret{std::move(raw).value()};
+                    auto binding=security::sha256(bindingSecret.expose());
+                    if (!binding) co_return fnd::fail(binding.error());
+                    bindingSecret=fnd::SecretString{};
+                    idp::AuthenticationRequest request{providerId,client};
+                    request.setParameter("subject",subject);
+                    request.setRequestedAssurance(totp?idp::AssuranceLevel::Ial2:
+                        idp::AssuranceLevel::Ial1);
+                    auto started=co_await service->beginAsync(std::move(request),binding.value(),correlation);
+                    if (!started) co_return fnd::fail(started.error());
+                    idp::AuthenticationResponse response{started->challenge().id(),client};
+                    response.setParameter("subject",idp::CredentialValue{std::move(subject)});
+                    response.setParameter("password",idp::CredentialValue{password.expose()});
+                    password=fnd::SecretString{};
+                    if (totp) {
+                        response.setParameter("totp",idp::CredentialValue{totp->expose()});
+                        totp.reset();
+                    }
+                    auto verified=co_await service->completeAsync(started->transactionId(),
+                        fnd::SecretString{std::string{started->continuationToken().expose()}},
+                        binding.value(),std::move(response));
+                    if (!verified) co_return fnd::fail(verified.error());
+                    co_return co_await sessions->issueReplacingAsync(verified.value(),std::move(client),std::move(prior));
+                });
+            nativeHandler=asyncTokenRead.get();
+            nativePaths.emplace_back("/oauth/userinfo");
+            nativePaths.emplace_back("/oauth/introspect");
+            nativePaths.emplace_back("/oauth/revoke");
+            nativePaths.emplace_back("/oauth/device_authorization");
+            nativePaths.emplace_back("/oauth/device");
+            nativePaths.emplace_back("/oauth/par");
+            nativePaths.emplace_back("/oauth/authorize");
+            nativePaths.emplace_back("/oauth/consent");
+            nativePaths.emplace_back("/login");
+            nativePaths.emplace_back("/oauth/token");
         }
         if (nativeOidcDiscoveryEnabled) {
             if (nativeOidcProvider == nullptr) {
@@ -3103,7 +3210,7 @@ addProtectedRoutes(gateway::Router& router,
                 *nativeAuthentication, providers, limiter.value(), *nativeHandler,
                 [service=nativeSessions.get()](fnd::SecretString token) {
                     return service->authenticate(std::move(token));
-                });
+                },authenticateNativeWeb3);
             nativeHandler = asyncFederated.get();
             nativePaths.emplace_back("/auth/federated/start");
 
@@ -3122,23 +3229,21 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/auth/federated/callback");
         }
         std::vector<std::pair<std::string, gateway::HttpMethod>> nativeMethods;
-        if (nativeContactIssuer) {
-            nativeMethods.emplace_back("/account/email/change",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/phone",gateway::HttpMethod::Post);
-            if (nativeTotp) {
-                nativeMethods.emplace_back("/account/totp/start",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/totp/complete",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/totp/disable",gateway::HttpMethod::Post);
+        if (nativeSignupEnabled) {
+            if (!nativeContactIssuer || !nativeSignup || !nativeVerifySignup
+                || !nativeResetPassword || !nativeVerifyPhone || !nativeVerifyEmailChange || !nativeTotp) {
+                reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
+                    "Native account credential lifecycle is unavailable."});
+                return ExitCode::ConfigurationError;
             }
-            if (nativeVerifyPhone) nativeMethods.emplace_back("/account/phone/verify",gateway::HttpMethod::Post);
-            if (nativeVerifyEmailChange) nativeMethods.emplace_back("/account/email/change/verify",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/email/resend",gateway::HttpMethod::Post);
-            nativeMethods.emplace_back("/account/password/forgot",gateway::HttpMethod::Post);
-            if (nativeResetPassword) nativeMethods.emplace_back("/account/password/reset",gateway::HttpMethod::Post);
-            if (nativeSignupEnabled) {
-                nativeMethods.emplace_back("/account/signup",gateway::HttpMethod::Post);
-                nativeMethods.emplace_back("/account/email/verify",gateway::HttpMethod::Post);
-            }
+            // Exact paths fail closed even if capability is withdrawn. No
+            // signup, verification or credential mutation can reach legacy SQL.
+            for (const auto* path : {"/account/signup", "/account/email/verify",
+                    "/account/email/change", "/account/email/change/verify",
+                    "/account/email/resend", "/account/phone", "/account/phone/verify",
+                    "/account/password/forgot", "/account/password/reset",
+                    "/account/totp/start", "/account/totp/complete", "/account/totp/disable"})
+                nativePaths.emplace_back(path);
         }
         if (nativeWeb3Enabled) {
             nativePaths.emplace_back("/account/connections/web3/start");
@@ -3146,27 +3251,25 @@ addProtectedRoutes(gateway::Router& router,
             nativePaths.emplace_back("/account/connections/web3/complete");
         }
         if (nativeFederatedStartEnabled) {
-            nativeMethods.emplace_back("/account/connections/start",gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/connections/handoff",gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/connections/start");
+            nativePaths.emplace_back("/account/connections/handoff");
+            nativePaths.emplace_back("/account/connections/complete");
         }
         if (nativeAccountProfileEnabled) {
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Patch);
-            nativeMethods.emplace_back("/account/profile", gateway::HttpMethod::Put);
+            nativePaths.emplace_back("/account/profile");
         }
         if (nativeAccountConnectionsEnabled) {
-            nativeMethods.emplace_back("/account/connections", gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/connections");
+            nativePaths.emplace_back("/account/connections/disconnect");
         }
         if (nativeAccountTotpStatusEnabled) {
-            nativeMethods.emplace_back("/account/totp", gateway::HttpMethod::Get);
+            nativePaths.emplace_back("/account/totp");
         }
         if (nativeLocalEnabled && nativeAccountEnabled && platform.account().enabled()) {
-            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/account/password/upgrade", gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/account/password/upgrade");
         }
         if (nativeAdminReadEnabled) {
-            if (!nativeSessions || !nativeCanonical) {
+            if (!nativeSessions || !nativeCanonical || !nativeAdminStore) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
                     "Native administration reader is unavailable."});
                 return ExitCode::ConfigurationError;
@@ -3180,20 +3283,132 @@ addProtectedRoutes(gateway::Router& router,
                 },
                 [canonical](identity::IdentityId actor) {
                     return canonical->readMembersAsync(std::move(actor));
-                });
+                }, adminHttp::CoroutineAdministrationReadAdapter::MutationContext{
+                    identity::OrganizationId{std::string{platform.auth().organizationId()}},
+                    providerId,&clock,
+                    [store=nativeAdminStore.get()](identity::IdentityId actor,
+                        const adminHttp::CoroutineAdministrationReadAdapter::Command& command) {
+                        return store->mutateAsync(std::move(actor),command);
+                    }});
             nativeHandler = asyncAdminRead.get();
-            nativeMethods.emplace_back("/admin/local-members", gateway::HttpMethod::Get);
+            for (const auto* path : {"/admin/local-members","/admin/local-members/roles",
+                    "/admin/local-members/suspend","/admin/local-members/reinstate",
+                    "/admin/local-members/remove","/admin/local-members/credentials/reset"})
+                nativePaths.emplace_back(path);
         }
         if (nativeRecoveryEnabled) {
             nativePaths.emplace_back("/auth/recovery-codes");
         }
         if (nativeConsentEnabled) {
-            nativeMethods.emplace_back("/oauth/consents", gateway::HttpMethod::Get);
-            nativeMethods.emplace_back("/oauth/consents/revoke", gateway::HttpMethod::Post);
+            nativePaths.emplace_back("/oauth/consents");
+            nativePaths.emplace_back("/oauth/consents/revoke");
         }
+        std::unique_ptr<applicationHttp::CoroutineManagementReadAdapter> nativeManagement;
+        if (platform.oidc().enabled()) {
+            nativeManagement=std::make_unique<applicationHttp::CoroutineManagementReadAdapter>(
+                *nativeHandler,limiter.value(),
+                [service=nativeSessions.get()](fnd::SecretString credential) {
+                    return service->authenticate(std::move(credential));
+                },
+                [reader=nativeCanonical.get(),&clock](application::ManagementRead operation,
+                    identity::IdentityId actor,session::SessionId sessionId,std::optional<std::string> filter) {
+                    return reader->readApplicationManagementAsync(operation,std::move(actor),
+                        std::move(sessionId),std::move(filter),clock.now());
+                },
+                [reader=nativeCanonical.get(),&clock](application::ApplicationMutationCommand command,
+                    identity::IdentityId actor,session::SessionId sessionId) {
+                    return reader->mutateApplicationAsync(std::move(command),std::move(actor),
+                        std::move(sessionId),clock.now());
+                },
+                applicationHttp::CoroutineManagementReadAdapter::ClientContext{
+                    nativeOAuthClientKey->clone(),
+                    [reader=nativeCanonical.get(),&clock](client::ManagementMutationCommand command,
+                        identity::IdentityId actor,session::SessionId sessionId) {
+                        return reader->mutateOAuthClientAsync(std::move(command),std::move(actor),
+                            std::move(sessionId),clock.now());
+                    },
+                    [reader=nativeCanonical.get(),&clock](client::ClientId id,std::optional<std::string> kid,
+                        std::optional<std::string> pem,identity::IdentityId actor,session::SessionId sessionId) {
+                        return reader->mutateOAuthJarKeyAsync(std::move(id),std::move(kid),std::move(pem),
+                            std::move(actor),std::move(sessionId),clock.now());
+                    }},
+                [reader=nativeCanonical.get(),&clock](resource::ResourceMutationCommand command,
+                    identity::IdentityId actor,session::SessionId sessionId) {
+                    return reader->mutateOAuthResourceAsync(std::move(command),std::move(actor),
+                        std::move(sessionId),clock.now());
+                },
+                [reader=nativeCanonical.get(),&clock](resource::ServiceMutationCommand command,
+                    identity::IdentityId actor,session::SessionId sessionId) {
+                    return reader->mutateServiceIdentityAsync(std::move(command),std::move(actor),
+                        std::move(sessionId),clock.now());
+                });
+            nativeHandler=nativeManagement.get();
+            for (const auto* route : {"/admin/console","/admin/applications","/admin/applications/suspend",
+                "/admin/applications/activate","/admin/applications/revoke","/admin/clients",
+                "/admin/clients/suspend","/admin/clients/activate","/admin/clients/revoke","/admin/clients/rotate-secret",
+                "/admin/clients/jar-key","/admin/resources","/admin/resources/suspend",
+                "/admin/resources/activate","/admin/resources/revoke","/admin/service-identities",
+                "/admin/service-identities/activate","/admin/service-identities/deactivate"})
+                nativePaths.emplace_back(route);
+        }
+        std::unique_ptr<authHttp::CoroutinePasskeyAccountAdapter> nativePasskeyAccount;
+        if (passkeyConfig) {
+            nativePasskeyAccount=std::make_unique<authHttp::CoroutinePasskeyAccountAdapter>(
+                *nativeHandler,limiter.value(),clock,*passkeyConfig,
+                [service=nativeSessions.get()](fnd::SecretString credential) {
+                    return service->authenticate(std::move(credential));
+                },
+                [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                    fnd::Instant now,std::optional<passkey::RegistrationCeremony> ceremony) {
+                    return reader->readPasskeyAccountAsync(std::move(actor),std::move(sessionId),now,std::move(ceremony));
+                },
+                [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                    fnd::Instant now,std::string credentialId,std::optional<idp::ChallengeId> ceremony,
+                    std::optional<passkey::PasskeyCredential> verified) {
+                    return reader->mutatePasskeyAccountAsync(std::move(actor),std::move(sessionId),now,
+                        std::move(credentialId),std::move(ceremony),std::move(verified));
+                },nativeAuthentication.get(),nativeSessions.get());
+            nativeHandler=nativePasskeyAccount.get();
+            nativePaths.emplace_back("/account/passkeys");
+            nativePaths.emplace_back("/auth/passkey/options");
+            nativePaths.emplace_back("/auth/passkey/verify");
+        }
+        std::unique_ptr<scimHttp::CoroutineReadAdapter> nativeScimRead;
+        std::vector<std::string> strictNativePrefixes;
+        if (passkeyConfig) strictNativePrefixes.emplace_back("/account/passkeys/");
+        if (scimBearerToken) {
+            nativeScimRead=std::make_unique<scimHttp::CoroutineReadAdapter>(
+                *nativeHandler,limiter.value(),scimBearerToken->clone(),
+                [reader=nativeCanonical.get()](scim::ReadRequest request) {
+                    return reader->readScimAsync(std::move(request));
+                },
+                [reader=nativeCanonical.get(),&clock](scim::MutationRequest request) {
+                    return reader->mutateScimAsync(std::move(request),clock.now());
+                });
+            nativeHandler=nativeScimRead.get();
+            nativePaths.emplace_back("/scim/v2");
+            strictNativePrefixes.emplace_back("/scim/v2/");
+        }
+        evidenceHttp::CoroutineEvidenceAdapter nativeEvidence{*nativeHandler,limiter.value(),clock,
+            std::move(evidenceVerifiers),std::move(evidenceTrustPolicy),
+            [service=nativeSessions.get()](fnd::SecretString credential) {
+                return service->authenticate(std::move(credential));
+            },
+            [reader=nativeCanonical.get()](identity::IdentityId actor,session::SessionId sessionId,
+                fnd::Instant now,evidenceVerification::AccountCommand command) {
+                return reader->evidenceAccountAsync(std::move(actor),std::move(sessionId),now,std::move(command));
+            }};
+        nativeHandler=&nativeEvidence;
+        nativePaths.emplace_back("/evidence");
+        nativePaths.emplace_back("/trust");
+        strictNativePrefixes.emplace_back("/evidence/");
+        operationsHttp::CoroutineHealthAdapter nativeHealth{*nativeHandler,
+            [reader=nativeCanonical.get()] { return reader->healthCheckAsync(); }};
+        nativePaths.emplace_back("/health/live");
+        nativePaths.emplace_back("/health/ready");
         gatewayHttp::CoroutineRouteOverlay nativeRoutes{
-            healthApi, *nativeHandler, std::move(nativePaths),
-            std::move(nativeMethods)};
+            fallback, nativeHealth, std::move(nativePaths),
+            std::move(nativeMethods),std::move(strictNativePrefixes)};
         if (nativeProtectedGatewayEnabled) {
             if (!nativeGatewayCore || !nativeGatewayVerifier || !nativeCanonical || !nativeGatewayAudit) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3265,69 +3480,22 @@ addProtectedRoutes(gateway::Router& router,
         return runListener(platform, nativeRoutes, logger);
     };
 
-    const auto runWithScim = [&](
-        gateway::HttpHandler& fallback,
-        gatewayHttp::CoroutineHttpHandler& nativeEnterprise) -> ExitCode {
-        if (!scimBearerToken) return runWithEvidence(fallback, nativeEnterprise);
-        scimHttp::Api scimApi{
-            scimService, scimBearerToken->clone(), limiter.value(), fallback};
-        return runWithEvidence(scimApi, nativeEnterprise);
-    };
-
     const auto runWithEnterprise = [&](gateway::HttpHandler& fallback) -> ExitCode {
-        authHttp::EnterpriseAuthenticationHttpApi enterpriseApi{
-            nativeAuthentication ? *nativeAuthentication : authentication,
-            sessions, limiter.value(), fallback, nativeSessions.get()};
-        // The native local handler is a leaf of the native-only chain.
-        // Keep the synchronous compatibility chain unchanged for other routes.
-        if (nativeLocalEnabled) {
-            authHttp::AuthenticationHttpApi nativeLocalApi{
-                *nativeLocalAuthentication, *nativeSessions,
-                limiter.value(), providerId, fallback};
-            authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
-                nativeAuthentication ? *nativeAuthentication : authentication,
-                sessions, limiter.value(), nativeLocalApi, nativeSessions.get()};
-            if (nativeWeb3Enabled) {
-                authHttp::Web3AuthenticationHttpApi localWeb3Api{
-                    *nativeAuthentication, providers, sessions, limiter.value(),
-                    localEnterpriseApi, nullptr, nativeSessions.get(),
-                    authenticateNativeWeb3};
-                return runWithScim(enterpriseApi, localWeb3Api);
-            }
-            return runWithScim(enterpriseApi, localEnterpriseApi);
-        }
+        authHttp::AuthenticationHttpApi nativeLocalApi{
+            *nativeLocalAuthentication,*nativeSessions,limiter.value(),providerId,fallback};
+        authHttp::EnterpriseAuthenticationHttpApi localEnterpriseApi{
+            *nativeAuthentication,limiter.value(),nativeLocalApi,*nativeSessions};
         if (nativeWeb3Enabled) {
-            // Compose native Web3 ABOVE the native LDAP adapter. Its guarded
-            // coroutine fallback delegates LDAP without touching the legacy
-            // Web3 handler, and the exact-path overlay decides which opt-ins
-            // actually receive native requests.
-            authHttp::Web3AuthenticationHttpApi nativeWeb3Api{
-                *nativeAuthentication, providers, sessions, limiter.value(),
-                enterpriseApi, nullptr, nativeSessions.get(),
-                authenticateNativeWeb3};
-            return runWithScim(enterpriseApi, nativeWeb3Api);
+            authHttp::Web3AuthenticationHttpApi localWeb3Api{
+                *nativeAuthentication,providers,limiter.value(),
+                localEnterpriseApi,*nativeSessions,authenticateNativeWeb3};
+            return runWithEvidence(fallback,localWeb3Api);
         }
-        return runWithScim(enterpriseApi, enterpriseApi);
+        return runWithEvidence(fallback,localEnterpriseApi);
     };
 
-    const auto runWithWeb3 = [&](gateway::HttpHandler& fallback,
-                                 session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        authHttp::Web3AuthenticationHttpApi web3Api{
-            authentication, providers, sessions, limiter.value(), fallback, delegated};
-        return runWithEnterprise(web3Api);
-    };
-
-    const auto runWithPasskey = [&](gateway::HttpHandler& fallback,
-                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        if (!passkeyService) return runWithWeb3(fallback, delegated);
-        authHttp::PasskeyAuthenticationHttpApi passkeyApi{
-            *passkeyService, authentication, sessions, limiter.value(), fallback};
-        return runWithWeb3(passkeyApi, delegated);
-    };
-
-    const auto runWithAccount = [&](gateway::HttpHandler& fallback,
-                                    session::DelegatedAccessAuthenticator* delegated) -> ExitCode {
-        if (!platform.account().enabled()) return runWithPasskey(fallback, delegated);
+    const auto runWithAccount = [&](gateway::HttpHandler& fallback) -> ExitCode {
+        if (!platform.account().enabled()) return runWithEnterprise(fallback);
 
         auto verificationMaterial = deriveSecret(
             platform.security().tokenSigningKey(), "openproof/account-verification-key/v1");
@@ -3337,15 +3505,13 @@ addProtectedRoutes(gateway::Router& router,
         }
         auto nativeVerificationKey=account::VerificationKey::create(verificationMaterial->clone());
         auto signupKey=account::VerificationKey::create(verificationMaterial->clone());
-        auto verificationKey = account::VerificationKey::create(
-            std::move(verificationMaterial).value());
         auto accountPolicy = account::AccountPolicy::create(
             std::chrono::hours{24}, std::chrono::minutes{10},
             std::chrono::minutes{30}, 8U);
         auto deliveryProxyConfig = gatewayHttp::ProxyConfig::create(
             32U * 1024U, 256U * 1024U,
             std::string{platform.account().deliveryCaFile()});
-        if (!verificationKey || !nativeVerificationKey || !signupKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
+        if (!nativeVerificationKey || !signupKey || !accountPolicy || !deliveryProxyConfig || !nativeIo || !nativeSessions || !nativeCanonical) {
             reportStartupFailure(fnd::Error{fnd::ErrorCode::InvalidArgument});
             return ExitCode::ConfigurationError;
         }
@@ -3353,17 +3519,6 @@ addProtectedRoutes(gateway::Router& router,
             std::move(deliveryProxyConfig).value());
         if (!deliveryTransport) {
             reportStartupFailure(deliveryTransport.error());
-            return ExitCode::ConfigurationError;
-        }
-        auto delivery = accountDelivery::createWebhookVerificationDelivery(
-            *deliveryTransport.value(),
-            std::string{platform.account().deliveryHost()},
-            platform.account().deliveryPort(), platform.account().deliveryTls(),
-            std::string{platform.account().deliveryPath()},
-            platform.account().deliveryAuthorization().clone(),
-            std::chrono::seconds{10});
-        if (!delivery) {
-            reportStartupFailure(delivery.error());
             return ExitCode::ConfigurationError;
         }
         auto nativeDelivery=accountDelivery::createCoroutineWebhookVerificationDelivery(
@@ -3398,15 +3553,9 @@ addProtectedRoutes(gateway::Router& router,
             [&contactStore](account::VerificationChallenge challenge,idp::ProviderId verificationProvider) {
                 return contactStore.replacePublicEmailAsync(std::move(challenge),std::move(verificationProvider));
             });
-        account::AccountService accountService{
-            identity::OrganizationId{std::string{platform.auth().organizationId()}},
-            providerId,
-            idp::ProviderId{std::string{platform.account().phoneProviderId()}},
-            identities, externalIdentities, identityProviderStore,
-            *accounts.value(), recoveryCodes.value(), accountRepository, sessions, clock,
-            std::move(verificationKey).value(), accountPolicy.value(), *delivery.value()};
-        accountHttp::AccountHttpApi accountApi{
-            accountService, authentication, sessions, limiter.value(), fallback, delegated};
+        // Namespace-only fallback: all account operations are native; no
+        // synchronous AccountService or verification repository is composed.
+        accountHttp::AccountHttpApi accountApi{limiter.value(),fallback};
         if (nativeSignupEnabled) {
             if (!nativeLocalPasswords || !nativeLocalAuthentication) {
                 reportStartupFailure(fnd::Error{fnd::ErrorCode::FailedPrecondition,
@@ -3453,8 +3602,8 @@ addProtectedRoutes(gateway::Router& router,
                 co_return co_await nativeSessions->issueAsync(verified.value(),std::move(client));
             };
         }
-        // Keep reset cutover coupled to the isolated native signup opt-in
-        // until session-generation fencing and live acceptance are verified.
+        // Password reset shares the native credential lifecycle and its
+        // session-generation fence.
         if (nativeSignupEnabled) {
             nativeResetPassword=[&](account::VerificationId id,fnd::SecretString secret,fnd::SecretString password)
                 ->boost::asio::awaitable<fnd::Status> {
@@ -3532,7 +3681,7 @@ addProtectedRoutes(gateway::Router& router,
             };
         }
         nativeContactIssuer=&contactIssuer;
-        const auto result=runWithPasskey(accountApi,delegated);
+        const auto result=runWithEnterprise(accountApi);
         nativeSignup={};
         nativeVerifySignup={};
         nativeResetPassword={};
@@ -3545,20 +3694,11 @@ addProtectedRoutes(gateway::Router& router,
 
     if (!platform.oidc().enabled()) {
         gateway::Gateway gatewayCore{
-            router, sessions, access, limiter.value(), discovery, loadBalancer,
-            circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10}};
+            router, limiter.value(), discovery, loadBalancer,
+            circuits.value(), signer.value(), std::chrono::seconds{10}};
         nativeGatewayCore = &gatewayCore;
-        adminHttp::AdministrationHttpApi administrationApi{
-            sessions, *administrationRepository.value(), identities, memberships,
-            limiter.value(),
-            identity::OrganizationId{std::string{platform.auth().organizationId()}},
-            providerId, clock, gatewayCore};
-        authHttp::AuthenticationHttpApi authApi{
-            *nativeLocalAuthentication, *nativeSessions,
-            limiter.value(), providerId, administrationApi};
-        authHttp::FederatedAuthenticationHttpApi federatedApi{
-            authentication, providers, sessions, limiter.value(), authApi, nullptr, true};
-        return runWithAccount(federatedApi, nullptr);
+        LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
+        return runWithAccount(administrationApi);
     }
 
     auto clientSecretMaterial = oauthClientSecretMaterial(platform.security());
@@ -3573,6 +3713,9 @@ addProtectedRoutes(gateway::Router& router,
         reportStartupFailure(fnd::Error{fnd::ErrorCode::Internal});
         return ExitCode::InternalError;
     }
+    nativeOAuthClientKey.emplace(clientSecretMaterial->clone());
+    nativeOAuthCodeKey.emplace(authorizationCodeMaterial->clone());
+    nativeOAuthDeviceKey.emplace(deviceAuthorizationMaterial->clone());
     auto clientSecretKey = client::ClientSecretKey::create(
         std::move(clientSecretMaterial).value());
     auto authorizationCodeKey = oauth::AuthorizationCodeKey::create(
@@ -3595,38 +3738,15 @@ addProtectedRoutes(gateway::Router& router,
         return ExitCode::ConfigurationError;
     }
 
-    postgres::PostgresResourceRepository resourceRepository{*pool.value()};
-    postgres::PostgresConsentRepository consentRepository{*pool.value()};
-    resource::ResourceRegistry resourceRegistry{resourceRepository, clock};
-    consent::ConsentService consentService{consentRepository, clock};
-
-    application::ApplicationRegistry applicationRegistry{identityProviderStore, clock};
-    client::ClientManager clientManager{
-        identityProviderStore, identityProviderStore, clock,
-        std::move(clientSecretKey).value()};
-    resource::ServiceIdentityService serviceIdentityService{
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        identities, resourceRepository, clientManager, clock};
-    oauth::AuthorizationService authorizationService{
-        clientManager, identityProviderStore, clock,
-        std::move(authorizationCodeKey).value(), std::chrono::minutes{5}};
-    token::TokenService tokenService{
-        identityProviderStore, clientManager, clock, std::move(tokenKey).value(),
-        std::move(tokenPolicy).value()};
-    oauth::DeviceAuthorizationService deviceAuthorizationService{
-        identityProviderStore, clientManager, clock,
-        std::move(deviceAuthorizationKey).value(), std::chrono::minutes{10},
-        std::chrono::seconds{5}};
-    oauth::PushedAuthorizationService pushedAuthorizationService{
-        identityProviderStore, clock, std::chrono::seconds{90}};
-    oauth::JarService jarService{identityProviderStore, identityProviderStore, clock};
+    nativeOAuthAccessLifetime=tokenPolicy->accessLifetime();
+    nativeOAuthRefreshLifetime=tokenPolicy->refreshLifetime();
     oidc::OpenIdProvider openIdProvider{
         std::move(oidcIssuer).value(), clock, std::move(oidcSigner).value(),
-        identityProviderStore, std::move(oidcPolicy).value(),
+        std::move(oidcPolicy).value(),
         std::move(previousOidcKeys).value()};
     nativeOidcProvider = &openIdProvider;
     oauth::DpopService dpopService{
-        identityProviderStore, clock, std::chrono::minutes{5}};
+        clock, std::chrono::minutes{5}};
     std::optional<fnd::SecretString> mtlsForwardingKey;
     if (auto configuredKey = environment.get("OPENPROOF_MTLS_FORWARDING_KEY");
         configuredKey.has_value()) {
@@ -3639,37 +3759,16 @@ addProtectedRoutes(gateway::Router& router,
         mtlsForwardingKey.emplace(std::move(configuredKey).value());
     }
     oauthHttp::SenderProofVerifier senderProof{
-        dpopService, identityProviderStore, clock, std::string{openIdProvider.issuer()},
+        dpopService, clock, std::string{openIdProvider.issuer()},
         std::move(mtlsForwardingKey)};
     nativeGatewaySender=&senderProof;
 
     gateway::Gateway gatewayCore{
-        router, sessions, access, limiter.value(), discovery, loadBalancer,
-        circuits.value(), *proxy.value(), signer.value(), std::chrono::seconds{10},
-        &tokenService, &senderProof};
+        router, limiter.value(), discovery, loadBalancer,
+        circuits.value(), signer.value(), std::chrono::seconds{10}};
     nativeGatewayCore = &gatewayCore;
-    adminHttp::AdministrationHttpApi administrationApi{
-        sessions, *administrationRepository.value(), identities, memberships,
-        limiter.value(),
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        providerId, clock, gatewayCore};
-    authHttp::AuthenticationHttpApi authApi{
-        *nativeLocalAuthentication, *nativeSessions,
-        limiter.value(), providerId, administrationApi};
-    authHttp::FederatedAuthenticationHttpApi federatedApi{
-        authentication, providers, sessions, limiter.value(), authApi, &tokenService, true};
-    oauthHttp::OAuthHttpApi oauthApi{
-        authorizationService, tokenService, openIdProvider, clientManager,
-        authentication, sessions, providerId, consentService, resourceRegistry,
-        serviceIdentityService, deviceAuthorizationService, pushedAuthorizationService,
-        jarService, senderProof, limiter.value(), federatedApi};
-    applicationHttp::ApplicationManagementHttpApi applicationApi{
-        applicationRegistry, identityProviderStore, clientManager,
-        identityProviderStore, resourceRegistry, serviceIdentityService, jarService,
-        sessions, memberships, limiter.value(),
-        identity::OrganizationId{std::string{platform.auth().organizationId()}},
-        oauthApi};
-    return runWithAccount(applicationApi, &tokenService);
+    LocalAdministrationFallback administrationApi{gatewayCore,limiter.value()};
+    return runWithAccount(administrationApi);
 }
 
 /** @brief Reports a startup failure on stderr, before a logger may exist. */

@@ -4,9 +4,14 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include <boost/asio/detail/call_stack.hpp>
+#include "../../src/gateway/asio_thread_context_extern.hpp"
+#include <boost/asio.hpp>
 #include <boost/json.hpp>
+#include "coroutine_admin_read_http.hpp"
 
 import openproof.administration;
 import openproof.administration.http;
@@ -30,16 +35,22 @@ namespace org = openproof::organization;
 namespace sec = openproof::security;
 namespace sess = openproof::session;
 namespace json = boost::json;
+namespace asio = boost::asio;
 
 constexpr fnd::Instant kNow{std::chrono::milliseconds{1'770'000'000'000}};
 constexpr std::string_view kSessionKey =
     "0123456789abcdef0123456789abcdef";
 
-class Fallback final : public gw::HttpHandler {
+class Fallback final : public gw::http::CoroutineHttpHandler {
 public:
-    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest) override
+    [[nodiscard]] bool nativeEnabled() const noexcept override { return true; }
+    [[nodiscard]] gw::HttpResponse handle(gw::HttpRequest request) override
     {
-        return gw::HttpResponse{418, {}, "fallback"};
+        return gw::HttpResponse{request.path().starts_with("/admin/") ? 404 : 418, {}, "fallback"};
+    }
+    asio::awaitable<gw::HttpResponse> handleAsync(gw::HttpRequest request) override
+    {
+        co_return handle(std::move(request));
     }
 };
 
@@ -149,10 +160,47 @@ struct Fixture {
                                           std::chrono::minutes{30}).value()),
           limiter(gw::TokenBucketRateLimiter::create(
               clock, 1000.0, 1000.0, 1000U).value()),
-          api(sessions, provisioner, identities, memberships, limiter,
-              core::OrganizationId{"org"}, idp::ProviderId{"local"},
-              clock, fallback)
+          api(fallback,limiter,
+              [this](fnd::SecretString token)->asio::awaitable<fnd::Result<sess::Session>> {
+                  auto authenticated=sessions.authenticate(token);
+                  if (!authenticated) co_return fnd::fail(authenticated.error());
+                  co_return authenticated->session();
+              },
+              [this](core::IdentityId actor)->asio::awaitable<fnd::Result<admin::MemberListing>> {
+                  auto owner=memberships.find(core::OrganizationId{"org"},actor);
+                  if (!owner) co_return fnd::fail(owner.error());
+                  if (!owner->has_value() || !owner->value().hasRole(org::Role{"owner"}))
+                      co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                  co_return admin::MemberListing{actor,{{actor,core::IdentityStatus::Active,
+                      owner->value().state(),owner->value().roles()}}};
+              },
+              adminHttp::CoroutineAdministrationReadAdapter::MutationContext{
+                  core::OrganizationId{"org"},idp::ProviderId{"local"},&clock,
+                  [this](core::IdentityId actor,const adminHttp::CoroutineAdministrationReadAdapter::Command& command)
+                      ->asio::awaitable<fnd::Status> {
+                      if (const auto* enrollment=std::get_if<admin::LocalMemberEnrollment>(&command))
+                          co_return provisioner.provision(actor,*enrollment);
+                      if (const auto* replacement=std::get_if<admin::MemberRoleReplacement>(&command))
+                          co_return provisioner.replaceRoles(actor,*replacement);
+                      if (const auto* change=std::get_if<admin::MemberLifecycleChange>(&command))
+                          co_return provisioner.changeLifecycle(actor,*change);
+                      co_return provisioner.resetCredentials(actor,std::get<admin::LocalCredentialReset>(command));
+                  }})
     {
+    }
+
+    static asio::awaitable<std::optional<gw::HttpResponse>> dispatch(
+        adminHttp::CoroutineAdministrationReadAdapter& handler,gw::HttpRequest input)
+    {
+        co_return std::optional<gw::HttpResponse>{co_await handler.handleAsync(std::move(input))};
+    }
+
+    gw::HttpResponse run(gw::HttpRequest input)
+    {
+        asio::io_context io;
+        auto pending=asio::co_spawn(io,dispatch(api,std::move(input)),asio::use_future);
+        io.run();
+        return std::move(pending.get()).value();
     }
 
     void addSession(std::string_view token, idp::AssuranceLevel assurance,
@@ -183,7 +231,7 @@ struct Fixture {
     org::InMemoryMembershipRepository memberships;
     gw::TokenBucketRateLimiter limiter;
     Fallback fallback;
-    adminHttp::AdministrationHttpApi api;
+    adminHttp::CoroutineAdministrationReadAdapter api;
 };
 
 constexpr std::string_view kValidBody =
@@ -193,7 +241,7 @@ TEST(AdministrationHttpApiTest, MemberEnumerationRequiresActiveOwner)
 {
     Fixture anonymousOwner;
     anonymousOwner.addSession("owner-token", idp::AssuranceLevel::Ial2);
-    const auto missing = anonymousOwner.api.handle(request(
+    const auto missing = anonymousOwner.run(request(
         "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
     EXPECT_EQ(missing.status(), 403);
     EXPECT_EQ(missing.body().find("identity_id"), std::string::npos);
@@ -205,7 +253,7 @@ TEST(AdministrationHttpApiTest, MemberEnumerationRequiresActiveOwner)
     ASSERT_TRUE(viewerMembership.grantRole(org::Role{"viewer"}));
     ASSERT_TRUE(viewerMembership.accept());
     ASSERT_TRUE(viewer.memberships.add(std::move(viewerMembership)));
-    const auto denied = viewer.api.handle(request(
+    const auto denied = viewer.run(request(
         "/admin/local-members", {}, "viewer-token", gw::HttpMethod::Get));
     EXPECT_EQ(denied.status(), 403);
     EXPECT_EQ(denied.body().find("identity_id"), std::string::npos);
@@ -218,7 +266,7 @@ TEST(AdministrationHttpApiTest, MemberEnumerationRequiresActiveOwner)
     ASSERT_TRUE(suspendedOwner.accept());
     ASSERT_TRUE(suspendedOwner.suspend());
     ASSERT_TRUE(suspended.memberships.add(std::move(suspendedOwner)));
-    const auto inactive = suspended.api.handle(request(
+    const auto inactive = suspended.run(request(
         "/admin/local-members", {}, "suspended-token", gw::HttpMethod::Get));
     EXPECT_EQ(inactive.status(), 403);
 }
@@ -232,7 +280,7 @@ TEST(AdministrationHttpApiTest, MemberEnumerationIsTenantScopedToActiveOwner)
     ASSERT_TRUE(foreign.grantRole(org::Role{"owner"}));
     ASSERT_TRUE(foreign.accept());
     ASSERT_TRUE(foreignOwner.memberships.add(std::move(foreign)));
-    const auto denied = foreignOwner.api.handle(request(
+    const auto denied = foreignOwner.run(request(
         "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
     EXPECT_EQ(denied.status(), 403);
 
@@ -243,7 +291,7 @@ TEST(AdministrationHttpApiTest, MemberEnumerationIsTenantScopedToActiveOwner)
     ASSERT_TRUE(membership.grantRole(org::Role{"owner"}));
     ASSERT_TRUE(membership.accept());
     ASSERT_TRUE(owner.memberships.add(std::move(membership)));
-    const auto permitted = owner.api.handle(request(
+    const auto permitted = owner.run(request(
         "/admin/local-members", {}, "owner-token", gw::HttpMethod::Get));
     ASSERT_EQ(permitted.status(), 200) << permitted.body();
     EXPECT_EQ(permitted.headers().at("cache-control"), "no-store");
@@ -254,13 +302,13 @@ TEST(AdministrationHttpApiTest, MemberEnumerationIsTenantScopedToActiveOwner)
 TEST(AdministrationHttpApiTest, RequiresAnIal2SessionBeforeProvisioning)
 {
     Fixture fixture;
-    EXPECT_EQ(fixture.api.handle(request(
+    EXPECT_EQ(fixture.run(request(
                   "/admin/local-members", std::string{kValidBody})).status(),
               401);
     EXPECT_FALSE(fixture.provisioner.called);
 
     fixture.addSession("ial1-token", idp::AssuranceLevel::Ial1);
-    EXPECT_EQ(fixture.api.handle(request(
+    EXPECT_EQ(fixture.run(request(
                   "/admin/local-members", std::string{kValidBody},
                   "ial1-token")).status(),
               403);
@@ -271,7 +319,7 @@ TEST(AdministrationHttpApiTest, GeneratesCredentialsAndReturnsThemOnlyAfterSucce
 {
     Fixture fixture;
     fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
-    const auto response = fixture.api.handle(request(
+    const auto response = fixture.run(request(
         "/admin/local-members", std::string{kValidBody}, "owner-token"));
 
     ASSERT_EQ(response.status(), 201) << response.body();
@@ -295,7 +343,7 @@ TEST(AdministrationHttpApiTest, DoesNotReturnGeneratedSecretsWhenOwnerCheckFails
     Fixture fixture;
     fixture.addSession("member-token", idp::AssuranceLevel::Ial2, "member");
     fixture.provisioner.failure = fnd::ErrorCode::PermissionDenied;
-    const auto response = fixture.api.handle(request(
+    const auto response = fixture.run(request(
         "/admin/local-members", std::string{kValidBody}, "member-token"));
 
     EXPECT_EQ(response.status(), 403);
@@ -308,23 +356,23 @@ TEST(AdministrationHttpApiTest, RejectsUnknownFieldsAndReservesAdminNamespace)
 {
     Fixture fixture;
     fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
-    const auto malformed = fixture.api.handle(request(
+    const auto malformed = fixture.run(request(
         "/admin/local-members",
         R"({"identity_id":"identity-2","subject":"bob","roles":["member"],"password":"chosen"})",
         "owner-token"));
     EXPECT_EQ(malformed.status(), 400);
     EXPECT_FALSE(fixture.provisioner.called);
-    EXPECT_EQ(fixture.api.handle(request(
+    EXPECT_EQ(fixture.run(request(
                   "/admin/unknown", {}, "owner-token")).status(),
               404);
-    EXPECT_EQ(fixture.api.handle(request("/outside")).status(), 418);
+    EXPECT_EQ(fixture.run(request("/outside")).status(), 418);
 }
 
 TEST(AdministrationHttpApiTest, ReplacesRolesThroughTheExplicitPutRoute)
 {
     Fixture fixture;
     fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
-    const auto response = fixture.api.handle(request(
+    const auto response = fixture.run(request(
         "/admin/local-members/roles",
         R"({"identity_id":"identity-2","roles":["viewer","member"]})",
         "owner-token", gw::HttpMethod::Put));
@@ -345,18 +393,31 @@ TEST(AdministrationHttpApiTest, DispatchesEachExplicitLifecycleTransition)
              {"/admin/local-members/suspend", "suspend"},
              {"/admin/local-members/reinstate", "reinstate"},
              {"/admin/local-members/remove", "remove"}}) {
-        const auto response = fixture.api.handle(request(
+        const auto response = fixture.run(request(
             path, R"({"identity_id":"identity-2"})", "owner-token"));
         EXPECT_EQ(response.status(), 204) << response.body();
         EXPECT_EQ(fixture.provisioner.operation, operation);
     }
 }
 
+TEST(AdministrationHttpApiTest, RetiredSynchronousAbiNeverInvokesStorage)
+{
+    Fixture fixture;
+    fixture.addSession("owner-token",idp::AssuranceLevel::Ial2);
+    adminHttp::AdministrationHttpApi retired{fixture.sessions,fixture.provisioner,
+        fixture.identities,fixture.memberships,fixture.limiter,core::OrganizationId{"org"},
+        idp::ProviderId{"local"},fixture.clock,fixture.fallback};
+    EXPECT_EQ(retired.handle(request("/admin/local-members",std::string{kValidBody},"owner-token")).status(),503);
+    EXPECT_EQ(retired.handle(request("/admin/local-members",{},"owner-token",gw::HttpMethod::Get)).status(),503);
+    EXPECT_FALSE(fixture.provisioner.called);
+    EXPECT_EQ(retired.handle(request("/outside")).status(),418);
+}
+
 TEST(AdministrationHttpApiTest, CredentialResetReturnsSecretsOnlyAfterSuccess)
 {
     Fixture fixture;
     fixture.addSession("owner-token", idp::AssuranceLevel::Ial2);
-    const auto response = fixture.api.handle(request(
+    const auto response = fixture.run(request(
         "/admin/local-members/credentials/reset",
         R"({"identity_id":"identity-2"})", "owner-token"));
     ASSERT_EQ(response.status(), 200) << response.body();
@@ -370,7 +431,7 @@ TEST(AdministrationHttpApiTest, CredentialResetReturnsSecretsOnlyAfterSuccess)
     Fixture denied;
     denied.addSession("owner-token", idp::AssuranceLevel::Ial2);
     denied.provisioner.failure = fnd::ErrorCode::FailedPrecondition;
-    const auto refused = denied.api.handle(request(
+    const auto refused = denied.run(request(
         "/admin/local-members/credentials/reset",
         R"({"identity_id":"identity-2"})", "owner-token"));
     EXPECT_EQ(refused.status(), 412);

@@ -18,6 +18,10 @@ import openproof.session;
 
 export namespace openproof::application::http {
 
+// Pure rendering shared by native and compatibility authorization paths.
+// Call only after an authenticated owner session has been authorized.
+[[nodiscard]] gateway::HttpResponse renderAdministrationConsole(std::string scriptNonce);
+
 /**
  * @brief Owner-only application and OAuth client management plane.
  *

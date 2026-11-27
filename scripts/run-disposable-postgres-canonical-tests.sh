@@ -54,6 +54,8 @@ for migration in \
     0005_account_lifecycle.sql \
     0006_resource_consent.sql \
     0007_oauth_device_flow.sql \
+    0008_oauth_par.sql \
+    0009_oauth_jar.sql \
     0010_oauth_sender_constraints.sql \
     0011_webauthn_passkeys.sql \
     0012_enterprise_scim.sql \

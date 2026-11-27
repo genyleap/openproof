@@ -32,39 +32,26 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 
-openproof_add_module(openproof_storage_postgres
-    MODULES
-        postgres.cppm
-    SOURCES
-        postgres.cpp
-    LINK_PUBLIC
-        openproof_foundation
-        openproof_account
-        openproof_administration
-        openproof_audit
-        openproof_security
-        openproof_identity_core
-        openproof_identity_provider
-        openproof_identity_profile
-        openproof_application
-        openproof_client
-        openproof_resource
-        openproof_consent
-        openproof_evidence
-        openproof_evidence_verifiers
-        openproof_enterprise_scim
-        openproof_oauth
-        openproof_token
-        openproof_session
-        openproof_credentials
-        openproof_provider_local
-        openproof_provider_passkey
-        openproof_organization
-        openproof_policy
-    LINK_PRIVATE
-        OpenProof::libpq
-        openproof_postgres_async_io
-)
+# Shared checksum-validated migration package, independent of libpq.
+openproof_add_module(openproof_migration_package
+    MODULES migration_package.cppm
+    SOURCES migration_package.cpp
+    LINK_PUBLIC openproof_foundation openproof_security)
+
+# The blocking PostgreSQL implementation has been retired. Every storage
+# target, including integration test dependencies, uses native libpq.
+
+add_library(openproof_postgres_async_startup STATIC coroutine_startup.cpp)
+target_compile_features(openproof_postgres_async_startup PUBLIC cxx_std_26)
+set_target_properties(openproof_postgres_async_startup PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(openproof_postgres_async_startup PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_postgres_async_startup PUBLIC
+    openproof_migration_package openproof_postgres_async_io openproof_foundation
+    openproof_security openproof_identity_core Boost::headers PRIVATE openproof_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(coroutine_startup.cpp PROPERTIES COMPILE_OPTIONS "-fno-inline")
+endif()
 
 # Keep native Asio types in ordinary C++ translation units rather than
 # attaching their Boost headers (and thread-local template definitions) to
@@ -85,8 +72,9 @@ set_target_properties(openproof_postgres_async_repository PROPERTIES
 target_compile_definitions(openproof_postgres_async_repository PRIVATE
     BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_postgres_async_repository
-    PUBLIC openproof_storage_postgres openproof_postgres_async_io
-        openproof_session openproof_foundation Boost::headers
+    PUBLIC openproof_postgres_async_io
+        openproof_session openproof_foundation openproof_security
+        openproof_identity_core openproof_identity_provider Boost::headers
     PRIVATE openproof_compile_options)
 
 # GCC 16.2 misidentifies Boost.Asio's own aligned coroutine-frame
@@ -210,10 +198,12 @@ endif()
 # HTTP composition is unchanged until integration acceptance passes.
 add_library(openproof_postgres_async_canonical STATIC
     coroutine_canonical_finalizer.cpp
-    coroutine_authorization_audit.cpp)
+    coroutine_authorization_audit.cpp
+    coroutine_admin_store.cpp)
 target_compile_features(openproof_postgres_async_canonical PUBLIC cxx_std_26)
 target_include_directories(openproof_postgres_async_canonical PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}")
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${PROJECT_SOURCE_DIR}/src/credentials")
 set_target_properties(openproof_postgres_async_canonical PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(openproof_postgres_async_canonical PRIVATE
@@ -222,11 +212,12 @@ target_link_libraries(openproof_postgres_async_canonical PUBLIC
     openproof_postgres_async_io openproof_authentication
     openproof_identity_core openproof_identity_provider
     openproof_identity_profile openproof_organization openproof_policy openproof_session
-    openproof_administration openproof_audit openproof_security
-    openproof_foundation Boost::headers
+    openproof_administration openproof_audit openproof_security openproof_credentials_async
+    openproof_oauth openproof_client openproof_application openproof_resource openproof_provider_passkey
+    openproof_enterprise_scim openproof_evidence openproof_evidence_verifiers openproof_foundation Boost::headers
     PRIVATE openproof_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(coroutine_canonical_finalizer.cpp coroutine_authorization_audit.cpp
+    set_source_files_properties(coroutine_canonical_finalizer.cpp coroutine_authorization_audit.cpp coroutine_admin_store.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 

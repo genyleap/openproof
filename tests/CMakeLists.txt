@@ -24,7 +24,6 @@ add_executable(openproof_tests
     authentication/http_test.cpp
     account/account_test.cpp
     administration/administration_test.cpp
-    administration/http_test.cpp
     session/session_test.cpp
     credentials/credentials_test.cpp
     providers/local_test.cpp
@@ -99,7 +98,12 @@ target_link_libraries(openproof_tests
         openproof_gateway
         openproof_gateway_http
         Boost::headers
-        openproof_storage_postgres
+        openproof_postgres_async_startup
+        openproof_postgres_async_repository
+        openproof_postgres_async_auth_repository
+        openproof_postgres_async_recovery_repository
+        openproof_postgres_async_local_credentials
+        openproof_postgres_async_canonical
         openproof_operations_http
         openproof_credentials
         OpenProof::libpq
@@ -117,6 +121,7 @@ target_link_libraries(openproof_tests
         openproof_enterprise_scim
         openproof_trust
         openproof_sdk_cpp
+        OpenSSL::Crypto
         GTest::gtest
         GTest::gtest_main
         openproof_test_compile_options
@@ -268,7 +273,7 @@ set_target_properties(openproof_postgres_domain_tests PROPERTIES
     CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
 target_link_libraries(openproof_postgres_domain_tests PRIVATE
     openproof_postgres_async_http openproof_postgres_async_repository
-    openproof_storage_postgres openproof_session openproof_foundation
+    openproof_postgres_async_startup openproof_session openproof_foundation
     Boost::headers OpenProof::libpq GTest::gtest_main openproof_test_compile_options)
 # GCC 16's inlined Boost.Asio aligned coroutine-frame allocator produces a
 # false-positive mismatched-new-delete diagnostic inside large TEST bodies.
@@ -290,6 +295,26 @@ gtest_discover_tests(openproof_postgres_domain_tests
     DISCOVERY_MODE PRE_TEST
     DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "postgres;async;domain")
+
+# A link-time isolation check: the same domain and failure-isolation tests
+# must build and execute with no dependency on the blocking storage archive.
+add_executable(openproof_postgres_native_only_tests
+    storage/postgres_async_domain_test.cpp)
+target_compile_features(openproof_postgres_native_only_tests PRIVATE cxx_std_26)
+target_compile_definitions(openproof_postgres_native_only_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+set_target_properties(openproof_postgres_native_only_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_link_libraries(openproof_postgres_native_only_tests PRIVATE
+    openproof_postgres_async_repository openproof_session openproof_foundation
+    openproof_security Boost::headers GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_postgres_native_only_tests PRIVATE
+        -static-libstdc++ -static-libgcc)
+endif()
+add_test(NAME NativePostgresOnly.LinkAndDomain
+    COMMAND openproof_postgres_native_only_tests --gtest_filter=PostgresCoroutineDomainTest.*)
+set_tests_properties(NativePostgresOnly.LinkAndDomain PROPERTIES
+    LABELS "postgres;async;domain" TIMEOUT 30)
 
 # OIDC's native discovery and ID-Token verification path must reject
 # malformed callbacks before any remote issuer, JWKS or UserInfo exchange.
@@ -475,10 +500,13 @@ target_link_libraries(openproof_postgres_async_tests PRIVATE
     openproof_test_compile_options)
 # GCC 16 -O2 can mistake Boost.Asio's custom aligned coroutine-frame
 # allocator for a mismatched new/delete when it inlines long test coroutines.
-# Demote only this warning in this one TEST translation unit; all production
-# sources and other diagnostics retain -Werror, and the warning stays visible.
+# Demote only this warning in the affected TEST translation units; all
+# production sources and other diagnostics retain -Werror, and it stays visible.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_source_files_properties(storage/postgres_async_session_test.cpp
+    set_source_files_properties(
+        storage/postgres_async_session_test.cpp
+        storage/postgres_async_test.cpp
+        storage/postgres_integration_test.cpp
         PROPERTIES COMPILE_OPTIONS "-Wno-error=mismatched-new-delete")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
@@ -600,7 +628,7 @@ target_include_directories(openproof_postgres_network_tests BEFORE PRIVATE
 target_link_libraries(openproof_postgres_network_tests PRIVATE
     openproof_postgres_async_listener
     openproof_postgres_async_http openproof_postgres_async_repository
-    openproof_gateway_http openproof_gateway openproof_storage_postgres
+    openproof_gateway_http openproof_gateway
     openproof_session openproof_foundation openproof_security
     Boost::headers OpenProof::libpq GTest::gtest_main
     openproof_test_compile_options)
@@ -918,10 +946,10 @@ target_link_libraries(openproof_postgres_async_canonical_tests PRIVATE
     openproof_postgres_async_auth_repository
     openproof_postgres_async_consent openproof_consent
     openproof_postgres_async_repository openproof_policy openproof_session
-    openproof_postgres_async_verification openproof_storage_postgres openproof_account
+    openproof_postgres_async_verification openproof_account
     openproof_postgres_async_local_credentials openproof_postgres_async_recovery_repository
     openproof_authentication openproof_identity_core
-    openproof_identity_provider openproof_identity_profile
+    openproof_identity_provider openproof_identity_profile openproof_token openproof_client
     openproof_security openproof_foundation Boost::headers OpenProof::libpq
     GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -946,7 +974,7 @@ target_include_directories(openproof_admin_coroutine_http_tests BEFORE PRIVATE
     "${googletest_SOURCE_DIR}/googletest/include" "${PROJECT_SOURCE_DIR}/src/authentication/http")
 target_compile_definitions(openproof_admin_coroutine_http_tests PRIVATE BOOST_HAS_LONG_LONG=1)
 target_link_libraries(openproof_admin_coroutine_http_tests PRIVATE
-    openproof_administration_async_http openproof_security GTest::gtest_main openproof_test_compile_options)
+    openproof_administration_async_http openproof_authentication_http openproof_security GTest::gtest_main openproof_test_compile_options)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(authentication/coroutine_admin_read_http_test.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
@@ -957,6 +985,43 @@ endif()
 gtest_discover_tests(openproof_admin_coroutine_http_tests
     TEST_PREFIX "NativeAdminRead." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
     PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
+
+# Keep separate translation units in isolated executables: GCC named modules
+# can emit duplicate Boost.Asio service identifiers when linked together.
+add_executable(openproof_admin_lifecycle_http_tests
+    administration/http_test.cpp)
+target_compile_features(openproof_admin_lifecycle_http_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_admin_lifecycle_http_tests PROPERTIES
+    CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_admin_lifecycle_http_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include" "${PROJECT_SOURCE_DIR}/src/authentication/http")
+target_compile_definitions(openproof_admin_lifecycle_http_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_admin_lifecycle_http_tests PRIVATE
+    openproof_administration_async_http openproof_authentication_http openproof_security GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(administration/http_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline;-O1;-g0")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_admin_lifecycle_http_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_admin_lifecycle_http_tests
+    TEST_PREFIX "NativeAdminLifecycle." DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120
+    PROPERTIES LABELS "admin;async;http;security" TIMEOUT 20)
+
+add_executable(openproof_native_health_tests operations/coroutine_health_test.cpp)
+target_compile_features(openproof_native_health_tests PRIVATE cxx_std_26)
+set_target_properties(openproof_native_health_tests PROPERTIES CXX_SCAN_FOR_MODULES ON CXX_EXTENSIONS OFF)
+target_include_directories(openproof_native_health_tests BEFORE PRIVATE
+    "${googletest_SOURCE_DIR}/googletest/include")
+target_compile_definitions(openproof_native_health_tests PRIVATE BOOST_HAS_LONG_LONG=1)
+target_link_libraries(openproof_native_health_tests PRIVATE
+    openproof_operations_async_http GTest::gtest_main openproof_test_compile_options)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+    target_link_options(openproof_native_health_tests PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+gtest_discover_tests(openproof_native_health_tests TEST_PREFIX "NativeHealth."
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120 PROPERTIES LABELS "health;async;http" TIMEOUT 20)
 
 # Isolated native delivery regression: keep the Gateway Asio definitions
 # separate from the umbrella provider executable.

@@ -105,8 +105,11 @@ test("native signup pair shares bounded KDF and owner-bound verification before 
     "acceptVerifiedEmailAsync(","std::move(activated->first),std::move(activated->second)","nativeSessions->issueAsync("]);
   assert.match(auth,/authorizeHandoffOwnerAsync\(expectedOwner,external\)/);
   assert.match(app,/nativeSignupFlag && \*nativeSignupFlag=="1"/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/signup",gateway::HttpMethod::Post\)/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/email\/verify",gateway::HttpMethod::Post\)/);
+  const lifecycle=app.slice(app.indexOf("if (!nativeContactIssuer || !nativeSignup"),app.indexOf("if (nativeWeb3Enabled) {",app.indexOf("if (!nativeContactIssuer || !nativeSignup")));
+  assert.match(lifecycle,/!nativeVerifySignup/);
+  assert.match(lifecycle,/return ExitCode::ConfigurationError/);
+  assert.match(lifecycle,/"\/account\/signup", "\/account\/email\/verify"/);
+  assert.match(lifecycle,/nativePaths.emplace_back\(path\)/);
   const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
   order(body,["ParsedPasswordGuard wipeParsed","request.wipeBody();","co_await m_signup(","co_await m_verifySignup(",
     "if (!safe(issued->id.value())","response.addHeader(\"set-cookie\""]);
@@ -181,7 +184,8 @@ test("native password reset HTTP scrubs both secrets and only commits a precompu
   const kdf=callback.indexOf("hashAsync(std::move(password))");
   const storage=callback.indexOf("contactStore.resetPasswordAsync(");
   assert.ok(digest>=0 && digest<wipe && wipe<kdf && kdf<storage);
-  assert.match(app,/if \(nativeResetPassword\) nativeMethods.emplace_back\("\/account\/password\/reset",gateway::HttpMethod::Post\)/);
+  assert.match(app,/!nativeResetPassword \|\| !nativeVerifyPhone/);
+  assert.match(app,/"\/account\/password\/forgot", "\/account\/password\/reset"/);
   assert.match(http,/\{"password","secret","new_password","code"\}/);
   const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::signupOrVerify("));
   const reset=body.slice(body.indexOf("request.wipeBody();"),body.indexOf("if (signup) {",body.indexOf("request.wipeBody();")));
@@ -215,9 +219,10 @@ test("local password proof generation remains fenced through both session persis
     assert.match(body,/AuthenticationFailed/);
   }
   assert.match(reset,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
-  const legacy=read("src/storage/postgres/postgres.cpp");
-  assert.match(legacy,/GREATEST\(p.changed_at_ms\+1,\(extract\(epoch FROM clock_timestamp\(\)\)/);
-  assert.match(legacy,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  const admin=read("src/storage/postgres/coroutine_admin_store.cpp");
+  const mfa=read("src/storage/postgres/coroutine_local_credential_store.cpp");
+  assert.match(admin,/GREATEST\(changed_at_ms\+1,\$3::bigint\)/);
+  assert.match(mfa,/GREATEST\(changed_at_ms\+1,\$2::bigint\)/);
   assert.match(read("src/authentication/service.cpp"),/if \(authentication.outcome\(\).passwordGeneration\(\)\)\s*co_return foundation::fail/);
 });
 
@@ -242,7 +247,8 @@ test("phone completion is owner-bound, generation-bound and atomic",()=>{
   assert.ok(route.indexOf("request.wipeBody();")<route.indexOf("co_await m_authenticate("));
   assert.match(route,/co_await m_verifyPhone\(actor->identity\(\)/);
   assert.match(route,/value->identity\(\)!=actor->identity\(\)/);
-  assert.match(read("apps/opp/main.cpp"),/if \(nativeVerifyPhone\) nativeMethods.emplace_back\("\/account\/phone\/verify"/);
+  assert.match(read("apps/opp/main.cpp"),/!nativeResetPassword \|\| !nativeVerifyPhone/);
+  assert.match(read("apps/opp/main.cpp"),/"\/account\/phone", "\/account\/phone\/verify"/);
 });
 
 test("native email change keeps existing password, fences alias ABA and never creates a second owner",()=>{
@@ -259,7 +265,8 @@ test("native email change keeps existing password, fences alias ABA and never cr
   assert.match(source,/r.identity_id=EXCLUDED.identity_id AND r.verification_id IS NOT NULL/);
   const app=read("apps/opp/main.cpp");
   assert.match(app,/contactStore.changeEmailAsync\(providerId,owner/);
-  assert.match(app,/nativeMethods.emplace_back\("\/account\/email\/change\/verify"/);
+  assert.match(app,/!nativeVerifyEmailChange \|\| !nativeTotp/);
+  assert.match(app,/"\/account\/email\/change", "\/account\/email\/change\/verify"/);
   assert.match(read("src/account/http/coroutine_session_http.cpp"),/co_await m_verifyEmailChange\(actor->identity\(\)/);
 });
 
@@ -309,7 +316,7 @@ test("native TOTP ceremony bounds pending state, verifies code and burns before 
   const app=read("apps/opp/main.cpp");
   assert.match(app,/nativeTotp.authenticate=\[sessions=nativeSessions.get\(\)\]/);
   for(const path of ["start","complete","disable"])
-    assert.ok(app.includes('nativeMethods.emplace_back("/account/totp/'+path+'",gateway::HttpMethod::Post)'));
+    assert.ok(app.slice(app.indexOf("if (!nativeContactIssuer || !nativeSignup"),app.indexOf("nativePaths.emplace_back(path);",app.indexOf("if (!nativeContactIssuer || !nativeSignup"))).includes('"/account/totp/'+path+'"'));
   const http=read("src/account/http/coroutine_session_http.cpp");
   const body=http.slice(http.indexOf("CoroutineContactVerificationAdapter::manageTotp("),
     http.indexOf("CoroutineContactVerificationAdapter::verifyPhone("));

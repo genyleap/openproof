@@ -13,6 +13,9 @@ export namespace openproof::application {
 struct ApplicationIdTag {};
 using ApplicationId = foundation::StrongId<ApplicationIdTag>;
 
+// Native administrative read projection; resource registry is platform-wide.
+enum class ManagementRead { Applications, Clients, JarKey, Resources, ServiceIdentity, Console };
+
 enum class Environment {
     Development,
     Staging,
@@ -20,6 +23,15 @@ enum class Environment {
 };
 
 [[nodiscard]] std::string_view environmentName(Environment environment) noexcept;
+
+enum class ApplicationMutation { Create, Suspend, Activate, Revoke };
+struct ApplicationMutationCommand final {
+    ApplicationMutation operation;
+    ApplicationId id;
+    std::string identifier;
+    std::string name;
+    Environment environment=Environment::Development;
+};
 
 enum class ApplicationStatus {
     Active,

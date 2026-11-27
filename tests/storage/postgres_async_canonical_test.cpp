@@ -39,7 +39,6 @@ import openproof.authentication;
 import openproof.audit;
 import openproof.consent;
 import openproof.credentials;
-import openproof.storage.postgres;
 import openproof.foundation;
 import openproof.identity.core;
 import openproof.identity.profile;
@@ -48,6 +47,9 @@ import openproof.organization;
 import openproof.policy;
 import openproof.session;
 import openproof.security;
+import openproof.token;
+import openproof.client;
+import openproof.oauth;
 
 namespace {
 namespace asio = boost::asio;
@@ -578,6 +580,29 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTimeoutDropsPoisonedConnection)
     EXPECT_TRUE(recovered);
 }
 
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseNativeReadinessChecksActualPool)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{"readiness-fixture"},1U,500ms,1000ms,3000ms};
+    auto first=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    auto second=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    io.run();
+    EXPECT_TRUE(first.get());
+    EXPECT_TRUE(second.get());
+    io.restart();
+    auto third=asio::co_spawn(io,native.healthCheckAsync(),asio::use_future);
+    io.run();
+    EXPECT_TRUE(third.get()); // the previous probes returned the only lease
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
 {
     const auto dsn = disposableDsn();
@@ -714,6 +739,793 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseTotpStatusOnlyReadsOwnedBoolean
     auto done = asio::co_spawn(io, run(), asio::use_future);
     io.run();
     ASSERT_NO_THROW(done.get());
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeEvidenceChallengesAndBatchesAreSessionBound)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace ev=openproof::evidence;
+    namespace verify=ev::verification;
+    using Op=verify::AccountOperation;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto sessionName="evidence-session-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(sessionName).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto provider=openproof::identity::provider::ProviderId{"signed-jwt-evidence"};
+    const auto challenge=verify::ChallengeDigest{fnd::toHex(openproof::security::sha256(seed.suffix).value())};
+    const auto task=[&](verify::AccountCommand command,std::string identity={},fnd::Instant when=kNow+1s){
+        return native.evidenceAccountAsync(ids::IdentityId{identity.empty()?seed.owner:identity},
+            openproof::session::SessionId{sessionName},when,std::move(command));
+    };
+    const auto run=[&](verify::AccountCommand command,std::string identity={},fnd::Instant when=kNow+1s){
+        io.restart();
+        auto done=asio::co_spawn(io,task(std::move(command),std::move(identity),when),asio::use_future);
+        io.run();return done.get();
+    };
+    const verify::AccountCommand list{Op::List,openproof::identity::provider::ProviderId{""},verify::ChallengeDigest{""},{},{}};
+    auto empty=run(list);
+    ASSERT_TRUE(empty && empty->empty());
+    EXPECT_FALSE(run(list,seed.foreignOwner));
+    const verify::AccountCommand issue{Op::Issue,provider,challenge,kNow+300s,{}};
+    const verify::AccountCommand consume{Op::Consume,provider,challenge,{},{}};
+    ASSERT_TRUE(run(issue));
+    EXPECT_FALSE(run(issue));
+    auto wrong=consume;wrong.provider=openproof::identity::provider::ProviderId{"x509-evidence"};
+    EXPECT_FALSE(run(wrong));
+    EXPECT_FALSE(run(consume,seed.secondOwner));
+    io.restart();
+    auto first=asio::co_spawn(io,task(consume),asio::use_future);
+    auto second=asio::co_spawn(io,task(consume),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_FALSE(run(consume));
+    const auto evidenceId="native-evidence-"+seed.suffix;
+    const auto record=[&](std::string id,std::string owner){
+        return ev::Evidence::create(ev::EvidenceId{std::move(id)},ids::IdentityId{std::move(owner)},
+            provider,"jwt.attestation","fixture.claim","fixture-value",85U,kNow+1s,kNow+200s).value();
+    };
+    auto item=record(evidenceId,seed.owner);
+    auto foreign=record(evidenceId+"-foreign",seed.foreignOwner);
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{foreign}}));
+    // A duplicate in the batch must roll back the first insert as well.
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{item,item}}));
+    auto rolledBack=run(list);
+    ASSERT_TRUE(rolledBack && rolledBack->empty());
+    ASSERT_TRUE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{item}}));
+    auto listed=run(list);
+    ASSERT_TRUE(listed && listed->size()==1U);
+    EXPECT_EQ(listed->front().id(),item.id());
+    EXPECT_EQ(listed->front().confidence(),85U);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.sessions SET state=1,revoked_at_ms=1770000002000 WHERE id=$1",{sessionName})));
+    EXPECT_FALSE(run(list));
+    EXPECT_FALSE(run({Op::Persist,provider,verify::ChallengeDigest{""},{},{record(evidenceId+"-revoked",seed.owner)}}));
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeScimReadsPreserveTenantAndCanonicalState)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace scim=openproof::enterprise::scim;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto group="scim-group-"+seed.suffix,foreignGroup="scim-foreign-"+seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_users(identity_id,organization_id,user_name,external_id,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'alice','fixture-external',1770000000000,1770000000123),"
+        "($3,$2,'bob',NULL,1770000000000,1770000000123),"
+        "($4,$5,'alice','foreign-external',1770000000000,1770000000123)",
+        {seed.owner,seed.org,seed.lockedOwner,seed.foreignOwner,seed.foreignOrg})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_groups(id,organization_id,display_name,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Engineering',1770000000000,1770000000123),"
+        "($3,$4,'Engineering',1770000000000,1770000000123)",
+        {group,seed.org,foreignGroup,seed.foreignOrg})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.scim_group_members(organization_id,group_id,identity_id) VALUES($1,$2,$3),($1,$2,$4),($5,$6,$7)",
+        {seed.org,group,seed.owner,seed.lockedOwner,seed.foreignOrg,foreignGroup,seed.foreignOwner})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,email,email_verified,created_at_ms,updated_at_ms) "
+        "VALUES($1,'Alice Fixture','alice@example.invalid',false,1770000000000,1770000000123) "
+        "ON CONFLICT(identity_id) DO UPDATE SET display_name=EXCLUDED.display_name,email=EXCLUDED.email",
+        {seed.owner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](scim::ReadKind kind,scim::ReadSelector selector=scim::ReadSelector::All,
+        std::optional<std::string> value=std::nullopt) {
+        io.restart();
+        auto done=asio::co_spawn(io,native.readScimAsync({kind,selector,std::move(value)}),asio::use_future);
+        io.run();return done.get();
+    };
+    auto users=read(scim::ReadKind::Users);
+    ASSERT_TRUE(users);
+    ASSERT_EQ(users->rows.size(),2U);
+    EXPECT_NE(users->rows[0].json.find(seed.owner),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find("Alice Fixture"),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find("alice@example.invalid"),std::string::npos);
+    EXPECT_NE(users->rows[0].json.find(fnd::toIso8601(kNow+123ms)),std::string::npos);
+    EXPECT_EQ(users->rows[0].updatedAt,kNow+123ms);
+    EXPECT_EQ(users->rows[0].json.find("foreign-external"),std::string::npos);
+    EXPECT_EQ(users->rows[1].json.find("externalId"),std::string::npos);
+    EXPECT_NE(users->rows[1].json.find("false"),std::string::npos);
+    auto matched=read(scim::ReadKind::Users,scim::ReadSelector::Name,"alice");
+    ASSERT_TRUE(matched && matched->rows.size()==1U);
+    EXPECT_NE(matched->rows.front().json.find(seed.owner),std::string::npos);
+    auto absent=read(scim::ReadKind::Users,scim::ReadSelector::Name,"missing");
+    ASSERT_TRUE(absent);
+    EXPECT_TRUE(absent->rows.empty());
+    auto foreign=read(scim::ReadKind::Users,scim::ReadSelector::Id,seed.foreignOwner);
+    ASSERT_FALSE(foreign);
+    EXPECT_EQ(foreign.error().code(),fnd::ErrorCode::NotFound);
+    auto groups=read(scim::ReadKind::Groups,scim::ReadSelector::Name,"Engineering");
+    ASSERT_TRUE(groups && groups->rows.size()==1U);
+    EXPECT_NE(groups->rows.front().json.find(group),std::string::npos);
+    EXPECT_NE(groups->rows.front().json.find(seed.owner),std::string::npos);
+    EXPECT_NE(groups->rows.front().json.find(seed.lockedOwner),std::string::npos);
+    EXPECT_EQ(groups->rows.front().json.find(seed.foreignOwner),std::string::npos);
+    EXPECT_FALSE(read(scim::ReadKind::Groups,scim::ReadSelector::Id,foreignGroup));
+    EXPECT_FALSE(read(scim::ReadKind::Users,scim::ReadSelector::All,"unexpected"));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.organizations SET state=1 WHERE id=$1",{seed.org})));
+    auto disabled=read(scim::ReadKind::Users);
+    ASSERT_FALSE(disabled);
+    EXPECT_EQ(disabled.error().code(),fnd::ErrorCode::PermissionDenied);
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeScimMutationsAreAtomicAndVersioned)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace scim=openproof::enterprise::scim;
+    using Op=scim::MutationKind;
+    using Kind=scim::ReadKind;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto command=[](Kind kind,Op op,std::string id) {
+        return scim::MutationRequest{kind,op,std::move(id),std::nullopt,
+            std::nullopt,std::nullopt,std::nullopt,std::nullopt,std::nullopt,{}};
+    };
+    const auto run=[&](scim::MutationRequest input) {
+        io.restart();
+        auto done=asio::co_spawn(io,native.mutateScimAsync(std::move(input),kNow+1s),asio::use_future);
+        io.run();return done.get();
+    };
+    const auto user="scim-user-"+seed.suffix,second=user+"-2",group="scim-group-"+seed.suffix;
+    auto create=command(Kind::Users,Op::Create,user);
+    create.name="fixture-user";create.displayName="Fixture User";create.email="fixture@example.invalid";
+    auto created=run(create);
+    ASSERT_TRUE(created && created->rows.size()==1U);
+    EXPECT_EQ(created->rows.front().updatedAt,kNow+1s);
+    auto duplicate=create;duplicate.id=second;
+    auto denied=run(duplicate);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(),fnd::ErrorCode::AlreadyExists);
+    const auto missing=execute(fixture.get(),"SELECT count(*)::text FROM openproof.identities WHERE id=$1",{second});
+    EXPECT_STREQ(PQgetvalue(missing.get(),0,0),"0");
+    duplicate.name="fixture-second";
+    ASSERT_TRUE(run(duplicate));
+    EXPECT_FALSE(run(command(Kind::Users,Op::Remove,seed.owner)));
+    EXPECT_FALSE(run(command(Kind::Users,Op::Remove,seed.foreignOwner)));
+    auto newGroup=command(Kind::Groups,Op::Create,group);
+    newGroup.name="Fixture Group";
+    newGroup.memberChanges.push_back({scim::MemberAction::Replace,{ids::IdentityId{seed.foreignOwner}}});
+    EXPECT_FALSE(run(newGroup));
+    const auto absent=execute(fixture.get(),"SELECT count(*)::text FROM openproof.scim_groups WHERE id=$1",{group});
+    EXPECT_STREQ(PQgetvalue(absent.get(),0,0),"0");
+    newGroup.memberChanges.front().members={ids::IdentityId{user}};
+    auto added=run(newGroup);
+    ASSERT_TRUE(added && added->rows.size()==1U);
+    auto groupPatch=command(Kind::Groups,Op::Patch,group);
+    groupPatch.expectedVersion=added->rows.front().updatedAt;
+    groupPatch.memberChanges.push_back({scim::MemberAction::Add,{ids::IdentityId{second}}});
+    auto modified=run(groupPatch);
+    ASSERT_TRUE(modified) << (modified ? "" : std::string{modified.error().internalDetail()});
+    ASSERT_EQ(modified->rows.size(),1U);
+    EXPECT_NE(modified->rows.front().json.find(second),std::string::npos);
+    EXPECT_GT(modified->rows.front().updatedAt,added->rows.front().updatedAt);
+    auto stale=run(groupPatch);
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(stale.error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto groupRemove=command(Kind::Groups,Op::Patch,group);
+    groupRemove.memberChanges.push_back({scim::MemberAction::Remove,{ids::IdentityId{second}}});
+    auto reduced=run(groupRemove);
+    ASSERT_TRUE(reduced && reduced->rows.size()==1U);
+    EXPECT_EQ(reduced->rows.front().json.find(second),std::string::npos);
+    const auto session="scim-session-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(session).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {session,user,digest})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",{seed.org,user})));
+    auto disable=command(Kind::Users,Op::Patch,user);
+    disable.active=false;
+    auto protectedOwner=run(disable);
+    ASSERT_FALSE(protectedOwner);
+    EXPECT_EQ(protectedOwner.error().code(),fnd::ErrorCode::FailedPrecondition);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.membership_roles(organization_id,identity_id,role) VALUES($1,$2,'owner')",{seed.org,second})));
+    auto disabled=run(disable);
+    ASSERT_TRUE(disabled && disabled->rows.size()==1U);
+    EXPECT_NE(disabled->rows.front().json.find("false"),std::string::npos);
+    const auto sessionState=execute(fixture.get(),"SELECT state::text FROM openproof.sessions WHERE id=$1",{session});
+    EXPECT_STREQ(PQgetvalue(sessionState.get(),0,0),"1");
+    disable.active=true;
+    ASSERT_TRUE(run(disable));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),"UPDATE openproof.identities SET status=2 WHERE id=$1",{user})));
+    EXPECT_FALSE(run(disable));
+    disable.active=false;
+    ASSERT_TRUE(run(disable));
+    disable.active=true;
+    EXPECT_FALSE(run(disable));
+    ASSERT_TRUE(run(command(Kind::Users,Op::Remove,user)));
+    const auto retired=execute(fixture.get(),
+        "SELECT i.status::text,m.state::text,(SELECT count(*) FROM openproof.scim_users WHERE identity_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.scim_group_members WHERE identity_id=$1)::text "
+        "FROM openproof.identities i JOIN openproof.memberships m ON m.identity_id=i.id WHERE i.id=$1",{user});
+    ASSERT_EQ(PQntuples(retired.get()),1);
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,0),"3");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,1),"3");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,2),"0");
+    EXPECT_STREQ(PQgetvalue(retired.get(),0,3),"0");
+    EXPECT_FALSE(run(disable));
+    auto oldGroupDelete=command(Kind::Groups,Op::Remove,group);
+    oldGroupDelete.expectedVersion=reduced->rows.front().updatedAt;
+    EXPECT_FALSE(run(oldGroupDelete));
+    ASSERT_TRUE(run(command(Kind::Groups,Op::Remove,group)));
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativePasskeyListingAndRegistrationChallengeAreSessionBound)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace pk=openproof::provider::passkey;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto sessionName="passkey-session-"+seed.suffix;
+    const auto credentialId="passkey-credential-"+seed.suffix;
+    const auto otherCredential="passkey-other-"+seed.suffix;
+    const auto digest=fnd::toHex(openproof::security::sha256(sessionName).value());
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.passkey_credentials(credential_id,identity_id,public_key_x,public_key_y,sign_count,created_at_ms,last_used_at_ms) "
+        "VALUES($1,$2,'fixture-x','fixture-y',7,1770000000000,1770000000000),"
+        "($3,$4,'fixture-x','fixture-y',0,1770000000000,1770000000000)",
+        {credentialId,seed.owner,otherCredential,seed.secondOwner})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](std::optional<pk::RegistrationCeremony> ceremony=std::nullopt,
+        std::string identity={},fnd::Instant now=kNow+1s) {
+        io.restart();
+        auto task=native.readPasskeyAccountAsync(ids::IdentityId{identity.empty()?seed.owner:identity},
+            openproof::session::SessionId{sessionName},now,std::move(ceremony));
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    const auto listed=read();
+    ASSERT_TRUE(listed);
+    ASSERT_EQ(listed->size(),1U);
+    EXPECT_EQ(listed->front().credentialId,credentialId);
+    EXPECT_EQ(listed->front().signCount,7U);
+    EXPECT_FALSE(read(std::nullopt,seed.secondOwner));
+    EXPECT_FALSE(read(std::nullopt,seed.owner,kNow+601s));
+    auto ceremony=[&](std::string suffix,fnd::Instant expiry) {
+        return pk::RegistrationCeremony{openproof::identity::provider::ChallengeId{"pkr_"+seed.suffix+suffix},
+            ids::IdentityId{seed.owner},expiry};
+    };
+    const auto first=ceremony("-first",kNow+300s);
+    const auto expired=ceremony("-expired",kNow);
+    EXPECT_FALSE(read(expired));
+    auto mismatch=first;
+    mismatch.identity=ids::IdentityId{seed.secondOwner};
+    EXPECT_FALSE(read(mismatch));
+    ASSERT_TRUE(read(first));
+    EXPECT_FALSE(read(first));
+    const auto stored=execute(fixture.get(),
+        "SELECT identity_id,expires_at_ms::text,consumed_at_ms IS NULL FROM openproof.passkey_registration_ceremonies WHERE id=$1",
+        {std::string{first.id.value()}});
+    ASSERT_EQ(PQntuples(stored.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(stored.get(),0,0)},seed.owner);
+    EXPECT_STREQ(PQgetvalue(stored.get(),0,1),"1770000300000");
+    EXPECT_STREQ(PQgetvalue(stored.get(),0,2),"t");
+    // The existing ceremony counts toward the bound; no unbounded creation.
+    for (int n=1;n<32;++n) {
+        const auto next=ceremony("-"+std::to_string(n),kNow+300s);
+        ASSERT_TRUE(read(next));
+    }
+    auto capped=read(ceremony("-capped",kNow+300s));
+    ASSERT_FALSE(capped);
+    EXPECT_EQ(capped.error().code(),fnd::ErrorCode::RateLimited);
+    // Passkey mutation rollback and last credential protection.
+    const auto mutate=[&](std::string id,std::optional<pk::RegistrationCeremony> challenge=std::nullopt,
+        std::string owner={},fnd::Instant now=kNow+2s) {
+        auto identity=ids::IdentityId{owner.empty()?seed.owner:owner};
+        std::optional<pk::PasskeyCredential> verified;
+        std::optional<openproof::identity::provider::ChallengeId> cid;
+        if (challenge) {
+            cid=challenge->id;
+            verified.emplace(pk::PasskeyCredential{id,identity,std::string(43,'A'),std::string(43,'B'),0U,now,now});
+        }
+        return native.mutatePasskeyAccountAsync(identity,openproof::session::SessionId{sessionName},now,
+            std::move(id),std::move(cid),std::move(verified));
+    };
+    const auto runMutation=[&](auto task){
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    EXPECT_FALSE(runMutation(mutate(otherCredential,first)));
+    const auto unconsumed=execute(fixture.get(),
+        "SELECT consumed_at_ms IS NULL FROM openproof.passkey_registration_ceremonies WHERE id=$1",
+        {std::string{first.id.value()}});
+    EXPECT_STREQ(PQgetvalue(unconsumed.get(),0,0),"t");
+    const auto newCredential="native-new-"+seed.suffix;
+    io.restart();
+    auto one=asio::co_spawn(io,mutate(newCredential,first),asio::use_future);
+    auto two=asio::co_spawn(io,mutate(newCredential+"-duplicate",first),asio::use_future);
+    io.run();
+    auto a=one.get(),b=two.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    const auto winner=a?newCredential:newCredential+"-duplicate";
+    EXPECT_FALSE(runMutation(mutate(otherCredential)));
+    EXPECT_FALSE(runMutation(mutate(winner,std::nullopt,seed.secondOwner)));
+    io.restart();
+    auto delA=asio::co_spawn(io,mutate(credentialId),asio::use_future);
+    auto delB=asio::co_spawn(io,mutate(winner),asio::use_future);
+    io.run();
+    auto da=delA.get(),db=delB.get();
+    ASSERT_NE(da.has_value(),db.has_value());
+    EXPECT_EQ((da?db:da).error().code(),fnd::ErrorCode::FailedPrecondition);
+    const auto remaining=read();
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->size(),1U);
+    const auto link=execute(fixture.get(),
+        "SELECT identity_id FROM openproof.external_identities WHERE provider='passkey' AND external_subject=$1",
+        {seed.owner});
+    ASSERT_EQ(PQntuples(link.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(link.get(),0,0)},seed.owner);
+    auto config=pk::PasskeyConfig::create("identity.example.test","Fixture","https://identity.example.test",
+        fnd::SecretString{std::string(32U,'k')},5min);
+    ASSERT_TRUE(config);
+    auto options=pk::assertionOptions(config.value(),kNow+2s);
+    ASSERT_TRUE(options);
+    const auto assertProof=[&](std::string credential){
+        io.restart();
+        std::optional<fnd::Result<ids::IdentityId>> result;
+        auto collect=[&]()->asio::awaitable<void>{
+            result.emplace(co_await native.verifyPasskeyAssertionAsync(config.value(),options->id(),
+                pk::AssertionResponse{std::move(credential),"invalid","invalid","invalid",std::nullopt},kNow+2s));
+        };
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(result).value();
+    };
+    EXPECT_FALSE(assertProof(remaining->front().credentialId));
+    EXPECT_FALSE(assertProof(otherCredential));
+    const auto unchanged=read();
+    ASSERT_TRUE(unchanged && unchanged->size()==1U);
+    EXPECT_EQ(unchanged->front().signCount,remaining->front().signCount);
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.external_identities WHERE provider='passkey' AND external_subject=$1",{seed.owner})));
+    EXPECT_FALSE(assertProof(remaining->front().credentialId));
+    ASSERT_TRUE(runMutation(mutate(remaining->front().credentialId)));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "UPDATE openproof.sessions SET state=1,revoked_at_ms=1770000002000 WHERE id=$1",{sessionName})));
+    EXPECT_FALSE(read());
+    EXPECT_FALSE(read(ceremony("-revoked",kNow+300s)));
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeApplicationReadsRequireCurrentOwnerSessionAndNeverProjectSecrets)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    using Read=openproof::application::ManagementRead;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="read-app-"+seed.suffix, foreignApp="foreign-"+app, client="read-client-"+seed.suffix;
+    const auto sessionName="read-session-"+seed.suffix, weakSession=sessionName+"-weak";
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    const auto digest=[&](std::string_view label) {
+        return fnd::toHex(openproof::security::sha256(seed.suffix+std::string{label}).value());
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.memberships(organization_id,identity_id,state,invited_at_ms) "
+        "VALUES($1,$2,1,1770000000000),($1,$3,1,1770000000000)",{seed.org,seed.owner,seed.secondOwner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.membership_roles(organization_id,identity_id,role) "
+        "VALUES($1,$2,'owner'),($1,$3,'member')",{seed.org,seed.owner,seed.secondOwner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',2,3,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000),"
+        "($4,$2,'local',1,1,false,0,decode($5,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,digest("-session"),weakSession,digest("-weak")}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'read-fixture','Fixture',0,0,1770000000000,1770000000000),"
+        "($3,$4,'foreign-fixture','Foreign',0,0,1770000000000,1770000000000)",{app,seed.org,foreignApp,seed.foreignOrg}));
+    const auto secret=digest("-client-secret");
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',0,0,decode($3,'hex'),1770000000000,1770000000000)",{client,app,secret}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) "
+        "VALUES($1,'https://fixture.example.invalid/callback')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'openid')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_request_signing_keys(client_id,key_id,public_key_pem,updated_at_ms) "
+        "VALUES($1,'fixture-key','fixture-public-material',1770000000000)",{client}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    const auto read=[&](Read op,std::optional<std::string> filter=std::nullopt,
+        std::string actor={},std::string session={}) {
+        io.restart();
+        auto task=native.readApplicationManagementAsync(op,ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},std::move(filter),kNow+1s);
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    auto apps=read(Read::Applications);
+    ASSERT_TRUE(apps);
+    EXPECT_NE(apps->find(app),std::string::npos);
+    EXPECT_EQ(apps->find(foreignApp),std::string::npos);
+    EXPECT_FALSE(read(Read::Applications,std::nullopt,seed.secondOwner));
+    auto weak=read(Read::Applications,std::nullopt,seed.owner,weakSession);
+    ASSERT_FALSE(weak);
+    EXPECT_EQ(weak.error().code(),fnd::ErrorCode::AssuranceInsufficient);
+    auto console=read(Read::Console);
+    ASSERT_TRUE(console);
+    EXPECT_EQ(console.value(),"{}");
+    EXPECT_FALSE(read(Read::Console,std::nullopt,seed.secondOwner));
+    auto weakConsole=read(Read::Console,std::nullopt,seed.owner,weakSession);
+    ASSERT_FALSE(weakConsole);
+    EXPECT_EQ(weakConsole.error().code(),fnd::ErrorCode::AssuranceInsufficient);
+    EXPECT_FALSE(read(Read::Clients,foreignApp));
+    auto clients=read(Read::Clients,app);
+    ASSERT_TRUE(clients);
+    EXPECT_NE(clients->find(client),std::string::npos);
+    EXPECT_NE(clients->find("https://fixture.example.invalid/callback"),std::string::npos);
+    EXPECT_EQ(clients->find(secret),std::string::npos);
+    EXPECT_EQ(clients->find("secret_digest"),std::string::npos);
+    auto jar=read(Read::JarKey,client);
+    ASSERT_TRUE(jar);
+    EXPECT_NE(jar->find("fixture-public-material"),std::string::npos);
+    EXPECT_TRUE(read(Read::Resources));
+    EXPECT_FALSE(read(Read::ServiceIdentity,client));
+    using Mutation=openproof::application::ApplicationMutation;
+    using Command=openproof::application::ApplicationMutationCommand;
+    using AppId=openproof::application::ApplicationId;
+    using Status=openproof::application::ApplicationStatus;
+    const auto mutate=[&](Command command,std::string actor={},std::string session={},fnd::Instant when=kNow+2s) {
+        return native.mutateApplicationAsync(std::move(command),
+            ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    const auto collect=[](auto task,auto& output)->asio::awaitable<void> {
+        output.emplace(co_await std::move(task));
+    };
+    const auto runMutation=[&](auto task) {
+        io.restart();
+        std::optional<typename decltype(task)::value_type> output;
+        auto done=asio::co_spawn(io,collect(std::move(task),output),asio::use_future);
+        io.run(); done.get();
+        return std::move(output).value();
+    };
+    const auto createdId="native-created-"+seed.suffix;
+    const auto create=[&](std::string id,std::string identifier) {
+        return Command{Mutation::Create,AppId{std::move(id)},std::move(identifier),"Native fixture",
+            openproof::application::Environment::Staging};
+    };
+    const auto change=[&](Mutation action,std::string id) {
+        return Command{action,AppId{std::move(id)},{},{}};
+    };
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"invalid identifier"))));
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"new-fixture"),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(mutate(create(createdId,"new-fixture"),seed.owner,weakSession)));
+    auto foreign=runMutation(mutate(change(Mutation::Revoke,foreignApp)));
+    ASSERT_FALSE(foreign);
+    EXPECT_EQ(foreign.error().code(),fnd::ErrorCode::NotFound);
+    auto created=runMutation(mutate(create(createdId,"new-fixture")));
+    ASSERT_TRUE(created);
+    EXPECT_EQ(created->id().value(),createdId);
+    EXPECT_EQ(created->status(),Status::Active);
+    auto duplicate=runMutation(mutate(create(createdId+"-duplicate","new-fixture")));
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(),fnd::ErrorCode::AlreadyExists);
+    io.restart();
+    std::optional<fnd::Result<openproof::application::Application>> resultA,resultB;
+    auto suspendA=asio::co_spawn(io,collect(mutate(change(Mutation::Suspend,createdId)),resultA),asio::use_future);
+    auto suspendB=asio::co_spawn(io,collect(mutate(change(Mutation::Suspend,createdId)),resultB),asio::use_future);
+    io.run(); suspendA.get(); suspendB.get();
+    auto a=std::move(resultA).value(),b=std::move(resultB).value();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto activated=runMutation(mutate(change(Mutation::Activate,createdId)));
+    ASSERT_TRUE(activated);
+    EXPECT_EQ(activated->status(),Status::Active);
+    auto revoked=runMutation(mutate(change(Mutation::Revoke,createdId)));
+    ASSERT_TRUE(revoked);
+    EXPECT_EQ(revoked->status(),Status::Revoked);
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Activate,createdId))));
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Revoke,createdId))));
+    const auto durable=execute(fixture.get(),
+        "SELECT status::text FROM openproof.applications WHERE id=$1",{createdId});
+    ASSERT_EQ(PQntuples(durable.get()),1);
+    EXPECT_STREQ(PQgetvalue(durable.get(),0,0),"2");
+    namespace cli=openproof::client;
+    using COp=cli::ManagementMutation;
+    using CCommand=cli::ManagementMutationCommand;
+    const auto clientDigest=[&](std::string_view label) {
+        return cli::ClientSecretDigest{openproof::security::sha256(seed.suffix+std::string{label}).value()};
+    };
+    const auto createClient=[&](std::string id,std::string parent,cli::ClientKind kind) {
+        std::vector<cli::RedirectUri> redirects;
+        if (kind!=cli::ClientKind::Service)
+            redirects.push_back(cli::RedirectUri::create("https://fixture.example.invalid/callback",kind).value());
+        std::vector<cli::Scope> scopes;
+        scopes.push_back(cli::Scope::create("openid").value());
+        return CCommand{COp::Create,cli::ClientId{std::move(id)},AppId{std::move(parent)},"Client fixture",
+            kind,std::move(redirects),std::move(scopes),
+            cli::clientIsPublic(kind)?std::nullopt:std::optional<cli::ClientSecretDigest>{clientDigest("-initial")}};
+    };
+    const auto clientChange=[&](COp action,std::string id,std::optional<cli::ClientSecretDigest> next=std::nullopt) {
+        return CCommand{action,cli::ClientId{std::move(id)},std::nullopt,{},cli::ClientKind::Web,{},{},next};
+    };
+    const auto clientTask=[&](CCommand command,std::string actor={},std::string session={}) {
+        return native.mutateOAuthClientAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},kNow+3s);
+    };
+    const auto privateId="native-confidential-"+seed.suffix,publicId="native-public-"+seed.suffix;
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,foreignApp,cli::ClientKind::Web))));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,createdId,cli::ClientKind::Web))));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web),seed.owner,weakSession)));
+    auto registered=runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web)));
+    ASSERT_TRUE(registered);
+    EXPECT_EQ(registered->status(),cli::ClientStatus::Active);
+    EXPECT_EQ(registered->secretDigest(),std::optional<cli::ClientSecretDigest>{clientDigest("-initial")});
+    EXPECT_FALSE(runMutation(clientTask(createClient(privateId,app,cli::ClientKind::Web))));
+    auto publicClient=runMutation(clientTask(createClient(publicId,app,cli::ClientKind::Browser)));
+    ASSERT_TRUE(publicClient);
+    EXPECT_FALSE(publicClient->secretDigest());
+    const auto next=clientDigest("-rotated");
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::RotateSecret,publicId,next))));
+    auto rotated=runMutation(clientTask(clientChange(COp::RotateSecret,privateId,next)));
+    ASSERT_TRUE(rotated);
+    EXPECT_EQ(rotated->secretDigest(),std::optional<cli::ClientSecretDigest>{next});
+    const auto persisted=execute(fixture.get(),
+        "SELECT encode(secret_digest,'hex'),(SELECT count(*) FROM openproof.oauth_client_scopes WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_client_redirect_uris WHERE client_id=$1)::text "
+        "FROM openproof.oauth_clients WHERE id=$1",{privateId});
+    ASSERT_EQ(PQntuples(persisted.get()),1);
+    EXPECT_EQ(std::string{PQgetvalue(persisted.get(),0,0)},fnd::toHex(next.bytes()));
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,2),"1");
+    io.restart();
+    std::optional<fnd::Result<cli::Client>> clientResultA,clientResultB;
+    auto clientA=asio::co_spawn(io,collect(clientTask(clientChange(COp::Suspend,privateId)),clientResultA),asio::use_future);
+    auto clientB=asio::co_spawn(io,collect(clientTask(clientChange(COp::Suspend,privateId)),clientResultB),asio::use_future);
+    io.run(); clientA.get(); clientB.get();
+    auto ca=std::move(clientResultA).value(),cb=std::move(clientResultB).value();
+    ASSERT_NE(ca.has_value(),cb.has_value());
+    ASSERT_TRUE(runMutation(clientTask(clientChange(COp::Activate,privateId))));
+    ASSERT_TRUE(runMutation(clientTask(clientChange(COp::Revoke,privateId))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::RotateSecret,privateId,next))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Activate,privateId))));
+    constexpr std::string_view kTestRsaPublicKey = R"PEM(-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxQQ9mwfAEgVMWUY1rcqU
+Q4YMPqUwXvppmoB2ffh5TXTN2YGR14AmL5wcCvxvA/LdmJ55vLWryzt6CBjp+1Ym
+1pkT5jKpfKGPF+BC4PmqHo7SSR/Hr/e9lHHVQr1BHvxPHw8tC6jOWueB6HrZLUar
++xg6ix+x/mJmB85zL2C21LgKzLbiIOkPWpOE29CQ4RgnpFLtUegBFJTn+7op70O1
+MfwasR7O/YMVe/Hq/LLhoVh64Il+6aLNgSSuU6wEvmAMRPJi6JYH4GhUsKaXvy+W
+7D1jmGHYDJZCA2E/GuOinFTHuQIHt/dQtJ73GX2SH+TniwPrYZQmJbPS1QQxdJeb
+2wIDAQAB
+-----END PUBLIC KEY-----
+)PEM";
+    const auto keyTask=[&](std::string id,std::optional<std::string> kid,std::optional<std::string> pem,
+        std::string actor={},std::string session={},fnd::Instant when=kNow+4s) {
+        return native.mutateOAuthJarKeyAsync(cli::ClientId{std::move(id)},std::move(kid),std::move(pem),
+            ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    const std::string pem{kTestRsaPublicKey};
+    EXPECT_FALSE(runMutation(keyTask(client,"bad","not a key")));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",pem+pem)));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",pem+"trailing material")));
+    EXPECT_FALSE(runMutation(keyTask(client,"bad",std::nullopt)));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem,seed.secondOwner)));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem,seed.owner,weakSession)));
+    EXPECT_FALSE(runMutation(keyTask(privateId,"revoked",pem)));
+    EXPECT_FALSE(runMutation(keyTask("missing-client","missing",pem)));
+    ASSERT_TRUE(runMutation(keyTask(client,"native-key",pem)));
+    auto registeredJar=read(Read::JarKey,client);
+    ASSERT_TRUE(registeredJar);
+    EXPECT_NE(registeredJar->find("native-key"),std::string::npos);
+    EXPECT_FALSE(runMutation(keyTask(client,"stale",pem,{}, {},kNow+3s)));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_jar_replays(client_id,jwt_id,expires_at_ms) "
+        "VALUES($1,'fixture-replay',1770000600000)",{client}));
+    ASSERT_TRUE(runMutation(keyTask(client,"rotated-key",pem)));
+    ASSERT_TRUE(runMutation(keyTask(client,std::nullopt,std::nullopt)));
+    ASSERT_TRUE(runMutation(keyTask(client,std::nullopt,std::nullopt)));
+    EXPECT_FALSE(read(Read::JarKey,client));
+    const auto replay=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_jar_replays WHERE client_id=$1 AND jwt_id='fixture-replay'",{client});
+    ASSERT_EQ(PQntuples(replay.get()),1);
+    EXPECT_STREQ(PQgetvalue(replay.get(),0,0),"1");
+    namespace res=openproof::resource;
+    using ROp=res::ResourceMutation;
+    using RCommand=res::ResourceMutationCommand;
+    const auto resourceId="native-resource-"+seed.suffix;
+    const auto audience="urn:fixture:resource:"+seed.suffix;
+    const auto resourceCreate=[&](std::string id,std::string target,std::vector<std::string> scopes) {
+        return RCommand{ROp::Create,res::ResourceId{std::move(id)},std::move(target),"Resource fixture",std::move(scopes)};
+    };
+    const auto resourceChange=[&](ROp op) {
+        return RCommand{op,res::ResourceId{""},audience,{},{}};
+    };
+    const auto resourceTask=[&](RCommand command,std::string actor={},std::string session={},
+        fnd::Instant when=kNow+5s) {
+        return native.mutateOAuthResourceAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,"invalid audience",{"read"}))));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{}))));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{"read"}),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(resourceTask(resourceCreate(resourceId,audience,{"read"}),seed.owner,weakSession)));
+    auto createdResource=runMutation(resourceTask(resourceCreate(resourceId,audience,{"write","read","read"})));
+    ASSERT_TRUE(createdResource);
+    EXPECT_EQ(createdResource->scopes(),(std::vector<std::string>{"read","write"}));
+    EXPECT_EQ(createdResource->status(),res::ResourceStatus::Active);
+    auto duplicateResource=runMutation(resourceTask(resourceCreate(resourceId+"-duplicate",audience,{"read"})));
+    ASSERT_FALSE(duplicateResource);
+    EXPECT_EQ(duplicateResource.error().code(),fnd::ErrorCode::AlreadyExists);
+    auto suspendedResource=runMutation(resourceTask(resourceChange(ROp::Suspend),{}, {},kNow+6s));
+    ASSERT_TRUE(suspendedResource);
+    EXPECT_EQ(suspendedResource->status(),res::ResourceStatus::Suspended);
+    auto staleResource=runMutation(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+5s));
+    ASSERT_FALSE(staleResource);
+    EXPECT_EQ(staleResource.error().code(),fnd::ErrorCode::Conflict);
+    io.restart();
+    std::optional<fnd::Result<res::ResourceServer>> revokeResult,activateResult;
+    auto revokeTask=asio::co_spawn(io,collect(resourceTask(resourceChange(ROp::Revoke),{}, {},kNow+7s),revokeResult),asio::use_future);
+    auto activateTask=asio::co_spawn(io,collect(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+7s),activateResult),asio::use_future);
+    io.run(); revokeTask.get(); activateTask.get();
+    ASSERT_TRUE(revokeResult && revokeResult->has_value());
+    ASSERT_TRUE(activateResult.has_value());
+    if (!activateResult->has_value()) {
+        EXPECT_EQ(activateResult->error().code(),fnd::ErrorCode::FailedPrecondition);
+    }
+    EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Activate),{}, {},kNow+8s)));
+    const auto resourceState=execute(fixture.get(),
+        "SELECT status::text,(SELECT count(*) FROM openproof.oauth_resource_scopes WHERE resource_id=$1)::text "
+        "FROM openproof.oauth_resources WHERE id=$1",{resourceId});
+    ASSERT_EQ(PQntuples(resourceState.get()),1);
+    EXPECT_STREQ(PQgetvalue(resourceState.get(),0,0),"2");
+    EXPECT_STREQ(PQgetvalue(resourceState.get(),0,1),"2");
+
+    using SOp=res::ServiceMutation;
+    using SCommand=res::ServiceMutationCommand;
+    const auto serviceClient="native-service-"+seed.suffix;
+    const auto serviceResource="native-service-resource-"+seed.suffix;
+    const auto serviceAudience="urn:fixture:service:"+seed.suffix;
+    const auto serviceIdentity="native-service-identity-"+seed.suffix;
+    ASSERT_TRUE(runMutation(clientTask(createClient(serviceClient,app,cli::ClientKind::Service))));
+    ASSERT_TRUE(runMutation(resourceTask(resourceCreate(serviceResource,serviceAudience,{"openid","read"}))));
+    const auto provision=[&](std::string id,std::string clientId,std::string target,std::vector<std::string> scopes) {
+        return SCommand{SOp::Provision,cli::ClientId{std::move(clientId)},ids::IdentityId{std::move(id)},
+            {std::move(target)},std::move(scopes)};
+    };
+    const auto serviceChange=[&](SOp op) {
+        return SCommand{op,cli::ClientId{serviceClient},ids::IdentityId{""},{},{}};
+    };
+    const auto serviceTask=[&](SCommand command,std::string actor={},std::string session={},fnd::Instant when=kNow+9s) {
+        return native.mutateServiceIdentityAsync(std::move(command),ids::IdentityId{actor.empty()?seed.owner:actor},
+            openproof::session::SessionId{session.empty()?sessionName:session},when);
+    };
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,publicId,serviceAudience,{"openid"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,audience,{"read"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"forbidden"}))));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"}),seed.secondOwner)));
+    EXPECT_FALSE(runMutation(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"}),seed.owner,weakSession)));
+    EXPECT_FALSE(runMutation(serviceTask(provision(seed.owner,serviceClient,serviceAudience,{"openid"}))));
+    const auto before=execute(fixture.get(),"SELECT count(*)::text FROM openproof.identities WHERE id=$1",{serviceIdentity});
+    ASSERT_EQ(PQntuples(before.get()),1);
+    EXPECT_STREQ(PQgetvalue(before.get(),0,0),"0");
+    io.restart();
+    std::optional<fnd::Result<res::ServiceIdentity>> serviceA,serviceB;
+    auto sa=asio::co_spawn(io,collect(serviceTask(provision(serviceIdentity,serviceClient,serviceAudience,{"openid"})),serviceA),asio::use_future);
+    auto sb=asio::co_spawn(io,collect(serviceTask(provision(serviceIdentity+"-duplicate",serviceClient,serviceAudience,{"openid"})),serviceB),asio::use_future);
+    io.run(); sa.get(); sb.get();
+    ASSERT_TRUE(serviceA && serviceB);
+    ASSERT_NE(serviceA->has_value(),serviceB->has_value());
+    const auto& registeredService=serviceA->has_value()?serviceA->value():serviceB->value();
+    EXPECT_TRUE(registeredService.active());
+    EXPECT_EQ(registeredService.scopes(),std::vector<std::string>{"openid"});
+    const auto provisioned=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.identities WHERE id IN ($1,$2) AND kind=1)::text,"
+        "(SELECT count(*) FROM openproof.service_identities WHERE client_id=$3)::text",
+        {serviceIdentity,serviceIdentity+"-duplicate",serviceClient});
+    ASSERT_EQ(PQntuples(provisioned.get()),1);
+    EXPECT_STREQ(PQgetvalue(provisioned.get(),0,0),"1");
+    EXPECT_STREQ(PQgetvalue(provisioned.get(),0,1),"1");
+    ASSERT_TRUE(read(Read::ServiceIdentity,serviceClient));
+    auto inactive=runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+10s));
+    ASSERT_TRUE(inactive);
+    EXPECT_FALSE(inactive->active());
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+9s)));
+    ASSERT_TRUE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+11s)));
+    ASSERT_TRUE(runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+12s)));
+    const RCommand stopResource{ROp::Revoke,res::ResourceId{""},serviceAudience,{},{}};
+    ASSERT_TRUE(runMutation(resourceTask(stopResource,{}, {},kNow+13s)));
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Activate),{}, {},kNow+14s)));
+    const auto serviceState=execute(fixture.get(),
+        "SELECT active::text,(SELECT count(*) FROM openproof.service_identity_audiences WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.service_identity_scopes WHERE client_id=$1)::text "
+        "FROM openproof.service_identities WHERE client_id=$1",{serviceClient});
+    ASSERT_EQ(PQntuples(serviceState.get()),1);
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,0),"false");
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(serviceState.get(),0,2),"1");
+    ASSERT_NO_THROW(sql("DELETE FROM openproof.membership_roles WHERE organization_id=$1 AND identity_id=$2 AND role='owner'",
+        {seed.org,seed.owner}));
+    EXPECT_FALSE(read(Read::Clients,app));
+    EXPECT_FALSE(read(Read::Console));
+    EXPECT_FALSE(runMutation(mutate(change(Mutation::Suspend,app))));
+    EXPECT_FALSE(runMutation(clientTask(clientChange(COp::Revoke,publicId))));
+    EXPECT_FALSE(runMutation(keyTask(client,"denied",pem)));
+    EXPECT_FALSE(runMutation(resourceTask(resourceChange(ROp::Revoke),{}, {},kNow+8s)));
+    EXPECT_FALSE(runMutation(serviceTask(serviceChange(SOp::Deactivate),{}, {},kNow+15s)));
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseAdminListingRequiresActiveTenantOwner)
@@ -947,7 +1759,7 @@ asio::awaitable<bool> concurrentConnectionRead(
         && linked->second.empty() == emptyExpected;
 }
 
-TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFederationState)
+TEST(PostgresCanonicalCoroutineTest, IndependentNativeTransactionsShareOneTimeFederationState)
 {
     const auto dsn=disposableDsn();
     if (!dsn) {
@@ -957,12 +1769,9 @@ TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFede
         GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
     }
     using namespace std::chrono_literals;
-    auto config=pg::PoolConfig::create(fnd::SecretString{*dsn},1U,500ms);
-    ASSERT_TRUE(config);
-    auto pool=pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(pool);
-    pg::PostgresAuthenticationTransactionStore legacy{*pool.value()};
     asio::io_context io;
+    pg::CoroutinePostgresAuthenticationTransactionStore peer{
+        io.get_executor(),fnd::SecretString{*dsn},1U,500ms,1000ms,2000ms};
     pg::CoroutinePostgresAuthenticationTransactionStore native{
         io.get_executor(),fnd::SecretString{*dsn},2U,500ms,1000ms,2000ms};
     const Seed seed;
@@ -989,28 +1798,28 @@ TEST(PostgresCanonicalCoroutineTest, NativeAndLegacyTransactionsShareOneTimeFede
         return std::move(result.value());
     };
     const auto first="legacy-to-native-"+seed.suffix;
-    ASSERT_TRUE(legacy.begin(pending(first)));
+    ASSERT_TRUE(run(peer.beginAsync(pending(first))));
     auto redeemed=run(native.consumeAsync(idp::TransactionId{first},nonce.clone(),binding,kNow+1s));
     ASSERT_TRUE(redeemed);
     EXPECT_EQ(redeemed->provider().value(),"fixture-provider");
     EXPECT_EQ(redeemed->metadata().at("challenge_id"),"fixture-challenge");
     EXPECT_EQ(redeemed->metadata().at("connection_identity"),seed.owner);
     EXPECT_EQ(redeemed->metadata().at("requested_assurance"),"1");
-    EXPECT_FALSE(legacy.consume(idp::TransactionId{first},nonce,binding,kNow+2s));
+    EXPECT_FALSE(run(peer.consumeAsync(idp::TransactionId{first},nonce.clone(),binding,kNow+2s)));
     const auto second="native-to-legacy-"+seed.suffix;
     ASSERT_TRUE(run(native.beginAsync(pending(second))));
-    auto legacyRedeemed=legacy.consume(idp::TransactionId{second},nonce,binding,kNow+1s);
+    auto legacyRedeemed=run(peer.consumeAsync(idp::TransactionId{second},nonce.clone(),binding,kNow+1s));
     ASSERT_TRUE(legacyRedeemed);
     EXPECT_EQ(legacyRedeemed->metadata().at("connection_identity"),seed.owner);
     EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{second},nonce.clone(),binding,kNow+2s)));
     const auto third="cross-store-burn-"+seed.suffix;
-    ASSERT_TRUE(legacy.begin(pending(third)));
+    ASSERT_TRUE(run(peer.beginAsync(pending(third))));
     EXPECT_FALSE(run(native.consumeAsync(idp::TransactionId{third},nonce.clone(),
         idp::BindingDigest{},kNow+1s)));
-    EXPECT_FALSE(legacy.consume(idp::TransactionId{third},nonce,binding,kNow+2s));
+    EXPECT_FALSE(run(peer.consumeAsync(idp::TransactionId{third},nonce.clone(),binding,kNow+2s)));
 }
 
-TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAndRollsBack)
+TEST(PostgresCanonicalCoroutineTest, IndependentNativeAuthorizationAuditSharesChainAndRollsBack)
 {
     const auto dsn = disposableDsn();
     if (!dsn) {
@@ -1036,12 +1845,10 @@ TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAn
     const auto makeKey = [] {
         return aud::AuditKey::create(fnd::SecretString{std::string(32U, 'A')}).value();
     };
-    auto config = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
-    ASSERT_TRUE(config);
-    auto legacyPool = pg::ConnectionPool::create(std::move(config).value());
-    ASSERT_TRUE(legacyPool);
-    pg::PostgresAuthorizationDecisionSink legacy{*legacyPool.value(), makeKey(), clock};
     asio::io_context io;
+    pg::CoroutineAuthorizationDecisionSink peer{
+        io.get_executor(), fnd::SecretString{*dsn}, makeKey(), clock,
+        1U, 500ms, 1000ms, 2000ms};
     pg::CoroutineAuthorizationDecisionSink native{
         io.get_executor(), fnd::SecretString{*dsn}, makeKey(), clock,
         2U, 500ms, 1000ms, 2000ms};
@@ -1049,22 +1856,21 @@ TEST(PostgresCanonicalCoroutineTest, NativeAuthorizationAuditSharesLegacyChainAn
     const pol::Action action{"protected.read"};
     const pol::Resource resource{"protected-resource"};
     const auto denial = pol::AuthorizationDecision::deny("fixture policy denied");
-    const auto record = [&](const std::string& correlation) {
+    const auto recordOn = [&](pg::CoroutineAuthorizationDecisionSink& sink,const std::string& correlation) {
         io.restart();
-        auto completion = asio::co_spawn(io, native.recordAsync(
+        auto completion = asio::co_spawn(io, sink.recordAsync(
             authenticated.value(), tenant, action, resource, denial,
             fnd::CorrelationId{correlation}), asio::use_future);
         io.run();
         return completion.get();
     };
-    const std::string first = "legacy-audit-" + seed.suffix;
+    const auto record=[&](const std::string& correlation){return recordOn(native,correlation);};
+    const std::string first = "peer-audit-" + seed.suffix;
     const std::string second = "native-audit-" + seed.suffix;
     const std::string third = "legacy-tail-" + seed.suffix;
-    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
-        denial, fnd::CorrelationId{first}));
+    ASSERT_TRUE(recordOn(peer,first));
     ASSERT_TRUE(record(second));
-    ASSERT_TRUE(legacy.record(authenticated.value(), tenant, action, resource,
-        denial, fnd::CorrelationId{third}));
+    ASSERT_TRUE(recordOn(peer,third));
     auto chain = execute(fixture.get(),
         "SELECT a.sequence,a.event_id,a.correlation_id,encode(a.previous_hash,'hex'),"
         "encode(a.event_hash,'hex'),o.payload->>'type',o.payload->>'identity_id',"
@@ -1356,19 +2162,35 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
         done.get();
         return std::move(result.value());
     };
+    const auto clientProof=fnd::toHex(openproof::security::sha256("confidential-fixture").value());
+    const auto authenticateClient=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string proof){
+        io.restart();
+        auto pending=asio::co_spawn(io,store.authenticateConfidentialClientAsync(client,std::move(proof)),asio::use_future);
+        io.run(); return pending.get();
+    };
+    EXPECT_FALSE(authenticateClient(native,clientProof)); // public client
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET kind=0,secret_digest=decode($2,'hex') WHERE id=$1",{client,clientProof}));
+    EXPECT_TRUE(authenticateClient(native,clientProof));
+    EXPECT_FALSE(authenticateClient(foreign,clientProof));
+    EXPECT_FALSE(authenticateClient(native,std::string(64U,'0')));
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_clients SET kind=1,secret_digest=NULL WHERE id=$1",{client}));
     auto accepted=read(native);
     ASSERT_TRUE(accepted) << (accepted ? "" : std::string{fnd::errorCodeName(accepted.error().code())});
     EXPECT_EQ(accepted->identity().value(),seed.owner);
     EXPECT_EQ(accepted->id().value(),"delegated-access");
     const auto readContext=[&]{
         std::optional<fnd::Result<openproof::session::DelegatedAccess>> result;
-        auto capture=[](auto& adapter,std::string fingerprint,auto& output)->asio::awaitable<void>{
-            output.emplace(co_await adapter.readDelegatedAccessAsync(std::move(fingerprint),kNow));
+        fnd::Instant issued{};
+        auto capture=[](auto& adapter,std::string fingerprint,auto& output,fnd::Instant& observed)->asio::awaitable<void>{
+            output.emplace(co_await adapter.readDelegatedAccessAsync(std::move(fingerprint),kNow,&observed));
         };
         io.restart();
-        auto done=asio::co_spawn(io,capture(native,digest,result),asio::use_future);
+        auto done=asio::co_spawn(io,capture(native,digest,result,issued),asio::use_future);
         io.run();
         done.get();
+        if (result && *result) {
+            EXPECT_EQ(issued,kNow);
+        }
         return std::move(result.value());
     };
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'gateway.read')",{family}));
@@ -1411,8 +2233,589 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=1 WHERE id=$1",{application}));
     EXPECT_FALSE(read(native));
     ASSERT_NO_THROW(sql("UPDATE openproof.applications SET status=0 WHERE id=$1",{application}));
-    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET revoked_at_ms=1770000000000 WHERE id=$1",{family}));
+    const auto otherClient=client+"-other";
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,"
+        "created_at_ms,updated_at_ms) VALUES($1,$2,'Other fixture',1,0,1770000000000,1770000000000)",{otherClient,application}));
+    const auto refreshDigest=openproof::security::sha256(family+"-refresh").value();
+    const auto refreshHex=fnd::toHex(refreshDigest);
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+        "VALUES(decode($1,'hex'),$2,0,0,1770000000000,1770000060000)",{refreshHex,family}));
+    auto revoke=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string caller,
+        std::optional<std::string> proof,std::string fingerprint){
+        io.restart();
+        auto pending=asio::co_spawn(io,store.revokeOAuthTokenAsync(std::move(caller),
+            std::move(proof),std::move(fingerprint),kNow+1s),asio::use_future);
+        io.run(); return pending.get();
+    };
+    EXPECT_FALSE(revoke(foreign,client,std::nullopt,refreshHex));
+    EXPECT_FALSE(revoke(native,client,clientProof,refreshHex)); // public clients must not present a secret
+    EXPECT_TRUE(revoke(native,otherClient,std::nullopt,refreshHex)); // foreign token, indistinguishable no-op
+    EXPECT_TRUE(revoke(native,client,std::nullopt,std::string(64U,'0')));
+    EXPECT_TRUE(read(native));
+    EXPECT_TRUE(revoke(native,client,std::nullopt,digest)); // access only
     EXPECT_FALSE(read(native));
+    auto liveFamily=execute(fixture.get(),
+        "SELECT (revoked_at_ms IS NULL)::text FROM openproof.oauth_token_families WHERE id=$1",{family});
+    ASSERT_EQ(PQntuples(liveFamily.get()),1);
+    EXPECT_STREQ(PQgetvalue(liveFamily.get(),0,0),"true");
+    // Race two independent native storage instances. Both possible orders
+    // must leave no live successor after revocation.
+    pg::CoroutinePostgresCanonicalFinalizer peer{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},1U,500ms,1000ms,3000ms};
+    const auto nextAccess=fnd::toHex(openproof::security::sha256(family+"-next-access").value());
+    const auto nextRefresh=fnd::toHex(openproof::security::sha256(family+"-next-refresh").value());
+    io.restart();
+    auto rotate=asio::co_spawn(io,peer.rotateOAuthRefreshAsync(client,std::nullopt,refreshHex,
+        nextAccess,nextRefresh,std::nullopt,kNow+1s,30s),asio::use_future);
+    auto revokeRace=asio::co_spawn(io,native.revokeOAuthTokenAsync(client,std::nullopt,refreshHex,kNow+1s),asio::use_future);
+    io.run();
+    const auto revoked=revokeRace.get();
+    const auto rotated=rotate.get();
+    ASSERT_TRUE(revoked);
+    if (!rotated) {
+        EXPECT_EQ(rotated.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    }
+    const auto states=execute(fixture.get(),
+        "SELECT (f.revoked_at_ms IS NOT NULL)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t WHERE t.family_id=f.id AND t.state=0)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.state<>2)::text "
+        "FROM openproof.oauth_token_families f WHERE f.id=$1",{family});
+    ASSERT_EQ(PQntuples(states.get()),1);
+    EXPECT_STREQ(PQgetvalue(states.get(),0,0),"true");
+    EXPECT_STREQ(PQgetvalue(states.get(),0,1),"0");
+    EXPECT_STREQ(PQgetvalue(states.get(),0,2),"0");
+    EXPECT_TRUE(revoke(native,client,std::nullopt,refreshHex)); // idempotent
+    EXPECT_FALSE(read(native));
+
+    // Fresh family for native/native rotation: exactly one transaction
+    // consumes the original token; the second detects reuse and commits
+    // revocation of that transaction's newly issued successor.
+    const auto rotatingFamily=family+"-native-rotation";
+    const auto fingerprint=[&](std::string_view label) {
+        return fnd::toHex(openproof::security::sha256(rotatingFamily+std::string{label}).value());
+    };
+    const auto original=fingerprint("-original");
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families(id,client_id,identity_id,provider,"
+        "assurance,factors,phishing_resistant,authenticated_at_ms) VALUES($1,$2,$3,'local',1,1,false,1770000000000)",
+        {rotatingFamily,client,seed.owner}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'account')",{rotatingFamily}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_refresh_tokens(token_digest,family_id,sequence,state,issued_at_ms,expires_at_ms) "
+        "VALUES(decode($1,'hex'),$2,0,0,1770000000000,1770000060000)",{original,rotatingFamily}));
+    using Sender=openproof::session::DelegatedSenderConstraint;
+    auto attempt=[&](std::string caller,std::string suffix,std::optional<Sender> binding=std::nullopt){
+        return native.rotateOAuthRefreshAsync(std::move(caller),std::nullopt,original,
+            fingerprint("-access-"+suffix),fingerprint("-refresh-"+suffix),std::move(binding),kNow+2s,15min);
+    };
+    io.restart();
+    auto denied=asio::co_spawn(io,attempt(otherClient,"foreign"),asio::use_future);
+    auto wrongSender=asio::co_spawn(io,attempt(client,"sender",Sender{
+        openproof::session::DelegatedSenderConstraintKind::Dpop,"fixture"}),asio::use_future);
+    io.run();
+    EXPECT_FALSE(denied.get());
+    EXPECT_FALSE(wrongSender.get());
+    io.restart();
+    auto first=asio::co_spawn(io,attempt(client,"first"),asio::use_future);
+    auto second=asio::co_spawn(io,attempt(client,"second"),asio::use_future);
+    io.run();
+    const auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ((a?a:b).value(),std::vector<std::string>{"account"});
+    const auto finalState=execute(fixture.get(),
+        "SELECT (f.revoked_at_ms IS NOT NULL)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t WHERE t.family_id=f.id AND t.state=0)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.state<>2)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r WHERE r.family_id=f.id AND r.sequence=1 AND r.expires_at_ms=1770000060000)::text "
+        "FROM openproof.oauth_token_families f WHERE f.id=$1",{rotatingFamily});
+    ASSERT_EQ(PQntuples(finalState.get()),1);
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,0),"true");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,1),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,2),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,3),"1");
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeParPreservesLoopbackAndCommitsJarReplayAtomically)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace oauth=openproof::oauth;
+    namespace cli=openproof::client;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="par-app-"+seed.suffix,client="par-client-"+seed.suffix;
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(client+std::string{suffix}).value());
+    };
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'par-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_redirect_uris(client_id,redirect_uri) "
+        "VALUES($1,'http://127.0.0.1:1234/callback')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'openid'),($1,'account')",{client}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_request_signing_keys(client_id,key_id,public_key_pem,updated_at_ms) "
+        "VALUES($1,'fixture-key','fixture-public-material',1770000000000)",{client}));
+    auto makeRequest=[&](std::string uri,std::string scope) {
+        std::vector<cli::Scope> scopes;
+        scopes.push_back(cli::Scope::create(std::move(scope)).value());
+        return oauth::AuthorizationRequest::create(cli::ClientId{client},std::move(uri),std::move(scopes),
+            oauth::PkceChallenge::create(std::string(43U,'a')).value(),"fixture-state","fixture-nonce",
+            60s,std::nullopt,oauth::AuthorizationResponseMode::Jwt).value();
+    };
+    const auto redirect="http://127.0.0.1:4321/callback";
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    const auto capture=[](auto task,auto& output)->asio::awaitable<void> {
+        output.emplace(co_await std::move(task));
+    };
+    const auto run=[&](auto task) {
+        io.restart();
+        std::optional<typename decltype(task)::value_type> result;
+        auto done=asio::co_spawn(io,capture(std::move(task),result),asio::use_future);
+        io.run(); done.get();
+        return std::move(result).value();
+    };
+    auto push=[&](auto& store,std::string label,oauth::AuthorizationRequest request,
+        std::optional<std::string> proof=std::nullopt) {
+        return run(store.pushOAuthAuthorizationAsync(client,std::move(proof),fingerprint(label),
+            std::move(request),{},kNow,90s));
+    };
+    EXPECT_FALSE(push(foreign,"-foreign",makeRequest(redirect,"openid")));
+    EXPECT_FALSE(push(native,"-secret",makeRequest(redirect,"openid"),std::string(64U,'0')));
+    EXPECT_FALSE(push(native,"-redirect",makeRequest("http://127.0.0.1:4321/wrong","openid")));
+    EXPECT_FALSE(push(native,"-scope",makeRequest(redirect,"profile")));
+    ASSERT_TRUE(push(native,"-direct",makeRequest(redirect,"openid")));
+    int verified=0;
+    const auto verifier=[&](std::string_view kid,std::string_view pem,fnd::Instant observed)
+        ->fnd::Result<oauth::NativeJarAuthorization> {
+        ++verified;
+        EXPECT_EQ(kid,"fixture-key");
+        EXPECT_EQ(pem,"fixture-public-material");
+        EXPECT_EQ(observed,kNow);
+        return oauth::NativeJarAuthorization{makeRequest(redirect,"account"),"fixture-jti",kNow-1s,kNow+60s};
+    };
+    auto jar=[&](std::string label) {
+        return native.pushOAuthAuthorizationAsync(client,std::nullopt,fingerprint(label),std::nullopt,
+            verifier,kNow,90s);
+    };
+    // Deliberately collide with the direct request. Its failed INSERT must
+    // roll back JTI consumption so the correct subsequent push can succeed.
+    EXPECT_FALSE(run(jar("-direct")));
+    io.restart();
+    auto first=asio::co_spawn(io,jar("-jar-first"),asio::use_future);
+    auto second=asio::co_spawn(io,jar("-jar-second"),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ(verified,3);
+    const auto rows=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_pushed_authorization_requests WHERE client_id=$1 "
+        "AND redirect_uri=$2 AND response_mode=1 AND expires_at_ms=1770000090000)::text,"
+        "(SELECT count(*) FROM openproof.oauth_jar_replays WHERE client_id=$1 AND jwt_id='fixture-jti')::text",
+        {client,redirect});
+    ASSERT_EQ(PQntuples(rows.get()),1);
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,0),"2");
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,1),"1");
+
+    // Exercise the actual PAR consumer, including consent and JARM failure.
+    const auto sessionName="par-session-"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',1,1,false,0,decode($3,'hex'),1770000000000,1770000000000,1770000000000,1770003600000,600000)",
+        {sessionName,seed.owner,fingerprint("-session")}));
+    using Decision=oauth::NativeAuthorizationDecision;
+    bool failSign=false;
+    int signedCalls=0;
+    const auto sign=[&](const oauth::AuthorizationRequest& request,bool denied)->fnd::Result<std::string>{
+        ++signedCalls;
+        EXPECT_EQ(request.redirectUri(),redirect);
+        EXPECT_EQ(request.state(),std::optional<std::string>{"fixture-state"});
+        if (failSign) return fnd::fail(fnd::ErrorCode::Unavailable);
+        return std::string{denied?"fixture-denial":"fixture-response"};
+    };
+    auto complete=[&](auto& store,std::string par,std::string suffix,Decision decision,
+        fnd::Instant now=kNow+1s,std::string owner={}) {
+        return store.completeOAuthAuthorizationAsync(client,fingerprint(par),std::nullopt,
+            ids::IdentityId{owner.empty()?seed.owner:owner},openproof::session::SessionId{sessionName},
+            decision,client+suffix,fingerprint("-code"+suffix),now,5min,sign);
+    };
+    EXPECT_FALSE(run(complete(foreign,"-direct","-foreign",Decision::Approve)));
+    EXPECT_FALSE(run(complete(native,"-direct","-wrong-owner",Decision::Approve,kNow+1s,seed.secondOwner)));
+    EXPECT_FALSE(run(complete(native,"-direct","-stale",Decision::Approve,kNow+61s)));
+    auto preview=run(complete(native,"-direct","-preview",Decision::ExistingConsent));
+    ASSERT_TRUE(preview);
+    EXPECT_TRUE(preview->consentRequired);
+    EXPECT_EQ(signedCalls,0);
+    failSign=true;
+    EXPECT_FALSE(run(complete(native,"-direct","-sign-failed",Decision::Approve)));
+    failSign=false;
+    auto afterFailure=run(complete(native,"-direct","-preview-after",Decision::ExistingConsent));
+    ASSERT_TRUE(afterFailure);
+    EXPECT_TRUE(afterFailure->consentRequired);
+    io.restart();
+    std::optional<fnd::Result<oauth::NativeAuthorizationResult>> resultA,resultB;
+    auto approveA=asio::co_spawn(io,capture(complete(native,"-direct","-approve-a",Decision::Approve),resultA),asio::use_future);
+    auto approveB=asio::co_spawn(io,capture(complete(native,"-direct","-approve-b",Decision::Approve),resultB),asio::use_future);
+    io.run();approveA.get();approveB.get();
+    auto approvedA=std::move(resultA).value(),approvedB=std::move(resultB).value();
+    ASSERT_NE(approvedA.has_value(),approvedB.has_value());
+    const auto& approved=approvedA?approvedA.value():approvedB.value();
+    ASSERT_TRUE(approved.signedResponse);
+    EXPECT_EQ(approved.signedResponse->expose(),"fixture-response");
+    EXPECT_FALSE(approved.consentRequired);
+    ASSERT_TRUE(push(native,"-covered",makeRequest(redirect,"openid")));
+    auto covered=run(complete(native,"-covered","-covered",Decision::ExistingConsent));
+    ASSERT_TRUE(covered);
+    EXPECT_FALSE(covered->consentRequired);
+    const std::string jarPar=a?"-jar-first":"-jar-second";
+    auto denied=run(complete(native,jarPar,"-denied",Decision::Deny));
+    ASSERT_TRUE(denied);
+    ASSERT_TRUE(denied->signedResponse);
+    EXPECT_EQ(denied->signedResponse->expose(),"fixture-denial");
+    EXPECT_FALSE(run(complete(native,jarPar,"-replay-denied",Decision::Approve)));
+    const auto finalState=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_pushed_authorization_requests WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_authorization_codes WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_consents WHERE client_id=$1 AND revoked_at_ms IS NULL)::text",
+        {client});
+    ASSERT_EQ(PQntuples(finalState.get()),1);
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,0),"0");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,1),"2");
+    EXPECT_STREQ(PQgetvalue(finalState.get(),0,2),"1");
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeCodeExchangeConsumesExactlyOnceAndRollsBackFailedSigning)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    namespace oauth=openproof::oauth;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="code-app-"+seed.suffix;
+    const auto client="code-client-"+seed.suffix;
+    const auto family="code-family-"+seed.suffix;
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(family+std::string{suffix}).value());
+    };
+    const auto code=fingerprint("-code");
+    const std::string challenge(43U,'a'),redirect="https://client.example.invalid/callback";
+    const auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'code-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_authorization_codes "
+        "(code_digest,client_id,identity_id,redirect_uri,code_challenge,nonce,provider,assurance,factors,phishing_resistant,authenticated_at_ms,issued_at_ms,expires_at_ms,resource) "
+        "VALUES(decode($1,'hex'),$2,$3,$4,$5,'fixture-nonce','local',1,1,false,1770000000000,1770000000000,1770000060000,'urn:fixture')",
+        {code,client,seed.owner,redirect,challenge}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_authorization_code_scopes(code_digest,scope) "
+        "VALUES(decode($1,'hex'),'openid'),(decode($1,'hex'),'account')",{code}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    int signCalls=0;
+    bool failSigning=false;
+    const auto signer=[&](const oauth::AuthorizationCode& grant)->fnd::Result<std::string> {
+        ++signCalls;
+        EXPECT_EQ(grant.clientId().value(),client);
+        EXPECT_EQ(grant.identity().value(),seed.owner);
+        EXPECT_EQ(grant.nonce(),std::optional<std::string>{"fixture-nonce"});
+        EXPECT_EQ(grant.resource(),std::optional<std::string>{"urn:fixture"});
+        if (failSigning) return fnd::fail(fnd::ErrorCode::Unavailable);
+        return std::string{"fixture-signed-result"};
+    };
+    const auto attempt=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string suffix,
+        std::string proof,std::string uri,std::optional<std::string> clientProof=std::nullopt){
+        return store.exchangeOAuthCodeAsync(client,std::move(clientProof),code,std::move(uri),std::move(proof),
+            family+suffix,fingerprint("-access"+suffix),fingerprint("-refresh"+suffix),std::nullopt,
+            kNow+1s,15min,24h*30,signer);
+    };
+    const auto run=[&](auto task){
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    EXPECT_FALSE(run(attempt(foreign,"-foreign",challenge,redirect)));
+    EXPECT_FALSE(run(attempt(native,"-pkce",std::string(43U,'b'),redirect)));
+    EXPECT_FALSE(run(attempt(native,"-redirect",challenge,redirect+"/wrong")));
+    EXPECT_FALSE(run(attempt(native,"-secret",challenge,redirect,std::string(64U,'0'))));
+    EXPECT_EQ(signCalls,0);
+    failSigning=true;
+    EXPECT_FALSE(run(attempt(native,"-sign-failed",challenge,redirect)));
+    failSigning=false;
+    EXPECT_EQ(signCalls,1);
+    io.restart();
+    auto first=asio::co_spawn(io,attempt(native,"-first",challenge,redirect),asio::use_future);
+    auto second=asio::co_spawn(io,attempt(native,"-second",challenge,redirect),asio::use_future);
+    io.run();
+    auto a=first.get();
+    auto b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::AuthenticationFailed);
+    const auto& accepted=a?a.value():b.value();
+    EXPECT_EQ(accepted.scopes,(std::vector<std::string>{"account","openid"}));
+    ASSERT_TRUE(accepted.idToken);
+    EXPECT_EQ(accepted.idToken->expose(),"fixture-signed-result");
+    EXPECT_EQ(signCalls,2);
+    const auto persisted=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_authorization_codes WHERE code_digest=decode($1,'hex'))::text,"
+        "(SELECT count(*) FROM openproof.oauth_token_families WHERE client_id=$2)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t JOIN openproof.oauth_token_families f ON f.id=t.family_id WHERE f.client_id=$2 AND t.state=0)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r JOIN openproof.oauth_token_families f ON f.id=r.family_id WHERE f.client_id=$2 AND r.state=0)::text",
+        {code,client});
+    ASSERT_EQ(PQntuples(persisted.get()),1);
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,0),"0");
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,2),"1");
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,3),"1");
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeMachineGrantsCannotWidenScopeAudienceOrLifetime)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="machine-app-"+seed.suffix,client="machine-client-"+seed.suffix;
+    const auto service="machine-identity-"+seed.suffix,resource="machine-resource-"+seed.suffix;
+    const auto audience="urn:machine:"+seed.suffix,otherAudience=audience+":other";
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(client+std::string{suffix}).value());
+    };
+    const auto clientProof=fingerprint("-client");
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'machine-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,secret_digest,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',3,0,decode($3,'hex'),1770000000000,1770000000000)",{client,app,clientProof}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.identities(id,organization_id,kind,status,created_at_ms) VALUES($1,$2,1,0,1770000000000)",{service,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.service_identities(client_id,identity_id,active,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,true,1770000000000,1770000000000)",{client,service}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resources(id,audience,display_name,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',0,1770000000000,1770000000000),($3,$4,'Other',0,1770000000000,1770000000000)",
+        {resource,audience,resource+"-other",otherAudience}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,'read'),($1,'write'),($2,'read')",
+        {resource,resource+"-other"}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.service_identity_audiences(client_id,audience) VALUES($1,$2)",{client,audience}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.service_identity_scopes(client_id,scope) VALUES($1,'read')",{client}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    using Sender=openproof::session::DelegatedSenderConstraint;
+    const auto issue=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string suffix,
+        std::optional<std::string> proof,std::optional<std::string> subject,std::string target,
+        std::vector<std::string> scopes,fnd::Instant now=kNow,std::optional<Sender> sender=std::nullopt) {
+        io.restart();
+        auto task=store.issueOAuthMachineGrantAsync(client,std::move(proof),std::move(subject),
+            std::move(target),std::move(scopes),client+suffix,fingerprint(suffix),std::move(sender),now,15min);
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run();
+        return done.get();
+    };
+    EXPECT_FALSE(issue(foreign,"-foreign",clientProof,std::nullopt,audience,{"read"}));
+    EXPECT_FALSE(issue(native,"-secret",std::string(64U,'0'),std::nullopt,audience,{"read"}));
+    EXPECT_FALSE(issue(native,"-wide",clientProof,std::nullopt,audience,{"write"}));
+    EXPECT_FALSE(issue(native,"-target",clientProof,std::nullopt,otherAudience,{"read"}));
+    auto issued=issue(native,"-initial",clientProof,std::nullopt,audience,{});
+    ASSERT_TRUE(issued);
+    EXPECT_EQ(issued->scopes,std::vector<std::string>{"read"});
+    EXPECT_EQ(issued->expiresIn,15min);
+    const auto source=fingerprint("-initial");
+    EXPECT_FALSE(issue(native,"-exchange-wide",clientProof,source,audience,{"write"}));
+    EXPECT_FALSE(issue(native,"-exchange-target",clientProof,source,otherAudience,{"read"}));
+    EXPECT_FALSE(issue(native,"-exchange-sender",clientProof,source,audience,{"read"},kNow,
+        Sender{openproof::session::DelegatedSenderConstraintKind::Dpop,"fixture"}));
+    auto exchanged=issue(native,"-exchanged",clientProof,source,audience,{"read"},kNow+10min);
+    ASSERT_TRUE(exchanged);
+    EXPECT_EQ(exchanged->expiresIn,5min);
+    EXPECT_EQ(exchanged->scopes,std::vector<std::string>{"read"});
+    ASSERT_NO_THROW(sql("UPDATE openproof.oauth_access_tokens SET state=1,revoked_at_ms=1770000600000 "
+        "WHERE token_digest=decode($1,'hex')",{source}));
+    EXPECT_FALSE(issue(native,"-revoked",clientProof,source,audience,{"read"},kNow+10min));
+    ASSERT_NO_THROW(sql("UPDATE openproof.service_identities SET active=false WHERE client_id=$1",{client}));
+    EXPECT_FALSE(issue(native,"-disabled",clientProof,std::nullopt,audience,{"read"}));
+    const auto rows=execute(fixture.get(),
+        "SELECT (SELECT count(*) FROM openproof.oauth_token_families WHERE client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r JOIN openproof.oauth_token_families f ON f.id=r.family_id WHERE f.client_id=$1)::text,"
+        "(SELECT count(*) FROM openproof.oauth_access_tokens t JOIN openproof.oauth_token_families f ON f.id=t.family_id WHERE f.client_id=$1 AND f.identity_id=$2)::text",
+        {client,service});
+    ASSERT_EQ(PQntuples(rows.get()),1);
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,0),"2");
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,1),"0");
+    EXPECT_STREQ(PQgetvalue(rows.get(),0,2),"2");
+}
+
+TEST(PostgresCanonicalCoroutineTest, NativeDevicePollingCommitsThrottleAndConsumesApprovedCodeExactlyOnce)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const auto app="device-app-"+seed.suffix,client="device-client-"+seed.suffix;
+    const auto family="device-family-"+seed.suffix;
+    const auto fingerprint=[&](std::string_view suffix) {
+        return fnd::toHex(openproof::security::sha256(family+std::string{suffix}).value());
+    };
+    const auto device=fingerprint("-device"),user=fingerprint("-user");
+    auto sql=[&](std::string query,std::initializer_list<std::string> args) {
+        static_cast<void>(execute(fixture.get(),query,args));
+    };
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.applications(id,organization_id,identifier,display_name,environment,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'device-fixture','Fixture',0,0,1770000000000,1770000000000)",{app,seed.org}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_clients(id,application_id,display_name,kind,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',1,0,1770000000000,1770000000000)",{client,app}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_client_scopes(client_id,scope) VALUES($1,'account'),($1,'read'),($1,'write')",{client}));
+    const auto resource="device-resource-"+seed.suffix;
+    const auto audience="urn:device:"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resources(id,audience,display_name,status,created_at_ms,updated_at_ms) "
+        "VALUES($1,$2,'Fixture',0,1770000000000,1770000000000)",{resource,audience}));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_resource_scopes(resource_id,scope) VALUES($1,'read')",{resource}));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer native{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,500ms,1000ms,3000ms};
+    pg::CoroutinePostgresCanonicalFinalizer foreign{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.foreignOrg},2U,500ms,1000ms,3000ms};
+    using State=openproof::oauth::NativeDevicePollState;
+    const auto attempt=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string suffix,fnd::Instant now,
+        std::optional<std::string> proof=std::nullopt) {
+        return store.pollOAuthDeviceAsync(client,std::move(proof),device,family+suffix,
+            fingerprint("-access"+suffix),fingerprint("-refresh"+suffix),std::nullopt,now,15min,24h*30);
+    };
+    const auto run=[&](auto task) {
+        io.restart();
+        auto done=asio::co_spawn(io,std::move(task),asio::use_future);
+        io.run(); return done.get();
+    };
+    const auto begin=[&](pg::CoroutinePostgresCanonicalFinalizer& store,std::string digest,
+        std::string human,std::vector<std::string> scopes,std::optional<std::string> target=std::nullopt,
+        std::optional<std::string> proof=std::nullopt) {
+        return run(store.beginOAuthDeviceAsync(client,std::move(proof),std::move(digest),
+            std::move(human),std::move(scopes),std::move(target),kNow,10min,5s));
+    };
+    EXPECT_FALSE(begin(foreign,device,user,{"account"}));
+    EXPECT_FALSE(begin(native,device,user,{"account"},std::nullopt,std::string(64U,'0')));
+    EXPECT_FALSE(begin(native,device,user,{"forbidden"}));
+    EXPECT_FALSE(begin(native,device,user,{"read"})); // API scope requires target
+    EXPECT_FALSE(begin(native,device,user,{"write"},audience)); // resource excludes write
+    EXPECT_FALSE(begin(native,device,user,{"account","account"}));
+    ASSERT_TRUE(begin(native,device,user,{"account"},audience));
+    const auto duplicate=begin(native,fingerprint("-other-device"),user,{"account"});
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().code(),fnd::ErrorCode::Conflict);
+    const auto persisted=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_device_authorizations WHERE client_id=$1",{client});
+    ASSERT_EQ(PQntuples(persisted.get()),1);
+    EXPECT_STREQ(PQgetvalue(persisted.get(),0,0),"1");
+    EXPECT_FALSE(run(attempt(foreign,"-foreign",kNow)));
+    EXPECT_FALSE(run(attempt(native,"-wrong-secret",kNow,std::string(64U,'0'))));
+    auto pending=run(attempt(native,"-pending",kNow));
+    ASSERT_TRUE(pending); EXPECT_EQ(pending->state,State::Pending);
+    auto slow=run(attempt(native,"-slow",kNow+1s));
+    ASSERT_TRUE(slow); EXPECT_EQ(slow->state,State::SlowDown);
+    const auto throttle=execute(fixture.get(),
+        "SELECT poll_interval_ms::text,last_poll_at_ms::text FROM openproof.oauth_device_authorizations WHERE device_digest=decode($1,'hex')",{device});
+    ASSERT_EQ(PQntuples(throttle.get()),1);
+    EXPECT_STREQ(PQgetvalue(throttle.get(),0,0),"10000");
+    EXPECT_STREQ(PQgetvalue(throttle.get(),0,1),"1770000001000");
+    const auto sessionName="device-session-"+seed.suffix;
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.sessions(id,identity_id,provider,assurance,factors,phishing_resistant,state,"
+        "token_digest,authenticated_at_ms,issued_at_ms,last_seen_at_ms,absolute_expires_at_ms,idle_timeout_ms) "
+        "VALUES($1,$2,'local',1,1,false,0,decode($3,'hex'),1770000001000,1770000001000,1770000001000,1770003600000,600000)",
+        {sessionName,seed.owner,fingerprint("-session")}));
+    auto readApproval=[&](auto& store, std::string owner) {
+        return run(store.readOAuthDeviceApprovalAsync(user,ids::IdentityId{std::move(owner)},kNow+1s));
+    };
+    EXPECT_FALSE(readApproval(foreign,seed.owner));
+    const auto preview=readApproval(native,seed.owner);
+    ASSERT_TRUE(preview);
+    EXPECT_EQ(preview->clientName,"Fixture");
+    EXPECT_EQ(preview->resource,std::optional<std::string>{audience});
+    EXPECT_EQ(preview->scopes,std::vector<std::string>{"account"});
+    const auto decide=[&](auto& store,std::string owner,bool approve,std::string consent){
+        return run(store.decideOAuthDeviceAsync(user,ids::IdentityId{std::move(owner)},
+            openproof::session::SessionId{sessionName},approve,std::move(consent),kNow+1s));
+    };
+    EXPECT_FALSE(decide(foreign,seed.owner,true,family+"-foreign"));
+    EXPECT_FALSE(decide(native,seed.secondOwner,true,family+"-wrong-owner"));
+    // Force a consent collision; the device must remain pending.
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_consents(id,identity_id,client_id,audience,granted_at_ms) "
+        "VALUES($1,$2,$3,$4,1770000000000)",{family+"-consent-collision",seed.owner,client,audience}));
+    EXPECT_FALSE(decide(native,seed.owner,true,family+"-consent-collision"));
+    EXPECT_TRUE(readApproval(native,seed.owner));
+    ASSERT_TRUE(decide(native,seed.owner,true,family+"-consent"));
+    EXPECT_FALSE(decide(native,seed.owner,false,""));
+    EXPECT_FALSE(readApproval(native,seed.owner));
+    const auto consents=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.oauth_consents c JOIN openproof.oauth_consent_scopes s ON s.consent_id=c.id "
+        "WHERE c.identity_id=$1 AND c.client_id=$2 AND c.revoked_at_ms IS NULL AND s.scope='account'",{seed.owner,client});
+    ASSERT_EQ(PQntuples(consents.get()),1);
+    EXPECT_STREQ(PQgetvalue(consents.get(),0,0),"1");
+    // A duplicate family insertion must roll back without consuming approval.
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_families "
+        "(id,client_id,identity_id,provider,assurance,factors,phishing_resistant,authenticated_at_ms) "
+        "VALUES($1,$2,$3,'local',1,1,false,1770000001000)",{family+"-collision",client,seed.owner}));
+    EXPECT_FALSE(run(attempt(native,"-collision",kNow+11s)));
+    io.restart();
+    auto first=asio::co_spawn(io,attempt(native,"-first",kNow+11s),asio::use_future);
+    auto second=asio::co_spawn(io,attempt(native,"-second",kNow+11s),asio::use_future);
+    io.run();
+    auto a=first.get(),b=second.get();
+    ASSERT_NE(a.has_value(),b.has_value());
+    EXPECT_EQ((a?b:a).error().code(),fnd::ErrorCode::AuthenticationFailed);
+    const auto& accepted=a?a.value():b.value();
+    EXPECT_EQ(accepted.state,State::Issued);
+    EXPECT_EQ(accepted.scopes,std::vector<std::string>{"account"});
+    const auto state=execute(fixture.get(),
+        "SELECT d.status::text,(SELECT count(*) FROM openproof.oauth_access_tokens t JOIN openproof.oauth_token_families f ON f.id=t.family_id WHERE f.client_id=$2)::text,"
+        "(SELECT count(*) FROM openproof.oauth_refresh_tokens r JOIN openproof.oauth_token_families f ON f.id=r.family_id WHERE f.client_id=$2)::text "
+        "FROM openproof.oauth_device_authorizations d WHERE d.device_digest=decode($1,'hex')",{device,client});
+    ASSERT_EQ(PQntuples(state.get()),1);
+    EXPECT_STREQ(PQgetvalue(state.get(),0,0),"3");
+    EXPECT_STREQ(PQgetvalue(state.get(),0,1),"1");
+    EXPECT_STREQ(PQgetvalue(state.get(),0,2),"1");
 }
 
 TEST(PostgresCanonicalCoroutineTest, SenderReplayConsumptionIsAtomicAcrossTenantsAndLegacy)
@@ -2240,11 +3643,15 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 2U, 500ms, 1000ms, 3000ms};
     pg::CoroutineVerificationChallengeStore foreign{io.get_executor(),
         fnd::SecretString{*dsn}, ids::OrganizationId{seed.foreignOrg}, 1U, 500ms, 1000ms, 3000ms};
-    auto poolConfig = pg::PoolConfig::create(fnd::SecretString{*dsn}, 1U, 500ms);
-    ASSERT_TRUE(poolConfig);
-    auto pool = pg::ConnectionPool::create(std::move(poolConfig).value());
-    ASSERT_TRUE(pool);
-    pg::PostgresAccountRepository legacy{*pool.value()};
+    pg::CoroutineVerificationChallengeStore peer{io.get_executor(),
+        fnd::SecretString{*dsn}, ids::OrganizationId{seed.org}, 1U, 500ms, 1000ms, 3000ms};
+    const idp::ProviderId localProvider{"fixture-local-" + seed.suffix};
+    const auto scalar=[&](std::string_view sql,std::initializer_list<std::string> args){
+        auto result=execute(fixture.get(),sql,args);
+        if (PQntuples(result.get())!=1 || PQnfields(result.get())!=1 || PQgetisnull(result.get(),0,0))
+            throw std::runtime_error{"Invalid verification fixture scalar"};
+        return std::string{PQgetvalue(result.get(),0,0)};
+    };
     const auto purpose = acc::VerificationPurpose::ChangeEmail;
     std::array<std::byte, 32> digest{};
     digest[0] = std::byte{42};
@@ -2264,16 +3671,14 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     const auto second = "verification-second-" + seed.suffix;
     const auto third = "verification-third-" + seed.suffix;
     const auto last = "verification-last-" + seed.suffix;
-    // Native and synchronous issuers operate on the same owner/purpose.
-    // A concurrent first issuance cannot leave two redeemable challenges.
-    auto legacyWrite = std::async(std::launch::async, [&] {
-        return legacy.replace(challenge(first, seed.owner));
-    });
+    // Independent native issuers share the same owner/purpose lock.
+    // Concurrent first issuance cannot leave two redeemable challenges.
     io.restart();
+    auto peerWrite = asio::co_spawn(io,peer.replaceAsync(challenge(first,seed.owner)),asio::use_future);
     auto a = asio::co_spawn(io, store.replaceAsync(challenge(second, seed.owner)), asio::use_future);
     auto b = asio::co_spawn(io, store.replaceAsync(challenge(third, seed.owner)), asio::use_future);
     io.run();
-    ASSERT_TRUE(legacyWrite.get());
+    ASSERT_TRUE(peerWrite.get());
     ASSERT_TRUE(a.get());
     ASSERT_TRUE(b.get());
     auto count = execute(fixture.get(),
@@ -2281,7 +3686,7 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         {seed.owner});
     EXPECT_STREQ(PQgetvalue(count.get(), 0, 0), "1");
 
-    ASSERT_TRUE(run(store.replaceAsync(challenge(last, seed.owner))));
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(last, seed.owner),localProvider)));
     for (const auto& previous : {first, second, third})
         EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{previous},
             ids::IdentityId{seed.owner}, purpose)));
@@ -2298,34 +3703,36 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
     auto signup = run(store.replaceAsync(challenge("signup-" + seed.suffix,
         seed.owner, acc::VerificationPurpose::SignupEmail)));
     EXPECT_TRUE(!signup && signup.error().code() == fnd::ErrorCode::InvalidArgument);
-    // Wrong-purpose requests must not consume or exhaust the native proof.
+    // Wrong-purpose, wrong-owner and foreign-tenant requests must not
+    // consume or exhaust a valid native proof.
     const ids::IdentityId expectedOwner{seed.owner};
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        auto wrong = legacy.consumeForPurpose(acc::VerificationId{last},
-            acc::VerificationDigest{std::array<std::byte, 32>{}}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
-        EXPECT_TRUE(!wrong && wrong.error().code() == fnd::ErrorCode::AuthenticationFailed);
+    for (int attempt=0;attempt<10;++attempt) {
+        auto wrong=run(peer.verifyPhoneAsync(localProvider,expectedOwner,acc::VerificationId{last},
+            acc::VerificationDigest{std::array<std::byte,32>{}},kNow,8U));
+        EXPECT_TRUE(!wrong && wrong.error().code()==fnd::ErrorCode::AuthenticationFailed);
     }
-    auto wrongPurpose = legacy.consumeForPurpose(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U, acc::VerificationPurpose::VerifyPhone, &expectedOwner);
-    EXPECT_TRUE(!wrongPurpose && wrongPurpose.error().code() == fnd::ErrorCode::AuthenticationFailed);
-    // Legacy consumption must still understand the native-issued digest.
-    auto consumed = legacy.consumeForPurpose(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U, purpose, &expectedOwner);
-    ASSERT_TRUE(consumed);
-    EXPECT_EQ(consumed->identity().value(), seed.owner);
-    EXPECT_EQ(consumed->purpose(), purpose);
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{last},
-        acc::VerificationDigest{digest}, kNow, 8U));
+    EXPECT_FALSE(run(peer.verifyPhoneAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},kNow,8U)));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ids::IdentityId{seed.secondOwner},
+        acc::VerificationId{last},acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_FALSE(run(foreign.changeEmailAsync(localProvider,expectedOwner,
+        acc::VerificationId{last},acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(scalar("SELECT attempts::text FROM openproof.account_verification_challenges WHERE id=$1",{last}),"0");
+    ASSERT_TRUE(run(peer.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(scalar("SELECT email||':'||email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",{seed.owner}),
+        "contact@example.test:true");
+    EXPECT_FALSE(run(store.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{last},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
     const auto failed = "verification-failed-" + seed.suffix;
     ASSERT_TRUE(run(store.replaceAsync(challenge(failed, seed.owner))));
     ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
         ids::IdentityId{seed.owner}, purpose)));
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{failed},
-        acc::VerificationDigest{digest}, kNow, 8U));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,expectedOwner,acc::VerificationId{failed},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
     EXPECT_TRUE(run(store.discardAsync(acc::VerificationId{failed},
         ids::IdentityId{seed.owner}, purpose)));
 
-    const idp::ProviderId localProvider{"fixture-local-" + seed.suffix};
     const auto reservedId = "reserved-" + seed.suffix;
     ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(reservedId, seed.owner), localProvider)));
     auto reservation = execute(fixture.get(),
@@ -2369,50 +3776,71 @@ TEST(PostgresCanonicalCoroutineTest, VerificationReplacementAndCompensationPrese
         "SELECT count(*) FROM openproof.pending_external_identity_reservations WHERE provider=$1",
         {std::string{rollbackProvider.value()}});
     EXPECT_STREQ(PQgetvalue(afterInsertFailure.get(), 0, 0), "0");
-    const ids::ExternalIdentityRef external{localProvider, idp::ExternalSubject{"contact@example.test"}};
     const ids::IdentityId ownerId{seed.owner};
-    auto oldGeneration = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
-    ASSERT_TRUE(oldGeneration && oldGeneration->has_value() && oldGeneration->value() == ownerId);
-    EXPECT_TRUE(legacy.releaseSubject(external, ownerId)); // owner-only must not remove tagged rows
-    auto untaggedRetry = legacy.reserveSubject(external, ownerId, kNow, kNow + 10min);
-    EXPECT_TRUE(!untaggedRetry && untaggedRetry.error().code() == fnd::ErrorCode::Conflict);
-    const auto renewedId = "renewed-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(renewedId, seed.owner), localProvider)));
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId}, ownerId, purpose)));
-    EXPECT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{reservedId}));
-    auto stale = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{reservedId});
-    EXPECT_TRUE(stale && !stale->has_value());
-    auto renewed = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{renewedId});
-    EXPECT_TRUE(renewed && renewed->has_value() && renewed->value() == ownerId);
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{renewedId}, ownerId, purpose)));
-    EXPECT_FALSE(legacy.consume(acc::VerificationId{renewedId},
-        acc::VerificationDigest{digest}, kNow, 8U));
-    auto released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
+    const std::string providerName{localProvider.value()};
+    const auto generation=[&](){
+        return scalar("SELECT COALESCE((SELECT verification_id FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject='contact@example.test' AND identity_id=$2),'none')",
+            {providerName,seed.owner});
+    };
+    const auto reservationCount=[&](){
+        return scalar("SELECT count(*)::text FROM openproof.pending_external_identity_reservations "
+            "WHERE provider=$1 AND external_subject='contact@example.test'",{providerName});
+    };
+    EXPECT_EQ(generation(),reservedId);
+    const auto renewedId="renewed-"+seed.suffix;
+    ASSERT_TRUE(run(peer.reserveAndReplaceAsync(challenge(renewedId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{reservedId},ownerId,purpose)));
+    EXPECT_EQ(generation(),renewedId);
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{reservedId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(generation(),renewedId);
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{renewedId},ownerId,purpose)));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{renewedId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    EXPECT_EQ(reservationCount(),"0");
 
-    // A consumed proof's reservation must survive delivery compensation:
-    // completion may still need it; only the matching generation can release it.
-    const auto completingId = "completing-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(completingId, seed.owner), localProvider)));
-    ASSERT_TRUE(legacy.consumeForPurpose(acc::VerificationId{completingId},
-        acc::VerificationDigest{digest}, kNow, 8U, purpose, &ownerId));
-    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{completingId}, ownerId, purpose)));
-    auto completing = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{completingId});
-    EXPECT_TRUE(completing && completing->has_value() && completing->value() == ownerId);
-    ASSERT_TRUE(legacy.releaseSubjectForChallenge(external, ownerId, acc::VerificationId{completingId}));
-    released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
+    // Native completion is atomic: no intermediate consumed-but-reserved
+    // state is published. Late delivery compensation cannot undo the profile.
+    const auto completingId="completing-"+seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(completingId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{completingId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{completingId},ownerId,purpose)));
+    EXPECT_EQ(reservationCount(),"0");
+    EXPECT_EQ(scalar("SELECT email||':'||email_verified::text FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.owner}),"contact@example.test:true");
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{completingId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
 
-    // Replacement by the legacy writer cleans a superseded tagged reservation.
-    const auto supersededId = "superseded-" + seed.suffix;
-    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(supersededId, seed.owner), localProvider)));
-    ASSERT_TRUE(legacy.replace(challenge("legacy-replacement-" + seed.suffix, seed.owner)));
-    released = legacy.reservedOwner(external, kNow);
-    EXPECT_TRUE(released && !released->has_value());
-    ASSERT_TRUE(legacy.reserveSubject(external, ownerId, kNow, kNow + 10min));
-    auto untagged = legacy.reservedOwnerForChallenge(external, kNow, acc::VerificationId{"legacy-id"});
-    EXPECT_TRUE(untagged && untagged->has_value() && untagged->value() == ownerId);
-    ASSERT_TRUE(legacy.releaseSubject(external, ownerId));
+    // Historical interrupted completion: a tagged reservation without its
+    // challenge is never accepted as proof; stale compensation is harmless.
+    const auto orphanId="orphan-"+seed.suffix;
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.pending_external_identity_reservations(provider,external_subject,identity_id,expires_at_ms,verification_id)"
+        " VALUES($1,'contact@example.test',$2,1770000600000,$3)",{providerName,seed.owner,orphanId})));
+    EXPECT_FALSE(run(peer.changeEmailAsync(localProvider,ownerId,acc::VerificationId{orphanId},
+        acc::VerificationDigest{digest},std::nullopt,kNow,8U)));
+    ASSERT_TRUE(run(store.discardAsync(acc::VerificationId{orphanId},ownerId,purpose)));
+    EXPECT_EQ(generation(),orphanId);
+    const auto supersededId="superseded-"+seed.suffix;
+    ASSERT_TRUE(run(store.reserveAndReplaceAsync(challenge(supersededId,seed.owner),localProvider)));
+    ASSERT_TRUE(run(peer.replaceAsync(challenge("peer-replacement-"+seed.suffix,seed.owner))));
+    EXPECT_EQ(reservationCount(),"0");
+
+    // A historical untagged signup reservation cannot be taken over by a
+    // contact-change ceremony, even by its own owner.
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.pending_external_identity_reservations(provider,external_subject,identity_id,expires_at_ms)"
+        " VALUES($1,'contact@example.test',$2,1770000600000)",{providerName,seed.owner})));
+    auto untagged=run(peer.reserveAndReplaceAsync(challenge("untagged-"+seed.suffix,seed.owner),localProvider));
+    EXPECT_TRUE(!untagged && untagged.error().code()==fnd::ErrorCode::AlreadyExists);
+    EXPECT_EQ(reservationCount(),"1");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM openproof.pending_external_identity_reservations "
+        "WHERE provider=$1 AND verification_id IS NULL",{providerName}),"1");
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "DELETE FROM openproof.pending_external_identity_reservations WHERE provider=$1 AND verification_id IS NULL",
+        {providerName})));
 }
 
 TEST(PostgresCanonicalCoroutineTest, NativeLocalCredentialsRejectStaleProofsAndTotpReplay)
@@ -3090,6 +4518,64 @@ TEST(PostgresCanonicalCoroutineTest, NativeLocalProofVerifiesRealPasswordTotpAnd
     ASSERT_TRUE(recovered);
     EXPECT_EQ(recovered->claimedAssurance(), idp::AssuranceLevel::Ial2);
     EXPECT_FALSE(proof("fixture-password", {}, "fixture-recovery-code"));
+}
+
+TEST(PostgresCanonicalCoroutineTest, RealDatabaseDisconnectPreservesLastRegisteredMethodUnderRace)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Invalid disposable socket DSN";
+        GTEST_SKIP()<<"Explicit disposable database required";
+    }
+    Conn fixture{PQconnectdb(dsn->c_str())};
+    ASSERT_TRUE(fixture && PQstatus(fixture.get())==CONNECTION_OK);
+    Seed seed;
+    ASSERT_NO_THROW(seed.install(fixture.get()));
+    const std::string provider="native-canonical-provider";
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.external_identities(provider,external_subject,identity_id,linked_at_ms) "
+        "VALUES('verification-only',$1,$2,1770000000000)",{seed.newSubject,seed.owner})));
+    ASSERT_NO_THROW(static_cast<void>(execute(fixture.get(),
+        "INSERT INTO openproof.identity_profiles(identity_id,display_name,created_at_ms,updated_at_ms,avatar_source) "
+        "VALUES($1,'Concurrent detach',1770000000000,1770000000000,$2)",{seed.simultaneousOwner,provider})));
+    asio::io_context io;
+    pg::CoroutinePostgresCanonicalFinalizer store{io.get_executor(),fnd::SecretString{*dsn},
+        ids::OrganizationId{seed.org},2U,std::chrono::milliseconds{500},
+        std::chrono::milliseconds{1000},std::chrono::milliseconds{3000}};
+    const std::vector<idp::ProviderId> registered{idp::ProviderId{provider}};
+    const auto detach=[&](const std::string& owner,const std::string& subject) {
+        return store.disconnectAsync(ids::IdentityId{owner},
+            ids::ExternalIdentityRef{idp::ProviderId{provider},idp::ExternalSubject{subject}},
+            registered,kNow);
+    };
+    auto last=asio::co_spawn(io,detach(seed.owner,seed.subject),asio::use_future);
+    auto foreign=asio::co_spawn(io,detach(seed.owner,seed.foreignSubject),asio::use_future);
+    io.run();
+    auto lastStatus=last.get();
+    ASSERT_FALSE(lastStatus);
+    EXPECT_EQ(lastStatus.error().code(),fnd::ErrorCode::FailedPrecondition);
+    auto foreignStatus=foreign.get();
+    ASSERT_FALSE(foreignStatus);
+    EXPECT_EQ(foreignStatus.error().code(),fnd::ErrorCode::PermissionDenied);
+    io.restart();
+    auto a=asio::co_spawn(io,detach(seed.simultaneousOwner,seed.simultaneousSubjectA),asio::use_future);
+    auto b=asio::co_spawn(io,detach(seed.simultaneousOwner,seed.simultaneousSubjectB),asio::use_future);
+    io.run();
+    auto first=a.get();
+    auto second=b.get();
+    ASSERT_NE(static_cast<bool>(first),static_cast<bool>(second));
+    EXPECT_EQ((first ? second : first).error().code(),fnd::ErrorCode::FailedPrecondition);
+    const auto remaining=execute(fixture.get(),
+        "SELECT count(*)::text FROM openproof.external_identities WHERE identity_id=$1 AND provider=$2",
+        {seed.simultaneousOwner,provider});
+    ASSERT_EQ(PQntuples(remaining.get()),1);
+    EXPECT_STREQ(PQgetvalue(remaining.get(),0,0),"1");
+    const auto avatar=execute(fixture.get(),
+        "SELECT avatar_source FROM openproof.identity_profiles WHERE identity_id=$1",
+        {seed.simultaneousOwner});
+    ASSERT_EQ(PQntuples(avatar.get()),1);
+    EXPECT_STREQ(PQgetvalue(avatar.get(),0,0),"auto");
 }
 
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseTenantOwnershipLifecycleAndProfiles)

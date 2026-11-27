@@ -421,6 +421,13 @@ public:
             session::DelegatedAccessAuthenticator* delegatedAccess = nullptr,
             SenderConstraintVerifier* senderConstraintVerifier = nullptr);
 
+    // Native-only composition: the coroutine preparation source supplies
+    // authentication and authorization; no blocking repositories are retained.
+    Gateway(const Router& router,TokenBucketRateLimiter& rateLimiter,
+            ServiceDiscovery& discovery,WeightedRoundRobin& loadBalancer,
+            CircuitBreaker& circuits,TrustedContextSigner& contextSigner,
+            foundation::Duration upstreamTimeout);
+
     [[nodiscard]] HttpResponse handle(HttpRequest request) override;
 
     /** Shared authorization/identity-context stage for both synchronous
@@ -447,15 +454,15 @@ private:
     [[nodiscard]] HttpResponse errorResponse(const foundation::Error& error,
                                              const HttpRequest& request) const;
     const Router* m_router;
-    session::SessionService* m_sessions;
+    session::SessionService* m_sessions{};
     session::DelegatedAccessAuthenticator* m_delegatedAccess{};
     SenderConstraintVerifier* m_senderConstraintVerifier{};
-    AccessController* m_access;
+    AccessController* m_access{};
     TokenBucketRateLimiter* m_rateLimiter;
     ServiceDiscovery* m_discovery;
     WeightedRoundRobin* m_loadBalancer;
     CircuitBreaker* m_circuits;
-    ProxyTransport* m_proxy;
+    ProxyTransport* m_proxy{};
     TrustedContextSigner* m_contextSigner;
     foundation::Duration m_upstreamTimeout;
 };

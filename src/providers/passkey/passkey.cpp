@@ -498,10 +498,9 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
     return foundation::ok();
 }
 
-[[nodiscard]] foundation::Result<PasskeyCredential> verifyAssertion(
-    PasskeyRepository& repository, const AssertionResponse& response,
-    const PasskeyConfig& config, std::string_view expectedChallenge,
-    foundation::Instant now)
+[[nodiscard]] foundation::Result<std::uint32_t> verifyAssertionCounter(
+    const PasskeyCredential& stored, const AssertionResponse& response,
+    const PasskeyConfig& config, std::string_view expectedChallenge)
 {
     auto client = verifyClientData(response.clientDataJson, "webauthn.get",
                                    expectedChallenge, config.origin());
@@ -511,8 +510,7 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
     if (!client || !credentialId || !authenticatorData || !signature) {
         return foundation::fail(failure("WebAuthn assertion encoding is invalid."));
     }
-    auto stored = repository.findCredential(response.credentialId);
-    if (!stored || !stored->has_value()) return foundation::fail(failure("WebAuthn credential is unknown."));
+    if (stored.credentialId!=response.credentialId) return foundation::fail(failure("WebAuthn credential is unknown."));
     auto prefix = verifyAuthenticatorPrefix(*authenticatorData, config.relyingPartyId(), false);
     if (!prefix) return foundation::fail(prefix.error());
     auto trailing = prefix->trailing;
@@ -522,7 +520,7 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
         if (!skipped || !extensions.done()) return foundation::fail(failure("WebAuthn assertion extension data is malformed."));
     } else if (!trailing.empty()) return foundation::fail(failure("WebAuthn assertion data has trailing bytes."));
     if (response.userHandle) {
-        auto handleDigest = security::sha256(stored->value().identity.value());
+        auto handleDigest = security::sha256(stored.identity.value());
         if (!handleDigest || !security::constantTimeEquals(*response.userHandle,
                 foundation::toBase64Url(handleDigest.value()))) {
             return foundation::fail(failure("WebAuthn user handle binding failed."));
@@ -534,20 +532,28 @@ using ParamsPointer = std::unique_ptr<OSSL_PARAM, ParamsDeleter>;
     signedData.reserve(authenticatorData->size() + clientHash->size());
     signedData.insert(signedData.end(), authenticatorData->begin(), authenticatorData->end());
     signedData.insert(signedData.end(), clientHash->begin(), clientHash->end());
-    auto verified = verifyEs256(stored->value().publicKeyX, stored->value().publicKeyY,
+    auto verified = verifyEs256(stored.publicKeyX, stored.publicKeyY,
                                 signedData, signature.value());
     if (!verified) return foundation::fail(verified.error());
-    const auto previous = stored->value().signCount;
+    const auto previous = stored.signCount;
     const auto next = prefix->signCount;
     if ((previous != 0U || next != 0U) && next <= previous) {
         return foundation::fail(failure("WebAuthn signature counter did not advance."));
     }
-    // Persist every successful use, including authenticators that do not support a
-    // signature counter and therefore report 0 on every assertion. The repository
-    // keeps the compare-and-update atomic for counters that are supported.
-    auto advanced = repository.advanceCounter(response.credentialId, previous, next, now);
+    return next;
+}
+
+[[nodiscard]] foundation::Result<PasskeyCredential> verifyAssertion(
+    PasskeyRepository& repository,const AssertionResponse& response,
+    const PasskeyConfig& config,std::string_view expectedChallenge,foundation::Instant now)
+{
+    auto stored=repository.findCredential(response.credentialId);
+    if (!stored || !stored->has_value()) return foundation::fail(failure("WebAuthn credential is unknown."));
+    auto next=verifyAssertionCounter(stored->value(),response,config,expectedChallenge);
+    if (!next) return foundation::fail(next.error());
+    auto advanced=repository.advanceCounter(response.credentialId,stored->value().signCount,next.value(),now);
     if (!advanced) return foundation::fail(advanced.error());
-    stored->value().signCount = next;
+    stored->value().signCount = next.value();
     stored->value().lastUsedAt = now;
     return std::move(stored).value().value();
 }
@@ -691,45 +697,63 @@ foundation::Result<RegistrationStart> PasskeyService::beginRegistration(
 {
     auto random = security::randomTokenBase64Url(24U); if (!random) return foundation::fail(random.error());
     idp::ChallengeId id{"pkr_" + std::move(random).value()};
-    auto challenge = challengeFor(*m_config, "register", id); if (!challenge) return foundation::fail(challenge.error());
     auto stored = m_repository->addCeremony(RegistrationCeremony{id, identity, m_clock->now() + m_config->ceremonyLifetime()});
     if (!stored) return foundation::fail(stored.error());
+    auto existing = m_repository->listCredentials(identity);
+    if (!existing) return foundation::fail(existing.error());
+    std::vector<std::string> excluded;
+    for (const auto& credential:existing.value()) excluded.push_back(credential.credentialId);
+    return registrationOptions(*m_config,identity,id,excluded);
+}
+
+foundation::Result<RegistrationStart> registrationOptions(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const idp::ChallengeId& id,const std::vector<std::string>& excludedCredentialIds)
+{
+    auto challenge = challengeFor(config, "register", id); if (!challenge) return foundation::fail(challenge.error());
     auto userDigest = security::sha256(identity.value()); if (!userDigest) return foundation::fail(userDigest.error());
     json::object options;
     options["challenge"] = challenge.value();
-    options["rp"] = json::object{{"id", m_config->relyingPartyId()}, {"name", m_config->relyingPartyName()}};
+    options["rp"] = json::object{{"id", config.relyingPartyId()}, {"name", config.relyingPartyName()}};
     options["user"] = json::object{{"id", foundation::toBase64Url(userDigest.value())},
                                     {"name", identity.value()}, {"displayName", identity.value()}};
     options["pubKeyCredParams"] = json::array{json::object{{"type", "public-key"}, {"alg", -7}}};
-    options["timeout"] = std::chrono::duration_cast<std::chrono::milliseconds>(m_config->ceremonyLifetime()).count();
+    options["timeout"] = std::chrono::duration_cast<std::chrono::milliseconds>(config.ceremonyLifetime()).count();
     options["attestation"] = "none";
     options["authenticatorSelection"] = json::object{{"residentKey", "required"},
         {"requireResidentKey", true}, {"userVerification", "required"}};
-    auto existing = m_repository->listCredentials(identity);
-    if (existing) {
-        json::array excluded;
-        for (const auto& credential : existing.value()) excluded.emplace_back(json::object{{"type", "public-key"}, {"id", credential.credentialId}});
-        options["excludeCredentials"] = std::move(excluded);
-    }
+    json::array excluded;
+    for (const auto& credentialId:excludedCredentialIds)
+        excluded.emplace_back(json::object{{"type", "public-key"}, {"id", credentialId}});
+    options["excludeCredentials"] = std::move(excluded);
     return RegistrationStart{id, json::serialize(options)};
+}
+
+foundation::Result<PasskeyCredential> verifyRegistration(
+    const PasskeyConfig& config,const identity::core::IdentityId& identity,
+    const idp::ChallengeId& ceremonyId,const RegistrationResponse& response,foundation::Instant now)
+{
+    auto challenge=challengeFor(config,"register",ceremonyId);
+    if (!challenge) return foundation::fail(challenge.error());
+    auto attestation=verifyAttestation(response,config,challenge.value());
+    if (!attestation) return foundation::fail(attestation.error());
+    return PasskeyCredential{attestation->credentialId,identity,attestation->x,attestation->y,
+        attestation->signCount,now,now};
 }
 
 foundation::Status PasskeyService::completeRegistration(
     const identity::core::IdentityId& identity, const idp::ChallengeId& ceremonyId,
     const RegistrationResponse& response)
 {
-    auto challenge = challengeFor(*m_config, "register", ceremonyId); if (!challenge) return foundation::fail(challenge.error());
-    auto attestation = verifyAttestation(response, *m_config, challenge.value());
-    if (!attestation) return foundation::fail(attestation.error());
+    auto credential=verifyRegistration(*m_config,identity,ceremonyId,response,m_clock->now());
+    if (!credential) return foundation::fail(credential.error());
     auto consumed = m_repository->consumeCeremony(ceremonyId, identity, m_clock->now());
     if (!consumed) return consumed;
     const identity::core::ExternalIdentityRef external{idp::ProviderId{"passkey"}, idp::ExternalSubject{std::string{identity.value()}}};
     auto owner = m_externalIdentities->ownerOf(external);
     if (!owner) return foundation::fail(owner.error());
     if (owner->has_value() && owner->value() != identity) return foundation::fail(foundation::ErrorCode::Conflict);
-    PasskeyCredential credential{attestation->credentialId, identity, attestation->x, attestation->y,
-        attestation->signCount, m_clock->now(), m_clock->now()};
-    auto added = m_repository->addCredential(credential); if (!added) return added;
+    auto added = m_repository->addCredential(std::move(credential).value()); if (!added) return added;
     if (!owner->has_value()) {
         auto link = identity::core::IdentityLink::request(identity, external, m_clock->now(), std::chrono::minutes{5});
         if (!link || !link->requireVerification(m_clock->now()) || !link->markVerified(m_clock->now()) || !link->complete(m_clock->now())) {
@@ -780,15 +804,29 @@ foundation::Result<idp::AuthenticationChallenge> PasskeyAuthenticationProvider::
     const idp::AuthenticationRequest& request)
 {
     if (request.provider() != id()) return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    return assertionOptions(*m_config,m_clock->now());
+}
+
+foundation::Result<idp::AuthenticationChallenge> assertionOptions(const PasskeyConfig& config,foundation::Instant now)
+{
     auto random = security::randomTokenBase64Url(24U); if (!random) return foundation::fail(random.error());
     idp::ChallengeId idValue{"pka_" + std::move(random).value()};
-    auto challenge = challengeFor(*m_config, "authenticate", idValue); if (!challenge) return foundation::fail(challenge.error());
-    json::object options{{"challenge", challenge.value()}, {"rpId", m_config->relyingPartyId()},
-        {"timeout", std::chrono::duration_cast<std::chrono::milliseconds>(m_config->ceremonyLifetime()).count()},
+    auto challenge = challengeFor(config, "authenticate", idValue); if (!challenge) return foundation::fail(challenge.error());
+    json::object options{{"challenge", challenge.value()}, {"rpId", config.relyingPartyId()},
+        {"timeout", std::chrono::duration_cast<std::chrono::milliseconds>(config.ceremonyLifetime()).count()},
         {"userVerification", "required"}};
-    idp::AuthenticationChallenge output{idValue, m_clock->now() + m_config->ceremonyLifetime()};
+    idp::AuthenticationChallenge output{idValue, now + config.ceremonyLifetime()};
     output.setParameter("public_key_options", json::serialize(options));
     return output;
+}
+
+foundation::Result<std::uint32_t> verifyAssertionProof(
+    const PasskeyConfig& config,const idp::ChallengeId& ceremony,
+    const AssertionResponse& response,const PasskeyCredential& credential)
+{
+    auto challenge=challengeFor(config,"authenticate",ceremony);
+    if (!challenge) return foundation::fail(challenge.error());
+    return verifyAssertionCounter(credential,response,config,challenge.value());
 }
 
 foundation::Result<idp::AuthenticationOutcome> PasskeyAuthenticationProvider::completeAuthentication(

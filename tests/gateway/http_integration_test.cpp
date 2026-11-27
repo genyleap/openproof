@@ -624,6 +624,25 @@ TEST(BeastHttpIntegrationTest, RouteOverlayPreservesCompatibilityAndDeniesUnread
 // Migrating a read-only route must not hijack the same path's PATCH/PUT
 // compatibility handlers. Security-critical strict-path overlays still
 // refuse ALL methods rather than silently falling back to blocking auth.
+TEST(BeastHttpIntegrationTest, StrictMethodPrefixNeverFallsBackForReads)
+{
+    CountingFastHandler compatibility;
+    SelectiveCoroutineHandler native;
+    httpAdapter::CoroutineRouteOverlay overlay{
+        compatibility,native,{}, {}, {},{{"/directory/",gw::HttpMethod::Get}}};
+    httpAdapter::BeastHttpServer server{overlay,serverConfig()};
+    ASSERT_TRUE(server.start());
+    const auto denied=sendRequest(server.boundPort(),beastHttp::verb::get,"/directory/users");
+    const auto write=sendRequest(server.boundPort(),beastHttp::verb::patch,"/directory/users","{}");
+    const auto near=sendRequest(server.boundPort(),beastHttp::verb::get,"/directory-other/users");
+    EXPECT_EQ(denied.result(),beastHttp::status::service_unavailable);
+    EXPECT_EQ(write.result(),beastHttp::status::ok);
+    EXPECT_EQ(near.result(),beastHttp::status::ok);
+    EXPECT_EQ(compatibility.received.load(),2);
+    EXPECT_EQ(native.synchronousCalls.load(),0);
+    server.stop();
+}
+
 TEST(BeastHttpIntegrationTest, MethodScopedNativeGetPreservesLegacyPatchAndStrictPaths)
 {
     CountingFastHandler compatibility;
@@ -1007,12 +1026,9 @@ asio::awaitable<void> collectAsyncProxyResponse(
         std::move(endpoint), std::move(request), timeout));
 }
 
-TEST(BeastHttpIntegrationTest, LegacyProxySendUsesCoroutineTransport)
+TEST(BeastHttpIntegrationTest, RetiredProxySendNeverContactsUpstream)
 {
-    // The synchronous gateway API must keep working for handlers that
-    // cannot yet opt into native dispatch. Its underlying socket, DNS,
-    // TLS and HTTP operations now use the same coroutine transport.
-    ClientIpHandler upstreamHandler;
+    CountingFastHandler upstreamHandler;
     httpAdapter::BeastHttpServer upstream{upstreamHandler, serverConfig()};
     ASSERT_TRUE(upstream.start());
 
@@ -1030,13 +1046,13 @@ TEST(BeastHttpIntegrationTest, LegacyProxySendUsesCoroutineTransport)
 
     const auto response = proxy.value()->send(
         endpoint.value(), request.value(), std::chrono::seconds{2});
-    ASSERT_TRUE(response);
-    EXPECT_EQ(response->status(), 200);
-    EXPECT_EQ(response->body(), "127.0.0.1");
+    ASSERT_FALSE(response);
+    EXPECT_EQ(response.error().code(), fnd::ErrorCode::Unavailable);
+    EXPECT_EQ(upstreamHandler.received.load(), 0);
     upstream.stop();
 }
 
-TEST(BeastHttpIntegrationTest, LegacyProxySendPreservesNativeDeadline)
+TEST(BeastHttpIntegrationTest, RetiredProxySendRejectsWithoutWaitingForDeadline)
 {
     WaitingHandler upstreamHandler;
     httpAdapter::BeastHttpServer upstream{upstreamHandler, serverConfig()};
@@ -1057,7 +1073,7 @@ TEST(BeastHttpIntegrationTest, LegacyProxySendPreservesNativeDeadline)
     const auto response = proxy.value()->send(
         endpoint.value(), request.value(), std::chrono::milliseconds{5});
     ASSERT_FALSE(response);
-    EXPECT_EQ(response.error().code(), fnd::ErrorCode::Timeout);
+    EXPECT_EQ(response.error().code(), fnd::ErrorCode::Unavailable);
     upstream.stop();
 }
 
@@ -1358,6 +1374,12 @@ TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermitt
     ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"native-proxy"}, gw::HttpMethod::Get,
         "/proxy", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
         pol::Action{"proxy.read"}, pol::Resource{"upstream:/proxy"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"api-proxy"}, gw::HttpMethod::Get,
+        "/api", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"}, pol::Resource{"upstream:/api"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"local-account"}, gw::HttpMethod::Get,
+        "/account", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"}, pol::Resource{"upstream:/account"}).value()));
     ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"scoped-proxy"}, gw::HttpMethod::Get,
         "/proxy/scoped", gw::ServiceId{"service"}, true, ids::OrganizationId{"tenant-a"},
         pol::Action{"proxy.scoped"}, pol::Resource{"upstream:/proxy"}, "delegated.read").value()));
@@ -1367,9 +1389,14 @@ TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermitt
     auto proxy = httpAdapter::BeastProxyTransport::create(
         httpAdapter::ProxyConfig::create(8192U, 4096U).value());
     ASSERT_TRUE(proxy);
-    gw::Gateway gateway{router, core.sessions, core.access, core.limiter,
-        core.discovery, core.balancer, core.circuits, *proxy.value(), core.signer,
+    gw::Gateway gateway{router, core.limiter,
+        core.discovery, core.balancer, core.circuits, core.signer,
         std::chrono::seconds{2}};
+    auto syncRequest=gw::HttpRequest::create(gw::HttpMethod::Get,"/proxy/item",
+        {{"authorization","Bearer fixture-valid"}},{},"127.0.0.1",fnd::CorrelationId{"native-only-core"});
+    ASSERT_TRUE(syncRequest);
+    EXPECT_EQ(gateway.handle(std::move(syncRequest).value()).status(),503);
+    EXPECT_EQ(upstream.calls.load(),0);
     SelectiveCoroutineHandler fallback;
     std::atomic<int> verifications{0};
     std::atomic<int> authorizations{0};
@@ -1410,11 +1437,13 @@ TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermitt
     EXPECT_EQ(accepted.body(), "verified");
     EXPECT_EQ(accepted.at("cache-control"), "no-store");
     EXPECT_EQ(upstream.calls.load(), 1);
-    EXPECT_EQ(send("/proxy/scoped", "Bearer fixture-valid").body(), "legacy");
+    EXPECT_EQ(send("/proxy/scoped", "Bearer fixture-valid").result_int(), 403U);
+    EXPECT_EQ(send("/api/item", "Bearer fixture-valid").body(), "verified");
+    EXPECT_EQ(send("/account/profile", "Bearer fixture-valid").body(), "legacy");
     EXPECT_EQ(send("/proxy-other", "Bearer fixture-valid").body(), "legacy");
     EXPECT_EQ(send("/native").body(), "native");
-    EXPECT_EQ(verifications.load(), 3);
-    EXPECT_EQ(authorizations.load(), 2);
+    EXPECT_EQ(verifications.load(), 5);
+    EXPECT_EQ(authorizations.load(), 3);
     EXPECT_EQ(fallback.synchronousCalls.load(), 2);
     EXPECT_EQ(fallback.asynchronousCalls.load(), 1);
     auto direct = gw::HttpRequest::create(gw::HttpMethod::Get, "/proxy/item",
@@ -1422,7 +1451,7 @@ TEST(BeastHttpIntegrationTest, NativeProtectedGatewayForwardsOnlyVerifiedPermitt
         fnd::CorrelationId{"direct-sync"});
     ASSERT_TRUE(direct);
     EXPECT_EQ(native.handle(std::move(direct).value()).status(), 503);
-    EXPECT_EQ(upstream.calls.load(), 1);
+    EXPECT_EQ(upstream.calls.load(), 2);
     server.stop();
     upstreamServer.stop();
 }
@@ -1461,8 +1490,8 @@ TEST(BeastHttpIntegrationTest, NativeDelegatedProxyRequiresGrantsAndSenderBefore
             upstreamServer.boundPort(),false,1U).value()}));
     auto proxy=httpAdapter::BeastProxyTransport::create(httpAdapter::ProxyConfig::create(8192U,4096U).value());
     ASSERT_TRUE(proxy);
-    gw::Gateway gateway{router,core.sessions,core.access,core.limiter,core.discovery,
-        core.balancer,core.circuits,*proxy.value(),core.signer,std::chrono::seconds{2}};
+    gw::Gateway gateway{router,core.limiter,core.discovery,
+        core.balancer,core.circuits,core.signer,std::chrono::seconds{2}};
     SelectiveCoroutineHandler fallback;
     std::atomic<int> accessCalls{0},proofCalls{0},policyCalls{0};
     const auto accepted=[]{
@@ -1541,14 +1570,17 @@ TEST(BeastHttpIntegrationTest, NativePublicProxyDoesNotEnterProtectedAuthenticat
     ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"protected-proxy"},gw::HttpMethod::Get,
         "/proxy/protected",gw::ServiceId{"service"},true,ids::OrganizationId{"tenant-a"},
         pol::Action{"proxy.read"},pol::Resource{"upstream:/proxy"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"local-trust"},gw::HttpMethod::Get,
+        "/trust",gw::ServiceId{"service"},false,ids::OrganizationId{"tenant-a"},
+        pol::Action{"proxy.read"},pol::Resource{"upstream:/trust"}).value()));
     ASSERT_TRUE(core.discovery.set(gw::ServiceId{"service"},{
         gw::Endpoint::create(gw::EndpointId{"public-upstream"},"127.0.0.1",
             upstreamServer.boundPort(),false,1U).value()}));
     auto transport=httpAdapter::BeastProxyTransport::create(
         httpAdapter::ProxyConfig::create(8192U,4096U).value());
     ASSERT_TRUE(transport);
-    gw::Gateway gateway{router,core.sessions,core.access,core.limiter,
-        core.discovery,core.balancer,core.circuits,*transport.value(),core.signer,
+    gw::Gateway gateway{router,core.limiter,
+        core.discovery,core.balancer,core.circuits,core.signer,
         std::chrono::seconds{2}};
     SelectiveCoroutineHandler fallback;
     httpAdapter::CoroutineProtectedGatewayAdapter native{gateway,*transport.value(),fallback,{},{},false};
@@ -1559,8 +1591,9 @@ TEST(BeastHttpIntegrationTest, NativePublicProxyDoesNotEnterProtectedAuthenticat
     EXPECT_EQ(upstream.received.load(),1);
     EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/proxy/protected").body(),"legacy");
     EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/proxy-other").body(),"legacy");
+    EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/trust").body(),"legacy");
     EXPECT_EQ(sendRequest(server.boundPort(),beastHttp::verb::get,"/native").body(),"native");
-    EXPECT_EQ(fallback.synchronousCalls.load(),2);
+    EXPECT_EQ(fallback.synchronousCalls.load(),3);
     EXPECT_EQ(fallback.asynchronousCalls.load(),1);
     auto direct=gw::HttpRequest::create(gw::HttpMethod::Get,"/proxy/public",{},{},"127.0.0.1",
         fnd::CorrelationId{"native-public-sync-denial"});

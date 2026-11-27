@@ -11,10 +11,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Preserve an in-flight full benchmark/E2E on the experimental branch;
-  # otherwise each small follow-up commit cancels its only complete data set.
+  # Preserve a running full build/benchmark on the consolidated migration PR.
+  # A newer head still needs its own successful run; don't discard the only
+  # completed diagnostic data set whenever another migration patch lands.
   # Mainline and ordinary PRs still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/perf/openproof-full-optimization-20261026' && github.head_ref != 'integration/native-runtime-schema-20261126' && github.ref != 'refs/heads/integration/native-runtime-schema-20261126' }}
 
 jobs:
   static:
@@ -62,7 +63,28 @@ jobs:
           node scripts/test-coroutine-account-connections-contract.mjs
           node scripts/test-coroutine-account-totp-status-contract.mjs
           node scripts/test-native-admin-members-contract.mjs
+          node scripts/test-coroutine-admin-authorization.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Native gateway transport retirement contract
+        run: |
+          node scripts/test-gateway-translation-unit-split.mjs
+          node scripts/test-native-gateway-tls-completion.mjs
+      - name: Mandatory native account credential lifecycle contract
+        run: |
+          node scripts/test-coroutine-native-contact-runtime.mjs
+          node scripts/test-coroutine-native-signup-foundation.mjs
+          node scripts/test-coroutine-account-session-http-contract.mjs
+          node scripts/test-coroutine-native-auth-secret-scrub.mjs
+          node scripts/test-native-http-credential-erasure.mjs
+          node scripts/test-coroutine-provider-transports.mjs
+      - name: Native OAuth token read contract
+        run: |
+          node scripts/test-coroutine-native-oauth-token-read.mjs
+          node scripts/test-coroutine-native-health-runtime.mjs
+          node scripts/test-coroutine-native-application-read.mjs
+          node scripts/test-coroutine-native-passkey-account.mjs
+          node scripts/test-coroutine-native-scim-read.mjs
+          node scripts/test-coroutine-native-evidence-runtime.mjs
       - name: Mandatory native public discovery and provider catalog contract
         run: |
           node scripts/test-coroutine-native-oidc-discovery-runtime.mjs
@@ -150,7 +172,8 @@ jobs:
           # This is a disposable CI runner; never run migrations or seed
           # records against a shared staging or production database.
           sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
-          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests --parallel 2
+          cmake --build --preset gcc-release --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_native_only_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_postgres_native_only_tests
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
           ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests --gtest_filter='PostgresCoroutineDomainTest.*:PostgresCoroutineRealDatabaseTest.*'
 
@@ -170,6 +193,10 @@ jobs:
           ./cmake-build-gcc-release/tests/openproof_account_coroutine_http_tests
           cmake --build --preset gcc-release --target openproof_admin_coroutine_http_tests --parallel 2
           ./cmake-build-gcc-release/tests/openproof_admin_coroutine_http_tests
+          cmake --build --preset gcc-release --target openproof_admin_lifecycle_http_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_admin_lifecycle_http_tests
+          cmake --build --preset gcc-release --target openproof_native_health_tests --parallel 2
+          ./cmake-build-gcc-release/tests/openproof_native_health_tests
 
       # A dedicated Unix-socket PostgreSQL instance, created and destroyed
       # by the checked-in guard script, validates the new connection SQL
@@ -181,7 +208,18 @@ jobs:
           bash scripts/run-disposable-postgres-canonical-tests.sh
 
       - name: Build opp executable
-        run: cmake --build --preset gcc-release --target opp --parallel 2
+        # Keep compiling independent translation units after the first error
+        # so the next migration fix can address every reported blocker.
+        # Ninja still exits nonzero if any compilation or link fails.
+        run: cmake --build --preset gcc-release --target opp --parallel 2 -- -k 0
+
+      - name: Verify executable has no blocking PostgreSQL symbols
+        run: |
+          nm -C ./cmake-build-gcc-release/apps/opp/opp > "${RUNNER_TEMP}/opp-symbols.txt"
+          if grep -E '(^|[[:space:]])(PQexec(Params)?|PQconnectdb(Params)?|PQreset)(@[^[:space:]]+)?$|openproof::storage::postgres::(ConnectionPool|PostgresAdministrationRepository|PostgresCredentialRekeyer|PostgresMasterKeyRotator)::' "${RUNNER_TEMP}/opp-symbols.txt"; then
+            echo "Blocking PostgreSQL implementation linked into opp"
+            exit 1
+          fi
 
       # Run the ordinary identity-platform HTTP scenarios over real native
       # PostgreSQL profile reads, with a separate disposable database. Keep
@@ -263,10 +301,14 @@ jobs:
           retention-days: 14
 
       - name: Build
-        run: cmake --build --preset gcc-release --parallel 2
+        run: cmake --build --preset gcc-release --parallel 2 -- -k 0
+
+      - name: Destructive PostgreSQL integration in private socket fixture
+        timeout-minutes: 15
+        run: bash scripts/run-disposable-postgres-integration-tests.sh
 
       - name: Test
-        run: ctest --preset gcc-release --output-on-failure
+        run: ctest --preset gcc-release --output-on-failure -E '^PostgresIntegrationTest\.'
 
       - name: Consolidated fresh schema and legacy-ledger integration
         env:
@@ -278,7 +320,8 @@ jobs:
           cp -a migrations "$OPENPROOF_TEST_BASELINE_DIRECTORY"
           python3 scripts/verify-schema-baseline.py --output-dir "$OPENPROOF_TEST_BASELINE_DIRECTORY/baseline" \
             --runtime-upgrade-tests ./cmake-build-gcc-release/tests/openproof_tests
-          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.*:PostgresIntegrationTest.ExistingSchemaNeverRestoresSnapshot'
+          ./cmake-build-gcc-release/tests/openproof_tests --gtest_filter='PostgresMigrationBaselineTest.FreshSnapshotRecordsHistoricalChecksumsAndIsIdempotent'
+          bash scripts/run-disposable-postgres-integration-tests.sh
 
 
       # Paired comparison is deliberately gated on the *full* test suite.

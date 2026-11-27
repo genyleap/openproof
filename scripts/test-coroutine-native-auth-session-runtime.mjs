@@ -21,7 +21,7 @@ test("auth session cutover is mandatory and rejects invalid or disabled configur
   assert.match(app,/platform\.auth\(\)\.enabled\(\) && nativeAuthSessionFlag && \*nativeAuthSessionFlag == "0"/);
   assert.match(app,/nativeAuthSessionEnabled && !platform\.auth\(\)\.enabled\(\)/);
   const begin=app.indexOf("OPENPROOF_EXPERIMENTAL_NATIVE_AUTH_SESSIONS");
-  const migrate=app.indexOf("postgres::Migrator migrator{*pool.value()}",begin);
+  const migrate=app.indexOf("postgres::nativeDatabasePreflight(",begin);
   assert.ok(begin>=0 && migrate>begin);
 });
 
@@ -51,7 +51,7 @@ test("only the three auth session mutations are overlaid; middleware chain canno
   for(const route of ["/auth/session/rotate","/auth/logout","/auth/logout-all"])
     assert.ok(native.includes('nativePaths.emplace_back("'+route+'")'));
   assert.doesNotMatch(native,/\/auth\/login|\/auth\/mfa\/verify|\/auth\/recovery-codes/);
-  assert.match(section.slice(account),/healthApi, \*nativeHandler, limiter\.value\(\)/);
+  assert.match(section.slice(account),/fallback, \*nativeHandler, limiter\.value\(\)/);
   assert.match(app,/std::unique_ptr<postgres::CoroutineSessionListenerStack> asyncAuthSessions;/);
 });
 

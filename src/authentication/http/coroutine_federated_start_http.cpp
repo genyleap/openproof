@@ -216,9 +216,11 @@ CoroutineFederatedStartAdapter::CoroutineFederatedStartAdapter(
     AuthenticationService& authentication,
     idp::ProviderRegistry& providers,
     gateway::TokenBucketRateLimiter& limiter,
-    gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate)
+    gateway::http::CoroutineHttpHandler& fallback, Authenticate authenticate,
+    Authenticate authenticateBearer)
     : m_authentication(&authentication), m_providers(&providers),
-      m_limiter(&limiter), m_fallback(&fallback), m_authenticate(std::move(authenticate))
+      m_limiter(&limiter), m_fallback(&fallback), m_authenticate(std::move(authenticate)),
+      m_authenticateBearer(std::move(authenticateBearer))
 {
 }
 
@@ -226,14 +228,13 @@ bool CoroutineFederatedStartAdapter::nativeEnabledFor(
     const gateway::HttpRequest& request) const noexcept
 {
     if (isStart(request)) return true;
+    if (request.path()=="/account/connections/complete" && request.method()==gateway::HttpMethod::Get)
+        return true;
     if (isHandoff(request) && request.method()==gateway::HttpMethod::Get)
         return static_cast<bool>(m_authenticate);
     if (isConnectionStart(request) || isHandoff(request)) {
         return static_cast<bool>(m_authenticate)
-            && (request.method()==gateway::HttpMethod::Get
-                || (request.method()==gateway::HttpMethod::Post
-                    && !request.header("authorization").has_value()))
-            && !request.header("authorization").has_value();
+            && (!request.header("authorization").has_value() || m_authenticateBearer);
     }
     return m_fallback->nativeEnabledFor(request);
 }
@@ -252,6 +253,12 @@ gateway::HttpResponse CoroutineFederatedStartAdapter::handle(
 asio::awaitable<gateway::HttpResponse>
 CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
 {
+    if (request.path()=="/account/connections/complete" && request.method()==gateway::HttpMethod::Get) {
+        SensitiveFederatedStartRequestGuard wipe{request};
+        gateway::HttpResponse response{204,{},{}};
+        secure(response);
+        co_return response;
+    }
     if (!isStart(request) && !isConnectionStart(request) && !isHandoff(request)) {
         if (m_fallback->nativeEnabledFor(request))
             co_return co_await m_fallback->handleAsync(std::move(request));
@@ -324,12 +331,34 @@ CoroutineFederatedStartAdapter::handleAsync(gateway::HttpRequest request)
     }
     std::optional<identity::core::IdentityId> target;
     if (isConnectionStart(request)) {
+        const bool explicitBearer=request.header("authorization").has_value();
+        if (request.header("authorization").value_or("").starts_with("DPoP "))
+            co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+        const auto& authenticate=explicitBearer ? m_authenticateBearer : m_authenticate;
         auto credential=gateway::takeSessionCredential(request);
         if (!credential || !credential->has_value())
             co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
         try {
-            auto actor=co_await m_authenticate(std::move(credential->value()));
+            auto actor=co_await authenticate(std::move(credential->value()));
             if (!actor) co_return denied(actor.error(),request);
+            if (explicitBearer) {
+                // Never initiate a browser-bound remote proof using an API
+                // credential directly. Issue an owner-bound single-use ticket.
+                const idp::ProviderId selected{provider->second};
+                auto* implementation=m_providers->find(selected);
+                if (!implementation || implementation->interactionModel()!=idp::InteractionModel::Redirect
+                    || !m_authentication->nativeProviderAuthenticationEnabled(selected))
+                    co_return denied(foundation::Error{foundation::ErrorCode::NotFound},request);
+                request.wipeTargetQuery(); request.wipeBody();
+                request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+                auto issued=co_await m_authentication->issueBrowserConnectionHandoffAsync(
+                    actor->identity(),selected,returnTarget,request.correlation());
+                if (!issued) co_return denied(issued.error(),request);
+                gateway::HttpResponse response{302,gateway::Headers{{"location",
+                    "/account/connections/handoff?ticket="+issued->ticket().expose()}},{}};
+                secure(response);
+                co_return response;
+            }
             target.emplace(actor->identity());
         } catch (...) {
             co_return denied(foundation::Error{foundation::ErrorCode::Unavailable},request);
@@ -429,12 +458,15 @@ CoroutineFederatedStartAdapter::issueHandoff(gateway::HttpRequest request)
     const std::string providerText{provider->as_string()},returnTarget{returning->as_string()};
     if (providerText.empty() || providerText.size()>128U || !validLocalReturn(returnTarget))
         co_return denied(foundation::Error{foundation::ErrorCode::InvalidArgument},request);
+    if (request.header("authorization").value_or("").starts_with("DPoP "))
+        co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationFailed},request);
+    const auto& authenticate=request.header("authorization").has_value() ? m_authenticateBearer : m_authenticate;
     auto credential=gateway::takeSessionCredential(request);
     if (!credential || !credential->has_value())
         co_return denied(foundation::Error{foundation::ErrorCode::AuthenticationRequired},request);
     request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
     try {
-        auto actor=co_await m_authenticate(std::move(credential->value()));
+        auto actor=co_await authenticate(std::move(credential->value()));
         if (!actor) co_return denied(actor.error(),request);
         auto issued=co_await m_authentication->issueBrowserConnectionHandoffAsync(
             actor->identity(),idp::ProviderId{providerText},returnTarget,request.correlation());

@@ -137,7 +137,14 @@ SenderProofVerifier::SenderProofVerifier(
     DpopService& dpop, MtlsForwardingReplayStore& mtlsReplays,
     const foundation::ClockSource& clock, std::string publicOrigin,
     std::optional<foundation::SecretString> mtlsForwardingKey)
-    : m_dpop(&dpop), m_mtlsReplays(&mtlsReplays), m_clock(&clock),
+    : SenderProofVerifier(dpop,clock,std::move(publicOrigin),std::move(mtlsForwardingKey))
+{
+    m_mtlsReplays=&mtlsReplays;
+}
+
+SenderProofVerifier::SenderProofVerifier(DpopService& dpop,const foundation::ClockSource& clock,
+    std::string publicOrigin,std::optional<foundation::SecretString> mtlsForwardingKey)
+    : m_dpop(&dpop), m_clock(&clock),
       m_publicOrigin(std::move(publicOrigin)),
       m_mtlsForwardingKey(std::move(mtlsForwardingKey))
 {
@@ -290,6 +297,7 @@ foundation::Result<token::SenderConstraint> SenderProofVerifier::verifyMtlsForwa
 {
     auto prepared=prepareMtlsForwarding(request);
     if (!prepared) return foundation::fail(prepared.error());
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
     auto replay=m_mtlsReplays->consumeMtlsForwardingReplay(prepared->binding.value(),
         prepared->identifier,prepared->expiresAt,prepared->now);
     if (!replay) return foundation::fail(replay.error());
@@ -324,9 +332,51 @@ boost::asio::awaitable<foundation::Status> SenderProofVerifier::consumePreparedA
         std::move(proof->identifier),proof->expiresAt,proof->now);
 }
 
+boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+SenderProofVerifier::tokenEndpointConstraintAsync(gateway::HttpRequest& request,ConsumeReplay consume)
+{
+    // Non-coroutine: prepare and erase raw sender proof before suspension.
+    const bool dpop=request.header("dpop").has_value();
+    const bool mtls=request.header("x-forwarded-client-cert-sha256").has_value()
+        || request.header("x-forwarded-client-cert-timestamp").has_value()
+        || request.header("x-forwarded-client-cert-nonce").has_value()
+        || request.header("x-forwarded-client-cert-signature").has_value();
+    const auto erase=[&request] {
+        for (const auto* key:{"dpop","x-forwarded-client-cert-sha256",
+                "x-forwarded-client-cert-timestamp","x-forwarded-client-cert-nonce",
+                "x-forwarded-client-cert-signature"}) request.eraseHeader(key);
+    };
+    if (dpop && mtls) {
+        erase();
+        return consumeTokenProofAsync(foundation::fail(foundation::ErrorCode::InvalidArgument),{});
+    }
+    if (!dpop && !mtls) return consumeTokenProofAsync(std::optional<ReplayProof>{},std::move(consume));
+    auto prepared=dpop?prepareDpop(request,nullptr):prepareMtlsForwarding(request);
+    erase();
+    if (!prepared) return consumeTokenProofAsync(foundation::fail(prepared.error()),{});
+    return consumeTokenProofAsync(std::optional<ReplayProof>{std::move(prepared).value()},std::move(consume));
+}
+
+boost::asio::awaitable<foundation::Result<std::optional<token::SenderConstraint>>>
+SenderProofVerifier::consumeTokenProofAsync(foundation::Result<std::optional<ReplayProof>> proof,
+    ConsumeReplay consume)
+{
+    if (!proof) co_return foundation::fail(proof.error());
+    if (!proof->has_value()) co_return std::optional<token::SenderConstraint>{};
+    if (!consume) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+    auto& prepared=proof->value();
+    const auto kind=prepared.binding.kind()==token::SenderConstraintKind::Dpop
+        ?session::DelegatedSenderConstraintKind::Dpop:session::DelegatedSenderConstraintKind::Mtls;
+    auto consumed=co_await consume(kind,std::string{prepared.binding.value()},
+        std::move(prepared.identifier),prepared.expiresAt,prepared.now);
+    if (!consumed) co_return foundation::fail(consumed.error());
+    co_return std::optional<token::SenderConstraint>{std::move(prepared.binding)};
+}
+
 foundation::Result<std::optional<token::SenderConstraint>>
 SenderProofVerifier::tokenEndpointConstraint(gateway::HttpRequest& request)
 {
+    if (!m_mtlsReplays) return foundation::fail(foundation::ErrorCode::Unavailable);
     const bool hasDpop = request.header("dpop").has_value();
     const bool hasMtls = request.header("x-forwarded-client-cert-sha256").has_value()
         || request.header("x-forwarded-client-cert-timestamp").has_value()

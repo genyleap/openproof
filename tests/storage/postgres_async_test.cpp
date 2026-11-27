@@ -307,6 +307,48 @@ TEST(PostgresNativeCoroutineTest, TransactionIsNotReusableUntilRollback)
     EXPECT_TRUE(returnedIdle);
 }
 
+TEST(PostgresNativeCoroutineTest, MigrationScriptUsesExplicitTransactionAndKeepsRequestQueriesSingleStatement)
+{
+    const char* connectionString=std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL()<<"CI requires disposable PostgreSQL";
+        }
+        GTEST_SKIP()<<"No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    bool rejectedOutside=false,inside=false,committed=false,ordinaryRejected=false,failedDiscarded=false;
+    const auto exercise=[&]()->asio::awaitable<void>{
+        auto connection=co_await pg::AsyncConnection::connect(connectionString,2s);
+        try {co_await connection->executeMigrationScript("SELECT 1; SELECT 2",2s);}
+        catch (const std::invalid_argument&) {rejectedOutside=connection->reusable();}
+        static_cast<void>(co_await connection->query("BEGIN",{},2s));
+        co_await connection->executeMigrationScript(
+            "CREATE TEMP TABLE native_migration_fixture(id integer);"
+            "INSERT INTO native_migration_fixture VALUES (1),(2);"
+            "SELECT count(*) FROM native_migration_fixture",2s);
+        const auto rows=co_await connection->query("SELECT count(*)::text FROM native_migration_fixture",{},2s);
+        inside=connection->inTransaction() && rows.rows.size()==1U && rows.rows.front().size()==1U
+            && rows.rows.front()[0]==std::optional<std::string>{"2"};
+        const auto commit=co_await connection->query("COMMIT",{},2s);
+        committed=connection->reusable() && commit.commandTag=="COMMIT";
+        try {static_cast<void>(co_await connection->query("SELECT 1; SELECT 2",{},2s));}
+        catch (const std::runtime_error&) {ordinaryRejected=!connection->healthy();}
+        auto failing=co_await pg::AsyncConnection::connect(connectionString,2s);
+        static_cast<void>(co_await failing->query("BEGIN",{},2s));
+        try {co_await failing->executeMigrationScript("CREATE TEMP TABLE native_failed_migration(id integer);SELECT 1/0",2s);}
+        catch (const std::runtime_error&) {failedDiscarded=!failing->healthy() && !failing->reusable();}
+    };
+    auto result=asio::co_spawn(context,exercise(),asio::use_future);
+    context.run();
+    ASSERT_NO_THROW(result.get());
+    EXPECT_TRUE(rejectedOutside);
+    EXPECT_TRUE(inside);
+    EXPECT_TRUE(committed);
+    EXPECT_TRUE(ordinaryRejected);
+    EXPECT_TRUE(failedDiscarded);
+}
+
 TEST(PostgresNativeCoroutineTest, FailedStatementCannotReturnAbortedLease)
 {
     const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");

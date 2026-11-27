@@ -32,6 +32,10 @@ private:
  * No assessment is persisted by this component. Every call observes evidence
  * revocation and expiry against one clock snapshot.
  */
+[[nodiscard]] foundation::Result<TrustAssessment> assessEvidence(
+    const identity::core::IdentityId& identity,const std::vector<evidence::Evidence>& records,
+    const TrustPolicy& policy,foundation::Instant now,std::vector<RiskSignal> risks={});
+
 class TrustEngine final {
 public:
     TrustEngine(evidence::EvidenceRepository& evidence,

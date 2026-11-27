@@ -650,13 +650,15 @@ OAuthHttpApi::OAuthHttpApi(
     resource::ServiceIdentityService& serviceIdentities,
     DeviceAuthorizationService& devices, PushedAuthorizationService& pushedAuthorization,
     JarService& jar, SenderProofVerifier& senderProof,
-    gateway::TokenBucketRateLimiter& limiter, gateway::HttpHandler& fallback)
+    gateway::TokenBucketRateLimiter& limiter, gateway::HttpHandler& fallback,
+    bool nativeTokenReadsRequired)
     : m_authorization(&authorization), m_tokens(&tokens), m_oidc(&oidc),
       m_clients(&clients), m_authentication(&authentication), m_sessions(&sessions),
       m_localProvider(std::move(localProvider)), m_consents(&consents),
       m_resources(&resources), m_serviceIdentities(&serviceIdentities),
       m_devices(&devices), m_pushedAuthorization(&pushedAuthorization),
-      m_jar(&jar), m_senderProof(&senderProof), m_limiter(&limiter), m_fallback(&fallback) {}
+      m_jar(&jar), m_senderProof(&senderProof), m_limiter(&limiter), m_fallback(&fallback),
+      m_nativeTokenReadsRequired(nativeTokenReadsRequired) {}
 
 gateway::HttpResponse OAuthHttpApi::error(
     const foundation::Error& failure, const gateway::HttpRequest& request) const
@@ -672,6 +674,30 @@ gateway::HttpResponse OAuthHttpApi::error(
 gateway::HttpResponse OAuthHttpApi::handle(gateway::HttpRequest request)
 {
     const auto path = request.path();
+    if (m_nativeTokenReadsRequired && path=="/login") {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    if (m_nativeTokenReadsRequired && (path=="/oauth/userinfo"
+        || path=="/oauth/introspect" || path=="/oauth/revoke")) {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    if (m_nativeTokenReadsRequired && (path=="/oauth/device_authorization" || path=="/oauth/device")) {
+        request.wipeBody(); request.wipeAuthorizationHeader();
+        request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    if (m_nativeTokenReadsRequired && (path=="/oauth/authorize" || path=="/oauth/consent")) {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
+    if (m_nativeTokenReadsRequired && path=="/oauth/par") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader(); request.wipeTargetQuery();
+        return error(foundation::Error{foundation::ErrorCode::Unavailable},request);
+    }
     if (request.method() == gateway::HttpMethod::Options
         && (path == "/oauth/token" || path == "/oauth/par"
             || path == "/oauth/device_authorization"
@@ -1449,6 +1475,34 @@ gateway::HttpResponse OAuthHttpApi::tokenEndpoint(gateway::HttpRequest request)
                                   "grant_type and client_id are required.");
     }
 
+    if (m_nativeTokenReadsRequired && grantType.value()=="refresh_token") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native refresh rotation is unavailable.");
+    }
+    if (m_nativeTokenReadsRequired && grantType.value()=="authorization_code") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native code exchange is unavailable.");
+    }
+    if (m_nativeTokenReadsRequired && (grantType.value()=="client_credentials"
+        || grantType.value()=="urn:ietf:params:oauth:grant-type:token-exchange")) {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native machine grant is unavailable.");
+    }
+    if (m_nativeTokenReadsRequired && grantType.value()=="urn:ietf:params:oauth:grant-type:device_code") {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(503,"temporarily_unavailable","Native device polling is unavailable.");
+    }
+    // All supported token grants are native. Unknown grants must not
+    // reach even synchronous client authentication.
+    if (m_nativeTokenReadsRequired) {
+        request.wipeBody(); request.wipeAuthorizationHeader(); request.wipeCookieHeader();
+        request.wipeTargetQuery();
+        return oauthErrorResponse(400,"unsupported_grant_type","The grant type is not supported.");
+    }
     client::ClientId clientId{clientIdText.value()};
     std::optional<foundation::SecretString> clientSecret;
     if (const auto rawSecret = optional(form.value(), "client_secret")) {

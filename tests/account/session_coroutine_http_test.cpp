@@ -127,7 +127,8 @@ struct Fixture final {
                      bool totpStatusEnabled = false,
                      bool passwordStatusEnabled = false,
                      bool passwordConfirmEnabled = false,
-                     bool profileWriteEnabled = false)
+                     bool profileWriteEnabled = false,
+                     bool scopedBearerReads = false, bool disconnectEnabled = false)
         : limiter(gw::TokenBucketRateLimiter::create(
             clock, 1000.0, 1000.0, 1000U).value()),
           api(legacy, fallback, limiter,
@@ -260,7 +261,33 @@ struct Fixture final {
                               std::nullopt,false,std::move(change.locale),std::move(change.picture),
                               kNow,kNow,change.avatarSource.value_or("auto"));
                       }}
-                  : http::CoroutineAccountSessionAdapter::UpdateProfile{})
+                  : http::CoroutineAccountSessionAdapter::UpdateProfile{},
+              scopedBearerReads
+                  ? http::CoroutineAccountSessionAdapter::Authenticate{
+                      [this](fnd::SecretString token)
+                          -> asio::awaitable<fnd::Result<sess::Session>> {
+                          ++scopedBearerCalls;
+                          if (token.expose() == "delegated-fixture" || token.expose() == "valid-token")
+                              co_return validSession("current");
+                          if (token.expose() == "no-scope-fixture")
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          if (token.expose() == "unavailable-fixture")
+                              co_return fnd::fail(fnd::ErrorCode::Unavailable);
+                          co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+                      }}
+                  : http::CoroutineAccountSessionAdapter::Authenticate{},
+              disconnectEnabled
+                  ? http::CoroutineAccountSessionAdapter::Disconnect{
+                      [this](core::IdentityId owner,core::ExternalIdentityRef external)
+                          -> asio::awaitable<fnd::Status> {
+                          ++disconnectCalls;
+                          if (owner.value()!="identity-current" || external.subject().value()=="foreign")
+                              co_return fnd::fail(fnd::ErrorCode::PermissionDenied);
+                          if (external.subject().value()=="last")
+                              co_return fnd::fail(fnd::ErrorCode::FailedPrecondition);
+                          co_return fnd::ok();
+                      }}
+                  : http::CoroutineAccountSessionAdapter::Disconnect{})
     {
     }
 
@@ -278,6 +305,7 @@ struct Fixture final {
     NativeFallback fallback;
     gw::TokenBucketRateLimiter limiter;
     int authenticationCalls{};
+    int scopedBearerCalls{};
     int listCalls{};
     bool includeForeignSession{};
     std::size_t generatedSessionCount{};
@@ -285,6 +313,7 @@ struct Fixture final {
     int profileReadCalls{};
     int profileWriteCalls{};
     int connectionsReadCalls{};
+    int disconnectCalls{};
     int totpStatusCalls{};
     int passwordStatusCalls{};
     int passwordConfirmCalls{};
@@ -604,6 +633,100 @@ TEST(AccountCoroutineSessionHttpTest, ConnectionsReadIsCookieOnlyAndPreservesLeg
     EXPECT_EQ(allowed.body().find("valid-token"), std::string::npos);
     EXPECT_EQ(f.connectionsReadCalls, 1);
     EXPECT_EQ(f.legacy.invoked, 2);
+}
+
+TEST(AccountCoroutineSessionHttpTest, ScopedBearerReadsNeverDelegateSessionOrCredentialMutations)
+{
+    Fixture f{true, true, true, true, true, true, true};
+    gw::http::CoroutineRouteOverlay overlay{
+        f.legacy, f.api, {}, {{"/account/profile", gw::HttpMethod::Get},
+            {"/account/connections", gw::HttpMethod::Get}}};
+    for (const auto* path : {"/account/profile", "/account/connections"}) {
+        EXPECT_TRUE(overlay.nativeEnabledFor(request(gw::HttpMethod::Get, path, "delegated-fixture")));
+        EXPECT_EQ(overlay.handle(request(gw::HttpMethod::Get, path, "delegated-fixture")).status(), 503);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "delegated-fixture")).status(), 200);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "no-scope-fixture")).status(), 403);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "unavailable-fixture")).status(), 503);
+        EXPECT_EQ(f.run(request(gw::HttpMethod::Get, path, "unknown-fixture")).status(), 401);
+        auto proof = gw::HttpRequest::create(gw::HttpMethod::Get, path,
+            {{"authorization", "DPoP delegated-fixture"}}, {}, "127.0.0.1",
+            fnd::CorrelationId{"account-proof-fixture"}).value();
+        EXPECT_EQ(f.run(std::move(proof)).status(), 401);
+        auto ambiguous = gw::HttpRequest::create(gw::HttpMethod::Get, path,
+            {{"authorization", "Bearer delegated-fixture"}, {"cookie", "__Host-openproof-session=valid-token"}},
+            {}, "127.0.0.1", fnd::CorrelationId{"account-ambiguous-fixture"}).value();
+        EXPECT_EQ(f.run(std::move(ambiguous)).status(), 401);
+    }
+    EXPECT_EQ(f.scopedBearerCalls, 8);
+    EXPECT_EQ(f.profileReadCalls, 1);
+    EXPECT_EQ(f.connectionsReadCalls, 1);
+    EXPECT_EQ(f.run(profileCookieRequest()).status(), 200);
+    EXPECT_EQ(f.authenticationCalls, 1);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get, "/account/sessions", "delegated-fixture")).status(), 401);
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Patch, "/account/profile", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Get, "/account/totp", "delegated-fixture")));
+    EXPECT_TRUE(f.api.nativeEnabledFor(request(gw::HttpMethod::Post, "/account/password/upgrade", "delegated-fixture")));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/totp","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/password/upgrade","delegated-fixture")).status(),200);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","no-scope-fixture",R"({"display_name":"denied"})")).status(),403);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Patch,"/account/profile","delegated-fixture",R"({"display_name":"Allowed"})")).status(),200);
+    auto delegatedUpgrade=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/password/upgrade",
+        {{"authorization","Bearer delegated-fixture"},{"host","example.invalid"},{"origin","https://example.invalid"},
+            {"sec-fetch-site","same-origin"},{"content-type","application/json"}},
+        R"({"password":"fixture-password"})","127.0.0.1",fnd::CorrelationId{"delegated-upgrade"}).value();
+    EXPECT_EQ(f.run(std::move(delegatedUpgrade)).status(),401);
+    EXPECT_EQ(f.passwordConfirmCalls,0);
+    EXPECT_EQ(f.scopedBearerCalls, 12);
+    EXPECT_EQ(f.listCalls, 0);
+    EXPECT_EQ(f.legacy.invoked, 0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeSecurityAndRecoveryPagesPreserveCspAndOwnerBoundary)
+{
+    Fixture f{false,false,true,false,false,false,true};
+    auto recovery=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    ASSERT_EQ(recovery.status(),200);
+    EXPECT_EQ(recovery.headers().at("cache-control"),"no-store");
+    EXPECT_NE(recovery.headers().at("content-security-policy").find("frame-ancestors 'none'"),std::string::npos);
+    EXPECT_NE(recovery.body().find("/account/password/reset"),std::string::npos);
+    auto recoveryAgain=f.run(request(gw::HttpMethod::Get,"/account/recover"));
+    EXPECT_NE(recovery.headers().at("content-security-policy"),recoveryAgain.headers().at("content-security-policy"));
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security")).status(),303);
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","delegated-fixture")).status(),303);
+    EXPECT_EQ(f.totpStatusCalls,0);
+    auto security=f.run(request(gw::HttpMethod::Get,"/account/security","valid-token"));
+    ASSERT_EQ(security.status(),200);
+    EXPECT_NE(security.body().find("Account Security"),std::string::npos);
+    EXPECT_NE(security.headers().at("content-security-policy").find("script-src 'nonce-"),std::string::npos);
+    EXPECT_EQ(security.body().find("valid-token"),std::string::npos);
+    EXPECT_EQ(f.totpStatusCalls,1);
+    f.totpForeign=true;
+    EXPECT_EQ(f.run(request(gw::HttpMethod::Get,"/account/security","valid-token")).status(),503);
+    EXPECT_EQ(f.scopedBearerCalls,0);
+    EXPECT_EQ(f.legacy.invoked,0);
+}
+
+TEST(AccountCoroutineSessionHttpTest, NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack)
+{
+    Fixture f{true,true,true,true,true,true,true,true};
+    const auto call=[&](std::string token,std::string body) {
+        auto input=gw::HttpRequest::create(gw::HttpMethod::Post,"/account/connections/disconnect",
+            {{"authorization","Bearer "+token},{"content-type","application/json"}},
+            std::move(body),"127.0.0.1",fnd::CorrelationId{"disconnect-fixture"}).value();
+        EXPECT_TRUE(f.api.nativeEnabledFor(input));
+        return f.run(std::move(input));
+    };
+    const std::string good=R"({"provider":"farcaster","subject":"owned"})";
+    EXPECT_EQ(call("no-scope-fixture",good).status(),403);
+    EXPECT_EQ(call("unavailable-fixture",good).status(),503);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"owned","identity_id":"other"})").status(),400);
+    EXPECT_EQ(call("delegated-fixture",R"({"provider":"farcaster","subject":"foreign"})").status(),403);
+    EXPECT_EQ(call("valid-token",R"({"provider":"local","subject":"last"})").status(),412);
+    const auto result=call("delegated-fixture",good);
+    EXPECT_EQ(result.status(),200);
+    EXPECT_EQ(result.headers().at("cache-control"),"no-store");
+    EXPECT_EQ(f.disconnectCalls,3);
+    EXPECT_EQ(f.legacy.invoked,0);
 }
 
 TEST(AccountCoroutineSessionHttpTest, ConnectionsReadRejectsForeignAndMissingWithoutDisclosure)

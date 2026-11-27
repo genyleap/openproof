@@ -1,8 +1,8 @@
 #pragma once
 
-// Provider-neutral, opt-in coroutine HTTP entry for account session and
-// read-only profile management. Keep the existing AccountHttpApi and all
-// mutation routes intact.
+// Provider-neutral coroutine HTTP entry for account session, profile and
+// connection management. Native disconnection is an atomic storage operation.
+// Unmigrated capabilities remain explicitly separate.
 // Native callbacks can be bound to any real asynchronous session repository:
 // this contract never imports PostgreSQL, a vendor, or an operator product.
 #include <boost/asio/awaitable.hpp>
@@ -43,6 +43,8 @@ public:
         std::vector<identity::core::ExternalIdentityRef>>;
     using ReadConnections = std::function<boost::asio::awaitable<
         foundation::Result<ConnectionList>>(identity::core::IdentityId)>;
+    using Disconnect = std::function<boost::asio::awaitable<foundation::Status>(
+        identity::core::IdentityId, identity::core::ExternalIdentityRef)>;
 
     using TotpStatus = std::pair<identity::core::IdentityId, std::optional<bool>>;
     using ReadTotpStatus = std::function<boost::asio::awaitable<
@@ -70,7 +72,8 @@ public:
         Authenticate authenticate, List list, RevokeOwned revokeOwned,
         ReadProfile readProfile = {}, ReadConnections readConnections = {},
         ReadTotpStatus readTotpStatus = {}, ReadPasswordUpgradeStatus readPasswordUpgradeStatus = {},
-        ConfirmPasswordUpgrade confirmPasswordUpgrade = {}, UpdateProfile updateProfile = {});
+        ConfirmPasswordUpgrade confirmPasswordUpgrade = {}, UpdateProfile updateProfile = {},
+        Authenticate authenticateReadBearer = {}, Disconnect disconnect = {});
 
     [[nodiscard]] bool nativeEnabled() const noexcept override { return false; }
     [[nodiscard]] bool nativeEnabledFor(
@@ -81,6 +84,8 @@ public:
         gateway::HttpRequest request) override;
 
 private:
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> securityPage(
+        gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionList(
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> sessionRevoke(
@@ -88,6 +93,8 @@ private:
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> profileRead(
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> connectionsRead(
+        gateway::HttpRequest request);
+    [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> disconnect(
         gateway::HttpRequest request);
     [[nodiscard]] boost::asio::awaitable<gateway::HttpResponse> totpStatusRead(
         gateway::HttpRequest request);
@@ -111,6 +118,10 @@ private:
     ReadPasswordUpgradeStatus m_readPasswordUpgradeStatus;
     ConfirmPasswordUpgrade m_confirmPasswordUpgrade;
     UpdateProfile m_updateProfile;
+    // Profile presentation, connection management and status reads may use
+    // scoped Bearer; password confirmation/session management do not.
+    Authenticate m_authenticateReadBearer;
+    Disconnect m_disconnect;
 };
 
 /** Native contact challenge issuance, independent of session-list opt-ins.

@@ -9,16 +9,18 @@ const root = path.resolve(import.meta.dirname, "..");
 const read = file => fs.readFileSync(path.join(root, file), "utf8");
 
 test("admin HTTP requires tenant-scoped owner role before enumeration", () => {
-  const raw = read("src/authentication/http/admin.cpp");
-  const start = raw.indexOf("AdministrationHttpApi::handle(");
-  const end = raw.indexOf("AdministrationHttpApi::listLocalMembers(", start);
-  assert.ok(start >= 0 && end > start);
-  const handle = raw.slice(start, end);
-  assert.match(handle, /m_memberships->find\s*\(\s*m_organization\s*,\s*actor\s*\)/);
-  assert.match(handle, /membership->value\(\)\.hasRole\(organization::Role\{"owner"\}\)/);
-  assert.match(handle, /ErrorCode::PermissionDenied/);
-  assert.ok(handle.indexOf("m_memberships->find(m_organization, actor)")
-            < handle.indexOf("return listLocalMembers(std::move(request))"));
+  const raw = read("src/authentication/http/coroutine_admin_read_http.cpp");
+  const storage=read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
+  const start=storage.indexOf("CoroutinePostgresCanonicalFinalizer::readMembersAsync(");
+  const end=storage.indexOf("CoroutinePostgresCanonicalFinalizer::readAuthorizationContextAsync(",start);
+  const listing=storage.slice(start,end);
+  assert.match(listing,/a.identity_id=\$1 AND a.organization_id=\$2/);
+  assert.match(listing,/a.state=1 AND ai.status=0 AND o.state=0/);
+  assert.match(listing,/AND ar.role='owner'/);
+  assert.match(listing,/ErrorCode::PermissionDenied/);
+  assert.match(raw,/listing->actor != actor/);
+  assert.match(raw,/role\.value\(\) == "owner"/);
+  assert.ok(raw.indexOf("co_await m_authenticate(")<raw.indexOf("co_await m_read(actor)"));
 });
 
 test("admin HTTP tests cover denied and authorized member enumeration", () => {
@@ -33,7 +35,7 @@ test("admin HTTP tests cover denied and authorized member enumeration", () => {
   assert.match(tests, /ASSERT_EQ\(permitted.status\(\), 200\)/);
 });
 
-test("pure admin domain has no transport I/O; real HTTP stays a migration blocker", () => {
+test("pure admin domain has no transport I/O; gate scans native HTTP, SQL and retired ABI", () => {
   const domain = cppExecutableText(read("src/administration/administration.cpp"));
   assert.doesNotMatch(domain,
     /\b(?:PQexec|PQconnectdb|ldap_sasl_bind_s|curl_easy_perform|read|write|connect)\s*\(/);
@@ -41,4 +43,7 @@ test("pure admin domain has no transport I/O; real HTTP stays a migration blocke
   assert.match(gate, /\["HTTP administration API", "src\/authentication\/http\/admin\.cpp"\]/);
   assert.doesNotMatch(gate,
     /\["HTTP administration API", "src\/administration\/administration\.cpp"\]/);
+  assert.match(gate,/src\/authentication\/http\/coroutine_admin_read_http\.cpp/);
+  assert.match(gate,/src\/storage\/postgres\/coroutine_admin_store\.cpp/);
+  assert.match(gate,/admin HTTP lifecycle has incomplete native authorization/);
 });

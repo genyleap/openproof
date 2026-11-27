@@ -39,7 +39,7 @@ jobs:
       - name: Compile native coroutine transport and real domain repository
         run: |
           cmake --build --preset gcc-release \
-            --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_network_tests \
+            --target openproof_postgres_async_tests openproof_postgres_domain_tests openproof_postgres_network_tests openproof_postgres_native_only_tests \
             --parallel 2
 
       - name: Exercise isolated libpq, SQL, and real session domain lifecycle
@@ -48,6 +48,7 @@ jobs:
           OPENPROOF_TEST_POSTGRES_DOMAIN_ACK: YES_EXCLUSIVE_DISPOSABLE_DATABASE
         run: |
           sudo -u postgres createdb -O openproof_ci openproof_coroutine_ci
+          ./cmake-build-gcc-release/tests/openproof_postgres_native_only_tests
           ./cmake-build-gcc-release/tests/openproof_postgres_async_tests \
             --gtest_filter='PostgresNativeCoroutineTest.*:PostgresAsyncPoolTest.*:PostgresAsyncSessionSqlTest.*'
           ./cmake-build-gcc-release/tests/openproof_postgres_domain_tests \

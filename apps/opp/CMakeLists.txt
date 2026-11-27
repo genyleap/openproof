@@ -51,13 +51,15 @@ target_link_libraries(opp
         openproof_consent
         openproof_evidence
         openproof_evidence_verifiers
-        openproof_evidence_http
+        openproof_evidence_async_http
         openproof_trust
         openproof_resource
         openproof_client
         openproof_application_http
+        openproof_application_async_http
         openproof_authentication
         openproof_authentication_http
+        openproof_authentication_async_passkey_http
         openproof_administration_async_http
         openproof_authentication_async_catalog_http
         openproof_authentication_async_federated_start_http
@@ -71,7 +73,8 @@ target_link_libraries(opp
         openproof_provider_enterprise
         openproof_enterprise_scim
         openproof_enterprise_scim_http
-        openproof_storage_postgres
+        openproof_enterprise_scim_async_http
+        openproof_postgres_async_startup
         openproof_postgres_async_auth_repository
         openproof_postgres_async_canonical
         openproof_postgres_async_verification
@@ -80,6 +83,7 @@ target_link_libraries(opp
         openproof_postgres_async_repository
         openproof_postgres_async_listener
         openproof_operations_http
+        openproof_operations_async_http
         openproof_organization
         openproof_session
         openproof_oauth

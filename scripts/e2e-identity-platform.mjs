@@ -409,6 +409,9 @@ async function main() {
   const consumerPassword = `E2E-consumer-${base64Url(crypto.randomBytes(24))}`;
   const replacementPassword = `E2E-replaced-${base64Url(crypto.randomBytes(24))}`;
   const resourceAudience = "https://api.e2e.openproof.invalid";
+  // The candidate enables native account capabilities by default. Only the
+  // explicitly pinned historical binary retains the legacy expectations.
+  const nativeAccountRuntime = process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1";
 
   let frontPort;
   const edgeServer = https.createServer(
@@ -752,6 +755,20 @@ async function main() {
       const csrf = response.body.match(/name="csrf" value="([^"]+)"/)?.[1];
       if (!csrf) fail("consent page did not contain its CSRF value");
       const form = new URLSearchParams({ return_to: authorizePath, csrf, decision: "approve" });
+      if (nativeAccountRuntime) {
+        // A valid cookie and form CSRF must not authorize a modified target.
+        const substituted = new URLSearchParams(query);
+        substituted.set("state", base64Url(crypto.randomBytes(18)));
+        const rejected = await edgeRequest("/oauth/consent", {
+          method: "POST",
+          jar: ownerJar,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            return_to: `/oauth/authorize?${substituted}`, csrf, decision: "approve",
+          }).toString(),
+        });
+        expectStatus(rejected, 401);
+      }
       response = await edgeRequest("/oauth/consent", {
         method: "POST",
         jar: ownerJar,
@@ -795,6 +812,16 @@ async function main() {
       code_verifier: verifier,
     });
     if (clientSecret) form.set("client_secret", clientSecret);
+    if (nativeAccountRuntime) {
+      const invalid = new URLSearchParams(form);
+      invalid.set("code_verifier", "a".repeat(43));
+      const denied = await edgeRequest("/oauth/token", {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: invalid.toString(),
+      });
+      expectStatus(denied, 400);
+      assert.equal(jsonBody(denied).error, "invalid_grant");
+    }
     const tokenResponse = await edgeRequest("/oauth/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -804,6 +831,14 @@ async function main() {
     const tokens = jsonBody(tokenResponse);
     assert.ok(tokens.access_token && tokens.refresh_token && tokens.id_token);
     const verified = verifyIdToken(tokens.id_token, keySet, { issuer, clientId, nonce });
+    if (nativeAccountRuntime) {
+      const replay = await edgeRequest("/oauth/token", {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      expectStatus(replay, 400);
+      assert.equal(jsonBody(replay).error, "invalid_grant");
+    }
     return { ...tokens, nonce, idHeader: verified.header };
   }
 
@@ -1022,7 +1057,7 @@ async function main() {
       secret: notifications[0].secret,
     });
     expectStatus(verifiedEmail, 200);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       assert.equal(jsonBody(verifiedEmail).verified, true);
       assert.ok(jsonBody(verifiedEmail).session_id);
       const replay = await jsonRequest("/account/email/verify", "POST", {
@@ -1170,7 +1205,7 @@ async function main() {
       expectStatus(await edgeRequest("/account/profile", { jar: consumerJar }), 200);
       assert.equal(active(), beforeActive, "same-browser local login must atomically replace the session");
       console.log("- native local HTTP: unknown/locked subject, invalid password, binding, replay, no provisioning and session replacement passed");
-      if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_SESSIONS === "1") {
+      if (nativeAccountRuntime) {
         expectStatus(await edgeRequest("/account/password/upgrade"), 401);
         const projection = await edgeRequest("/account/password/upgrade", { jar: consumerJar });
         expectStatus(projection, 200);
@@ -1203,7 +1238,7 @@ async function main() {
         console.log("- native password upgrade HTTP: owner-bound metadata, no-store, inactive identity denial, origin and policy enforcement passed");
       }
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/account/totp"), 401);
       const status = await edgeRequest("/account/totp", { jar: consumerJar });
       expectStatus(status, 200);
@@ -1211,7 +1246,7 @@ async function main() {
         assurance: consumerGrant.assurance });
       assert.equal(status.headers["cache-control"], "no-store");
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+    if (nativeAccountRuntime) {
       // Preserve the legacy projection: retired/unregistered provider links
       // can exist in storage, but cannot appear as available login methods.
       command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
@@ -1233,10 +1268,10 @@ async function main() {
       jsonBody(connectionsBefore).connections.map(({ provider, subject }) => `${provider}:${subject}`).sort(),
       [`farcaster:${farcasterFid}`, "local:consumer@e2e.invalid"],
     );
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
-      // Exercise the opt-in read concurrently: connection-pool contention
+    if (nativeAccountRuntime) {
+      // Exercise the native read concurrently: connection-pool contention
       // must suspend without dropping sockets or leaking another identity.
-      // Default/benchmark runs keep their existing compatibility workload.
+      // The later timed mixed-read workload is unchanged.
       const reads = await Promise.all(Array.from({ length: 8 },
         () => edgeRequest("/account/connections", { jar: consumerJar })));
       for (const response of reads) {
@@ -1254,7 +1289,7 @@ async function main() {
         );
       }
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1") {
+    if (nativeAccountRuntime) {
       // Remove only the dedicated fixture before testing last-method policy.
       command("psql", [databaseUrl, "-v", "ON_ERROR_STOP=1", "-c",
         "DELETE FROM openproof.external_identities WHERE provider='fixture-retired-provider' " +
@@ -1279,6 +1314,17 @@ async function main() {
       subject: String(farcasterFid),
     }, consumerJar);
     expectStatus(disconnected, 200);
+    if (nativeAccountRuntime) {
+      const afterDisconnect=await edgeRequest("/account/connections",{jar:consumerJar});
+      expectStatus(afterDisconnect,200);
+      assert.ok(!jsonBody(afterDisconnect).connections.some(c=>c.provider==="farcaster" && c.subject===String(farcasterFid)));
+      expectStatus(await jsonRequest("/account/connections/disconnect","POST",{
+        provider:"farcaster",subject:String(farcasterFid)
+      },consumerJar),404);
+      expectStatus(await jsonRequest("/account/connections/disconnect","POST",{
+        provider:"local",subject:"consumer@e2e.invalid",identity_id:"e2e-owner"
+      },consumerJar),400);
+    }
     const refusedLastMethod = await jsonRequest("/account/connections/disconnect", "POST", {
       provider: "local",
       subject: "consumer@e2e.invalid",
@@ -1294,7 +1340,7 @@ async function main() {
     }, consumerJar);
     expectStatus(updatedProfile, 200);
     assert.equal(jsonBody(updatedProfile).locale, "fa-IR");
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_PROFILE === "1") {
+    if (nativeAccountRuntime) {
       const refused = await jsonRequest("/account/profile", "PATCH", {
         display_name: "Uncommitted profile", avatar_source: "missing-avatar-provider",
       }, consumerJar);
@@ -1310,6 +1356,21 @@ async function main() {
       console.log("- native profile mutation: rollback, protected contacts and tenant ownership passed");
     }
 
+    if (nativeAccountRuntime) {
+      const recovery = await edgeRequest("/account/recover");
+      expectStatus(recovery,200);
+      assert.match(recovery.headers["content-security-policy"],/script-src 'nonce-/);
+      assert.match(recovery.body,/Reset your OpenProof password/);
+      const security = await edgeRequest("/account/security",{jar:consumerJar});
+      expectStatus(security,200);
+      assert.equal(security.headers["cache-control"],"no-store");
+      assert.match(security.headers["content-security-policy"],/frame-ancestors 'none'/);
+      assert.match(security.body,/Account Security/);
+      const unauthenticated = await edgeRequest("/account/security");
+      expectStatus(unauthenticated,303);
+      assert.equal(unauthenticated.headers.location,"/login?return_to=%2Faccount%2Fsecurity");
+    }
+
     const forgot = await jsonRequest("/account/password/forgot", "POST", {
       email: "consumer@e2e.invalid",
     });
@@ -1322,7 +1383,7 @@ async function main() {
       new_password: replacementPassword,
     });
     expectStatus(reset, 200);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       assert.equal(jsonBody(reset).password_reset, true);
       assert.equal(reset.headers["set-cookie"], undefined);
       const resetReplay = await jsonRequest("/account/password/reset", "POST", {
@@ -1336,7 +1397,7 @@ async function main() {
     }
     const consumerJarAfterReset = new CookieJar();
     await login("consumer@e2e.invalid", replacementPassword, consumerJarAfterReset);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_SIGNUP === "1") {
+    if (nativeAccountRuntime) {
       const enrollment = await jsonRequest("/account/totp/start", "POST",
         { password: replacementPassword }, consumerJarAfterReset);
       expectStatus(enrollment, 201);
@@ -1353,6 +1414,10 @@ async function main() {
       const mfaGrant = await login("consumer@e2e.invalid", replacementPassword, mfaJar,
         await nextTotp(setup.secret_base32, code));
       assert.equal(mfaGrant.assurance, "ial2");
+      // A valid IAL2 session is necessary but not sufficient for owner administration.
+      const nonOwnerConsole = await edgeRequest("/admin/console", { jar: mfaJar });
+      expectStatus(nonOwnerConsole, 403);
+      assert.doesNotMatch(nonOwnerConsole.body, /OpenProof Admin Console/);
       const removed = await jsonRequest("/account/totp/disable", "POST",
         { password: replacementPassword }, mfaJar);
       expectStatus(removed, 200);
@@ -1387,7 +1452,7 @@ async function main() {
       assert.equal(countOwnerSessions(), before);
       console.log("- native local MFA: missing second factor and previously consumed TOTP denied");
     }
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_TOTP_STATUS === "1") {
+    if (nativeAccountRuntime) {
       const status = await edgeRequest("/account/totp", { jar: ownerJar });
       expectStatus(status, 200);
       assert.deepEqual(jsonBody(status), { available: true, enabled: true, assurance: "ial2" });
@@ -1445,6 +1510,24 @@ async function main() {
     expectStatus(adminConsole, 200);
     assert.match(adminConsole.body, /name="identity_id"/);
     assert.match(adminConsole.body, /identity_id:v\.identity_id/);
+    assert.equal(adminConsole.headers["cache-control"], "no-store");
+    assert.match(adminConsole.headers["content-security-policy"], /frame-ancestors 'none'/);
+    const consoleNonce = adminConsole.body.match(/<script nonce="([^"]+)">/);
+    assert.ok(consoleNonce);
+    assert.ok(adminConsole.headers["content-security-policy"].includes("'nonce-" + consoleNonce[1] + "'"));
+    if (nativeAccountRuntime) {
+      const guestConsole = await edgeRequest("/admin/console");
+      expectStatus(guestConsole, 303);
+      assert.equal(guestConsole.headers.location, "/login?return_to=%2Fadmin%2Fconsole");
+      assert.doesNotMatch(guestConsole.body, /OpenProof Admin Console/);
+      // An authenticated password-only session must be directed to step-up,
+      // not confused with an IAL2 principal denied by the owner-role check.
+      const insufficientConsole = await edgeRequest("/admin/console", { jar: consumerJarAfterReset });
+      expectStatus(insufficientConsole, 303);
+      assert.equal(insufficientConsole.headers.location, "/account/security");
+      assert.equal(insufficientConsole.headers["cache-control"], "no-store");
+      assert.doesNotMatch(insufficientConsole.body, /OpenProof Admin Console/);
+    }
     const localMemberResponse = await jsonRequest("/admin/local-members", "POST", {
       identity_id: "e2e-dispatcher",
       subject: "dispatcher@e2e.invalid",
@@ -1455,7 +1538,7 @@ async function main() {
     assert.equal(localMember.identity_id, "e2e-dispatcher");
     assert.ok(localMember.initial_password.length >= 32);
     assert.match(localMember.totp_secret_base32, /^[A-Z2-7]+$/);
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/admin/local-members"), 401);
       expectStatus(await edgeRequest("/admin/local-members", { jar: consumerJarAfterReset }), 403);
       const listing = await edgeRequest("/admin/local-members", { jar: ownerJar });
@@ -1467,6 +1550,40 @@ async function main() {
       assert.ok(members.some(m => m.identity_id === "e2e-dispatcher" && m.roles.includes("dispatcher")));
       assert.ok(members.every(m => Object.keys(m).sort().join(",")
         === "identity_id,identity_status,membership_state,roles"));
+      const adminTarget = { identity_id: "e2e-dispatcher" };
+      // Protect the last active owner and deny unauthorized mutation before
+      // modifying any member or returning replacement credentials.
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { identity_id: "e2e-owner", roles: ["dispatcher"] }, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        { identity_id: "e2e-owner" }, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, consumerJarAfterReset), 403);
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { ...adminTarget, roles: ["dispatcher", "viewer"] }, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        adminTarget, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/suspend", "POST",
+        adminTarget, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, ownerJar), 412);
+      expectStatus(await jsonRequest("/admin/local-members/reinstate", "POST",
+        adminTarget, ownerJar), 204);
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { ...adminTarget, roles: ["dispatcher"] }, ownerJar), 204);
+      const resetMember = await jsonRequest("/admin/local-members/credentials/reset", "POST",
+        adminTarget, ownerJar);
+      expectStatus(resetMember, 200);
+      const replacement = jsonBody(resetMember);
+      assert.equal(replacement.identity_id, localMember.identity_id);
+      assert.notEqual(replacement.initial_password, localMember.initial_password);
+      assert.notEqual(replacement.totp_secret_base32, localMember.totp_secret_base32);
+      assert.equal(resetMember.headers["cache-control"], "no-store");
+      Object.assign(localMember, replacement);
+      const auditCount = command("psql", [databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
+        "SELECT count(*) FROM openproof.audit_events a JOIN openproof.security_event_outbox o USING(event_id) WHERE a.category='administration' AND a.identity_id='e2e-dispatcher' AND a.action IN ('local-member.create','local-member.roles.replace','local-member.suspend','local-member.reinstate','local-member.credentials.reset') AND a.event_hash<>decode(repeat('00',32),'hex')"]).trim();
+      assert.equal(auditCount, "6");
+      console.log("- native administration: role/lifecycle/reset, final owner, denied credentials and atomic audit/outbox passed");
     }
 
     const applicationResponse = await jsonRequest("/admin/applications", "POST", {
@@ -1544,6 +1661,27 @@ async function main() {
       headers: { authorization: `Bearer ${profileOnlyTokens.access_token}` },
     });
     expectStatus(accountWithoutScope, 403);
+    const connectionsWithoutScope = await edgeRequest("/account/connections", {
+      headers: { authorization: `Bearer ${profileOnlyTokens.access_token}` },
+    });
+    expectStatus(connectionsWithoutScope, 403);
+    if (nativeAccountRuntime) {
+      for (const route of ["/account/profile", "/account/connections", "/account/totp", "/account/password/upgrade"]) {
+        const allowed = await edgeRequest(route,{headers:{authorization:`Bearer ${nativeTokens.access_token}`}});
+        expectStatus(allowed,200);
+        const unscoped = await edgeRequest(route,{headers:{authorization:`Bearer ${profileOnlyTokens.access_token}`}});
+        expectStatus(unscoped,403);
+        const proofWithoutVerifier = await edgeRequest(route, {
+          headers: { authorization: `DPoP ${nativeTokens.access_token}` },
+        });
+        expectStatus(proofWithoutVerifier, 401);
+        const ambiguous = await edgeRequest(route, {
+          jar: ownerJar,
+          headers: { authorization: `Bearer ${nativeTokens.access_token}` },
+        });
+        expectStatus(ambiguous, 401);
+      }
+    }
 
     const firstTokens = await authorizeAndExchange(clientId, clientSecret, ownerJar, initialJwks);
     assert.equal(firstTokens.idHeader.kid, "e2e-old");
@@ -1572,6 +1710,33 @@ async function main() {
     });
     expectStatus(introspection, 200);
     assert.equal(jsonBody(introspection).active, true);
+    if (nativeAccountRuntime) {
+      const claims = jsonBody(introspection);
+      assert.equal(claims.client_id,clientId);
+      assert.equal(claims.sub,"e2e-owner");
+      assert.ok(Number.isInteger(claims.iat) && Number.isInteger(claims.exp) && claims.exp>claims.iat);
+      const inspect = async (form) => edgeRequest("/oauth/introspect",{
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:form.toString(),
+      });
+      const invalid = new URLSearchParams(introspectionForm);
+      invalid.set("token","unknown-fixture-token");
+      const inactive=await inspect(invalid);
+      expectStatus(inactive,200);
+      assert.deepEqual(jsonBody(inactive),{active:false});
+      invalid.set("client_secret","invalid-fixture-proof");
+      expectStatus(await inspect(invalid),401);
+      const publicCaller=new URLSearchParams(introspectionForm);
+      publicCaller.set("client_id",nativeClientId);
+      expectStatus(await inspect(publicCaller),401);
+      const malformed=new URLSearchParams(introspectionForm);
+      malformed.append("token","duplicate");
+      expectStatus(await inspect(malformed),400);
+      const anonymous=await edgeRequest("/oauth/userinfo");
+      expectStatus(anonymous,401);
+      assert.match(anonymous.headers["www-authenticate"],/invalid_token/);
+      const preflight=await edgeRequest("/oauth/userinfo",{method:"OPTIONS"});
+      expectStatus(preflight,204);
+    }
 
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
@@ -1631,6 +1796,29 @@ async function main() {
       }).toString(),
     });
     expectStatus(familyResponse, 400);
+    if (nativeAccountRuntime) {
+      const revoke = (form) => edgeRequest("/oauth/revoke", {
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams(form).toString(),
+      });
+      const userInfo = (token) => edgeRequest("/oauth/userinfo",{
+        headers:{authorization:`Bearer ${token}`},
+      });
+      expectStatus(await revoke({client_id:clientId,client_secret:clientSecret,
+        token:nativeTokens.refresh_token}),200); // another client's token: no-op
+      expectStatus(await userInfo(nativeTokens.access_token),200);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.access_token}),200);
+      expectStatus(await userInfo(nativeTokens.access_token),401);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.refresh_token}),200);
+      expectStatus(await revoke({client_id:nativeClientId,token:nativeTokens.refresh_token}),200);
+      const revokedRefresh=await edgeRequest("/oauth/token",{
+        method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams({grant_type:"refresh_token",client_id:nativeClientId,
+          refresh_token:nativeTokens.refresh_token}).toString(),
+      });
+      expectStatus(revokedRefresh,400);
+      expectStatus(await userInfo(profileOnlyTokens.access_token),200);
+    }
 
     await stopOpp();
     await startOpp();
@@ -1680,9 +1868,11 @@ async function main() {
       initialDispatcherTotp,
     );
     assert.equal(dispatcherGrant.assurance, "ial2");
-    if (process.env.OPENPROOF_EXPERIMENTAL_NATIVE_ADMIN_MEMBERS === "1") {
+    if (nativeAccountRuntime) {
       expectStatus(await edgeRequest("/admin/local-members", { jar: dispatcherJar }), 403);
-      console.log("- native owner-only administration listing: IAL2 non-owner denied");
+      expectStatus(await jsonRequest("/admin/local-members/roles", "PUT",
+        { identity_id: "e2e-dispatcher", roles: ["owner"] }, dispatcherJar), 403);
+      console.log("- native owner-only administration listing and mutation: IAL2 non-owner denied");
     }
 
     await stopOpp();
@@ -1751,6 +1941,45 @@ async function main() {
     const rotatedTokens = await authorizeAndExchange(
       clientId, clientSecret, ownerJarAfterMasterRotation, rotatedJwks);
     assert.equal(rotatedTokens.idHeader.kid, "e2e-new");
+
+    if (nativeAccountRuntime && !holdOpen) {
+      expectStatus(await jsonRequest("/admin/local-members/remove", "POST",
+        { identity_id: "e2e-dispatcher" }, ownerJarAfterMasterRotation), 204);
+      expectStatus(await edgeRequest("/account/profile", { jar: dispatcherJarAfterMasterRotation }), 401);
+      expectStatus(await jsonRequest("/admin/local-members/reinstate", "POST",
+        { identity_id: "e2e-dispatcher" }, ownerJarAfterMasterRotation), 412);
+      const removed = await edgeRequest("/admin/local-members", { jar: ownerJarAfterMasterRotation });
+      expectStatus(removed, 200);
+      assert.ok(jsonBody(removed).members.some(m => m.identity_id === "e2e-dispatcher"
+        && m.membership_state === "removed" && m.roles.length === 0));
+    }
+
+    // Native consent mutation is tested only after the final token exchange,
+    // never against the historical benchmark binary or interactive demo.
+    if (process.env.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1" && !holdOpen) {
+      expectStatus(await edgeRequest("/oauth/consents"), 401);
+      expectStatus(await edgeRequest("/oauth/consents", {
+        headers: { authorization: `Bearer ${rotatedTokens.access_token}` },
+      }), 401);
+      const listed = await edgeRequest("/oauth/consents", { jar: ownerJarAfterMasterRotation });
+      expectStatus(listed, 200);
+      assert.equal(listed.headers["cache-control"], "no-store");
+      const document = jsonBody(listed);
+      const grant = document.consents.find(item => item.client_id === clientId && item.active);
+      assert.ok(grant, "active grant must be present before revocation");
+      assert.ok(document.csrf);
+      const revoke = (csrf) => edgeRequest("/oauth/consents/revoke", {
+        method: "POST",
+        jar: ownerJarAfterMasterRotation,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ consent_id: grant.id, csrf }).toString(),
+      });
+      expectStatus(await revoke("invalid"), 401);
+      expectStatus(await revoke(document.csrf), 204);
+      const afterRevoke = await edgeRequest("/oauth/consents", { jar: ownerJarAfterMasterRotation });
+      expectStatus(afterRevoke, 200);
+      assert.equal(jsonBody(afterRevoke).consents.find(item => item.id === grant.id)?.active, false);
+    }
 
     const logout = await jsonRequest("/auth/logout", "POST", undefined, consumerJarAfterReset);
     expectStatus(logout, 204);

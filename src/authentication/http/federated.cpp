@@ -308,7 +308,9 @@ gateway::HttpResponse FederatedAuthenticationHttpApi::handle(gateway::HttpReques
     if (m_nativeRedirectsRequired &&
         (request.path()=="/auth/federated/start"
          || request.path()=="/auth/federated/callback"
-         || (request.path()=="/account/connections/handoff" && request.method()==gateway::HttpMethod::Get))) {
+         || request.path()=="/account/connections/start"
+         || request.path()=="/account/connections/handoff"
+         || request.path()=="/account/connections/complete")) {
         request.wipeTargetQuery(); request.wipeBody();
         request.wipeAuthorizationHeader(); request.wipeCookieHeader();
         return error(foundation::Error{foundation::ErrorCode::Unavailable},request,true);

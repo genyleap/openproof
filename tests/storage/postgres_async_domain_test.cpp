@@ -16,7 +16,6 @@ import openproof.foundation;
 import openproof.identity.core;
 import openproof.session;
 import openproof.security;
-import openproof.storage.postgres;
 
 namespace {
 namespace pg = openproof::storage::postgres;

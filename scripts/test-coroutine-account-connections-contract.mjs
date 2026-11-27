@@ -14,13 +14,13 @@ const native = cppExecutableText(http);
 const sql = read("src/storage/postgres/coroutine_canonical_finalizer.cpp");
 const sqlNative = cppExecutableText(sql);
 
-test("connection reads are independently enabled and method-scoped", () => {
+test("connection reads are mandatory for enabled account API and strict-path scoped", () => {
   const header = read("src/account/http/coroutine_session_http.hpp");
   assert.match(header, /ReadConnections readConnections = \{\}/);
   assert.match(main, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS/);
   assert.match(main, /nativeAccountConnectionsFlag && \*nativeAccountConnectionsFlag == "1"/);
   assert.match(main, /nativeAccountConnectionsEnabled[\s\S]*?!nativeAccountEnabled/);
-  assert.match(main, /nativeMethods.emplace_back\("\/account\/connections", gateway::HttpMethod::Get\)/);
+  assert.match(main, /nativePaths.emplace_back\("\/account\/connections"\)/);
   assert.match(http, /request.method\(\) == gateway::HttpMethod::Get\s*&& request.path\(\) == "\/account\/connections"/);
   assert.match(http, /if \(connectionsReadRoute\(request\)\)[\s\S]*?\!request.header\("authorization"\).has_value\(\)/);
 });
@@ -45,7 +45,7 @@ test("HTTP validates session and repository owner before disclosure", () => {
   const start = native.indexOf("CoroutineAccountSessionAdapter::connectionsRead(");
   assert.ok(start > 0);
   const body = native.slice(start);
-  const auth = body.indexOf("co_await m_authenticate(std::move(credential->value()))");
+  const auth = body.indexOf("co_await authenticate(std::move(credential->value()))");
   const readIndex = body.indexOf("co_await m_readConnections(authenticated->identity())");
   const validate = body.indexOf("connections->first != authenticated->identity()");
   const serialize = body.indexOf("json::array connectionsJson;");
@@ -56,6 +56,34 @@ test("HTTP validates session and repository owner before disclosure", () => {
   const cxx = read("tests/account/session_coroutine_http_test.cpp");
   assert.match(cxx, /ConnectionsReadIsCookieOnlyAndPreservesLegacyBearer/);
   assert.match(cxx, /ConnectionsReadRejectsForeignAndMissingWithoutDisclosure/);
+});
+
+test("native disconnect checks scoped owner and locks a surviving registered method before deletion", () => {
+  const body=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::disconnectAsync("));
+  const ordered=["co_await m_impl->pool.acquire(deadline)",'connection.query("BEGIN"',
+    "pg_advisory_xact_lock(hashtextextended($1::text, 684271993))","co_await activeTarget(",
+    "WHERE provider=$1 AND external_subject=$2 FOR UPDATE",
+    "required(linked.rows.front().front())!=owner.value()",
+    "AND NOT (provider=$2 AND external_subject=$3) AND provider IN (",
+    "LIMIT 1 FOR UPDATE","survivor.rows.empty()","DELETE FROM openproof.external_identities",
+    "UPDATE openproof.identity_profiles SET avatar_source='auto'","connection.query(\"COMMIT\""];
+  let previous=-1;
+  for(const term of ordered) {
+    const index=body.indexOf(term,previous+1);
+    assert.ok(index>previous,term);
+    previous=index;
+  }
+  assert.match(body,/std::find\(authenticationProviders.begin\(\),authenticationProviders.end\(\)/);
+  assert.doesNotMatch(body,/\bPQ(?:exec|execParams|connectdb|reset)\s*\(/);
+  assert.match(main,/nativePaths.emplace_back\("\/account\/connections\/disconnect"\)/);
+  assert.match(main,/reader->disconnectAsync\(std::move\(owner\),std::move\(external\),\s*registered,clock.now\(\)\)/);
+  const handler=http.slice(http.indexOf("CoroutineAccountSessionAdapter::disconnect("),
+    http.indexOf("CoroutineAccountSessionAdapter::totpStatusRead("));
+  assert.match(handler,/co_await authenticate\(std::move\(credential->value\(\)\)\)/);
+  assert.match(handler,/co_await m_disconnect\(actor->identity\(\),std::move\(external\)\)/);
+  assert.match(handler,/parsed.as_object\(\).size\(\)!=2U/);
+  assert.match(read("tests/account/session_coroutine_http_test.cpp"),/NativeDisconnectUsesOwnedScopedCredentialAndNeverFallsBack/);
+  assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/RealDatabaseDisconnectPreservesLastRegisteredMethodUnderRace/);
 });
 
 test("native connection list preserves Farcaster projection and no-store", () => {
@@ -95,7 +123,8 @@ test("canonical PostgreSQL and repeated HTTP E2E use isolated guarded databases"
 
 test("native HTTP E2E exercises concurrent reads with no extra identity creation", () => {
   const e2e = read("scripts/e2e-identity-platform.mjs");
-  assert.match(e2e, /OPENPROOF_EXPERIMENTAL_NATIVE_ACCOUNT_CONNECTIONS === "1"/);
+  assert.match(e2e, /const nativeAccountRuntime = process\.env\.OPENPROOF_E2E_EXPECT_LEGACY_AUTH !== "1"/);
+  assert.match(e2e, /if \(nativeAccountRuntime\) \{[\s\S]*?const reads = await Promise\.all/);
   assert.match(e2e, /Promise\.all\(Array\.from\(\{ length: 8 \}/);
   assert.match(e2e, /edgeRequest\("\/account\/connections", \{ jar: consumerJar \}\)/);
   assert.match(e2e, /jsonBody\(response\)\.connections\.map/);
