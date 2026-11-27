@@ -182,6 +182,15 @@ public:
         const auto deadline = detail::saturatingSteadyDeadline(timeout);
         auto executor = co_await asio::this_coro::executor;
         try {
+            // Reuse an explicitly serialized request executor only while
+            // executing on that very strand. Other callers retain the
+            // independent strand and co_spawn cancellation boundary.
+            using RequestStrand = asio::strand<asio::any_io_executor>;
+            if (executor.target_type() == typeid(RequestStrand)) {
+                const auto* strand = executor.target<RequestStrand>();
+                if (strand && strand->running_in_this_thread())
+                    co_return co_await sendOnStrand(std::move(endpoint), std::move(request), deadline);
+            }
             auto result = co_await asio::co_spawn(
                 asio::make_strand(executor),
                 sendSerialized(std::move(endpoint), std::move(request), deadline),

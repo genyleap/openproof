@@ -342,7 +342,12 @@ public:
                     wire = co_await dispatchHandler(
                         std::move(*operation), version, headRequest, true);
                 } else {
-                    wire = co_await asio::co_spawn(m_owner->m_handlerPool,
+                    // One serialized executor per worker-dispatched request.
+                    // Native SQL and proxy operations can reuse this strand
+                    // rather than repeatedly spawning nested serialized tasks.
+                    auto requestStrand = asio::make_strand(
+                        asio::any_io_executor{m_owner->m_handlerPool.get_executor()});
+                    wire = co_await asio::co_spawn(requestStrand,
                         dispatchHandler(std::move(*operation), version, headRequest),
                         asio::use_awaitable);
                 }
