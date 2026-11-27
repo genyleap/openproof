@@ -223,7 +223,14 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   const gateway = read("src/gateway/http.cpp");
   assert.match(gateway,
     /m_acceptor\.async_accept\(\s*asio::make_strand\(m_context\)/);
-  assert.match(gateway, /asio::post\(m_stream\.get_executor\(\),/);
+  // The read coroutine is started on the socket strand and awaits the
+  // bounded handler pool. Its associated executor resumes the write.
+  assert.match(gateway, /asio::co_spawn\(m_stream\.get_executor\(\),\s*readRequest\(\)/);
+  const read = gateway.slice(gateway.indexOf("asio::awaitable<void> readRequest()"),
+    gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
+  assert.match(read, /co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.ok(read.indexOf("m_response.emplace(std::move(wire))") > read.indexOf("co_await asio::co_spawn("));
+  assert.ok(read.indexOf("co_await writeResponse(headRequest);") > read.indexOf("m_response.emplace(std::move(wire))"));
   assert.doesNotMatch(gateway, /asio::post\(m_owner->m_context,/);
   const integration = read("tests/gateway/http_integration_test.cpp");
   const start = integration.indexOf(
