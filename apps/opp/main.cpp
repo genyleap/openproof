@@ -2767,14 +2767,14 @@ addProtectedRoutes(gateway::Router& router,
             co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
         // Compute the delegated digest before suspension. The session verifier
         // consumes the raw credential synchronously before its own SQL await.
-        auto fingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
-        if (!fingerprint) co_return fnd::fail(fingerprint.error());
+        auto delegatedFingerprint=security::hmacSha256(*nativeWeb3DelegatedKey,credential.expose());
+        if (!delegatedFingerprint) co_return fnd::fail(delegatedFingerprint.error());
         auto authenticated=co_await nativeSessions->authenticate(std::move(credential));
         if (authenticated || authenticated.error().code()!=fnd::ErrorCode::AuthenticationFailed)
             co_return std::move(authenticated);
         // The native SQL adapter receives only the keyed digest.
         co_return co_await nativeCanonical->authorizeDelegatedAccountAsync(
-            fnd::toHex(fingerprint.value()),clock.now());
+            fnd::toHex(delegatedFingerprint.value()),clock.now());
     };
 
     accountDelivery::CoroutineContactVerificationIssuer* nativeContactIssuer=nullptr;
