@@ -22,6 +22,24 @@ try {
   assert.equal(report.pairCount,5);
   assert.equal(report.metrics.requestsPerSecond.pairedChangePct,25);
   assert.equal(report.metrics.p99Ms.pairedChangePct,-12.5);
+  assert.deepEqual(report.diagnosticMetrics, {});
+  assert.match(r.stdout, /\| readiness \| 0\.00% \| 0\.00% \| 0\.00% \|/);
+  const diagnostic = {serverUserCpuTicksDelta:7,serverSystemCpuTicksDelta:3,
+    serverVoluntaryContextSwitchesDelta:20,serverInvoluntaryContextSwitchesDelta:0,
+    serverStableThreadCount:4};
+  const measuredBaseline = {...source,...diagnostic};
+  const measuredCandidate = {...candidate,...diagnostic,serverVoluntaryContextSwitchesDelta:10};
+  for(let i=1;i<=5;i++){write("baseline",i,measuredBaseline);write("candidate",i,measuredCandidate);}
+  r=run();assert.equal(r.status,0,r.stderr);
+  report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+  assert.equal(report.diagnosticMetrics.serverVoluntaryContextSwitchesDelta.pairedChangePct,-50);
+  assert.equal(report.diagnosticMetrics.serverInvoluntaryContextSwitchesDelta.pairedChangePct,null);
+  assert.equal(report.diagnosticMetrics.serverUserCpuTicksDelta.pairedChangePct,0);
+  write("candidate",3,{...measuredCandidate,serverSystemCpuTicksDelta:4,serverStableThreadCount:0});
+  r=run();assert.equal(r.status,0,r.stderr);
+  report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+  assert.deepEqual(report.diagnosticMetrics,{},"Inconsistent diagnostic groups must be omitted");
+  for(let i=1;i<=5;i++){write("baseline",i,source);write("candidate",i,candidate);}
   for(const invalid of [
     {...candidate,commit:a},
     {...candidate,requests:599},
