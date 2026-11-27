@@ -288,7 +288,9 @@ TEST(PostgresNativeCoroutineTest, ParameterPointerTablePreservesInlineAndOverflo
             const auto expected = params;
             auto reply = co_await connection->query(std::move(sql), std::move(params), 2s);
             EXPECT_EQ(reply.rows.size(), 1U);
-            if (reply.rows.size() == 1U) EXPECT_EQ(reply.rows.front(), expected);
+            if (reply.rows.size() == 1U) {
+                EXPECT_EQ(reply.rows.front(), expected);
+            }
             EXPECT_TRUE(connection->reusable());
         }
     };
