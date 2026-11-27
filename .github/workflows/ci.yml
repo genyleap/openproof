@@ -66,6 +66,14 @@ jobs:
           node scripts/test-native-admin-members-contract.mjs
           node scripts/test-coroutine-admin-authorization.mjs
           node scripts/test-native-recovery-runtime-contract.mjs
+      - name: Native PostgreSQL readiness descriptor ownership contract
+        run: node scripts/test-native-pg-fd-ownership.mjs
+      - name: Benchmark measurement and reporting contracts
+        run: |
+          python3 -m py_compile scripts/ci/probe-asio-inline.py
+          node tests/scripts/process-usage-test.mjs
+          node tests/scripts/gateway-bench-summary-test.mjs
+          node tests/scripts/mixed-read-summary-test.mjs
       - name: Native gateway transport retirement contract
         run: |
           node scripts/test-gateway-translation-unit-split.mjs
@@ -135,7 +143,7 @@ jobs:
 
   build:
     name: Build and test
-    needs: ldap-fixture
+    needs: [static, ldap-fixture]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -176,15 +184,6 @@ jobs:
           path: asio-inline-probe.json
           if-no-files-found: ignore
           retention-days: 14
-
-      - name: Repeated Gateway benchmark analysis regression
-        run: node tests/scripts/gateway-bench-summary-test.mjs
-
-      - name: Repeated mixed-read benchmark analysis regression
-        run: node tests/scripts/mixed-read-summary-test.mjs
-
-      - name: Linux process usage diagnostics regression
-        run: node tests/scripts/process-usage-test.mjs
 
       - name: Read-only deployment readiness probe regression
         run: node tests/scripts/live-readiness-test.mjs
