@@ -71,6 +71,38 @@ for (const [label, key] of [
       "% favorable |");
   }
 }
+if (baseline.byOperation || candidate.byOperation) {
+  assert.ok(baseline.byOperation && candidate.byOperation,
+    "Both artifacts must have route metrics for a matched breakdown");
+  const labels = ["readiness", "discovery", "jwks", "userinfo", "gateway", "introspection"];
+  for (const artifact of [baseline, candidate]) {
+    assert.deepEqual(Object.keys(artifact.byOperation).sort(), [...labels].sort());
+    let total = 0;
+    for (const [i, label] of labels.entries()) {
+      const route = artifact.byOperation[label];
+      const expected = Math.floor(artifact.requests / labels.length)
+        + (i < artifact.requests % labels.length ? 1 : 0);
+      assert.equal(route.requests, expected, "Unexpected request distribution: " + label);
+      for (const key of ["p50Ms", "p95Ms", "p99Ms"]) {
+        assert.ok(Number.isFinite(route[key]) && route[key] > 0, "Invalid " + label + " " + key);
+      }
+      assert.ok(route.p50Ms <= route.p95Ms && route.p95Ms <= route.p99Ms);
+      total += route.requests;
+    }
+    assert.equal(total, artifact.requests);
+  }
+  console.log("");
+  console.log("Mixed-workload per-operation latencies (ms; not isolated capacity):");
+  console.log("| Operation | Samples per run | Baseline p50 / p95 / p99 | Candidate p50 / p95 / p99 | p95 favorable change |");
+  console.log("|---|---:|---:|---:|---:|");
+  for (const label of labels) {
+    const b = baseline.byOperation[label], c = candidate.byOperation[label];
+    const fmt = r => [r.p50Ms, r.p95Ms, r.p99Ms].map(v => v.toFixed(2)).join(" / ");
+    const favorable = (b.p95Ms / c.p95Ms - 1) * 100;
+    console.log("| " + label + " | " + b.requests + " | " + fmt(b) +
+      " | " + fmt(c) + " | " + (favorable >= 0 ? "+" : "") + favorable.toFixed(1) + "% |");
+  }
+}
 console.log("");
 console.log("NOT APPROVED: this tool compares point estimates, not statistically " +
   "significant results. The same hardware, build flags, warmed-up state, " +
