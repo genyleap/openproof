@@ -74,6 +74,7 @@ jobs:
           python3 -B scripts/ci/test-qualify-gateway-inline.py
           node tests/scripts/process-usage-test.mjs
           node --test tests/scripts/edge-phase-metrics-test.mjs
+          node --test tests/scripts/mixed-read-correctness-test.mjs
           node tests/scripts/gateway-bench-summary-test.mjs
           node tests/scripts/mixed-read-summary-test.mjs
       - name: Native gateway transport retirement contract

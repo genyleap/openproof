@@ -17,6 +17,7 @@ import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-dia
 import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
 import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
+import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -187,7 +188,7 @@ function verifyIdToken(compact, jwks, expected) {
   return { header, claims };
 }
 
-async function concurrentSmoke(operations, requestCount = 600, concurrency = 24) {
+async function concurrentSmoke(operations, requestCount = 600, concurrency = 24, validate) {
   assert.ok(operations.length > 0);
   const latencies = [];
   const byRoute = operations.map(({ name }) => ({ name, latencies: [] }));
@@ -202,6 +203,9 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
       const response = await operations[operationIndex].run();
       expectStatus(response, 200);
       const latency = performance.now() - requestStarted;
+      // Validate each completed response after capturing request latency.
+      // Throughput still includes client validation cost on both sides.
+      validate?.(operations[operationIndex].name, response);
       latencies.push(latency);
       byRoute[operationIndex].latencies.push(latency);
     }
@@ -216,6 +220,7 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
   return {
     requests: requestCount,
     concurrency,
+    ...(validate ? { normalizedResponseChecks: requestCount } : {}),
     requestsPerSecond: requestCount / (elapsedMs / 1000),
     p50Ms: percentile(latencies, 0.50),
     p95Ms: percentile(latencies, 0.95),
@@ -1747,6 +1752,11 @@ async function main() {
     // request mix are unchanged. Both sides use the same fixture.
     if (metricsFile && mixedLoadRequests <= 10000)
       edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
+    const validateMixedRead = createMixedReadValidator({
+      readiness: jsonBody(ready), discovery, jwks: initialJwks,
+      userinfo: jsonBody(userInfo), protectedProxy: jsonBody(protectedResponse),
+      introspection: jsonBody(introspection),
+    });
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
       { name: "readiness", run: () => edgeRequest("/health/ready") },
@@ -1763,7 +1773,7 @@ async function main() {
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: introspectionForm.toString(),
       }) },
-    ], mixedLoadRequests, mixedLoadConcurrency);
+    ], mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     edgePhaseMetrics = edgePhaseCollector?.report();
     edgePhaseCollector = undefined;
