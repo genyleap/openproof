@@ -427,6 +427,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # The ordinary C24 benchmark remains unchanged; qualify the complete
+      # documented load grid on this separate diagnostic PR.
+      - name: Matched mixed-read load matrix with warmup
+        if: github.head_ref == 'perf/mixed-read-full-load-matrix-20261127'
+        timeout-minutes: 70
+        run: |
+          for concurrency in 1 8 32 128; do
+            bash scripts/ci/run-repeated-mixed-read.sh "$concurrency"
+          done
+      - name: Preserve load matrix measurements
+        if: always() && github.head_ref == 'perf/mixed-read-full-load-matrix-20261127'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openproof-mixed-read-full-matrix
+          path: mixed-read-matrix/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Build release packages
         run: |
           mkdir -p dist

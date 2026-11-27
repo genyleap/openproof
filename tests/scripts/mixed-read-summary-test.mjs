@@ -81,5 +81,29 @@ try {
   write("candidate",3,candidate);
   fs.unlinkSync(path.join(dir,"candidate-5.json"));
   assert.notEqual(run().status,0,"Missing pair must be rejected");
+  // Four balanced trials, explicit warmup, and even-sample median.
+  for(const load of [1,8,32,128]){
+    const warmupRequests=6*Math.ceil(Math.max(24,2*load)/6);
+    const row={...source,requests:1536,concurrency:load,warmupRequests,
+      routes:source.routes.map(r=>({...r,requests:256}))};
+    fs.rmSync(path.join(dir,"baseline-5.json"),{force:true});
+    for(let i=1;i<=4;i++){
+      write("baseline",i,row);
+      write("candidate",i,{...row,commit:b,requestsPerSecond:100+10*i});
+    }
+    const matrixRun=()=>spawnSync(process.execPath,[script,dir,a,b,String(load)],
+      {encoding:"utf8",timeout:10000});
+    r=matrixRun();assert.equal(r.status,0,r.stderr);
+    report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+    assert.equal(report.pairCount,4);assert.equal(report.concurrency,load);
+    assert.equal(report.warmupRequests,warmupRequests);
+    assert.equal(report.metrics.requestsPerSecond.candidateMedian,125);
+    assert.ok(Math.abs(report.metrics.requestsPerSecond.pairedChangePct-25)<1e-9);
+    write("candidate",4,{...row,commit:b,warmupRequests:0});
+    assert.notEqual(matrixRun().status,0,"Wrong warmup must fail");
+    write("candidate",4,{...row,commit:b});
+    fs.unlinkSync(path.join(dir,"candidate-4.json"));
+    assert.notEqual(matrixRun().status,0,"Missing trial must fail");
+  }
   console.log("Mixed-read paired-report regression: PASSED");
 } finally {fs.rmSync(dir,{recursive:true,force:true});}

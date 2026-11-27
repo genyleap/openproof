@@ -5,7 +5,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
-const [dir, baselineCommit, candidateCommit] = process.argv.slice(2);
+const [dir, baselineCommit, candidateCommit, load] = process.argv.slice(2);
+assert.ok(process.argv.length === 5 || process.argv.length === 6);
+const matrix = load !== undefined;
+if (matrix) assert.ok(["1","8","32","128"].includes(load), "Unsupported matrix load");
+const concurrency = matrix ? Number(load) : 24;
+const requests = matrix ? 1536 : 600;
+const pairCount = matrix ? 4 : 5;
+const warmupRequests = matrix ? 6 * Math.ceil(Math.max(24,2*concurrency)/6) : 0;
 assert.ok(dir, "Usage: summarize-mixed-read.mjs <directory> <baseline-sha> <candidate-sha>");
 for (const sha of [baselineCommit,candidateCommit]) assert.match(sha,/^[a-f0-9]{40}$/);
 assert.notEqual(baselineCommit,candidateCommit);
@@ -14,13 +21,14 @@ const fields = ["requestsPerSecond","p50Ms","p95Ms","p99Ms","serverCpuTicksDelta
 const files = fs.readdirSync(dir);
 for (const side of ["baseline","candidate"]) {
   assert.equal(files.filter(f => new RegExp("^"+side+"-[1-9][0-9]*\\.json$").test(f)).length,
-    5, "Exactly five matched trials required on each side");
+    pairCount, "Exact matched trial count required on each side");
 }
 function validate(record, commit) {
   assert.equal(record.benchmark,"openproof-isolated-e2e-mixed-read");
   assert.equal(record.commit,commit,"Commit mismatch");
-  assert.equal(record.requests,600);
-  assert.equal(record.concurrency,24);
+  assert.equal(record.requests,requests);
+  assert.equal(record.concurrency,concurrency);
+  assert.equal(record.warmupRequests ?? 0,warmupRequests,"Warmup mismatch");
   for (const key of fields) {
     assert.ok(Number.isFinite(record[key]) && (key==="serverCpuTicksDelta" ? record[key]>=0 : record[key]>0),
       "Invalid measurement: "+key);
@@ -35,18 +43,19 @@ function validate(record, commit) {
   for (const name of routes) {
     const matching=record.routes.filter(r=>r.name===name);
     assert.equal(matching.length,1,"Missing or repeated route: "+name);
-    assert.equal(matching[0].requests,100);
+    assert.equal(matching[0].requests,requests/routes.length);
     latency(matching[0]);
   }
   return record;
 }
-const pairs=Array.from({length:5},(_,i)=>{
+const pairs=Array.from({length:pairCount},(_,i)=>{
   const read=(side,sha)=>validate(JSON.parse(fs.readFileSync(path.join(dir,side+"-"+(i+1)+".json"),"utf8")),sha);
   return {baseline:read("baseline",baselineCommit),candidate:read("candidate",candidateCommit)};
 });
 function median(values) {
   const sorted=[...values].sort((a,b)=>a-b);
-  return sorted[Math.floor(sorted.length/2)];
+  const mid=Math.floor(sorted.length/2);
+  return sorted.length%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
 }
 function summarize(key, selector=r=>r) {
   const a=pairs.map(p=>selector(p.baseline)[key]);
@@ -95,7 +104,8 @@ const edgePhaseComparison = records.every(validEdge)
       latencyKeys.map(k => [k,summarize(k,r=>r.edgePhaseMetrics.phases[name])]))]))
   : null;
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
-  pairCount:5,requestsPerRun:600,concurrency:24,
+  pairCount,requestsPerRun:requests,concurrency,
+  ...(matrix ? {warmupRequests} : {}),
   metrics:Object.fromEntries(fields.map(k=>[k,summarize(k)])),
   diagnosticMetrics,
   ...(edgePhaseComparison ? {edgePhaseComparison} : {}),
@@ -103,7 +113,7 @@ const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candi
     ["p50Ms","p95Ms","p99Ms"].map(k=>[k,summarize(k,r=>r.routes.find(x=>x.name===name))]))])),
   caveat:"Exploratory paired medians; not full coroutine acceptance or production qualification."};
 fs.writeFileSync(path.join(dir,"summary.json"),JSON.stringify(report,null,2)+"\n",{mode:0o600});
-console.log("# Matched mixed-read: five alternating pairs, 600 requests / concurrency 24");
+console.log(`# Matched mixed-read: ${pairCount} alternating pairs, ${requests} requests / concurrency ${concurrency}; warmup ${warmupRequests}`);
 console.log("| Metric | Baseline median | Candidate median | Median paired change | Range |");
 console.log("|---|---:|---:|---:|---:|");
 for (const [k,v] of Object.entries({...report.metrics,...report.diagnosticMetrics})) {
