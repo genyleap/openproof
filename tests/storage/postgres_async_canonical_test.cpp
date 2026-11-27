@@ -2182,7 +2182,9 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
             std::move(token),observedClock,&issued),asio::use_future);
         io.run();
         auto result=done.get();
-        if (result && result->has_value()) EXPECT_EQ(issued,kNow);
+        if (result && result->has_value()) {
+            EXPECT_EQ(issued,kNow);
+        }
         return result;
     };
     auto activeIntrospection=introspect(native,clientProof,digest);
