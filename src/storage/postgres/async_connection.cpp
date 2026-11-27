@@ -470,9 +470,16 @@ asio::awaitable<QueryRows> AsyncConnection::query(
 {
     const Deadline deadline = makeDeadline(timeout);
     auto executor = co_await asio::this_coro::executor;
-    // A pooled PGconn can move between request executors. Its next query
-    // must use the current operation's serialized executor, not the one
-    // on which the physical connection happened to be opened.
+    // A pooled PGconn can move between request executors. Reuse only
+    // the exact current strand type while executing inside it, never
+    // assume an arbitrary erased executor or a thread pool is serialized.
+    // cancel_after's timer and readiness callback still share this strand.
+    using RequestStrand = asio::strand<asio::any_io_executor>;
+    if (executor.target_type() == typeid(RequestStrand)) {
+        const auto* strand = executor.target<RequestStrand>();
+        if (strand && strand->running_in_this_thread())
+            co_return co_await querySerialized(std::move(sql), std::move(params), deadline);
+    }
     co_return co_await asio::co_spawn(asio::make_strand(executor),
         querySerialized(std::move(sql), std::move(params), deadline),
         asio::use_awaitable);

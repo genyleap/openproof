@@ -93,7 +93,15 @@ test("normal HTTP completion awaits the bounded pool and writes on the connectio
   assert.ok(read.length>0 && dispatch.length>0);
   assert.match(read,/m_pendingHandlers\.fetch_add\(/);
   assert.match(read,/struct PendingHandlerGuard final[\s\S]*?pending\.fetch_sub\(1U, std::memory_order_acq_rel\)/);
-  assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.match(read,/auto requestStrand = asio::make_strand\(\s*asio::any_io_executor\{m_owner->m_handlerPool.get_executor\(\)\}\)/);
+  assert.match(read,/co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  for (const file of ["src/storage/postgres/async_connection.cpp","src/gateway/http_proxy.cpp"]) {
+    const source=fs.readFileSync(path.join(root,file),"utf8");
+    assert.match(source,/executor\.target_type\(\) == typeid\(RequestStrand\)/);
+    assert.match(source,/executor\.target<RequestStrand>\(\)/);
+    assert.match(source,/strand && strand->running_in_this_thread\(\)/);
+    assert.match(source,/asio::make_strand\(executor\)/);
+  }
   const completion=read.indexOf("m_response.emplace(std::move(wire))");
   assert.ok(completion>read.indexOf("co_await asio::co_spawn("));
   assert.ok(read.indexOf("co_await writeResponse(headRequest);")>completion);

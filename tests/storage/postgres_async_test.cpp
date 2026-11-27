@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <typeinfo>
 #include <utility>
 
 namespace {
@@ -260,6 +262,51 @@ TEST(PostgresNativeCoroutineTest, SqlNullIsDistinctFromEmptyText)
     EXPECT_FALSE(rows->rows.front()[0].has_value());
     ASSERT_TRUE(rows->rows.front()[1].has_value());
     EXPECT_EQ(rows->rows.front()[1].value(), "");
+}
+
+TEST(PostgresNativeCoroutineTest, RequestStrandPreservesQueryDeadlineAndConnectionIsolation)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context context;
+    auto serialized = asio::make_strand(asio::any_io_executor{context.get_executor()});
+    const auto exercise = [](std::string dsn) -> asio::awaitable<void> {
+        auto executor = co_await asio::this_coro::executor;
+        using RequestStrand = asio::strand<asio::any_io_executor>;
+        const bool typed = executor.target_type() == typeid(RequestStrand);
+        EXPECT_TRUE(typed);
+        const auto* strand = typed ? executor.target<RequestStrand>() : nullptr;
+        EXPECT_TRUE(strand && strand->running_in_this_thread());
+        auto connection = co_await pg::AsyncConnection::connect(dsn, 2s);
+        auto first = co_await connection->query("SELECT $1::text", {"strand-test"}, 2s);
+        EXPECT_EQ(first.rows.size(), 1U);
+        if (first.rows.size()==1U && first.rows.front().size()==1U) {
+            EXPECT_EQ(first.rows.front().front(), "strand-test");
+        }
+        bool timeout = false;
+        try {
+            static_cast<void>(co_await connection->query("SELECT pg_sleep(0.3)", {}, 15ms));
+        } catch (const std::runtime_error&) {
+            timeout = true;
+        }
+        EXPECT_TRUE(timeout);
+        EXPECT_FALSE(connection->reusable());
+        auto replacement = co_await pg::AsyncConnection::connect(std::move(dsn), 2s);
+        auto result = co_await replacement->query("SELECT 1", {}, 2s);
+        EXPECT_EQ(result.rows.size(), 1U);
+        EXPECT_TRUE(replacement->reusable());
+    };
+    auto done = asio::co_spawn(serialized, exercise(connectionString), asio::use_future);
+    // Exercise the strand with a genuinely multithreaded execution context.
+    std::thread other([&context] { context.run(); });
+    context.run();
+    other.join();
+    ASSERT_NO_THROW(done.get());
 }
 
 TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
