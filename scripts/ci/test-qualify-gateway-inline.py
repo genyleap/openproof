@@ -3,6 +3,9 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
+import time
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -12,6 +15,19 @@ spec.loader.exec_module(probe)
 
 
 class QualificationTest(unittest.TestCase):
+    def test_compiler_timeout_drains_descendant_pipes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The child inherits both capture pipes. Terminating only its
+            # parent would leave communicate blocked until the child exits.
+            command = [sys.executable, "-c",
+                       "import subprocess, sys, time; "
+                       "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)']); "
+                       "time.sleep(15)"]
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                probe.run_compiler(command, Path(tmp), 1)
+            self.assertLess(time.monotonic() - started, 8)
+
     def test_preserve_hardening_and_redirect_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             build = Path(tmp).resolve()

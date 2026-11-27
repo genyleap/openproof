@@ -8,8 +8,10 @@ performance qualification. Keep the existing build workaround unchanged.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 import time
@@ -58,6 +60,25 @@ def candidate_command(entry, build, unit, output, flags):
     return args
 
 
+def run_compiler(command, build, timeout):
+    # GCC drives cc1plus and assembler subprocesses. Killing only the driver
+    # can leave a compiler holding the capture pipes or consuming the runner
+    # budget. The diagnostic owns a separate process group per invocation.
+    with subprocess.Popen(command, cwd=build, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, errors="replace",
+                          start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True)
@@ -84,8 +105,7 @@ def main():
                 command = candidate_command(entry, build, unit, output, flags)
                 started = time.monotonic()
                 try:
-                    result = subprocess.run(command, cwd=build, capture_output=True,
-                                            text=True, errors="replace", timeout=args.timeout)
+                    result = run_compiler(command, build, args.timeout)
                     row = {"exitCode": result.returncode,
                            "objectBytes": output.stat().st_size if output.exists() else None,
                            "stderr": result.stderr[-16000:]}
