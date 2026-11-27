@@ -118,6 +118,85 @@ struct Fixture {
     }
 };
 
+TEST(NativeOAuthTokenReadTest, SharedLeaseIntrospectionNeverFallsBackAndPreservesErrors)
+{
+    namespace sec=openproof::security;
+    fnd::ManualClockSource clock{kNow};
+    Fallback fallback;
+    auto limiter=gw::TokenBucketRateLimiter::create(clock,1000.0,1000.0,1000U).value();
+    fnd::SecretString tokenKey{std::string(32U,'t')},clientKey{std::string(32U,'c')};
+    const auto valid=fnd::toHex(sec::hmacSha256(tokenKey,"fixture-access").value());
+    const auto unavailable=fnd::toHex(sec::hmacSha256(tokenKey,"fixture-unavailable").value());
+    const auto clientDigest=fnd::toHex(sec::hmacSha256(clientKey,"fixture-proof").value());
+    int sharedCalls=0,legacyAccessCalls=0,legacyClientCalls=0;
+    http::CoroutineTokenReadAdapter api{fallback,limiter,tokenKey.clone(),clientKey.clone(),
+        [&](std::string,fnd::Instant*)->asio::awaitable<fnd::Result<sess::DelegatedAccess>> {
+            ++legacyAccessCalls;
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        },
+        [&](std::string,std::string)->asio::awaitable<fnd::Status> {
+            ++legacyClientCalls;
+            co_return fnd::fail(fnd::ErrorCode::Unavailable);
+        },{},{},{},{},{},fnd::Duration{900000},std::nullopt,{},std::nullopt,std::nullopt,{},
+        [&](std::string id,std::string proof,std::string digest,fnd::Instant* issued)
+            ->asio::awaitable<fnd::Result<std::optional<sess::DelegatedAccess>>> {
+            ++sharedCalls;
+            EXPECT_EQ(digest.size(),64U);
+            EXPECT_EQ(proof.size(),64U);
+            if (id!="fixture-client" || proof!=clientDigest) {
+                co_return fnd::fail(fnd::ErrorCode::AuthenticationFailed);
+            }
+            if (digest==unavailable) {
+                co_return fnd::fail(fnd::ErrorCode::Unavailable);
+            }
+            if (digest!=valid) {
+                co_return std::optional<sess::DelegatedAccess>{};
+            }
+            if (issued) {
+                *issued=kNow-10s;
+            }
+            auto authenticated=sess::AuthenticatedSession::fromDelegatedAccess(
+                core::IdentityId{"owner"},idp::ProviderId{"local"},idp::AssuranceLevel::Ial1,
+                idp::AuthenticationStrength{idp::AuthenticationFactor::Knowledge,false},
+                kNow-20s,kNow,kNow+60s);
+            co_return std::optional<sess::DelegatedAccess>{sess::DelegatedAccess{
+                std::move(authenticated).value(),"fixture-client",{"openid"},{"urn:fixture"},std::nullopt}};
+        }};
+    auto run=[&](gw::HttpRequest input) {
+        EXPECT_TRUE(api.nativeEnabledFor(input));
+        asio::io_context io;
+        std::optional<gw::HttpResponse> result;
+        auto collect=[&]()->asio::awaitable<void>{
+            result.emplace(co_await api.handleAsync(std::move(input)));
+        };
+        auto done=asio::co_spawn(io,collect(),asio::use_future);
+        io.run(); done.get(); return std::move(result).value();
+    };
+    auto inspect=[&](std::string proof,std::string token) {
+        auto response=run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
+            "client_id=fixture-client&client_secret="+proof+"&token="+token));
+        EXPECT_EQ(response.headers().at("cache-control"),"no-store");
+        EXPECT_EQ(response.body().find(proof),std::string::npos);
+        EXPECT_EQ(response.body().find(token),std::string::npos);
+        return response;
+    };
+    EXPECT_EQ(inspect("fixture-wrong","fixture-access").status(),401);
+    auto active=inspect("fixture-proof","fixture-access");
+    ASSERT_EQ(active.status(),200);
+    EXPECT_NE(active.body().find("\"active\":true"),std::string::npos);
+    EXPECT_NE(active.body().find("\"iat\":1769999990"),std::string::npos);
+    EXPECT_NE(active.body().find("\"exp\":1770000060"),std::string::npos);
+    EXPECT_EQ(inspect("fixture-proof","fixture-unknown").body(),R"({"active":false})");
+    EXPECT_EQ(inspect("fixture-proof","fixture-unavailable").status(),503);
+    EXPECT_EQ(run(request(gw::HttpMethod::Post,"/oauth/introspect",{},
+        "client_id=fixture-client&client_secret=fixture-proof&token=a&token=b")).status(),400);
+    EXPECT_EQ(sharedCalls,4);
+    EXPECT_EQ(legacyAccessCalls,0);
+    EXPECT_EQ(legacyClientCalls,0);
+    EXPECT_EQ(fallback.syncCalls,0);
+    EXPECT_EQ(fallback.asyncCalls,0);
+}
+
 TEST(NativeOAuthTokenReadTest, ScopedUserInfoAndAuthenticatedIntrospectionNeverUseLegacy)
 {
     namespace sec=openproof::security;
