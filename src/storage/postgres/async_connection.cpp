@@ -577,21 +577,34 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         std::size_t copiedBytes = 0U;
         std::size_t copiedCells = 0U;
         bool finished = false;
+        bool needInput = true;
         for (;;) {
             if (Clock::now() >= deadline) {
                 throw std::runtime_error{"PostgreSQL operation timed out"};
             }
-            if (PQconsumeInput(connection) == 0) {
-                throw std::runtime_error{"PostgreSQL query read failed"};
+            // Drain complete results already buffered by libpq before
+            // attempting another socket read. Single-row mode may expose
+            // many rows from one receive, including the terminal result.
+            // Always consume input initially and after a readiness wait;
+            // PQisBusy alone cannot fetch new data from the server.
+            if (needInput || PQisBusy(connection) != 0) {
+                if (PQconsumeInput(connection) == 0) {
+                    throw std::runtime_error{"PostgreSQL query read failed"};
+                }
+                if (Clock::now() >= deadline) {
+                    throw std::runtime_error{"PostgreSQL operation timed out"};
+                }
+                if (PQisBusy(connection) != 0) {
+                    co_await waitForSocket(executor, connection,
+                        asio::posix::stream_descriptor::wait_read, deadline, &querySocket);
+                    needInput = true;
+                    continue;
+                }
+                needInput = false;
             }
-            // PQconsumeInput can process buffered protocol data synchronously.
+            // Parsing buffered input can also consume the operation budget.
             if (Clock::now() >= deadline) {
                 throw std::runtime_error{"PostgreSQL operation timed out"};
-            }
-            if (PQisBusy(connection) != 0) {
-                co_await waitForSocket(executor, connection,
-                    asio::posix::stream_descriptor::wait_read, deadline, &querySocket);
-                continue;
             }
             ResultPointer result{PQgetResult(connection)};
             if (!result) {
