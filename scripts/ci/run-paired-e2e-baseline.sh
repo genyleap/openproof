@@ -45,7 +45,7 @@ mkdir "${OUT}"
 run_trial() (
     set -euo pipefail
     local side="$1" concurrency="$2" trial="$3" requests="$4"
-    local db="opbench_${GITHUB_RUN_ID}_${concurrency}_${trial}_${side}"
+    local db="opbench_e2e_${GITHUB_RUN_ID}_${concurrency}_${trial}_${side}"
     local binary commit legacy
     if [[ "${side}" == "baseline" ]]; then
         binary="${BASE_BIN}"; commit="${BASE_SHA}"; legacy=1
