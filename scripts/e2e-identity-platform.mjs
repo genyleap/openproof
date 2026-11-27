@@ -18,6 +18,7 @@ import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
 import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
 import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
+import {createConnectionAccounting} from "./ci/mixed-read-connections.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -404,6 +405,8 @@ async function main() {
   let loadResourceMetrics = {};
   let edgePhaseCollector;
   let edgePhaseMetrics;
+  const connections = createConnectionAccounting();
+  let connectionMetrics;
   let nativeClientId = "";
   const masterKey = base64Url(crypto.randomBytes(48));
   const ownerPassword = `E2E-owner-${base64Url(crypto.randomBytes(24))}`;
@@ -419,6 +422,7 @@ async function main() {
     { key: privateTlsKey, cert: certificate },
     (request, response) => {
       const phase = edgePhaseCollector?.start(performance.now());
+      connections.observe("clientToEdge",request.socket);
       const headers = {
         ...request.headers,
         // Preserve the public TLS authority for the same-origin POST
@@ -452,6 +456,7 @@ async function main() {
       let upstreamConnected = false;
       let upstreamRequestSent = false;
       forwarded.once("socket", (socket) => {
+        connections.observe("edgeToOpp",socket);
         if (!socket.connecting) upstreamConnected = true;
         else socket.once("connect", () => { upstreamConnected = true; });
       });
@@ -1757,6 +1762,7 @@ async function main() {
       userinfo: jsonBody(userInfo), protectedProxy: jsonBody(protectedResponse),
       introspection: jsonBody(introspection),
     });
+    connections.begin();
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke([
       { name: "readiness", run: () => edgeRequest("/health/ready") },
@@ -1775,6 +1781,7 @@ async function main() {
       }) },
     ], mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
+    connectionMetrics = connections.finish(loadResult.requests);
     edgePhaseMetrics = edgePhaseCollector?.report();
     edgePhaseCollector = undefined;
     loadResourceMetrics = oppUsageDelta(beforeLoadUsage, afterLoadUsage);
@@ -2025,6 +2032,7 @@ async function main() {
         ...loadResult,
         ...loadResourceMetrics,
         ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
+        connectionMetrics,
         ...(executionProfile ? { executionProfile } : {}),
       }, null, 2) + "\n", { mode: 0o600 });
     }
