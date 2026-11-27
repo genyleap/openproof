@@ -10,6 +10,8 @@ build="$ROOT/cmake-build-gcc-release"
 binary="$build/apps/opp/opp"
 control="$build/apps/opp/opp-inline-control"
 out="$ROOT/gateway-inline-pairs"
+mode="${1:-inline}"
+[[ $# -le 1 && ( "$mode" == inline || "$mode" == combined ) ]] || exit 2
 [[ -x "$binary" && ! -e "$control" ]] || exit 2
 mkdir "$out"
 cp "$binary" "$control"
@@ -26,34 +28,62 @@ printf 'commit=%s\ncontrol_sha256=%s\ncandidate_sha256=%s\n' "$GITHUB_SHA" "$con
 # Run all non-destructive CTest gates again on the alternate linked binary.
 ctest --preset gcc-release --output-on-failure -E '^PostgresIntegrationTest\.'
 run_trial() (
-    local side="$1" trial="$2" executable db
+    local side="$1" trial="$2" concurrency="$3" requests="$4" warmup="$5" output="$6" executable db
+    local -a overrides=()
     case "$side" in
         control) executable="$control" ;;
         candidate) executable="$binary" ;;
         *) exit 2 ;;
     esac
-    db="openproof_e2e_inline_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${trial}_${side}"
+    if [[ "$mode" == combined ]]; then
+        case "$side" in
+            control) overrides=(OPENPROOF_E2E_EXECUTION_PROFILE=auto) ;;
+            candidate) overrides=(OPENPROOF_E2E_EXECUTION_PROFILE=minimal OPENPROOF_EXPERIMENTAL_REACTOR_THREADS=1 OPENPROOF_EXPERIMENTAL_HANDLER_THREADS=2 OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS=1) ;;
+        esac
+    fi
+    db="opp_e2e_inline_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${concurrency}_${trial}_${side}"
     [[ ${#db} -le 63 ]] || exit 2
     sudo -u postgres createdb -O openproof_ci "$db"
     trap 'sudo -u postgres dropdb --if-exists "$db"' EXIT
     env -u OPENPROOF_EXPERIMENTAL_HANDLER_THREADS -u OPENPROOF_EXPERIMENTAL_REACTOR_PUBLIC_READS \
         -u OPENPROOF_EXPERIMENTAL_CPU_BUDGET -u OPENPROOF_EXPERIMENTAL_REACTOR_THREADS \
+        -u OPENPROOF_E2E_EXECUTION_PROFILE "${overrides[@]}" \
         OPENPROOF_E2E_POSTGRES="postgresql://openproof_ci:ci_disposable_only@127.0.0.1:5432/$db" \
         OPENPROOF_E2E_DATABASE_ACK=YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE \
         OPENPROOF_E2E_OPP="$executable" OPENPROOF_E2E_COMMIT="$GITHUB_SHA" \
-        OPENPROOF_E2E_EXPECT_LEGACY_AUTH=0 OPENPROOF_E2E_LOAD_REQUESTS=600 \
-        OPENPROOF_E2E_LOAD_CONCURRENCY=24 OPENPROOF_E2E_METRICS_FILE="$out/$side-$trial.json" \
+        OPENPROOF_E2E_EXPECT_LEGACY_AUTH=0 OPENPROOF_E2E_LOAD_REQUESTS="$requests" \
+        OPENPROOF_E2E_LOAD_WARMUP="$warmup" OPENPROOF_E2E_LOAD_CONCURRENCY="$concurrency" \
+        OPENPROOF_E2E_METRICS_FILE="$output/$side-$trial.json" \
         node "$ROOT/scripts/e2e-identity-platform.mjs"
-    [[ -s "$out/$side-$trial.json" ]]
+    [[ -s "$output/$side-$trial.json" ]]
 )
-for trial in 1 2 3 4; do
-    if (( trial % 2 == 1 )); then
-        run_trial control "$trial"
-        run_trial candidate "$trial"
-    else
-        run_trial candidate "$trial"
-        run_trial control "$trial"
-    fi
-    node "$ROOT/scripts/compare-e2e-metrics.mjs" "$out/control-$trial.json" "$out/candidate-$trial.json"
-done
-node "$ROOT/scripts/summarize-gateway-inline-pairs.mjs" "$out" "$GITHUB_SHA"
+run_load() {
+    local concurrency="$1" requests="$2" warmup="$3" output="$4" trial
+    for trial in 1 2 3 4; do
+        if (( trial % 2 == 1 )); then
+            run_trial control "$trial" "$concurrency" "$requests" "$warmup" "$output"
+            run_trial candidate "$trial" "$concurrency" "$requests" "$warmup" "$output"
+        else
+            run_trial candidate "$trial" "$concurrency" "$requests" "$warmup" "$output"
+            run_trial control "$trial" "$concurrency" "$requests" "$warmup" "$output"
+        fi
+        node "$ROOT/scripts/compare-e2e-metrics.mjs" "$output/control-$trial.json" "$output/candidate-$trial.json"
+    done
+}
+if [[ "$mode" == inline ]]; then
+    run_load 24 600 0 "$out"
+    node "$ROOT/scripts/summarize-gateway-inline-pairs.mjs" "$out" "$GITHUB_SHA"
+else
+    # The combined candidate is intentionally tested at high load too.
+    # No relaxation of pending-handler, rate or connection limits.
+    for concurrency in 1 8 32 128; do
+        warmup=$(( (2*concurrency+5)/6*6 ))
+        if (( warmup < 24 )); then warmup=24; fi
+        output="$out/c$concurrency"
+        mkdir "$output"
+        cp "$out/provenance.txt" "$output/provenance.txt"
+        echo "Combined qualification: concurrency $concurrency, warmup $warmup"
+        run_load "$concurrency" 1536 "$warmup" "$output"
+        node "$ROOT/scripts/summarize-gateway-inline-pairs.mjs" "$output" "$GITHUB_SHA" "$concurrency"
+    done
+fi

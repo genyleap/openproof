@@ -57,3 +57,31 @@ test("paired profile summary rejects stale/mislabeled records and preserves perc
     }
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+test("combined inlining qualification enforces warmed matched workloads and exact runtime profiles",()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"opp-combined-profile-test-"));
+  try{
+    fs.writeFileSync(path.join(dir,"provenance.txt"),"commit="+commit+"\ncontrol_sha256="+"a".repeat(64)+"\ncandidate_sha256="+"b".repeat(64)+"\n");
+    for(const load of [1,8,32,128]){
+      const warmupRequests=6*Math.ceil(Math.max(24,2*load)/6);
+      const row=(name)=>({benchmark:"openproof-isolated-e2e-mixed-read",commit,
+        requests:1536,concurrency:load,warmupRequests,
+        executionProfile:{name,requestedOverrides:profiles[name]},
+        requestsPerSecond:name==="auto"?100:125,p50Ms:10,p95Ms:20,p99Ms:30,
+        serverCpuTicksDelta:10,serverRssKiBEnd:1000,serverStableThreadCount:name==="auto"?26:9,
+        serverVoluntaryContextSwitchesDelta:100,serverInvoluntaryContextSwitchesDelta:5,
+        routes:routes.map(name=>({name,requests:256,p50Ms:10,p95Ms:20,p99Ms:30}))});
+      const write=(side,i,r)=>fs.writeFileSync(path.join(dir,side+"-"+i+".json"),JSON.stringify(r));
+      for(let i=1;i<=4;i++){write("control",i,row("auto"));write("candidate",i,row("minimal"));}
+      const run=()=>spawnSync(process.execPath,[path.resolve(import.meta.dirname,"summarize-gateway-inline-pairs.mjs"),dir,commit,String(load)],{encoding:"utf8"});
+      const good=run();assert.equal(good.status,0,good.stderr);
+      const report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+      assert.equal(report.metrics.requestsPerSecond.medianPairedChangePercent,25);
+      assert.equal(report.threads.candidateMedian,9);assert.equal(report.qualified,false);
+      write("candidate",1,row("auto"));assert.notEqual(run().status,0);
+      write("candidate",1,{...row("minimal"),warmupRequests:0});assert.notEqual(run().status,0);
+      write("candidate",1,row("minimal"));fs.unlinkSync(path.join(dir,"candidate-4.json"));
+      assert.notEqual(run().status,0);
+    }
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
