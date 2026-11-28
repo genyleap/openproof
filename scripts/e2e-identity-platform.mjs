@@ -20,6 +20,7 @@ import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
 import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
 import {createConnectionAccounting} from "./ci/mixed-read-connections.mjs";
 import {snapshotSql,statementDelta} from "./ci/postgres-statement-metrics.mjs";
+import {profileMixedRead} from "./ci/mixed-read-cpu-profile.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -1801,7 +1802,17 @@ async function main() {
     const statementBefore = statementProbe ? snapshotStatements() : undefined;
     connections.begin();
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
-    loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
+    const profileOutput=process.env.OPENPROOF_E2E_CPU_PROFILE_FILE;
+    const work=()=>concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
+    if(profileOutput) {
+      if(process.env.GITHUB_ACTIONS!=="true"
+          || databaseAck!=="YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
+          || !/^opp_e2e_cpu_[0-9_]+(?:baseline|candidate)$/.test(databaseName)
+          || statementProbe || holdOpen)
+        fail("CPU profiling requires its isolated CI fixture");
+      loadResult=await profileMixedRead({pid:oppProcess?.pid,
+        perf:process.env.OPENPROOF_E2E_PERF_BINARY??"",output:profileOutput,work});
+    } else loadResult=await work();
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     const postgresStatementMetrics = statementProbe
       ? statementDelta(statementBefore,snapshotStatements()) : undefined;
