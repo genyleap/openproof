@@ -20,14 +20,19 @@ if(process.argv[2]==="record") {
   // Avoid a blocking fs.read on a libuv worker during signal shutdown.
   const socket=new net.Socket({fd:3,readable:true,writable:false});
   const control=readline.createInterface({input:socket});
+  // Real perf re-raises SIGINT; successful collection must use stop.
   process.on("SIGINT",()=>{
-    control.close();
-    socket.destroy();
-    fs.writeFileSync(data,"synthetic");
-    process.exit(0);
+    process.removeAllListeners("SIGINT");
+    process.kill(process.pid,"SIGINT");
   });
   control.on("line",line=>{
-    if(line==="enable"||line==="disable") fs.writeSync(4,"ack\\n\\0");
+    if(line==="enable"||line==="disable"||line==="stop") fs.writeSync(4,"ack\\n\\0");
+    if(line==="stop"){
+      control.close();
+      socket.destroy();
+      fs.writeFileSync(data,"synthetic");
+      process.exit(process.env.TEST_PERF_STOP_FAILURE==="1"?2:0);
+    }
   });
 } else if(process.argv[2]==="report") {
   const count=process.env.TEST_PERF_LOW_COUNT==="1"?"4":"1K";
@@ -45,6 +50,9 @@ if(process.argv[2]==="record") {
   process.env.TEST_PERF_LOW_COUNT="1";
   await assert.rejects(profileMixedRead({pid:process.pid,perf:fake,output:path.join(root,"low"),work:async()=>0}),/insufficient CPU samples/);
   delete process.env.TEST_PERF_LOW_COUNT;
+  process.env.TEST_PERF_STOP_FAILURE="1";
+  await assert.rejects(profileMixedRead({pid:process.pid,perf:fake,output:path.join(root,"stop-failure"),work:async()=>0}),/perf record failed/);
+  delete process.env.TEST_PERF_STOP_FAILURE;
   process.env.TEST_PERF_EARLY_EXIT="1";
   await assert.rejects(profileMixedRead({pid:process.pid,perf:fake,output:path.join(root,"early"),work:async()=>{throw Error("load must not start");}}),/perf exited|perf control/);
   console.log("CPU profile control and sample-validation contract: PASSED");
@@ -53,5 +61,6 @@ if(process.argv[2]==="record") {
   else process.env.GITHUB_ACTIONS=original;
   delete process.env.TEST_PERF_LOW_COUNT;
   delete process.env.TEST_PERF_EARLY_EXIT;
+  delete process.env.TEST_PERF_STOP_FAILURE;
   fs.rmSync(root,{recursive:true,force:true});
 }
