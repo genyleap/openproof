@@ -16,10 +16,10 @@ try {
   fs.writeFileSync(library,"");
   process.env.GITHUB_ACTIONS="true";
   process.env.RUNNER_ENVIRONMENT="github-hosted";
-  const env=profileEnvironment(library,path.join(dir,"profile"),{CPUPROFILE_REALTIME:"0",CPUPROFILE_TIMER_SIGNAL:"99",OTHER:"kept"});
+  const env=profileEnvironment(library,path.join(dir,"profile"),{CPUPROFILE_REALTIME:"0",CPUPROFILE_TIMER_SIGNAL:"99",CPUPROFILE_PER_THREAD_TIMERS:"0",OTHER:"kept"});
   assert.equal(Object.hasOwn(env,"CPUPROFILE_REALTIME"),false);
   assert.equal(Object.hasOwn(env,"CPUPROFILE_TIMER_SIGNAL"),false);
-  assert.equal(env.CPUPROFILE_PER_THREAD_TIMERS,"1");
+  assert.equal(Object.hasOwn(env,"CPUPROFILE_PER_THREAD_TIMERS"),false);
   assert.equal(env.OTHER,"kept");
 } finally {fs.rmSync(dir,{recursive:true,force:true});}
 console.log("gperftools symbol-only report contract: PASSED");

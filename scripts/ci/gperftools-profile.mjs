@@ -20,9 +20,12 @@ export function profileEnvironment(library,base,inherited=process.env) {
   // gperftools enables REALTIME by presence, even when the value is 0.
   delete env.CPUPROFILE_REALTIME;
   delete env.CPUPROFILE_TIMER_SIGNAL;
+  // Separate Linux timers require explicit ProfilerRegisterThread calls.
+  // The injected library cannot assume every application worker registers.
+  // Use default process-wide ITIMER_PROF, validated by the worker preflight.
+  delete env.CPUPROFILE_PER_THREAD_TIMERS;
   return {...env,LD_PRELOAD:library,CPUPROFILE:base,
-    CPUPROFILESIGNAL:String(os.constants.signals.SIGUSR2),CPUPROFILE_FREQUENCY:"1000",
-    CPUPROFILE_PER_THREAD_TIMERS:"1"};
+    CPUPROFILESIGNAL:String(os.constants.signals.SIGUSR2),CPUPROFILE_FREQUENCY:"1000"};
 }
 async function until(child,predicate,label) {
   const deadline=performance.now()+10000;
