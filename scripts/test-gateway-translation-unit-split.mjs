@@ -90,6 +90,8 @@ test("network layer retains bounded request and response framing",()=>{
 
 test("normal HTTP completion awaits the bounded pool and writes on the connection strand",()=>{
   const read=server.slice(server.indexOf("asio::awaitable<void> readRequest()"),
+    server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchWorkerOperation("));
+  const initiation=server.slice(server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchWorkerOperation("),
     server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("));
   const worker=server.slice(server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("),
     server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
@@ -99,11 +101,16 @@ test("normal HTTP completion awaits the bounded pool and writes on the connectio
   assert.match(read,/m_pendingHandlers\.fetch_add\(/);
   assert.match(read,/struct PendingHandlerGuard final[\s\S]*?pending\.fetch_sub\(1U, std::memory_order_acq_rel\)/);
   assert.doesNotMatch(read,/asio::make_strand\(|requestStrand/);
-  assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool\.get_executor\(\),\s*dispatchOnWorker\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.match(read,/co_await dispatchWorkerOperation\(\s*std::move\(\*operation\), version, headRequest\)/);
   assert.match(worker,/auto executor = co_await asio::this_coro::executor;/);
   assert.match(worker,/auto requestStrand = asio::make_strand\(executor\);/);
   assert.match(worker,/co_return co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(operation\), version, headRequest\),\s*asio::use_awaitable\)/);
   assert.doesNotMatch(worker,/m_stream|m_context|m_handlerPool/);
+  assert.match(initiation,/return asio::async_initiate<decltype\(asio::use_awaitable\),\s*void\(std::exception_ptr, Wire\)>/);
+  assert.match(initiation,/if \(asio::get_associated_cancellation_slot\(completion\).is_connected\(\)\) \{[\s\S]*?asio::co_spawn\(m_owner->m_handlerPool.get_executor\(\),[\s\S]*?dispatchOnWorker\([\s\S]*?std::move\(completion\)\);\s*return;\s*\}/);
+  assert.match(initiation,/auto requestStrand = asio::make_strand\(\s*asio::any_io_executor\{m_owner->m_handlerPool.get_executor\(\)\}\)/);
+  assert.match(initiation,/asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(request\), requestVersion, requestHead\),\s*std::move\(completion\)\)/);
+  assert.doesNotMatch(initiation,/co_await|co_return|m_stream|m_context/);
   for (const file of ["src/storage/postgres/async_connection.cpp","src/gateway/http_proxy.cpp"]) {
     const source=fs.readFileSync(path.join(root,file),"utf8");
     assert.match(source,/executor\.target_type\(\) == typeid\(RequestStrand\)/);
@@ -112,7 +119,7 @@ test("normal HTTP completion awaits the bounded pool and writes on the connectio
     assert.match(source,/asio::make_strand\(executor\)/);
   }
   const completion=read.indexOf("m_response.emplace(std::move(wire))");
-  assert.ok(completion>read.indexOf("co_await asio::co_spawn("));
+  assert.ok(completion>read.indexOf("co_await dispatchWorkerOperation("));
   assert.ok(read.indexOf("co_await writeResponse(headRequest);")>completion);
   assert.match(read,/if \(!m_owner->m_running.load\(std::memory_order_acquire\)\) co_return;/);
   assert.match(dispatch,/asyncHandler->nativeEnabledFor\(operation\)/);
