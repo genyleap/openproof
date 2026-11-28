@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import {validateConnectionMetrics,connectionLegs} from "./ci/mixed-read-connections.mjs";
+import {fields as statementFields,validateSnapshot as validateStatementMetrics} from "./ci/postgres-statement-metrics.mjs";
 
 const [dir, baselineCommit, candidateCommit, load] = process.argv.slice(2);
 assert.ok(process.argv.length === 5 || process.argv.length === 6);
@@ -109,11 +110,24 @@ const edgePhaseComparison = records.every(validEdge)
   ? Object.fromEntries(edgePhases.map(name => [name,Object.fromEntries(
       latencyKeys.map(k => [k,summarize(k,r=>r.edgePhaseMetrics.phases[name])]))]))
   : null;
+const statementProbe=process.env.OPENPROOF_E2E_STATEMENT_PROBE==="1";
+const statementRecords=records.filter(r=>r.postgresStatementMetrics!==undefined);
+if(statementProbe || statementRecords.length>0) {
+  assert.equal(statementRecords.length,records.length,"Missing paired PostgreSQL statement evidence");
+  for(const r of records) {
+    validateStatementMetrics(r.postgresStatementMetrics);
+    assert.ok(r.postgresStatementMetrics.calls>0);
+  }
+}
+const postgresStatementComparison=statementRecords.length===records.length
+  ? Object.fromEntries(statementFields.map(k=>[k,summarize(k,r=>r.postgresStatementMetrics)]))
+  : null;
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
   pairCount,requestsPerRun:requests,concurrency,
   ...(matrix ? {warmupRequests} : {}),
   metrics:Object.fromEntries(fields.map(k=>[k,summarize(k)])),
   diagnosticMetrics,
+  ...(postgresStatementComparison ? {postgresStatementComparison} : {}),
   ...(matrix ? {connectionMetrics:Object.fromEntries(connectionLegs.map(leg=>[leg,Object.fromEntries(["assignments","distinctSockets","firstSeenSockets","reusedAssignments"].map(key=>[key,summarize(key,r=>r.connectionMetrics[leg])]))]))} : {}),
   ...(edgePhaseComparison ? {edgePhaseComparison} : {}),
   routes:Object.fromEntries(routes.map(name=>[name,Object.fromEntries(
@@ -127,6 +141,13 @@ for (const [k,v] of Object.entries({...report.metrics,...report.diagnosticMetric
   const fmt=x=>x===null?"n/a":x.toFixed(2)+"%";
   console.log("| "+k+" | "+v.baselineMedian.toFixed(2)+" | "+v.candidateMedian.toFixed(2)+" | "+
     fmt(v.pairedChangePct)+" | "+(v.pairedRangePct?v.pairedRangePct.map(fmt).join(" to "):"n/a")+" |");
+}
+if(postgresStatementComparison) {
+  console.log("| PostgreSQL metric | Baseline median | Candidate median | Median paired change |");
+  console.log("|---|---:|---:|---:|");
+  for(const [key,value] of Object.entries(postgresStatementComparison))
+    console.log("| "+key+" | "+value.baselineMedian.toFixed(2)+" | "+value.candidateMedian.toFixed(2)+" | "+(value.pairedChangePct===null?"n/a":value.pairedChangePct.toFixed(2)+"%")+" |");
+  console.log("Statement execution time is summed across server backends, not wall-clock HTTP latency; includes utility statements and excludes client scheduling.");
 }
 console.log("| Route | Paired p50 change | Paired p95 change | Paired p99 change |");
 console.log("|---|---:|---:|---:|");
