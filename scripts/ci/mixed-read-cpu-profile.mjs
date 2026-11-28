@@ -36,7 +36,9 @@ export async function profileMixedRead({pid,perf,output,work}) {
       try {
         const ack=new Promise((resolve,reject)=>{
           listener=line=>{
-            if(line.trim()==="ack") resolve();
+            // Linux perf writes sizeof("ack\\n"), including the trailing
+            // NUL. readline retains that byte before the next acknowledgement.
+            if(line.replace(/\0/g,"").trim()==="ack") resolve();
           };
           onError=()=>reject(new Error("perf control pipe failed"));
           reader.on("line",listener);
