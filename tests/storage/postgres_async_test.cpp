@@ -368,8 +368,9 @@ TEST(PostgresNativeCoroutineTest, QueryAwaitablePreservesLazyDeadlineOnBothExecu
         // The query budget starts at execution, not awaitable construction.
         auto result = co_await std::move(deferred);
         EXPECT_EQ(result.rows.size(), 1U);
-        if (result.rows.size() == 1U && result.rows.front().size() == 1U)
+        if (result.rows.size() == 1U && result.rows.front().size() == 1U) {
             EXPECT_EQ(result.rows.front().front(), "lazy-deadline");
+        }
         EXPECT_TRUE(connection->reusable());
     };
     for (const bool typed : {false, true}) {
