@@ -81,5 +81,27 @@ try {
   write("candidate",3,candidate);
   fs.unlinkSync(path.join(dir,"candidate-5.json"));
   assert.notEqual(run().status,0,"Missing pair must be rejected");
+  // Native/native pairs require the same runtime profile on BOTH sides.
+  for(const side of ["baseline","candidate"]) {
+    for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(side+"-"))) fs.unlinkSync(path.join(dir,name));
+  }
+  const connectionMetrics=Object.fromEntries(["clientToEdge","edgeToOpp"].map(leg=>[
+    leg,{assignments:1536,distinctSockets:128,firstSeenSockets:128,reusedAssignments:1408}]));
+  const matrixRecord={...source,requests:1536,concurrency:128,warmupRequests:258,
+    normalizedResponseChecks:1536,connectionMetrics,executionProfile:{name:"minimal"},
+    routes:source.routes.map(route=>({...route,requests:256}))};
+  for(let i=1;i<=4;i++){
+    write("baseline",i,matrixRecord);
+    write("candidate",i,{...matrixRecord,commit:b});
+  }
+  const nativeRun=()=>spawnSync(process.execPath,[script,dir,a,b,"128","native-native"],{encoding:"utf8",timeout:10000});
+  r=nativeRun();assert.equal(r.status,0,r.stderr);
+  report=JSON.parse(fs.readFileSync(path.join(dir,"summary.json"),"utf8"));
+  assert.equal(report.comparison,"native-native");
+  write("baseline",2,{...matrixRecord,executionProfile:{name:"auto"}});
+  assert.notEqual(nativeRun().status,0,"Native pair must reject mismatched runtime profiles");
+  write("baseline",2,matrixRecord);
+  assert.notEqual(spawnSync(process.execPath,[script,dir,a,b,"128"],{encoding:"utf8",timeout:10000}).status,0,
+    "Historical pair must still require the historical auto profile");
   console.log("Mixed-read paired-report regression: PASSED");
 } finally {fs.rmSync(dir,{recursive:true,force:true});}
