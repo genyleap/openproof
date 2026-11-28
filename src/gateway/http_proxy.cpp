@@ -171,31 +171,142 @@ public:
     }
 
     asio::awaitable<foundation::Result<HttpResponse>> sendAsync(
-        Endpoint endpoint, HttpRequest request, foundation::Duration timeout)
+        Endpoint endpoint, HttpRequest request, foundation::Duration timeout,
+        std::optional<std::chrono::steady_clock::time_point> inheritedDeadline = std::nullopt)
     {
         const OwnedRequestScrub scrub{request};
         if (timeout <= foundation::Duration::zero()) {
             co_return foundation::fail(foundation::ErrorCode::InvalidArgument,
                                         "The upstream timeout must be positive.");
         }
-        // Include strand admission in the same absolute request budget.
-        const auto deadline = detail::saturatingSteadyDeadline(timeout);
+        // Compute the budget once, then preserve it across fallback admission.
+        const auto deadline = inheritedDeadline
+            ? *inheritedDeadline : detail::saturatingSteadyDeadline(timeout);
         auto executor = co_await asio::this_coro::executor;
         try {
-            // Reuse an explicitly serialized request executor only while
-            // executing on that very strand. Other callers retain the
-            // independent strand and co_spawn cancellation boundary.
-            using RequestStrand = asio::strand<asio::any_io_executor>;
-            if (executor.target_type() == typeid(RequestStrand)) {
-                const auto* strand = executor.target<RequestStrand>();
-                if (strand && strand->running_in_this_thread())
-                    co_return co_await sendOnStrand(std::move(endpoint), std::move(request), deadline);
+            if (!inheritedDeadline) {
+                using RequestStrand = asio::strand<asio::any_io_executor>;
+                const auto* strand = executor.target_type() == typeid(RequestStrand)
+                    ? executor.target<RequestStrand>() : nullptr;
+                const bool serialized = strand && strand->running_in_this_thread();
+                if (!serialized) {
+                    auto result = co_await asio::co_spawn(
+                        asio::make_strand(executor),
+                        sendSerialized(std::move(endpoint), std::move(request), timeout, deadline),
+                        asio::use_awaitable);
+                    if (result) co_return std::move(*result);
+                    co_return foundation::fail(
+                        std::chrono::steady_clock::now() >= deadline
+                            ? foundation::ErrorCode::Timeout : foundation::ErrorCode::Unavailable);
+                }
             }
-            auto result = co_await asio::co_spawn(
-                asio::make_strand(executor),
-                sendSerialized(std::move(endpoint), std::move(request), deadline),
-                asio::use_awaitable);
-            if (result) co_return std::move(*result);
+            // The proven request strand executes the actual transport in
+            // this frame. Unknown executors retain the original isolated
+            // strand via the private completion envelope.
+            if (std::chrono::steady_clock::now() >= deadline) {
+                co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                            "The upstream request timed out.");
+            }
+            boost::system::error_code error;
+            Tcp::resolver::results_type endpoints;
+            std::optional<Tcp::endpoint> literalEndpoint;
+            const std::string host{endpoint.host()};
+            boost::system::error_code addressError;
+            const auto address = asio::ip::make_address(host, addressError);
+            if (!addressError && address.is_v4()) {
+                // A literal IPv4 destination needs neither a resolver nor a
+                // heap-backed resolver result sequence. Preserve the original
+                // host for HTTP authority, SNI and TLS peer verification.
+                literalEndpoint.emplace(address, endpoint.port());
+            } else {
+                // Keep existing hostname and scoped IPv6 resolution semantics.
+                const auto service = std::to_string(endpoint.port());
+                auto resolver = std::make_shared<Tcp::resolver>(executor);
+                asio::steady_timer resolverDeadline{executor};
+                resolverDeadline.expires_at(deadline);
+                resolverDeadline.async_wait(
+                    [weak = std::weak_ptr<Tcp::resolver>{resolver}](boost::system::error_code timerError) {
+                        if (!timerError) {
+                            if (auto active = weak.lock()) active->cancel();
+                        }
+                    });
+                endpoints = co_await resolver->async_resolve(
+                    host, service, asio::redirect_error(asio::use_awaitable, error));
+                resolverDeadline.cancel();
+            }
+            // A successful DNS result does not imply that the overall request
+            // deadline is still valid: cancellation can race a resolver result.
+            // Never start TCP/TLS or contact a retry target after that deadline.
+            if (std::chrono::steady_clock::now() >= deadline) {
+                co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                            "The upstream request timed out.");
+            }
+            if (error) {
+                co_return foundation::fail(networkError("resolve upstream", error));
+            }
+
+            if (!endpoint.tls()) {
+                beast::tcp_stream stream{executor};
+                stream.expires_at(deadline);
+                if (literalEndpoint) {
+                    co_await stream.async_connect(*literalEndpoint,
+                        asio::redirect_error(asio::use_awaitable, error));
+                } else {
+                    static_cast<void>(co_await stream.async_connect(endpoints,
+                        asio::redirect_error(asio::use_awaitable, error)));
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                                "The upstream request timed out.");
+                }
+                if (error) co_return foundation::fail(networkError("connect upstream", error));
+                auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
+                boost::system::error_code ignored;
+                stream.socket().shutdown(Tcp::socket::shutdown_both, ignored);
+                co_return response;
+            }
+
+            beast::ssl_stream<beast::tcp_stream> stream{executor, m_tlsContext};
+            if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                         TLSEXT_NAMETYPE_host_name,
+                         const_cast<char*>(host.c_str())) != 1) {
+                co_return foundation::fail(foundation::ErrorCode::Internal,
+                                            "TLS SNI configuration failed.");
+            }
+            stream.set_verify_callback(ssl::host_name_verification{host});
+            beast::get_lowest_layer(stream).expires_at(deadline);
+            if (literalEndpoint) {
+                co_await beast::get_lowest_layer(stream).async_connect(*literalEndpoint,
+                    asio::redirect_error(asio::use_awaitable, error));
+            } else {
+                static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
+                    endpoints, asio::redirect_error(asio::use_awaitable, error)));
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                            "The upstream request timed out.");
+            }
+            if (error) co_return foundation::fail(networkError("connect TLS upstream", error));
+            beast::get_lowest_layer(stream).expires_at(deadline);
+            co_await stream.async_handshake(
+                ssl::stream_base::client, asio::redirect_error(asio::use_awaitable, error));
+            if (std::chrono::steady_clock::now() >= deadline) {
+                co_return foundation::fail(foundation::ErrorCode::Timeout,
+                                            "The upstream request timed out.");
+            }
+            if (error) co_return foundation::fail(networkError("verify TLS upstream", error));
+            auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
+            // Beast completed and validated the entire HTTP message under an
+            // authenticated TLS session. Awaiting peer close_notify after this
+            // point lets a slow/half-closed upstream consume the gateway's retry
+            // deadline even when the response body is already complete.
+            // This transport is one-shot and explicitly uses Connection: close;
+            // discard the socket without reading/trusting additional peer bytes.
+            // Any truncated framing or oversized body was already rejected in
+            // exchangeAsync before reaching this point.
+            boost::system::error_code ignored;
+            beast::get_lowest_layer(stream).socket().close(ignored);
+            co_return response;
         } catch (...) {
             // Never propagate transport exception details to the caller.
         }
@@ -208,123 +319,11 @@ private:
     // Optional completion envelope satisfies Boost.Asio 1.88 co_spawn
     // exception-path construction without inventing an HTTP response.
     asio::awaitable<std::optional<foundation::Result<HttpResponse>>> sendSerialized(
-        Endpoint endpoint, HttpRequest request,
+        Endpoint endpoint, HttpRequest request, foundation::Duration timeout,
         std::chrono::steady_clock::time_point deadline)
     {
         co_return std::optional<foundation::Result<HttpResponse>>{
-            co_await sendOnStrand(std::move(endpoint), std::move(request), deadline)};
-    }
-
-    asio::awaitable<foundation::Result<HttpResponse>> sendOnStrand(
-        Endpoint endpoint, HttpRequest request,
-        std::chrono::steady_clock::time_point deadline)
-    {
-        const OwnedRequestScrub scrub{request};
-        auto executor = co_await asio::this_coro::executor;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                        "The upstream request timed out.");
-        }
-        boost::system::error_code error;
-        Tcp::resolver::results_type endpoints;
-        std::optional<Tcp::endpoint> literalEndpoint;
-        const std::string host{endpoint.host()};
-        boost::system::error_code addressError;
-        const auto address = asio::ip::make_address(host, addressError);
-        if (!addressError && address.is_v4()) {
-            // A literal IPv4 destination needs neither a resolver nor a
-            // heap-backed resolver result sequence. Preserve the original
-            // host for HTTP authority, SNI and TLS peer verification.
-            literalEndpoint.emplace(address, endpoint.port());
-        } else {
-            // Keep existing hostname and scoped IPv6 resolution semantics.
-            const auto service = std::to_string(endpoint.port());
-            auto resolver = std::make_shared<Tcp::resolver>(executor);
-            asio::steady_timer resolverDeadline{executor};
-            resolverDeadline.expires_at(deadline);
-            resolverDeadline.async_wait(
-                [weak = std::weak_ptr<Tcp::resolver>{resolver}](boost::system::error_code timerError) {
-                    if (!timerError) {
-                        if (auto active = weak.lock()) active->cancel();
-                    }
-                });
-            endpoints = co_await resolver->async_resolve(
-                host, service, asio::redirect_error(asio::use_awaitable, error));
-            resolverDeadline.cancel();
-        }
-        // A successful DNS result does not imply that the overall request
-        // deadline is still valid: cancellation can race a resolver result.
-        // Never start TCP/TLS or contact a retry target after that deadline.
-        if (std::chrono::steady_clock::now() >= deadline) {
-            co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                        "The upstream request timed out.");
-        }
-        if (error) {
-            co_return foundation::fail(networkError("resolve upstream", error));
-        }
-
-        if (!endpoint.tls()) {
-            beast::tcp_stream stream{executor};
-            stream.expires_at(deadline);
-            if (literalEndpoint) {
-                co_await stream.async_connect(*literalEndpoint,
-                    asio::redirect_error(asio::use_awaitable, error));
-            } else {
-                static_cast<void>(co_await stream.async_connect(endpoints,
-                    asio::redirect_error(asio::use_awaitable, error)));
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                            "The upstream request timed out.");
-            }
-            if (error) co_return foundation::fail(networkError("connect upstream", error));
-            auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
-            boost::system::error_code ignored;
-            stream.socket().shutdown(Tcp::socket::shutdown_both, ignored);
-            co_return response;
-        }
-
-        beast::ssl_stream<beast::tcp_stream> stream{executor, m_tlsContext};
-        if (SSL_ctrl(stream.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                     TLSEXT_NAMETYPE_host_name,
-                     const_cast<char*>(host.c_str())) != 1) {
-            co_return foundation::fail(foundation::ErrorCode::Internal,
-                                        "TLS SNI configuration failed.");
-        }
-        stream.set_verify_callback(ssl::host_name_verification{host});
-        beast::get_lowest_layer(stream).expires_at(deadline);
-        if (literalEndpoint) {
-            co_await beast::get_lowest_layer(stream).async_connect(*literalEndpoint,
-                asio::redirect_error(asio::use_awaitable, error));
-        } else {
-            static_cast<void>(co_await beast::get_lowest_layer(stream).async_connect(
-                endpoints, asio::redirect_error(asio::use_awaitable, error)));
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                        "The upstream request timed out.");
-        }
-        if (error) co_return foundation::fail(networkError("connect TLS upstream", error));
-        beast::get_lowest_layer(stream).expires_at(deadline);
-        co_await stream.async_handshake(
-            ssl::stream_base::client, asio::redirect_error(asio::use_awaitable, error));
-        if (std::chrono::steady_clock::now() >= deadline) {
-            co_return foundation::fail(foundation::ErrorCode::Timeout,
-                                        "The upstream request timed out.");
-        }
-        if (error) co_return foundation::fail(networkError("verify TLS upstream", error));
-        auto response = co_await exchangeAsync(stream, endpoint, request, deadline);
-        // Beast completed and validated the entire HTTP message under an
-        // authenticated TLS session. Awaiting peer close_notify after this
-        // point lets a slow/half-closed upstream consume the gateway's retry
-        // deadline even when the response body is already complete.
-        // This transport is one-shot and explicitly uses Connection: close;
-        // discard the socket without reading/trusting additional peer bytes.
-        // Any truncated framing or oversized body was already rejected in
-        // exchangeAsync before reaching this point.
-        boost::system::error_code ignored;
-        beast::get_lowest_layer(stream).socket().close(ignored);
-        co_return response;
+            co_await sendAsync(std::move(endpoint), std::move(request), timeout, deadline)};
     }
 
 private:
