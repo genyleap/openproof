@@ -49,7 +49,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common linux-tools-generic
           perf_bin=""
           while IFS= read -r candidate; do
-            if "$candidate" stat -e cpu-clock:u -- true >/dev/null 2>&1; then
+            if "$candidate" stat -e task-clock:u -- true >/dev/null 2>&1; then
               perf_bin="$candidate"
               break
             fi
