@@ -22,7 +22,7 @@ sudo sysctl -q -w kernel.perf_event_paranoid=1
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common linux-tools-generic
 PERF=""
 while IFS= read -r candidate; do
-    if "$candidate" stat -e cpu-clock:u -- true >/dev/null 2>&1; then
+    if "$candidate" stat -e task-clock:u -- true >/dev/null 2>&1; then
         PERF="$candidate"
         break
     fi
