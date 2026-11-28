@@ -338,8 +338,11 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         // Reset every recycled connection *before* returning it to a new
         // tenant, using the same nonblocking SQL transport and a deadline.
         try {
-            static_cast<void>(co_await lease.m_connection->query(
-                "DISCARD ALL", {}, bounded(state->connectTimeout)));
+            const auto reset=co_await lease.m_connection->query(
+                "DISCARD ALL", {}, bounded(state->connectTimeout));
+            if (reset.commandTag!="DISCARD ALL" || !reset.rows.empty()
+                || !lease.m_connection->reusable())
+                throw std::runtime_error{"Invalid PostgreSQL session reset result"};
         } catch (...) {
             lease.m_connection.reset();
             throw std::runtime_error{"Async PostgreSQL session reset failed"};

@@ -107,6 +107,14 @@ test("connected query reuses readiness ownership only within its own executor an
   assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
 });
 
+test("simple query optimization is restricted to the exact parameter-free reset", () => {
+  assert.match(text,/const bool sessionReset=!migrationScript && params\.empty\(\) && sql=="DISCARD ALL";/);
+  assert.match(text,/const int submitted=\(migrationScript \|\| sessionReset\)\s*\? PQsendQuery\(connection,sql\.c_str\(\)\)\s*:\s*submitParameterized\(connection,sql,params\)/);
+  assert.match(text,/if \(!migrationScript && PQsetSingleRowMode\(connection\) != 1\)/);
+  const pool=fs.readFileSync(path.join(root,"src/storage/postgres/async_pool.cpp"),"utf8");
+  assert.match(pool,/reset\.commandTag!="DISCARD ALL" \|\| !reset\.rows\.empty\(\)/);
+});
+
 test("single-row results drain buffered input without an unconditional socket read per row", () => {
   const query = source.slice(source.indexOf("QueryRows output;"));
   const guard = query.indexOf("if (needInput || PQisBusy(connection) != 0)");

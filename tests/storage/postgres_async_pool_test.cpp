@@ -129,6 +129,20 @@ asio::awaitable<void> recycledLeaseClearsSessionState(
         "SELECT current_setting('application_name')", {}, 2s);
     cleared = after.rows.size() == 1U && after.rows[0].size() == 1U
         && after.rows[0][0] != marker && next.connection().reusable();
+    const auto reset=co_await next.connection().query("DISCARD ALL",{},2s);
+    EXPECT_EQ(reset.commandTag,"DISCARD ALL");
+    EXPECT_TRUE(reset.rows.empty());
+    EXPECT_TRUE(next.connection().reusable());
+    // Ordinary parameterless SQL must still use extended protocol, which
+    // rejects multiple statements before executing any of them.
+    bool rejected=false;
+    try {
+        static_cast<void>(co_await next.connection().query("SELECT 1; SELECT 2",{},2s));
+    } catch (const std::runtime_error& error) {
+        rejected=std::string{error.what()}=="PostgreSQL query returned an error";
+    }
+    EXPECT_TRUE(rejected);
+    EXPECT_FALSE(next.connection().reusable());
 }
 
 asio::awaitable<void> uncommittedLeaseIsReplaced(

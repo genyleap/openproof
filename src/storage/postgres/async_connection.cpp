@@ -559,8 +559,14 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         if (Clock::now() >= deadline) {
             throw std::runtime_error{"PostgreSQL operation timed out"};
         }
-        const int submitted=migrationScript?PQsendQuery(connection,sql.c_str()):
-            submitParameterized(connection,sql,params);
+        // DISCARD ALL is a fixed, parameter-free utility command. Avoid
+        // Parse/Bind/Describe/Execute/Sync framing for this exact literal,
+        // not for arbitrary parameterless SQL. Keep normal row bounds,
+        // cancellation, timeout and connection poisoning unchanged.
+        const bool sessionReset=!migrationScript && params.empty() && sql=="DISCARD ALL";
+        const int submitted=(migrationScript || sessionReset)
+            ? PQsendQuery(connection,sql.c_str())
+            : submitParameterized(connection,sql,params);
         if (submitted==0) {
             throw std::runtime_error{"PostgreSQL query could not be submitted"};
         }
