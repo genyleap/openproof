@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -1227,8 +1228,16 @@ TEST(BeastHttpIntegrationTest, TrustedLoopbackProxySuppliesOneValidatedClientIp)
 asio::awaitable<void> collectAsyncProxyResponse(
     httpAdapter::BeastProxyTransport& transport,
     gw::Endpoint endpoint, gw::HttpRequest request, fnd::Duration timeout,
-    std::optional<fnd::Result<gw::HttpResponse>>& result)
+    std::optional<fnd::Result<gw::HttpResponse>>& result,
+    std::optional<bool> expectTypedStrand = std::nullopt)
 {
+    if (expectTypedStrand) {
+        auto executor = co_await asio::this_coro::executor;
+        using RequestStrand = asio::strand<asio::any_io_executor>;
+        const auto* strand = executor.target_type() == typeid(RequestStrand)
+            ? executor.target<RequestStrand>() : nullptr;
+        EXPECT_EQ(strand && strand->running_in_this_thread(), *expectTypedStrand);
+    }
     result.emplace(co_await transport.sendAsync(
         std::move(endpoint), std::move(request), timeout));
 }
@@ -1344,9 +1353,14 @@ TEST(BeastHttpIntegrationTest, NativeProxySharedTransportCompletesOnFourThreads)
             "/native-concurrent-proxy", {}, {}, "127.0.0.1",
             fnd::CorrelationId{"concurrent-proxy-test"});
         ASSERT_TRUE(request);
-        completions.push_back(asio::co_spawn(io, collectAsyncProxyResponse(
+        // Exercise both actual dispatch paths for literal IPv4 and DNS.
+        // The typed strand must survive executor erasure at the call site.
+        const bool typed = targetIndex % 4U >= 2U;
+        asio::any_io_executor executor{io.get_executor()};
+        if (typed) executor = asio::make_strand(executor);
+        completions.push_back(asio::co_spawn(executor, collectAsyncProxyResponse(
             *proxy.value(), target, std::move(request).value(),
-            std::chrono::seconds{3}, result), asio::use_future));
+            std::chrono::seconds{3}, result, typed), asio::use_future));
     }
     std::vector<std::jthread> workers;
     for (std::size_t index = 0; index < 4U; ++index) {
