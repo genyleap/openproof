@@ -185,13 +185,14 @@ const std::optional<DelegatedSenderConstraint>& DelegatedAccess::senderConstrain
 
 bool DelegatedAccess::permits(std::string_view scope) const noexcept
 {
-    return scope.empty() || std::ranges::binary_search(m_scopes, std::string{scope});
+    return scope.empty() || std::binary_search(m_scopes.begin(),m_scopes.end(),scope,
+        [](std::string_view left,std::string_view right) noexcept { return left<right; });
 }
 
 bool DelegatedAccess::permitsAudience(std::string_view audience) const noexcept
 {
-    return audience.empty()
-        || std::ranges::binary_search(m_audiences, std::string{audience});
+    return audience.empty() || std::binary_search(m_audiences.begin(),m_audiences.end(),audience,
+        [](std::string_view left,std::string_view right) noexcept { return left<right; });
 }
 
 SessionService::SessionService(SessionRepository& sessions,
