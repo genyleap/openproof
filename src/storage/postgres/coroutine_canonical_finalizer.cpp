@@ -53,15 +53,26 @@ using Params = std::vector<std::optional<std::string>>;
     return duration;
 }
 
-[[nodiscard]] std::string required(const std::optional<std::string>& field)
+[[nodiscard]] const std::string& requiredRef(const std::optional<std::string>& field)
 {
     if (!field) throw std::runtime_error{"Malformed canonical identity row"};
     return *field;
 }
 
+[[nodiscard]] std::string required(const std::optional<std::string>& field)
+{
+    return requiredRef(field);
+}
+
+[[nodiscard]] std::string takeRequired(std::optional<std::string>& field)
+{
+    if (!field) throw std::runtime_error{"Malformed canonical identity row"};
+    return std::move(*field);
+}
+
 [[nodiscard]] std::int64_t milliseconds(const std::optional<std::string>& field)
 {
-    const auto value = required(field);
+    const auto& value = requiredRef(field);
     std::int64_t parsed{};
     const auto [end, error] = std::from_chars(
         value.data(), value.data() + value.size(), parsed);
@@ -73,7 +84,7 @@ using Params = std::vector<std::optional<std::string>>;
 
 [[nodiscard]] bool boolean(const std::optional<std::string>& field)
 {
-    const auto value = required(field);
+    const auto& value = requiredRef(field);
     if (value == "t") return true;
     if (value == "f") return false;
     throw std::runtime_error{"Malformed canonical profile boolean"};
@@ -868,8 +879,11 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
     })) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
-        Params params{std::move(digestHex),std::to_string(now.time_since_epoch().count()),
-            std::string{m_impl->organization.value()}};
+        Params params;
+        params.reserve(3U);
+        params.emplace_back(std::move(digestHex));
+        params.emplace_back(std::to_string(now.time_since_epoch().count()));
+        params.emplace_back(std::string{m_impl->organization.value()});
         // One statement snapshot: never assemble a grant from separately
         // observed token, lifecycle, scope or audience state. The lateral
         // union avoids the scope/audience Cartesian product.
@@ -928,14 +942,14 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         statement.append(grantJoins);
         if (selectedProfile) statement.append(profileJoin);
         statement.append(grantFilters);
-        const auto result=co_await connection.query(std::move(statement),
+        auto result=co_await connection.query(std::move(statement),
             std::move(params),remaining(deadline));
         if (result.rows.empty())
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
         const std::size_t expectedFields=selectedProfile?25U:13U;
         if (result.rows.size()>maximumGrants || result.rows.front().size()!=expectedFields)
             co_return foundation::fail(foundation::ErrorCode::Unavailable);
-        const auto& row=result.rows.front();
+        auto& row=result.rows.front();
         const auto assurance=milliseconds(row[2]);
         const auto factors=milliseconds(row[3]);
         if (assurance>4 || factors>7 || row[8].has_value()!=row[9].has_value())
@@ -949,8 +963,8 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
                 :session::DelegatedSenderConstraintKind::Mtls,*row[9]);
         }
         std::vector<std::string> scopes,audiences;
-        const Row* profileRow=nullptr;
-        for (const auto& grant:result.rows) {
+        Row* profileRow=nullptr;
+        for (auto& grant:result.rows) {
             if (grant.size()!=expectedFields || !std::equal(row.begin(),row.begin()+10,grant.begin())
                 || grant[12]!=row[12])
                 co_return foundation::fail(foundation::ErrorCode::Unavailable);
@@ -973,24 +987,26 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
             if (!grant[10] || !grant[11])
                 co_return foundation::fail(foundation::ErrorCode::Unavailable);
             const auto kind=milliseconds(grant[10]);
-            const auto& value=*grant[11];
+            auto& value=*grant[11];
             if (kind==0 && !value.empty() && value.size()<=128U
                 && std::ranges::all_of(value,[](char ch){
                     const auto byte=static_cast<unsigned char>(ch);
                     return byte==0x21U || (byte>=0x23U && byte<=0x5BU)
                         || (byte>=0x5DU && byte<=0x7EU);
                 })) {
-                scopes.push_back(value);
+                scopes.push_back(std::move(value));
             } else if (kind==1 && !value.empty() && value.size()<=2048U
                 && std::ranges::none_of(value,[](char ch){
                     const auto byte=static_cast<unsigned char>(ch);
                     return byte<0x20U || byte==0x7fU;
                 })) {
-                audiences.push_back(value);
+                audiences.push_back(std::move(value));
             } else co_return foundation::fail(foundation::ErrorCode::Unavailable);
         }
+        // All rows have been validated against the same unchanged metadata.
+        // Transfer ownership only now; no view escapes the result lifetime.
         auto authorized=session::AuthenticatedSession::fromDelegatedAccess(
-            core::IdentityId{required(row[0])},idp::ProviderId{required(row[1])},
+            core::IdentityId{takeRequired(row[0])},idp::ProviderId{takeRequired(row[1])},
             static_cast<idp::AssuranceLevel>(assurance),
             idp::AuthenticationStrength{static_cast<idp::AuthenticationFactor>(factors),boolean(row[4])},
             foundation::Instant{foundation::Duration{milliseconds(row[5])}},now,
@@ -999,7 +1015,7 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         const auto issued=foundation::Instant{foundation::Duration{milliseconds(row[12])}};
         if (issued>now || issued>=foundation::Instant{foundation::Duration{milliseconds(row[6])}})
             co_return foundation::fail(foundation::ErrorCode::Unavailable);
-        auto access=session::DelegatedAccess{std::move(authorized).value(),required(row[7]),
+        auto access=session::DelegatedAccess{std::move(authorized).value(),takeRequired(row[7]),
             std::move(scopes),std::move(audiences),std::move(sender)};
         if (profileRow) {
             // Do not restore or expose a profile unless the fully decoded
@@ -1007,14 +1023,14 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
             if (!selectedProfile || access.senderConstraint() || !access.permits("openid")
                 || (!access.permits("profile") && !access.permits("email")))
                 co_return foundation::fail(foundation::ErrorCode::Unavailable);
-            const auto& fields=*profileRow;
+            auto& fields=*profileRow;
             auto value=profile::IdentityProfile::restore(
                 access.authenticated().session().identity(),
-                text(fields,14),text(fields,15),text(fields,16),boolean(fields[17]),
-                text(fields,18),boolean(fields[19]),text(fields,20),text(fields,21),
+                std::move(fields[14]),std::move(fields[15]),std::move(fields[16]),boolean(fields[17]),
+                std::move(fields[18]),boolean(fields[19]),std::move(fields[20]),std::move(fields[21]),
                 foundation::Instant{foundation::Duration{milliseconds(fields[23])}},
                 foundation::Instant{foundation::Duration{milliseconds(fields[24])}},
-                required(fields[22]));
+                takeRequired(fields[22]));
             if (!value) co_return foundation::fail(foundation::ErrorCode::Unavailable);
             selectedProfile->emplace(std::move(value).value());
         }

@@ -2270,6 +2270,9 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_EQ(unbound->second->identity(),expected->identity());
     EXPECT_EQ(unbound->second->displayName(),expected->displayName());
     EXPECT_EQ(unbound->second->email(),expected->email());
+    EXPECT_EQ(unbound->second->preferredUsername(),expected->preferredUsername());
+    EXPECT_EQ(unbound->second->pictureUrl(),expected->pictureUrl());
+    EXPECT_EQ(unbound->second->locale(),expected->locale());
     ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes WHERE family_id=$1 AND scope='profile'",{family}));
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope) VALUES($1,'email')",{family}));
     auto emailOnly=userInfo(native,digest);
@@ -2284,6 +2287,7 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     auto senderBound=userInfo(native,digest);
     ASSERT_TRUE(senderBound);
     ASSERT_TRUE(senderBound->first.senderConstraint());
+    EXPECT_EQ(senderBound->first.senderConstraint()->value(),"fixture");
     EXPECT_FALSE(senderBound->second.has_value()); // Never read claims before sender proof.
     ASSERT_NO_THROW(sql("UPDATE openproof.oauth_token_families SET sender_constraint_kind=NULL,"
         "sender_constraint_value=NULL WHERE id=$1",{family}));
@@ -2340,10 +2344,19 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_EQ(context->audiences().size(),2U);
     EXPECT_TRUE(context->permits("gateway.read"));
     EXPECT_TRUE(context->permitsAudience("https://gateway.example.test"));
+    EXPECT_TRUE(context->permitsAudience("https://other.example.test"));
     EXPECT_FALSE(context->permitsAudience("https://wrong.example.test"));
     EXPECT_FALSE(context->senderConstraint());
+    // Exercise both heap-owned strings and vector growth at the exact cap.
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope)"
-        " SELECT $1,'bounded-'||n FROM generate_series(1,257) n",{family}));
+        " SELECT $1,'bounded-'||repeat('a',40)||n FROM generate_series(1,252) n",{family}));
+    auto bounded=readContext();
+    ASSERT_TRUE(bounded);
+    EXPECT_EQ(bounded->scopes().size(),254U);
+    EXPECT_EQ(bounded->audiences().size(),2U);
+    EXPECT_TRUE(bounded->permits("bounded-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa252"));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope)"
+        " VALUES($1,'bounded-overflow')",{family}));
     EXPECT_FALSE(readContext());
     ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes"
         " WHERE family_id=$1 AND scope LIKE 'bounded-%'",{family}));
