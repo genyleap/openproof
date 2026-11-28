@@ -60,7 +60,8 @@ test("introspection requires confidential client and erases raw form credentials
   for(const term of ["co_await m_impl->pool.acquire","a.organization_id=$2","o.state=0",
     "c.status=0 AND a.status=0 AND c.kind IN (0,3)","security::constantTimeEquals"])
     assert.ok(client.includes(term),term);
-  assert.match(sql,/g.kind,g.value,t.issued_at_ms/);
+  assert.match(sql,/g.kind,g.value,f.issued_at_ms/);
+  assert.match(sql,/WITH eligible_token AS MATERIALIZED/);
   assert.match(sql,/if \(issuedAt\) \*issuedAt=issued/);
   assert.match(read("tests/oauth_native_consent_test.cpp"),/ScopedUserInfoAndAuthenticatedIntrospectionNeverUseLegacy/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/authenticateClient\(foreign,clientProof\)/);
