@@ -232,6 +232,19 @@ target_link_libraries(openproof_postgres_async_canonical PUBLIC
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(coroutine_canonical_finalizer.cpp coroutine_authorization_audit.cpp coroutine_admin_store.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
+    # Isolated follow-up to the measured libpq transport CPU reduction.
+    # Keep the default workaround on other units and preserve every warning.
+    option(OPENPROOF_EXPERIMENTAL_CANONICAL_SQL_LIMITED_INLINING
+        "Qualify narrower canonical SQL inlining flags" OFF)
+    if(OPENPROOF_EXPERIMENTAL_CANONICAL_SQL_LIMITED_INLINING)
+        if(NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo"
+           OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16"
+           OR CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "17")
+            message(FATAL_ERROR "Canonical SQL inlining qualification requires GCC 16 RelWithDebInfo")
+        endif()
+        set_source_files_properties(coroutine_canonical_finalizer.cpp PROPERTIES COMPILE_OPTIONS
+            "-fno-inline-small-functions;-fno-inline-functions-called-once;-fno-early-inlining")
+    endif()
 endif()
 
 add_library(openproof_postgres_async_consent STATIC coroutine_consent_store.cpp)
