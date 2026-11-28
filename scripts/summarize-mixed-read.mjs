@@ -117,6 +117,8 @@ if(statementProbe || statementRecords.length>0) {
   for(const r of records) {
     validateStatementMetrics(r.postgresStatementMetrics);
     assert.ok(r.postgresStatementMetrics.calls>0);
+    assert.ok(r.postgresStatementMetrics.plans>0 && r.postgresStatementMetrics.planningMs>0,
+      "Missing real PostgreSQL planning attribution");
   }
 }
 const postgresStatementComparison=statementRecords.length===records.length
