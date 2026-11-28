@@ -29,8 +29,10 @@ struct PoolPermitDeleter final {
 
 // Internal, bounded coroutine pool. A channel token represents exactly one
 // exclusive connection slot, even when its physical PGconn must be replaced.
-// No condition_variable or blocking pool wait is permitted on the reactor.
+// Recycled slots remain unavailable until their bounded asynchronous reset
+// completes. No condition_variable or blocking pool wait is permitted.
 // Must outlive in-progress acquire() calls; leases can outlive the pool owner.
+// The configured executor must outlive leases and queued reset operations.
 class AsyncConnectionPool final {
     struct State;
 public:
@@ -67,7 +69,8 @@ public:
     [[nodiscard]] boost::asio::awaitable<Lease> acquire();
 
     // Operation-wide monotonic deadline: cap queue admission, connection
-    // establishment and session reset against the SAME caller budget.
+    // establishment against the SAME caller budget. A recycled slot is
+    // admitted only after its independently bounded reset completes.
     // Existing callers retain acquire() compatibility behavior.
     [[nodiscard]] boost::asio::awaitable<Lease> acquire(
         std::chrono::steady_clock::time_point deadline);

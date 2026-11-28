@@ -10,6 +10,7 @@
 #include <exception>
 #include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -116,8 +117,14 @@ asio::awaitable<void> recycledLeaseClearsSessionState(
     pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
         std::move(connectionString), 1U, 1s, 2s};
     constexpr auto marker = "openproof_previous_tenant_marker";
+    std::optional<std::string> backend;
     {
         auto first = co_await pool.acquire();
+        const auto pid = co_await first.connection().query(
+            "SELECT pg_backend_pid()::text", {}, 2s);
+        backend = pid.rows.at(0).at(0);
+        static_cast<void>(co_await first.connection().query(
+            "CREATE TEMP TABLE openproof_previous_tenant_temp (value integer)", {}, 2s));
         static_cast<void>(co_await first.connection().query(
             "SET application_name = 'openproof_previous_tenant_marker'", {}, 2s));
         const auto before = co_await first.connection().query(
@@ -127,8 +134,43 @@ asio::awaitable<void> recycledLeaseClearsSessionState(
     auto next = co_await pool.acquire();
     const auto after = co_await next.connection().query(
         "SELECT current_setting('application_name')", {}, 2s);
+    const auto session = co_await next.connection().query(
+        "SELECT pg_backend_pid()::text, "
+        "to_regclass('pg_temp.openproof_previous_tenant_temp') IS NULL", {}, 2s);
     cleared = after.rows.size() == 1U && after.rows[0].size() == 1U
-        && after.rows[0][0] != marker && next.connection().reusable();
+        && after.rows[0][0] != marker && next.connection().reusable()
+        && backend.has_value() && session.rows.at(0).at(0) == backend
+        && session.rows.at(0).at(1) == "t";
+}
+
+// A disconnected dirty session must never be published as a clean slot.
+asio::awaitable<void> terminatedBackendRestoresCapacity(std::string connectionString)
+{
+    pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
+        std::move(connectionString), 2U, 2s, 2s};
+    auto observer = co_await pool.acquire();
+    std::optional<std::string> previousPid;
+    {
+        auto dirty = co_await pool.acquire();
+        const auto pid = co_await dirty.connection().query(
+            "SELECT pg_backend_pid()::text", {}, 2s);
+        previousPid = pid.rows.at(0).at(0);
+        if (!previousPid) throw std::runtime_error{"Missing disposable backend PID"};
+        static_cast<void>(co_await dirty.connection().query(
+            "SET application_name = 'openproof_previous_tenant_marker'", {}, 2s));
+        std::vector<std::optional<std::string>> params{previousPid};
+        const auto terminated = co_await observer.connection().query(
+            "SELECT pg_terminate_backend($1::integer)", std::move(params), 2s);
+        EXPECT_EQ(terminated.rows.at(0).at(0), "t");
+    }
+    // The observer retains the other slot. Only recovery of the discarded
+    // slot can satisfy this acquisition.
+    auto replacement = co_await pool.acquire();
+    const auto rows = co_await replacement.connection().query(
+        "SELECT pg_backend_pid()::text, current_setting('application_name')", {}, 2s);
+    EXPECT_NE(rows.rows.at(0).at(0), previousPid);
+    EXPECT_NE(rows.rows.at(0).at(1), "openproof_previous_tenant_marker");
+    EXPECT_TRUE(replacement.connection().reusable());
 }
 
 asio::awaitable<void> uncommittedLeaseIsReplaced(
@@ -334,6 +376,20 @@ TEST(PostgresAsyncPoolTest, RecycledConnectionClearsPriorTenantSessionState)
     io.run();
     ASSERT_NO_THROW(done.get());
     EXPECT_TRUE(cleared);
+}
+
+TEST(PostgresAsyncPoolTest, TerminatedBackendRestoresCapacityWithoutDirtyReuse)
+{
+    const char* connectionString = disposableDatabase();
+    if (!connectionString || !*connectionString) {
+        requireDisposableDatabase();
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    asio::io_context io;
+    auto done = asio::co_spawn(io, terminatedBackendRestoresCapacity(connectionString),
+        asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
 }
 
 TEST(PostgresAsyncPoolTest, OpenTransactionCannotLeakIntoNextLease)

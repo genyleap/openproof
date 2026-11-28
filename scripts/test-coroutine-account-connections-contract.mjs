@@ -278,13 +278,19 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /co_await waiter->timer\.async_wait/);
   assert.match(implementation, /cancellation\.cancelled\(\) != asio::cancellation_type::none/);
   assert.match(implementation, /if \(!permit\) \{[\s\S]*?State::waitForPermit\(state, admissionDeadline\)/);
-  assert.match(implementation, /m_state->notifyWaiter\(\)/);
+  assert.match(implementation, /state->notifyWaiter\(\)/);
   assert.doesNotMatch(implementation, /retryInterval|retryTimer/);
   assert.match(implementation, /"DISCARD ALL"/);
   assert.doesNotMatch(implementation, /slots\.async_receive\(/);
   assert.match(implementation, /auto connection = std::move\(slot->connection\)/);
-  assert.match(implementation, /slot->connection = std::move\(m_connection\)/);
-  assert.match(implementation, /if \(!returned\) std::terminate\(\)/);
+  assert.match(implementation, /struct SanitizingSlot final/);
+  assert.match(implementation, /State::sanitize\(std::move\(pending\)\)/);
+  assert.match(implementation, /reset.commandTag == "DISCARD ALL" && reset.rows.empty\(\)/);
+  assert.match(implementation, /slot->connection = std::move\(pending.connection\)/);
+  assert.ok(implementation.indexOf("pending.connection.reset();") <
+    implementation.indexOf("pending.permit.reset();"));
+  const admission = implementation.slice(implementation.indexOf("AsyncConnectionPool::acquireImpl("));
+  assert.doesNotMatch(admission, /"DISCARD ALL"/);
   assert.doesNotMatch(implementation, /std::condition_variable/);
 });
 

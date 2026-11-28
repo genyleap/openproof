@@ -2,6 +2,7 @@
 
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/cancellation_state.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
@@ -61,6 +62,34 @@ struct AsyncConnectionPool::State final : std::enable_shared_from_this<State> {
             std::terminate();
         }
         state->notifyWaiter();
+    }
+
+    // A dirty connection and its permit travel together until reset succeeds.
+    // Member destruction closes a dirty PGconn before recovering its permit,
+    // even when co_spawn fails or executor shutdown destroys a queued frame.
+    struct SanitizingSlot final {
+        std::shared_ptr<State> state;
+        SlotToken permit;
+        std::unique_ptr<AsyncConnection> connection;
+    };
+
+    static asio::awaitable<void> sanitize(SanitizingSlot pending)
+    {
+        try {
+            const auto reset = co_await pending.connection->query(
+                "DISCARD ALL", {}, pending.state->connectTimeout);
+            if (reset.commandTag == "DISCARD ALL" && reset.rows.empty()
+                && pending.connection->reusable()) {
+                auto* slot = static_cast<Slot*>(pending.permit.get());
+                slot->connection = std::move(pending.connection);
+            }
+        } catch (...) {
+            // Reset failure or cancellation is never a reusable session.
+        }
+        pending.connection.reset();
+        // Publish only a proven clean connection or an empty reconnect slot.
+        // Keep State alive through permit recovery and waiter notification.
+        pending.permit.reset();
     }
 
     // The wait queue carries notifications only, never exclusive permits.
@@ -229,18 +258,24 @@ AsyncConnectionPool::Lease::Lease(
 AsyncConnectionPool::Lease::~Lease() noexcept
 {
     if (!m_state) return;
-    // Every acquired permit must return even if connect/query throws. Poisoned
-    // or aborted transactions become null slots, never an inherited PGconn.
-    if (m_connection && !m_connection->reusable()) m_connection.reset();
-    auto* slot = static_cast<State::Slot*>(m_permit.get());
-    if (!slot) std::terminate();
-    slot->connection = std::move(m_connection);
-    const bool returned = m_state->slots.try_send(
-        boost::system::error_code{}, std::move(m_permit));
-    // If channel lifetime/slot accounting breaks, fail closed rather than
-    // accidentally sharing the same physical connection with another lease.
-    if (!returned) std::terminate();
-    m_state->notifyWaiter();
+    // A reusable PGconn is still dirty: transaction-idle is not evidence
+    // of tenant isolation. Never publish it until the async reset finishes.
+    if (!m_connection || !m_connection->reusable()) {
+        m_connection.reset();
+        m_permit.reset();
+        return;
+    }
+    State::SanitizingSlot pending{m_state, std::move(m_permit),
+        std::move(m_connection)};
+    try {
+        // One bounded operation per exclusive slot, not an unbounded queue.
+        // Use the pool's executor rather than the completed request's strand.
+        auto executor = asio::make_strand(m_state->slots.get_executor());
+        asio::co_spawn(executor, State::sanitize(std::move(pending)), asio::detached);
+    } catch (...) {
+        // The RAII pending slot drops the dirty connection before recovering
+        // capacity if scheduling fails. No exception leaves the destructor.
+    }
 }
 
 AsyncConnection& AsyncConnectionPool::Lease::connection() const noexcept
@@ -332,19 +367,9 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         // the local lease reissues a null permit from its noexcept destructor.
         lease.m_connection = co_await AsyncConnection::connect(
             state->connectionString, bounded(state->connectTimeout));
-    } else {
-        // PQTRANS_IDLE does not prove session isolation: SET ROLE, session
-        // GUCs, temporary objects and advisory locks can outlive COMMIT.
-        // Reset every recycled connection *before* returning it to a new
-        // tenant, using the same nonblocking SQL transport and a deadline.
-        try {
-            static_cast<void>(co_await lease.m_connection->query(
-                "DISCARD ALL", {}, bounded(state->connectTimeout)));
-        } catch (...) {
-            lease.m_connection.reset();
-            throw std::runtime_error{"Async PostgreSQL session reset failed"};
-        }
     }
+    // Recycled slots contain only a completed reset, never an in-flight
+    // sanitizer. A dirty slot cannot be received until its permit returns.
     // Avoid handing a connection to the caller after its total budget has
     // expired. The lease destructor returns the permit (or drops a poisoned
     // PGconn), so a timeout cannot leak pool capacity.
