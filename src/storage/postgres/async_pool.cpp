@@ -278,10 +278,29 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire(
     return acquireImpl(deadline);
 }
 
+asio::awaitable<bool> AsyncConnectionPool::probeReadiness(
+    std::chrono::steady_clock::time_point deadline)
+{
+    bool resetConfirmed = false;
+    auto lease = co_await acquireImpl(deadline, &resetConfirmed);
+    if (resetConfirmed) co_return true;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) co_return false;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    if (remaining <= std::chrono::milliseconds::zero()) co_return false;
+    const auto rows = co_await lease.connection().query("SELECT 1", {}, remaining);
+    co_return rows.commandTag == "SELECT 1" && rows.rows.size() == 1U
+        && rows.rows.front().size() == 1U
+        && rows.rows.front().front() == std::optional<std::string>{"1"}
+        && lease.connection().reusable()
+        && std::chrono::steady_clock::now() < deadline;
+}
+
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
-    std::optional<std::chrono::steady_clock::time_point> deadline)
+    std::optional<std::chrono::steady_clock::time_point> deadline, bool* resetConfirmed)
 {
     auto state = m_state;
+    if (resetConfirmed) *resetConfirmed = false;
     // A caller-level deadline must never be restarted between different
     // stages of acquiring a reusable connection. Reject an expired deadline
     // before touching the channel or initiating any network operation.
@@ -338,8 +357,12 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
         // Reset every recycled connection *before* returning it to a new
         // tenant, using the same nonblocking SQL transport and a deadline.
         try {
-            static_cast<void>(co_await lease.m_connection->query(
-                "DISCARD ALL", {}, bounded(state->connectTimeout)));
+            const auto reset = co_await lease.m_connection->query(
+                "DISCARD ALL", {}, bounded(state->connectTimeout));
+            if (reset.commandTag != "DISCARD ALL" || !reset.rows.empty()
+                || !lease.m_connection->reusable())
+                throw std::runtime_error{"Unexpected PostgreSQL session reset result"};
+            if (resetConfirmed) *resetConfirmed = true;
         } catch (...) {
             lease.m_connection.reset();
             throw std::runtime_error{"Async PostgreSQL session reset failed"};
