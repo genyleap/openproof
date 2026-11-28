@@ -211,9 +211,19 @@ test("liveness has no SQL dependency and readiness is bounded and fail-closed",(
   }
   const probe=store.slice(store.indexOf("CoroutinePostgresCanonicalFinalizer::healthCheckAsync("));
   assert.match(probe,/Clock::now\(\)\+m_impl->queryTimeout/);
-  assert.match(probe,/co_await m_impl->pool.acquire\(deadline\)/);
-  assert.match(probe,/co_await lease.connection\(\).query\("SELECT 1",\{\},remaining\(deadline\)\)/);
-  assert.match(probe,/rows.rows.front\(\).front\(\)!=std::optional<std::string>\{"1"\}/);
+  assert.match(probe,/co_await m_impl->pool.probeReadiness\(deadline\)/);
+  const pool=read("src/storage/postgres/async_pool.cpp");
+  const ready=pool.slice(pool.indexOf("AsyncConnectionPool::probeReadiness("),pool.indexOf("AsyncConnectionPool::acquireImpl("));
+  assert.match(ready,/co_await acquireImpl\(deadline, &resetConfirmed\)/);
+  assert.match(ready,/if \(resetConfirmed\) co_return true;/);
+  assert.match(ready,/co_await lease.connection\(\).query\("SELECT 1", \{\}, remaining\)/);
+  assert.match(ready,/rows.rows.front\(\).front\(\) == std::optional<std::string>\{"1"\}/);
+  const acquire=pool.slice(pool.indexOf("AsyncConnectionPool::acquireImpl("));
+  const reset=acquire.indexOf('"DISCARD ALL", {}, bounded(state->connectTimeout)');
+  assert.ok(reset>=0);
+  assert.ok(acquire.indexOf('reset.commandTag != "DISCARD ALL"',reset)>reset);
+  assert.ok(acquire.indexOf('*resetConfirmed = true',reset)>reset);
+  assert.match(acquire,/lease.m_connection.reset\(\);/);
   assert.doesNotMatch(cppExecutableText(probe),/PQexec|PQconnectdb|PQreset|wait_for\(/);
   assert.match(read("tests/operations/coroutine_health_test.cpp"),/ReadinessAwaitsDependencyAndLivenessNeverTouchesStorage/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/RealDatabaseNativeReadinessChecksActualPool/);
