@@ -1780,13 +1780,25 @@ async function main() {
         body: introspectionForm.toString(),
       }) },
     ];
+    const isolatedRoute=process.env.OPENPROOF_E2E_ISOLATED_ROUTE;
+    let measuredOperations=mixedOperations;
+    if (isolatedRoute!==undefined) {
+      if (process.env.GITHUB_ACTIONS!=="true" || process.env.RUNNER_ENVIRONMENT!=="github-hosted"
+          || databaseAck!=="YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
+          || !/^opp_e2e_route_[0-9_]+(?:baseline|candidate)$/.test(databaseName)
+          || holdOpen || !metricsFile)
+        fail("Isolated route attribution requires an acknowledged disposable hosted CI fixture");
+      measuredOperations=mixedOperations.filter(operation=>operation.name===isolatedRoute);
+      assert.equal(measuredOperations.length,1,"Unknown isolated route");
+    }
     if (mixedLoadWarmup > 0)
-      await concurrentSmoke(mixedOperations, mixedLoadWarmup, mixedLoadConcurrency, validateMixedRead);
+      await concurrentSmoke(measuredOperations, mixedLoadWarmup, mixedLoadConcurrency, validateMixedRead);
     if (metricsFile && mixedLoadRequests <= 10000)
       edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
     connections.begin();
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
-    loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
+    loadResult = await concurrentSmoke(measuredOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
+    if (isolatedRoute!==undefined) loadResult.isolatedRoute=isolatedRoute;
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     connectionMetrics = connections.finish(loadResult.requests);
     edgePhaseMetrics = edgePhaseCollector?.report();
@@ -2033,7 +2045,7 @@ async function main() {
     if (metricsFile) {
       // Only non-sensitive aggregate metrics; no tokens, passwords or addresses.
       fs.writeFileSync(metricsFile, JSON.stringify({
-        benchmark: "openproof-isolated-e2e-mixed-read",
+        benchmark: loadResult.isolatedRoute ? "openproof-isolated-e2e-route-attribution" : "openproof-isolated-e2e-mixed-read",
         commit: process.env.OPENPROOF_E2E_COMMIT ?? process.env.GITHUB_SHA ?? "local",
         timestamp: new Date().toISOString(),
         ...loadResult,
