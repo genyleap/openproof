@@ -16,10 +16,12 @@ export async function profileMixedRead({pid,perf,output,work}) {
   const data=path.join(dir,"perf.data");
   let child,closed,reader;
   try {
-    // cpu-clock counts nanoseconds. Use a fixed 1 ms event period rather
-    // than adaptive frequency, which can be throttled on shared VMs.
-    child=spawn(perf,["record","-e","cpu-clock:u","-c","1000000",
-      "-p",String(pid),"-D","-1","--control=fd:3,4",
+    // task-clock counts scheduled task CPU time in nanoseconds. Start
+    // recording immediately, avoiding the disabled-at-start event path.
+    // A control ping barriers readiness before the workload. A fixed 1 ms
+    // period limits sampling overhead; idle attach/teardown are diagnostic only.
+    child=spawn(perf,["record","-e","task-clock:u","-c","1000000",
+      "-p",String(pid),"--control=fd:3,4",
       "--no-buildid-cache","-o",data],
       {stdio:["ignore","ignore","ignore","pipe","pipe"]});
     // Always observe child closure, even when the spawn fails.
@@ -55,7 +57,7 @@ export async function profileMixedRead({pid,perf,output,work}) {
         if(onError) child.stdio[3].off("error",onError);
       }
     };
-    await send("enable");
+    await send("ping");
     const result=await work();
     await send("disable");
     // Linux perf record re-raises SIGINT from its atexit handler.
