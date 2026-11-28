@@ -345,9 +345,8 @@ public:
                     // The reactor frame must never retain a strand owned by
                     // the worker context: shutdown destroys that context
                     // before the reactor discards suspended readRequest frames.
-                    wire = co_await asio::co_spawn(m_owner->m_handlerPool.get_executor(),
-                        dispatchOnWorker(std::move(*operation), version, headRequest),
-                        asio::use_awaitable);
+                    wire = co_await dispatchWorkerOperation(
+                        std::move(*operation), version, headRequest);
                 }
                 operation.reset();
                 if (!m_owner->m_running.load(std::memory_order_acquire)) co_return;
@@ -356,6 +355,39 @@ public:
             // Completion is associated with this coroutine's executor, the
             // connection strand. No handler worker touches the Beast stream.
             co_await writeResponse(headRequest);
+        }
+
+        // Ordinary initiating function: no worker executor or strand is
+        // captured by the reactor's suspended use_awaitable frame.
+        asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchWorkerOperation(
+            HttpRequest operation, unsigned int version, bool headRequest)
+        {
+            using Wire = beastHttp::response<beastHttp::string_body>;
+            return asio::async_initiate<decltype(asio::use_awaitable),
+                void(std::exception_ptr, Wire)>(
+                [this](auto completion, HttpRequest request, unsigned int requestVersion,
+                       bool requestHead) {
+                    // co_spawn may install a cancellation handler containing
+                    // its executor into a connected upstream cancellation
+                    // slot. Keep the proven two-stage path in that case so
+                    // a worker-owned strand cannot escape into the reactor.
+                    if (asio::get_associated_cancellation_slot(completion).is_connected()) {
+                        asio::co_spawn(m_owner->m_handlerPool.get_executor(),
+                            dispatchOnWorker(std::move(request), requestVersion, requestHead),
+                            std::move(completion));
+                        return;
+                    }
+                    // Eager initiation with an actual completion handler,
+                    // not a lazy use_awaitable token: this local strand
+                    // dies before initiation returns. The worker owns the
+                    // remaining strand references; completion resumes on
+                    // the original handler's associated socket executor.
+                    auto requestStrand = asio::make_strand(
+                        asio::any_io_executor{m_owner->m_handlerPool.get_executor()});
+                    asio::co_spawn(requestStrand,
+                        dispatchHandler(std::move(request), requestVersion, requestHead),
+                        std::move(completion));
+                }, asio::use_awaitable, std::move(operation), version, headRequest);
         }
 
         asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker(
