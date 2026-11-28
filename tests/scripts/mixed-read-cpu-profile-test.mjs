@@ -26,7 +26,7 @@ if(process.argv[2]==="record") {
     process.kill(process.pid,"SIGINT");
   });
   control.on("line",line=>{
-    if(line==="enable"||line==="disable"||line==="stop") fs.writeSync(4,"ack\\n\\0");
+    if(line==="ping"||line==="disable"||line==="stop") fs.writeSync(4,"ack\\n\\0");
     if(line==="stop"){
       control.close();
       socket.destroy();
@@ -36,7 +36,7 @@ if(process.argv[2]==="record") {
   });
 } else if(process.argv[2]==="report") {
   const count=process.env.TEST_PERF_LOW_COUNT==="1"?"4":"1K";
-  console.log("# Samples: "+count+" of event 'cpu-clock:u'");
+  console.log("# Samples: "+count+" of event 'task-clock:u'");
   console.log("# Event count (approx.): 1000000");
   console.log("    80.00%  800  opp  [.] example");
   console.log("discard this extra diagnostic");
