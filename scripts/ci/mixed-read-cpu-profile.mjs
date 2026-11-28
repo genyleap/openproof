@@ -16,7 +16,9 @@ export async function profileMixedRead({pid,perf,output,work}) {
   const data=path.join(dir,"perf.data");
   let child,closed,reader;
   try {
-    child=spawn(perf,["record","-e","cpu-clock:u","-F","997",
+    // cpu-clock counts nanoseconds. Use a fixed 1 ms event period rather
+    // than adaptive frequency, which can be throttled on shared VMs.
+    child=spawn(perf,["record","-e","cpu-clock:u","-c","1000000",
       "-p",String(pid),"-D","-1","--control=fd:3,4",
       "--no-buildid-cache","-o",data],
       {stdio:["ignore","ignore","ignore","pipe","pipe"]});
@@ -77,7 +79,9 @@ export async function profileMixedRead({pid,perf,output,work}) {
     const samples=report.stdout.match(/Samples:\s*([0-9.]+)([KkMm]?)\s/);
     assert.ok(samples,"perf report lacks parseable sample count");
     const multiplier={k:1000,m:1000000}[samples[2].toLowerCase()]??1;
-    assert.ok(Number(samples[1])*multiplier>=500,"insufficient CPU samples");
+    const sampleCount=Number(samples[1])*multiplier;
+    assert.ok(Number.isFinite(sampleCount) && sampleCount>=500,
+      `insufficient CPU samples (${sampleCount}; minimum 500)`);
     // Only event/sample summaries and histogram rows are retained.
     const filtered=report.stdout.split("\n").filter(line=>
       /^#\s+(Samples:|Event count|Overhead|Lost)/.test(line) ||
