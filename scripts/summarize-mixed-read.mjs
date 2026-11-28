@@ -6,9 +6,11 @@ import fs from "node:fs";
 import path from "node:path";
 import {validateConnectionMetrics,connectionLegs} from "./ci/mixed-read-connections.mjs";
 
-const [dir, baselineCommit, candidateCommit, load] = process.argv.slice(2);
-assert.ok(process.argv.length === 5 || process.argv.length === 6);
+const [dir, baselineCommit, candidateCommit, load, comparison] = process.argv.slice(2);
+assert.ok(process.argv.length >= 5 && process.argv.length <= 7);
 const matrix = load !== undefined;
+assert.ok(comparison === undefined || (matrix && comparison === "native-native"), "Unsupported comparison");
+const nativePair = comparison === "native-native";
 if (matrix) assert.ok(["1","8","32","128"].includes(load), "Unsupported matrix load");
 const concurrency = matrix ? Number(load) : 24;
 const requests = matrix ? 1536 : 600;
@@ -33,7 +35,7 @@ function validate(record, commit) {
   if (matrix) {
     assert.equal(record.normalizedResponseChecks,requests,"Missing normalized response evidence");
     validateConnectionMetrics(record.connectionMetrics,requests);
-    assert.equal(record.executionProfile?.name,commit===candidateCommit?"minimal":"auto","Execution profile mismatch");
+    assert.equal(record.executionProfile?.name,nativePair || commit===candidateCommit?"minimal":"auto","Execution profile mismatch");
   }
   for (const key of fields) {
     assert.ok(Number.isFinite(record[key]) && (key==="serverCpuTicksDelta" ? record[key]>=0 : record[key]>0),
@@ -111,7 +113,7 @@ const edgePhaseComparison = records.every(validEdge)
   : null;
 const report={benchmark:"openproof-isolated-e2e-mixed-read",baselineCommit,candidateCommit,
   pairCount,requestsPerRun:requests,concurrency,
-  ...(matrix ? {warmupRequests} : {}),
+  ...(matrix ? {warmupRequests,comparison:nativePair?"native-native":"historical-native"} : {}),
   metrics:Object.fromEntries(fields.map(k=>[k,summarize(k)])),
   diagnosticMetrics,
   ...(matrix ? {connectionMetrics:Object.fromEntries(connectionLegs.map(leg=>[leg,Object.fromEntries(["assignments","distinctSockets","firstSeenSockets","reusedAssignments"].map(key=>[key,summarize(key,r=>r.connectionMetrics[leg])]))]))} : {}),
