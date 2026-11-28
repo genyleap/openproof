@@ -61,7 +61,13 @@ test("introspection requires confidential client and erases raw form credentials
     "c.status=0 AND a.status=0 AND c.kind IN (0,3)","security::constantTimeEquals"])
     assert.ok(client.includes(term),term);
   assert.match(sql,/g.kind,g.value,t.issued_at_ms/);
-  assert.match(sql,/if \(issuedAt\) \*issuedAt=issued/);
+  const decoder=read("src/storage/postgres/delegated_access_decode.cpp");
+  assert.match(sql,/co_return decodeDelegatedAccess\(result,now,issuedAt,selectedProfile\)/);
+  assert.match(decoder,/if \(issuedAt\) \*issuedAt=issued/);
+  assert.match(decoder,/result.rows.size\(\)>maximumGrants/);
+  assert.match(decoder,/access.senderConstraint\(\) \|\| !access.permits\("openid"\)/);
+  assert.match(decoder,/std::equal\(row.begin\(\),row.begin\(\)\+10,grant.begin\(\)\)/);
+  assert.doesNotMatch(cppExecutableText(decoder),/co_await|co_return|PQexec/);
   assert.match(read("tests/oauth_native_consent_test.cpp"),/ScopedUserInfoAndAuthenticatedIntrospectionNeverUseLegacy/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/authenticateClient\(foreign,clientProof\)/);
   assert.match(read("scripts/e2e-identity-platform.mjs"),/claims.exp>claims.iat/);
