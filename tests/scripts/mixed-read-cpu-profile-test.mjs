@@ -27,7 +27,7 @@ if(process.argv[2]==="record") {
     process.exit(0);
   });
   control.on("line",line=>{
-    if(line==="enable"||line==="disable") fs.writeSync(4,"ack\\n");
+    if(line==="enable"||line==="disable") fs.writeSync(4,"ack\\n\\0");
   });
 } else if(process.argv[2]==="report") {
   const count=process.env.TEST_PERF_LOW_COUNT==="1"?"4":"1K";
