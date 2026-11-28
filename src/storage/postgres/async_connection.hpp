@@ -63,7 +63,9 @@ private:
         std::string connectionString, std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<QueryRows> querySerialized(
         std::string sql, std::vector<std::optional<std::string>> params,
-        std::chrono::steady_clock::time_point deadline,bool migrationScript=false);
+        std::chrono::milliseconds timeout,
+        std::optional<std::chrono::steady_clock::time_point> inheritedDeadline = std::nullopt,
+        bool migrationScript=false);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
