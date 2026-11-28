@@ -215,7 +215,7 @@ test("liveness has no SQL dependency and readiness is bounded and fail-closed",(
   const pool=read("src/storage/postgres/async_pool.cpp");
   const ready=pool.slice(pool.indexOf("AsyncConnectionPool::probeReadiness("),pool.indexOf("AsyncConnectionPool::acquireImpl("));
   assert.match(ready,/co_await acquireImpl\(deadline, &resetConfirmed\)/);
-  assert.match(ready,/if \(resetConfirmed\) co_return true;/);
+  assert.match(ready,/if \(resetConfirmed\)\s+co_return lease.connection\(\).reusable\(\) && std::chrono::steady_clock::now\(\) < deadline;/);
   assert.match(ready,/co_await lease.connection\(\).query\("SELECT 1", \{\}, remaining\)/);
   assert.match(ready,/rows.rows.front\(\).front\(\) == std::optional<std::string>\{"1"\}/);
   const acquire=pool.slice(pool.indexOf("AsyncConnectionPool::acquireImpl("));
