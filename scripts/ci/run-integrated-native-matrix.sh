@@ -12,7 +12,7 @@ case "$mode" in
     loads=(1 8 32 128)
     ;;
   native-native)
-    BASE_SHA=c18450e405aabe88abb41f9edf367b6dc8f669f1
+    BASE_SHA=65918aaf71879b5754dc33bdc9b51421173c218e
     BASE_DIR="${RUNNER_TEMP:?}/openproof-postgres-inline-native-control"
     loads=(1 8 32 128)
     git -C "$ROOT" fetch --no-tags --depth=1 origin "$BASE_SHA"
@@ -39,7 +39,7 @@ if [[ "$mode" == native-native ]]; then
     grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
 fi
 OUT="$ROOT/integrated-native-matrix"
-if [[ "$mode" == native-native ]]; then OUT="$ROOT/bounded-access-planner-matrix"; fi
+if [[ "$mode" == native-native ]]; then OUT="$ROOT/native-access-row-ownership-matrix"; fi
 mkdir "$OUT"
 printf 'baseline_commit=%s\ncandidate_commit=%s\n' "$BASE_SHA" "$GITHUB_SHA" > "$OUT/provenance.txt"
 sha256sum "$BASE" "$CAND" >> "$OUT/provenance.txt"
