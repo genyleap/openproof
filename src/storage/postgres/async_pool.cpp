@@ -283,7 +283,8 @@ asio::awaitable<bool> AsyncConnectionPool::probeReadiness(
 {
     bool resetConfirmed = false;
     auto lease = co_await acquireImpl(deadline, &resetConfirmed);
-    if (resetConfirmed) co_return true;
+    if (resetConfirmed)
+        co_return lease.connection().reusable() && std::chrono::steady_clock::now() < deadline;
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) co_return false;
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
