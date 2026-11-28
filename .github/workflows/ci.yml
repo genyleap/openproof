@@ -37,6 +37,40 @@ jobs:
       - name: CPU profile collector contract
         run: node tests/scripts/mixed-read-cpu-profile-test.mjs
         timeout-minutes: 2
+      - name: Real perf control and symbol-report preflight
+        if: github.head_ref == 'perf/cpu-hotspot-attribution-20261128' && runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          previous="$(sysctl -n kernel.perf_event_paranoid)"
+          temp="$(mktemp -d)"
+          trap 'sudo sysctl -q -w "kernel.perf_event_paranoid=$previous"; rm -rf "$temp"' EXIT
+          sudo sysctl -q -w kernel.perf_event_paranoid=1
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common linux-tools-generic
+          perf_bin=""
+          while IFS= read -r candidate; do
+            if "$candidate" stat -e cpu-clock:u -- true >/dev/null 2>&1; then
+              perf_bin="$candidate"
+              break
+            fi
+          done < <(find /usr/lib/linux-tools -name perf -executable | sort -Vr)
+          test -n "$perf_bin"
+          node --input-type=module - "$perf_bin" "$temp/report.txt" <<'NODE'
+          import assert from "node:assert/strict";
+          import {profileMixedRead} from "./scripts/ci/mixed-read-cpu-profile.mjs";
+          const [, , perf, output] = process.argv;
+          const result=await profileMixedRead({pid:process.pid,perf,output,work:async()=>{
+            const start=process.cpuUsage();
+            const deadline=performance.now()+8000;
+            let n=0;
+            while(process.cpuUsage(start).user<1500000 && performance.now()<deadline) {
+              for(let i=0;i<10000;i++) n=(n+Math.sqrt(i+1))%100000;
+            }
+            return Number.isFinite(n);
+          }});
+          assert.equal(result,true);
+          console.log("Real perf control and symbol-report preflight: PASSED");
+          NODE
       - name: PostgreSQL statement metrics contract
         run: node tests/scripts/postgres-statement-metrics-test.mjs
       - name: Protocol independence gate
