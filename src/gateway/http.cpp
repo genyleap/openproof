@@ -158,11 +158,27 @@ bool ServerConfig::trustProxyClientIp() const noexcept { return m_trustProxyClie
 bool ServerConfig::reactorPublicReads() const noexcept { return m_reactorPublicReads; }
 
 class BeastHttpServer::Implementation final {
+    using WorkerStrand = asio::strand<asio::any_io_executor>;
 public:
     Implementation(HttpHandler& handler, ServerConfig config)
         : m_handler(&handler), m_config(std::move(config)), m_acceptor(m_context),
           m_handlerPool(m_config.handlerThreads())
     {
+        // Fixed, bounded set of worker-owned serialization lanes. A lane
+        // serializes callbacks, not the whole lifetime of a suspended task.
+        const auto lanes = std::clamp<std::size_t>(
+            m_config.handlerThreads() * 4U, 8U, 64U);
+        m_workerStrands.reserve(lanes);
+        for (std::size_t i = 0; i < lanes; ++i) {
+            m_workerStrands.emplace_back(asio::make_strand(
+                asio::any_io_executor{m_handlerPool.get_executor()}));
+        }
+    }
+
+    [[nodiscard]] WorkerStrand nextWorkerStrand()
+    {
+        const auto index = m_nextWorkerStrand.fetch_add(1U, std::memory_order_relaxed);
+        return m_workerStrands[index % m_workerStrands.size()];
     }
 
     class Connection final : public std::enable_shared_from_this<Connection> {
@@ -361,12 +377,11 @@ public:
         asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker(
             HttpRequest operation, unsigned int version, bool headRequest)
         {
-            // Create and retain the per-request strand only in the worker
-            // coroutine. All child SQL/proxy tasks can still reuse it.
-            // The outer co_spawn crosses contexts using the plain pool
-            // executor, as before the shared-strand optimization.
-            auto executor = co_await asio::this_coro::executor;
-            auto requestStrand = asio::make_strand(executor);
+            // Select a persistent lane only after entering the worker
+            // coroutine. Never retain a pool strand in the reactor frame.
+            // SQL and proxy continuations still share a typed serialized
+            // executor, and no lane is held exclusively across suspension.
+            auto requestStrand = m_owner->nextWorkerStrand();
             co_return co_await asio::co_spawn(requestStrand,
                 dispatchHandler(std::move(operation), version, headRequest),
                 asio::use_awaitable);
@@ -564,6 +579,10 @@ private:
     asio::io_context m_context;
     Tcp::acceptor m_acceptor;
     asio::thread_pool m_handlerPool;
+    // Destroy these handles before the pool's execution context. All
+    // suspended worker frames are owned by that context, not the reactor.
+    std::vector<WorkerStrand> m_workerStrands;
+    std::atomic<std::size_t> m_nextWorkerStrand{0U};
     std::vector<std::jthread> m_workers;
 };
 
