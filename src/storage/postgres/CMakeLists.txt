@@ -30,6 +30,19 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(
         async_connection.cpp async_session.cpp async_recovery_code.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
+    # Qualification of the actual libpq transport TU only. Keep all warnings
+    # and the default workaround for every other unit and build configuration.
+    option(OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING
+        "Qualify narrower PostgreSQL transport inlining flags" OFF)
+    if(OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING)
+        if(NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo"
+           OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16"
+           OR CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "17")
+            message(FATAL_ERROR "PostgreSQL inlining qualification requires GCC 16 RelWithDebInfo")
+        endif()
+        set_source_files_properties(async_connection.cpp PROPERTIES COMPILE_OPTIONS
+            "-fno-inline-small-functions;-fno-inline-functions-called-once;-fno-early-inlining")
+    endif()
 endif()
 
 # Shared checksum-validated migration package, independent of libpq.
