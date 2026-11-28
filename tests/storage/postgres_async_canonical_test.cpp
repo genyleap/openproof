@@ -27,6 +27,7 @@
 #include "async_pool.hpp"
 #include "coroutine_auth_transaction_store.hpp"
 #include "coroutine_canonical_finalizer.hpp"
+#include "delegated_access_decode.hpp"
 #include "coroutine_consent_store.hpp"
 #include "coroutine_session_authenticator.hpp"
 #include "coroutine_authorization_audit.hpp"
@@ -2148,6 +2149,31 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseAuthorizationMembershipIsTenant
     ASSERT_TRUE(refreshedResult);
     auto& bounded = *refreshedResult;
     EXPECT_TRUE(!bounded && bounded.error().code() == fnd::ErrorCode::Unavailable);
+}
+
+TEST(PostgresCanonicalCoroutineTest, DelegatedSnapshotDecoderRejectsMalformedAndOversizedRows)
+{
+    pg::async_detail::QueryRows rows;
+    auto issued=kNow;
+    std::optional<openproof::identity::profile::IdentityProfile> profile;
+    auto result=pg::decodeDelegatedAccess(rows,kNow,&issued,&profile);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(),fnd::ErrorCode::AuthenticationFailed);
+    EXPECT_EQ(issued,kNow);
+    EXPECT_FALSE(profile);
+
+    rows.rows.resize(1);
+    rows.rows.front().resize(12);
+    result=pg::decodeDelegatedAccess(rows,kNow,&issued,nullptr);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(),fnd::ErrorCode::Unavailable);
+
+    rows.rows.resize(257,std::vector<std::optional<std::string>>(13));
+    result=pg::decodeDelegatedAccess(rows,kNow,&issued,nullptr);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(),fnd::ErrorCode::Unavailable);
+    EXPECT_EQ(issued,kNow);
+    EXPECT_FALSE(profile);
 }
 
 TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndTenantBound)
