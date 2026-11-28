@@ -12,7 +12,7 @@ case "$mode" in
     loads=(1 8 32 128)
     ;;
   native-native)
-    BASE_SHA=c18450e405aabe88abb41f9edf367b6dc8f669f1
+    BASE_SHA=a57b528adb37a768b071deac90d94d03498fda9a
     BASE_DIR="${RUNNER_TEMP:?}/openproof-postgres-inline-native-control"
     loads=(1 8 32 128)
     git -C "$ROOT" fetch --no-tags --depth=1 origin "$BASE_SHA"
@@ -21,12 +21,10 @@ case "$mode" in
       cd "$BASE_DIR"
       cmake --preset gcc-release \
         -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install" \
-        -DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=ON \
-        -DOPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING=ON
+        -DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=ON
       cmake --build --preset gcc-release --target opp --parallel 2
     )
     grep -qx 'OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING:BOOL=ON' "$BASE_DIR/cmake-build-gcc-release/CMakeCache.txt"
-    grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$BASE_DIR/cmake-build-gcc-release/CMakeCache.txt"
     ;;
   *) exit 2 ;;
 esac
@@ -35,11 +33,9 @@ BASE="$BASE_DIR/cmake-build-gcc-release/apps/opp/opp"
 CAND="$ROOT/cmake-build-gcc-release/apps/opp/opp"
 [[ -x "$BASE" && -x "$CAND" ]] || exit 2
 grep -qx 'OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
-if [[ "$mode" == native-native ]]; then
-    grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
-fi
+grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
 OUT="$ROOT/integrated-native-matrix"
-if [[ "$mode" == native-native ]]; then OUT="$ROOT/bounded-access-planner-matrix"; fi
+if [[ "$mode" == native-native ]]; then OUT="$ROOT/postgres-inline-native-matrix"; fi
 mkdir "$OUT"
 printf 'baseline_commit=%s\ncandidate_commit=%s\n' "$BASE_SHA" "$GITHUB_SHA" > "$OUT/provenance.txt"
 sha256sum "$BASE" "$CAND" >> "$OUT/provenance.txt"
