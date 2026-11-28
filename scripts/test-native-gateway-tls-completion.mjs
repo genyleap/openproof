@@ -39,7 +39,7 @@ test("native gateway refuses late DNS success before initiating TCP or TLS",()=>
 test("native gateway saturates huge budgets instead of overflowing the steady clock",()=>{
   assert.match(raw, /#include "steady_deadline\.hpp"/);
   const creation = native.slice(
-    native.indexOf("const auto deadline = detail::saturatingSteadyDeadline(timeout);"),
+    native.indexOf("const auto deadline = inheritedDeadline"),
     native.indexOf("auto executor = co_await asio::this_coro::executor;"));
   assert.match(creation,/detail::saturatingSteadyDeadline\(timeout\)/);
   assert.match(deadlineHeader,/duration_cast<std::chrono::milliseconds>/);
@@ -51,6 +51,14 @@ test("native gateway saturates huge budgets instead of overflowing the steady cl
   assert.match(server,/NativeCoroutineProxySaturatesExtremeDeadline/);
   assert.match(server,/std::chrono::milliseconds::max\(\), result/);
   assert.match(server,/EXPECT_EQ\(handler.received.load\(std::memory_order_relaxed\), 1\)/);
+});
+
+test("proven request strand runs upstream transport in one internal coroutine frame",()=>{
+  assert.match(native,/const auto deadline = inheritedDeadline\s*\? \*inheritedDeadline : detail::saturatingSteadyDeadline\(timeout\)/);
+  assert.match(native,/if \(!inheritedDeadline\) \{[\s\S]*?executor\.target_type\(\) == typeid\(RequestStrand\)[\s\S]*?strand && strand->running_in_this_thread\(\)[\s\S]*?if \(!serialized\) \{[\s\S]*?asio::co_spawn\(\s*asio::make_strand\(executor\),\s*sendSerialized\(std::move\(endpoint\), std::move\(request\), timeout, deadline\)/);
+  assert.match(native,/co_await sendAsync\(std::move\(endpoint\), std::move\(request\), timeout, deadline\)/);
+  assert.doesNotMatch(native,/\bsendOnStrand\(/);
+  assert.match(native,/const OwnedRequestScrub scrub\{request\}/);
 });
 
 test("native gateway checks the absolute budget after writing and reading",()=>{
