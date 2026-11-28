@@ -33,9 +33,7 @@ BASE="$BASE_DIR/cmake-build-gcc-release/apps/opp/opp"
 CAND="$ROOT/cmake-build-gcc-release/apps/opp/opp"
 [[ -x "$BASE" && -x "$CAND" ]] || exit 2
 grep -qx 'OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
-if [[ "$mode" == native-native ]]; then
-    grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
-fi
+grep -qx 'OPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
 OUT="$ROOT/integrated-native-matrix"
 if [[ "$mode" == native-native ]]; then OUT="$ROOT/postgres-inline-native-matrix"; fi
 mkdir "$OUT"

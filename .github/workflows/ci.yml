@@ -68,6 +68,8 @@ jobs:
           node scripts/test-native-recovery-runtime-contract.mjs
       - name: Native PostgreSQL readiness descriptor ownership contract
         run: node scripts/test-native-pg-fd-ownership.mjs
+      - name: Historical efficiency gate contract
+        run: node tests/scripts/historical-efficiency-gate-test.mjs
       - name: Benchmark measurement and reporting contracts
         run: |
           python3 -m py_compile scripts/ci/probe-asio-inline.py
@@ -171,8 +173,8 @@ jobs:
         run: |
           cmake --preset gcc-release \
             -DCMAKE_PREFIX_PATH="$HOME/.cache/openproof/boost-1.88.0/install" \
-            ${{ (github.head_ref == 'perf/integrated-native-candidate-20261128' || github.head_ref == 'perf/postgres-io-limited-inlining-20261128') && '-DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=ON' || '-DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=OFF' }} \
-            ${{ github.head_ref == 'perf/postgres-io-limited-inlining-20261128' && '-DOPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING=ON' || '-DOPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING=OFF' }}
+            ${{ (github.head_ref == 'perf/integrated-native-candidate-20261128' || github.head_ref == 'perf/historical-efficiency-gate-20261128') && '-DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=ON' || '-DOPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING=OFF' }} \
+            ${{ github.head_ref == 'perf/historical-efficiency-gate-20261128' && '-DOPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING=ON' || '-DOPENPROOF_EXPERIMENTAL_POSTGRES_IO_LIMITED_INLINING=OFF' }}
 
       # Diagnostic only: compare compiler inlining on a bounded synthetic
       # workload. A failed probe never weakens warnings, sanitizers or the
@@ -528,22 +530,25 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Compare native PostgreSQL I/O inlining against repaired native control
-        if: github.head_ref == 'perf/postgres-io-limited-inlining-20261128'
+      - name: Compare optimized native against historical Blocking control
+        if: github.head_ref == 'perf/historical-efficiency-gate-20261128'
         timeout-minutes: 100
-        run: bash scripts/ci/run-integrated-native-matrix.sh native-native
-      - name: Preserve matched native PostgreSQL I/O inlining matrix
-        if: always() && github.head_ref == 'perf/postgres-io-limited-inlining-20261128'
+        run: bash scripts/ci/run-integrated-native-matrix.sh historical-native
+      - name: Enforce historical efficiency objectives
+        if: github.head_ref == 'perf/historical-efficiency-gate-20261128'
+        run: node scripts/ci/evaluate-historical-efficiency.mjs integrated-native-matrix "$GITHUB_SHA"
+      - name: Preserve historical efficiency matrix
+        if: always() && github.head_ref == 'perf/historical-efficiency-gate-20261128'
         uses: actions/upload-artifact@v4
         with:
-          name: openproof-postgres-inline-native-matrix
-          path: postgres-inline-native-matrix/
+          name: openproof-historical-efficiency-matrix
+          path: integrated-native-matrix/
           if-no-files-found: error
           retention-days: 14
 
   dev-hardening:
     name: Development hardening (${{ matrix.preset }})
-    if: github.ref == 'refs/heads/dev' || github.head_ref == 'perf/integrated-native-candidate-20261128' || github.head_ref == 'perf/postgres-io-limited-inlining-20261128'
+    if: github.ref == 'refs/heads/dev' || github.head_ref == 'perf/integrated-native-candidate-20261128' || github.head_ref == 'perf/historical-efficiency-gate-20261128'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
