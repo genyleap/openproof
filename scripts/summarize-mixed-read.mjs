@@ -7,9 +7,11 @@ import path from "node:path";
 import {validateConnectionMetrics,connectionLegs} from "./ci/mixed-read-connections.mjs";
 import {fields as statementFields,validateSnapshot as validateStatementMetrics} from "./ci/postgres-statement-metrics.mjs";
 
-const [dir, baselineCommit, candidateCommit, load] = process.argv.slice(2);
-assert.ok(process.argv.length === 5 || process.argv.length === 6);
+const [dir, baselineCommit, candidateCommit, load, comparison] = process.argv.slice(2);
+assert.ok(process.argv.length >= 5 && process.argv.length <= 7);
 const matrix = load !== undefined;
+assert.ok(comparison === undefined || (matrix && comparison === "native-native"), "Unsupported comparison");
+const nativePair = comparison === "native-native";
 if (matrix) assert.ok(["1","8","32","128"].includes(load), "Unsupported matrix load");
 const concurrency = matrix ? Number(load) : 24;
 const requests = matrix ? 1536 : 600;
@@ -34,7 +36,7 @@ function validate(record, commit) {
   if (matrix) {
     assert.equal(record.normalizedResponseChecks,requests,"Missing normalized response evidence");
     validateConnectionMetrics(record.connectionMetrics,requests);
-    assert.equal(record.executionProfile?.name,commit===candidateCommit?"minimal":"auto","Execution profile mismatch");
+    assert.equal(record.executionProfile?.name,nativePair || commit===candidateCommit?"minimal":"auto","Execution profile mismatch");
   }
   for (const key of fields) {
     assert.ok(Number.isFinite(record[key]) && (key==="serverCpuTicksDelta" ? record[key]>=0 : record[key]>0),
@@ -119,6 +121,11 @@ if(statementProbe || statementRecords.length>0) {
     assert.ok(r.postgresStatementMetrics.calls>0);
     assert.ok(r.postgresStatementMetrics.plans>0 && r.postgresStatementMetrics.planningMs>0,
       "Missing real PostgreSQL planning attribution");
+    assert.equal(r.postgresStatementMetrics.accessReadCalls, requests/2,
+      "Access-token statement attribution must cover all three protected routes");
+    assert.ok(r.postgresStatementMetrics.accessReadPlans>0 &&
+      r.postgresStatementMetrics.accessReadPlanningMs>0,
+      "Missing access-token planning evidence");
   }
 }
 const postgresStatementComparison=statementRecords.length===records.length
