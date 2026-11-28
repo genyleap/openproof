@@ -19,6 +19,7 @@ import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
 import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
 import {createConnectionAccounting} from "./ci/mixed-read-connections.mjs";
+import {snapshotSql,statementDelta} from "./ci/postgres-statement-metrics.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -1784,10 +1785,29 @@ async function main() {
       await concurrentSmoke(mixedOperations, mixedLoadWarmup, mixedLoadConcurrency, validateMixedRead);
     if (metricsFile && mixedLoadRequests <= 10000)
       edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
+    // Only the explicit disposable-runner diagnostic enables privileged
+    // aggregate snapshots. Run the observer against the maintenance DB so
+    // its statements cannot enter the measured fixture's own counters.
+    const statementProbe = process.env.OPENPROOF_E2E_STATEMENT_PROBE === "1";
+    const snapshotStatements = () => {
+      if (process.env.GITHUB_ACTIONS !== "true"
+          || databaseAck !== "YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
+          || !/^opp_e2e_int_[0-9_]+(?:baseline|candidate)$/.test(databaseName))
+        fail("Statement probe requires a disposable CI matrix database");
+      return JSON.parse(command("sudo",["-u","postgres","psql","-d","postgres",
+        "-AtX","-v","ON_ERROR_STOP=1","-v",`fixture_database=${databaseName}`],
+        {input:snapshotSql+";\n",stdio:["pipe","pipe","pipe"]}));
+    };
+    const statementBefore = statementProbe ? snapshotStatements() : undefined;
     connections.begin();
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
     loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
+    const postgresStatementMetrics = statementProbe
+      ? statementDelta(statementBefore,snapshotStatements()) : undefined;
+    if (postgresStatementMetrics) {
+      assert.ok(postgresStatementMetrics.calls > 0,"Statement probe captured no fixture SQL");
+    }
     connectionMetrics = connections.finish(loadResult.requests);
     edgePhaseMetrics = edgePhaseCollector?.report();
     edgePhaseCollector = undefined;
@@ -2040,6 +2060,7 @@ async function main() {
         ...loadResourceMetrics,
         ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
         connectionMetrics,
+        ...(postgresStatementMetrics ? {postgresStatementMetrics} : {}),
         ...(mixedLoadWarmup > 0 ? { warmupRequests: mixedLoadWarmup } : {}),
         ...(executionProfile ? { executionProfile } : {}),
       }, null, 2) + "\n", { mode: 0o600 });
