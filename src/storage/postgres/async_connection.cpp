@@ -490,21 +490,9 @@ asio::awaitable<QueryRows> AsyncConnection::query(
     std::string sql, std::vector<std::optional<std::string>> params,
     std::chrono::milliseconds timeout)
 {
-    const Deadline deadline = makeDeadline(timeout);
-    auto executor = co_await asio::this_coro::executor;
-    // A pooled PGconn can move between request executors. Reuse only
-    // the exact current strand type while executing inside it, never
-    // assume an arbitrary erased executor or a thread pool is serialized.
-    // cancel_after's timer and readiness callback still share this strand.
-    using RequestStrand = asio::strand<asio::any_io_executor>;
-    if (executor.target_type() == typeid(RequestStrand)) {
-        const auto* strand = executor.target<RequestStrand>();
-        if (strand && strand->running_in_this_thread())
-            co_return co_await querySerialized(std::move(sql), std::move(params), deadline);
-    }
-    co_return co_await asio::co_spawn(asio::make_strand(executor),
-        querySerialized(std::move(sql), std::move(params), deadline),
-        asio::use_awaitable);
+    // Forward a lazy awaitable. A request already on its typed strand
+    // needs only the SQL operation's frame, not a separate routing frame.
+    return querySerialized(std::move(sql), std::move(params), timeout);
 }
 
 asio::awaitable<void> AsyncConnection::executeMigrationScript(
@@ -513,14 +501,31 @@ asio::awaitable<void> AsyncConnection::executeMigrationScript(
     const auto deadline=makeDeadline(timeout);
     auto executor=co_await asio::this_coro::executor;
     static_cast<void>(co_await asio::co_spawn(asio::make_strand(executor),
-        querySerialized(std::move(sql),{},deadline,true),asio::use_awaitable));
+        querySerialized(std::move(sql),{},timeout,deadline,true),asio::use_awaitable));
 }
 
 asio::awaitable<QueryRows> AsyncConnection::querySerialized(
     std::string sql, std::vector<std::optional<std::string>> params,
-    Deadline deadline,bool migrationScript)
+    std::chrono::milliseconds timeout, std::optional<Deadline> inheritedDeadline,
+    bool migrationScript)
 {
+    const Deadline deadline = inheritedDeadline ? *inheritedDeadline : makeDeadline(timeout);
     auto executor = co_await asio::this_coro::executor;
+    if (!inheritedDeadline) {
+        // A pooled PGconn can move between request executors. Reuse only
+        // the exact current strand type while executing inside it. The
+        // readiness and timeout completions must remain serialized.
+        using RequestStrand = asio::strand<asio::any_io_executor>;
+        const auto* strand = executor.target_type() == typeid(RequestStrand)
+            ? executor.target<RequestStrand>() : nullptr;
+        if (!strand || !strand->running_in_this_thread()) {
+            // No SQL or busy acquisition before entering the fallback
+            // strand. Preserve the original absolute deadline across it.
+            co_return co_await asio::co_spawn(asio::make_strand(executor),
+                querySerialized(std::move(sql), std::move(params), timeout, deadline, migrationScript),
+                asio::use_awaitable);
+        }
+    }
     if (m_impl->busy.exchange(true, std::memory_order_acq_rel)) {
         throw std::runtime_error{"PostgreSQL connection is already busy"};
     }
