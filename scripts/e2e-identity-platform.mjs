@@ -19,6 +19,7 @@ import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
 import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
 import {createConnectionAccounting} from "./ci/mixed-read-connections.mjs";
+import {profileEnvironment,sampleFixture} from "./ci/gperftools-profile.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -265,6 +266,12 @@ async function main() {
       || ["postgres", "template0", "template1"].includes(databaseName)) {
     fail("the PostgreSQL database name must contain a standalone 'e2e' segment");
   }
+  const profileOutput=process.env.OPENPROOF_E2E_GPERFTOOLS_PROFILE;
+  if(profileOutput && (process.env.GITHUB_ACTIONS!=="true" || process.env.RUNNER_ENVIRONMENT!=="github-hosted"
+      || databaseAck!=="YES_I_UNDERSTAND_THIS_DATABASE_MUST_BE_DISPOSABLE"
+      || !/^opp_e2e_gperf_[0-9_]+(?:baseline|candidate)$/.test(databaseName)
+      || holdOpen || nativeLdapFixtureEnabled || !metricsFile || !path.isAbsolute(profileOutput)))
+    fail("gperftools profiling requires its disposable hosted CI fixture");
   const tableCount = Number(command("psql", [
     databaseUrl, "-AtX", "-v", "ON_ERROR_STOP=1", "-c",
     "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')",
@@ -593,18 +600,32 @@ async function main() {
     }
   }
 
+  let profilerBase,profileFinished=false,profilerLaunches=0,profilerLog="",profilerTail="";
   async function launchOpp() {
     oppLog = "";
+    profilerLog="";
+    profilerTail="";
+    const profiling=profileOutput && !profileFinished;
     const checked = command(binary, ["check-config", "--config", configurationPath], {
       env: childEnvironment,
     });
     assert.match(checked, /configuration is valid/i);
+    if(profiling) profilerBase=path.join(tempRoot,"cpu-profile-"+ ++profilerLaunches);
+    const serverEnvironment=profiling?profileEnvironment(process.env.OPENPROOF_E2E_PROFILER_LIBRARY??"",profilerBase,childEnvironment):childEnvironment;
     oppProcess = spawn(binary, ["server", "--config", configurationPath], {
       cwd: root,
-      env: childEnvironment,
+      env: serverEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const append = (chunk) => {
+      if(profiling) {
+        const lines=(profilerTail+chunk.toString("utf8")).split("\n");
+        profilerTail=lines.pop().slice(-4096);
+        for(const line of lines) {
+          const marker=line.match(/Using signal \d+ as cpu profiling switch|PROFILE: interrupts\/evictions\/bytes = \d+\/\d+\/\d+/);
+          if(marker) profilerLog=(profilerLog+"\n"+marker[0]).slice(-4096);
+        }
+      }
       oppLog += chunk.toString("utf8");
       if (oppLog.length > 32_000) oppLog = oppLog.slice(-32_000);
     };
@@ -1786,7 +1807,12 @@ async function main() {
       edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
     connections.begin();
     const beforeLoadUsage = readOppUsage(oppProcess?.pid);
-    loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
+    const measure=()=>concurrentSmoke(mixedOperations,mixedLoadRequests,mixedLoadConcurrency,validateMixedRead);
+    if(profileOutput) {
+      loadResult=await sampleFixture({child:oppProcess,base:profilerBase,output:profileOutput,binary,
+        pprof:process.env.OPENPROOF_E2E_PPROF??"",readLog:()=>profilerLog,work:measure});
+      profileFinished=true;
+    } else loadResult=await measure();
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
     connectionMetrics = connections.finish(loadResult.requests);
     edgePhaseMetrics = edgePhaseCollector?.report();
@@ -2033,7 +2059,7 @@ async function main() {
     if (metricsFile) {
       // Only non-sensitive aggregate metrics; no tokens, passwords or addresses.
       fs.writeFileSync(metricsFile, JSON.stringify({
-        benchmark: "openproof-isolated-e2e-mixed-read",
+        benchmark: profileOutput?"openproof-isolated-e2e-gperftools-diagnostic":"openproof-isolated-e2e-mixed-read",
         commit: process.env.OPENPROOF_E2E_COMMIT ?? process.env.GITHUB_SHA ?? "local",
         timestamp: new Date().toISOString(),
         ...loadResult,
