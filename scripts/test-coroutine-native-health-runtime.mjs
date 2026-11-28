@@ -47,7 +47,8 @@ test("server preflight and listener use no blocking PostgreSQL repository",()=>{
   assert.match(startup,/WHERE id=\$1 AND state=0/);
   assert.doesNotMatch(cppExecutableText(startup),/PQexec|PQconnectdb|PQreset|condition_variable/);
   const transport=read("src/storage/postgres/async_connection.cpp");
-  assert.match(transport,/migrationScript\?PQsendQuery\(connection,sql.c_str\(\)\):/);
+  assert.match(transport,/const bool sessionReset=!migrationScript && params\.empty\(\) && sql=="DISCARD ALL";/);
+  assert.match(transport,/const int submitted=\(migrationScript \|\| sessionReset\)\s*\? PQsendQuery\(connection,sql\.c_str\(\)\)\s*:\s*submitParameterized\(connection,sql,params\)/);
   assert.match(transport,/migrationScript && \(!params.empty\(\) \|\| !inTransaction\(\)/);
   assert.match(transport,/migrationScript && !inTransaction\(\)/);
   assert.match(read("tests/storage/postgres_async_test.cpp"),/MigrationScriptUsesExplicitTransactionAndKeepsRequestQueriesSingleStatement/);
