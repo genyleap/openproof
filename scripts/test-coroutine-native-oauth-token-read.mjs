@@ -61,6 +61,20 @@ test("introspection requires confidential client and erases raw form credentials
     "c.status=0 AND a.status=0 AND c.kind IN (0,3)","security::constantTimeEquals"])
     assert.ok(client.includes(term),term);
   assert.match(sql,/g.kind,g.value,t.issued_at_ms/);
+  const grants=sql.slice(sql.indexOf("constexpr std::string_view grantJoins="),
+    sql.indexOf("constexpr std::string_view profileJoin="));
+  assert.match(grants,/UNION ALL [\s\S]*?LIMIT 257\) g ON true/);
+  assert.doesNotMatch(cppExecutableText(grants),/\bco_await\b/);
+  assert.doesNotMatch(grants,/ORDER BY/);
+  const snapshot=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease("),
+    sql.indexOf("CoroutinePostgresCanonicalFinalizer::consumeSenderReplayAsync("));
+  assert.match(snapshot,/ORDER BY g.kind,g.value/);
+  assert.match(snapshot,/result.rows.size\(\)>maximumGrants/);
+  const session=read("src/session/service.cpp");
+  const lookup=session.slice(session.indexOf("bool DelegatedAccess::permits("),session.indexOf("SessionService::SessionService("));
+  assert.match(lookup,/std::binary_search\(m_scopes.begin\(\),m_scopes.end\(\),scope/);
+  assert.match(lookup,/std::binary_search\(m_audiences.begin\(\),m_audiences.end\(\),audience/);
+  assert.doesNotMatch(lookup,/std::string\{/);
   assert.match(sql,/if \(issuedAt\) \*issuedAt=issued/);
   assert.match(read("tests/oauth_native_consent_test.cpp"),/ScopedUserInfoAndAuthenticatedIntrospectionNeverUseLegacy/);
   assert.match(read("tests/storage/postgres_async_canonical_test.cpp"),/authenticateClient\(foreign,clientProof\)/);
