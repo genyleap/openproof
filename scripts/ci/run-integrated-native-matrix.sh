@@ -37,7 +37,11 @@ run_trial() (
       OPENPROOF_E2E_METRICS_FILE="$output/$side-$trial.json" node "$ROOT/scripts/e2e-identity-platform.mjs"
     [[ -s "$output/$side-$trial.json" ]]
 )
-for concurrency in 1 8 32 128; do
+loads=(1 8 32 128)
+if [[ "${OPENPROOF_E2E_STATEMENT_PROBE:-0}" == 1 ]]; then
+    loads=(1 32)
+fi
+for concurrency in "${loads[@]}"; do
     warmup=$(( (2*concurrency+5)/6*6 ))
     if (( warmup < 24 )); then warmup=24; fi
     output="$OUT/c$concurrency"
