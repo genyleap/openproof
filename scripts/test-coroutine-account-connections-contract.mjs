@@ -234,8 +234,12 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   assert.ok(readerBody.length > 0 && workerBody.length > 0);
   assert.doesNotMatch(readerBody, /asio::make_strand\(|requestStrand/);
   assert.match(readerBody, /co_await asio::co_spawn\(m_owner->m_handlerPool\.get_executor\(\),\s*dispatchOnWorker\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
-  assert.match(workerBody, /auto executor = co_await asio::this_coro::executor;/);
-  assert.match(workerBody, /auto requestStrand = asio::make_strand\(executor\);/);
+  assert.match(workerBody,/auto requestStrand = m_owner->nextWorkerStrand\(\);/);
+  assert.doesNotMatch(workerBody,/asio::make_strand\(/);
+  assert.match(gateway,/m_workerStrands\.reserve\(lanes\)/);
+  assert.match(gateway,/m_workerStrands\.emplace_back\(asio::make_strand\(/);
+  assert.match(gateway,/return m_workerStrands\[index % m_workerStrands\.size\(\)\]/);
+  assert.match(gateway,/asio::thread_pool m_handlerPool;[\s\S]*?std::vector<WorkerStrand> m_workerStrands;/);
   assert.match(workerBody, /co_return co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(operation\), version, headRequest\),\s*asio::use_awaitable\)/);
   assert.doesNotMatch(workerBody, /m_stream|m_context|m_handlerPool/);
   assert.ok(readerBody.indexOf("m_response.emplace(std::move(wire))") > readerBody.indexOf("co_await asio::co_spawn("));
