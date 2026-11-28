@@ -2342,9 +2342,22 @@ TEST(PostgresCanonicalCoroutineTest, DelegatedAccountAuthorizationIsReadOnlyAndT
     EXPECT_TRUE(context->permitsAudience("https://gateway.example.test"));
     EXPECT_FALSE(context->permitsAudience("https://wrong.example.test"));
     EXPECT_FALSE(context->senderConstraint());
+    // Two scopes and two audiences already exist. Exactly 256 total
+    // grants must remain valid regardless of SQL's bounded selection order.
     ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope)"
-        " SELECT $1,'bounded-'||n FROM generate_series(1,257) n",{family}));
-    EXPECT_FALSE(readContext());
+        " SELECT $1,'bounded-'||n FROM generate_series(1,252) n",{family}));
+    auto maximum=readContext();
+    ASSERT_TRUE(maximum);
+    EXPECT_EQ(maximum->scopes().size(),254U);
+    EXPECT_EQ(maximum->audiences().size(),2U);
+    EXPECT_TRUE(maximum->permits("bounded-1"));
+    EXPECT_TRUE(maximum->permits("bounded-252"));
+    EXPECT_TRUE(maximum->permitsAudience("https://gateway.example.test"));
+    ASSERT_NO_THROW(sql("INSERT INTO openproof.oauth_token_family_scopes(family_id,scope)"
+        " VALUES($1,'bounded-253')",{family}));
+    auto overflow=readContext();
+    ASSERT_FALSE(overflow);
+    EXPECT_EQ(overflow.error().code(),fnd::ErrorCode::Unavailable);
     ASSERT_NO_THROW(sql("DELETE FROM openproof.oauth_token_family_scopes"
         " WHERE family_id=$1 AND scope LIKE 'bounded-%'",{family}));
     EXPECT_FALSE(read(foreign));
