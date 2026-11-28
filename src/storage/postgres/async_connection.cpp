@@ -518,7 +518,8 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         using RequestStrand = asio::strand<asio::any_io_executor>;
         const auto* strand = executor.target_type() == typeid(RequestStrand)
             ? executor.target<RequestStrand>() : nullptr;
-        if (!strand || !strand->running_in_this_thread()) {
+        const bool serialized = strand && strand->running_in_this_thread();
+        if (!serialized) {
             // No SQL or busy acquisition before entering the fallback
             // strand. Preserve the original absolute deadline across it.
             co_return co_await asio::co_spawn(asio::make_strand(executor),
