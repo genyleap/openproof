@@ -211,6 +211,7 @@ endif()
 # HTTP composition is unchanged until integration acceptance passes.
 add_library(openproof_postgres_async_canonical STATIC
     coroutine_canonical_finalizer.cpp
+    delegated_access_decode.cpp
     coroutine_authorization_audit.cpp
     coroutine_admin_store.cpp)
 target_compile_features(openproof_postgres_async_canonical PUBLIC cxx_std_26)
