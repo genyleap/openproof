@@ -25,7 +25,12 @@ export async function profileMixedRead({pid,perf,output,work}) {
       child.once("error",()=>resolve({code:null,signal:"spawn-error"}));
       child.once("close",(code,signal)=>resolve({code,signal}));
     });
+    // Stream errors may arrive after acknowledgement; observe them even
+    // when no command is pending (the next command/closure still fails).
+    child.stdio[3].on("error",()=>{});
+    child.stdio[4].on("error",()=>{});
     reader=createInterface({input:child.stdio[4],crlfDelay:Infinity});
+    reader.on("error",()=>{});
     const send=async command=>{
       let timer,listener,onError;
       try {
@@ -50,7 +55,13 @@ export async function profileMixedRead({pid,perf,output,work}) {
     const result=await work();
     await send("disable");
     child.kill("SIGINT");
-    const exit=await closed;
+    let stopTimer;
+    let exit;
+    try {
+      exit=await Promise.race([closed,new Promise((_,reject)=>{
+        stopTimer=setTimeout(()=>reject(new Error("perf stop timed out")),10000);
+      })]);
+    } finally { clearTimeout(stopTimer); }
     assert.equal(exit.code,0,"perf record failed");
     assert.ok(fs.statSync(data).size>0,"perf captured no data");
     const report=spawnSync(perf,["report","--stdio","--no-children",
