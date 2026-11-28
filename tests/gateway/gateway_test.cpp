@@ -468,6 +468,42 @@ TEST(RouterTest, ChoosesLongestSegmentBoundaryPrefix)
                                    false, {}, {}, {}).has_value());
 }
 
+TEST(RouterTest, NativeClassificationMatchesOwnedPolicySnapshot)
+{
+    using Access = gw::Router::NativeAccess;
+    gw::Router router;
+    ASSERT_TRUE(router.add(route(false)));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"private"},
+        gw::HttpMethod::Get, "/api/private", gw::ServiceId{"private"}, true,
+        core::OrganizationId{"org"}, pol::Action{"read"}, pol::Resource{"thing"}).value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"scoped"},
+        gw::HttpMethod::Get, "/api/scoped", gw::ServiceId{"scoped"}, false,
+        {}, {}, {}, "read").value()));
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"audience"},
+        gw::HttpMethod::Get, "/api/audience", gw::ServiceId{"audience"}, false,
+        {}, {}, {}, "", "resource").value()));
+    for (const auto method : {gw::HttpMethod::Get, gw::HttpMethod::Post}) {
+        for (const std::string_view path : {"/api", "/apiary", "/api/private",
+                "/api/private/child", "/api/private-other", "/api/scoped", "/api/audience"}) {
+            const auto matched = router.match(method, path);
+            const auto expected = !matched ? Access::None : matched->isProtected()
+                ? Access::Protected : matched->requiredScope().empty()
+                    && matched->requiredAudience().empty() ? Access::Public : Access::None;
+            EXPECT_EQ(router.classifyNative(method, path), expected) << path;
+        }
+    }
+    EXPECT_EQ(router.classifyNative(gw::HttpMethod::Get, "/api/private/child"), Access::Protected);
+    EXPECT_EQ(router.classifyNative(gw::HttpMethod::Get, "/api/private-other"), Access::Public);
+    EXPECT_EQ(router.classifyNative(gw::HttpMethod::Get, "/api/scoped"), Access::None);
+    EXPECT_EQ(router.classifyNative(gw::HttpMethod::Get, "/api/audience"), Access::None);
+    // A more specific rule added later must immediately change classification;
+    // this is not a cache and no pointer to a vector element survives the lock.
+    ASSERT_TRUE(router.add(gw::Route::create(gw::RouteId{"child"},
+        gw::HttpMethod::Get, "/api/private/child", gw::ServiceId{"child"},
+        false, {}, {}, {}).value()));
+    EXPECT_EQ(router.classifyNative(gw::HttpMethod::Get, "/api/private/child"), Access::Public);
+}
+
 TEST(RateLimiterTest, RefillsDeterministicallyAndBoundsCardinality)
 {
     fnd::ManualClockSource clock{kNow};

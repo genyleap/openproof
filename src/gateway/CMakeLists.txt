@@ -47,4 +47,15 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
     set_source_files_properties(
         http_coroutine.cpp http_proxy.cpp http.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-inline")
+    # Opt-in qualification only: previous CI compiled these two real units
+    # at -O2 with narrower flags. Keep the full workaround on middleware.
+    option(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING
+        "Qualify narrower Gateway listener/proxy inlining flags" OFF)
+    if(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING)
+        if(NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+            message(FATAL_ERROR "Gateway inlining qualification requires RelWithDebInfo")
+        endif()
+        set_source_files_properties(http_proxy.cpp http.cpp PROPERTIES COMPILE_OPTIONS
+            "-fno-inline-small-functions;-fno-inline-functions-called-once;-fno-early-inlining")
+    endif()
 endif()

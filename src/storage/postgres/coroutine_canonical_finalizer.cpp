@@ -371,10 +371,23 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     try {
         const Deadline deadline = Clock::now() + m_impl->queryTimeout;
         auto lease = co_await m_impl->pool.acquire(deadline);
+        co_return co_await readProfileOnLease(lease.connection(),std::move(owner),deadline);
+    } catch (const std::exception&) {
+        co_return foundation::fail(foundation::ErrorCode::Unavailable,
+            "Native account profile lookup is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<profile::IdentityProfile>>
+CoroutinePostgresCanonicalFinalizer::readProfileOnLease(
+    async_detail::AsyncConnection& connection,core::IdentityId owner,Deadline deadline)
+{
+    if (owner.empty()) co_return foundation::fail(foundation::ErrorCode::InvalidArgument);
+    try {
         Params params{
             std::string{owner.value()},
             std::string{m_impl->organization.value()}};
-        const auto result = co_await lease.connection().query(
+        const auto result = co_await connection.query(
             "SELECT p.display_name,p.preferred_username,p.email,p.email_verified,"
             "p.phone_number,p.phone_number_verified,p.locale,p.picture_url,"
             "p.avatar_source,p.created_at_ms,p.updated_at_ms "
@@ -405,6 +418,29 @@ CoroutinePostgresCanonicalFinalizer::readProfileAsync(core::IdentityId owner)
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable,
             "Native account profile lookup is unavailable.");
+    }
+}
+
+asio::awaitable<foundation::Result<std::pair<session::DelegatedAccess,std::optional<identity::profile::IdentityProfile>>>>
+CoroutinePostgresCanonicalFinalizer::readBearerUserInfoAsync(std::string digestHex,foundation::Instant now)
+{
+    using E=foundation::ErrorCode;
+    if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
+        return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');
+    })) co_return foundation::fail(E::AuthenticationFailed);
+    try {
+        const Deadline deadline=Clock::now()+m_impl->queryTimeout;
+        auto lease=co_await m_impl->pool.acquire(deadline);
+        std::optional<profile::IdentityProfile> selected;
+        // Grant and permitted unbound profile use one MVCC statement
+        // snapshot. Sender-bound grants carry no profile projection and
+        // retain the adapter's proof/replay-before-profile path.
+        auto access=co_await readDelegatedAccessOnLease(lease.connection(),
+            std::move(digestHex),now,nullptr,deadline,&selected);
+        if (!access) co_return foundation::fail(access.error());
+        co_return std::pair{std::move(access).value(),std::move(selected)};
+    } catch (const std::exception&) {
+        co_return foundation::fail(E::Unavailable);
     }
 }
 
@@ -824,7 +860,8 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
 asio::awaitable<foundation::Result<session::DelegatedAccess>>
 CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
     async_detail::AsyncConnection& connection,std::string digestHex,
-    foundation::Instant now,foundation::Instant* issuedAt,Deadline deadline)
+    foundation::Instant now,foundation::Instant* issuedAt,Deadline deadline,
+    std::optional<profile::IdentityProfile>* selectedProfile)
 {
     constexpr std::size_t maximumGrants=256U;
     if (digestHex.size()!=64U || !std::ranges::all_of(digestHex,[](char ch){
@@ -836,11 +873,16 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         // One statement snapshot: never assemble a grant from separately
         // observed token, lifecycle, scope or audience state. The lateral
         // union avoids the scope/audience Cartesian product.
-        const auto result=co_await connection.query(
+        constexpr std::string_view grantProjection=
             "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
             "f.authenticated_at_ms,t.expires_at_ms,c.id,"
-            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,t.issued_at_ms "
-            "FROM openproof.oauth_access_tokens t "
+            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,t.issued_at_ms";
+        constexpr std::string_view profileProjection=
+            ",p.identity_id,p.display_name,p.preferred_username,p.email,p.email_verified,"
+            "p.phone_number,p.phone_number_verified,p.locale,p.picture_url,"
+            "p.avatar_source,p.created_at_ms,p.updated_at_ms";
+        constexpr std::string_view grantJoins=
+            " FROM openproof.oauth_access_tokens t "
             "JOIN openproof.oauth_token_families f ON f.id=t.family_id "
             "JOIN openproof.oauth_clients c ON c.id=f.client_id "
             "JOIN openproof.applications a ON a.id=c.application_id "
@@ -850,17 +892,38 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
             "SELECT 0 AS kind,s.scope AS value FROM openproof.oauth_token_family_scopes s WHERE s.family_id=f.id "
             "UNION ALL "
             "SELECT 1 AS kind,u.audience AS value FROM openproof.oauth_token_family_audiences u WHERE u.family_id=f.id "
-            "ORDER BY kind,value LIMIT 257) g ON true "
+            "ORDER BY kind,value LIMIT 257) g ON true ";
+        // The unique (family_id,scope) key permits at most one openid row.
+        // Project the profile only on that row, not once for every grant.
+        // Both constraint columns must be null: bound or malformed sender
+        // state must never prefetch profile data before proof validation.
+        constexpr std::string_view profileJoin=
+            "LEFT JOIN openproof.identity_profiles p ON p.identity_id=i.id "
+            "AND f.sender_constraint_kind IS NULL AND f.sender_constraint_value IS NULL "
+            "AND g.kind=0 AND g.value='openid' "
+            "AND EXISTS (SELECT 1 FROM openproof.oauth_token_family_scopes ps "
+            "WHERE ps.family_id=f.id AND ps.scope IN ('profile','email')) ";
+        constexpr std::string_view grantFilters=
             "WHERE t.token_digest=decode($1,'hex') AND t.state=0 "
             "AND t.revoked_at_ms IS NULL AND t.issued_at_ms<=$2 AND t.expires_at_ms>$2 "
             "AND f.revoked_at_ms IS NULL AND f.authenticated_at_ms<=$2 "
             "AND c.status=0 AND a.status=0 AND i.status=0 AND o.state=0 "
             "AND i.organization_id=$3 AND a.organization_id=$3 "
-            "ORDER BY g.kind,g.value",
+            "ORDER BY g.kind,g.value";
+        std::string statement;
+        statement.reserve(grantProjection.size()+grantJoins.size()+grantFilters.size()
+            +(selectedProfile?profileProjection.size()+profileJoin.size():0U));
+        statement.append(grantProjection);
+        if (selectedProfile) statement.append(profileProjection);
+        statement.append(grantJoins);
+        if (selectedProfile) statement.append(profileJoin);
+        statement.append(grantFilters);
+        const auto result=co_await connection.query(std::move(statement),
             std::move(params),remaining(deadline));
         if (result.rows.empty())
             co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
-        if (result.rows.size()>maximumGrants || result.rows.front().size()!=13U)
+        const std::size_t expectedFields=selectedProfile?25U:13U;
+        if (result.rows.size()>maximumGrants || result.rows.front().size()!=expectedFields)
             co_return foundation::fail(foundation::ErrorCode::Unavailable);
         const auto& row=result.rows.front();
         const auto assurance=milliseconds(row[2]);
@@ -876,10 +939,23 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
                 :session::DelegatedSenderConstraintKind::Mtls,*row[9]);
         }
         std::vector<std::string> scopes,audiences;
+        const Row* profileRow=nullptr;
         for (const auto& grant:result.rows) {
-            if (grant.size()!=13U || !std::equal(row.begin(),row.begin()+10,grant.begin())
+            if (grant.size()!=expectedFields || !std::equal(row.begin(),row.begin()+10,grant.begin())
                 || grant[12]!=row[12])
                 co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            if (selectedProfile) {
+                if (grant[13]) {
+                    if (profileRow || sender || grant[13]!=row[0]
+                        || grant[10]!=std::optional<std::string>{"0"}
+                        || grant[11]!=std::optional<std::string>{"openid"})
+                        co_return foundation::fail(foundation::ErrorCode::Unavailable);
+                    profileRow=&grant;
+                } else if (std::any_of(grant.begin()+14,grant.end(),
+                    [](const auto& field){return field.has_value();})) {
+                    co_return foundation::fail(foundation::ErrorCode::Unavailable);
+                }
+            }
             if (!grant[10] && !grant[11]) {
                 if (result.rows.size()!=1U) co_return foundation::fail(foundation::ErrorCode::Unavailable);
                 continue;
@@ -913,9 +989,27 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         const auto issued=foundation::Instant{foundation::Duration{milliseconds(row[12])}};
         if (issued>now || issued>=foundation::Instant{foundation::Duration{milliseconds(row[6])}})
             co_return foundation::fail(foundation::ErrorCode::Unavailable);
-        if (issuedAt) *issuedAt=issued;
-        co_return session::DelegatedAccess{std::move(authorized).value(),required(row[7]),
+        auto access=session::DelegatedAccess{std::move(authorized).value(),required(row[7]),
             std::move(scopes),std::move(audiences),std::move(sender)};
+        if (profileRow) {
+            // Do not restore or expose a profile unless the fully decoded
+            // live access grant independently authorizes those claims.
+            if (!selectedProfile || access.senderConstraint() || !access.permits("openid")
+                || (!access.permits("profile") && !access.permits("email")))
+                co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            const auto& fields=*profileRow;
+            auto value=profile::IdentityProfile::restore(
+                access.authenticated().session().identity(),
+                text(fields,14),text(fields,15),text(fields,16),boolean(fields[17]),
+                text(fields,18),boolean(fields[19]),text(fields,20),text(fields,21),
+                foundation::Instant{foundation::Duration{milliseconds(fields[23])}},
+                foundation::Instant{foundation::Duration{milliseconds(fields[24])}},
+                required(fields[22]));
+            if (!value) co_return foundation::fail(foundation::ErrorCode::Unavailable);
+            selectedProfile->emplace(std::move(value).value());
+        }
+        if (issuedAt) *issuedAt=issued;
+        co_return access;
     } catch (const std::exception&) {
         co_return foundation::fail(foundation::ErrorCode::Unavailable);
     }

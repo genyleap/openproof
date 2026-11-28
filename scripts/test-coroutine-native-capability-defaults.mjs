@@ -168,12 +168,21 @@ test("native protected proxy is mandatory for authenticated and OIDC runtimes", 
   assert.ok(start >= 0 && end > start);
   const gate = domain.slice(start, end);
   assert.match(gate, /localProtocolPath\(request\.path\(\)\)/);
-  assert.match(gate, /route && route->isProtected\(\)/);
+  assert.match(gate, /classifyNative\(request\.method\(\), request\.path\(\)\)\s*== Router::NativeAccess::Protected/);
+  const classification=domain.slice(domain.indexOf("Router::NativeAccess Router::classifyNative("),
+    domain.indexOf("Endpoint::Endpoint("));
+  assert.match(classification,/std::lock_guard<std::mutex> guard\{m_mutex\}/);
+  assert.match(classification,/bestMatchLocked\(method, path\)/);
+  assert.match(classification,/if \(best->isProtected\(\)\) return NativeAccess::Protected;/);
+  assert.match(classification,/if \(!best\) return NativeAccess::None;/);
+  assert.doesNotMatch(classification,/std::optional<Route>|return \*best/);
   const local=domain.slice(domain.indexOf("bool localProtocolPath("),start);
   for(const prefix of ["/auth","/admin","/account","/oauth","/login","/.well-known","/evidence","/trust","/scim","/health","/metrics"])
     assert.ok(local.includes('"'+prefix+'"'),prefix);
   assert.match(local,/path\[prefix.size\(\)\] == '\/'/);
   const begin=domain.slice(domain.indexOf("GatewayNativePreparationSource::begin("),domain.indexOf("GatewayNativePreparationSource::admitIdentity("));
+  assert.match(begin,/auto route = gateway\.m_router->match\(request\.method\(\), request\.path\(\)\)/);
+  assert.match(begin,/if \(!route \|\| !route->isProtected\(\)\)/);
   assert.match(begin,/!delegated && \(gateway.m_delegatedAccess != nullptr/);
   assert.match(begin,/gateway.m_senderConstraintVerifier != nullptr/);
   const native = implementation.slice(implementation.indexOf("auto started = begin(*m_gateway"));
@@ -260,7 +269,12 @@ test("authenticated runtimes dispatch explicitly public proxy routes without inv
   const implementation=read("src/gateway/http_coroutine.cpp");
   const gate=domain.slice(domain.indexOf("bool GatewayNativePreparationSource::eligiblePublic("),
     domain.indexOf("HttpResponse GatewayNativePreparationSource::reject("));
-  assert.match(gate,/route && !route->isProtected\(\)/);
+  assert.match(gate,/classifyNative\(request\.method\(\),request\.path\(\)\)\s*== Router::NativeAccess::Public/);
+  const classification=domain.slice(domain.indexOf("Router::NativeAccess Router::classifyNative("),
+    domain.indexOf("Endpoint::Endpoint("));
+  assert.match(classification,/if \(best->isProtected\(\)\) return NativeAccess::Protected;/);
+  assert.match(classification,/if \(!best->requiredScope\(\)\.empty\(\) \|\| !best->requiredAudience\(\)\.empty\(\)\)\s*return NativeAccess::None;\s*return NativeAccess::Public;/);
+  assert.match(gate,/if \(!route \|\| route->isProtected\(\) \|\| !route->requiredScope\(\)\.empty\(\)\s*\|\| !route->requiredAudience\(\)\.empty\(\)\)/);
   assert.match(gate,/if \(!route \|\| route->isProtected\(\)/);
   assert.match(gate,/stripTrustedIdentityHeaders\(request\)/);
   assert.match(gate,/stripHopByHop\(request\)/);

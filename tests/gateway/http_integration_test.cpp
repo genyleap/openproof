@@ -927,7 +927,13 @@ TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnecti
                 std::atomic<int>& destroyed;
                 ~Lifetime() { destroyed.fetch_add(1, std::memory_order_relaxed); }
             } lifetime{destroyed};
-            asio::steady_timer timer{co_await asio::this_coro::executor};
+            auto executor = co_await asio::this_coro::executor;
+            using RequestStrand = asio::strand<asio::any_io_executor>;
+            const auto* strand = executor.target_type() == typeid(RequestStrand)
+                ? executor.target<RequestStrand>() : nullptr;
+            serialized.store(strand && strand->running_in_this_thread(),
+                             std::memory_order_relaxed);
+            asio::steady_timer timer{executor};
             timer.expires_after(std::chrono::seconds{30});
             entered.set_value();
             co_await timer.async_wait(asio::use_awaitable);
@@ -935,6 +941,7 @@ TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnecti
             co_return gw::HttpResponse{200, {}, "late response"};
         }
         std::promise<void> entered;
+        std::atomic<bool> serialized{false};
         std::atomic<int> destroyed{0};
         std::atomic<int> completed{0};
         std::atomic<int> synchronousCalls{0};
@@ -960,6 +967,7 @@ TEST(BeastHttpIntegrationTest, ShutdownReleasesSuspendedNativeHandlerAndConnecti
     }
     // Include destruction of both execution contexts, not only stop().
     EXPECT_LT(std::chrono::steady_clock::now() - shutdownStarted, std::chrono::seconds{10});
+    EXPECT_TRUE(handler.serialized.load());
     EXPECT_EQ(handler.destroyed.load(), 1);
     EXPECT_EQ(handler.completed.load(), 0);
     EXPECT_EQ(handler.synchronousCalls.load(), 0);

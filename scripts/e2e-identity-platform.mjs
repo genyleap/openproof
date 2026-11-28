@@ -17,6 +17,8 @@ import { classifyStartupFailure, replaceFixturePort } from "./ci/e2e-startup-dia
 import { readOppUsage, oppUsageDelta } from "./ci/process-usage.mjs";
 import { createEdgePhaseMetrics } from "./ci/edge-phase-metrics.mjs";
 import { requestedExecutionProfile } from "./ci/executor-profiles.mjs";
+import {createMixedReadValidator} from "./ci/mixed-read-correctness.mjs";
+import {createConnectionAccounting} from "./ci/mixed-read-connections.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const databaseUrl = process.env.OPENPROOF_E2E_POSTGRES ?? "";
@@ -29,6 +31,7 @@ const mixedLoadRequests = Number.parseInt(
 const mixedLoadConcurrency = Number.parseInt(
   process.env.OPENPROOF_E2E_LOAD_CONCURRENCY ?? "24", 10,
 );
+const mixedLoadWarmup = Number(process.env.OPENPROOF_E2E_LOAD_WARMUP ?? "0");
 const holdOpen = process.env.OPENPROOF_E2E_HOLD_OPEN === "1";
 const connectionFile = process.env.OPENPROOF_E2E_CONNECTION_FILE ?? "";
 const realAuthMode = holdOpen && process.env.OPENPROOF_E2E_REAL_AUTH === "1";
@@ -187,7 +190,7 @@ function verifyIdToken(compact, jwks, expected) {
   return { header, claims };
 }
 
-async function concurrentSmoke(operations, requestCount = 600, concurrency = 24) {
+async function concurrentSmoke(operations, requestCount = 600, concurrency = 24, validate) {
   assert.ok(operations.length > 0);
   const latencies = [];
   const byRoute = operations.map(({ name }) => ({ name, latencies: [] }));
@@ -202,6 +205,9 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
       const response = await operations[operationIndex].run();
       expectStatus(response, 200);
       const latency = performance.now() - requestStarted;
+      // Validate each completed response after capturing request latency.
+      // Throughput still includes client validation cost on both sides.
+      validate?.(operations[operationIndex].name, response);
       latencies.push(latency);
       byRoute[operationIndex].latencies.push(latency);
     }
@@ -216,6 +222,7 @@ async function concurrentSmoke(operations, requestCount = 600, concurrency = 24)
   return {
     requests: requestCount,
     concurrency,
+    ...(validate ? { normalizedResponseChecks: requestCount } : {}),
     requestsPerSecond: requestCount / (elapsedMs / 1000),
     p50Ms: percentile(latencies, 0.50),
     p95Ms: percentile(latencies, 0.95),
@@ -237,7 +244,10 @@ async function main() {
   if (!Number.isSafeInteger(mixedLoadRequests) || mixedLoadRequests < 6
       || mixedLoadRequests > 1_000_000
       || !Number.isSafeInteger(mixedLoadConcurrency) || mixedLoadConcurrency < 1
-      || mixedLoadConcurrency > 1_000) {
+      || mixedLoadConcurrency > 1_000
+      || !Number.isSafeInteger(mixedLoadWarmup) || mixedLoadWarmup < 0
+      || mixedLoadWarmup > 10_000 || mixedLoadWarmup % 6 !== 0
+      || (mixedLoadWarmup !== 0 && mixedLoadWarmup < mixedLoadConcurrency)) {
     fail("E2E load requests/concurrency are outside the safe supported bounds");
   }
   if (!fs.existsSync(binary)) fail(`opp binary is missing at ${binary}`);
@@ -399,6 +409,8 @@ async function main() {
   let loadResourceMetrics = {};
   let edgePhaseCollector;
   let edgePhaseMetrics;
+  const connections = createConnectionAccounting();
+  let connectionMetrics;
   let nativeClientId = "";
   const masterKey = base64Url(crypto.randomBytes(48));
   const ownerPassword = `E2E-owner-${base64Url(crypto.randomBytes(24))}`;
@@ -414,6 +426,7 @@ async function main() {
     { key: privateTlsKey, cert: certificate },
     (request, response) => {
       const phase = edgePhaseCollector?.start(performance.now());
+      connections.observe("clientToEdge",request.socket);
       const headers = {
         ...request.headers,
         // Preserve the public TLS authority for the same-origin POST
@@ -447,6 +460,7 @@ async function main() {
       let upstreamConnected = false;
       let upstreamRequestSent = false;
       forwarded.once("socket", (socket) => {
+        connections.observe("edgeToOpp",socket);
         if (!socket.connecting) upstreamConnected = true;
         else socket.once("connect", () => { upstreamConnected = true; });
       });
@@ -1745,10 +1759,12 @@ async function main() {
 
     // Keep diagnostics bounded and optional; the acceptance workload and
     // request mix are unchanged. Both sides use the same fixture.
-    if (metricsFile && mixedLoadRequests <= 10000)
-      edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
-    const beforeLoadUsage = readOppUsage(oppProcess?.pid);
-    loadResult = await concurrentSmoke([
+    const validateMixedRead = createMixedReadValidator({
+      readiness: jsonBody(ready), discovery, jwks: initialJwks,
+      userinfo: jsonBody(userInfo), protectedProxy: jsonBody(protectedResponse),
+      introspection: jsonBody(introspection),
+    });
+    const mixedOperations = [
       { name: "readiness", run: () => edgeRequest("/health/ready") },
       { name: "discovery", run: () => edgeRequest("/.well-known/openid-configuration") },
       { name: "jwks", run: () => edgeRequest("/.well-known/jwks.json") },
@@ -1763,8 +1779,16 @@ async function main() {
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: introspectionForm.toString(),
       }) },
-    ], mixedLoadRequests, mixedLoadConcurrency);
+    ];
+    if (mixedLoadWarmup > 0)
+      await concurrentSmoke(mixedOperations, mixedLoadWarmup, mixedLoadConcurrency, validateMixedRead);
+    if (metricsFile && mixedLoadRequests <= 10000)
+      edgePhaseCollector = createEdgePhaseMetrics(mixedLoadRequests);
+    connections.begin();
+    const beforeLoadUsage = readOppUsage(oppProcess?.pid);
+    loadResult = await concurrentSmoke(mixedOperations, mixedLoadRequests, mixedLoadConcurrency, validateMixedRead);
     const afterLoadUsage = readOppUsage(oppProcess?.pid);
+    connectionMetrics = connections.finish(loadResult.requests);
     edgePhaseMetrics = edgePhaseCollector?.report();
     edgePhaseCollector = undefined;
     loadResourceMetrics = oppUsageDelta(beforeLoadUsage, afterLoadUsage);
@@ -2015,6 +2039,8 @@ async function main() {
         ...loadResult,
         ...loadResourceMetrics,
         ...(edgePhaseMetrics ? { edgePhaseMetrics } : {}),
+        connectionMetrics,
+        ...(mixedLoadWarmup > 0 ? { warmupRequests: mixedLoadWarmup } : {}),
         ...(executionProfile ? { executionProfile } : {}),
       }, null, 2) + "\n", { mode: 0o600 });
     }

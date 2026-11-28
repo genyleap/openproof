@@ -510,9 +510,8 @@ foundation::Status Router::add(Route route)
     return foundation::ok();
 }
 
-std::optional<Route> Router::match(HttpMethod method, std::string_view path) const
+const Route* Router::bestMatchLocked(HttpMethod method, std::string_view path) const
 {
-    const std::lock_guard<std::mutex> guard{m_mutex};
     const Route* best = nullptr;
     for (const Route& route : m_routes) {
         if (route.method() == method && prefixMatches(path, route.pathPrefix())
@@ -520,7 +519,25 @@ std::optional<Route> Router::match(HttpMethod method, std::string_view path) con
             best = &route;
         }
     }
+    return best;
+}
+
+std::optional<Route> Router::match(HttpMethod method, std::string_view path) const
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const Route* best = bestMatchLocked(method, path);
     return best == nullptr ? std::nullopt : std::optional<Route>{*best};
+}
+
+Router::NativeAccess Router::classifyNative(HttpMethod method, std::string_view path) const
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    const Route* best = bestMatchLocked(method, path);
+    if (!best) return NativeAccess::None;
+    if (best->isProtected()) return NativeAccess::Protected;
+    if (!best->requiredScope().empty() || !best->requiredAudience().empty())
+        return NativeAccess::None;
+    return NativeAccess::Public;
 }
 
 Endpoint::Endpoint(EndpointId id, std::string host, std::uint16_t port,
@@ -1021,8 +1038,8 @@ bool GatewayNativePreparationSource::eligible(const Gateway& gateway,
 {
     try {
         if (localProtocolPath(request.path())) return false;
-        const auto route = gateway.m_router->match(request.method(), request.path());
-        return route && route->isProtected();
+        return gateway.m_router->classifyNative(request.method(), request.path())
+            == Router::NativeAccess::Protected;
     } catch (...) {
         return false;
     }
@@ -1033,9 +1050,8 @@ bool GatewayNativePreparationSource::eligiblePublic(const Gateway& gateway,
 {
     try {
         if (localProtocolPath(request.path())) return false;
-        const auto route=gateway.m_router->match(request.method(),request.path());
-        return route && !route->isProtected() && route->requiredScope().empty()
-            && route->requiredAudience().empty();
+        return gateway.m_router->classifyNative(request.method(),request.path())
+            == Router::NativeAccess::Public;
     } catch (...) { return false; }
 }
 

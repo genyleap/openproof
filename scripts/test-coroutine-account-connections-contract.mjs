@@ -227,8 +227,17 @@ test("Beast sockets and post-dispatch responses stay on the same strand", () => 
   // bounded handler pool. Its associated executor resumes the write.
   assert.match(gateway, /asio::co_spawn\(m_stream\.get_executor\(\),\s*readRequest\(\)/);
   const readerBody = gateway.slice(gateway.indexOf("asio::awaitable<void> readRequest()"),
+    gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("));
+  const workerBody = gateway.slice(
+    gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("),
     gateway.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
-  assert.match(readerBody, /co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.ok(readerBody.length > 0 && workerBody.length > 0);
+  assert.doesNotMatch(readerBody, /asio::make_strand\(|requestStrand/);
+  assert.match(readerBody, /co_await asio::co_spawn\(m_owner->m_handlerPool\.get_executor\(\),\s*dispatchOnWorker\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.match(workerBody, /auto executor = co_await asio::this_coro::executor;/);
+  assert.match(workerBody, /auto requestStrand = asio::make_strand\(executor\);/);
+  assert.match(workerBody, /co_return co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.doesNotMatch(workerBody, /m_stream|m_context|m_handlerPool/);
   assert.ok(readerBody.indexOf("m_response.emplace(std::move(wire))") > readerBody.indexOf("co_await asio::co_spawn("));
   assert.ok(readerBody.indexOf("co_await writeResponse(headRequest);") > readerBody.indexOf("m_response.emplace(std::move(wire))"));
   assert.doesNotMatch(gateway, /asio::post\(m_owner->m_context,/);
@@ -256,13 +265,21 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /state->slots\.try_send\(boost::system::error_code\{\},/);
   assert.match(implementation, /recovered\.release\(\)/);
   assert.match(implementation, /new Slot\{weak_from_this\(\), \{\}\}/);
-  assert.match(implementation, /const bool received = state->slots\.try_receive\(/);
-  assert.match(implementation, /std::optional<asio::steady_timer> retryTimer/);
-  assert.match(implementation, /constexpr auto retryInterval = std::chrono::milliseconds\{4\}/);
-  assert.match(implementation, /retryTimer->expires_at\(std::min\(admissionDeadline, now \+ retryInterval\)\)/);
-  assert.match(implementation, /co_await retryTimer->async_wait/);
-  assert.ok(implementation.indexOf('if (!retryTimer) retryTimer.emplace') > implementation.indexOf('if (received)'));
-  assert.match(implementation, /if \(!retryTimer\) retryTimer.emplace\(co_await asio::this_coro::executor\)/);
+  assert.match(implementation, /const bool received = slots\.try_receive\(/);
+  assert.match(implementation, /struct Waiter final/);
+  assert.match(implementation, /std::list<std::shared_ptr<Waiter>> waiters/);
+  assert.match(implementation, /asio::post\(executor, \[selected = std::move\(selected\)\]/);
+  assert.match(implementation, /selected->timer\.cancel\(\)/);
+  assert.match(implementation, /if \(selected && state\.slots\.ready\(\)\) state\.notifyWaiter\(\)/);
+  assert.match(implementation, /auto executor = selected->executor;/);
+  assert.match(implementation, /Registration registration\{\*state, waiter\}/);
+  assert.ok(implementation.indexOf("Registration registration{*state, waiter}") <
+    implementation.indexOf("auto permit = state->tryTake()",implementation.indexOf("Registration registration{*state, waiter}")));
+  assert.match(implementation, /co_await waiter->timer\.async_wait/);
+  assert.match(implementation, /cancellation\.cancelled\(\) != asio::cancellation_type::none/);
+  assert.match(implementation, /if \(!permit\) \{[\s\S]*?State::waitForPermit\(state, admissionDeadline\)/);
+  assert.match(implementation, /m_state->notifyWaiter\(\)/);
+  assert.doesNotMatch(implementation, /retryInterval|retryTimer/);
   assert.match(implementation, /"DISCARD ALL"/);
   assert.doesNotMatch(implementation, /slots\.async_receive\(/);
   assert.match(implementation, /auto connection = std::move\(slot->connection\)/);

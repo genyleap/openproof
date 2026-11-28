@@ -342,8 +342,11 @@ public:
                     wire = co_await dispatchHandler(
                         std::move(*operation), version, headRequest, true);
                 } else {
-                    wire = co_await asio::co_spawn(m_owner->m_handlerPool,
-                        dispatchHandler(std::move(*operation), version, headRequest),
+                    // The reactor frame must never retain a strand owned by
+                    // the worker context: shutdown destroys that context
+                    // before the reactor discards suspended readRequest frames.
+                    wire = co_await asio::co_spawn(m_owner->m_handlerPool.get_executor(),
+                        dispatchOnWorker(std::move(*operation), version, headRequest),
                         asio::use_awaitable);
                 }
                 operation.reset();
@@ -353,6 +356,20 @@ public:
             // Completion is associated with this coroutine's executor, the
             // connection strand. No handler worker touches the Beast stream.
             co_await writeResponse(headRequest);
+        }
+
+        asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker(
+            HttpRequest operation, unsigned int version, bool headRequest)
+        {
+            // Create and retain the per-request strand only in the worker
+            // coroutine. All child SQL/proxy tasks can still reuse it.
+            // The outer co_spawn crosses contexts using the plain pool
+            // executor, as before the shared-strand optimization.
+            auto executor = co_await asio::this_coro::executor;
+            auto requestStrand = asio::make_strand(executor);
+            co_return co_await asio::co_spawn(requestStrand,
+                dispatchHandler(std::move(operation), version, headRequest),
+                asio::use_awaitable);
         }
 
         asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler(

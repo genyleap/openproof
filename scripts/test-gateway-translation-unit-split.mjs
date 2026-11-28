@@ -50,6 +50,9 @@ test("GCC16 Asio coroutine allocation workaround is isolated without suppressing
   assert.match(cmake,/if\(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16"\s*AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "17"\)/);
   assert.match(cmake,/set_source_files_properties\(\s*http_coroutine\.cpp http_proxy\.cpp http\.cpp\s*PROPERTIES COMPILE_OPTIONS "-fno-inline"\)/);
   assert.doesNotMatch(cmake,/-Wno-error|-Wno-mismatched-new-delete/);
+  assert.match(cmake,/option\(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING[\s\S]*?OFF\)/);
+  assert.match(cmake,/if\(OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING\)[\s\S]*?if\(NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo"\)/);
+  assert.match(cmake,/set_source_files_properties\(http_proxy\.cpp http\.cpp PROPERTIES COMPILE_OPTIONS\s*"-fno-inline-small-functions;-fno-inline-functions-called-once;-fno-early-inlining"\)/);
 });
 
 test("the same gateway library links all three C++26 implementation files",()=>{
@@ -87,13 +90,27 @@ test("network layer retains bounded request and response framing",()=>{
 
 test("normal HTTP completion awaits the bounded pool and writes on the connection strand",()=>{
   const read=server.slice(server.indexOf("asio::awaitable<void> readRequest()"),
+    server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("));
+  const worker=server.slice(server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchOnWorker("),
     server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("));
   const dispatch=server.slice(server.indexOf("asio::awaitable<beastHttp::response<beastHttp::string_body>> dispatchHandler("),
     server.indexOf("void write(beastHttp::response"));
   assert.ok(read.length>0 && dispatch.length>0);
   assert.match(read,/m_pendingHandlers\.fetch_add\(/);
   assert.match(read,/struct PendingHandlerGuard final[\s\S]*?pending\.fetch_sub\(1U, std::memory_order_acq_rel\)/);
-  assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool,\s*dispatchHandler\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.doesNotMatch(read,/asio::make_strand\(|requestStrand/);
+  assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool\.get_executor\(\),\s*dispatchOnWorker\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.match(worker,/auto executor = co_await asio::this_coro::executor;/);
+  assert.match(worker,/auto requestStrand = asio::make_strand\(executor\);/);
+  assert.match(worker,/co_return co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(operation\), version, headRequest\),\s*asio::use_awaitable\)/);
+  assert.doesNotMatch(worker,/m_stream|m_context|m_handlerPool/);
+  for (const file of ["src/storage/postgres/async_connection.cpp","src/gateway/http_proxy.cpp"]) {
+    const source=fs.readFileSync(path.join(root,file),"utf8");
+    assert.match(source,/executor\.target_type\(\) == typeid\(RequestStrand\)/);
+    assert.match(source,/executor\.target<RequestStrand>\(\)/);
+    assert.match(source,/strand && strand->running_in_this_thread\(\)/);
+    assert.match(source,/asio::make_strand\(executor\)/);
+  }
   const completion=read.indexOf("m_response.emplace(std::move(wire))");
   assert.ok(completion>read.indexOf("co_await asio::co_spawn("));
   assert.ok(read.indexOf("co_await writeResponse(headRequest);")>completion);

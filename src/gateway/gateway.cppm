@@ -166,7 +166,12 @@ public:
     [[nodiscard]] foundation::Status add(Route route);
     /** Longest segment-boundary prefix wins; method mismatch is not a match. */
     [[nodiscard]] std::optional<Route> match(HttpMethod method, std::string_view path) const;
+    // Classification is an admission hint, never an authorization decision.
+    // No Route or policy strings are copied or exposed outside the lock.
+    enum class NativeAccess { None, Public, Protected };
+    [[nodiscard]] NativeAccess classifyNative(HttpMethod method, std::string_view path) const;
 private:
+    [[nodiscard]] const Route* bestMatchLocked(HttpMethod method, std::string_view path) const;
     mutable std::mutex m_mutex;
     std::vector<Route> m_routes;
 };
