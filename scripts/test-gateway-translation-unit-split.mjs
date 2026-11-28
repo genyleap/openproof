@@ -100,8 +100,12 @@ test("normal HTTP completion awaits the bounded pool and writes on the connectio
   assert.match(read,/struct PendingHandlerGuard final[\s\S]*?pending\.fetch_sub\(1U, std::memory_order_acq_rel\)/);
   assert.doesNotMatch(read,/asio::make_strand\(|requestStrand/);
   assert.match(read,/co_await asio::co_spawn\(m_owner->m_handlerPool\.get_executor\(\),\s*dispatchOnWorker\(std::move\(\*operation\), version, headRequest\),\s*asio::use_awaitable\)/);
-  assert.match(worker,/auto executor = co_await asio::this_coro::executor;/);
-  assert.match(worker,/auto requestStrand = asio::make_strand\(executor\);/);
+  assert.match(worker,/auto requestStrand = m_owner->nextWorkerStrand\(\);/);
+  assert.doesNotMatch(worker,/asio::make_strand\(/);
+  assert.match(server,/m_workerStrands\.reserve\(lanes\)/);
+  assert.match(server,/m_workerStrands\.emplace_back\(asio::make_strand\(/);
+  assert.match(server,/return m_workerStrands\[index % m_workerStrands\.size\(\)\]/);
+  assert.match(server,/asio::thread_pool m_handlerPool;[\s\S]*?std::vector<WorkerStrand> m_workerStrands;/);
   assert.match(worker,/co_return co_await asio::co_spawn\(requestStrand,\s*dispatchHandler\(std::move\(operation\), version, headRequest\),\s*asio::use_awaitable\)/);
   assert.doesNotMatch(worker,/m_stream|m_context|m_handlerPool/);
   for (const file of ["src/storage/postgres/async_connection.cpp","src/gateway/http_proxy.cpp"]) {
