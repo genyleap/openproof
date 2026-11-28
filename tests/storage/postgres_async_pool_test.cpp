@@ -222,22 +222,29 @@ TEST(PostgresAsyncPoolTest, EventDrivenContentionPreservesExclusiveSlots)
         requireDisposableDatabase();
         GTEST_SKIP()<<"No disposable PostgreSQL integration database configured";
     }
-    asio::io_context io;
-    pg::AsyncConnectionPool pool{io.get_executor(),connectionString,1U,2s,2s};
-    std::atomic<unsigned int> active{0U},completed{0U};
-    std::vector<std::future<void>> futures;
-    for (unsigned int i=0;i<8U;++i) {
-        futures.emplace_back(asio::co_spawn(io,contendForExclusiveSlot(pool,active,completed),
-            asio::use_future));
+    // Cover the generic executor fallback and the exact typed strand used
+    // by worker-dispatched Gateway requests. Each contender owns its strand.
+    for (const bool serialized : {false, true}) {
+        SCOPED_TRACE(serialized);
+        asio::io_context io;
+        pg::AsyncConnectionPool pool{io.get_executor(),connectionString,1U,2s,2s};
+        std::atomic<unsigned int> active{0U},completed{0U};
+        std::vector<std::future<void>> futures;
+        for (unsigned int i=0;i<8U;++i) {
+            asio::any_io_executor executor{io.get_executor()};
+            if (serialized) executor=asio::make_strand(executor);
+            futures.emplace_back(asio::co_spawn(executor,
+                contendForExclusiveSlot(pool,active,completed),asio::use_future));
+        }
+        std::thread other([&io]{io.run();});
+        io.run();
+        other.join();
+        for (auto& future : futures) {
+            EXPECT_NO_THROW(future.get());
+        }
+        EXPECT_EQ(active.load(),0U);
+        EXPECT_EQ(completed.load(),40U);
     }
-    std::thread other([&io]{io.run();});
-    io.run();
-    other.join();
-    for (auto& future : futures) {
-        EXPECT_NO_THROW(future.get());
-    }
-    EXPECT_EQ(active.load(),0U);
-    EXPECT_EQ(completed.load(),40U);
 }
 
 TEST(PostgresAsyncPoolTest, EventDrivenCancelledWaiterDoesNotStrandFollowingWaiter)
@@ -247,21 +254,29 @@ TEST(PostgresAsyncPoolTest, EventDrivenCancelledWaiterDoesNotStrandFollowingWait
         requireDisposableDatabase();
         GTEST_SKIP()<<"No disposable PostgreSQL integration database configured";
     }
-    asio::io_context io;
-    pg::AsyncConnectionPool pool{io.get_executor(),connectionString,1U,1s,2s};
-    asio::cancellation_signal signal;
-    auto holder=asio::co_spawn(io,holdAndCancelWaiter(pool,signal),asio::use_future);
-    auto cancelled=asio::co_spawn(io,waitAfterHolderStarts(pool),
-        asio::bind_cancellation_slot(signal.slot(),asio::use_future));
-    auto next=asio::co_spawn(io,waitAfterHolderStarts(pool),asio::use_future);
-    io.run();
-    EXPECT_NO_THROW(holder.get());
-    EXPECT_ANY_THROW(cancelled.get());
-    EXPECT_NO_THROW(next.get());
-    io.restart();
-    auto final=asio::co_spawn(io,waitAfterHolderStarts(pool),asio::use_future);
-    io.run();
-    EXPECT_NO_THROW(final.get());
+    for (const bool serialized : {false, true}) {
+        SCOPED_TRACE(serialized);
+        asio::io_context io;
+        pg::AsyncConnectionPool pool{io.get_executor(),connectionString,1U,1s,2s};
+        const auto requestExecutor = [&]() -> asio::any_io_executor {
+            asio::any_io_executor executor{io.get_executor()};
+            if (serialized) executor=asio::make_strand(executor);
+            return executor;
+        };
+        asio::cancellation_signal signal;
+        auto holder=asio::co_spawn(requestExecutor(),holdAndCancelWaiter(pool,signal),asio::use_future);
+        auto cancelled=asio::co_spawn(requestExecutor(),waitAfterHolderStarts(pool),
+            asio::bind_cancellation_slot(signal.slot(),asio::use_future));
+        auto next=asio::co_spawn(requestExecutor(),waitAfterHolderStarts(pool),asio::use_future);
+        io.run();
+        EXPECT_NO_THROW(holder.get());
+        EXPECT_ANY_THROW(cancelled.get());
+        EXPECT_NO_THROW(next.get());
+        io.restart();
+        auto final=asio::co_spawn(requestExecutor(),waitAfterHolderStarts(pool),asio::use_future);
+        io.run();
+        EXPECT_NO_THROW(final.get());
+    }
 }
 
 TEST(PostgresAsyncPoolTest, InvalidCapacityAndDeadlinesFailClosed)
