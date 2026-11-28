@@ -72,11 +72,17 @@ public:
     [[nodiscard]] boost::asio::awaitable<Lease> acquire(
         std::chrono::steady_clock::time_point deadline);
 
+    // Fresh database round-trip: a recycled connection's verified reset
+    // already proves server responsiveness. Newly opened connections run SELECT 1.
+    [[nodiscard]] boost::asio::awaitable<bool> probeReadiness(
+        std::chrono::steady_clock::time_point deadline);
+
     [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
     [[nodiscard]] boost::asio::awaitable<Lease> acquireImpl(
-        std::optional<std::chrono::steady_clock::time_point> deadline);
+        std::optional<std::chrono::steady_clock::time_point> deadline,
+        bool* resetConfirmed = nullptr);
     std::shared_ptr<State> m_state;
 };
 
