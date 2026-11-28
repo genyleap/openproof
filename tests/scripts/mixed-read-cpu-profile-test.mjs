@@ -12,11 +12,20 @@ try {
   fs.writeFileSync(fake,`#!/usr/bin/env node
 const fs=require("node:fs");
 const readline=require("node:readline");
+const net=require("node:net");
 if(process.argv[2]==="record") {
   if(process.env.TEST_PERF_EARLY_EXIT==="1") process.exit(1);
   const data=process.argv[process.argv.indexOf("-o")+1];
-  process.on("SIGINT",()=>{fs.writeFileSync(data,"synthetic");process.exit(0);});
-  const control=readline.createInterface({input:fs.createReadStream(null,{fd:3})});
+  // spawn's extra stdio pipes are stream sockets, not regular files.
+  // Avoid a blocking fs.read on a libuv worker during signal shutdown.
+  const socket=new net.Socket({fd:3,readable:true,writable:false});
+  const control=readline.createInterface({input:socket});
+  process.on("SIGINT",()=>{
+    control.close();
+    socket.destroy();
+    fs.writeFileSync(data,"synthetic");
+    process.exit(0);
+  });
   control.on("line",line=>{
     if(line==="enable"||line==="disable") fs.writeSync(4,"ack\\n");
   });
