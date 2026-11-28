@@ -211,7 +211,7 @@ test("liveness has no SQL dependency and readiness is bounded and fail-closed",(
   }
   const probe=store.slice(store.indexOf("CoroutinePostgresCanonicalFinalizer::healthCheckAsync("));
   assert.match(probe,/Clock::now\(\)\+m_impl->queryTimeout/);
-  assert.match(probe,/co_await m_impl->pool.acquire\(deadline\)/);
+  assert.match(probe,/co_await m_impl->pool.acquireScoped\(deadline\)/);
   assert.match(probe,/co_await lease.connection\(\).query\("SELECT 1",\{\},remaining\(deadline\)\)/);
   assert.match(probe,/rows.rows.front\(\).front\(\)!=std::optional<std::string>\{"1"\}/);
   assert.doesNotMatch(cppExecutableText(probe),/PQexec|PQconnectdb|PQreset|wait_for\(/);

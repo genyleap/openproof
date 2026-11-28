@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <exception>
 #include <future>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -30,6 +32,62 @@ void requireDisposableDatabase()
 {
     if (std::getenv("GITHUB_ACTIONS")) {
         FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for pool regressions";
+    }
+}
+
+// The disposable Linux process has no other concurrent socket owners in
+// this fixture. Count only duplicated socket inodes, not epoll/timer fds.
+std::size_t duplicatedSocketCount()
+{
+    std::map<std::string,std::size_t> sockets;
+    for (const auto& fd : std::filesystem::directory_iterator{"/proc/self/fd"}) {
+        std::error_code error;
+        const auto target=std::filesystem::read_symlink(fd.path(),error).string();
+        if (!error && target.starts_with("socket:[")) ++sockets[target];
+    }
+    std::size_t duplicates=0;
+    for (const auto& entry : sockets) duplicates+=entry.second-1U;
+    return duplicates;
+}
+
+asio::awaitable<void> scopedReadinessLifecycle(pg::AsyncConnectionPool& pool)
+{
+    using Clock=std::chrono::steady_clock;
+    const auto before=duplicatedSocketCount();
+    {
+        auto lease=co_await pool.acquireScoped(Clock::now()+2s);
+        for (unsigned int i=0;i<2U;++i) {
+            // Ensure the query must actually wait for socket readiness.
+            const auto result=co_await lease.connection().query(
+                "SELECT 17::text FROM pg_sleep(0.02)",{},2s);
+            EXPECT_EQ(result.rows.size(),1U);
+            EXPECT_EQ(duplicatedSocketCount(),before+1U);
+        }
+        EXPECT_TRUE(lease.connection().reusable());
+    }
+    EXPECT_EQ(duplicatedSocketCount(),before);
+    {
+        auto lease=co_await pool.acquireScoped(Clock::now()+2s);
+        const auto result=co_await lease.connection().query(
+            "SELECT 18::text FROM pg_sleep(0.02)",{},2s);
+        EXPECT_EQ(result.rows.size(),1U);
+        EXPECT_EQ(duplicatedSocketCount(),before+1U);
+        bool denied=false;
+        try {
+            static_cast<void>(co_await lease.connection().query(
+                "SELECT pg_sleep(0.2)",{},20ms));
+        } catch (const std::runtime_error&) { denied=true; }
+        EXPECT_TRUE(denied);
+        EXPECT_FALSE(lease.connection().reusable());
+        EXPECT_EQ(duplicatedSocketCount(),before);
+    }
+    {
+        // Ordinary leases retain their operation-local descriptor lifetime.
+        auto lease=co_await pool.acquire();
+        const auto result=co_await lease.connection().query(
+            "SELECT 19::text FROM pg_sleep(0.02)",{},2s);
+        EXPECT_EQ(result.rows.size(),1U);
+        EXPECT_EQ(duplicatedSocketCount(),before);
     }
 }
 
@@ -214,6 +272,22 @@ asio::awaitable<void> waitAfterHolderStarts(pg::AsyncConnectionPool& pool)
     EXPECT_TRUE(lease.connection().reusable());
 }
 } // namespace
+
+TEST(PostgresAsyncPoolTest, ScopedReadinessReusesAndDiscardsDescriptor)
+{
+    const char* connectionString=disposableDatabase();
+    if (!connectionString || !*connectionString) {
+        requireDisposableDatabase();
+        GTEST_SKIP()<<"No disposable PostgreSQL integration database configured";
+    }
+    if (!std::filesystem::exists("/proc/self/fd")) GTEST_SKIP()<<"Linux fd inspection required";
+    asio::io_context io;
+    pg::AsyncConnectionPool pool{io.get_executor(),connectionString,1U,2s,2s};
+    auto strand=asio::make_strand(asio::any_io_executor{io.get_executor()});
+    auto done=asio::co_spawn(strand,scopedReadinessLifecycle(pool),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(done.get());
+}
 
 TEST(PostgresAsyncPoolTest, EventDrivenContentionPreservesExclusiveSlots)
 {

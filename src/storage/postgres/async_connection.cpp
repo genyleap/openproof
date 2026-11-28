@@ -126,9 +126,9 @@ int submitParameterized(PGconn* connection, const std::string& sql,
     return now + timeout;
 }
 
-// A query on an already-connected PGconn owns its readiness descriptor
-// for that operation only. Connect polling must not reuse it: libpq may
-// replace the physical socket while trying connection addresses.
+// Default readiness ownership is per query. An explicitly request-local
+// lease may retain the descriptor between queries on the same strand.
+// Connect polling never shares it: libpq may replace the physical socket.
 struct QuerySocketReadiness final {
     std::optional<asio::posix::stream_descriptor> descriptor;
     int originalFd{-1};
@@ -190,6 +190,7 @@ asio::awaitable<void> waitForSocket(
 
 struct AsyncConnection::Impl final {
     PgPointer connection;
+    std::optional<QuerySocketReadiness> scopedReadiness;
     std::atomic<bool> busy{false};
 
     explicit Impl(PGconn* handle) : connection(handle) {}
@@ -199,6 +200,16 @@ AsyncConnection::AsyncConnection(pg_conn* handle)
     : m_impl(std::make_unique<Impl>(handle)) {}
 
 AsyncConnection::~AsyncConnection() = default;
+
+void AsyncConnection::beginReadinessScope()
+{
+    m_impl->scopedReadiness.emplace();
+}
+
+void AsyncConnection::endReadinessScope() noexcept
+{
+    m_impl->scopedReadiness.reset();
+}
 
 bool AsyncConnection::healthy() const noexcept
 {
@@ -551,9 +562,20 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
         || sql.size()>16U*1024U*1024U))
         throw std::invalid_argument{"Invalid PostgreSQL migration script boundary"};
     try {
-        // Lazily register the socket once per query; destroy the duplicate
-        // before the catch handler discards a failed libpq connection.
+        // Lazily register once per query or explicitly scoped lease.
+        // Both paths discard the duplicate before poisoning the PGconn.
         QuerySocketReadiness querySocket;
+        auto* readiness = &querySocket;
+        if (m_impl->scopedReadiness && !migrationScript) {
+            auto& scoped = *m_impl->scopedReadiness;
+            // Only reuse on the exact same serialized executor. The opt-in
+            // lease guarantees that its original context remains alive.
+            if (scoped.descriptor && scoped.descriptor->get_executor() != executor) {
+                scoped.descriptor.reset();
+                scoped.originalFd = -1;
+            }
+            readiness = &scoped;
+        }
         // Validation and parameter materialization consume the same absolute
         // deadline as libpq I/O; never submit an already-expired operation.
         if (Clock::now() >= deadline) {
@@ -593,7 +615,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
                 throw std::runtime_error{"PostgreSQL query flush failed"};
             }
             co_await waitForSocket(executor, connection,
-                asio::posix::stream_descriptor::wait_write, deadline, &querySocket);
+                asio::posix::stream_descriptor::wait_write, deadline, readiness);
         }
 
         QueryRows output;
@@ -619,7 +641,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
                 }
                 if (PQisBusy(connection) != 0) {
                     co_await waitForSocket(executor, connection,
-                        asio::posix::stream_descriptor::wait_read, deadline, &querySocket);
+                        asio::posix::stream_descriptor::wait_read, deadline, readiness);
                     needInput = true;
                     continue;
                 }
@@ -704,6 +726,7 @@ asio::awaitable<QueryRows> AsyncConnection::querySerialized(
     } catch (...) {
         // A lost or cancelled query may still be executing on the server.
         // Discard the connection instead of risking transaction/session reuse.
+        endReadinessScope();
         m_impl->connection.reset();
         throw;
     }

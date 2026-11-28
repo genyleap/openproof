@@ -47,7 +47,7 @@ test("introspection requires confidential client and erases raw form credentials
   assert.match(body,/if \(m_introspectAccess\) \{[\s\S]*?co_await m_introspectAccess[\s\S]*?if \(!checked\) co_return fail\(checked.error\(\).code\(\),r\)/);
   assert.ok(body.indexOf("input->token=foundation::SecretString{}") < body.indexOf("co_await m_introspectAccess("));
   const shared=sql.slice(sql.indexOf("CoroutinePostgresCanonicalFinalizer::introspectAccessAsync("),sql.indexOf("CoroutinePostgresCanonicalFinalizer::revokeOAuthTokenAsync("));
-  assert.equal([...shared.matchAll(/co_await m_impl->pool.acquire\(deadline\)/g)].length,1);
+  assert.equal([...shared.matchAll(/co_await m_impl->pool.acquireScoped\(deadline\)/g)].length,1);
   const auth=shared.indexOf("co_await authenticateConfidentialClientOnLease("), denied=shared.indexOf("if (!caller)"), token=shared.indexOf("co_await readDelegatedAccessOnLease(");
   assert.ok(auth>=0 && denied>auth && token>denied);
   assert.match(shared,/readDelegatedAccessOnLease\(lease.connection\(\),\s*std::move\(tokenDigest\),clock.now\(\),issuedAt,deadline\)/);

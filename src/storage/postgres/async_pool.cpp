@@ -231,6 +231,7 @@ AsyncConnectionPool::Lease::~Lease() noexcept
     if (!m_state) return;
     // Every acquired permit must return even if connect/query throws. Poisoned
     // or aborted transactions become null slots, never an inherited PGconn.
+    if (m_connection) m_connection->endReadinessScope();
     if (m_connection && !m_connection->reusable()) m_connection.reset();
     auto* slot = static_cast<State::Slot*>(m_permit.get());
     if (!slot) std::terminate();
@@ -278,8 +279,14 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquire(
     return acquireImpl(deadline);
 }
 
+asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireScoped(
+    std::chrono::steady_clock::time_point deadline)
+{
+    return acquireImpl(deadline, true);
+}
+
 asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
-    std::optional<std::chrono::steady_clock::time_point> deadline)
+    std::optional<std::chrono::steady_clock::time_point> deadline, bool scopedReadiness)
 {
     auto state = m_state;
     // A caller-level deadline must never be restarted between different
@@ -327,12 +334,21 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
     auto* slot = static_cast<State::Slot*>(permit.get());
     auto connection = std::move(slot->connection);
     Lease lease{state, std::move(permit), std::move(connection)};
+    if (scopedReadiness) {
+        const auto executor = co_await asio::this_coro::executor;
+        using RequestStrand = asio::strand<asio::any_io_executor>;
+        const auto* strand = executor.target_type() == typeid(RequestStrand)
+            ? executor.target<RequestStrand>() : nullptr;
+        scopedReadiness = strand && strand->running_in_this_thread();
+    }
     if (!lease.m_connection) {
         // A failed or cancelled connection attempt is also slot-safe:
         // the local lease reissues a null permit from its noexcept destructor.
         lease.m_connection = co_await AsyncConnection::connect(
             state->connectionString, bounded(state->connectTimeout));
+        if (scopedReadiness) lease.m_connection->beginReadinessScope();
     } else {
+        if (scopedReadiness) lease.m_connection->beginReadinessScope();
         // PQTRANS_IDLE does not prove session isolation: SET ROLE, session
         // GUCs, temporary objects and advisory locks can outlive COMMIT.
         // Reset every recycled connection *before* returning it to a new

@@ -102,9 +102,9 @@ test("connected query reuses readiness ownership only within its own executor an
   const query = source.slice(source.indexOf("AsyncConnection::querySerialized("));
   assert.match(query, /try\s*\{\s*QuerySocketReadiness querySocket;/);
   for (const direction of ["wait_read", "wait_write"]) {
-    assert.ok(query.includes("asio::posix::stream_descriptor::"+direction+", deadline, &querySocket)"));
+    assert.ok(query.includes("asio::posix::stream_descriptor::"+direction+", deadline, readiness)"));
   }
-  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
+  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*endReadinessScope\(\);\s*m_impl->connection.reset\(\);/);
 });
 
 test("single-row results drain buffered input without an unconditional socket read per row", () => {
@@ -118,5 +118,5 @@ test("single-row results drain buffered input without an unconditional socket re
   assert.match(query, /co_await waitForSocket\([\s\S]*?needInput = true;\s*continue;/);
   assert.match(query, /needInput = false;\s*\}/);
   assert.match(query, /if \(!result\)\s*\{\s*if \(!finished\)/);
-  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*m_impl->connection.reset\(\);/);
+  assert.match(query, /catch\s*\(\.\.\.\)\s*\{\s*endReadinessScope\(\);\s*m_impl->connection.reset\(\);/);
 });

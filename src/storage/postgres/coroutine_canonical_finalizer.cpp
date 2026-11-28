@@ -430,7 +430,7 @@ CoroutinePostgresCanonicalFinalizer::readBearerUserInfoAsync(std::string digestH
     })) co_return foundation::fail(E::AuthenticationFailed);
     try {
         const Deadline deadline=Clock::now()+m_impl->queryTimeout;
-        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto lease=co_await m_impl->pool.acquireScoped(deadline);
         std::optional<profile::IdentityProfile> selected;
         // Grant and permitted unbound profile use one MVCC statement
         // snapshot. Sender-bound grants carry no profile projection and
@@ -849,7 +849,7 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessAsync(
     })) co_return foundation::fail(foundation::ErrorCode::AuthenticationFailed);
     try {
         const Deadline deadline=Clock::now()+m_impl->queryTimeout;
-        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto lease=co_await m_impl->pool.acquireScoped(deadline);
         co_return co_await readDelegatedAccessOnLease(lease.connection(),std::move(digestHex),
             now,issuedAt,deadline);
     } catch (const std::exception&) {
@@ -1376,7 +1376,7 @@ CoroutinePostgresCanonicalFinalizer::introspectAccessAsync(std::string clientId,
         // Authenticate before touching token state, using one exclusive lease
         // and one absolute deadline. No cached credentials or authorization.
         const Deadline deadline=Clock::now()+m_impl->queryTimeout;
-        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto lease=co_await m_impl->pool.acquireScoped(deadline);
         auto caller=co_await authenticateConfidentialClientOnLease(lease.connection(),
             std::move(clientId),std::move(clientDigest),deadline);
         if (!caller) co_return foundation::fail(caller.error());
@@ -2862,7 +2862,7 @@ CoroutinePostgresCanonicalFinalizer::healthCheckAsync()
 {
     try {
         const auto deadline=Clock::now()+m_impl->queryTimeout;
-        auto lease=co_await m_impl->pool.acquire(deadline);
+        auto lease=co_await m_impl->pool.acquireScoped(deadline);
         auto rows=co_await lease.connection().query("SELECT 1",{},remaining(deadline));
         if (rows.rows.size()!=1U || rows.rows.front().size()!=1U
             || rows.rows.front().front()!=std::optional<std::string>{"1"})

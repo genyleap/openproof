@@ -58,6 +58,11 @@ public:
     [[nodiscard]] bool reusable() const noexcept;
 
 private:
+    friend class AsyncConnectionPool;
+    // Only an explicitly request-scoped pool lease may keep a descriptor.
+    // The lease must end before its request executor/context is destroyed.
+    void beginReadinessScope();
+    void endReadinessScope() noexcept;
     explicit AsyncConnection(pg_conn* handle);
     static boost::asio::awaitable<std::unique_ptr<AsyncConnection>> connectSerialized(
         std::string connectionString, std::chrono::steady_clock::time_point deadline);

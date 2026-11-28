@@ -72,11 +72,16 @@ public:
     [[nodiscard]] boost::asio::awaitable<Lease> acquire(
         std::chrono::steady_clock::time_point deadline);
 
+    // Opt-in for a strictly request-local lease. All queries and destruction
+    // must complete before the request execution context is destroyed.
+    [[nodiscard]] boost::asio::awaitable<Lease> acquireScoped(
+        std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
     [[nodiscard]] boost::asio::awaitable<Lease> acquireImpl(
-        std::optional<std::chrono::steady_clock::time_point> deadline);
+        std::optional<std::chrono::steady_clock::time_point> deadline,
+        bool scopedReadiness=false);
     std::shared_ptr<State> m_state;
 };
 
