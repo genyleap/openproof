@@ -278,6 +278,9 @@ test("cancelled channel receives cannot silently consume native PostgreSQL pool 
   assert.match(implementation, /co_await waiter->timer\.async_wait/);
   assert.match(implementation, /cancellation\.cancelled\(\) != asio::cancellation_type::none/);
   assert.match(implementation, /if \(!permit\) \{[\s\S]*?State::waitForPermit\(state, admissionDeadline\)/);
+  assert.match(implementation, /executor\.target_type\(\) == typeid\(RequestStrand\)/);
+  assert.match(implementation, /executor\.target<RequestStrand>\(\)/);
+  assert.match(implementation, /if \(strand && strand->running_in_this_thread\(\)\) \{\s*permit = co_await State::waitForPermit\(state, admissionDeadline\);\s*\} else \{\s*permit = co_await asio::co_spawn\(asio::make_strand\(executor\),/);
   assert.match(implementation, /m_state->notifyWaiter\(\)/);
   assert.doesNotMatch(implementation, /retryInterval|retryTimer/);
   assert.match(implementation, /"DISCARD ALL"/);
