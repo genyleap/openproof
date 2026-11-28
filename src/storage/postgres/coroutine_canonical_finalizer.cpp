@@ -873,6 +873,9 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         // One statement snapshot: never assemble a grant from separately
         // observed token, lifecycle, scope or audience state. The lateral
         // union avoids the scope/audience Cartesian product.
+        // Limit to maximumGrants+1 before sorting. At most 256 grants
+        // are accepted, so any selection of 257 rows fails closed. Valid
+        // results retain the outer ORDER BY and the domain's canonical order.
         constexpr std::string_view grantProjection=
             "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
             "f.authenticated_at_ms,t.expires_at_ms,c.id,"
@@ -892,7 +895,7 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
             "SELECT 0 AS kind,s.scope AS value FROM openproof.oauth_token_family_scopes s WHERE s.family_id=f.id "
             "UNION ALL "
             "SELECT 1 AS kind,u.audience AS value FROM openproof.oauth_token_family_audiences u WHERE u.family_id=f.id "
-            "ORDER BY kind,value LIMIT 257) g ON true ";
+            "LIMIT 257) g ON true ";
         // The unique (family_id,scope) key permits at most one openid row.
         // Project the profile only on that row, not once for every grant.
         // Both constraint columns must be null: bound or malformed sender
