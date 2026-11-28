@@ -73,15 +73,25 @@ test("timed PostgreSQL operations are serialized on their current executor", () 
   const query = source.indexOf("AsyncConnection::query(");
   const queryImpl = source.indexOf("AsyncConnection::querySerialized(", query);
   assert.ok(connect > 0 && connectImpl > connect && query > connectImpl && queryImpl > query);
-  for (const wrapper of [source.slice(connect, connectImpl), source.slice(query, queryImpl)]) {
-    assert.match(wrapper, /const Deadline deadline = makeDeadline\(timeout\)/);
-    assert.match(wrapper, /co_await asio::this_coro::executor/);
-    assert.match(wrapper, /asio::co_spawn\(asio::make_strand\(executor\)/);
-    assert.match(wrapper, /asio::use_awaitable/);
-  }
+  const connectWrapper = source.slice(connect, connectImpl);
+  assert.match(connectWrapper, /const Deadline deadline = makeDeadline\(timeout\)/);
+  assert.match(connectWrapper, /co_await asio::this_coro::executor/);
+  assert.match(connectWrapper, /asio::co_spawn\(asio::make_strand\(executor\)/);
+  assert.match(connectWrapper, /asio::use_awaitable/);
+  const migration = source.indexOf("AsyncConnection::executeMigrationScript(", query);
+  assert.ok(migration > query && migration < queryImpl);
+  const queryWrapper = source.slice(query, migration);
+  assert.match(queryWrapper, /return querySerialized\(std::move\(sql\), std::move\(params\), timeout\);/);
+  assert.doesNotMatch(queryWrapper, /co_await|co_return|makeDeadline/);
+  const migrationWrapper = source.slice(migration, queryImpl);
+  assert.match(migrationWrapper, /const auto deadline=makeDeadline\(timeout\)/);
+  assert.match(migrationWrapper, /co_await asio::co_spawn\(asio::make_strand\(executor\),\s*querySerialized\(std::move\(sql\),\{\},timeout,deadline,true\),asio::use_awaitable\)/);
   assert.doesNotMatch(source, /m_impl->executor/);
   const implementation = source.slice(queryImpl);
+  assert.match(implementation, /const Deadline deadline = inheritedDeadline \? \*inheritedDeadline : makeDeadline\(timeout\)/);
   assert.match(implementation, /auto executor = co_await asio::this_coro::executor/);
+  assert.match(implementation, /if \(!inheritedDeadline\) \{[\s\S]*?executor\.target_type\(\) == typeid\(RequestStrand\)[\s\S]*?strand && strand->running_in_this_thread\(\)[\s\S]*?if \(!serialized\) \{\s*co_return co_await asio::co_spawn\(asio::make_strand\(executor\),\s*querySerialized\(std::move\(sql\), std::move\(params\), timeout, deadline, migrationScript\),\s*asio::use_awaitable\);\s*\}\s*\}/);
+  assert.ok(implementation.indexOf("if (!inheritedDeadline)") < implementation.indexOf("m_impl->busy.exchange("));
   assert.match(implementation, /waitForSocket\(executor, connection,/);
   const testSource = fs.readFileSync(path.join(root,
     "tests/storage/postgres_async_canonical_test.cpp"), "utf8");
