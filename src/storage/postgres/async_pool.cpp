@@ -319,8 +319,19 @@ asio::awaitable<AsyncConnectionPool::Lease> AsyncConnectionPool::acquireImpl(
     auto permit = state->tryTake();
     if (!permit) {
         auto executor = co_await asio::this_coro::executor;
-        permit = co_await asio::co_spawn(asio::make_strand(executor),
-            State::waitForPermit(state, admissionDeadline), asio::use_awaitable);
+        // The notification timer and its cancellation must remain on one
+        // serialized executor. Gateway worker requests already own a strand;
+        // reuse it only when its exact type and current affinity are proven.
+        // Other callers still get an independent serialized wait.
+        using RequestStrand = asio::strand<asio::any_io_executor>;
+        const auto* strand = executor.target_type() == typeid(RequestStrand)
+            ? executor.target<RequestStrand>() : nullptr;
+        if (strand && strand->running_in_this_thread()) {
+            permit = co_await State::waitForPermit(state, admissionDeadline);
+        } else {
+            permit = co_await asio::co_spawn(asio::make_strand(executor),
+                State::waitForPermit(state, admissionDeadline), asio::use_awaitable);
+        }
     }
     if (!permit || std::chrono::steady_clock::now() >= admissionDeadline)
         throw std::runtime_error{"Async PostgreSQL pool acquisition timed out"};
