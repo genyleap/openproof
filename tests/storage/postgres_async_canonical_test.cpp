@@ -617,14 +617,43 @@ TEST(PostgresCanonicalCoroutineTest, ReadinessResetProofPreservesPoolIsolationAn
     pg::async_detail::AsyncConnectionPool pool{io.get_executor(),*dsn,1U,500ms,1000ms};
     auto run=[&]() -> asio::awaitable<void> {
         EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        auto observer=co_await pg::async_detail::AsyncConnection::connect(*dsn,1s);
+        std::string backend;
         {
             auto lease=co_await pool.acquire(std::chrono::steady_clock::now()+3s);
+            const auto pid=co_await lease.connection().query("SELECT pg_backend_pid()::text",{},1s);
+            if (pid.rows.size()!=1U || pid.rows.front().size()!=1U || !pid.rows.front().front()) {
+                ADD_FAILURE()<<"Missing readiness fixture backend";
+                co_return;
+            }
+            backend=*pid.rows.front().front();
             static_cast<void>(co_await lease.connection().query(
                 "SET application_name TO 'readiness_prior_lease'",{},1s));
             static_cast<void>(co_await lease.connection().query(
                 "CREATE TEMP TABLE readiness_prior_lease_marker(value int)",{},1s));
         }
+        auto observe=[&]() -> asio::awaitable<pg::async_detail::QueryRows> {
+            std::vector<std::optional<std::string>> args{backend};
+            co_return co_await observer->query(
+                "SELECT application_name,query FROM pg_catalog.pg_stat_activity WHERE pid=$1::integer",
+                std::move(args),1s);
+        };
+        const auto before=co_await observe();
+        if (before.rows.size()!=1U || before.rows.front().size()!=2U) {
+            ADD_FAILURE()<<"Missing dirty readiness backend";
+            co_return;
+        }
+        EXPECT_EQ(before.rows.front()[0],"readiness_prior_lease");
         EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        // Observe the original backend without a second acquire/reset. Its
+        // latest command must be the actual reset, not an extra SELECT 1.
+        const auto after=co_await observe();
+        if (after.rows.size()!=1U || after.rows.front().size()!=2U) {
+            ADD_FAILURE()<<"Readiness unexpectedly replaced the backend";
+            co_return;
+        }
+        EXPECT_NE(after.rows.front()[0],"readiness_prior_lease");
+        EXPECT_EQ(after.rows.front()[1],"DISCARD ALL");
         {
             auto lease=co_await pool.acquire(std::chrono::steady_clock::now()+3s);
             const auto result=co_await lease.connection().query(
@@ -641,6 +670,22 @@ TEST(PostgresCanonicalCoroutineTest, ReadinessResetProofPreservesPoolIsolationAn
             static_cast<void>(co_await pool.probeReadiness(std::chrono::steady_clock::now()-1ms));
         } catch (const std::exception&) { expired=true; }
         EXPECT_TRUE(expired);
+        EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        // Disconnect only our own disposable backend and wait for its exit.
+        // The recycled connection must not report ready from prior evidence.
+        std::vector<std::optional<std::string>> terminateArgs{backend};
+        const auto terminated=co_await observer->query(
+            "SELECT pg_catalog.pg_terminate_backend($1::integer,1000)::text",std::move(terminateArgs),2s);
+        if (terminated.rows.size()!=1U || terminated.rows.front().size()!=1U) {
+            ADD_FAILURE()<<"Unable to terminate readiness fixture backend";
+            co_return;
+        }
+        EXPECT_EQ(terminated.rows.front().front(),"true");
+        bool unavailable=false;
+        try {
+            unavailable=!(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        } catch (const std::exception&) { unavailable=true; }
+        EXPECT_TRUE(unavailable);
         EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
     };
     auto future=asio::co_spawn(io,run(),asio::use_future);
