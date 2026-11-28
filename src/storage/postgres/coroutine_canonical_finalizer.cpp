@@ -873,19 +873,32 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
         // One statement snapshot: never assemble a grant from separately
         // observed token, lifecycle, scope or audience state. The lateral
         // union avoids the scope/audience Cartesian product.
+        // The token digest and all joined lifecycle keys are unique. Fence
+        // this at-most-one-row lookup from grant/profile join enumeration.
+        // MATERIALIZED changes planning boundaries, not the MVCC snapshot.
+        constexpr std::string_view eligibleToken=
+            "WITH eligible_token AS MATERIALIZED ("
+            "SELECT f.id,f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
+            "f.authenticated_at_ms,t.expires_at_ms,c.id AS client_id,"
+            "f.sender_constraint_kind,f.sender_constraint_value,t.issued_at_ms "
+            "FROM openproof.oauth_access_tokens t "
+            "JOIN openproof.oauth_token_families f ON f.id=t.family_id "
+            "JOIN openproof.oauth_clients c ON c.id=f.client_id "
+            "JOIN openproof.applications a ON a.id=c.application_id "
+            "WHERE t.token_digest=decode($1,'hex') AND t.state=0 "
+            "AND t.revoked_at_ms IS NULL AND t.issued_at_ms<=$2 AND t.expires_at_ms>$2 "
+            "AND f.revoked_at_ms IS NULL AND f.authenticated_at_ms<=$2 "
+            "AND c.status=0 AND a.status=0 AND a.organization_id=$3) ";
         constexpr std::string_view grantProjection=
             "SELECT f.identity_id,f.provider,f.assurance,f.factors,f.phishing_resistant,"
-            "f.authenticated_at_ms,t.expires_at_ms,c.id,"
-            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,t.issued_at_ms";
+            "f.authenticated_at_ms,f.expires_at_ms,f.client_id,"
+            "f.sender_constraint_kind,f.sender_constraint_value,g.kind,g.value,f.issued_at_ms";
         constexpr std::string_view profileProjection=
             ",p.identity_id,p.display_name,p.preferred_username,p.email,p.email_verified,"
             "p.phone_number,p.phone_number_verified,p.locale,p.picture_url,"
             "p.avatar_source,p.created_at_ms,p.updated_at_ms";
         constexpr std::string_view grantJoins=
-            " FROM openproof.oauth_access_tokens t "
-            "JOIN openproof.oauth_token_families f ON f.id=t.family_id "
-            "JOIN openproof.oauth_clients c ON c.id=f.client_id "
-            "JOIN openproof.applications a ON a.id=c.application_id "
+            " FROM eligible_token f "
             "JOIN openproof.identities i ON i.id=f.identity_id "
             "JOIN openproof.organizations o ON o.id=i.organization_id "
             "LEFT JOIN LATERAL ("
@@ -904,15 +917,12 @@ CoroutinePostgresCanonicalFinalizer::readDelegatedAccessOnLease(
             "AND EXISTS (SELECT 1 FROM openproof.oauth_token_family_scopes ps "
             "WHERE ps.family_id=f.id AND ps.scope IN ('profile','email')) ";
         constexpr std::string_view grantFilters=
-            "WHERE t.token_digest=decode($1,'hex') AND t.state=0 "
-            "AND t.revoked_at_ms IS NULL AND t.issued_at_ms<=$2 AND t.expires_at_ms>$2 "
-            "AND f.revoked_at_ms IS NULL AND f.authenticated_at_ms<=$2 "
-            "AND c.status=0 AND a.status=0 AND i.status=0 AND o.state=0 "
-            "AND i.organization_id=$3 AND a.organization_id=$3 "
+            "WHERE i.status=0 AND o.state=0 AND i.organization_id=$3 "
             "ORDER BY g.kind,g.value";
         std::string statement;
-        statement.reserve(grantProjection.size()+grantJoins.size()+grantFilters.size()
+        statement.reserve(eligibleToken.size()+grantProjection.size()+grantJoins.size()+grantFilters.size()
             +(selectedProfile?profileProjection.size()+profileJoin.size():0U));
+        statement.append(eligibleToken);
         statement.append(grantProjection);
         if (selectedProfile) statement.append(profileProjection);
         statement.append(grantJoins);

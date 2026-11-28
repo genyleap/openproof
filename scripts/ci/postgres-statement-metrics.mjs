@@ -14,10 +14,10 @@ export const snapshotSql = `SELECT json_build_object(
  'resetExecutionMs',coalesce(sum(s.total_exec_time) FILTER (WHERE upper(trim(both ' ;' from s.query))='DISCARD ALL'),0),
  'plans',coalesce(sum(s.plans),0),
  'planningMs',coalesce(sum(s.total_plan_time),0),
- 'accessReadCalls',coalesce(sum(s.calls) FILTER (WHERE s.query ILIKE 'SELECT%oauth_access_tokens%'),0),
- 'accessReadPlans',coalesce(sum(s.plans) FILTER (WHERE s.query ILIKE 'SELECT%oauth_access_tokens%'),0),
- 'accessReadPlanningMs',coalesce(sum(s.total_plan_time) FILTER (WHERE s.query ILIKE 'SELECT%oauth_access_tokens%'),0),
- 'accessReadExecutionMs',coalesce(sum(s.total_exec_time) FILTER (WHERE s.query ILIKE 'SELECT%oauth_access_tokens%'),0))
+ 'accessReadCalls',coalesce(sum(s.calls) FILTER (WHERE (s.query ILIKE 'SELECT%oauth_access_tokens%' OR s.query ILIKE 'WITH eligible_token AS MATERIALIZED%oauth_access_tokens%')),0),
+ 'accessReadPlans',coalesce(sum(s.plans) FILTER (WHERE (s.query ILIKE 'SELECT%oauth_access_tokens%' OR s.query ILIKE 'WITH eligible_token AS MATERIALIZED%oauth_access_tokens%')),0),
+ 'accessReadPlanningMs',coalesce(sum(s.total_plan_time) FILTER (WHERE (s.query ILIKE 'SELECT%oauth_access_tokens%' OR s.query ILIKE 'WITH eligible_token AS MATERIALIZED%oauth_access_tokens%')),0),
+ 'accessReadExecutionMs',coalesce(sum(s.total_exec_time) FILTER (WHERE (s.query ILIKE 'SELECT%oauth_access_tokens%' OR s.query ILIKE 'WITH eligible_token AS MATERIALIZED%oauth_access_tokens%')),0))
  FROM pg_stat_statements s JOIN pg_database d ON d.oid=s.dbid
  WHERE d.datname=:'fixture_database'`;
 export function validateSnapshot(value) {
