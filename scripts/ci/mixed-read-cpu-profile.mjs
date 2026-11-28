@@ -56,7 +56,10 @@ export async function profileMixedRead({pid,perf,output,work}) {
     await send("enable");
     const result=await work();
     await send("disable");
-    child.kill("SIGINT");
+    // Linux perf record re-raises SIGINT from its atexit handler.
+    // Its native stop command acknowledges and drains the recording,
+    // without converting a successful finalization into a signal exit.
+    await send("stop");
     let stopTimer;
     let exit;
     try {
@@ -64,7 +67,7 @@ export async function profileMixedRead({pid,perf,output,work}) {
         stopTimer=setTimeout(()=>reject(new Error("perf stop timed out")),10000);
       })]);
     } finally { clearTimeout(stopTimer); }
-    assert.equal(exit.code,0,"perf record failed");
+    assert.deepEqual(exit,{code:0,signal:null},"perf record failed");
     assert.ok(fs.statSync(data).size>0,"perf captured no data");
     const report=spawnSync(perf,["report","--stdio","--no-children",
       "--sort","dso,symbol","--show-nr-samples","--percent-limit","0.5","-i",data],
