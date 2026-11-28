@@ -509,6 +509,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         storage/postgres_async_test.cpp
         storage/postgres_integration_test.cpp
         PROPERTIES COMPILE_OPTIONS "-Wno-error=mismatched-new-delete")
+    # GCC 16.2 diagnoses enlarged Asio pool lifecycle test frames.
+    # Keep warnings fatal here; only prevent inlining in this test TU.
+    set_source_files_properties(storage/postgres_async_pool_test.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-inline")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
     target_link_options(openproof_postgres_async_tests PRIVATE

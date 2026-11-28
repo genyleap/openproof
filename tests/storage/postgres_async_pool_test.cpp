@@ -10,6 +10,7 @@
 #include <exception>
 #include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -116,19 +117,44 @@ asio::awaitable<void> recycledLeaseClearsSessionState(
     pg::AsyncConnectionPool pool{co_await asio::this_coro::executor,
         std::move(connectionString), 1U, 1s, 2s};
     constexpr auto marker = "openproof_previous_tenant_marker";
+    std::optional<std::string> backend;
     {
         auto first = co_await pool.acquire();
         static_cast<void>(co_await first.connection().query(
             "SET application_name = 'openproof_previous_tenant_marker'", {}, 2s));
+        static_cast<void>(co_await first.connection().query(
+            "CREATE TEMP TABLE openproof_previous_tenant_temp (value integer)", {}, 2s));
+        static_cast<void>(co_await first.connection().query(
+            "PREPARE openproof_previous_tenant_plan AS SELECT 1", {}, 2s));
+        static_cast<void>(co_await first.connection().query(
+            "SELECT pg_advisory_lock(1827364513)", {}, 2s));
         const auto before = co_await first.connection().query(
-            "SELECT current_setting('application_name')", {}, 2s);
-        EXPECT_EQ(before.rows[0][0], marker);
+            "SELECT pg_backend_pid()::text,current_setting('application_name'),"
+            "to_regclass('pg_temp.openproof_previous_tenant_temp') IS NOT NULL,"
+            "EXISTS (SELECT 1 FROM pg_prepared_statements WHERE name='openproof_previous_tenant_plan'),"
+            "EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid())", {}, 2s);
+        if (before.rows.size()!=1U || before.rows[0].size()!=5U) {
+            ADD_FAILURE() << "Unexpected session state probe shape";
+            co_return;
+        }
+        backend=before.rows[0][0];
+        EXPECT_TRUE(backend.has_value());
+        EXPECT_EQ(before.rows[0][1],marker);
+        EXPECT_EQ(before.rows[0][2],"t");
+        EXPECT_EQ(before.rows[0][3],"t");
+        EXPECT_EQ(before.rows[0][4],"t");
     }
     auto next = co_await pool.acquire();
     const auto after = co_await next.connection().query(
-        "SELECT current_setting('application_name')", {}, 2s);
-    cleared = after.rows.size() == 1U && after.rows[0].size() == 1U
-        && after.rows[0][0] != marker && next.connection().reusable();
+        "SELECT pg_backend_pid()::text,current_setting('application_name'),"
+        "to_regclass('pg_temp.openproof_previous_tenant_temp') IS NULL,"
+        "NOT EXISTS (SELECT 1 FROM pg_prepared_statements WHERE name='openproof_previous_tenant_plan'),"
+        "NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid())", {}, 2s);
+    cleared = after.rows.size() == 1U && after.rows[0].size() == 5U
+        && backend.has_value() && after.rows[0][0] == backend
+        && after.rows[0][1] != marker && after.rows[0][2] == "t"
+        && after.rows[0][3] == "t" && after.rows[0][4] == "t"
+        && next.connection().reusable();
     const auto reset=co_await next.connection().query("DISCARD ALL",{},2s);
     EXPECT_EQ(reset.commandTag,"DISCARD ALL");
     EXPECT_TRUE(reset.rows.empty());
