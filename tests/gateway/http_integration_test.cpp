@@ -1,10 +1,12 @@
 #include "../../src/gateway/asio_service_ids_extern.hpp"
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <latch>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -857,6 +859,62 @@ TEST(BeastHttpIntegrationTest, NativeHandlersSuspendWithOneExplicitHandlerWorker
     // A single worker must still permit overlapping native suspensions.
     EXPECT_GT(handler.peak(), 8);
     server.stop();
+}
+
+TEST(BeastHttpIntegrationTest, PersistentWorkerStrandsAreReusedWithoutEscapingServerLifetime)
+{
+    using Strand = asio::strand<asio::any_io_executor>;
+    class InspectingHandler final : public httpAdapter::CoroutineHttpHandler {
+    public:
+        bool nativeEnabled() const noexcept override { return true; }
+        gw::HttpResponse handle(gw::HttpRequest) override
+        {
+            return gw::HttpResponse{500, {}, "unexpected synchronous dispatch"};
+        }
+        asio::awaitable<gw::HttpResponse> handleAsync(gw::HttpRequest) override
+        {
+            auto executor = co_await asio::this_coro::executor;
+            const auto* strand = executor.target_type() == typeid(Strand)
+                ? executor.target<Strand>() : nullptr;
+            if (!strand || !strand->running_in_this_thread())
+                co_return gw::HttpResponse{500, {}, "invalid worker affinity"};
+            {
+                std::lock_guard lock{mutex};
+                if (std::find(seen.begin(),seen.end(),*strand)==seen.end())
+                    seen.push_back(*strand);
+                ++calls;
+            }
+            co_return gw::HttpResponse{200, {}, "serialized"};
+        }
+        std::mutex mutex;
+        std::vector<Strand> seen;
+        unsigned int calls{0U};
+    } handler;
+    auto config = httpAdapter::ServerConfig::create(
+        "127.0.0.1", 0U, 8192U, 1024U, std::chrono::seconds{2},
+        std::chrono::seconds{2}, 64U, 2U, false, 1U);
+    ASSERT_TRUE(config);
+    httpAdapter::BeastHttpServer server{handler,std::move(config).value()};
+    // Retained test-only strand handles must be released before destruction
+    // of their owner, including on an assertion failure or client exception.
+    struct Cleanup final {
+        httpAdapter::BeastHttpServer& server;
+        InspectingHandler& handler;
+        ~Cleanup() {
+            server.stop();
+            std::lock_guard lock{handler.mutex};
+            handler.seen.clear();
+        }
+    } cleanup{server,handler};
+    ASSERT_TRUE(server.start());
+    for (unsigned int i=0;i<24U;++i) {
+        const auto response=sendRequest(server.boundPort(),beastHttp::verb::get,"/");
+        ASSERT_EQ(response.result(),beastHttp::status::ok);
+        ASSERT_EQ(response.body(),"serialized");
+    }
+    std::lock_guard lock{handler.mutex};
+    EXPECT_EQ(handler.calls,24U);
+    EXPECT_EQ(handler.seen.size(),8U);
 }
 
 TEST(BeastHttpIntegrationTest, ExplicitReactorSafeReadProgressesWhileCompatibilityWorkerIsOccupied)
