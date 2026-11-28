@@ -346,6 +346,42 @@ TEST(PostgresNativeCoroutineTest, RequestStrandPreservesQueryDeadlineAndConnecti
     ASSERT_NO_THROW(done.get());
 }
 
+TEST(PostgresNativeCoroutineTest, QueryAwaitablePreservesLazyDeadlineOnBothExecutorPaths)
+{
+    const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
+    if (!connectionString || !*connectionString) {
+        if (std::getenv("GITHUB_ACTIONS")) {
+            FAIL() << "CI requires OPENPROOF_TEST_POSTGRES for native libpq tests";
+        }
+        GTEST_SKIP() << "No disposable PostgreSQL integration database configured";
+    }
+    const auto exercise = [](std::string dsn) -> asio::awaitable<void> {
+        auto connection = co_await pg::AsyncConnection::connect(std::move(dsn), 2s);
+        // Constructing or discarding an awaitable must not submit SQL.
+        { auto unused = connection->query("SELECT 1 / 0", {}, 1s); }
+        EXPECT_TRUE(connection->reusable());
+        auto deferred = connection->query("SELECT $1::text", {"lazy-deadline"}, 500ms);
+        auto executor = co_await asio::this_coro::executor;
+        asio::steady_timer delay{executor};
+        delay.expires_after(650ms);
+        co_await delay.async_wait(asio::use_awaitable);
+        // The query budget starts at execution, not awaitable construction.
+        auto result = co_await std::move(deferred);
+        EXPECT_EQ(result.rows.size(), 1U);
+        if (result.rows.size() == 1U && result.rows.front().size() == 1U)
+            EXPECT_EQ(result.rows.front().front(), "lazy-deadline");
+        EXPECT_TRUE(connection->reusable());
+    };
+    for (const bool typed : {false, true}) {
+        asio::io_context context;
+        asio::any_io_executor executor{context.get_executor()};
+        if (typed) executor = asio::make_strand(executor);
+        auto result = asio::co_spawn(executor, exercise(connectionString), asio::use_future);
+        context.run();
+        ASSERT_NO_THROW(result.get());
+    }
+}
+
 TEST(PostgresNativeCoroutineTest, DeadlineInvalidatesBusyConnection)
 {
     const char* connectionString = std::getenv("OPENPROOF_TEST_POSTGRES");
