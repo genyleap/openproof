@@ -15,7 +15,7 @@ CAND="$ROOT/cmake-build-gcc-release/apps/opp/opp"
 grep -qx 'OPENPROOF_EXPERIMENTAL_GATEWAY_LIMITED_INLINING:BOOL=ON' "$ROOT/cmake-build-gcc-release/CMakeCache.txt"
 
 # User-space profiler library and symbolizer only; no kernel policy changes.
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libgoogle-perftools4 google-perftools
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libgoogle-perftools4t64 google-perftools
 LIB="$(ldconfig -p | awk '/libprofiler\.so\.0 / && /x86-64/ {print $NF; exit}')"
 PPROF="$(command -v google-pprof)"
 [[ -f "$LIB" && -x "$PPROF" ]] || exit 2
@@ -24,7 +24,7 @@ OUT="$ROOT/gperftools-cpu-matrix"
 mkdir "$OUT"
 printf 'baseline_commit=%s\ncandidate_commit=%s\n' "$BASE_SHA" "$GITHUB_SHA" > "$OUT/provenance.txt"
 sha256sum "$BASE" "$CAND" >> "$OUT/provenance.txt"
-dpkg-query -W libgoogle-perftools4 google-perftools >> "$OUT/provenance.txt"
+dpkg-query -W libgoogle-perftools4t64 google-perftools >> "$OUT/provenance.txt"
 run_trial() (
     local side="$1" concurrency="$2" binary sha legacy db
     local -a overrides
