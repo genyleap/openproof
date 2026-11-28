@@ -611,8 +611,7 @@ async function main() {
     });
     assert.match(checked, /configuration is valid/i);
     if(profiling) profilerBase=path.join(tempRoot,"cpu-profile-"+ ++profilerLaunches);
-    const serverEnvironment=profiling?{...childEnvironment,
-      ...profileEnvironment(process.env.OPENPROOF_E2E_PROFILER_LIBRARY??"",profilerBase)}:childEnvironment;
+    const serverEnvironment=profiling?profileEnvironment(process.env.OPENPROOF_E2E_PROFILER_LIBRARY??"",profilerBase,childEnvironment):childEnvironment;
     oppProcess = spawn(binary, ["server", "--config", configurationPath], {
       cwd: root,
       env: serverEnvironment,

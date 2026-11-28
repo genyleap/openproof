@@ -10,15 +10,19 @@ function requireCI() {
   assert.equal(process.env.GITHUB_ACTIONS,"true");
   assert.equal(process.env.RUNNER_ENVIRONMENT,"github-hosted");
 }
-export function profileEnvironment(library,base) {
+export function profileEnvironment(library,base,inherited=process.env) {
   requireCI();
   assert.ok(path.isAbsolute(library)&&path.isAbsolute(base));
   assert.match(path.basename(library),/^libprofiler\.so(?:\.[0-9]+)*$/);
   assert.ok(fs.statSync(library).isFile());
   assert.ok(!fs.existsSync(base+".0"));
-  return {LD_PRELOAD:library,CPUPROFILE:base,
+  const env={...inherited};
+  // gperftools enables REALTIME by presence, even when the value is 0.
+  delete env.CPUPROFILE_REALTIME;
+  delete env.CPUPROFILE_TIMER_SIGNAL;
+  return {...env,LD_PRELOAD:library,CPUPROFILE:base,
     CPUPROFILESIGNAL:String(os.constants.signals.SIGUSR2),CPUPROFILE_FREQUENCY:"1000",
-    CPUPROFILE_REALTIME:"0",CPUPROFILE_PER_THREAD_TIMERS:"0"};
+    CPUPROFILE_PER_THREAD_TIMERS:"1"};
 }
 async function until(child,predicate,label) {
   const deadline=performance.now()+10000;
@@ -35,6 +39,7 @@ export function parseProfileReport(report) {
   assert.ok(Number.isSafeInteger(count)&&count>=500,"insufficient CPU samples ("+count+")");
   const rows=report.split("\n").filter(line=>/^\s*\d+\s+[\d.]+%\s+[\d.]+%\s+\d+\s+[\d.]+%\s+\S/.test(line));
   assert.ok(rows.length,"missing pprof symbol histogram");
+  assert.ok(rows.some(line=>!/(?:clock_nanosleep|nanosleep|__sleep|\bsleep\b|epoll_wait|poll|pthread_cond_wait|futex|\[unknown\])/.test(line)&&Number(line.trim().split(/\s+/)[0])>0),"profile contains only idle or unresolved samples");
   return {count,report:["Total: "+count+" samples",...rows].join("\n")+"\n"};
 }
 export async function sampleFixture({child,base,output,binary,pprof,readLog,work}) {
