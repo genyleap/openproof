@@ -604,6 +604,50 @@ TEST(PostgresCanonicalCoroutineTest, RealDatabaseNativeReadinessChecksActualPool
     EXPECT_TRUE(third.get()); // the previous probes returned the only lease
 }
 
+TEST(PostgresCanonicalCoroutineTest, ReadinessResetProofPreservesPoolIsolationAndDeadline)
+{
+    const auto dsn=disposableDsn();
+    if (!dsn) {
+        if (std::getenv("OPENPROOF_TEST_POSTGRES_DOMAIN_ACK")!=nullptr)
+            FAIL()<<"Explicit disposable database has invalid socket DSN";
+        GTEST_SKIP()<<"Only an explicitly acknowledged disposable database may be used.";
+    }
+    using namespace std::chrono_literals;
+    asio::io_context io;
+    pg::async_detail::AsyncConnectionPool pool{io.get_executor(),*dsn,1U,500ms,1000ms};
+    auto run=[&]() -> asio::awaitable<void> {
+        EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        {
+            auto lease=co_await pool.acquire(std::chrono::steady_clock::now()+3s);
+            static_cast<void>(co_await lease.connection().query(
+                "SET application_name TO 'readiness_prior_lease'",{},1s));
+            static_cast<void>(co_await lease.connection().query(
+                "CREATE TEMP TABLE readiness_prior_lease_marker(value int)",{},1s));
+        }
+        EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+        {
+            auto lease=co_await pool.acquire(std::chrono::steady_clock::now()+3s);
+            const auto result=co_await lease.connection().query(
+                "SELECT current_setting('application_name'),to_regclass('pg_temp.readiness_prior_lease_marker')::text",{},1s);
+            if (result.rows.size()!=1U || result.rows.front().size()!=2U) {
+                ADD_FAILURE()<<"Malformed readiness isolation fixture result";
+                co_return;
+            }
+            EXPECT_NE(result.rows.front()[0],"readiness_prior_lease");
+            EXPECT_FALSE(result.rows.front()[1].has_value());
+        }
+        bool expired=false;
+        try {
+            static_cast<void>(co_await pool.probeReadiness(std::chrono::steady_clock::now()-1ms));
+        } catch (const std::exception&) { expired=true; }
+        EXPECT_TRUE(expired);
+        EXPECT_TRUE(co_await pool.probeReadiness(std::chrono::steady_clock::now()+3s));
+    };
+    auto future=asio::co_spawn(io,run(),asio::use_future);
+    io.run();
+    ASSERT_NO_THROW(future.get());
+}
+
 TEST(PostgresCanonicalCoroutineTest, RealDatabaseRecycledLeaseResetsSession)
 {
     const auto dsn = disposableDsn();
