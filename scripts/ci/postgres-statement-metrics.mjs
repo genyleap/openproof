@@ -3,6 +3,8 @@
 import assert from "node:assert/strict";
 export const fields=["calls","executionMs","rows","sharedHits","sharedReads","resetCalls","resetExecutionMs"];
 export const snapshotSql = `SELECT json_build_object(
+ 'dealloc',(SELECT dealloc FROM pg_stat_statements_info),
+ 'statsReset',(SELECT stats_reset::text FROM pg_stat_statements_info),
  'calls',coalesce(sum(s.calls),0),
  'executionMs',coalesce(sum(s.total_exec_time),0),
  'rows',coalesce(sum(s.rows),0),
@@ -22,7 +24,14 @@ export function validateSnapshot(value) {
   return value;
 }
 export function statementDelta(before,after) {
-  validateSnapshot(before);validateSnapshot(after);
+  for(const snapshot of [before,after]) {
+    const {dealloc,statsReset,...counters}=snapshot;
+    validateSnapshot(counters);
+    assert.ok(Number.isSafeInteger(dealloc) && dealloc>=0);
+    assert.ok(typeof statsReset==="string" && statsReset.length>0);
+  }
+  assert.equal(before.dealloc,after.dealloc,"PostgreSQL statistics entries were evicted");
+  assert.equal(before.statsReset,after.statsReset,"PostgreSQL statistics reset during load");
   const delta=Object.fromEntries(fields.map(k=>[k,after[k]-before[k]]));
   return validateSnapshot(delta);
 }
